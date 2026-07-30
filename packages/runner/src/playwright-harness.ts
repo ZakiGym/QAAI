@@ -63,6 +63,9 @@ function resolvePlaywrightLayout(): { runsRoot: string; cliPath: string } {
 
 const { runsRoot, cliPath } = resolvePlaywrightLayout();
 
+/** The Playwright binary the runner drives; record mode uses it too. */
+export const playwrightCliPath = cliPath;
+
 // ─── Playwright JSON reporter shapes (the subset we consume) ─────────────────
 
 interface PwErrorish {

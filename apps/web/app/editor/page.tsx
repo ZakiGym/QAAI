@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { CodeEditor } from '../../components/CodeEditor';
 import { AgentPanel } from '../../components/AgentPanel';
+import { RecordButton } from '../../components/RecordButton';
 import { StatusDot, duration } from '../../components/ui';
 
 /**
@@ -256,6 +257,15 @@ export default function EditorPage() {
 
         <div className="ml-auto flex items-center gap-2">
           {status && <span className="text-ink-faint text-xs">{status}</span>}
+          <RecordButton
+            projectId={project?.id ?? ''}
+            environmentId={project?.environments[0]?.id ?? null}
+            onRecorded={(testId) => {
+              if (project) {
+                void loadTests(project.id).then(() => void openFile(project.id, testId));
+              }
+            }}
+          />
           <button
             type="button"
             onClick={() => void save()}

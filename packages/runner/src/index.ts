@@ -6,3 +6,4 @@ export { smokePlugin } from './plugins/smoke.js';
 export { apiPlugin } from './plugins/api.js';
 export { accessibilityPlugin } from './plugins/accessibility.js';
 export { securitySmokePlugin } from './plugins/security-smoke.js';
+export * from './record.js';
