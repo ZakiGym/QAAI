@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FIXTURE_PREFIX, buildTree, type TreeNode, type TreeTest } from '../lib/tree';
+import { FileMenu, type MenuItem } from './FileMenu';
 
 /**
  * The editor's file explorer — a real, collapsible folder tree built from each
@@ -69,6 +70,12 @@ export interface FileTreeProps {
   onOpen: (testId: string) => void;
   /** Create a new file inside `folderPath` ('' = root). */
   onAdd: (folderPath: string) => void;
+  /** Right-click operations. Each reloads the tree when it settles. */
+  onRename?: (test: TreeTest) => void;
+  onDuplicate?: (test: TreeTest) => void;
+  onDelete?: (test: TreeTest) => void;
+  onRenameFolder?: (folderPath: string) => void;
+  onDeleteFolder?: (folderPath: string) => void;
 }
 
 export function FileTree({
@@ -78,7 +85,36 @@ export function FileTree({
   dirtyTestId,
   onOpen,
   onAdd,
+  onRename,
+  onDuplicate,
+  onDelete,
+  onRenameFolder,
+  onDeleteFolder,
 }: FileTreeProps) {
+  const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+
+  /** Right-click on a file. */
+  const fileMenu = (event: React.MouseEvent, test: TreeTest): void => {
+    event.preventDefault();
+    const items: MenuItem[] = [
+      { label: 'Open', onSelect: () => onOpen(test.id) },
+      { label: 'Rename or move…', onSelect: () => onRename?.(test), disabled: !onRename },
+      { label: 'Duplicate', onSelect: () => onDuplicate?.(test), disabled: !onDuplicate },
+      { label: 'Delete', onSelect: () => onDelete?.(test), disabled: !onDelete, danger: true, separated: true },
+    ];
+    setMenu({ x: event.clientX, y: event.clientY, items });
+  };
+
+  /** Right-click on a folder. */
+  const folderMenu = (event: React.MouseEvent, path: string): void => {
+    event.preventDefault();
+    const items: MenuItem[] = [
+      { label: 'New file…', onSelect: () => onAdd(path) },
+      { label: 'Rename or move…', onSelect: () => onRenameFolder?.(path), disabled: !onRenameFolder },
+      { label: 'Delete folder', onSelect: () => onDeleteFolder?.(path), disabled: !onDeleteFolder, danger: true, separated: true },
+    ];
+    setMenu({ x: event.clientX, y: event.clientY, items });
+  };
   const nodes = useMemo(() => buildTree(tests), [tests]);
 
   // Persist which folders the user COLLAPSED — default is open, and a folder we
@@ -119,6 +155,7 @@ export function FileTree({
       return (
         <div key={`dir:${node.path}`}>
           <div
+            onContextMenu={(e) => folderMenu(e, node.path)}
             className="group text-ink-dim hover:bg-surface-1 flex items-center gap-1.5 rounded px-1.5 py-1 text-[13px]"
             style={{ paddingLeft: depth * IND + 6 }}
           >
@@ -160,6 +197,7 @@ export function FileTree({
         key={`file:${node.test.id}`}
         type="button"
         onClick={() => onOpen(node.test.id)}
+        onContextMenu={(e) => fileMenu(e, node.test)}
         title={node.test.name}
         style={{ paddingLeft: depth * IND + 6 }}
         className={`flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[13px] ${
@@ -189,5 +227,10 @@ export function FileTree({
     );
   }
 
-  return <div className="py-1">{nodes.map((node) => renderNode(node, 0))}</div>;
+  return (
+    <>
+      <div className="py-1">{nodes.map((node) => renderNode(node, 0))}</div>
+      {menu && <FileMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
+    </>
+  );
 }

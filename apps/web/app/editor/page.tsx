@@ -300,6 +300,48 @@ export default function EditorPage() {
     });
   }
 
+  /** File operations. Each one reloads the tree, and closes the file if it went away. */
+  async function fileOp(label: string, fn: () => Promise<unknown>, closedTestId?: string) {
+    if (!project) return;
+    try {
+      await fn();
+      await loadTests(project.id);
+      if (closedTestId && openTest?.id === closedTestId) {
+        setOpenTest(null);
+        setDraft('');
+        setDirty(false);
+      }
+      setStatus(label);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : `${label} failed`);
+    }
+  }
+
+  function renameFile(test: { id: string; filePath: string; name: string }) {
+    const next = prompt(
+      'New path (move it by changing the folders)',
+      test.filePath,
+    );
+    if (!next || next === test.filePath) return;
+    void fileOp('Moved', () =>
+      api(`/projects/${project!.id}/tests/${test.id}/path`, {
+        method: 'PATCH',
+        body: JSON.stringify({ filePath: next }),
+      }),
+    );
+  }
+
+  function renameFolder(folderPath: string) {
+    const next = prompt('New folder path', folderPath);
+    if (!next || next === folderPath) return;
+    void fileOp('Folder moved', () =>
+      api(`/projects/${project!.id}/folders/move`, {
+        method: 'POST',
+        body: JSON.stringify({ from: folderPath, to: next }),
+      }),
+    );
+  }
+
   const result = lastRun?.results?.[0] ?? null;
   const openIsFixture = openTest?.filePath.startsWith(FIXTURE_PREFIX) ?? false;
 
@@ -390,6 +432,30 @@ export default function EditorPage() {
               dirtyTestId={dirty ? (openTest?.id ?? null) : null}
               onOpen={(testId) => void openFile(project.id, testId)}
               onAdd={(folderPath) => void createInFolder(folderPath)}
+              onRename={(t) => renameFile(t)}
+              onDuplicate={(t) =>
+                void fileOp('Duplicated', () =>
+                  api(`/projects/${project.id}/tests/${t.id}/duplicate`, { method: 'POST' }),
+                )
+              }
+              onDelete={(t) => {
+                if (!confirm(`Delete ${t.filePath}? Its history and past results are kept.`)) return;
+                void fileOp(
+                  'Deleted',
+                  () => api(`/projects/${project.id}/tests/${t.id}`, { method: 'DELETE' }),
+                  t.id,
+                );
+              }}
+              onRenameFolder={(path) => renameFolder(path)}
+              onDeleteFolder={(path) => {
+                if (!confirm(`Delete everything in ${path}/?`)) return;
+                void fileOp('Folder deleted', () =>
+                  api(`/projects/${project.id}/folders/delete`, {
+                    method: 'POST',
+                    body: JSON.stringify({ path }),
+                  }),
+                );
+              }}
             />
           )}
         </aside>

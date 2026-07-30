@@ -38,6 +38,14 @@ export default function OnboardingPage() {
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  /**
+   * Teardown for the in-flight crawl watcher. followCrawl returns one, and it
+   * used to be dropped on the floor — so the five-minute give-up timer fired
+   * even after a successful crawl, flipping a user reading their plan back to
+   * an empty form with a false "the crawl did not finish" error.
+   */
+  const stopWatchingRef = useRef<(() => void) | null>(null);
+  useEffect(() => () => stopWatchingRef.current?.(), []);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -62,7 +70,7 @@ export default function OnboardingPage() {
     // The crawl ends by writing a plan; the run.finished event carries the
     // item count. Poll for the plan too, in case the event is missed.
     source.addEventListener('run.finished', () => {
-      source.close();
+      stop();
       setPhase('done');
     });
 
@@ -71,27 +79,27 @@ export default function OnboardingPage() {
         () => null,
       );
       if (plan) {
-        clearInterval(poll);
-        source.close();
+        stop();
         setPhase('done');
       }
     }, 3000);
 
     // Give up after five minutes rather than spin forever if the worker is down.
     const giveUp = setTimeout(() => {
-      clearInterval(poll);
-      source.close();
+      stop();
       setError(
         'The crawl did not finish. Is the worker running? Check that ANTHROPIC_API_KEY is set for the plan step.',
       );
       setPhase('error');
     }, 5 * 60_000);
 
-    return () => {
+    function stop() {
       clearInterval(poll);
       clearTimeout(giveUp);
       source.close();
-    };
+    }
+
+    return stop;
   }, []);
 
   async function start(event: React.FormEvent) {
@@ -99,30 +107,47 @@ export default function OnboardingPage() {
     setError(null);
 
     try {
-      // One project, one environment, one crawl — the whole first-run in a
-      // single submit so nobody has to assemble it by hand.
-      const { project } = await api<{ project: Project }>('/projects', {
-        method: 'POST',
-        body: JSON.stringify({ name, primaryFramework: framework }),
-      });
-      setProject(project);
+      /**
+       * One project, one environment, one crawl — the whole first-run in a
+       * single submit so nobody has to assemble it by hand.
+       *
+       * Each step reuses what already exists rather than re-creating it. This
+       * matters on the retry path: creating the project and then failing at the
+       * environment used to leave a project behind, and resubmitting hit "slug
+       * already exists" (and, on the Free plan, "1 project allowed") forever.
+       */
+      const existing = project;
+      const created =
+        existing ??
+        (
+          await api<{ project: Project }>('/projects', {
+            method: 'POST',
+            body: JSON.stringify({ name, primaryFramework: framework }),
+          })
+        ).project;
+      setProject(created);
 
-      const { environment } = await api<{ environment: { id: string } }>(
-        `/projects/${project.id}/environments`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ name: envKind.toLowerCase(), kind: envKind, baseUrl }),
-        },
-      );
+      const environments = await api<{ environments: Array<{ id: string; baseUrl: string }> }>(
+        `/projects/${created.id}/environments`,
+      ).catch(() => ({ environments: [] as Array<{ id: string; baseUrl: string }> }));
 
-      await api(`/projects/${project.id}/explore`, {
+      const environment =
+        environments.environments[0] ??
+        (
+          await api<{ environment: { id: string } }>(`/projects/${created.id}/environments`, {
+            method: 'POST',
+            body: JSON.stringify({ name: envKind.toLowerCase(), kind: envKind, baseUrl }),
+          })
+        ).environment;
+
+      await api(`/projects/${created.id}/explore`, {
         method: 'POST',
         body: JSON.stringify({ environmentId: environment.id, maxPages: 25, maxDepth: 3 }),
       });
 
       setPhase('crawling');
       setLog([`Crawling ${baseUrl}…`]);
-      followCrawl(project.id);
+      stopWatchingRef.current = followCrawl(created.id);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.push('/login');

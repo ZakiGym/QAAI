@@ -5,6 +5,7 @@
 import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
 import {
+  FIXTURE_PREFIX,
   GIT_INTEGRATION_KINDS,
   INLINE_EDIT_PREFIX,
   QUEUE_NAMES,
@@ -14,8 +15,11 @@ import {
   createProjectSchema,
   createTestSchema,
   gitPushSchema,
+  deleteFolderSchema,
   importSecretsSchema,
   inlineEditRequestSchema,
+  moveFolderSchema,
+  moveTestSchema,
   locatorsFromFlowMap,
   updateEnvironmentSchema,
   updateTestSchema,
@@ -129,6 +133,46 @@ projectsRouter.get('/:projectId', async (req, res) => {
   });
   if (!project) throw notFound('Project');
   res.json({ project });
+});
+
+/**
+ * Archive a project.
+ *
+ * There was no way to remove a project at all, which turned a half-finished
+ * onboarding into a permanent dead end: the project existed, the retry hit
+ * "slug already exists" and — on the Free plan's single-project limit — the
+ * user could never create another one.
+ *
+ * Archived rather than deleted: runs, results and artifacts are the record of
+ * what was tested, and a stray click should not erase them. The slug is freed
+ * so the name can be reused immediately.
+ */
+projectsRouter.delete('/:projectId', requireRole('ADMIN'), async (req, res) => {
+  const actor = actorOf(req);
+  const project = await prisma.project.findUnique({
+    where: { id: String(req.params.projectId) },
+    select: { id: true, name: true, slug: true, archivedAt: true },
+  });
+  if (!project || project.archivedAt) throw notFound('Project');
+
+  await prisma.project.update({
+    where: { id: project.id },
+    data: {
+      archivedAt: new Date(),
+      // Free the slug so the same name can be used again straight away.
+      slug: `${project.slug}-archived-${Date.now().toString(36)}`,
+    },
+  });
+
+  await audit({
+    actor,
+    action: 'project.archive',
+    targetType: 'Project',
+    targetId: project.id,
+    metadata: { name: project.name, slug: project.slug },
+  });
+
+  res.json({ ok: true });
 });
 
 // ─── Environments ────────────────────────────────────────────────────────────
@@ -781,6 +825,292 @@ projectsRouter.post(
   });
 
   res.json({ push: result });
+});
+
+// ─── File operations (§8) ────────────────────────────────────────────────────
+
+/**
+ * Paths are written to disk by the runner and committed by the exporter, so a
+ * path is normalised in one place rather than trusted from wherever it came.
+ * `relativeFilePath` in the schema already rejects traversal.
+ */
+function normalisePath(input: string): string {
+  const cleaned = input.replace(/^[/\\]+/, '').replace(/\\/g, '/');
+  return cleaned
+    .split('/')
+    .filter((s) => s && s !== '.')
+    .join('/');
+}
+
+/**
+ * `fixtures/` decides whether a row is a TEST or DATA — it is excluded from run
+ * selection and materialised into every workspace. That boundary was previously
+ * enforced only on read, so a move could silently turn a runnable test into a
+ * file that never runs again. It is enforced here, on the write.
+ */
+function assertFixtureBoundary(path: string, hasRunnableCode: boolean): void {
+  if (path.startsWith(FIXTURE_PREFIX) && hasRunnableCode && !path.endsWith('.json')) {
+    throw badRequest(
+      `Moving a test into ${FIXTURE_PREFIX} would stop it ever running — that folder holds ` +
+        `test data, not tests. Move it elsewhere, or save it as .json if it really is data.`,
+    );
+  }
+}
+
+/** Rename or move one file. */
+projectsRouter.patch('/:projectId/tests/:testId/path', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = moveTestSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const test = await prisma.test.findUnique({
+    where: { id: String(req.params.testId) },
+    select: { id: true, projectId: true, filePath: true, name: true, code: true },
+  });
+  if (!test || test.projectId !== projectId) throw notFound('Test');
+
+  const target = normalisePath(input.filePath);
+  if (!target) throw badRequest('A file needs a name');
+
+  const hasRunnableCode = test.code.trim().length > 0 && !test.filePath.endsWith('.json');
+  assertFixtureBoundary(target, hasRunnableCode);
+
+  if (target !== test.filePath) {
+    const clash = await prisma.test.findFirst({
+      where: { projectId, filePath: target, disabledAt: null, id: { not: test.id } },
+      select: { id: true },
+    });
+    if (clash) throw conflict(`${target} already exists`);
+  }
+
+  const updated = await prisma.test.update({
+    where: { id: test.id },
+    data: { filePath: target, ...(input.name ? { name: input.name } : {}) },
+    select: { id: true, name: true, filePath: true },
+  });
+
+  await audit({
+    actor,
+    action: 'test.move',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { from: test.filePath, to: target },
+  });
+
+  res.json({ test: updated });
+});
+
+/**
+ * Delete a file. Soft, via `disabledAt` — the column existed and nothing ever
+ * wrote it, so deleting was impossible. Soft because a test carries its version
+ * history and its past run results; hard-deleting would quietly rewrite the
+ * record of what was tested when.
+ */
+projectsRouter.delete('/:projectId/tests/:testId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const test = await prisma.test.findUnique({
+    where: { id: String(req.params.testId) },
+    select: { id: true, projectId: true, name: true, filePath: true, disabledAt: true },
+  });
+  if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
+  if (test.disabledAt) throw conflict('That file is already deleted');
+
+  await prisma.test.update({ where: { id: test.id }, data: { disabledAt: new Date() } });
+
+  await audit({
+    actor,
+    action: 'test.delete',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { name: test.name, filePath: test.filePath },
+  });
+
+  res.json({ ok: true });
+});
+
+/** Restore a soft-deleted file. */
+projectsRouter.post('/:projectId/tests/:testId/restore', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const test = await prisma.test.findUnique({
+    where: { id: String(req.params.testId) },
+    select: { id: true, projectId: true, filePath: true, disabledAt: true },
+  });
+  if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
+  if (!test.disabledAt) throw conflict('That file is not deleted');
+
+  // Its old path may have been taken while it was gone.
+  const clash = await prisma.test.findFirst({
+    where: {
+      projectId: test.projectId,
+      filePath: test.filePath,
+      disabledAt: null,
+      id: { not: test.id },
+    },
+    select: { id: true },
+  });
+  if (clash) throw conflict(`${test.filePath} is occupied — rename that file first`);
+
+  const restored = await prisma.test.update({
+    where: { id: test.id },
+    data: { disabledAt: null },
+    select: { id: true, name: true, filePath: true },
+  });
+
+  await audit({
+    actor,
+    action: 'test.restore',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { filePath: test.filePath },
+  });
+
+  res.json({ test: restored });
+});
+
+/** Copy a file, so a near-identical test does not have to be retyped. */
+projectsRouter.post(
+  '/:projectId/tests/:testId/duplicate',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+
+    const source = await prisma.test.findUnique({ where: { id: String(req.params.testId) } });
+    if (!source || source.projectId !== projectId) throw notFound('Test');
+
+    // `a/b.spec.ts` → `a/b-copy.spec.ts`; the compound suffix stays intact so
+    // Playwright still collects the copy.
+    const compound = /(\.(?:spec|test)\.[cm]?[jt]sx?)$/.exec(source.filePath);
+    const ext = compound ? compound[1]! : (/(\.[^./]+)$/.exec(source.filePath)?.[1] ?? '');
+    const stem = ext ? source.filePath.slice(0, -ext.length) : source.filePath;
+
+    let filePath = `${stem}-copy${ext}`;
+    for (let n = 2; n < 100; n++) {
+      const taken = await prisma.test.findFirst({
+        where: { projectId, filePath, disabledAt: null },
+        select: { id: true },
+      });
+      if (!taken) break;
+      filePath = `${stem}-copy-${n}${ext}`;
+    }
+
+    const copy = await prisma.test.create({
+      data: {
+        orgId: actor.orgId,
+        projectId,
+        suiteId: source.suiteId,
+        name: `${source.name} (copy)`,
+        type: source.type,
+        feature: source.feature,
+        priority: source.priority,
+        code: source.code,
+        filePath,
+        spec: (source.spec as object) ?? undefined,
+        tags: source.tags,
+        versions: {
+          create: {
+            orgId: actor.orgId,
+            version: 1,
+            code: source.code,
+            source: 'HUMAN',
+            authorId: actor.userId,
+            message: `Duplicated from ${source.filePath}`,
+          },
+        },
+      },
+      select: { id: true, name: true, filePath: true },
+    });
+
+    await audit({
+      actor,
+      action: 'test.duplicate',
+      targetType: 'Test',
+      targetId: copy.id,
+      metadata: { from: source.filePath, to: filePath },
+    });
+
+    res.status(201).json({ test: copy });
+  },
+);
+
+/** Rename or move a folder — rewrites the path prefix on everything beneath it. */
+projectsRouter.post('/:projectId/folders/move', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = moveFolderSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const from = normalisePath(input.from);
+  const to = normalisePath(input.to);
+  if (!from || !to) throw badRequest('Both a source and a destination folder are required');
+  if (from === to) throw badRequest('The source and destination are the same');
+  // Moving a folder inside itself would rewrite the prefix forever.
+  if (to.startsWith(`${from}/`)) throw badRequest('A folder cannot be moved inside itself');
+
+  const contents = await prisma.test.findMany({
+    where: { projectId, disabledAt: null, filePath: { startsWith: `${from}/` } },
+    select: { id: true, filePath: true, code: true },
+  });
+  if (contents.length === 0) throw notFound('Folder');
+
+  const moves = contents.map((t) => ({
+    id: t.id,
+    to: `${to}/${t.filePath.slice(from.length + 1)}`,
+    hasRunnableCode: t.code.trim().length > 0 && !t.filePath.endsWith('.json'),
+  }));
+
+  for (const move of moves) assertFixtureBoundary(move.to, move.hasRunnableCode);
+
+  const clashes = await prisma.test.findMany({
+    where: {
+      projectId,
+      disabledAt: null,
+      filePath: { in: moves.map((m) => m.to) },
+      id: { notIn: moves.map((m) => m.id) },
+    },
+    select: { filePath: true },
+  });
+  if (clashes.length > 0) {
+    throw conflict(`${clashes[0]!.filePath} already exists in the destination`);
+  }
+
+  // One transaction: a half-moved folder is worse than a failed move.
+  await prisma.$transaction(
+    moves.map((m) => prisma.test.update({ where: { id: m.id }, data: { filePath: m.to } })),
+  );
+
+  await audit({
+    actor,
+    action: 'folder.move',
+    targetType: 'Project',
+    targetId: projectId,
+    metadata: { from, to, files: moves.length },
+  });
+
+  res.json({ moved: moves.length, from, to });
+});
+
+/** Soft-delete every file in a folder. */
+projectsRouter.post('/:projectId/folders/delete', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = deleteFolderSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+  const path = normalisePath(input.path);
+  if (!path) throw badRequest('A folder is required');
+
+  const result = await prisma.test.updateMany({
+    where: { projectId, disabledAt: null, filePath: { startsWith: `${path}/` } },
+    data: { disabledAt: new Date() },
+  });
+
+  await audit({
+    actor,
+    action: 'folder.delete',
+    targetType: 'Project',
+    targetId: projectId,
+    metadata: { path, files: result.count },
+  });
+
+  res.json({ deleted: result.count, path });
 });
 
 // ─── Editor intelligence (§8) ────────────────────────────────────────────────

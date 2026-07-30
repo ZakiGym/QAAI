@@ -239,6 +239,34 @@ export const createTestSchema = z.object({
 });
 
 /**
+ * Rename or move a file. These are one operation, not two: a move is a rename
+ * whose directory part changed. Keeping them together means the path rules —
+ * traversal, uniqueness, the fixtures/ boundary — are enforced in exactly one
+ * place instead of drifting apart.
+ */
+export const moveTestSchema = z.object({
+  filePath: relativeFilePath,
+  /** Rename the test itself too. Omit to keep the current name. */
+  name: z.string().min(1).max(160).optional(),
+});
+
+/**
+ * Rename or move a folder — a bulk path-prefix rewrite.
+ *
+ * Folders are not stored anywhere. They exist only as slashes inside filePath,
+ * exactly as they do in git, which is why this is a prefix update across many
+ * rows rather than an edit to a folder row that does not exist.
+ */
+export const moveFolderSchema = z.object({
+  from: relativeFilePath,
+  to: relativeFilePath,
+});
+
+export const deleteFolderSchema = z.object({
+  path: relativeFilePath,
+});
+
+/**
  * An inline edit request (⌘K in the editor). The selection may be empty — the
  * user can invoke it with nothing highlighted to act on the whole file.
  */

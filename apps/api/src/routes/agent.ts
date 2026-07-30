@@ -43,7 +43,11 @@ agentRouter.post('/projects/:projectId/explore', requireRole('MEMBER'), async (r
     maxPages: Math.min(60, Number(req.body?.maxPages ?? 25)),
     maxDepth: Math.min(6, Number(req.body?.maxDepth ?? 3)),
     autoApprove: req.body?.autoApprove === true,
-  });
+  },
+  // One attempt. A crawl is expensive and NOT idempotent — it writes a new
+  // FlowMap version every run — so the default 3 retries silently re-crawled
+  // the customer's site three times whenever the plan step failed.
+  { attempts: 1 });
 
   await audit({
     actor,
