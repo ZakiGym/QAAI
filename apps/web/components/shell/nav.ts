@@ -3,6 +3,7 @@ import {
   IconList,
   IconGrid,
   IconCode,
+  IconBranch,
   IconKey,
   IconDownload,
   IconPlusSquare,
@@ -27,6 +28,7 @@ export const NAV: NavItemDef[] = [
   { href: '/dashboard', label: 'Dashboard', Icon: IconGrid },
   { href: '/editor', label: 'Editor', Icon: IconCode },
   { href: '/environments', label: 'Environments', Icon: IconKey },
+  { href: '/source-control', label: 'Source control', Icon: IconBranch },
   { href: '/import', label: 'Import', Icon: IconDownload },
   { href: '/onboarding', label: 'Add app', Icon: IconPlusSquare },
 ];

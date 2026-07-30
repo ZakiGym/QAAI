@@ -66,12 +66,24 @@ export function SecretsPanel({
     setError(null);
     setImportNote(null);
     try {
-      const { imported, skipped } = await api<{ imported: string[]; skipped: string[] }>(
-        `${base}/import`,
-        { method: 'POST', body: JSON.stringify({ content: envText, overwrite: true }) },
-      );
+      const { imported, skipped, rejected } = await api<{
+        imported: string[];
+        skipped: string[];
+        rejected: number;
+      }>(`${base}/import`, {
+        method: 'POST',
+        body: JSON.stringify({ content: envText, overwrite: true }),
+      });
+      // Only already-known names are ever named back; anything else is a count,
+      // because a rejected "name" can be a fragment of the pasted secret itself.
       setImportNote(
-        `Imported ${imported.length}${skipped.length ? ` · skipped ${skipped.length} (${skipped.join(', ')})` : ''}`,
+        [
+          `Imported ${imported.length}`,
+          skipped.length ? `kept ${skipped.length} existing (${skipped.join(', ')})` : '',
+          rejected ? `${rejected} line(s) ignored — names must be SCREAMING_SNAKE_CASE` : '',
+        ]
+          .filter(Boolean)
+          .join(' · '),
       );
       setEnvText('');
       await load();

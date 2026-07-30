@@ -37,9 +37,33 @@ const HOST: Record<GitIntegrationKind, string> = {
   BITBUCKET: 'bitbucket.org',
 };
 
-/** `owner/repo` → the provider's https clone URL. A full https URL passes through. */
+/**
+ * `owner/repo` → the provider's https clone URL.
+ *
+ * A full https URL is allowed but its host is pinned to the provider. This is
+ * load-bearing security, not tidiness: isomorphic-git sends an unauthenticated
+ * `/info/refs` first and retries with `Authorization: Basic <user:PAT>` on a 401,
+ * so any host that answers 401 would be handed the plaintext token. Resolving the
+ * URL therefore has to fail *before* the token is ever decrypted.
+ */
 export function repoHttpsUrl(kind: GitIntegrationKind, repo: string): string {
-  if (/^https:\/\//.test(repo)) return repo.replace(/\.git$/, '') + '.git';
+  if (/^https:\/\//.test(repo)) {
+    let url: URL;
+    try {
+      url = new URL(repo);
+    } catch {
+      throw new Error('Not a valid repository URL');
+    }
+    if (url.hostname !== HOST[kind]) {
+      throw new Error(
+        `Refusing to push to ${url.hostname}: a ${kind} integration may only push to ${HOST[kind]}`,
+      );
+    }
+    if (url.username || url.password) {
+      throw new Error('Remove the credentials from the repository URL — the token is stored separately');
+    }
+    return `https://${url.host}${url.pathname.replace(/\.git$/, '')}.git`;
+  }
   return `https://${HOST[kind]}/${repo.replace(/\.git$/, '')}.git`;
 }
 
@@ -114,6 +138,18 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
       await git.add({ fs, dir, filepath: relPath });
     }
 
+    // Delete what QAAI no longer has. Without this the branch would accumulate
+    // remote-files ∪ tree, so a test deleted in QAAI would linger in the repo
+    // forever and keep running in the customer's CI.
+    if (basedOnRemote) {
+      const tracked = await git.listFiles({ fs, dir, ref: 'HEAD' }).catch(() => [] as string[]);
+      for (const relPath of tracked) {
+        if (tree.has(relPath)) continue;
+        await git.remove({ fs, dir, filepath: relPath });
+        await rm(safeJoin(dir, relPath), { force: true }).catch(() => {});
+      }
+    }
+
     const commitSha = await git.commit({
       fs,
       dir,
@@ -133,7 +169,6 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
       onAuth,
     });
 
-    void basedOnRemote;
     return { commitSha, branch: opts.branch, repoUrl: url, fileCount: tree.size };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});

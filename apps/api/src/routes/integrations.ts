@@ -132,12 +132,24 @@ integrationsRouter.patch('/:id', requireRole('ADMIN'), async (req, res) => {
     ...(config.keyVersion !== undefined ? { keyVersion: config.keyVersion } : {}),
   };
 
+  // Repointing the remote invalidates the stored token unless a new one is
+  // supplied in the same request. A token is granted for a destination, so
+  // silently carrying it to a different one is exactly the move an attacker
+  // would make to have it delivered somewhere they control.
+  const repoChanged = input.repo !== undefined && input.repo !== config.repo;
+
   if (input.token) {
     const sealed = sealToken(input.token, actor.orgId, current.id);
     nextConfig.keyVersion = sealed.keyVersion;
     await prisma.integration.update({
       where: { id: current.id },
       data: { configEnc: sealed.ciphertext },
+    });
+  } else if (repoChanged) {
+    delete nextConfig.keyVersion;
+    await prisma.integration.update({
+      where: { id: current.id },
+      data: { configEnc: null },
     });
   }
 
@@ -159,12 +171,20 @@ integrationsRouter.patch('/:id', requireRole('ADMIN'), async (req, res) => {
     },
   });
 
+  // The repo is recorded because a changed destination is the thing a reviewer
+  // most needs to see; the token itself never appears.
   await audit({
     actor,
     action: 'integration.update',
     targetType: 'Integration',
     targetId: row.id,
-    metadata: { rotatedToken: Boolean(input.token), enabled: row.enabled },
+    metadata: {
+      repo: nextConfig.repo,
+      repoChanged,
+      rotatedToken: Boolean(input.token),
+      tokenCleared: repoChanged && !input.token,
+      enabled: row.enabled,
+    },
   });
 
   res.json({ integration: present(row) });

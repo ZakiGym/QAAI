@@ -10,7 +10,7 @@
  *      brittle CSS, and anything low-confidence comes back as a review flag.
  */
 
-import { generatedTestSchema } from '@qaai/shared';
+import { FIXTURE_PREFIX, generatedTestSchema } from '@qaai/shared';
 import type { FlowMap, Language, PlanItem, UiFramework } from '@qaai/shared';
 import type { CallContext, LlmService } from './llm.js';
 
@@ -161,7 +161,17 @@ export async function generateTest(
 ): Promise<GeneratedTest> {
   const { item, flowMap, framework } = args;
   const rules = FRAMEWORK_RULES[framework] ?? PLAYWRIGHT_TS_RULES;
-  const suggestedPath = `${slugify(item.feature)}/${slugify(item.title)}.spec.ts`;
+
+  /**
+   * `fixtures/` is reserved for test data — anything under it is excluded from run
+   * selection. Features come from the crawl's first URL segment, so an app with a
+   * top-level `/fixtures` route (a league site, a lighting store) would otherwise
+   * put a real test somewhere it can never run.
+   */
+  const featureDir = slugify(item.feature);
+  const suggestedPath = `${
+    featureDir === FIXTURE_PREFIX.slice(0, -1) ? `${featureDir}-feature` : featureDir
+  }/${slugify(item.title)}.spec.ts`;
 
   const prompt = `TEST PLAN ITEM
   title:      ${item.title}

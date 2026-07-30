@@ -25,12 +25,20 @@ import { audit } from '../lib/audit.js';
 import { seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
-import { pushRepo } from '../lib/git.js';
+import { pushRepo, repoHttpsUrl } from '../lib/git.js';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
-import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
+import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
 
-/** SCREAMING_SNAKE_CASE, matching upsertSecretSchema — used to filter a pasted .env. */
-const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+/**
+ * SCREAMING_SNAKE_CASE, matching upsertSecretSchema — used to filter a pasted
+ * .env. The length cap matters as much as the shape: dotenv parses a stray line
+ * of a pasted private key as a KEY (base64 lines often end in `=`), and real
+ * env-var names are short while such fragments are long.
+ */
+const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]{0,79}$/;
+
+/** A value of `=` or similar punctuation is a mis-parsed line, not a credential. */
+const MEANINGLESS_VALUE_RE = /^[=\-+/\s]*$/;
 
 export const projectsRouter: Router = Router();
 
@@ -153,25 +161,36 @@ projectsRouter.post('/:projectId/environments', requireRole('MEMBER'), async (re
 
 // ─── Secrets (§1 vault) ──────────────────────────────────────────────────────
 
-/** Names and hints only. Plaintext leaves the vault for test execution, never for a client. */
-projectsRouter.get('/:projectId/environments/:environmentId/secrets', async (req, res) => {
-  const secrets = await prisma.secret.findMany({
-    where: { environmentId: String(req.params.environmentId) },
-    select: { id: true, name: true, hint: true, updatedAt: true },
-    orderBy: { name: 'asc' },
-  });
+/**
+ * Names and hints only. Plaintext leaves the vault for test execution, never for
+ * a client.
+ *
+ * MEMBER and up: the hint is the last four characters of a real credential, so it
+ * is a (small) disclosure and does not belong to a read-only VIEWER.
+ */
+projectsRouter.get(
+  '/:projectId/environments/:environmentId/secrets',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const secrets = await prisma.secret.findMany({
+      where: { environmentId: String(req.params.environmentId) },
+      select: { id: true, name: true, hint: true, updatedAt: true },
+      orderBy: { name: 'asc' },
+    });
 
-  res.json({
-    secrets: secrets.map((s) => ({
-      ...s,
-      value: s.hint ? `${SECRET_MASK}${s.hint}` : SECRET_MASK,
-    })),
-  });
-});
+    res.json({
+      secrets: secrets.map((s) => ({
+        ...s,
+        value: s.hint ? `${SECRET_MASK}${s.hint}` : SECRET_MASK,
+      })),
+    });
+  },
+);
 
 projectsRouter.put(
   '/:projectId/environments/:environmentId/secrets',
   requireRole('ADMIN'),
+  requireScope('secrets:write'),
   async (req, res) => {
     const actor = actorOf(req);
     const input = upsertSecretSchema.parse(req.body);
@@ -310,6 +329,7 @@ projectsRouter.delete(
 projectsRouter.delete(
   '/:projectId/environments/:environmentId/secrets/:secretId',
   requireRole('ADMIN'),
+  requireScope('secrets:write'),
   async (req, res) => {
     const actor = actorOf(req);
     const secret = await prisma.secret.findUnique({
@@ -343,6 +363,7 @@ projectsRouter.delete(
 projectsRouter.post(
   '/:projectId/environments/:environmentId/secrets/import',
   requireRole('ADMIN'),
+  requireScope('secrets:write'),
   async (req, res) => {
     const actor = actorOf(req);
     const input = importSecretsSchema.parse(req.body);
@@ -360,7 +381,19 @@ projectsRouter.post(
     if (entries.length === 0) throw badRequest('No KEY=VALUE lines found');
 
     const imported: string[] = [];
+    /**
+     * Names we can PROVE are safe to echo, because they already exist as secret
+     * names in this environment. Everything else is only counted.
+     *
+     * This matters more than it looks: dotenv parses a stray line of a pasted
+     * private key or base64 blob as a KEY (base64 often ends in `=`), so a
+     * rejected "name" can itself be secret material. No pattern reliably tells a
+     * key name from a base64 fragment, so the rule is to never echo an unproven
+     * one rather than to guess.
+     */
     const skipped: string[] = [];
+    /** Rejected because the name is not SCREAMING_SNAKE_CASE, or the value was empty/oversized. */
+    let rejected = 0;
 
     const existing = input.overwrite
       ? new Set<string>()
@@ -374,8 +407,13 @@ projectsRouter.post(
         );
 
     for (const [name, value] of entries) {
-      if (!SECRET_NAME_RE.test(name) || value.length === 0 || value.length > 8192) {
-        skipped.push(name);
+      if (
+        !SECRET_NAME_RE.test(name) ||
+        value.length === 0 ||
+        value.length > 8192 ||
+        MEANINGLESS_VALUE_RE.test(value)
+      ) {
+        rejected += 1;
         continue;
       }
       if (!input.overwrite && existing.has(name)) {
@@ -404,10 +442,12 @@ projectsRouter.post(
       action: 'secret.import',
       targetType: 'Environment',
       targetId: env.id,
-      metadata: { imported: imported.length, skipped: skipped.length },
+      metadata: { imported: imported.length, skipped: skipped.length, rejected },
     });
 
-    res.json({ imported, skipped });
+    // `skipped` holds only names that passed SCREAMING_SNAKE_CASE *and* already
+    // exist here — so echoing them discloses nothing. `rejected` is a bare count.
+    res.json({ imported, skipped, rejected });
   },
 );
 
@@ -616,8 +656,15 @@ projectsRouter.get('/:projectId/git/preview', async (req, res) => {
 /**
  * Download the repo as a zip. Needs no integration and no token: the
  * credential-free way to take your tests and push them yourself.
+ *
+ * MEMBER and up: this is a bulk export of every test in the project, so it is
+ * gated above a read-only VIEWER even though the individual tests are readable.
  */
-projectsRouter.get('/:projectId/git/export', async (req, res) => {
+projectsRouter.get(
+  '/:projectId/git/export',
+  requireRole('MEMBER'),
+  requireScope('tests:read'),
+  async (req, res) => {
   const projectId = String(req.params.projectId);
   const project = await prisma.project.findUnique({
     where: { id: projectId },
@@ -642,7 +689,11 @@ projectsRouter.get('/:projectId/git/export', async (req, res) => {
  * it is never logged, audited, or returned. Failures are reported with the
  * provider's message only after it has been checked for credential material.
  */
-projectsRouter.post('/:projectId/git/push', requireRole('ADMIN'), async (req, res) => {
+projectsRouter.post(
+  '/:projectId/git/push',
+  requireRole('ADMIN'),
+  requireScope('git:push'),
+  async (req, res) => {
   const actor = actorOf(req);
   const input = gitPushSchema.parse(req.body);
   const projectId = String(req.params.projectId);
@@ -667,6 +718,15 @@ projectsRouter.post('/:projectId/git/push', requireRole('ADMIN'), async (req, re
   if (!config.repo) throw badRequest('That integration has no repository configured');
 
   const branch = input.branch ?? config.defaultBranch;
+
+  // Resolve (and host-pin) the destination BEFORE decrypting the token, so a
+  // repointed remote can never cause the PAT to be produced at all.
+  try {
+    repoHttpsUrl(integration.kind as GitIntegrationKind, config.repo);
+  } catch (err) {
+    throw badRequest(err instanceof Error ? err.message : 'Invalid repository');
+  }
+
   const token = openToken(
     integration.configEnc,
     config.keyVersion ?? 1,

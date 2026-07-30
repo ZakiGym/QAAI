@@ -129,13 +129,16 @@ export default function EditorPage() {
     setStatus(null);
     try {
       const isSpec = SPEC_DRIVEN.has(openTest.type);
-      // A spec-driven test stores JSON; refuse to save something unparseable
-      // rather than let the runner discover it at execution time.
-      if (isSpec) {
+      // Anything stored as JSON — a spec-driven test's config, or a .json
+      // fixture — is parsed before saving. Catching it here beats letting a test
+      // discover the syntax error mid-run, when the failure looks like a bug.
+      if (isSpec || openTest.filePath.endsWith('.json')) {
         try {
           JSON.parse(draft);
-        } catch {
-          setStatus('Not valid JSON — fix it before saving');
+        } catch (err) {
+          setStatus(
+            `Not valid JSON — ${err instanceof Error ? err.message : 'fix it before saving'}`,
+          );
           return;
         }
       }

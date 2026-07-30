@@ -47,11 +47,21 @@ function withSpecExt(path: string): string {
   return /\.(spec|test)\.[cm]?[jt]sx?$/.test(path) ? path : `${path}.spec.ts`;
 }
 
-/** Ensure two tests never collide on one path: `a.spec.ts` → `a-2.spec.ts`. */
+/**
+ * Ensure two tests never collide on one path: `a.spec.ts` → `a-2.spec.ts`.
+ *
+ * The compound suffix has to be treated as one unit. `extname` only sees the
+ * last dot, so splitting on it would yield `a.spec-2.ts` — which no longer
+ * matches Playwright's `*.spec.ts` collection pattern, silently dropping the
+ * de-duplicated test from the exported repo.
+ */
 function uniquePath(tree: RepoTree, path: string): string {
   if (!tree.has(path)) return path;
-  const ext = extname(path);
+
+  const compound = /(\.(?:spec|test)\.[cm]?[jt]sx?)$/.exec(path);
+  const ext = compound ? compound[1]! : extname(path);
   const stem = ext ? path.slice(0, -ext.length) : path;
+
   for (let n = 2; n < 1000; n++) {
     const candidate = `${stem}-${n}${ext}`;
     if (!tree.has(candidate)) return candidate;

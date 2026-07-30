@@ -86,6 +86,19 @@ export function IconPlusSquare(props: IconProps) {
   );
 }
 
+/** Source control — a git branch. */
+export function IconBranch(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="6" cy="5" r="2.5" />
+      <circle cx="6" cy="19" r="2.5" />
+      <circle cx="18" cy="8" r="2.5" />
+      <path d="M6 7.5v9" />
+      <path d="M18 10.5c0 4-4 3.5-6 5.5" />
+    </Svg>
+  );
+}
+
 /** Environments / secrets — a key. */
 export function IconKey(props: IconProps) {
   return (

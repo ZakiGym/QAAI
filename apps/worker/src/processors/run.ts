@@ -61,7 +61,14 @@ export async function processRun(job: RunJob): Promise<void> {
   // Test data lives as Test rows under `fixtures/`; every workspace gets a copy
   // so a spec can read its data off disk. Loaded once per run, not per test.
   const fixtureRows = await prisma.test.findMany({
-    where: { orgId, projectId: run.projectId, filePath: { startsWith: FIXTURE_PREFIX } },
+    where: {
+      orgId,
+      projectId: run.projectId,
+      // Matches the export's filter, so the workspace and a pushed repo can never
+      // disagree about which fixtures exist.
+      disabledAt: null,
+      filePath: { startsWith: FIXTURE_PREFIX },
+    },
     select: { filePath: true, code: true, spec: true },
   });
   const fixtures = Object.fromEntries(

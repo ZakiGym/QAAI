@@ -20,6 +20,7 @@
 import { z } from 'zod';
 import { defineTool } from '@qaai/agent';
 import type { AgentTool } from '@qaai/agent';
+import { FIXTURE_PREFIX } from '@qaai/shared';
 import type { FlowMap } from '@qaai/shared';
 import { logger, prisma } from './context.js';
 import { enqueueRun } from './queues.js';
@@ -55,6 +56,8 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
           orgId: ctx.orgId,
           projectId: ctx.projectId,
           disabledAt: null,
+          // Fixtures are test data; listing them as tests would mislead the agent.
+          filePath: { not: { startsWith: FIXTURE_PREFIX } },
           ...(feature ? { feature } : {}),
         },
         orderBy: [{ feature: 'asc' }, { name: 'asc' }],
@@ -207,15 +210,21 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
       });
       if (!environment) return { error: 'This project has no environment configured' };
 
-      const ids =
-        testIds && testIds.length > 0
-          ? testIds
-          : (
-              await prisma.test.findMany({
-                where: { orgId: ctx.orgId, projectId: ctx.projectId, disabledAt: null },
-                select: { id: true },
-              })
-            ).map((t) => t.id);
+      // Resolved through the DB even when ids are supplied, so rows under
+      // `fixtures/` (test data, with no runnable code) can never be queued and
+      // then reported as failures. Mirrors the guard in POST /runs — the copilot
+      // creates the Run directly and would otherwise bypass it.
+      const runnable = await prisma.test.findMany({
+        where: {
+          orgId: ctx.orgId,
+          projectId: ctx.projectId,
+          disabledAt: null,
+          filePath: { not: { startsWith: FIXTURE_PREFIX } },
+          ...(testIds && testIds.length > 0 ? { id: { in: testIds } } : {}),
+        },
+        select: { id: true },
+      });
+      const ids = runnable.map((t) => t.id);
 
       if (ids.length === 0) return { error: 'There are no tests to run' };
 
