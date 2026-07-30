@@ -13,6 +13,70 @@ import { SeverityLabel, StatusDot, VerdictChip, duration } from '../../../compon
  * timeline — the scrubber. Right: the evidence for the selected step, and the
  * Triage verdict card with its review actions.
  */
+/**
+ * Turning a stream event into a line a person can read.
+ *
+ * This pane used to render `step {"testId":"cms6vrt5i0003…","index":1,…}` —
+ * the raw event payload, straight from the wire. It is the one part of the app
+ * a user watches while they wait, and it was showing them our internal schema.
+ *
+ * Returning null drops an event rather than printing a placeholder for it: an
+ * unnamed frame adds noise to the only surface where noise actually costs
+ * something, because the whole point is to glance at it and know what is
+ * happening.
+ */
+interface LiveLine {
+  text: string;
+  tone: string;
+}
+
+function describeEvent(label: string, data: Record<string, unknown>): LiveLine | null {
+  const str = (key: string): string | null =>
+    typeof data[key] === 'string' ? (data[key] as string) : null;
+  const num = (key: string): number | null =>
+    typeof data[key] === 'number' ? (data[key] as number) : null;
+
+  switch (label) {
+    case 'test.started': {
+      const name = str('name');
+      return name ? { text: `Running ${name}`, tone: 'bg-accent' } : null;
+    }
+    case 'test.finished': {
+      const name = str('name');
+      const status = str('status');
+      if (!name || !status) return null;
+      const ms = num('durationMs');
+      const took = ms === null ? '' : ms >= 1000 ? ` · ${(ms / 1000).toFixed(1)}s` : ` · ${ms}ms`;
+      const passed = status === 'PASSED';
+      return {
+        text: `${passed ? 'Passed' : status === 'SKIPPED' ? 'Skipped' : 'Failed'}: ${name}${took}`,
+        tone: passed ? 'bg-pass' : status === 'SKIPPED' ? 'bg-skip' : 'bg-fail',
+      };
+    }
+    case 'step': {
+      // Step titles are what the test actually did — "Click Add to cart" — and
+      // are the most useful thing in the stream.
+      const title = str('title');
+      if (!title) return null;
+      const status = str('status');
+      return {
+        text: title,
+        tone: status === 'FAILED' ? 'bg-fail' : status === 'PASSED' ? 'bg-pass' : 'bg-skip',
+      };
+    }
+    case 'verdict': {
+      const verdict = str('verdict');
+      return verdict
+        ? { text: `Triaged as ${verdict.toLowerCase().replace(/_/g, ' ')}`, tone: 'bg-flake' }
+        : null;
+    }
+    case 'run.finished':
+      return { text: 'Run finished', tone: 'bg-accent' };
+    default:
+      return null;
+  }
+}
+
 export default function CockpitPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = use(params);
 
@@ -20,7 +84,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const [run, setRun] = useState<Run | null>(null);
   const [selectedTestId, setSelectedTestId] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
-  const [live, setLive] = useState<string[]>([]);
+  const [live, setLive] = useState<LiveLine[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [rerunning, setRerunning] = useState(false);
 
@@ -85,7 +149,8 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
     const record = (label: string) => (event: MessageEvent) => {
       try {
         const parsed = JSON.parse(event.data) as { data: Record<string, unknown> };
-        setLive((prev) => [`${label} ${JSON.stringify(parsed.data)}`, ...prev].slice(0, 60));
+        const line = describeEvent(label, parsed.data);
+        if (line) setLive((prev) => [line, ...prev].slice(0, 60));
       } catch {
         /* a malformed frame is not worth surfacing */
       }
@@ -330,13 +395,22 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
 
           {live.length > 0 && (
             <div className="mt-6">
-              <h3 className="text-ink-dim mb-2 text-xs font-semibold tracking-wider uppercase">
+              <h3 className="text-ink-dim mb-2 flex items-center gap-2 text-xs font-semibold tracking-wider uppercase">
+                <span className="bg-accent inline-block h-1.5 w-1.5 animate-pulse rounded-full" />
                 Live
               </h3>
-              <ul className="text-ink-faint space-y-0.5 font-mono text-meta">
+              {/* Newest first, so the thing that just happened is where the eye
+                  already is — this list is watched, not scrolled. */}
+              <ul className="space-y-1" aria-live="polite">
                 {live.map((line, i) => (
-                  <li key={i} className="truncate">
-                    {line}
+                  <li
+                    key={`${line.text}-${i}`}
+                    className={`text-micro flex items-baseline gap-2 ${
+                      i === 0 ? 'text-ink-dim' : 'text-ink-faint'
+                    }`}
+                  >
+                    <span className={`mt-1 h-1 w-1 shrink-0 rounded-full ${line.tone}`} />
+                    <span className="min-w-0 flex-1 truncate">{line.text}</span>
                   </li>
                 ))}
               </ul>
