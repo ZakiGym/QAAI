@@ -9,6 +9,7 @@ import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
 import { FileTree } from '../../components/FileTree';
 import { InlineEdit } from '../../components/InlineEdit';
+import { VersionHistory } from '../../components/VersionHistory';
 import type { LocatorSuggestion } from '../../components/CodeEditor';
 import { FIXTURE_PREFIX } from '../../lib/tree';
 import { StatusDot, duration } from '../../components/ui';
@@ -75,9 +76,50 @@ export default function EditorPage() {
 
   const [project, setProject] = useState<Project | null>(null);
   const [tests, setTests] = useState<TestSummary[]>([]);
-  const [openTest, setOpenTest] = useState<FullTest | null>(null);
-  const [draft, setDraft] = useState('');
-  const [dirty, setDirty] = useState(false);
+  /**
+   * One entry per open tab. `openTest`, `draft` and `dirty` below are derived
+   * from the active one, so everything downstream reads exactly as it did when
+   * only a single file could be open.
+   *
+   * Tabs are what remove the discard-confirm: switching files used to threaten
+   * your unsaved work, which made the editor feel hostile to actually editing.
+   */
+  const [tabs, setTabs] = useState<Array<{ test: FullTest; draft: string; dirty: boolean }>>([]);
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  const activeTab = tabs.find((t) => t.test.id === activeId) ?? null;
+  const openTest = activeTab?.test ?? null;
+  const draft = activeTab?.draft ?? '';
+  const dirty = activeTab?.dirty ?? false;
+
+  const patchActive = useCallback(
+    (patch: Partial<{ draft: string; dirty: boolean; test: FullTest }>) =>
+      setTabs((prev) =>
+        prev.map((t) => (t.test.id === activeId ? { ...t, ...patch } : t)),
+      ),
+    [activeId],
+  );
+  const setDraft = useCallback((value: string) => patchActive({ draft: value }), [patchActive]);
+  const setDirty = useCallback((value: boolean) => patchActive({ dirty: value }), [patchActive]);
+
+  /** Close a tab, warning once if it holds unsaved work. */
+  const closeTab = useCallback(
+    (testId: string) => {
+      const tab = tabs.find((t) => t.test.id === testId);
+      if (tab?.dirty && !confirm(`${tab.test.filePath} has unsaved changes. Close it anyway?`)) {
+        return;
+      }
+      setTabs((prev) => {
+        const next = prev.filter((t) => t.test.id !== testId);
+        if (testId === activeId) {
+          const index = prev.findIndex((t) => t.test.id === testId);
+          setActiveId(next[Math.min(index, next.length - 1)]?.test.id ?? null);
+        }
+        return next;
+      });
+    },
+    [tabs, activeId],
+  );
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -89,6 +131,7 @@ export default function EditorPage() {
     endLine: number;
   } | null>(null);
   const [running, setRunning] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const editorRef = useRef<import('monaco-editor').editor.IStandaloneCodeEditor | null>(null);
 
   const loadTests = useCallback(async (projectId: string) => {
@@ -129,11 +172,18 @@ export default function EditorPage() {
   }, []);
 
   async function openFile(projectId: string, testId: string) {
-    if (dirty && !confirm('Discard unsaved changes?')) return;
+    // Already open? Just focus it — no fetch, and no unsaved work at risk.
+    if (tabs.some((t) => t.test.id === testId)) {
+      setActiveId(testId);
+      setStatus(null);
+      return;
+    }
     const { test } = await api<{ test: FullTest }>(`/projects/${projectId}/tests/${testId}`);
-    setOpenTest(test);
-    setDraft(SPEC_DRIVEN.has(test.type) ? JSON.stringify(test.spec ?? {}, null, 2) : test.code);
-    setDirty(false);
+    const initial = SPEC_DRIVEN.has(test.type)
+      ? JSON.stringify(test.spec ?? {}, null, 2)
+      : test.code;
+    setTabs((prev) => [...prev, { test, draft: initial, dirty: false }]);
+    setActiveId(test.id);
     setStatus(null);
   }
 
@@ -306,10 +356,9 @@ export default function EditorPage() {
     try {
       await fn();
       await loadTests(project.id);
-      if (closedTestId && openTest?.id === closedTestId) {
-        setOpenTest(null);
-        setDraft('');
-        setDirty(false);
+      if (closedTestId) {
+        setTabs((prev) => prev.filter((t) => t.test.id !== closedTestId));
+        setActiveId((cur) => (cur === closedTestId ? null : cur));
       }
       setStatus(label);
     } catch (err) {
@@ -358,6 +407,15 @@ export default function EditorPage() {
 
   return (
     <div className="flex h-full flex-col">
+      {historyOpen && openTest && project && (
+        <VersionHistory
+          projectId={project.id}
+          testId={openTest.id}
+          filePath={openTest.filePath}
+          currentCode={draft}
+          onClose={() => setHistoryOpen(false)}
+        />
+      )}
       <header className="border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
         <span className="text-ink-dim text-sm font-medium">Editor</span>
         {openTest && (
@@ -378,6 +436,15 @@ export default function EditorPage() {
               }
             }}
           />
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            disabled={!openTest}
+            title="Who changed this file, and what did they change"
+            className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs disabled:opacity-40"
+          >
+            History
+          </button>
           <button
             type="button"
             onClick={openInlineEdit}
@@ -461,7 +528,45 @@ export default function EditorPage() {
         </aside>
 
         {/* ── Monaco ──────────────────────────────────────────────────────── */}
-        <section className="relative min-h-0">
+        <section className="relative grid min-h-0 grid-rows-[auto_1fr]">
+          {/* Open files. Dirty tabs show a dot instead of the close ✕ until hovered,
+              the way VS Code does — so unsaved work is visible without being noisy. */}
+          {tabs.length > 0 && (
+            <div className="border-line flex min-w-0 shrink-0 overflow-x-auto border-b">
+              {tabs.map((tab) => {
+                const active = tab.test.id === activeId;
+                return (
+                  <div
+                    key={tab.test.id}
+                    className={`group border-line flex shrink-0 items-center gap-2 border-r px-3 py-1.5 text-[12px] ${
+                      active ? 'bg-surface text-ink' : 'text-ink-faint hover:bg-surface-1'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setActiveId(tab.test.id)}
+                      title={tab.test.filePath}
+                      className="max-w-44 truncate"
+                    >
+                      {tab.test.filePath.split('/').pop()}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => closeTab(tab.test.id)}
+                      aria-label={`Close ${tab.test.filePath}`}
+                      className="text-ink-faint hover:text-ink shrink-0 leading-none"
+                    >
+                      {tab.dirty ? (
+                        <span className="text-flake group-hover:hidden">●</span>
+                      ) : null}
+                      <span className={tab.dirty ? 'hidden group-hover:inline' : ''}>✕</span>
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="relative min-h-0">
           {openTest && inlineSelection && project && (
             <InlineEdit
               projectId={project.id}
@@ -498,6 +603,7 @@ export default function EditorPage() {
               Select a test, or press + to write a new one.
             </p>
           )}
+          </div>
         </section>
 
         {/* ── Agent + result ─────────────────────────────────────────────── */}

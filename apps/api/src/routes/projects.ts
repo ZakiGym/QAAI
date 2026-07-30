@@ -607,6 +607,25 @@ projectsRouter.get('/:projectId/tests/:testId/versions', async (req, res) => {
   res.json({ versions });
 });
 
+/** One version, WITH its code — the list omits code to stay small. */
+projectsRouter.get('/:projectId/tests/:testId/versions/:versionId', async (req, res) => {
+  const version = await prisma.testVersion.findUnique({
+    where: { id: String(req.params.versionId) },
+    select: {
+      id: true,
+      version: true,
+      source: true,
+      message: true,
+      authorId: true,
+      createdAt: true,
+      code: true,
+      testId: true,
+    },
+  });
+  if (!version || version.testId !== String(req.params.testId)) throw notFound('Version');
+  res.json({ version });
+});
+
 /**
  * Create a test by hand, with no plan item behind it (§8).
  *
