@@ -1,6 +1,10 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    // The API imports @qaai/agent (for suite-import detection), whose barrel
+    // includes the crawler; its page.evaluate() callbacks typecheck as browser
+    // code, so the DOM lib is needed even though the API runs on Node.
+    "lib": ["ES2023", "DOM"],
     "noEmit": true,
     "composite": false,
     "declaration": false,
