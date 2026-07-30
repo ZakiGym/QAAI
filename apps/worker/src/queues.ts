@@ -5,12 +5,13 @@
 
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '@qaai/shared';
-import type { GenerateJob, RunJob, TriageJob } from '@qaai/shared';
+import type { CopilotJob, GenerateJob, RunJob, TriageJob } from '@qaai/shared';
 import { connection } from './context.js';
 
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
 const triageQueue = new Queue(QUEUE_NAMES.triage, { connection });
+const copilotQueue = new Queue(QUEUE_NAMES.copilot, { connection });
 
 export async function enqueueGenerate(job: GenerateJob): Promise<void> {
   await generateQueue.add(QUEUE_NAMES.generate, job, { attempts: 2 });
@@ -29,6 +30,15 @@ export async function enqueueTriage(job: TriageJob): Promise<void> {
   });
 }
 
+export async function enqueueCopilot(job: CopilotJob): Promise<void> {
+  await copilotQueue.add(QUEUE_NAMES.copilot, job, { attempts: 1 });
+}
+
 export async function closeProducers(): Promise<void> {
-  await Promise.all([generateQueue.close(), runQueue.close(), triageQueue.close()]);
+  await Promise.all([
+    generateQueue.close(),
+    runQueue.close(),
+    triageQueue.close(),
+    copilotQueue.close(),
+  ]);
 }

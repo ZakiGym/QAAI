@@ -22,6 +22,7 @@ import { authRouter } from './routes/auth.js';
 import { projectsRouter } from './routes/projects.js';
 import { agentRouter } from './routes/agent.js';
 import { runsRouter } from './routes/runs.js';
+import { copilotRouter } from './routes/copilot.js';
 
 const app = express();
 
@@ -97,6 +98,7 @@ app.get('/health/ready', async (_req, res) => {
 app.use('/auth', authRouter);
 app.use('/projects', projectsRouter);
 app.use('/runs', runsRouter);
+app.use('/copilot', copilotRouter);
 app.use('/', agentRouter);
 
 app.use(notFoundHandler);

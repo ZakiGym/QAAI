@@ -995,13 +995,57 @@ model ChatMessage {
   /// Tool calls the copilot made, so the UI can show its work (§3 "never a black box").
   toolCalls      Json?
   userId         String?
+  /// Set while the assistant turn is still being produced.
+  pending        Boolean  @default(false)
+  /// Populated when a turn fails, so the UI can say why instead of hanging.
+  error          String?
   createdAt      DateTime @default(now())
 
   conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user         User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  proposals    AgentProposal[]
 
   @@index([orgId])
   @@index([conversationId, createdAt])
+}
+
+enum ProposalState {
+  PENDING
+  APPLIED
+  REJECTED
+}
+
+/// A file change the copilot wants to make, held for human approval (§3).
+///
+/// The copilot never writes a test directly. It proposes, the person reads the
+/// diff, and only an explicit accept mutates anything — the same contract the
+/// Healer works under, for the same reason: an agent that silently edits your
+/// test suite is one that can silently stop testing something.
+model AgentProposal {
+  id             String        @id @default(cuid())
+  orgId          String
+  projectId      String
+  conversationId String
+  messageId      String?
+  /// Null when the proposal creates a new test rather than editing one.
+  testId         String?
+  filePath       String
+  /// Empty for a new file. Kept so the diff survives later edits to the test.
+  oldCode        String
+  newCode        String
+  /// Why the copilot wants this change, in its own words.
+  rationale      String
+  testName       String
+  testType       TestType      @default(E2E)
+  state          ProposalState @default(PENDING)
+  decidedBy      String?
+  decidedAt      DateTime?
+  createdAt      DateTime      @default(now())
+
+  message ChatMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, state])
+  @@index([conversationId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

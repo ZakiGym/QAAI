@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { CodeEditor } from '../../components/CodeEditor';
+import { AgentPanel } from '../../components/AgentPanel';
 import { StatusDot, duration } from '../../components/ui';
 
 /**
@@ -274,7 +275,7 @@ export default function EditorPage() {
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[260px_1fr_360px]">
+      <div className="grid min-h-0 flex-1 grid-cols-[240px_1fr_400px]">
         {/* ── File tree ───────────────────────────────────────────────────── */}
         <aside className="border-line min-h-0 overflow-y-auto border-r">
           <div className="border-line flex items-center justify-between border-b px-3 py-2">
@@ -340,69 +341,83 @@ export default function EditorPage() {
           )}
         </section>
 
-        {/* ── Result ──────────────────────────────────────────────────────── */}
-        <aside className="border-line min-h-0 overflow-y-auto border-l px-4 py-4">
-          {openTest?.reviewFlags.length ? (
-            <div className="border-flake/40 bg-flake/10 mb-4 rounded-md border p-3">
-              <p className="text-flake mb-1.5 text-[11px] font-semibold tracking-wider uppercase">
-                Generator flagged
-              </p>
-              <ul className="text-ink-dim space-y-1 text-xs">
-                {openTest.reviewFlags.map((flag, i) => (
-                  <li key={i}>{flag}</li>
-                ))}
-              </ul>
-              <p className="text-ink-faint mt-2 text-[11px]">Saving clears these.</p>
-            </div>
-          ) : null}
+        {/* ── Agent + result ─────────────────────────────────────────────── */}
+        <aside className="border-line grid min-h-0 grid-rows-[1fr_auto] border-l">
+          <div className="min-h-0">
+            <AgentPanel
+              projectId={project?.id ?? ''}
+              onApplied={() => {
+                if (project) {
+                  void loadTests(project.id);
+                  if (openTest) void openFile(project.id, openTest.id);
+                }
+              }}
+            />
+          </div>
 
-          {result ? (
-            <>
-              <div className="mb-3 flex items-center gap-2">
-                <StatusDot status={result.status} />
-                <span className="text-sm">{result.status}</span>
-                <span className="text-ink-faint ml-auto font-mono text-xs">
-                  {duration(result.durationMs)}
-                </span>
+          <div className="border-line max-h-[45%] overflow-y-auto border-t px-3 py-3">
+            {openTest?.reviewFlags.length ? (
+              <div className="border-flake/40 bg-flake/10 mb-4 rounded-md border p-3">
+                <p className="text-flake mb-1.5 text-[11px] font-semibold tracking-wider uppercase">
+                  Generator flagged
+                </p>
+                <ul className="text-ink-dim space-y-1 text-xs">
+                  {openTest.reviewFlags.map((flag, i) => (
+                    <li key={i}>{flag}</li>
+                  ))}
+                </ul>
+                <p className="text-ink-faint mt-2 text-[11px]">Saving clears these.</p>
               </div>
+            ) : null}
 
-              <ol className="space-y-1">
-                {result.steps.map((s) => (
-                  <li
-                    key={s.id}
-                    className={`flex items-center gap-2 rounded border px-2 py-1.5 text-xs ${
-                      s.status === 'FAILED' ? 'border-fail/40 bg-fail/5' : 'border-line'
-                    }`}
+            {result ? (
+              <>
+                <div className="mb-3 flex items-center gap-2">
+                  <StatusDot status={result.status} />
+                  <span className="text-sm">{result.status}</span>
+                  <span className="text-ink-faint ml-auto font-mono text-xs">
+                    {duration(result.durationMs)}
+                  </span>
+                </div>
+
+                <ol className="space-y-1">
+                  {result.steps.map((s) => (
+                    <li
+                      key={s.id}
+                      className={`flex items-center gap-2 rounded border px-2 py-1.5 text-xs ${
+                        s.status === 'FAILED' ? 'border-fail/40 bg-fail/5' : 'border-line'
+                      }`}
+                    >
+                      <StatusDot status={s.status} />
+                      <span className="flex-1 truncate">{s.title}</span>
+                      <span className="text-ink-faint font-mono text-[10px]">
+                        {duration(s.durationMs)}
+                      </span>
+                    </li>
+                  ))}
+                </ol>
+
+                {(result.errorMessage || result.steps.some((s) => s.errorMessage)) && (
+                  <pre className="border-fail/40 bg-fail/5 text-fail mt-3 overflow-x-auto rounded-md border p-2.5 font-mono text-[11px] whitespace-pre-wrap">
+                    {result.errorMessage ?? result.steps.find((s) => s.errorMessage)?.errorMessage}
+                  </pre>
+                )}
+
+                {lastRun && (
+                  <Link
+                    href={`/runs/${lastRun.id}`}
+                    className="text-accent mt-3 inline-block text-xs"
                   >
-                    <StatusDot status={s.status} />
-                    <span className="flex-1 truncate">{s.title}</span>
-                    <span className="text-ink-faint font-mono text-[10px]">
-                      {duration(s.durationMs)}
-                    </span>
-                  </li>
-                ))}
-              </ol>
-
-              {(result.errorMessage || result.steps.some((s) => s.errorMessage)) && (
-                <pre className="border-fail/40 bg-fail/5 text-fail mt-3 overflow-x-auto rounded-md border p-2.5 font-mono text-[11px] whitespace-pre-wrap">
-                  {result.errorMessage ?? result.steps.find((s) => s.errorMessage)?.errorMessage}
-                </pre>
-              )}
-
-              {lastRun && (
-                <Link
-                  href={`/runs/${lastRun.id}`}
-                  className="text-accent mt-3 inline-block text-xs"
-                >
-                  Open in cockpit →
-                </Link>
-              )}
-            </>
-          ) : (
-            <p className="text-ink-faint text-xs">
-              Press <span className="font-mono">⌘↵</span> to run this test. The result lands here.
-            </p>
-          )}
+                    Open in cockpit →
+                  </Link>
+                )}
+              </>
+            ) : (
+              <p className="text-ink-faint text-xs">
+                Press <span className="font-mono">⌘↵</span> to run this test. The result lands here.
+              </p>
+            )}
+          </div>
         </aside>
       </div>
     </div>

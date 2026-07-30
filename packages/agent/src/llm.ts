@@ -161,6 +161,59 @@ export interface StructuredOptions<T extends z.ZodType> extends CompleteOptions 
   schemaName: string;
 }
 
+// ─── Tool loop ───────────────────────────────────────────────────────────────
+
+/**
+ * A tool the copilot can call.
+ *
+ * `input` is a zod schema used twice: converted to JSON Schema for the API, and
+ * used to parse what comes back before `execute` sees it. The tool body
+ * therefore never handles a malformed argument.
+ */
+export interface AgentTool<T extends z.ZodType = z.ZodType> {
+  name: string;
+  /** The model picks tools from this text. Say *when* to use it, not just what it does. */
+  description: string;
+  input: T;
+  execute: (input: z.infer<T>) => Promise<unknown>;
+}
+
+/**
+ * Declares a tool with its input type inferred from the zod schema.
+ *
+ * Writing `const t: AgentTool = {...}` collapses the generic, so `execute`
+ * degrades to `(input: unknown)` and the body loses every field name. Passing
+ * through this function keeps inference at the definition site and widens only
+ * on the way out, where the loop does not care.
+ */
+export function defineTool<T extends z.ZodType>(tool: AgentTool<T>): AgentTool {
+  return tool as unknown as AgentTool;
+}
+
+export interface ToolLoopMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export type ToolLoopEvent =
+  | { type: 'text'; text: string }
+  | { type: 'tool_start'; id: string; name: string; input: unknown }
+  | { type: 'tool_end'; id: string; name: string; output: unknown; isError: boolean };
+
+export interface ToolCallRecord {
+  id: string;
+  name: string;
+  input: unknown;
+  output: unknown;
+  isError: boolean;
+}
+
+export interface ToolLoopResult {
+  text: string;
+  calls: ToolCallRecord[];
+  stoppedBecause: 'end_turn' | 'max_rounds';
+}
+
 export class LlmService {
   private readonly client: Anthropic;
 
@@ -228,6 +281,163 @@ export class LlmService {
       `${opts.schemaName} failed schema validation twice:\n${retried.issues}`,
       'SCHEMA',
     );
+  }
+
+  /**
+   * Agentic tool loop — the engine behind the copilot panel.
+   *
+   * Uses the API's native tool calling rather than asking the model to emit a
+   * command string we parse ourselves. That matters for three reasons: inputs
+   * arrive as validated JSON instead of something we regex, parallel tool calls
+   * work, and the model is actually trained on this shape.
+   *
+   * Every tool call is reported through `onEvent` before and after execution so
+   * the UI can show work in progress rather than a spinner. A tool that throws
+   * comes back as an error result the model can react to — a failed read should
+   * let it try a different file, not kill the turn.
+   */
+  async runToolLoop(
+    ctx: CallContext,
+    opts: {
+      system: string;
+      messages: ToolLoopMessage[];
+      tools: AgentTool[];
+      tier?: ModelTier;
+      effort?: Effort;
+      maxTokens?: number;
+      /** Hard stop on round trips. A loop that will not settle is a cost bug. */
+      maxRounds?: number;
+      onEvent?: (event: ToolLoopEvent) => void | Promise<void>;
+    },
+  ): Promise<ToolLoopResult> {
+    this.assertConfigured();
+
+    const model = this.modelFor(opts.tier ?? 'strong');
+    const maxRounds = opts.maxRounds ?? 12;
+    const secrets = ctx.secrets ?? [];
+    const emit = opts.onEvent ?? (() => {});
+
+    const toolDefs = opts.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: toStructuredSchema(tool.input) as Anthropic.Beta.BetaTool['input_schema'],
+    }));
+
+    const conversation: Anthropic.Beta.BetaMessageParam[] = opts.messages.map((message) => ({
+      role: message.role,
+      content: maskSecrets(message.content, secrets),
+    }));
+
+    const calls: ToolCallRecord[] = [];
+    let finalText = '';
+
+    for (let round = 0; round < maxRounds; round++) {
+      const startedAt = Date.now();
+
+      const response = await this.client.beta.messages.create({
+        model,
+        max_tokens: opts.maxTokens ?? 8000,
+        betas: ['server-side-fallback-2026-07-01'],
+        fallbacks: 'default',
+        output_config: { effort: opts.effort ?? 'medium' },
+        system: [
+          {
+            type: 'text',
+            text: maskSecrets(opts.system, secrets),
+            cache_control: { type: 'ephemeral' },
+          },
+        ],
+        tools: toolDefs,
+        messages: conversation,
+      });
+
+      const usage = this.accountFor(model, response.usage);
+      await this.sink({
+        ...usage,
+        orgId: ctx.orgId,
+        projectId: ctx.projectId,
+        agent: ctx.agent,
+        subjectId: ctx.subjectId ?? null,
+        durationMs: Date.now() - startedAt,
+        at: new Date().toISOString(),
+      });
+
+      if (response.stop_reason === 'refusal') {
+        throw new LlmError('The model declined this request', 'REFUSAL');
+      }
+
+      const text = response.content
+        .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === 'text')
+        .map((b) => b.text)
+        .join('');
+      if (text.trim()) {
+        finalText = text;
+        await emit({ type: 'text', text });
+      }
+
+      const toolUses = response.content.filter(
+        (b): b is Anthropic.Beta.BetaToolUseBlock => b.type === 'tool_use',
+      );
+
+      if (toolUses.length === 0) {
+        return { text: finalText, calls, stoppedBecause: 'end_turn' };
+      }
+
+      conversation.push({ role: 'assistant', content: response.content });
+
+      // Parallel tool calls must all come back in ONE user message; splitting
+      // them trains the model out of ever calling in parallel again.
+      const results: Anthropic.Beta.BetaToolResultBlockParam[] = [];
+
+      for (const use of toolUses) {
+        const tool = opts.tools.find((t) => t.name === use.name);
+        await emit({ type: 'tool_start', id: use.id, name: use.name, input: use.input });
+
+        if (!tool) {
+          results.push({
+            type: 'tool_result',
+            tool_use_id: use.id,
+            content: `No tool named "${use.name}" exists.`,
+            is_error: true,
+          });
+          continue;
+        }
+
+        let output: unknown;
+        let isError = false;
+        try {
+          const parsed = tool.input.parse(use.input);
+          output = await tool.execute(parsed as never);
+        } catch (err) {
+          isError = true;
+          output = { error: err instanceof Error ? err.message : String(err) };
+        }
+
+        const serialised = maskSecrets(
+          typeof output === 'string' ? output : JSON.stringify(output, null, 2),
+          secrets,
+        );
+
+        calls.push({ id: use.id, name: use.name, input: use.input, output, isError });
+        await emit({ type: 'tool_end', id: use.id, name: use.name, output, isError });
+
+        results.push({
+          type: 'tool_result',
+          tool_use_id: use.id,
+          // A huge tool result is mostly wasted context; truncation is visible
+          // to the model so it can narrow its next query rather than assume.
+          content:
+            serialised.length > 24_000
+              ? `${serialised.slice(0, 24_000)}\n…[truncated, ${serialised.length} chars total]`
+              : serialised,
+          is_error: isError,
+        });
+      }
+
+      conversation.push({ role: 'user', content: results });
+    }
+
+    return { text: finalText, calls, stoppedBecause: 'max_rounds' };
   }
 
   private validate<T extends z.ZodType>(

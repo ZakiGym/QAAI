@@ -8,7 +8,7 @@
  */
 
 import { Router } from 'express';
-import { QUEUE_NAMES, approvePlanSchema, chatMessageSchema } from '@qaai/shared';
+import { QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
@@ -259,53 +259,5 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
   });
 });
 
-// ─── Chat copilot (§3.5) ─────────────────────────────────────────────────────
-
-agentRouter.post('/chat', async (req, res) => {
-  const actor = actorOf(req);
-  const input = chatMessageSchema.parse(req.body);
-
-  const conversation = input.conversationId
-    ? await prisma.chatConversation.findUnique({ where: { id: input.conversationId } })
-    : await prisma.chatConversation.create({
-        data: {
-          orgId: actor.orgId,
-          projectId: input.projectId,
-          title: input.message.slice(0, 60),
-          createdBy: actor.userId,
-        },
-      });
-  if (!conversation) throw notFound('Conversation');
-
-  await prisma.chatMessage.create({
-    data: {
-      orgId: actor.orgId,
-      conversationId: conversation.id,
-      role: 'user',
-      content: input.message,
-      userId: actor.userId,
-    },
-  });
-
-  // The copilot itself runs in the worker so a slow tool loop cannot hold this
-  // connection; the cockpit polls the conversation for the reply.
-  const jobId = await enqueue(QUEUE_NAMES.notify, {
-    orgId: actor.orgId,
-    event: 'chat.message',
-    payload: {
-      conversationId: conversation.id,
-      projectId: input.projectId,
-      message: input.message,
-    },
-  });
-
-  res.status(202).json({ conversationId: conversation.id, jobId });
-});
-
-agentRouter.get('/chat/:conversationId', async (req, res) => {
-  const messages = await prisma.chatMessage.findMany({
-    where: { conversationId: String(req.params.conversationId) },
-    orderBy: { createdAt: 'asc' },
-  });
-  res.json({ messages });
-});
+// Chat lives in routes/copilot.ts — it outgrew this file the moment it
+// gained tools and an approval gate.

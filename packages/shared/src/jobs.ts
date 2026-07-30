@@ -40,6 +40,13 @@ export interface TriageJob {
   testResultId: string;
 }
 
+export interface CopilotJob {
+  orgId: string;
+  projectId: string;
+  conversationId: string;
+  userMessageId: string;
+}
+
 export interface NotifyJob {
   orgId: string;
   event: string;
@@ -57,6 +64,7 @@ export interface JobPayloads {
   'qaai.run': RunJob;
   'qaai.triage': TriageJob;
   'qaai.notify': NotifyJob;
+  'qaai.copilot': CopilotJob;
   'qaai.schedule': ScheduleTickJob;
 }
 
