@@ -125,5 +125,50 @@ export interface Project {
   _count: { tests: number; runs: number };
 }
 
+// ─── Environments, secrets, integrations, git ────────────────────────────────
+
+export interface Environment {
+  id: string;
+  name: string;
+  kind: 'LOCAL' | 'PREVIEW' | 'STAGING' | 'PRODUCTION';
+  baseUrl: string;
+  createdAt?: string;
+  _count?: { secrets: number };
+}
+
+/** The API never returns a plaintext value — only the name and a masked hint. */
+export interface Secret {
+  id: string;
+  name: string;
+  hint: string | null;
+  updatedAt: string;
+  value: string; // always the mask (••••••••+last4)
+}
+
+export interface Integration {
+  id: string;
+  kind: 'GITHUB' | 'GITLAB' | 'BITBUCKET';
+  name: string;
+  repo: string;
+  defaultBranch: string;
+  enabled: boolean;
+  /** True once a token is stored; the token itself is never returned. */
+  hasToken: boolean;
+  updatedAt: string;
+}
+
+export interface GitPreviewFile {
+  path: string;
+  bytes: number;
+}
+
+export interface GitPreview {
+  files: GitPreviewFile[];
+  totalFiles: number;
+  totalBytes: number;
+}
+
+export const gitExportUrl = (projectId: string) => `${API_URL}/projects/${projectId}/git/export`;
+
 export const artifactUrl = (runId: string, key: string) =>
   `${API_URL}/runs/${runId}/artifacts/${key.split('/').map(encodeURIComponent).join('/')}`;
