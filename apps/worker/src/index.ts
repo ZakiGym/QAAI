@@ -15,11 +15,12 @@ import type {
   GenerateJob,
   ImportJob,
   NotifyJob,
+  ScheduleTickJob,
   RunJob,
   TriageJob,
 } from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
-import { closeProducers } from './queues.js';
+import { armScheduleTick, closeProducers } from './queues.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
 import { processRun } from './processors/run.js';
@@ -27,6 +28,7 @@ import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
 import { processNotify } from './processors/notify.js';
+import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
 
 const workers: Worker[] = [];
@@ -79,6 +81,10 @@ register<CopilotJob>(QUEUE_NAMES.copilot, config.concurrency, processCopilot);
 // their own lane rather than queueing behind a long copilot turn.
 register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
 register<NotifyJob>(QUEUE_NAMES.notify, config.concurrency, processNotify);
+// One repeating sweep rather than a timer per schedule: timers drift, do not
+// survive a restart, and a scheduler that quietly stops is worse than none.
+register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, processScheduleTick);
+void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
 
 logger.info(

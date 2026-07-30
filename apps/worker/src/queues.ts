@@ -13,6 +13,7 @@ const runQueue = new Queue(QUEUE_NAMES.run, { connection });
 const triageQueue = new Queue(QUEUE_NAMES.triage, { connection });
 const copilotQueue = new Queue(QUEUE_NAMES.copilot, { connection });
 const notifyQueue = new Queue(QUEUE_NAMES.notify, { connection });
+const scheduleQueue = new Queue(QUEUE_NAMES.schedule, { connection });
 
 export async function enqueueGenerate(job: GenerateJob): Promise<void> {
   await generateQueue.add(QUEUE_NAMES.generate, job, { attempts: 2 });
@@ -41,6 +42,24 @@ export async function enqueueCopilot(job: CopilotJob): Promise<void> {
  */
 export async function enqueueNotify(job: NotifyJob): Promise<void> {
   await notifyQueue.add(QUEUE_NAMES.notify, job, { attempts: 3 });
+}
+
+/**
+ * Arm the scheduler sweep. A BullMQ repeatable job survives restarts and
+ * de-duplicates by key, so calling this on every boot is safe and means the
+ * sweep exists as long as a worker does.
+ */
+export async function armScheduleTick(): Promise<void> {
+  await scheduleQueue.add(
+    'tick',
+    { at: new Date().toISOString() },
+    {
+      repeat: { every: 60_000 },
+      jobId: 'qaai-schedule-tick',
+      removeOnComplete: 20,
+      removeOnFail: 20,
+    },
+  );
 }
 
 export async function closeProducers(): Promise<void> {

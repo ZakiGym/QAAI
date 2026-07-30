@@ -13,6 +13,8 @@ import {
   SECRET_MASK,
   createEnvironmentSchema,
   createProjectSchema,
+  createMonitorSchema,
+  createScheduleSchema,
   createTestSchema,
   gitPushSchema,
   deleteFolderSchema,
@@ -888,6 +890,199 @@ projectsRouter.put('/:projectId/gate-rules', requireRole('ADMIN'), async (req, r
   });
 
   res.json({ rules: updated.gateRules });
+});
+
+
+// ─── Schedules & monitors (§6) ───────────────────────────────────────────────
+
+/** Recurring runs and production monitors for a project. */
+projectsRouter.get('/:projectId/automation', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const [schedules, monitors, suites, environments] = await Promise.all([
+    prisma.schedule.findMany({
+      where: { projectId },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        cron: true,
+        timezone: true,
+        enabled: true,
+        lastRunAt: true,
+        nextRunAt: true,
+        suiteId: true,
+        environmentId: true,
+      },
+    }),
+    prisma.monitor.findMany({
+      where: { projectId },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        intervalMinutes: true,
+        enabled: true,
+        failureThreshold: true,
+        consecutiveFailures: true,
+        lastStatus: true,
+        lastCheckedAt: true,
+        suiteId: true,
+        environmentId: true,
+      },
+    }),
+    prisma.suite.findMany({ where: { projectId }, select: { id: true, name: true } }),
+    prisma.environment.findMany({
+      where: { projectId },
+      select: { id: true, name: true, kind: true },
+    }),
+  ]);
+  res.json({ schedules, monitors, suites, environments });
+});
+
+projectsRouter.post('/:projectId/schedules', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = createScheduleSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const schedule = await prisma.schedule.create({
+    data: {
+      orgId: actor.orgId,
+      projectId,
+      suiteId: input.suiteId,
+      environmentId: input.environmentId,
+      name: input.name,
+      cron: input.cron,
+      timezone: input.timezone,
+    },
+    select: { id: true, name: true, cron: true, enabled: true },
+  });
+
+  await audit({
+    actor,
+    action: 'schedule.create',
+    targetType: 'Schedule',
+    targetId: schedule.id,
+    metadata: { name: input.name, cron: input.cron },
+  });
+
+  res.status(201).json({ schedule });
+});
+
+projectsRouter.patch('/:projectId/schedules/:scheduleId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const enabled = req.body?.enabled;
+  const schedule = await prisma.schedule.findUnique({
+    where: { id: String(req.params.scheduleId) },
+    select: { id: true, projectId: true },
+  });
+  if (!schedule || schedule.projectId !== String(req.params.projectId)) throw notFound('Schedule');
+
+  const updated = await prisma.schedule.update({
+    where: { id: schedule.id },
+    data: { ...(typeof enabled === 'boolean' ? { enabled } : {}) },
+    select: { id: true, enabled: true },
+  });
+  await audit({
+    actor,
+    action: 'schedule.update',
+    targetType: 'Schedule',
+    targetId: schedule.id,
+    metadata: { enabled: updated.enabled },
+  });
+  res.json({ schedule: updated });
+});
+
+projectsRouter.delete('/:projectId/schedules/:scheduleId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const schedule = await prisma.schedule.findUnique({
+    where: { id: String(req.params.scheduleId) },
+    select: { id: true, projectId: true, name: true },
+  });
+  if (!schedule || schedule.projectId !== String(req.params.projectId)) throw notFound('Schedule');
+  await prisma.schedule.delete({ where: { id: schedule.id } });
+  await audit({
+    actor,
+    action: 'schedule.delete',
+    targetType: 'Schedule',
+    targetId: schedule.id,
+    metadata: { name: schedule.name },
+  });
+  res.json({ ok: true });
+});
+
+projectsRouter.post('/:projectId/monitors', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = createMonitorSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const monitor = await prisma.monitor.create({
+    data: {
+      orgId: actor.orgId,
+      projectId,
+      suiteId: input.suiteId,
+      environmentId: input.environmentId,
+      name: input.name,
+      intervalMinutes: input.intervalMinutes,
+      failureThreshold: input.failureThreshold,
+    },
+    select: { id: true, name: true, intervalMinutes: true, enabled: true },
+  });
+
+  await audit({
+    actor,
+    action: 'monitor.create',
+    targetType: 'Monitor',
+    targetId: monitor.id,
+    metadata: { name: input.name, intervalMinutes: input.intervalMinutes },
+  });
+
+  res.status(201).json({ monitor });
+});
+
+projectsRouter.patch('/:projectId/monitors/:monitorId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const enabled = req.body?.enabled;
+  const monitor = await prisma.monitor.findUnique({
+    where: { id: String(req.params.monitorId) },
+    select: { id: true, projectId: true },
+  });
+  if (!monitor || monitor.projectId !== String(req.params.projectId)) throw notFound('Monitor');
+
+  const updated = await prisma.monitor.update({
+    where: { id: monitor.id },
+    data: {
+      ...(typeof enabled === 'boolean' ? { enabled } : {}),
+      // Re-enabling clears the streak; otherwise it would page instantly.
+      ...(enabled === true ? { consecutiveFailures: 0 } : {}),
+    },
+    select: { id: true, enabled: true },
+  });
+  await audit({
+    actor,
+    action: 'monitor.update',
+    targetType: 'Monitor',
+    targetId: monitor.id,
+    metadata: { enabled: updated.enabled },
+  });
+  res.json({ monitor: updated });
+});
+
+projectsRouter.delete('/:projectId/monitors/:monitorId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const monitor = await prisma.monitor.findUnique({
+    where: { id: String(req.params.monitorId) },
+    select: { id: true, projectId: true, name: true },
+  });
+  if (!monitor || monitor.projectId !== String(req.params.projectId)) throw notFound('Monitor');
+  await prisma.monitor.delete({ where: { id: monitor.id } });
+  await audit({
+    actor,
+    action: 'monitor.delete',
+    targetType: 'Monitor',
+    targetId: monitor.id,
+    metadata: { name: monitor.name },
+  });
+  res.json({ ok: true });
 });
 
 // ─── Quality surfaces (§4, §5) ───────────────────────────────────────────────

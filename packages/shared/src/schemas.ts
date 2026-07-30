@@ -377,6 +377,32 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Schedules & monitors (§6) ───────────────────────────────────────────────
+
+/** Standard 5-field cron. Validated on the worker too, which disables a bad one. */
+const cronExpression = z
+  .string()
+  .min(9)
+  .max(120)
+  .regex(/^[\d*/,\-\s?LW#]+$/, 'not a cron expression');
+
+export const createScheduleSchema = z.object({
+  name: z.string().min(1).max(80),
+  suiteId: z.string().min(1),
+  environmentId: z.string().min(1),
+  cron: cronExpression,
+  timezone: z.string().min(1).max(64).default('UTC'),
+});
+
+export const createMonitorSchema = z.object({
+  name: z.string().min(1).max(80),
+  suiteId: z.string().min(1),
+  environmentId: z.string().min(1),
+  intervalMinutes: z.number().int().min(1).max(1440).default(15),
+  /** Consecutive failures before it pages — 1 makes every blip an alert. */
+  failureThreshold: z.number().int().min(1).max(10).default(2),
+});
+
 // ─── Quality gates (§5) ──────────────────────────────────────────────────────
 
 /**

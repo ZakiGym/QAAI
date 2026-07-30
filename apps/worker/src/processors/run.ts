@@ -29,6 +29,7 @@ import { artifactKey } from '@qaai/storage';
 import { logger, prisma, publishEvent, storage } from '../context.js';
 import { secretsFor } from '../vault.js';
 import { enqueueNotify, enqueueTriage } from '../queues.js';
+import { recordMonitorResult } from './schedule.js';
 
 /** Retention window per plan (§5); the sweeper deletes past this. */
 const RETENTION_DAYS: Record<string, number> = {
@@ -409,6 +410,14 @@ export async function processRun(job: RunJob): Promise<void> {
       errorMessage: runErrored,
     },
   });
+
+  // A monitor-triggered run updates its streak, and pages once the threshold
+  // is crossed rather than on every blip.
+  if (run.trigger === 'MONITOR') {
+    await recordMonitorResult(orgId, run.id, status).catch((err) =>
+      logger.warn({ err, runId: run.id }, 'could not record the monitor result'),
+    );
+  }
 
   // A PR-triggered run reports itself back to the pull request. Fire-and-forget:
   // a comment that fails to post must never fail the run that produced it.
