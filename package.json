@@ -2,7 +2,7 @@
   "name": "qaai",
   "private": true,
   "version": "0.1.0",
-  "description": "QAAI — the AI QA engineer",
+  "description": "QAAI \u2014 the AI QA engineer",
   "workspaces": [
     "packages/*",
     "apps/*"
@@ -23,7 +23,8 @@
     "dev:api": "npm run dev -w @qaai/api",
     "dev:worker": "npm run dev -w @qaai/worker",
     "dev:demo": "npm run dev -w @qaai/demo",
-    "dev:web": "npm run dev -w @qaai/web"
+    "dev:web": "npm run dev -w @qaai/web",
+    "postinstall": "prisma generate --schema apps/api/prisma/schema.prisma"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

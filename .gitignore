@@ -26,3 +26,6 @@ coverage/
 
 # Ephemeral Playwright workspaces created by the runner
 .qaai-runs/
+
+# Prisma client output — regenerate with: npm run db:generate -w @qaai/api
+apps/api/src/generated/
