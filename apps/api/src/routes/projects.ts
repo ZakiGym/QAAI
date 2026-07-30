@@ -11,6 +11,8 @@ import {
   QUEUE_NAMES,
   PLAN_LIMITS,
   SECRET_MASK,
+  authProfileConfigSchema,
+  authProfileSchema,
   createEnvironmentSchema,
   createProjectSchema,
   createMonitorSchema,
@@ -31,13 +33,14 @@ import {
 import type { FlowMap, GitIntegrationKind } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
-import { badRequest, conflict, notFound, planLimit } from '../lib/errors.js';
+import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
 import { enqueue } from '../lib/queues.js';
-import { seal } from '../lib/vault.js';
+import { open as openSecret, seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
 import { pushRepo, repoHttpsUrl } from '../lib/git.js';
+import { performCookieInjection, performFormLogin, performSsoToken } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
 
@@ -892,6 +895,217 @@ projectsRouter.put('/:projectId/gate-rules', requireRole('ADMIN'), async (req, r
   res.json({ rules: updated.gateRules });
 });
 
+
+
+// ─── Auth profiles (§2) ──────────────────────────────────────────────────────
+
+/**
+ * How QAAI signs in to your app. Config is stored plainly; every credential is
+ * a REFERENCE to a vault secret by name, so a profile can be read, edited and
+ * exported without ever exposing a password.
+ */
+projectsRouter.get('/:projectId/environments/:environmentId/auth-profiles', async (req, res) => {
+  const profiles = await prisma.authProfile.findMany({
+    where: { environmentId: String(req.params.environmentId) },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      name: true,
+      kind: true,
+      config: true,
+      storageStateExpiresAt: true,
+      // Never the storageState itself: it is a live session.
+      updatedAt: true,
+    },
+  });
+
+  res.json({
+    profiles: profiles.map((p) => ({
+      ...p,
+      signedIn:
+        p.storageStateExpiresAt !== null && p.storageStateExpiresAt > new Date(),
+    })),
+  });
+});
+
+projectsRouter.post(
+  '/:projectId/environments/:environmentId/auth-profiles',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const input = authProfileSchema.parse(req.body);
+    const environmentId = String(req.params.environmentId);
+
+    const environment = await prisma.environment.findUnique({
+      where: { id: environmentId },
+      select: { id: true, projectId: true },
+    });
+    if (!environment || environment.projectId !== String(req.params.projectId)) {
+      throw notFound('Environment');
+    }
+
+    // Validate the config against its kind, so a FORM_LOGIN missing its
+    // password selector fails here rather than halfway through a browser run.
+    const perKind = authProfileConfigSchema[input.kind];
+    const parsed = perKind.safeParse(input.config);
+    if (!parsed.success) {
+      throw badRequest(
+        `That ${input.kind} profile is incomplete: ${parsed.error.issues
+          .map((i) => `${i.path.join('.') || '(root)'} ${i.message}`)
+          .join('; ')}`,
+      );
+    }
+
+    const profile = await prisma.authProfile.create({
+      data: {
+        orgId: actor.orgId,
+        environmentId,
+        name: input.name,
+        kind: input.kind,
+        config: parsed.data as object,
+      },
+      select: { id: true, name: true, kind: true, config: true },
+    });
+
+    await audit({
+      actor,
+      action: 'auth-profile.create',
+      targetType: 'AuthProfile',
+      targetId: profile.id,
+      metadata: { name: input.name, kind: input.kind },
+    });
+
+    res.status(201).json({ profile });
+  },
+);
+
+projectsRouter.delete(
+  '/:projectId/environments/:environmentId/auth-profiles/:profileId',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const profile = await prisma.authProfile.findUnique({
+      where: { id: String(req.params.profileId) },
+      select: { id: true, environmentId: true, name: true },
+    });
+    if (!profile || profile.environmentId !== String(req.params.environmentId)) {
+      throw notFound('Auth profile');
+    }
+    await prisma.authProfile.delete({ where: { id: profile.id } });
+    await audit({
+      actor,
+      action: 'auth-profile.delete',
+      targetType: 'AuthProfile',
+      targetId: profile.id,
+      metadata: { name: profile.name },
+    });
+    res.json({ ok: true });
+  },
+);
+
+/**
+ * Actually sign in, and cache the session.
+ *
+ * This is the step that never existed: storageState was read by the crawler and
+ * every run, and produced by nothing, so a profile was configuration for
+ * something that never happened. Running it here also makes the profile
+ * verifiable — you find out the selector is wrong now, not during a nightly.
+ */
+projectsRouter.post(
+  '/:projectId/environments/:environmentId/auth-profiles/:profileId/sign-in',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+
+    const profile = await prisma.authProfile.findUnique({
+      where: { id: String(req.params.profileId) },
+      select: { id: true, environmentId: true, kind: true, config: true, name: true },
+    });
+    if (!profile || profile.environmentId !== String(req.params.environmentId)) {
+      throw notFound('Auth profile');
+    }
+
+    const environment = await prisma.environment.findUnique({
+      where: { id: profile.environmentId },
+      select: { id: true, baseUrl: true },
+    });
+    if (!environment) throw notFound('Environment');
+
+    // Decrypt only this environment's secrets, in memory, for this call.
+    const rows = await prisma.secret.findMany({
+      where: { environmentId: environment.id },
+      select: { name: true, valueEnc: true, keyVersion: true },
+    });
+    const secrets: Record<string, string> = {};
+    for (const row of rows) {
+      try {
+        secrets[row.name] = openSecret(row.valueEnc, row.keyVersion, actor.orgId, row.name);
+      } catch {
+        /* a secret sealed under a retired key is simply unavailable here */
+      }
+    }
+
+    /**
+     * Re-validated here rather than trusted: a profile may predate the
+     * per-kind validation, and driving a browser with a half-formed config
+     * fails in a way nobody can read.
+     */
+    const shape = authProfileConfigSchema[profile.kind];
+    const parsedConfig = shape.safeParse(profile.config);
+    if (!parsedConfig.success) {
+      throw unprocessable(
+        `This ${profile.kind} profile is incomplete: ${parsedConfig.error.issues
+          .map((i) => `${i.path.join('.') || '(root)'} ${i.message}`)
+          .join('; ')}`,
+      );
+    }
+
+    const result =
+      profile.kind === 'FORM_LOGIN'
+        ? await performFormLogin(
+            parsedConfig.data as Parameters<typeof performFormLogin>[0],
+            secrets,
+            environment.baseUrl,
+          )
+        : profile.kind === 'COOKIE_INJECTION'
+          ? performCookieInjection(
+              parsedConfig.data as Parameters<typeof performCookieInjection>[0],
+              secrets,
+            )
+          : profile.kind === 'SSO_BYPASS_TOKEN'
+            ? performSsoToken(
+                parsedConfig.data as Parameters<typeof performSsoToken>[0],
+                secrets,
+              )
+            : {
+                ok: false,
+                storageState: null,
+                message: `${profile.kind} needs the mail catcher / TOTP support that is not built yet — use FORM_LOGIN, COOKIE_INJECTION or SSO_BYPASS_TOKEN.`,
+                expiresAt: null,
+              };
+
+    if (result.ok) {
+      await prisma.authProfile.update({
+        where: { id: profile.id },
+        data: {
+          storageState: (result.storageState as object) ?? undefined,
+          storageStateExpiresAt: result.expiresAt,
+        },
+      });
+    }
+
+    // The message never contains a credential — see packages/runner/src/login.ts.
+    await audit({
+      actor,
+      action: result.ok ? 'auth-profile.sign-in' : 'auth-profile.sign-in.failed',
+      targetType: 'AuthProfile',
+      targetId: profile.id,
+      metadata: { name: profile.name, kind: profile.kind },
+    });
+
+    res.json({ ok: result.ok, message: result.message, expiresAt: result.expiresAt });
+  },
+);
 
 // ─── Schedules & monitors (§6) ───────────────────────────────────────────────
 
