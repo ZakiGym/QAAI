@@ -13,6 +13,8 @@ import { smokePlugin } from './plugins/smoke.js';
 import { apiPlugin } from './plugins/api.js';
 import { accessibilityPlugin } from './plugins/accessibility.js';
 import { securitySmokePlugin } from './plugins/security-smoke.js';
+import { loadPlugin } from './plugins/load.js';
+import { externalPlugin } from './plugins/external.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -20,6 +22,12 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   API: apiPlugin,
   ACCESSIBILITY: accessibilityPlugin,
   SECURITY_SMOKE: securitySmokePlugin,
+  LOAD: loadPlugin,
+  // Any runner QAAI does not implement natively — Vitest, Jest, Cypress, Newman,
+  // Pa11y, Maestro… — runs through the external-command plugin and reports via
+  // its own JUnit output. UNIT_GEN shares it for the same reason.
+  INTEGRATION: externalPlugin,
+  UNIT_GEN: { ...externalPlugin, type: 'UNIT_GEN' },
 };
 
 /**
@@ -28,10 +36,7 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
  * up as a mystery "unsupported type" at run time.
  */
 export const UNIMPLEMENTED_TYPES: Partial<Record<TestType, string>> = {
-  INTEGRATION: 'Multi-service assertions need the customer-provided DB/API hooks (§4)',
   VISUAL: 'Baseline capture and the ignore-region editor are not built yet (§4)',
-  LOAD: 'k6 script generation and the results graph are not built yet (§4)',
-  UNIT_GEN: 'Requires a connected repo to diff changed files (§4)',
   CROSS_BROWSER: 'Needs the Firefox/WebKit project matrix wired into the runner (§4)',
   LOCALIZATION: 'Needs per-locale run configuration (§4)',
   EMAIL_OTP: 'The demo SMTP catcher exists; the plugin that drives it does not (§4)',

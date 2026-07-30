@@ -331,6 +331,82 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Load testing — k6 (§4) ──────────────────────────────────────────────────
+
+/**
+ * A k6 load test.
+ *
+ * Either bring your own script, or describe the shape and let QAAI generate one.
+ * Thresholds are the assertions: a load test that reports "it ran" without
+ * saying what was acceptable is not a test, so a spec with no thresholds gets
+ * sensible defaults rather than silently always passing.
+ */
+/** The shape of the generated scenario, split out so its defaults are typed. */
+const loadScenarioSchema = z.object({
+  /** Path or absolute URL to hit. Relative resolves against the environment. */
+  path: z.string().min(1).default('/'),
+  method: z
+    .string()
+    .transform((m) => m.toUpperCase())
+    .pipe(z.string().regex(/^[A-Z]+$/))
+    .default('GET'),
+  headers: z.record(z.string(), z.string()).default({}),
+  body: z.string().optional(),
+  /** Virtual users held for `durationSeconds`. */
+  vus: z.number().int().min(1).max(10_000).default(10),
+  durationSeconds: z.number().int().min(1).max(3600).default(30),
+  /** Ramp to `vus` over this long; 0 means start at full load. */
+  rampUpSeconds: z.number().int().min(0).max(3600).default(0),
+});
+
+const loadThresholdsSchema = z.object({
+  /** Fail if the 95th-percentile response exceeds this. */
+  p95Ms: z.number().int().positive().default(800),
+  /** Fail above this share of failed requests, 0–1. */
+  errorRate: z.number().min(0).max(1).default(0.01),
+});
+
+export const loadTestSpecSchema = z.object({
+  /** A complete k6 script. When present, `scenario` is ignored. */
+  script: z.string().max(200_000).optional(),
+  scenario: loadScenarioSchema.default(loadScenarioSchema.parse({})),
+  thresholds: loadThresholdsSchema.default(loadThresholdsSchema.parse({})),
+});
+
+export type LoadTestSpec = z.infer<typeof loadTestSpecSchema>;
+
+// ─── External command tests (§4) ─────────────────────────────────────────────
+
+/** Report shapes QAAI can turn into per-test results. */
+export const EXTERNAL_REPORT_FORMATS = ['junit', 'json-summary', 'exit-code'] as const;
+export type ExternalReportFormat = (typeof EXTERNAL_REPORT_FORMATS)[number];
+
+/**
+ * Run any test tool that QAAI does not implement natively — Vitest, Jest, Mocha,
+ * Cypress, Newman, Pa11y, Lighthouse CI, Maestro, and so on.
+ *
+ * Rather than pretend to reimplement a dozen runners, QAAI executes the tool's
+ * own command in the workspace and reads the report it already emits. Nearly
+ * every runner can produce JUnit XML, which is why that is the default.
+ */
+export const externalTestSpecSchema = z.object({
+  /** The executable, e.g. `npx`. Never passed through a shell. */
+  command: z.string().min(1).max(200),
+  args: z.array(z.string().max(500)).max(64).default([]),
+  /** Extra env for the child. Secret VALUES are injected separately, by name. */
+  env: z.record(z.string(), z.string()).default({}),
+  /** Secret names to expose to the child process, resolved from the vault. */
+  secretNames: z.array(z.string().max(80)).max(50).default([]),
+  /** Where the tool writes its report, relative to the workspace. */
+  reportPath: z.string().max(300).default('report.xml'),
+  reportFormat: z.enum(EXTERNAL_REPORT_FORMATS).default('junit'),
+  timeoutSeconds: z.number().int().min(1).max(3600).default(600),
+  /** Working directory inside the workspace. */
+  cwd: z.string().max(300).default('.'),
+});
+
+export type ExternalTestSpec = z.infer<typeof externalTestSpecSchema>;
+
 // ─── Runs (§5) ───────────────────────────────────────────────────────────────
 
 export const createRunSchema = z.object({

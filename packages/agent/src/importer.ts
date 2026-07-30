@@ -41,6 +41,28 @@ export const SOURCE_FRAMEWORKS = [
   'POSTMAN',
   'KARATE',
   'GHERKIN',
+  'CODECEPTJS',
+  'VITEST',
+  'JEST',
+  'MOCHA',
+  'JASMINE',
+  'AVA',
+  'TAP',
+  'NODE_TEST',
+  'SUPERTEST',
+  'PACTUM',
+  'BRUNO',
+  'HURL',
+  'PACT',
+  'K6',
+  'APPIUM',
+  'MAESTRO',
+  'DETOX',
+  'ESPRESSO',
+  'XCUITEST',
+  'BACKSTOPJS',
+  'PA11Y',
+  'LIGHTHOUSE',
   'UNKNOWN',
 ] as const;
 export type SourceFramework = (typeof SOURCE_FRAMEWORKS)[number];
@@ -61,6 +83,28 @@ export const FRAMEWORK_LABELS: Record<SourceFramework, string> = {
   POSTMAN: 'Postman / Newman',
   KARATE: 'Karate',
   GHERKIN: 'Cucumber / Gherkin',
+  CODECEPTJS: 'CodeceptJS',
+  VITEST: 'Vitest',
+  JEST: 'Jest',
+  MOCHA: 'Mocha',
+  JASMINE: 'Jasmine',
+  AVA: 'AVA',
+  TAP: 'Tape / uvu (TAP)',
+  NODE_TEST: 'node:test / Bun / Deno',
+  SUPERTEST: 'Supertest',
+  PACTUM: 'PactumJS',
+  BRUNO: 'Bruno',
+  HURL: 'Hurl',
+  PACT: 'Pact (contract)',
+  K6: 'k6 (load)',
+  APPIUM: 'Appium',
+  MAESTRO: 'Maestro',
+  DETOX: 'Detox',
+  ESPRESSO: 'Espresso',
+  XCUITEST: 'XCUITest',
+  BACKSTOPJS: 'BackstopJS',
+  PA11Y: 'Pa11y',
+  LIGHTHOUSE: 'Lighthouse CI',
   UNKNOWN: 'Unknown',
 };
 
@@ -86,6 +130,88 @@ interface Rule {
  * import to Puppeteer; and so on.
  */
 const RULES: Rule[] = [
+  // ── Unit & component runners ──────────────────────────────────────────────
+  {
+    framework: 'VITEST',
+    filenames: [/vitest\.config\.[jt]s$/, /\.test\.[jt]sx?$/],
+    patterns: [/from\s+['"]vitest['"]/, /require\(['"]vitest['"]\)/, /\bvi\.(fn|mock|spyOn)\(/],
+    weight: 3,
+  },
+  {
+    framework: 'JEST',
+    filenames: [/jest\.config\.[cm]?[jt]s$/, /\.test\.[jt]sx?$/],
+    patterns: [/\bjest\.(fn|mock|spyOn|requireActual)\(/, /@jest\/globals/, /['"]ts-jest['"]/],
+    weight: 3,
+  },
+  {
+    framework: 'NODE_TEST',
+    patterns: [
+      /from\s+['"]node:test['"]/,
+      /require\(['"]node:test['"]\)/,
+      /from\s+['"]bun:test['"]/,
+      /\bDeno\.test\(/,
+    ],
+    weight: 3,
+  },
+  {
+    framework: 'MOCHA',
+    filenames: [/\.mocharc\.(json|ya?ml|[jc]s)$/],
+    patterns: [/require\(['"]mocha['"]\)/, /from\s+['"]mocha['"]/, /\bthis\.timeout\(/],
+    weight: 2,
+  },
+  {
+    framework: 'JASMINE',
+    filenames: [/jasmine\.json$/, /karma\.conf\.[jt]s$/],
+    patterns: [/\bjasmine\.\w+/, /\bbeforeAll\(.*done/, /require\(['"]karma['"]\)/],
+    weight: 2,
+  },
+  { framework: 'AVA', patterns: [/from\s+['"]ava['"]/, /require\(['"]ava['"]\)/, /\btest\(['"].*['"],\s*async\s*\(t\)/], weight: 2 },
+  {
+    framework: 'TAP',
+    patterns: [/require\(['"]tape['"]\)/, /from\s+['"]tape['"]/, /from\s+['"]uvu['"]/, /from\s+['"]uvu\/assert['"]/],
+    weight: 2,
+  },
+  // ── API & contract ────────────────────────────────────────────────────────
+  {
+    framework: 'SUPERTEST',
+    patterns: [/require\(['"]supertest['"]\)/, /from\s+['"]supertest['"]/, /\brequest\(app\)\s*\./],
+    weight: 3,
+  },
+  { framework: 'PACTUM', patterns: [/require\(['"]pactum['"]\)/, /from\s+['"]pactum['"]/, /\bspec\(\)\s*\.get\(/], weight: 3 },
+  { framework: 'BRUNO', filenames: [/\.bru$/, /bruno\.json$/], patterns: [/^\s*meta\s*\{/m, /^\s*(get|post|put|delete)\s*\{/m], weight: 4 },
+  { framework: 'HURL', filenames: [/\.hurl$/], patterns: [/^(GET|POST|PUT|DELETE|PATCH)\s+https?:\/\//m, /^HTTP\/?\d*\s+\d{3}/m], weight: 4 },
+  {
+    framework: 'PACT',
+    patterns: [/@pact-foundation/, /\bPact\s*\(/, /pactWith\(/, /willRespondWith/],
+    weight: 3,
+  },
+  // ── Load ──────────────────────────────────────────────────────────────────
+  {
+    framework: 'K6',
+    patterns: [/from\s+['"]k6\/http['"]/, /from\s+['"]k6['"]/, /export\s+const\s+options\s*=/, /\b__VU\b/, /\bhttp\.batch\(/],
+    weight: 4,
+  },
+  // ── Mobile ────────────────────────────────────────────────────────────────
+  { framework: 'MAESTRO', filenames: [/\.ya?ml$/], patterns: [/^appId:\s*\S+/m, /^\s*-\s*(launchApp|tapOn|assertVisible|inputText):/m], weight: 4 },
+  { framework: 'DETOX', filenames: [/\.detoxrc\.[jt]s(on)?$/], patterns: [/require\(['"]detox['"]\)/, /\bdevice\.launchApp\(/, /\belement\(by\./], weight: 3 },
+  {
+    framework: 'APPIUM',
+    patterns: [/appium/i, /desiredCapabilities/, /\bMobileBy\./, /appium:automationName/],
+    weight: 3,
+  },
+  { framework: 'ESPRESSO', filenames: [/\.java$/, /\.kt$/], patterns: [/androidx\.test\.espresso/, /\bonView\(/, /\bwithId\(/], weight: 3 },
+  { framework: 'XCUITEST', filenames: [/\.swift$/], patterns: [/import\s+XCTest/, /XCUIApplication\(/, /XCTAssert/], weight: 3 },
+  // ── Visual & accessibility ────────────────────────────────────────────────
+  { framework: 'BACKSTOPJS', filenames: [/backstop\.json$/], patterns: [/["']scenarios["']\s*:/, /backstopjs/i, /misMatchThreshold/], weight: 4 },
+  { framework: 'PA11Y', filenames: [/\.pa11yci(\.json)?$/, /pa11y\.json$/], patterns: [/require\(['"]pa11y['"]\)/, /pa11y-ci/, /["']standard["']\s*:\s*["']WCAG/], weight: 3 },
+  { framework: 'LIGHTHOUSE', filenames: [/lighthouserc\.(json|[jc]s|ya?ml)$/], patterns: [/@lhci\/cli/, /["']assertions["']\s*:/, /lighthouse:recommended/], weight: 3 },
+  // ── Other E2E ─────────────────────────────────────────────────────────────
+  {
+    framework: 'CODECEPTJS',
+    filenames: [/codecept\.conf\.[jt]s$/, /_test\.[jt]s$/],
+    patterns: [/\bFeature\(['"]/, /\bScenario\(['"]/, /\bI\.(amOnPage|click|see|fillField)\(/],
+    weight: 3,
+  },
   {
     framework: 'CYPRESS',
     filenames: [/\.cy\.[jt]sx?$/, /cypress\.config\.[jt]s$/, /cypress\/e2e\//],
