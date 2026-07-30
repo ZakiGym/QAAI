@@ -21,6 +21,44 @@
   --color-flake: #e3a723;
   --color-skip: #646c7a;
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+
+  /*
+   * Type scale. The cockpit is a dense, data-heavy UI, so the scale is tight
+   * and bottom-weighted — the three sizes below are all under 14px, because
+   * that is where a run list, a step tree and a diff actually live.
+   *
+   * These three replace the arbitrary `text-[11px]` / `text-[10px]` /
+   * `text-[13px]` values that were scattered across the app, drifting between
+   * 10, 11 and 12px for what was visually the same label.
+   */
+  --text-meta: 0.625rem; /* 10px — badges, kbd caps */
+  --text-meta--line-height: 1.4;
+  --text-micro: 0.6875rem; /* 11px — table meta, section eyebrows */
+  --text-micro--line-height: 1.45;
+  --text-body-sm: 0.8125rem; /* 13px — the workhorse: lists, forms, rows */
+  --text-body-sm--line-height: 1.5;
+
+  /*
+   * Radius. Four steps, deliberately far enough apart to be a decision rather
+   * than a coin flip — a radius scale goes wrong when it has six values nobody
+   * can tell apart.
+   */
+  --radius-sm: 0.25rem; /* inline: kbd, badges, chips */
+  --radius-md: 0.375rem; /* controls: buttons, inputs, rows */
+  --radius-lg: 0.5rem; /* containers: cards, panels */
+  --radius-xl: 0.75rem; /* overlays: dialogs, the palette */
+
+  /*
+   * Elevation. A dark UI cannot lean on shadow the way a light one does — a
+   * black shadow on a near-black surface is invisible. What actually reads as
+   * "raised" here is the shadow plus a lighter border, which is why the
+   * overlay level is paired with `--color-line-strong` wherever it is used.
+   */
+  --shadow-raised: 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-overlay: 0 16px 48px -12px rgb(0 0 0 / 0.65);
+
+  /* One easing for everything that moves. */
+  --ease-out-soft: cubic-bezier(0.2, 0, 0, 1);
 }
 
 html,
@@ -38,6 +76,38 @@ body {
   color: var(--color-ink);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/*
+ * Focus.
+ *
+ * Nearly every control in the app carries `outline-none`, which was added to
+ * kill the browser's default ring on click — and took keyboard focus with it,
+ * leaving anyone navigating by Tab with no idea where they are. `:focus-visible`
+ * fires only for keyboard focus, so this restores the ring for the people who
+ * need it without putting it back on mouse clicks. It is `!important` because
+ * it has to beat the utility.
+ *
+ * A 2px ring plus a 1px dark offset keeps it legible against both the page and
+ * the accent-coloured buttons it sometimes lands on.
+ */
+:focus-visible {
+  outline: 2px solid var(--color-accent) !important;
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+
+/* Reduced motion is a promise, not a preference: honour it globally rather than
+   per-component, where it always eventually gets forgotten. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Cards and interactive surfaces lift slightly on hover — the app should feel

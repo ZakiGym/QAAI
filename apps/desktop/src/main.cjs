@@ -108,7 +108,7 @@ function createSplash() {
     height: 220,
     frame: false,
     resizable: false,
-    backgroundColor: '#0e1013',
+    backgroundColor: '#0b0d11',
     show: true,
   });
 
@@ -116,7 +116,7 @@ function createSplash() {
     <style>
       body { margin:0; height:100vh; display:flex; flex-direction:column;
              align-items:center; justify-content:center; gap:10px;
-             background:#0e1013; color:#e8eaed;
+             background:#0b0d11; color:#e9ecf1;
              font:14px -apple-system, BlinkMacSystemFont, sans-serif; }
       h1 { margin:0; font-size:22px; letter-spacing:-0.02em; }
       p  { margin:0; color:#6b7480; font-size:12px; }
@@ -136,7 +136,7 @@ function createMainWindow() {
     height: 900,
     minWidth: 1100,
     minHeight: 700,
-    backgroundColor: '#0e1013',
+    backgroundColor: '#0b0d11',
     // macOS keeps its traffic lights over the page; the header reserves space
     // for them (see `.app-drag` in globals.css) and `trafficLightPosition`
     // centres them against a 44px header rather than the default 12px inset.

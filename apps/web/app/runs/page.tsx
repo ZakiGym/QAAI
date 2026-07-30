@@ -5,9 +5,12 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
+import { EmptyState } from '../../components/ui/EmptyState';
+import { useToast } from '../../components/ui/Toast';
 
 export default function RunsPage() {
   const router = useRouter();
+  const toast = useToast();
   const [projects, setProjects] = useState<Project[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -46,9 +49,15 @@ export default function RunsPage() {
         method: 'POST',
         body: JSON.stringify({ environmentId, trigger: 'MANUAL' }),
       });
+      toast.success('Run queued.', {
+        label: 'View it',
+        run: () => router.push(`/runs/${run.id}`),
+      });
       router.push(`/runs/${run.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not start the run');
+      const message = err instanceof Error ? err.message : 'Could not start the run';
+      setError(message);
+      toast.error(message);
     } finally {
       setStarting(false);
     }
@@ -100,13 +109,12 @@ export default function RunsPage() {
               </div>
             ))}
             {projects.length === 0 && (
-              <p className="text-ink-faint text-sm">
-                No projects yet.{' '}
-                <Link href="/onboarding" className="text-accent hover:underline">
-                  Add your app
-                </Link>
-                .
-              </p>
+              <EmptyState
+                title="No apps connected yet"
+                body="Point QAAI at a URL or a repo and it explores the app, writes the tests, and runs them. Nothing to install first."
+                action={{ label: 'Add your app', href: '/onboarding' }}
+                secondary={{ label: 'Import existing tests', href: '/onboarding?mode=import' }}
+              />
             )}
           </div>
         </section>
@@ -143,9 +151,17 @@ export default function RunsPage() {
               </Link>
             ))}
             {runs.length === 0 && (
-              <p className="text-ink-faint px-4 py-10 text-center text-sm">
-                No runs yet — run a project above.
-              </p>
+              <EmptyState
+                title="No runs yet"
+                body={
+                  projects.length === 0
+                    ? 'Once an app is connected, every run lands here with its failures triaged and its flakes flagged.'
+                    : 'Hit Run above to start one. Results stream in live — you do not have to wait on this page.'
+                }
+                {...(projects.length === 0
+                  ? { action: { label: 'Add your app', href: '/onboarding' } }
+                  : {})}
+              />
             )}
           </div>
         </section>

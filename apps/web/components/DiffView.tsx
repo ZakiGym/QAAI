@@ -24,10 +24,10 @@ function defineTheme(monaco: Monaco): void {
       { token: 'type', foreground: '4c8dff' },
     ],
     colors: {
-      'editor.background': '#0e1013',
-      'editor.foreground': '#e8eaed',
+      'editor.background': '#0b0d11',
+      'editor.foreground': '#e9ecf1',
       'editorLineNumber.foreground': '#3a4149',
-      'editorGutter.background': '#0e1013',
+      'editorGutter.background': '#0b0d11',
       // Muted diff tints: readable against near-black without shouting.
       'diffEditor.insertedTextBackground': '#3fb95022',
       'diffEditor.removedTextBackground': '#f8514922',
