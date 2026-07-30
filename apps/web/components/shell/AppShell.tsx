@@ -36,6 +36,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteMode, setPaletteMode] = useState<PaletteMode>('commands');
   const [files, setFiles] = useState<TestLite[]>([]);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   useEffect(() => {
     try {
@@ -121,6 +122,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       } else if (k === '\\') {
         e.preventDefault();
         toggle();
+      } else if (k === '/') {
+        // ⌘/ — the shortcuts themselves. Every frequent action here has a
+        // binding, and until now none of them were discoverable anywhere.
+        e.preventDefault();
+        setShortcutsOpen((open) => !open);
       }
     };
     // Capture so the palette wins even when focus is inside Monaco.
@@ -168,6 +174,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         group: 'View',
         run: openFiles,
       },
+      {
+        id: 'view:shortcuts',
+        label: 'Keyboard shortcuts',
+        detail: '⌘/',
+        group: 'View',
+        run: () => setShortcutsOpen(true),
+      },
     ];
   }, [paletteMode, files, collapsed, router, toggle, openFiles]);
 
@@ -190,6 +203,88 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         items={items}
         onClose={() => setPaletteOpen(false)}
       />
+      {shortcutsOpen && <ShortcutSheet onClose={() => setShortcutsOpen(false)} />}
+    </div>
+  );
+}
+
+/** Every binding in one place. Reached with ⌘/ or from the command palette. */
+function ShortcutSheet({ onClose }: { onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const GROUPS: Array<[string, Array<[string, string]>]> = [
+    [
+      'Anywhere',
+      [
+        ['⌘K', 'Command palette'],
+        ['⌘⇧P', 'Command palette (even in the editor)'],
+        ['⌘P', 'Go to file'],
+        ['⌘\\', 'Collapse the sidebar'],
+        ['⌘/', 'This sheet'],
+      ],
+    ],
+    [
+      'In the editor',
+      [
+        ['⌘K', 'Edit the selection in plain English'],
+        ['⌘S', 'Save'],
+        ['⌘↵', 'Run the open test'],
+        ['⌘F', 'Find in file'],
+        ['Right-click', 'Rename, duplicate or delete a file'],
+      ],
+    ],
+  ];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-8"
+      onMouseDown={onClose}
+      role="presentation"
+    >
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Keyboard shortcuts"
+        className="border-line bg-surface-1 w-full max-w-md overflow-hidden rounded-lg border shadow-2xl"
+      >
+        <div className="border-line flex items-baseline gap-2 border-b px-5 py-3">
+          <h2 className="text-sm font-medium">Keyboard shortcuts</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-ink-faint hover:text-ink ml-auto text-sm"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="space-y-5 px-5 py-4">
+          {GROUPS.map(([group, rows]) => (
+            <div key={group}>
+              <p className="text-ink-faint mb-2 text-[11px] font-semibold tracking-wider uppercase">
+                {group}
+              </p>
+              <dl className="space-y-1.5">
+                {rows.map(([keys, what]) => (
+                  <div key={keys + what} className="flex items-baseline gap-3">
+                    <dt className="border-line text-ink-dim w-24 shrink-0 rounded border px-1.5 py-0.5 text-center font-mono text-[11px]">
+                      {keys}
+                    </dt>
+                    <dd className="text-ink-dim text-[13px]">{what}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
