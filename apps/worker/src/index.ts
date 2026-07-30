@@ -14,6 +14,7 @@ import type {
   ExploreJob,
   GenerateJob,
   ImportJob,
+  NotifyJob,
   RunJob,
   TriageJob,
 } from '@qaai/shared';
@@ -25,6 +26,7 @@ import { processRun } from './processors/run.js';
 import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
+import { processNotify } from './processors/notify.js';
 import { processImport } from './processors/import.js';
 
 const workers: Worker[] = [];
@@ -76,6 +78,7 @@ register<CopilotJob>(QUEUE_NAMES.copilot, config.concurrency, processCopilot);
 // Inline edits are interactive — a user is staring at a spinner — so they get
 // their own lane rather than queueing behind a long copilot turn.
 register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
+register<NotifyJob>(QUEUE_NAMES.notify, config.concurrency, processNotify);
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
 
 logger.info(

@@ -27,6 +27,7 @@ import { settingsRouter } from './routes/settings.js';
 import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
+import { webhooksRouter } from './routes/webhooks.js';
 
 const app = express();
 
@@ -57,6 +58,9 @@ app.use(
   }),
 );
 
+// The GitHub webhook is HMAC-verified over the RAW body, so it must not be
+// JSON-parsed first. Mounted ahead of the global parser for that reason alone.
+app.use('/webhooks', express.raw({ type: 'application/json', limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -105,6 +109,7 @@ app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
 app.use('/settings', settingsRouter);
 app.use('/integrations', integrationsRouter);
+app.use('/webhooks', webhooksRouter);
 app.use('/', recordRouter);
 app.use('/', importRouter);
 app.use('/', agentRouter);
