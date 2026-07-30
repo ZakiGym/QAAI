@@ -8,6 +8,7 @@ import { z } from 'zod';
 import {
   AUTH_PROFILE_KINDS,
   ENVIRONMENT_KINDS,
+  GIT_INTEGRATION_KINDS,
   LANGUAGES,
   ORG_ROLES,
   PRIORITIES,
@@ -72,14 +73,37 @@ export const createEnvironmentSchema = z.object({
   baseUrl: httpUrl,
 });
 
+/** Rename / repoint an environment. Kind is immutable — LOCAL vs PRODUCTION is a
+ *  meaningful identity, not an editable label. */
+export const updateEnvironmentSchema = z
+  .object({
+    name: z.string().min(1).max(60).optional(),
+    baseUrl: httpUrl.optional(),
+  })
+  .refine((v) => v.name !== undefined || v.baseUrl !== undefined, 'nothing to update');
+
+/** SCREAMING_SNAKE_CASE, so a secret can be injected into a test process verbatim. */
+const secretName = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(/^[A-Z][A-Z0-9_]*$/, 'use SCREAMING_SNAKE_CASE');
+
 export const upsertSecretSchema = z.object({
-  /** Env-var style so it can be injected into test processes verbatim. */
-  name: z
-    .string()
-    .min(1)
-    .max(80)
-    .regex(/^[A-Z][A-Z0-9_]*$/, 'use SCREAMING_SNAKE_CASE'),
+  name: secretName,
   value: z.string().min(1).max(8192),
+});
+
+/**
+ * Bulk-import secrets from a pasted `.env` file. The raw text is parsed on the
+ * server (KEY=VALUE, `export` prefix and `#` comments tolerated, quotes
+ * stripped) so a whole environment's credentials land in the vault in one step.
+ * Parsed values never echo back — only the names that were imported.
+ */
+export const importSecretsSchema = z.object({
+  content: z.string().min(1).max(200_000),
+  /** Replace an existing secret of the same name (default) or skip it. */
+  overwrite: z.boolean().default(true),
 });
 
 export const authProfileSchema = z.object({
@@ -318,6 +342,58 @@ export const chatMessageSchema = z.object({
   projectId: z.string().min(1),
   conversationId: z.string().nullish(),
   message: z.string().min(1).max(8000),
+});
+
+// ─── Git integrations & push (§7) ────────────────────────────────────────────
+
+/** An `owner/repo` slug or a full https(s) git URL — never ssh, never a token in the URL. */
+const gitRepo = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine(
+    (r) => /^[\w.-]+\/[\w.-]+$/.test(r) || /^https:\/\/[^\s@]+$/.test(r),
+    'use owner/repo or an https:// URL',
+  );
+
+/** A git branch name — no spaces, no leading dash, no `..`, no path tricks. */
+const gitBranch = z
+  .string()
+  .min(1)
+  .max(120)
+  .regex(/^[^\s~^:?*[\\]+$/, 'invalid branch name')
+  .refine((b) => !b.includes('..') && !b.startsWith('-') && !b.startsWith('/'), 'invalid branch name');
+
+export const createIntegrationSchema = z.object({
+  kind: z.enum(GIT_INTEGRATION_KINDS),
+  name: z.string().min(1).max(80),
+  repo: gitRepo,
+  /** Personal access token. Write-only: sealed into the vault, never returned. */
+  token: z.string().min(1).max(4096),
+  defaultBranch: gitBranch.default('qaai/tests'),
+});
+
+export const updateIntegrationSchema = z
+  .object({
+    name: z.string().min(1).max(80).optional(),
+    repo: gitRepo.optional(),
+    defaultBranch: gitBranch.optional(),
+    enabled: z.boolean().optional(),
+    /** Rotate the token. Omit to keep the existing one. */
+    token: z.string().min(1).max(4096).optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, 'nothing to update');
+
+/**
+ * Push a project's materialised repo to a connected integration. `confirm` must
+ * be the literal `true`: a network write to the customer's own repo is never
+ * implicit, and a stray/replayed request without it is rejected.
+ */
+export const gitPushSchema = z.object({
+  integrationId: z.string().min(1),
+  branch: gitBranch.optional(),
+  message: z.string().min(1).max(500).optional(),
+  confirm: z.literal(true),
 });
 
 // ─── Pagination ──────────────────────────────────────────────────────────────

@@ -1,12 +1,14 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { CodeEditor } from '../../components/CodeEditor';
 import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
+import { FileTree } from '../../components/FileTree';
+import { FIXTURE_PREFIX } from '../../lib/tree';
 import { StatusDot, duration } from '../../components/ui';
 
 /**
@@ -49,6 +51,22 @@ test('describe what must be true', async ({ page }) => {
   });
 });
 `;
+
+const NEW_FIXTURE_TEMPLATE = `{
+  "example": "replace with your test data"
+}
+`;
+
+const slugify = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+/** Monaco language for a file — by content type for tests, by extension for fixtures. */
+function editorLanguage(test: { type: string; filePath: string }): string {
+  if (SPEC_DRIVEN.has(test.type)) return 'json';
+  if (test.filePath.endsWith('.json')) return 'json';
+  if (test.filePath.endsWith('.js')) return 'javascript';
+  if (test.filePath.endsWith('.csv') || test.filePath.endsWith('.txt')) return 'plaintext';
+  return 'typescript';
+}
 
 export default function EditorPage() {
   const router = useRouter();
@@ -141,6 +159,8 @@ export default function EditorPage() {
 
   const runThis = useCallback(async () => {
     if (!project || !openTest || running) return;
+    // Fixtures are data, not tests — ⌘↵ on one is a no-op.
+    if (openTest.filePath.startsWith(FIXTURE_PREFIX)) return;
     const environmentId = project.environments[0]?.id;
     if (!environmentId) {
       setStatus('This project has no environment to run against');
@@ -214,10 +234,21 @@ export default function EditorPage() {
     return () => window.removeEventListener('qaai:open-test', onOpen);
   }, []);
 
-  async function createTest() {
+  /**
+   * Create a new file inside a folder. A folder under `fixtures/` makes test
+   * DATA (a .json fixture); anywhere else makes a test spec. The folder defaults
+   * to `hand-written/` when adding from the root, so hand-authored tests still
+   * land somewhere sensible.
+   */
+  async function createInFolder(folderPath: string) {
     if (!project) return;
-    const name = prompt('Test name', 'New test');
+    const isFixture = folderPath === FIXTURE_PREFIX.slice(0, -1) || folderPath.startsWith(FIXTURE_PREFIX);
+    const name = prompt(isFixture ? 'Fixture name' : 'Test name', isFixture ? 'data' : 'New test');
     if (!name) return;
+
+    const dir = folderPath || (isFixture ? 'fixtures' : 'hand-written');
+    const slug = slugify(name) || (isFixture ? 'data' : 'test');
+    const filePath = isFixture ? `${dir}/${slug}.json` : `${dir}/${slug}.spec.ts`;
 
     try {
       const { test } = await api<{ test: FullTest }>(`/projects/${project.id}/tests`, {
@@ -225,30 +256,22 @@ export default function EditorPage() {
         body: JSON.stringify({
           name,
           type: 'E2E',
-          feature: 'Hand-written',
+          feature: isFixture ? 'Fixtures' : 'Hand-written',
           priority: 'IMPORTANT',
-          code: NEW_TEST_TEMPLATE,
-          filePath: `hand-written/${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.spec.ts`,
+          code: isFixture ? NEW_FIXTURE_TEMPLATE : NEW_TEST_TEMPLATE,
+          filePath,
           tags: [],
         }),
       });
       await loadTests(project.id);
       await openFile(project.id, test.id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not create the test');
+      setError(err instanceof Error ? err.message : 'Could not create the file');
     }
   }
 
-  const grouped = useMemo(() => {
-    const groups = new Map<string, TestSummary[]>();
-    for (const test of tests) {
-      const key = test.feature ?? 'Uncategorised';
-      groups.set(key, [...(groups.get(key) ?? []), test]);
-    }
-    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
-  }, [tests]);
-
   const result = lastRun?.results?.[0] ?? null;
+  const openIsFixture = openTest?.filePath.startsWith(FIXTURE_PREFIX) ?? false;
 
   if (error) {
     return (
@@ -294,7 +317,8 @@ export default function EditorPage() {
           <button
             type="button"
             onClick={() => void runThis()}
-            disabled={running || !openTest}
+            disabled={running || !openTest || openIsFixture}
+            title={openIsFixture ? 'Fixtures hold test data — there is nothing to run' : undefined}
             className="bg-accent rounded-md px-2.5 py-1 text-xs font-medium text-white disabled:opacity-40"
           >
             {running ? 'Running…' : 'Run'} <span className="opacity-70">⌘↵</span>
@@ -307,11 +331,11 @@ export default function EditorPage() {
         <aside className="border-line min-h-0 overflow-y-auto border-r">
           <div className="border-line flex items-center justify-between border-b px-3 py-2">
             <span className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
-              {project?.name ?? 'Tests'}
+              {project?.name ?? 'Files'}
             </span>
             <button
               type="button"
-              onClick={() => void createTest()}
+              onClick={() => void createInFolder('')}
               title="New test"
               className="text-ink-faint hover:text-ink px-1 text-sm"
             >
@@ -319,34 +343,16 @@ export default function EditorPage() {
             </button>
           </div>
 
-          {grouped.map(([feature, items]) => (
-            <div key={feature}>
-              <p className="text-ink-faint px-3 pt-3 pb-1 font-mono text-[10px] tracking-wider uppercase">
-                {feature}
-              </p>
-              {items.map((test) => (
-                <button
-                  key={test.id}
-                  type="button"
-                  onClick={() => project && void openFile(project.id, test.id)}
-                  className={`flex w-full items-center gap-2 px-3 py-1.5 text-left ${
-                    openTest?.id === test.id ? 'bg-surface-2' : 'hover:bg-surface-1'
-                  }`}
-                >
-                  <span className="min-w-0 flex-1 truncate text-[13px]">{test.name}</span>
-                  {test.reviewFlags.length > 0 && (
-                    <span
-                      className="text-flake text-[10px]"
-                      title="Generator flagged this for review"
-                    >
-                      ⚑
-                    </span>
-                  )}
-                  <span className="text-ink-faint font-mono text-[9px]">{test.type}</span>
-                </button>
-              ))}
-            </div>
-          ))}
+          {project && (
+            <FileTree
+              tests={tests}
+              projectId={project.id}
+              openTestId={openTest?.id ?? null}
+              dirtyTestId={dirty ? (openTest?.id ?? null) : null}
+              onOpen={(testId) => void openFile(project.id, testId)}
+              onAdd={(folderPath) => void createInFolder(folderPath)}
+            />
+          )}
         </aside>
 
         {/* ── Monaco ──────────────────────────────────────────────────────── */}
@@ -354,7 +360,7 @@ export default function EditorPage() {
           {openTest ? (
             <CodeEditor
               value={draft}
-              language={SPEC_DRIVEN.has(openTest.type) ? 'json' : 'typescript'}
+              language={editorLanguage(openTest)}
               onChange={(next) => {
                 setDraft(next);
                 setDirty(true);

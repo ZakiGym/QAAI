@@ -99,6 +99,17 @@ export const ROLE_RANK: Record<OrgRole, number> = {
 export const ENVIRONMENT_KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
 export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number];
 
+/** The git providers QAAI can push a materialised repo to (token-based). */
+export const GIT_INTEGRATION_KINDS = ['GITHUB', 'GITLAB', 'BITBUCKET'] as const;
+export type GitIntegrationKind = (typeof GIT_INTEGRATION_KINDS)[number];
+
+/**
+ * A test whose `filePath` starts with this is treated as test data, not a test:
+ * excluded from run selection and the flake radar, materialised into the run
+ * workspace so specs can read it. Reuses the Test row so no new model is needed.
+ */
+export const FIXTURE_PREFIX = 'fixtures/';
+
 export const AUTH_PROFILE_KINDS = [
   'FORM_LOGIN',
   'MAGIC_LINK',

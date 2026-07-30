@@ -3,21 +3,27 @@
  */
 
 import { Router } from 'express';
+import { parse as parseDotenv } from 'dotenv';
 import {
   PLAN_LIMITS,
   SECRET_MASK,
   createEnvironmentSchema,
   createProjectSchema,
   createTestSchema,
+  importSecretsSchema,
+  updateEnvironmentSchema,
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
-import { conflict, notFound, planLimit } from '../lib/errors.js';
+import { badRequest, conflict, notFound, planLimit } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
 import { seal } from '../lib/vault.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
+
+/** SCREAMING_SNAKE_CASE, matching upsertSecretSchema — used to filter a pasted .env. */
+const SECRET_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
 
 export const projectsRouter: Router = Router();
 
@@ -196,6 +202,205 @@ projectsRouter.put(
     });
 
     res.json({ secret: { ...secret, value: `${SECRET_MASK}${secret.hint ?? ''}` } });
+  },
+);
+
+/** List environments for a project (config only — secrets have their own route). */
+projectsRouter.get('/:projectId/environments', async (req, res) => {
+  const environments = await prisma.environment.findMany({
+    where: { projectId: String(req.params.projectId) },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      name: true,
+      kind: true,
+      baseUrl: true,
+      createdAt: true,
+      _count: { select: { secrets: true } },
+    },
+  });
+  res.json({ environments });
+});
+
+/** Rename or repoint an environment. Kind is immutable (see updateEnvironmentSchema). */
+projectsRouter.patch(
+  '/:projectId/environments/:environmentId',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const input = updateEnvironmentSchema.parse(req.body);
+
+    const environment = await prisma.environment.findUnique({
+      where: { id: String(req.params.environmentId) },
+      select: { id: true, projectId: true },
+    });
+    if (!environment || environment.projectId !== String(req.params.projectId)) {
+      throw notFound('Environment');
+    }
+
+    const updated = await prisma.environment.update({
+      where: { id: environment.id },
+      data: {
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        ...(input.baseUrl !== undefined ? { baseUrl: input.baseUrl } : {}),
+      },
+      select: { id: true, name: true, kind: true, baseUrl: true },
+    });
+
+    await audit({
+      actor,
+      action: 'environment.update',
+      targetType: 'Environment',
+      targetId: environment.id,
+      metadata: { name: updated.name, baseUrl: updated.baseUrl },
+    });
+
+    res.json({ environment: updated });
+  },
+);
+
+/**
+ * Delete an environment. Its secrets and auth profiles cascade (shredding the
+ * vault entries), but runs reference it with RESTRICT — so an environment with
+ * run history is refused rather than orphaning that history.
+ */
+projectsRouter.delete(
+  '/:projectId/environments/:environmentId',
+  requireRole('ADMIN'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const environment = await prisma.environment.findUnique({
+      where: { id: String(req.params.environmentId) },
+      select: { id: true, projectId: true, name: true },
+    });
+    if (!environment || environment.projectId !== String(req.params.projectId)) {
+      throw notFound('Environment');
+    }
+
+    const runCount = await prisma.run.count({ where: { environmentId: environment.id } });
+    if (runCount > 0) {
+      throw conflict(
+        `This environment has ${runCount} run(s) in its history and can't be deleted. ` +
+          `Remove its secrets individually instead.`,
+      );
+    }
+
+    await prisma.environment.delete({ where: { id: environment.id } });
+
+    await audit({
+      actor,
+      action: 'environment.delete',
+      targetType: 'Environment',
+      targetId: environment.id,
+      metadata: { name: environment.name },
+    });
+
+    res.json({ ok: true });
+  },
+);
+
+/** Remove a secret. Hard delete — the vault holds nothing recoverable anyway. */
+projectsRouter.delete(
+  '/:projectId/environments/:environmentId/secrets/:secretId',
+  requireRole('ADMIN'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const secret = await prisma.secret.findUnique({
+      where: { id: String(req.params.secretId) },
+      select: { id: true, name: true, environmentId: true },
+    });
+    if (!secret || secret.environmentId !== String(req.params.environmentId)) {
+      throw notFound('Secret');
+    }
+
+    await prisma.secret.delete({ where: { id: secret.id } });
+
+    await audit({
+      actor,
+      action: 'secret.delete',
+      targetType: 'Secret',
+      targetId: secret.id,
+      metadata: { name: secret.name, environmentId: secret.environmentId },
+    });
+
+    res.json({ ok: true });
+  },
+);
+
+/**
+ * Bulk-import a pasted `.env` file into the vault. Each valid KEY=VALUE line is
+ * sealed like a single upsert. Names that are not SCREAMING_SNAKE_CASE are
+ * reported back (by name only) rather than silently dropped; no value is ever
+ * echoed. `export ` prefixes and `#` comments are tolerated.
+ */
+projectsRouter.post(
+  '/:projectId/environments/:environmentId/secrets/import',
+  requireRole('ADMIN'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const input = importSecretsSchema.parse(req.body);
+
+    const env = await prisma.environment.findUnique({
+      where: { id: String(req.params.environmentId) },
+      select: { id: true, projectId: true },
+    });
+    if (!env || env.projectId !== String(req.params.projectId)) throw notFound('Environment');
+
+    // dotenv.parse handles quotes and comments; strip a leading `export ` first.
+    const normalized = input.content.replace(/^\s*export\s+/gm, '');
+    const parsed = parseDotenv(normalized);
+    const entries = Object.entries(parsed);
+    if (entries.length === 0) throw badRequest('No KEY=VALUE lines found');
+
+    const imported: string[] = [];
+    const skipped: string[] = [];
+
+    const existing = input.overwrite
+      ? new Set<string>()
+      : new Set(
+          (
+            await prisma.secret.findMany({
+              where: { environmentId: env.id },
+              select: { name: true },
+            })
+          ).map((s) => s.name),
+        );
+
+    for (const [name, value] of entries) {
+      if (!SECRET_NAME_RE.test(name) || value.length === 0 || value.length > 8192) {
+        skipped.push(name);
+        continue;
+      }
+      if (!input.overwrite && existing.has(name)) {
+        skipped.push(name);
+        continue;
+      }
+      const sealed = seal(value, actor.orgId, name);
+      await prisma.secret.upsert({
+        where: { environmentId_name: { environmentId: env.id, name } },
+        create: {
+          orgId: actor.orgId,
+          environmentId: env.id,
+          name,
+          valueEnc: sealed.ciphertext,
+          keyVersion: sealed.keyVersion,
+          hint: sealed.hint,
+          createdBy: actor.userId,
+        },
+        update: { valueEnc: sealed.ciphertext, keyVersion: sealed.keyVersion, hint: sealed.hint },
+      });
+      imported.push(name);
+    }
+
+    await audit({
+      actor,
+      action: 'secret.import',
+      targetType: 'Environment',
+      targetId: env.id,
+      metadata: { imported: imported.length, skipped: skipped.length },
+    });
+
+    res.json({ imported, skipped });
   },
 );
 
