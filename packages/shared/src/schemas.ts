@@ -331,6 +331,45 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Visual regression (§4) ──────────────────────────────────────────────────
+
+const ignoreRegionSchema = z.object({
+  x: z.number().min(0),
+  y: z.number().min(0),
+  width: z.number().positive(),
+  height: z.number().positive(),
+});
+
+const viewportSchema = z.object({
+  width: z.number().int().min(200).max(4000).default(1280),
+  height: z.number().int().min(200).max(4000).default(800),
+});
+
+/**
+ * A visual test. The two thresholds do different jobs and both matter:
+ * `pixelThreshold` is per-pixel colour tolerance (anti-aliasing, sub-pixel text),
+ * while `maxDiffRatio` is how much of the image may legitimately change before
+ * the test fails.
+ */
+export const visualTestSpecSchema = z.object({
+  /** Route or absolute URL to capture. */
+  path: z.string().min(1).default('/'),
+  /** Capture just this element instead of the page. */
+  selector: z.string().max(400).optional(),
+  fullPage: z.boolean().default(true),
+  viewport: viewportSchema.default(viewportSchema.parse({})),
+  /** Per-pixel colour tolerance, 0–1. 0.1 absorbs anti-aliasing without hiding real change. */
+  pixelThreshold: z.number().min(0).max(1).default(0.1),
+  /** Share of the image allowed to differ, 0–1. */
+  maxDiffRatio: z.number().min(0).max(1).default(0.002),
+  /** Extra wait after network idle, for late-settling UI. */
+  settleMs: z.number().int().min(0).max(30_000).default(250),
+  /** Rectangles excluded from the diff — clocks, avatars, ad slots. */
+  ignoreRegions: z.array(ignoreRegionSchema).max(50).default([]),
+});
+
+export type VisualTestSpec = z.infer<typeof visualTestSpecSchema>;
+
 // ─── Load testing — k6 (§4) ──────────────────────────────────────────────────
 
 /**

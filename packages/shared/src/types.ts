@@ -123,6 +123,12 @@ export interface TestExecution {
   retriedAndPassed: boolean;
   /** Findings that are first-class results rather than pass/fail (a11y, security). */
   findings: Finding[];
+  /**
+   * Set by the visual plugin when it captured a NEW baseline (first run for this
+   * test/viewport). The worker persists the VisualBaseline row; the plugin
+   * cannot, because the runner has no database access by design.
+   */
+  newBaseline?: { imageKey: string; viewport: string; browser: string } | null;
 }
 
 export interface Finding {
@@ -160,6 +166,14 @@ export interface RunContext {
    * secret-bearing and must never be logged or written into an exported repo.
    */
   grid?: { provider: string; wsEndpoint: string } | null;
+  /**
+   * The approved visual baseline for the test being executed, when one exists.
+   * Resolved by the worker so the plugin never touches the database.
+   */
+  visualBaseline?: {
+    imageKey: string;
+    ignoreRegions: Array<{ x: number; y: number; width: number; height: number }>;
+  } | null;
   /** Playwright storageState JSON from the auth profile, when one applies (§2). */
   storageState: unknown | null;
   /** Where the plugin writes screenshots/videos/traces. */
@@ -180,6 +194,17 @@ export interface ArtifactSink {
   /** Returns the storage key. */
   put(name: string, body: Buffer | Uint8Array, contentType: string): Promise<string>;
   putFile(name: string, absolutePath: string, contentType: string): Promise<string>;
+  /**
+   * Read a previously stored artifact by its key. Visual regression needs it:
+   * the baseline was written by an earlier run and has to be fetched back to
+   * diff against. Returns null when the key is gone (retention, or a first run).
+   */
+  get(key: string): Promise<Buffer | null>;
+  /**
+   * Store something that must OUTLIVE this run, like an approved baseline.
+   * Normal artifacts are keyed by run and swept on retention; this is not.
+   */
+  putPersistent(name: string, body: Buffer | Uint8Array, contentType: string): Promise<string>;
 }
 
 export interface RunLogger {

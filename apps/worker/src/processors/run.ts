@@ -204,6 +204,17 @@ export async function processRun(job: RunJob): Promise<void> {
 
       const uploaded: Array<{ key: string; contentType: string }> = [];
 
+      // Visual tests compare against an approved baseline. Resolved here so the
+      // runner never needs database access.
+      const baselineRow =
+        test.type === 'VISUAL'
+          ? await prisma.visualBaseline.findFirst({
+              where: { orgId, testId: test.id },
+              orderBy: { updatedAt: 'desc' },
+              select: { imageKey: true, ignoreRegions: true },
+            })
+          : null;
+
       const context: RunContext = {
         runId: run.id,
         orgId,
@@ -213,6 +224,17 @@ export async function processRun(job: RunJob): Promise<void> {
         secrets,
         fixtures,
         grid,
+        visualBaseline: baselineRow
+          ? {
+              imageKey: baselineRow.imageKey,
+              ignoreRegions: (baselineRow.ignoreRegions ?? []) as Array<{
+                x: number;
+                y: number;
+                width: number;
+                height: number;
+              }>,
+            }
+          : null,
         storageState,
         signal: controller.signal,
         determinism: {
@@ -234,6 +256,18 @@ export async function processRun(job: RunJob): Promise<void> {
             const key = artifactKey({ orgId, runId: run.id, name });
             await storage.putFile(key, absolutePath, contentType);
             uploaded.push({ key, contentType });
+            return key;
+          },
+          async get(key) {
+            // A missing baseline is an expected state (first run, or swept by
+            // retention), not an error — the plugin treats null as "capture one".
+            return storage.get(key).catch(() => null);
+          },
+          async putPersistent(name, body, contentType) {
+            // Deliberately NOT run-scoped: a baseline has to outlive the run
+            // that captured it, and the retention sweeper works by run prefix.
+            const key = `orgs/${orgId}/persistent/${name}`;
+            await storage.put(key, Buffer.from(body), contentType);
             return key;
           },
         },
@@ -272,6 +306,33 @@ export async function processRun(job: RunJob): Promise<void> {
           retriedAndPassed: false,
           findings: [],
         };
+      }
+
+      // A first-run visual capture becomes the approved baseline. Recorded here
+      // rather than in the plugin, which has no database access by design.
+      if (execution.newBaseline) {
+        await prisma.visualBaseline.upsert({
+          where: {
+            testId_viewport_browser: {
+              testId: test.id,
+              viewport: execution.newBaseline.viewport,
+              browser: execution.newBaseline.browser,
+            },
+          },
+          create: {
+            orgId,
+            projectId: run.projectId,
+            testId: test.id,
+            viewport: execution.newBaseline.viewport,
+            browser: execution.newBaseline.browser,
+            imageKey: execution.newBaseline.imageKey,
+          },
+          update: { imageKey: execution.newBaseline.imageKey },
+        });
+        logger.info(
+          { testId: test.id, viewport: execution.newBaseline.viewport },
+          'visual baseline captured',
+        );
       }
 
       await persistExecution({
