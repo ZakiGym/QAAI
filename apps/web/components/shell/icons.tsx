@@ -86,6 +86,41 @@ export function IconPlusSquare(props: IconProps) {
   );
 }
 
+/** Flow map — connected nodes. */
+export function IconMap(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="18" cy="6" r="2.5" />
+      <circle cx="12" cy="18" r="2.5" />
+      <path d="M8.5 6h7" />
+      <path d="M7 8.2 10.8 16" />
+      <path d="M17 8.2 13.2 16" />
+    </Svg>
+  );
+}
+
+/** Triage — a magnifier over a decision. */
+export function IconTriage(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <circle cx="10.5" cy="10.5" r="6.5" />
+      <path d="M20 20l-4.6-4.6" />
+      <path d="M8 10.5l2 2 3.5-3.5" />
+    </Svg>
+  );
+}
+
+/** Quality — a shield with a check. */
+export function IconShield(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 3l7.5 3v6c0 4.5-3.2 7.9-7.5 9-4.3-1.1-7.5-4.5-7.5-9V6Z" />
+      <path d="M9 12l2 2 4-4" />
+    </Svg>
+  );
+}
+
 /** Self-healing — a bandage / mend. */
 export function IconHeal(props: IconProps) {
   return (

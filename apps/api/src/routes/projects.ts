@@ -846,6 +846,226 @@ projectsRouter.post(
   res.json({ push: result });
 });
 
+
+// ─── Quality surfaces (§4, §5) ───────────────────────────────────────────────
+
+/**
+ * Findings across the whole project — accessibility, security, performance,
+ * localisation and visual. They were only ever visible inside one test result,
+ * which made "what is wrong with this app" a question you could not ask.
+ *
+ * De-duplicated by (kind, code, location): the same axe violation on the same
+ * element across forty runs is one problem, not forty.
+ */
+projectsRouter.get('/:projectId/findings', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const includeMuted = String(req.query.muted ?? '') === 'true';
+
+  const rows = await prisma.finding.findMany({
+    where: {
+      testResult: { run: { projectId } },
+      ...(includeMuted ? {} : { mutedAt: null }),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 1000,
+    select: {
+      id: true,
+      kind: true,
+      severity: true,
+      code: true,
+      message: true,
+      location: true,
+      helpUrl: true,
+      mutedAt: true,
+      createdAt: true,
+      testResult: {
+        select: { id: true, runId: true, test: { select: { id: true, name: true } } },
+      },
+    },
+  });
+
+  const grouped = new Map<
+    string,
+    {
+      id: string;
+      kind: string;
+      severity: string;
+      code: string;
+      message: string;
+      location: string;
+      helpUrl: string | null;
+      mutedAt: Date | null;
+      occurrences: number;
+      lastSeenAt: Date;
+      tests: string[];
+    }
+  >();
+
+  for (const row of rows) {
+    const key = `${row.kind}:${row.code}:${row.location}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.occurrences += 1;
+      if (row.testResult?.test.name && !existing.tests.includes(row.testResult.test.name)) {
+        existing.tests.push(row.testResult.test.name);
+      }
+      continue;
+    }
+    grouped.set(key, {
+      id: row.id,
+      kind: row.kind,
+      severity: row.severity,
+      code: row.code,
+      message: row.message,
+      location: row.location,
+      helpUrl: row.helpUrl,
+      mutedAt: row.mutedAt,
+      occurrences: 1,
+      lastSeenAt: row.createdAt,
+      tests: row.testResult?.test.name ? [row.testResult.test.name] : [],
+    });
+  }
+
+  const RANK: Record<string, number> = { CRITICAL: 0, SERIOUS: 1, MODERATE: 2, MINOR: 3 };
+  const findings = [...grouped.values()].sort(
+    (a, b) => (RANK[a.severity] ?? 9) - (RANK[b.severity] ?? 9) || b.occurrences - a.occurrences,
+  );
+
+  res.json({ findings });
+});
+
+/** Mute a finding — it keeps recording but stops gating. */
+projectsRouter.post('/:projectId/findings/:findingId/mute', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const muted = String(req.body?.muted ?? 'true') !== 'false';
+
+  const finding = await prisma.finding.findUnique({
+    where: { id: String(req.params.findingId) },
+    select: { id: true, code: true },
+  });
+  if (!finding) throw notFound('Finding');
+
+  await prisma.finding.update({
+    where: { id: finding.id },
+    data: { mutedAt: muted ? new Date() : null },
+  });
+
+  await audit({
+    actor,
+    action: muted ? 'finding.mute' : 'finding.unmute',
+    targetType: 'Finding',
+    targetId: finding.id,
+    metadata: { code: finding.code },
+  });
+
+  res.json({ ok: true, muted });
+});
+
+/**
+ * The flake radar. `flakeRate` has been maintained on every run and never
+ * shown, so "which tests can I not trust" had no answer — the single most
+ * corrosive question in a test suite.
+ */
+projectsRouter.get('/:projectId/flaky', async (req, res) => {
+  const tests = await prisma.test.findMany({
+    where: { projectId: String(req.params.projectId), disabledAt: null },
+    orderBy: [{ quarantined: 'desc' }, { flakeRate: 'desc' }],
+    select: {
+      id: true,
+      name: true,
+      filePath: true,
+      type: true,
+      priority: true,
+      flakeRate: true,
+      quarantined: true,
+      quarantinedAt: true,
+      lastRunAt: true,
+    },
+  });
+
+  // Everything with any instability, plus anything already quarantined.
+  res.json({ tests: tests.filter((t) => t.flakeRate > 0 || t.quarantined) });
+});
+
+/** Quarantine a flaky test: it still runs, but it stops gating a deploy (§5). */
+projectsRouter.post('/:projectId/tests/:testId/quarantine', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const quarantined = String(req.body?.quarantined ?? 'true') !== 'false';
+
+  const test = await prisma.test.findUnique({
+    where: { id: String(req.params.testId) },
+    select: { id: true, projectId: true, name: true },
+  });
+  if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
+
+  const updated = await prisma.test.update({
+    where: { id: test.id },
+    data: { quarantined, quarantinedAt: quarantined ? new Date() : null },
+    select: { id: true, quarantined: true, quarantinedAt: true },
+  });
+
+  await audit({
+    actor,
+    action: quarantined ? 'test.quarantine' : 'test.unquarantine',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { name: test.name },
+  });
+
+  res.json({ test: updated });
+});
+
+/** Approved visual baselines, for the review screen. */
+projectsRouter.get('/:projectId/baselines', async (req, res) => {
+  const baselines = await prisma.visualBaseline.findMany({
+    where: { projectId: String(req.params.projectId) },
+    orderBy: { updatedAt: 'desc' },
+    select: {
+      id: true,
+      viewport: true,
+      browser: true,
+      imageKey: true,
+      updatedAt: true,
+      approvedBy: true,
+      test: { select: { id: true, name: true, filePath: true } },
+    },
+  });
+  res.json({ baselines });
+});
+
+/**
+ * Re-approve a baseline from a run's captured screenshot — the "yes, that
+ * change was intended" action. Without it the only way to accept a deliberate
+ * redesign was to delete the row by hand.
+ */
+projectsRouter.post('/:projectId/baselines/:baselineId/approve', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const imageKey = String(req.body?.imageKey ?? '');
+  if (!imageKey) throw badRequest('imageKey is required');
+
+  const baseline = await prisma.visualBaseline.findUnique({
+    where: { id: String(req.params.baselineId) },
+    select: { id: true, projectId: true, testId: true },
+  });
+  if (!baseline || baseline.projectId !== String(req.params.projectId)) throw notFound('Baseline');
+
+  const updated = await prisma.visualBaseline.update({
+    where: { id: baseline.id },
+    data: { imageKey, approvedBy: actor.userId },
+    select: { id: true, imageKey: true, updatedAt: true },
+  });
+
+  await audit({
+    actor,
+    action: 'baseline.approve',
+    targetType: 'VisualBaseline',
+    targetId: baseline.id,
+    metadata: { testId: baseline.testId },
+  });
+
+  res.json({ baseline: updated });
+});
+
 // ─── File operations (§8) ────────────────────────────────────────────────────
 
 /**
