@@ -377,6 +377,31 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Email / OTP (§4) ────────────────────────────────────────────────────────
+
+/**
+ * A real email-code sign-in. The mailbox URL is the one honest dependency: you
+ * need a test mail sink. The bundled demo exposes `/__mail`; MailHog, Mailpit
+ * and Mailosaur expose the same shape.
+ */
+export const emailOtpSpecSchema = z.object({
+  requestUrl: z.string().min(1).default('/login'),
+  emailSelector: z.string().min(1),
+  requestSubmitSelector: z.string().min(1),
+  /** Prefer a vault secret; an inline address is allowed for throwaway inboxes. */
+  recipientSecretName: z.string().max(80).default('OTP_RECIPIENT'),
+  recipient: z.string().email().optional(),
+  mailboxUrl: z.string().min(1).default('/__mail'),
+  /** First capture group wins, else the whole match. */
+  codePattern: z.string().min(1).default('\\b(\\d{6})\\b'),
+  codeSelector: z.string().min(1),
+  verifySubmitSelector: z.string().min(1),
+  successSelector: z.string().min(1),
+  timeoutSeconds: z.number().int().min(5).max(300).default(60),
+});
+
+export type EmailOtpSpec = z.infer<typeof emailOtpSpecSchema>;
+
 // ─── Cross-browser & localisation (§4) ───────────────────────────────────────
 
 export const BROWSER_ENGINES = ['chromium', 'firefox', 'webkit'] as const;
