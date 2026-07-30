@@ -154,6 +154,12 @@ export interface RunContext {
    * its data off disk. Not secret — fixtures are committed alongside the tests.
    */
   fixtures?: Readonly<Record<string, string>>;
+  /**
+   * A cloud browser grid to run against instead of the worker's local browser
+   * (§6). Already carries the provider's credentials in the URL, so it is
+   * secret-bearing and must never be logged or written into an exported repo.
+   */
+  grid?: { provider: string; wsEndpoint: string } | null;
   /** Playwright storageState JSON from the auth profile, when one applies (§2). */
   storageState: unknown | null;
   /** Where the plugin writes screenshots/videos/traces. */

@@ -193,6 +193,8 @@ const CONFIG_TEMPLATE = (opts: {
   timeoutMs: number;
   retryOnce: boolean;
   outputDir: string;
+  /** Cloud grid websocket endpoint. Credential-bearing — never logged. */
+  gridWsEndpoint?: string | null;
 }) => `import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
@@ -207,7 +209,13 @@ export default defineConfig({
   timeout: ${opts.timeoutMs},
   outputDir: ${JSON.stringify(opts.outputDir)},
   use: {
-    baseURL: ${JSON.stringify(opts.baseUrl)},
+    baseURL: ${JSON.stringify(opts.baseUrl)},${
+      opts.gridWsEndpoint
+        ? `
+    // Runs on a cloud grid instead of this machine's browser (§6).
+    connectOptions: { wsEndpoint: ${JSON.stringify(opts.gridWsEndpoint)} },`
+        : ''
+    }
     trace: 'retain-on-failure',
     video: 'retain-on-failure',
     screenshot: 'only-on-failure',
@@ -235,6 +243,7 @@ async function createWorkspace(ctx: RunContext, test: ExecutableTest): Promise<W
       timeoutMs: test.timeoutMs,
       retryOnce: ctx.determinism.retryOnce,
       outputDir,
+      gridWsEndpoint: ctx.grid?.wsEndpoint ?? null,
     }),
     'utf8',
   );

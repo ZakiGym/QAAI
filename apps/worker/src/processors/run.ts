@@ -12,7 +12,10 @@
  */
 
 import { evaluateGates, pluginFor, reasonUnsupported } from '@qaai/runner';
-import { FIXTURE_PREFIX } from '@qaai/shared';
+import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS } from '@qaai/shared';
+import type { GridIntegrationKind } from '@qaai/shared';
+import { gridWsEndpoint } from '../grids.js';
+import { open as openSecret } from '../vault.js';
 import type {
   ExecutableTest,
   GateRule,
@@ -81,6 +84,58 @@ export async function processRun(job: RunJob): Promise<void> {
         : row.code,
     ]),
   );
+
+  /**
+   * A configured cloud grid moves the browser off this machine (§6). The
+   * endpoint carries the provider's access key, so it is built here from the
+   * vault and kept in memory — never logged, never written to an exported repo.
+   */
+  let grid: { provider: string; wsEndpoint: string } | null = null;
+  const gridIntegration = await prisma.integration.findFirst({
+    where: { orgId, enabled: true, kind: { in: [...GRID_INTEGRATION_KINDS] } },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, kind: true, config: true, configEnc: true },
+  });
+  if (gridIntegration?.configEnc) {
+    try {
+      const cfg = (gridIntegration.config ?? {}) as {
+        username?: string;
+        keyVersion?: number;
+        os?: string;
+        browser?: string;
+        browserVersion?: string;
+      };
+      const accessKey = openSecret(
+        gridIntegration.configEnc,
+        cfg.keyVersion ?? 1,
+        orgId,
+        `integration:${gridIntegration.id}`,
+      );
+      grid = {
+        provider: gridIntegration.kind,
+        wsEndpoint: gridWsEndpoint(
+          gridIntegration.kind as GridIntegrationKind,
+          { username: cfg.username ?? '', accessKey },
+          {
+            os: cfg.os,
+            browser: cfg.browser,
+            browserVersion: cfg.browserVersion,
+            buildName: `QAAI ${run.id.slice(-8)}`,
+            sessionName: `QAAI run ${run.id.slice(-8)}`,
+          },
+        ),
+      };
+      logger.info({ provider: gridIntegration.kind }, 'running on a cloud grid');
+    } catch (err) {
+      // A broken grid config must not silently fall back to a local browser —
+      // the customer asked for Safari on Windows and would get Chromium here.
+      throw new Error(
+        `Cloud grid ${gridIntegration.kind} is configured but its credentials could not be used: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+    }
+  }
 
   const authProfile = await prisma.authProfile.findFirst({
     where: { orgId, environmentId: run.environment.id },
@@ -157,6 +212,7 @@ export async function processRun(job: RunJob): Promise<void> {
         baseUrl,
         secrets,
         fixtures,
+        grid,
         storageState,
         signal: controller.signal,
         determinism: {

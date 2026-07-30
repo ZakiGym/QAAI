@@ -18,7 +18,7 @@ function keyForVersion(version: number): Buffer {
   return key;
 }
 
-function open(sealed: string, keyVersion: number, orgId: string, name: string): string {
+export function open(sealed: string, keyVersion: number, orgId: string, name: string): string {
   const raw = Buffer.from(sealed, 'base64');
   const iv = raw.subarray(0, IV_LENGTH);
   const tag = raw.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);

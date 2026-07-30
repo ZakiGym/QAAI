@@ -190,6 +190,15 @@ enum IntegrationKind {
   GITHUB
   GITLAB
   BITBUCKET
+  // Cloud browser grids — where a run's browser actually executes (§6).
+  BROWSERSTACK
+  SAUCE_LABS
+  LAMBDATEST
+  PERFECTO
+  // Managed visual-diff services, as an alternative to QAAI's own baselines.
+  APPLITOOLS
+  PERCY
+  CHROMATIC
   SLACK
   MSTEAMS
   DISCORD

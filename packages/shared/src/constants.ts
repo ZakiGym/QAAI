@@ -104,6 +104,22 @@ export const GIT_INTEGRATION_KINDS = ['GITHUB', 'GITLAB', 'BITBUCKET'] as const;
 export type GitIntegrationKind = (typeof GIT_INTEGRATION_KINDS)[number];
 
 /**
+ * Cloud browser grids. A run can execute against one of these instead of the
+ * worker's local browser — same tests, someone else's Windows/Safari/device farm.
+ */
+export const GRID_INTEGRATION_KINDS = [
+  'BROWSERSTACK',
+  'SAUCE_LABS',
+  'LAMBDATEST',
+  'PERFECTO',
+] as const;
+export type GridIntegrationKind = (typeof GRID_INTEGRATION_KINDS)[number];
+
+/** Managed visual-diff services, as an alternative to QAAI's own baselines. */
+export const VISUAL_INTEGRATION_KINDS = ['APPLITOOLS', 'PERCY', 'CHROMATIC'] as const;
+export type VisualIntegrationKind = (typeof VISUAL_INTEGRATION_KINDS)[number];
+
+/**
  * A test whose `filePath` starts with this is treated as test data, not a test:
  * excluded from run selection and the flake radar, materialised into the run
  * workspace so specs can read it. Reuses the Test row so no new model is needed.
