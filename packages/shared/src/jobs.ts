@@ -47,6 +47,18 @@ export interface CopilotJob {
   userMessageId: string;
 }
 
+/** One inline edit: the agent rewrites a test from a plain-English instruction. */
+export interface EditJob {
+  orgId: string;
+  projectId: string;
+  /** The AgentProposal row the worker fills in. */
+  proposalId: string;
+  instruction: string;
+  selection: string;
+  selectionStartLine: number;
+  selectionEndLine: number;
+}
+
 export interface ImportJob {
   orgId: string;
   projectId: string;
@@ -73,6 +85,7 @@ export interface JobPayloads {
   'qaai.triage': TriageJob;
   'qaai.notify': NotifyJob;
   'qaai.copilot': CopilotJob;
+  'qaai.edit': EditJob;
   'qaai.import': ImportJob;
   'qaai.schedule': ScheduleTickJob;
 }

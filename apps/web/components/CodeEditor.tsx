@@ -2,6 +2,7 @@
 
 import { useRef } from 'react';
 import Editor, { type Monaco, type OnMount } from '@monaco-editor/react';
+import type { editor, Position } from 'monaco-editor';
 
 /**
  * The Monaco wrapper — the same editor VS Code is built on.
@@ -159,6 +160,16 @@ function defineTheme(monaco: Monaco): void {
   });
 }
 
+/** A locator the last crawl found — offered as a completion. */
+export interface LocatorSuggestion {
+  label: string;
+  route: string;
+  kind: string;
+  strategy: string;
+  confidence: number;
+  expression: string;
+}
+
 export interface CodeEditorProps {
   value: string;
   language?: string;
@@ -166,6 +177,20 @@ export interface CodeEditorProps {
   onChange?: (value: string) => void;
   /** Cmd-S. Wired here rather than on window so it only fires with focus in the editor. */
   onSave?: () => void;
+  /**
+   * Locators from the project's flow map. These are what makes completion here
+   * different from a generic assistant's: they are elements the crawler actually
+   * saw, not plausible guesses.
+   */
+  locators?: LocatorSuggestion[];
+  /** ⌘K with the editor focused — inline edit on the current selection. */
+  onInlineEdit?: (selection: {
+    text: string;
+    startLine: number;
+    endLine: number;
+  }) => void;
+  /** The mounted editor, so a toolbar button can read the current selection. */
+  onReady?: (editor: editor.IStandaloneCodeEditor) => void;
 }
 
 export function CodeEditor({
@@ -174,11 +199,22 @@ export function CodeEditor({
   readOnly,
   onChange,
   onSave,
+  locators,
+  onInlineEdit,
+  onReady,
 }: CodeEditorProps) {
   // Kept in a ref so the Monaco keybinding always calls the latest handler
   // rather than the one captured when the editor mounted.
   const saveRef = useRef(onSave);
   saveRef.current = onSave;
+  const inlineEditRef = useRef(onInlineEdit);
+  inlineEditRef.current = onInlineEdit;
+  // Read inside the provider, so newly-crawled locators appear without
+  // re-registering (and without leaking a provider per render).
+  const locatorsRef = useRef(locators);
+  locatorsRef.current = locators;
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
 
   const handleMount: OnMount = (editor, monaco) => {
     defineTheme(monaco);
@@ -205,6 +241,73 @@ export function CodeEditor({
     });
 
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current?.());
+
+    // ⌘K belongs to the editor when the editor has focus — the command palette
+    // keeps it everywhere else. This is the Cursor/VS Code convention, and the
+    // reason AppShell's global handler skips events originating inside Monaco.
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => {
+      const selection = editor.getSelection();
+      const model = editor.getModel();
+      if (!model) return;
+      inlineEditRef.current?.({
+        text: selection && !selection.isEmpty() ? model.getValueInRange(selection) : '',
+        startLine: selection?.startLineNumber ?? 1,
+        endLine: selection?.endLineNumber ?? model.getLineCount(),
+      });
+    });
+
+    /**
+     * Locator completions from the crawl.
+     *
+     * Registered once per mount and reading `locatorsRef`, so it stays correct as
+     * the list loads. Triggered after a `.` (so `page.` offers them) and on the
+     * usual identifier characters, and each item inserts the real Playwright
+     * expression with the element's label and route as its documentation.
+     */
+    const provider = monaco.languages.registerCompletionItemProvider(['typescript', 'javascript'], {
+      triggerCharacters: ['.', "'", '"'],
+      provideCompletionItems(model: editor.ITextModel, position: Position) {
+        const all = locatorsRef.current;
+        if (!all?.length) return { suggestions: [] };
+
+        const word = model.getWordUntilPosition(position);
+        const range = {
+          startLineNumber: position.lineNumber,
+          endLineNumber: position.lineNumber,
+          startColumn: word.startColumn,
+          endColumn: word.endColumn,
+        };
+
+        return {
+          suggestions: all.map((locator, index) => ({
+            label: {
+              label: locator.expression,
+              description: `${locator.label} · ${locator.route}`,
+            },
+            kind: monaco.languages.CompletionItemKind.Method,
+            insertText: locator.expression,
+            range,
+            detail: `${locator.kind} on ${locator.route}`,
+            documentation: {
+              value: [
+                `**${locator.label}**`,
+                '',
+                `Seen on \`${locator.route}\` during the last crawl.`,
+                '',
+                `Strategy: \`${locator.strategy}\` · confidence ${Math.round(locator.confidence * 100)}%`,
+              ].join('\n'),
+            },
+            // Confidence order is meaningful; keep it rather than let Monaco
+            // re-sort alphabetically.
+            sortText: String(index).padStart(4, '0'),
+          })),
+        };
+      },
+    });
+
+    editor.onDidDispose(() => provider.dispose());
+
+    onReadyRef.current?.(editor);
   };
 
   return (

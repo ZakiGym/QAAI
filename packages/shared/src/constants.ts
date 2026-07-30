@@ -110,6 +110,13 @@ export type GitIntegrationKind = (typeof GIT_INTEGRATION_KINDS)[number];
  */
 export const FIXTURE_PREFIX = 'fixtures/';
 
+/**
+ * `AgentProposal.conversationId` prefix for inline edits. That column has no
+ * foreign key, so it doubles as a namespace — inline edits are transient and
+ * must not appear in the copilot's proposal inbox.
+ */
+export const INLINE_EDIT_PREFIX = 'inline:';
+
 export const AUTH_PROFILE_KINDS = [
   'FORM_LOGIN',
   'MAGIC_LINK',
@@ -249,6 +256,7 @@ export const QUEUE_NAMES = {
   generate: 'qaai.generate',
   triage: 'qaai.triage',
   copilot: 'qaai.copilot',
+  edit: 'qaai.edit',
   import: 'qaai.import',
   schedule: 'qaai.schedule',
   notify: 'qaai.notify',

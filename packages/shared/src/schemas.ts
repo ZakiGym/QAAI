@@ -238,6 +238,17 @@ export const createTestSchema = z.object({
   tags: z.array(z.string().max(40)).max(20).default([]),
 });
 
+/**
+ * An inline edit request (⌘K in the editor). The selection may be empty — the
+ * user can invoke it with nothing highlighted to act on the whole file.
+ */
+export const inlineEditRequestSchema = z.object({
+  instruction: z.string().min(1).max(2000),
+  selection: z.string().max(100_000).default(''),
+  selectionStartLine: z.number().int().min(0).default(0),
+  selectionEndLine: z.number().int().min(0).default(0),
+});
+
 // ─── Triage (§3.3) ───────────────────────────────────────────────────────────
 
 export const triageVerdictSchema = z.object({

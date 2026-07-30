@@ -6,6 +6,8 @@ import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
 import {
   GIT_INTEGRATION_KINDS,
+  INLINE_EDIT_PREFIX,
+  QUEUE_NAMES,
   PLAN_LIMITS,
   SECRET_MASK,
   createEnvironmentSchema,
@@ -13,15 +15,18 @@ import {
   createTestSchema,
   gitPushSchema,
   importSecretsSchema,
+  inlineEditRequestSchema,
+  locatorsFromFlowMap,
   updateEnvironmentSchema,
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
-import type { GitIntegrationKind } from '@qaai/shared';
+import type { FlowMap, GitIntegrationKind } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
+import { enqueue } from '../lib/queues.js';
 import { seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
@@ -776,6 +781,111 @@ projectsRouter.post(
   });
 
   res.json({ push: result });
+});
+
+// ─── Editor intelligence (§8) ────────────────────────────────────────────────
+
+/**
+ * Locators the last crawl actually found, for editor autocomplete.
+ *
+ * Entirely deterministic — this reads the flow map, so it works with no model
+ * and no API key. It is also the thing a general-purpose coding assistant
+ * structurally cannot offer: it knows what is really on the page.
+ */
+projectsRouter.get('/:projectId/locators', async (req, res) => {
+  const flowMap = await prisma.flowMap.findFirst({
+    where: { projectId: String(req.params.projectId) },
+    orderBy: { version: 'desc' },
+    select: { graph: true, version: true, createdAt: true },
+  });
+
+  if (!flowMap) {
+    res.json({ locators: [], version: null, crawledAt: null });
+    return;
+  }
+
+  res.json({
+    locators: locatorsFromFlowMap(flowMap.graph as unknown as FlowMap).slice(0, 300),
+    version: flowMap.version,
+    crawledAt: flowMap.createdAt,
+  });
+});
+
+/**
+ * Ask the agent to rewrite a test from a plain-English instruction (⌘K).
+ *
+ * Enqueued rather than answered inline, because the API holds no model client —
+ * the row is created here so the client has something to poll immediately.
+ */
+projectsRouter.post(
+  '/:projectId/tests/:testId/inline-edit',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const input = inlineEditRequestSchema.parse(req.body);
+    const projectId = String(req.params.projectId);
+
+    const test = await prisma.test.findUnique({
+      where: { id: String(req.params.testId) },
+      select: { id: true, name: true, type: true, filePath: true, code: true, projectId: true },
+    });
+    if (!test || test.projectId !== projectId) throw notFound('Test');
+
+    const proposal = await prisma.agentProposal.create({
+      data: {
+        orgId: actor.orgId,
+        projectId,
+        // No FK here; the prefix namespaces inline edits so they never show up
+        // in the copilot's proposal inbox.
+        conversationId: `${INLINE_EDIT_PREFIX}${test.id}`,
+        testId: test.id,
+        filePath: test.filePath,
+        oldCode: test.code,
+        newCode: '',
+        rationale: input.instruction,
+        testName: test.name,
+        testType: test.type,
+        state: 'PENDING',
+      },
+      select: { id: true },
+    });
+
+    await enqueue(QUEUE_NAMES.edit, {
+      orgId: actor.orgId,
+      projectId,
+      proposalId: proposal.id,
+      instruction: input.instruction,
+      selection: input.selection,
+      selectionStartLine: input.selectionStartLine,
+      selectionEndLine: input.selectionEndLine,
+    });
+
+    res.status(202).json({ proposalId: proposal.id });
+  },
+);
+
+/** Poll target for an inline edit. `newCode: ''` means still working. */
+projectsRouter.get('/:projectId/inline-edit/:proposalId', async (req, res) => {
+  const proposal = await prisma.agentProposal.findUnique({
+    where: { id: String(req.params.proposalId) },
+    select: {
+      id: true,
+      state: true,
+      oldCode: true,
+      newCode: true,
+      rationale: true,
+      filePath: true,
+    },
+  });
+  if (!proposal || !proposal.filePath) throw notFound('Edit');
+
+  res.json({
+    edit: {
+      ...proposal,
+      ready: proposal.newCode.length > 0,
+      failed: proposal.state === 'REJECTED' && proposal.newCode.length === 0,
+    },
+  });
 });
 
 /** Latest flow map, for the Flow Map screen (§8). */

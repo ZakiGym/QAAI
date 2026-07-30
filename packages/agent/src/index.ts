@@ -5,5 +5,6 @@ export * from './generator.js';
 export * from './triage.js';
 export * from './healer.js';
 export * from './heal-apply.js';
+export * from './inline-edit.js';
 export * from './chat.js';
 export * from './importer.js';

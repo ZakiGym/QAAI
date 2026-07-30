@@ -8,7 +8,15 @@
 
 import { Worker, type Job } from 'bullmq';
 import { QUEUE_NAMES } from '@qaai/shared';
-import type { CopilotJob, ExploreJob, GenerateJob, ImportJob, RunJob, TriageJob } from '@qaai/shared';
+import type {
+  CopilotJob,
+  EditJob,
+  ExploreJob,
+  GenerateJob,
+  ImportJob,
+  RunJob,
+  TriageJob,
+} from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
 import { closeProducers } from './queues.js';
 import { processExplore } from './processors/explore.js';
@@ -16,6 +24,7 @@ import { processGenerate } from './processors/generate.js';
 import { processRun } from './processors/run.js';
 import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
+import { processEdit } from './processors/edit.js';
 import { processImport } from './processors/import.js';
 
 const workers: Worker[] = [];
@@ -64,6 +73,9 @@ register<TriageJob>(QUEUE_NAMES.triage, config.concurrency * 2, processTriage);
 // A copilot turn can hold a browser for minutes via run_tests, so it is capped
 // at the browser-bound concurrency rather than the wider LLM pool.
 register<CopilotJob>(QUEUE_NAMES.copilot, config.concurrency, processCopilot);
+// Inline edits are interactive — a user is staring at a spinner — so they get
+// their own lane rather than queueing behind a long copilot turn.
+register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
 
 logger.info(

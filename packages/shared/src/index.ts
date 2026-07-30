@@ -1,5 +1,6 @@
 export * from './constants.js';
 export * from './flow-map.js';
+export * from './locators.js';
 export * from './types.js';
 export * from './schemas.js';
 export * from './mask.js';

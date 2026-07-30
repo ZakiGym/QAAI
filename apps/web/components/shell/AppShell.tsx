@@ -104,6 +104,15 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       if (!(isMac ? e.metaKey : e.ctrlKey)) return;
       const k = e.key.toLowerCase();
       if (k === 'k') {
+        // ⌘K inside the code editor means "edit this selection", per the
+        // Cursor/VS Code convention. Let Monaco's own binding take it there;
+        // ⌘⇧P still opens the palette from anywhere.
+        const target = e.target as HTMLElement | null;
+        if (!e.shiftKey && target?.closest?.('.monaco-editor')) return;
+        e.preventDefault();
+        openCommands();
+      } else if (k === 'p' && e.shiftKey) {
+        // ⌘⇧P — the palette, always, even with the editor focused.
         e.preventDefault();
         openCommands();
       } else if (k === 'p') {

@@ -8,6 +8,8 @@ import { CodeEditor } from '../../components/CodeEditor';
 import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
 import { FileTree } from '../../components/FileTree';
+import { InlineEdit } from '../../components/InlineEdit';
+import type { LocatorSuggestion } from '../../components/CodeEditor';
 import { FIXTURE_PREFIX } from '../../lib/tree';
 import { StatusDot, duration } from '../../components/ui';
 
@@ -80,7 +82,14 @@ export default function EditorPage() {
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastRun, setLastRun] = useState<Run | null>(null);
+  const [locators, setLocators] = useState<LocatorSuggestion[]>([]);
+  const [inlineSelection, setInlineSelection] = useState<{
+    text: string;
+    startLine: number;
+    endLine: number;
+  } | null>(null);
   const [running, setRunning] = useState(false);
+  const editorRef = useRef<import('monaco-editor').editor.IStandaloneCodeEditor | null>(null);
 
   const loadTests = useCallback(async (projectId: string) => {
     const { tests } = await api<{ tests: TestSummary[] }>(`/projects/${projectId}/tests`);
@@ -98,6 +107,11 @@ export default function EditorPage() {
           return;
         }
         setProject(first);
+        // Locators come from the crawl and need no model — load them for
+        // completions, and shrug if the project has never been explored.
+        void api<{ locators: LocatorSuggestion[] }>(`/projects/${first.id}/locators`)
+          .then((d) => setLocators(d.locators))
+          .catch(() => setLocators([]));
         const loaded = await loadTests(first.id);
         // ⌘P quick-open lands here as ?test=<id>; fall back to the first test.
         const wanted = new URLSearchParams(window.location.search).get('test');
@@ -273,6 +287,19 @@ export default function EditorPage() {
     }
   }
 
+  /** Shared by the ⌘K binding and the toolbar button. */
+  function openInlineEdit() {
+    const ed = editorRef.current;
+    if (!ed) return;
+    const sel = ed.getSelection();
+    const model = ed.getModel();
+    setInlineSelection({
+      text: sel && model && !sel.isEmpty() ? model.getValueInRange(sel) : '',
+      startLine: sel?.startLineNumber ?? 1,
+      endLine: sel?.endLineNumber ?? (model?.getLineCount() ?? 1),
+    });
+  }
+
   const result = lastRun?.results?.[0] ?? null;
   const openIsFixture = openTest?.filePath.startsWith(FIXTURE_PREFIX) ?? false;
 
@@ -309,6 +336,15 @@ export default function EditorPage() {
               }
             }}
           />
+          <button
+            type="button"
+            onClick={openInlineEdit}
+            disabled={!openTest}
+            title="Describe a change in plain English"
+            className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs disabled:opacity-40"
+          >
+            Edit <span className="text-ink-faint">⌘K</span>
+          </button>
           <button
             type="button"
             onClick={() => void save()}
@@ -359,7 +395,23 @@ export default function EditorPage() {
         </aside>
 
         {/* ── Monaco ──────────────────────────────────────────────────────── */}
-        <section className="min-h-0">
+        <section className="relative min-h-0">
+          {openTest && inlineSelection && project && (
+            <InlineEdit
+              projectId={project.id}
+              testId={openTest.id}
+              selection={inlineSelection}
+              language={editorLanguage(openTest)}
+              onClose={() => setInlineSelection(null)}
+              onAccept={(code) => {
+                // Staged into the draft, not saved — the user still owns ⌘S.
+                setDraft(code);
+                setDirty(true);
+                setInlineSelection(null);
+                setStatus('Edit applied — ⌘S to save');
+              }}
+            />
+          )}
           {openTest ? (
             <CodeEditor
               value={draft}
@@ -369,6 +421,11 @@ export default function EditorPage() {
                 setDirty(true);
               }}
               onSave={() => void save()}
+              locators={locators}
+              onInlineEdit={(selection) => setInlineSelection(selection)}
+              onReady={(ed) => {
+                editorRef.current = ed;
+              }}
             />
           ) : (
             <p className="text-ink-faint p-6 text-sm">
