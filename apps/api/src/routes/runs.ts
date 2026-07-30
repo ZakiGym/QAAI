@@ -4,7 +4,7 @@
  */
 
 import { Router } from 'express';
-import { PLAN_LIMITS, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
+import { FIXTURE_PREFIX, PLAN_LIMITS, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, notFound, planLimit } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
@@ -51,18 +51,22 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
     }
   }
 
-  const testIds =
-    input.testIds ??
-    (
-      await prisma.test.findMany({
-        where: {
-          projectId: environment.projectId,
-          disabledAt: null,
-          ...(input.suiteId ? { suiteId: input.suiteId } : {}),
-        },
-        select: { id: true },
-      })
-    ).map((t) => t.id);
+  /**
+   * Rows under `fixtures/` are test DATA, not tests — they hold no runnable code.
+   * Excluded from both selection paths, so neither "run everything" nor an
+   * explicit id list can queue one and report it as a failure.
+   */
+  const runnable = await prisma.test.findMany({
+    where: {
+      projectId: environment.projectId,
+      disabledAt: null,
+      filePath: { not: { startsWith: FIXTURE_PREFIX } },
+      ...(input.testIds ? { id: { in: input.testIds } } : {}),
+      ...(input.suiteId && !input.testIds ? { suiteId: input.suiteId } : {}),
+    },
+    select: { id: true },
+  });
+  const testIds = runnable.map((t) => t.id);
 
   if (testIds.length === 0) {
     throw badRequest('There are no tests to run for that suite or project');

@@ -12,6 +12,7 @@
  */
 
 import { evaluateGates, pluginFor, reasonUnsupported } from '@qaai/runner';
+import { FIXTURE_PREFIX } from '@qaai/shared';
 import type {
   ExecutableTest,
   GateRule,
@@ -56,6 +57,23 @@ export async function processRun(job: RunJob): Promise<void> {
 
   const baseUrl = run.baseUrlOverride ?? run.environment.baseUrl;
   const secrets = await secretsFor(orgId, run.environment.id);
+
+  // Test data lives as Test rows under `fixtures/`; every workspace gets a copy
+  // so a spec can read its data off disk. Loaded once per run, not per test.
+  const fixtureRows = await prisma.test.findMany({
+    where: { orgId, projectId: run.projectId, filePath: { startsWith: FIXTURE_PREFIX } },
+    select: { filePath: true, code: true, spec: true },
+  });
+  const fixtures = Object.fromEntries(
+    fixtureRows.map((row) => [
+      row.filePath,
+      // A fixture edited as JSON is stored in `spec`; anything else keeps its raw
+      // text in `code`. Prefer whichever actually holds content.
+      row.spec !== null && row.spec !== undefined
+        ? JSON.stringify(row.spec, null, 2)
+        : row.code,
+    ]),
+  );
 
   const authProfile = await prisma.authProfile.findFirst({
     where: { orgId, environmentId: run.environment.id },
@@ -131,6 +149,7 @@ export async function processRun(job: RunJob): Promise<void> {
         environmentId: run.environment.id,
         baseUrl,
         secrets,
+        fixtures,
         storageState,
         signal: controller.signal,
         determinism: {

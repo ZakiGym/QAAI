@@ -24,6 +24,7 @@ import { agentRouter } from './routes/agent.js';
 import { runsRouter } from './routes/runs.js';
 import { copilotRouter } from './routes/copilot.js';
 import { settingsRouter } from './routes/settings.js';
+import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
 
@@ -103,6 +104,7 @@ app.use('/projects', projectsRouter);
 app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
 app.use('/settings', settingsRouter);
+app.use('/integrations', integrationsRouter);
 app.use('/', recordRouter);
 app.use('/', importRouter);
 app.use('/', agentRouter);

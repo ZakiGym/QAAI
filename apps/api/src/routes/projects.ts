@@ -5,21 +5,28 @@
 import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
 import {
+  GIT_INTEGRATION_KINDS,
   PLAN_LIMITS,
   SECRET_MASK,
   createEnvironmentSchema,
   createProjectSchema,
   createTestSchema,
+  gitPushSchema,
   importSecretsSchema,
   updateEnvironmentSchema,
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
+import type { GitIntegrationKind } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
 import { seal } from '../lib/vault.js';
+import { buildRepoTree } from '../lib/repo-export.js';
+import { zipTree } from '../lib/zip.js';
+import { pushRepo } from '../lib/git.js';
+import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
 
 /** SCREAMING_SNAKE_CASE, matching upsertSecretSchema — used to filter a pasted .env. */
@@ -574,6 +581,141 @@ projectsRouter.post('/:projectId/tests', requireRole('MEMBER'), async (req, res)
   });
 
   res.status(201).json({ test });
+});
+
+// ─── Repo export & git push (§7) ─────────────────────────────────────────────
+
+/**
+ * What a push or export would contain. Read-only: no remote is contacted and no
+ * credential is touched, so this is safe to call freely before committing to a
+ * push.
+ */
+projectsRouter.get('/:projectId/git/preview', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const { tree, secretNames, skipped } = await buildRepoTree({ projectId });
+  const files = [...tree.entries()]
+    .map(([path, content]) => ({ path, bytes: Buffer.byteLength(content, 'utf8') }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+
+  res.json({
+    files,
+    totalFiles: files.length,
+    totalBytes: files.reduce((sum, f) => sum + f.bytes, 0),
+    /** Names only — the export deliberately carries no secret values. */
+    secretNames,
+    skipped,
+  });
+});
+
+/**
+ * Download the repo as a zip. Needs no integration and no token: the
+ * credential-free way to take your tests and push them yourself.
+ */
+projectsRouter.get('/:projectId/git/export', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true, slug: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const { tree } = await buildRepoTree({ projectId });
+  const zip = await zipTree(tree);
+
+  res.setHeader('content-type', 'application/zip');
+  res.setHeader('content-disposition', `attachment; filename="${project.slug}-tests.zip"`);
+  res.setHeader('content-length', String(zip.byteLength));
+  res.end(zip);
+});
+
+/**
+ * Push the repo to a connected git remote.
+ *
+ * ADMIN-only and gated on `confirm: true` — a write to the customer's own repo is
+ * never implicit. The token is decrypted here, handed to the push, and dropped;
+ * it is never logged, audited, or returned. Failures are reported with the
+ * provider's message only after it has been checked for credential material.
+ */
+projectsRouter.post('/:projectId/git/push', requireRole('ADMIN'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = gitPushSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true, name: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const integration = await prisma.integration.findUnique({
+    where: { id: input.integrationId },
+    select: { id: true, kind: true, config: true, configEnc: true, enabled: true },
+  });
+  if (!integration || !GIT_INTEGRATION_KINDS.includes(integration.kind as GitIntegrationKind)) {
+    throw notFound('Integration');
+  }
+  if (!integration.enabled) throw badRequest('That integration is disabled');
+  if (!integration.configEnc) throw badRequest('That integration has no token stored');
+
+  const config = parseGitConfig(integration.config);
+  if (!config.repo) throw badRequest('That integration has no repository configured');
+
+  const branch = input.branch ?? config.defaultBranch;
+  const token = openToken(
+    integration.configEnc,
+    config.keyVersion ?? 1,
+    actor.orgId,
+    integration.id,
+  );
+
+  const { tree } = await buildRepoTree({ projectId });
+
+  let result;
+  try {
+    result = await pushRepo(tree, {
+      kind: integration.kind as GitIntegrationKind,
+      repo: config.repo,
+      token,
+      branch,
+      message: input.message ?? `QAAI: sync ${tree.size} test files`,
+      authorName: 'QAAI',
+      authorEmail: 'bot@qaai.local',
+    });
+  } catch (err) {
+    // Never surface raw provider output: it can echo the request, and the token
+    // rode in an auth header. Report the shape of the failure, not its body.
+    const message = err instanceof Error ? err.message : 'Push failed';
+    const safe = message.replace(/\b[A-Za-z0-9_-]{20,}\b/g, '[redacted]');
+    await audit({
+      actor,
+      action: 'git.push.failed',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: { integrationId: integration.id, branch, reason: safe.slice(0, 200) },
+    });
+    throw badRequest(`Push failed: ${safe.slice(0, 300)}`);
+  }
+
+  await audit({
+    actor,
+    action: 'git.push',
+    targetType: 'Project',
+    targetId: projectId,
+    metadata: {
+      integrationId: integration.id,
+      branch: result.branch,
+      commitSha: result.commitSha,
+      files: result.fileCount,
+    },
+  });
+
+  res.json({ push: result });
 });
 
 /** Latest flow map, for the Flow Map screen (§8). */

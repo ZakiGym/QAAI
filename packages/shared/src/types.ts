@@ -148,6 +148,12 @@ export interface RunContext {
    * freely; the artifact writer and log serialiser mask any value that appears here.
    */
   secrets: Readonly<Record<string, string>>;
+  /**
+   * Test data, keyed by path relative to the workspace root (e.g.
+   * `fixtures/users.json`). Written into every run workspace so a spec can read
+   * its data off disk. Not secret — fixtures are committed alongside the tests.
+   */
+  fixtures?: Readonly<Record<string, string>>;
   /** Playwright storageState JSON from the auth profile, when one applies (§2). */
   storageState: unknown | null;
   /** Where the plugin writes screenshots/videos/traces. */

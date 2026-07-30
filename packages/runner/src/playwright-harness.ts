@@ -173,6 +173,21 @@ function safeSpecPath(dir: string, filePath: string): string {
   return full;
 }
 
+/**
+ * Same guard for a fixture, resolved against the workspace root rather than
+ * `tests/` — fixture paths already start with `fixtures/`, and a spec reads them
+ * relative to the workspace it runs in.
+ */
+function safeFixturePath(dir: string, filePath: string): string {
+  const cleaned = filePath.replace(/^[/\\]+/, '');
+  const full = resolve(join(dir, cleaned));
+  const root = resolve(dir);
+  if (!full.startsWith(root + sep)) {
+    throw new Error(`Refusing to write fixture outside the workspace: ${filePath}`);
+  }
+  return full;
+}
+
 const CONFIG_TEMPLATE = (opts: {
   baseUrl: string;
   timeoutMs: number;
@@ -223,6 +238,15 @@ async function createWorkspace(ctx: RunContext, test: ExecutableTest): Promise<W
     }),
     'utf8',
   );
+
+  // Test data, so a spec can read `fixtures/users.json` off disk. Written into
+  // every workspace: each run gets a fresh temp dir holding only its own spec,
+  // so a fixture that is not copied in simply would not exist at run time.
+  for (const [fixturePath, content] of Object.entries(ctx.fixtures ?? {})) {
+    const target = safeFixturePath(dir, fixturePath);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content, 'utf8');
+  }
 
   // Storage state from the environment's auth profile, when one applies (§2).
   if (ctx.storageState) {
