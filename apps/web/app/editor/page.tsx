@@ -81,7 +81,10 @@ export default function EditorPage() {
         }
         setProject(first);
         const loaded = await loadTests(first.id);
-        if (loaded[0]) void openFile(first.id, loaded[0].id);
+        // ⌘P quick-open lands here as ?test=<id>; fall back to the first test.
+        const wanted = new URLSearchParams(window.location.search).get('test');
+        const target = (wanted && loaded.find((t) => t.id === wanted)) || loaded[0];
+        if (target) void openFile(first.id, target.id);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
           router.push('/login');
@@ -194,6 +197,23 @@ export default function EditorPage() {
     return () => window.removeEventListener('beforeunload', onBeforeUnload);
   }, [dirty]);
 
+  // ⌘P quick-open dispatches this when the editor is already mounted — a
+  // query-only navigation would not remount the page, so the ?test= read on
+  // mount never re-fires. A ref keeps the listener on the current handler
+  // (which honours the discard-confirm inside openFile).
+  const openTestRef = useRef<(testId: string) => void>(() => {});
+  openTestRef.current = (testId: string) => {
+    if (project) void openFile(project.id, testId);
+  };
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const id = (e as CustomEvent<string>).detail;
+      if (id) openTestRef.current(id);
+    };
+    window.addEventListener('qaai:open-test', onOpen);
+    return () => window.removeEventListener('qaai:open-test', onOpen);
+  }, []);
+
   async function createTest() {
     if (!project) return;
     const name = prompt('Test name', 'New test');
@@ -242,12 +262,9 @@ export default function EditorPage() {
   }
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="app-drag border-line flex shrink-0 items-center gap-4 border-b px-5 py-3">
-        <Link href="/runs" className="text-sm font-semibold tracking-tight">
-          QAAI
-        </Link>
-        <span className="text-ink-dim text-sm">Editor</span>
+    <div className="flex h-full flex-col">
+      <header className="border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
+        <span className="text-ink-dim text-sm font-medium">Editor</span>
         {openTest && (
           <span className="text-ink-faint font-mono text-xs">
             {openTest.filePath}

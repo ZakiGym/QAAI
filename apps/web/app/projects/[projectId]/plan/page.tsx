@@ -129,11 +129,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
 
   return (
     <main className="mx-auto max-w-2xl px-6 py-12">
-      <Link href="/runs" className="text-ink-faint hover:text-ink text-sm">
-        ← Runs
-      </Link>
-
-      <h1 className="mt-6 text-3xl font-semibold tracking-tight">Proposed test plan</h1>
+      <h1 className="text-3xl font-semibold tracking-tight">Proposed test plan</h1>
       <p className="text-ink-dim mt-2">{plan.summary}</p>
 
       {alreadyGenerated > 0 && (

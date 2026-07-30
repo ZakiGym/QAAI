@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
-import { TopNav } from '../../components/TopNav';
 
 /**
  * A read-only overview of the fleet. Everything shown is derived client-side
@@ -54,12 +53,10 @@ export default function DashboardPage() {
   const timeline = runs.slice(0, 30).reverse();
 
   return (
-    <>
-      <TopNav />
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        <h1 className="mb-8 text-2xl font-semibold tracking-tight">Dashboard</h1>
+    <main className="mx-auto max-w-5xl px-6 py-10">
+      <h1 className="mb-8 text-2xl font-semibold tracking-tight">Dashboard</h1>
 
-        {error && (
+      {error && (
         <p
           role="alert"
           className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
@@ -171,7 +168,6 @@ export default function DashboardPage() {
           )}
         </div>
       </section>
-      </main>
-    </>
+    </main>
   );
 }

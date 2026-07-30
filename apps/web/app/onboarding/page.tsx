@@ -134,14 +134,8 @@ export default function OnboardingPage() {
   }
 
   return (
-    <>
-      <div className="app-drag-strip" />
-      <main className="mx-auto max-w-xl px-6 py-16">
-        <Link href="/runs" className="text-ink-faint hover:text-ink text-sm">
-          ← Runs
-        </Link>
-
-        <h1 className="mt-6 text-3xl font-semibold tracking-tight">Add your app</h1>
+    <main className="mx-auto max-w-xl px-6 py-16">
+      <h1 className="text-3xl font-semibold tracking-tight">Add your app</h1>
         <p className="text-ink-dim mt-2">
           QAAI will crawl it, map the flows, and propose a test plan you approve.
         </p>
@@ -274,7 +268,6 @@ export default function OnboardingPage() {
             )}
           </div>
         )}
-      </main>
-    </>
+    </main>
   );
 }

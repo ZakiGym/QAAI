@@ -115,8 +115,8 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const step = selected?.steps.find((s) => s.index === selectedStep) ?? null;
 
   return (
-    <div className="flex h-screen flex-col">
-      <header className="app-drag border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
+    <div className="flex h-full flex-col">
+      <header className="border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
         <Link
           href="/runs"
           className="text-ink-dim hover:text-ink hover:border-accent border-line flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors"

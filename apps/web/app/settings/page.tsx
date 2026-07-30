@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
-import { TopNav } from '../../components/TopNav';
 
 /** The shape of GET /auth/me — declared here since it is settings-specific. */
 interface Org {
@@ -55,12 +54,10 @@ export default function SettingsPage() {
   const activeOrg = me?.orgs.find((org) => org.id === me.activeOrgId) ?? null;
 
   return (
-    <>
-      <TopNav />
-      <main className="mx-auto max-w-3xl px-6 py-10">
-        <h1 className="mb-8 text-2xl font-semibold tracking-tight">Settings</h1>
+    <main className="mx-auto max-w-3xl px-6 py-10">
+      <h1 className="mb-8 text-2xl font-semibold tracking-tight">Settings</h1>
 
-        {error && (
+      {error && (
         <p
           role="alert"
           className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
@@ -95,8 +92,7 @@ export default function SettingsPage() {
       ) : (
         <ApiKeysTab />
       )}
-      </main>
-    </>
+    </main>
   );
 }
 

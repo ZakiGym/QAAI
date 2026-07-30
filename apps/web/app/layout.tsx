@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import { DesktopChrome } from '../components/DesktopChrome';
+import { AppShell } from '../components/shell/AppShell';
 
 export const metadata: Metadata = {
   title: 'QAAI — Your AI QA engineer',
@@ -13,7 +14,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="en">
       <body className="min-h-screen antialiased">
         <DesktopChrome />
-        {children}
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );

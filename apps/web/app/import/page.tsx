@@ -163,14 +163,8 @@ export default function ImportPage() {
   }
 
   return (
-    <>
-      <div className="app-drag-strip" />
-      <main className="mx-auto max-w-2xl px-6 py-14">
-        <Link href="/runs" className="text-ink-faint hover:text-ink text-sm">
-          ← Runs
-        </Link>
-
-        <h1 className="mt-6 text-3xl font-semibold tracking-tight">Import an existing suite</h1>
+    <main className="mx-auto max-w-2xl px-6 py-14">
+      <h1 className="text-3xl font-semibold tracking-tight">Import an existing suite</h1>
         <p className="text-ink-dim mt-2">
           Cypress, Selenium, WebdriverIO, Puppeteer, TestCafe, Nightwatch, Robot Framework, Postman,
           Karate, or Cucumber. QAAI detects it, converts to Playwright, and reports what you gained.
@@ -293,7 +287,6 @@ export default function ImportPage() {
         )}
 
         {error && <p className="text-fail mt-6 text-sm">{error}</p>}
-      </main>
-    </>
+    </main>
   );
 }

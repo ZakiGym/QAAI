@@ -226,6 +226,7 @@ export function CodeEditor({
         automaticLayout: true,
         tabSize: 2,
         padding: { top: 14, bottom: 14 },
+        stickyScroll: { enabled: true },
         bracketPairColorization: { enabled: true },
         suggestSelection: 'first',
         fixedOverflowWidgets: true,

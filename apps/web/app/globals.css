@@ -62,35 +62,18 @@ body {
  * Desktop window chrome.
  *
  * Only applies when DesktopChrome has marked the document, so the browser build
- * is untouched. Two problems to solve, both created by hiding the title bar:
+ * is untouched. Hiding the title bar creates two problems, solved by the two
+ * drag mechanisms below:
  *
- *  1. No draggable region — the window cannot be moved at all. Any element
- *     marked `.app-drag` becomes one.
+ *  1. No draggable region — the window cannot be moved at all. Inside the shell
+ *     the sidebar is the handle (`.app-sidebar-drag`); the two pages that stand
+ *     outside the shell (login, marketing) get a thin `.app-drag-strip`.
  *  2. macOS draws the close/minimise/zoom buttons over the top-left of the
- *     page. The header needs to start to the right of them.
+ *     page, so whichever element owns that corner insets to clear them.
  *
- * The child rule matters as much as the parent: a drag region swallows clicks
- * from everything inside it, so every interactive descendant has to opt back
- * out or the header's buttons stop working.
+ * A drag region swallows clicks from everything inside it, so every interactive
+ * descendant has to opt back out or its buttons stop working.
  */
-[data-desktop] .app-drag {
-  -webkit-app-region: drag;
-}
-
-/* Only macOS overlays its window buttons on the page; other platforms keep a
-   real frame, so reserving 78px there would just be a gap. */
-[data-desktop][data-desktop-platform='mac'] .app-drag {
-  padding-left: 78px;
-}
-
-[data-desktop] .app-drag button,
-[data-desktop] .app-drag a,
-[data-desktop] .app-drag input,
-[data-desktop] .app-drag select,
-[data-desktop] .app-drag textarea,
-[data-desktop] .app-drag [role='button'] {
-  -webkit-app-region: no-drag;
-}
 
 /* Pages with no header of their own still need somewhere to grab. */
 [data-desktop] .app-drag-strip {
@@ -101,6 +84,25 @@ body {
   right: 0;
   height: 38px;
   z-index: 40;
+}
+
+/*
+ * The left sidebar is now the window's drag handle. Unlike the old top header,
+ * the traffic lights sit over its TOP-LEFT, so the inset is vertical
+ * (padding-top) rather than the header's horizontal padding-left. Interactive
+ * descendants opt back out or their clicks get swallowed by the drag region.
+ */
+[data-desktop] .app-sidebar-drag {
+  -webkit-app-region: drag;
+}
+[data-desktop] .app-sidebar-drag a,
+[data-desktop] .app-sidebar-drag button,
+[data-desktop] .app-sidebar-drag input,
+[data-desktop] .app-sidebar-drag [role='button'] {
+  -webkit-app-region: no-drag;
+}
+[data-desktop][data-desktop-platform='mac'] .app-sidebar-drag {
+  padding-top: 40px;
 }
 
 /* A scrollbar that does not scream in a dark UI. */

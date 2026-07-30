@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
-import { TopNav } from '../../components/TopNav';
 
 export default function RunsPage() {
   const router = useRouter();
@@ -56,10 +55,8 @@ export default function RunsPage() {
   }
 
   return (
-    <>
-      <TopNav />
-      <main className="mx-auto max-w-5xl px-6 py-10">
-        {error && (
+    <main className="mx-auto max-w-5xl px-6 py-10">
+      {error && (
           <p
             role="alert"
             className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
@@ -152,7 +149,6 @@ export default function RunsPage() {
             )}
           </div>
         </section>
-      </main>
-    </>
+    </main>
   );
 }
