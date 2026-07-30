@@ -2,6 +2,7 @@
 
 import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { API_URL, api, artifactUrl, type Run, type TestResult } from '../../../lib/api';
 import { SeverityLabel, StatusDot, VerdictChip, duration } from '../../../components/ui';
 
@@ -15,11 +16,37 @@ import { SeverityLabel, StatusDot, VerdictChip, duration } from '../../../compon
 export default function CockpitPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = use(params);
 
+  const router = useRouter();
   const [run, setRun] = useState<Run | null>(null);
   const [selectedTestId, setSelectedTestId] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
   const [live, setLive] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [rerunning, setRerunning] = useState(false);
+
+  /**
+   * Re-run the exact same tests against the same environment. Passing the
+   * original test ids rather than the whole project means "re-run" reproduces
+   * what you were just looking at, even if it was a subset.
+   */
+  async function rerun() {
+    if (!run || rerunning) return;
+    setRerunning(true);
+    try {
+      const { run: fresh } = await api<{ run: { id: string } }>('/runs', {
+        method: 'POST',
+        body: JSON.stringify({
+          environmentId: run.environmentId,
+          testIds: run.results?.map((r) => r.test.id) ?? null,
+          trigger: 'MANUAL',
+        }),
+      });
+      router.push(`/runs/${fresh.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not start the re-run');
+      setRerunning(false);
+    }
+  }
 
   const load = useCallback(async () => {
     try {
@@ -89,12 +116,17 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
 
   return (
     <div className="flex h-screen flex-col">
-      <header className="app-drag border-line flex shrink-0 items-center gap-4 border-b px-5 py-3">
-        <Link href="/runs" className="text-sm font-semibold tracking-tight">
-          QAAI
+      <header className="app-drag border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
+        <Link
+          href="/runs"
+          className="text-ink-dim hover:text-ink hover:border-accent border-line flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors"
+          title="Back to all runs"
+        >
+          <span aria-hidden>←</span> Runs
         </Link>
-        <StatusDot status={run.status} />
-        <span className="font-mono text-xs">{run.id.slice(-8)}</span>
+        <span className="border-line rounded-md border px-2 py-0.5 font-mono text-[11px]">
+          {run.id.slice(-8)}
+        </span>
         <span className="text-ink-dim text-sm">{run.environment.name}</span>
 
         <div className="ml-auto flex items-center gap-3 text-xs">
@@ -111,10 +143,19 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               gate {run.gateResult.passed ? 'pass' : 'block'}
             </span>
           )}
-          <Link href="/editor" className="text-ink-faint hover:text-ink">
-            Editor
-          </Link>
-          <a href={`${API_URL}/runs/${run.id}/junit.xml`} className="text-ink-faint hover:text-ink">
+          <button
+            type="button"
+            onClick={() => void rerun()}
+            disabled={rerunning || run.status === 'RUNNING' || run.status === 'QUEUED'}
+            className="bg-accent rounded-md px-2.5 py-1 font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+            title="Run the same tests again"
+          >
+            {rerunning ? 'Starting…' : '↻ Re-run'}
+          </button>
+          <a
+            href={`${API_URL}/runs/${run.id}/junit.xml`}
+            className="text-ink-faint hover:text-ink transition-colors"
+          >
             JUnit XML
           </a>
         </div>

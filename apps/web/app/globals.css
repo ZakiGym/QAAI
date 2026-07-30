@@ -6,26 +6,56 @@
  * where a QA engineer spends the day.
  */
 @theme {
-  --color-ink: #e8eaed;
-  --color-ink-dim: #9aa3ad;
-  --color-ink-faint: #6b7480;
-  --color-surface: #0e1013;
-  --color-surface-1: #14171c;
-  --color-surface-2: #1b1f26;
-  --color-line: #262b33;
-  --color-accent: #4c8dff;
+  --color-ink: #e9ecf1;
+  --color-ink-dim: #99a1ad;
+  --color-ink-faint: #646c7a;
+  --color-surface: #0b0d11;
+  --color-surface-1: #14171d;
+  --color-surface-2: #1c2029;
+  --color-line: #262b34;
+  --color-line-strong: #333a45;
+  --color-accent: #5b8dff;
+  --color-accent-2: #8b5cff;
   --color-pass: #3fb950;
   --color-fail: #f85149;
-  --color-flake: #d29922;
-  --color-skip: #6b7480;
+  --color-flake: #e3a723;
+  --color-skip: #646c7a;
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
 }
 
 html,
 body {
-  background: var(--color-surface);
+  /*
+   * A near-black base with two faint accent glows in the top corners. It reads
+   * as depth rather than a flat panel, which is most of the difference between
+   * "basic" and "considered" in a dark UI — without pulling attention.
+   */
+  background:
+    radial-gradient(60rem 40rem at 100% -10%, color-mix(in srgb, var(--color-accent) 7%, transparent), transparent 60%),
+    radial-gradient(50rem 40rem at -10% -20%, color-mix(in srgb, var(--color-accent-2) 6%, transparent), transparent 55%),
+    var(--color-surface);
+  background-attachment: fixed;
   color: var(--color-ink);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Cards and interactive surfaces lift slightly on hover — the app should feel
+   alive under the cursor rather than static. */
+.lift {
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease,
+    transform 0.15s ease;
+}
+.lift:hover {
+  border-color: var(--color-line-strong);
+  transform: translateY(-1px);
+}
+
+/* The brand gradient, used on the logo mark and the odd accent. */
+.brand-gradient {
+  background: linear-gradient(135deg, var(--color-accent), var(--color-accent-2));
 }
 
 /*

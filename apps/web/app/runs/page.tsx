@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
+import { TopNav } from '../../components/TopNav';
 
 export default function RunsPage() {
   const router = useRouter();
@@ -55,106 +56,103 @@ export default function RunsPage() {
   }
 
   return (
-    <main className="mx-auto max-w-5xl px-6 py-10">
-      <header className="app-drag -mx-6 mb-10 flex items-baseline gap-4 px-6 py-3">
-        <Link href="/" className="text-base font-semibold tracking-tight">
-          QAAI
-        </Link>
-        <h1 className="text-ink-dim text-sm">Runs</h1>
-        <Link href="/onboarding" className="text-ink-dim hover:text-ink ml-auto text-sm">
-          Add app
-        </Link>
-        <Link href="/import" className="text-ink-dim hover:text-ink text-sm">
-          Import
-        </Link>
-        <Link href="/dashboard" className="text-ink-dim hover:text-ink text-sm">
-          Dashboard
-        </Link>
-        <Link href="/editor" className="text-ink-dim hover:text-ink text-sm">
-          Editor
-        </Link>
-        <Link href="/settings" className="text-ink-dim hover:text-ink text-sm">
-          Settings
-        </Link>
-      </header>
+    <>
+      <TopNav />
+      <main className="mx-auto max-w-5xl px-6 py-10">
+        {error && (
+          <p
+            role="alert"
+            className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
+          >
+            {error}
+          </p>
+        )}
 
-      {error && (
-        <p
-          role="alert"
-          className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
-        >
-          {error}
-        </p>
-      )}
-
-      <section className="mb-10">
-        <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
-          Projects
-        </h2>
-        <div className="grid gap-3 sm:grid-cols-2">
-          {projects.map((project) => (
-            <div key={project.id} className="border-line bg-surface-1 rounded-lg border p-4">
-              <div className="flex items-baseline justify-between">
-                <h3 className="font-medium">{project.name}</h3>
-                <span className="text-ink-faint font-mono text-xs">
-                  {project.primaryFramework.toLowerCase()}
-                </span>
-              </div>
-              <p className="text-ink-faint mt-1 text-xs">
-                {project._count.tests} tests · {project._count.runs} runs
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {project.environments.map((env) => (
-                  <button
-                    key={env.id}
-                    type="button"
-                    disabled={starting}
-                    onClick={() => void startRun(env.id)}
-                    className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
-                  >
-                    Run against {env.name}
-                  </button>
-                ))}
-              </div>
-            </div>
-          ))}
-          {projects.length === 0 && (
-            <p className="text-ink-faint text-sm">
-              No projects yet. Run <code className="font-mono">npm run db:seed</code>.
-            </p>
-          )}
-        </div>
-      </section>
-
-      <section>
-        <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
-          Recent runs
-        </h2>
-        <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
-          {runs.map((run) => (
-            <Link
-              key={run.id}
-              href={`/runs/${run.id}`}
-              className="hover:bg-surface-1 flex items-center gap-4 px-4 py-3"
-            >
-              <StatusDot status={run.status} />
-              <span className="font-mono text-xs">{run.id.slice(-8)}</span>
-              <span className="text-ink-dim text-sm">
-                {run.environment.name} · {run.trigger.toLowerCase()}
-              </span>
-              <span className="ml-auto flex items-center gap-3 text-xs">
-                <span className="text-pass">{run.passedCount} passed</span>
-                {run.failedCount > 0 && <span className="text-fail">{run.failedCount} failed</span>}
-                {run.flakyCount > 0 && <span className="text-flake">{run.flakyCount} flaky</span>}
-                <span className="text-ink-faint">{relativeTime(run.queuedAt)}</span>
-              </span>
+        <section className="mb-12">
+          <div className="mb-4 flex items-baseline justify-between">
+            <h1 className="text-2xl font-semibold tracking-tight">Projects</h1>
+            <Link href="/onboarding" className="text-accent text-sm hover:underline">
+              + Add app
             </Link>
-          ))}
-          {runs.length === 0 && (
-            <p className="text-ink-faint px-4 py-8 text-center text-sm">No runs yet.</p>
-          )}
-        </div>
-      </section>
-    </main>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {projects.map((project) => (
+              <div key={project.id} className="border-line bg-surface-1 lift rounded-xl border p-5">
+                <div className="flex items-baseline justify-between">
+                  <h3 className="font-medium">{project.name}</h3>
+                  <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-[10px]">
+                    {project.primaryFramework.toLowerCase()}
+                  </span>
+                </div>
+                <p className="text-ink-faint mt-1.5 text-xs">
+                  {project._count.tests} tests · {project._count.runs} runs
+                </p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {project.environments.map((env) => (
+                    <button
+                      key={env.id}
+                      type="button"
+                      disabled={starting}
+                      onClick={() => void startRun(env.id)}
+                      className="bg-accent rounded-md px-3 py-1.5 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+                    >
+                      ▶ Run {env.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+            {projects.length === 0 && (
+              <p className="text-ink-faint text-sm">
+                No projects yet.{' '}
+                <Link href="/onboarding" className="text-accent hover:underline">
+                  Add your app
+                </Link>
+                .
+              </p>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <h2 className="mb-4 text-lg font-semibold tracking-tight">Recent runs</h2>
+          <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
+            {runs.map((run) => (
+              <Link
+                key={run.id}
+                href={`/runs/${run.id}`}
+                className="hover:bg-surface-2 flex items-center gap-4 px-4 py-3.5 transition-colors"
+              >
+                <StatusDot status={run.status} />
+                <span className="border-line text-ink-dim rounded border px-1.5 py-0.5 font-mono text-[11px]">
+                  {run.id.slice(-8)}
+                </span>
+                <span className="text-ink-dim text-sm">
+                  {run.environment.name}
+                  <span className="text-ink-faint"> · {run.trigger.toLowerCase()}</span>
+                </span>
+                <span className="ml-auto flex items-center gap-3 text-xs">
+                  {run.passedCount > 0 && (
+                    <span className="text-pass">{run.passedCount} passed</span>
+                  )}
+                  {run.failedCount > 0 && (
+                    <span className="text-fail">{run.failedCount} failed</span>
+                  )}
+                  {run.flakyCount > 0 && <span className="text-flake">{run.flakyCount} flaky</span>}
+                  <span className="text-ink-faint w-16 text-right">
+                    {relativeTime(run.queuedAt)}
+                  </span>
+                </span>
+              </Link>
+            ))}
+            {runs.length === 0 && (
+              <p className="text-ink-faint px-4 py-10 text-center text-sm">
+                No runs yet — run a project above.
+              </p>
+            )}
+          </div>
+        </section>
+      </main>
+    </>
   );
 }

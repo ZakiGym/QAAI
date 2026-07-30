@@ -1,9 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
+import { TopNav } from '../../components/TopNav';
 
 /** The shape of GET /auth/me — declared here since it is settings-specific. */
 interface Org {
@@ -55,21 +55,12 @@ export default function SettingsPage() {
   const activeOrg = me?.orgs.find((org) => org.id === me.activeOrgId) ?? null;
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-10">
-      <header className="app-drag -mx-6 mb-10 flex items-baseline gap-4 px-6 py-3">
-        <Link href="/" className="text-base font-semibold tracking-tight">
-          QAAI
-        </Link>
-        <h1 className="text-ink-dim text-sm">Settings</h1>
-        <Link href="/runs" className="text-ink-dim hover:text-ink ml-auto text-sm">
-          Runs
-        </Link>
-        <Link href="/editor" className="text-ink-dim hover:text-ink text-sm">
-          Editor
-        </Link>
-      </header>
+    <>
+      <TopNav />
+      <main className="mx-auto max-w-3xl px-6 py-10">
+        <h1 className="mb-8 text-2xl font-semibold tracking-tight">Settings</h1>
 
-      {error && (
+        {error && (
         <p
           role="alert"
           className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm"
@@ -104,7 +95,8 @@ export default function SettingsPage() {
       ) : (
         <ApiKeysTab />
       )}
-    </main>
+      </main>
+    </>
   );
 }
 

@@ -97,6 +97,7 @@ export interface TestResult {
 
 export interface Run {
   id: string;
+  environmentId: string;
   status: 'QUEUED' | 'RUNNING' | 'PASSED' | 'FAILED' | 'CANCELLED' | 'ERRORED';
   trigger: string;
   queuedAt: string;
