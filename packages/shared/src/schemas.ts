@@ -377,6 +377,29 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Cross-browser & localisation (§4) ───────────────────────────────────────
+
+export const BROWSER_ENGINES = ['chromium', 'firefox', 'webkit'] as const;
+
+/** Chromium is always run; listing it again is harmless. */
+export const crossBrowserSpecSchema = z.object({
+  browsers: z.array(z.enum(BROWSER_ENGINES)).min(1).default(['chromium', 'firefox', 'webkit']),
+});
+
+export const localizationSpecSchema = z.object({
+  locales: z
+    .array(
+      z.object({
+        /** BCP-47, e.g. `de-DE`. */
+        tag: z.string().min(2).max(35),
+        /** IANA zone. Half of localisation bugs are date and currency formatting. */
+        timezone: z.string().max(64).optional(),
+      }),
+    )
+    .min(1)
+    .max(20),
+});
+
 // ─── Schedules & monitors (§6) ───────────────────────────────────────────────
 
 /** Standard 5-field cron. Validated on the worker too, which disables a bad one. */

@@ -188,6 +188,18 @@ function safeFixturePath(dir: string, filePath: string): string {
   return full;
 }
 
+/** Playwright's device preset for a browser engine. */
+function deviceFor(browserName: string): string {
+  switch (browserName) {
+    case 'firefox':
+      return 'Desktop Firefox';
+    case 'webkit':
+      return 'Desktop Safari';
+    default:
+      return 'Desktop Chrome';
+  }
+}
+
 const CONFIG_TEMPLATE = (opts: {
   baseUrl: string;
   timeoutMs: number;
@@ -195,7 +207,13 @@ const CONFIG_TEMPLATE = (opts: {
   outputDir: string;
   /** Cloud grid websocket endpoint. Credential-bearing — never logged. */
   gridWsEndpoint?: string | null;
-}) => `import { defineConfig } from '@playwright/test';
+  /**
+   * One Playwright project per browser or locale. Cross-browser and
+   * localisation are the same mechanism — run the identical spec under a
+   * different `use` block — so they share this rather than forking the harness.
+   */
+  projects?: Array<{ name: string; browserName?: string; locale?: string; timezoneId?: string }>;
+}) => `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests',
@@ -207,7 +225,25 @@ export default defineConfig({
   workers: 1,
   reporter: [['json', { outputFile: 'report.json' }]],
   timeout: ${opts.timeoutMs},
-  outputDir: ${JSON.stringify(opts.outputDir)},
+  outputDir: ${JSON.stringify(opts.outputDir)},${
+    opts.projects?.length
+      ? `
+  projects: [
+${opts.projects
+  .map(
+    (p) =>
+      `    { name: ${JSON.stringify(p.name)}, use: { ${[
+        p.browserName ? `...devices[${JSON.stringify(deviceFor(p.browserName))}]` : null,
+        p.locale ? `locale: ${JSON.stringify(p.locale)}` : null,
+        p.timezoneId ? `timezoneId: ${JSON.stringify(p.timezoneId)}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ')} } },`,
+  )
+  .join('\n')}
+  ],`
+      : ''
+  }
   use: {
     baseURL: ${JSON.stringify(opts.baseUrl)},${
       opts.gridWsEndpoint
@@ -225,7 +261,11 @@ export default defineConfig({
 });
 `;
 
-async function createWorkspace(ctx: RunContext, test: ExecutableTest): Promise<Workspace> {
+async function createWorkspace(
+  ctx: RunContext,
+  test: ExecutableTest,
+  projects?: HarnessOptions['projects'],
+): Promise<Workspace> {
   await mkdir(runsRoot, { recursive: true });
   const dir = await mkdtemp(join(runsRoot, 'run-'));
   const outputDir = join(dir, 'artifacts');
@@ -244,6 +284,7 @@ async function createWorkspace(ctx: RunContext, test: ExecutableTest): Promise<W
       retryOnce: ctx.determinism.retryOnce,
       outputDir,
       gridWsEndpoint: ctx.grid?.wsEndpoint ?? null,
+      projects,
     }),
     'utf8',
   );
@@ -454,6 +495,8 @@ function toConsoleEntries(result: PwResult | undefined): ConsoleEntry[] {
 export interface HarnessOptions {
   /** Reported on the TestExecution; lets smoke reuse this harness verbatim. */
   network?: NetworkEntry[];
+  /** Run the spec once per entry — a browser matrix, or a locale matrix. */
+  projects?: Array<{ name: string; browserName?: string; locale?: string; timezoneId?: string }>;
 }
 
 /** Runs one generated spec file and maps the result into QAAI's shape. */
@@ -462,7 +505,7 @@ export async function runPlaywrightSpec(
   test: ExecutableTest,
   options: HarnessOptions = {},
 ): Promise<TestExecution> {
-  const ws = await createWorkspace(ctx, test);
+  const ws = await createWorkspace(ctx, test, options.projects);
   const startedAt = Date.now();
 
   try {
@@ -477,6 +520,32 @@ export async function runPlaywrightSpec(
     }
 
     const { videoKey, traceKey, screenshotKeys } = await uploadArtifacts(ws, ctx, test.id);
+
+    /**
+     * A browser engine that was never installed is an environment gap, not a
+     * failing test. Reporting it as FAILED would say the customer's app is
+     * broken when the truth is `npx playwright install` was never run — the
+     * same distinction k6 makes when its binary is missing.
+     */
+    const combinedOutput = `${outcome.stderr}\n${outcome.stdout}`;
+    if (/Executable doesn't exist at|browserType\.launch: Executable/.test(combinedOutput)) {
+      const engine = /(chromium|firefox|webkit)-\d+/.exec(combinedOutput)?.[1] ?? 'a browser';
+      return {
+        testId: test.id,
+        status: 'SKIPPED',
+        durationMs: Date.now() - startedAt,
+        steps: [],
+        network: options.network ?? [],
+        console: [],
+        videoKey,
+        traceKey,
+        errorMessage:
+          `${engine} is not installed on this worker, so the test was not evaluated. ` +
+          `Run \`npx playwright install ${engine === 'a browser' ? '' : engine}\`.`,
+        retriedAndPassed: false,
+        findings: [],
+      };
+    }
 
     // No report at all means the spec did not compile or Playwright itself
     // failed — an ENV_ISSUE in triage terms, not a test failure.
