@@ -47,6 +47,14 @@ export interface CopilotJob {
   userMessageId: string;
 }
 
+export interface ImportJob {
+  orgId: string;
+  projectId: string;
+  /** Persisted on the ImportBatch row; the worker reads the files from there. */
+  importBatchId: string;
+  requestedBy: string;
+}
+
 export interface NotifyJob {
   orgId: string;
   event: string;
@@ -65,6 +73,7 @@ export interface JobPayloads {
   'qaai.triage': TriageJob;
   'qaai.notify': NotifyJob;
   'qaai.copilot': CopilotJob;
+  'qaai.import': ImportJob;
   'qaai.schedule': ScheduleTickJob;
 }
 

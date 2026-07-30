@@ -1015,6 +1015,40 @@ enum ProposalState {
   REJECTED
 }
 
+enum ImportState {
+  DETECTED
+  CONVERTING
+  DONE
+  ERRORED
+}
+
+/// A suite migration (§7): upload existing tests → convert to Playwright.
+///
+/// The uploaded files and the conversion result live on the row so the whole
+/// batch is one auditable, resumable unit. Detection runs synchronously in the
+/// request; conversion is the worker's job because it calls the model.
+model ImportBatch {
+  id             String      @id @default(cuid())
+  orgId          String
+  projectId      String
+  /// Detected source framework (a SourceFramework from packages/agent).
+  framework      String
+  detectionConfidence Float  @default(0)
+  /// SourceFile[] — [{ path, content }]. The suite as uploaded.
+  files          Json
+  state          ImportState @default(DETECTED)
+  /// Free-text conversion summary once the worker finishes.
+  summary        String?
+  /// How many tests were produced, for the coverage report.
+  convertedCount Int         @default(0)
+  error          String?
+  requestedBy    String
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([orgId, projectId])
+}
+
 /// A file change the copilot wants to make, held for human approval (§3).
 ///
 /// The copilot never writes a test directly. It proposes, the person reads the

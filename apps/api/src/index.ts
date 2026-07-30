@@ -25,6 +25,7 @@ import { runsRouter } from './routes/runs.js';
 import { copilotRouter } from './routes/copilot.js';
 import { settingsRouter } from './routes/settings.js';
 import { recordRouter } from './routes/record.js';
+import { importRouter } from './routes/import.js';
 
 const app = express();
 
@@ -103,6 +104,7 @@ app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
 app.use('/settings', settingsRouter);
 app.use('/', recordRouter);
+app.use('/', importRouter);
 app.use('/', agentRouter);
 
 app.use(notFoundHandler);

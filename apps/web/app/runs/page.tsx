@@ -64,6 +64,9 @@ export default function RunsPage() {
         <Link href="/onboarding" className="text-ink-dim hover:text-ink ml-auto text-sm">
           Add app
         </Link>
+        <Link href="/import" className="text-ink-dim hover:text-ink text-sm">
+          Import
+        </Link>
         <Link href="/dashboard" className="text-ink-dim hover:text-ink text-sm">
           Dashboard
         </Link>

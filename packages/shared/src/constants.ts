@@ -238,6 +238,7 @@ export const QUEUE_NAMES = {
   generate: 'qaai.generate',
   triage: 'qaai.triage',
   copilot: 'qaai.copilot',
+  import: 'qaai.import',
   schedule: 'qaai.schedule',
   notify: 'qaai.notify',
 } as const;
