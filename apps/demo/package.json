@@ -1,0 +1,23 @@
+{
+  "name": "@qaai/demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bundled demo store — the app QAAI tests during onboarding and offline demos",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "mailparser": "^3.9.14",
+    "smtp-server": "^3.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/mailparser": "^3.4.6",
+    "@types/smtp-server": "^3.5.13"
+  }
+}

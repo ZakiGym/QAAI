@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // The worker pulls in @qaai/agent, whose crawler typechecks its
+    // page.evaluate() callbacks as browser code. Node lib alone is not enough.
+    "lib": ["ES2023", "DOM"],
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

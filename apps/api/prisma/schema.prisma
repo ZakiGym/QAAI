@@ -1,0 +1,1093 @@
+// QAAI data model.
+//
+// Tenancy rule (§1): every table that holds customer data carries `orgId` and is
+// indexed on it. `apps/api/src/lib/prisma.ts` installs a Prisma extension that
+// injects the org filter on every read and stamps it on every write — models are
+// NOT trusted to scope themselves. The handful of genuinely global tables
+// (User, Session, FeatureFlag, ...) are listed in GLOBAL_MODELS there.
+
+// Prisma 7: the connection URL lives in prisma.config.ts (for Migrate) and is
+// supplied to PrismaClient through a driver adapter (see src/lib/prisma.ts).
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enums — mirror packages/shared/src/constants.ts. Keep in sync; `npm run
+// check:enums -w @qaai/api` diffs them and fails CI on drift.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum Plan {
+  FREE
+  TEAM
+  BUSINESS
+  ENTERPRISE
+}
+
+enum EnvironmentKind {
+  LOCAL
+  PREVIEW
+  STAGING
+  PRODUCTION
+}
+
+enum AuthProfileKind {
+  FORM_LOGIN
+  MAGIC_LINK
+  SSO_BYPASS_TOKEN
+  COOKIE_INJECTION
+  TOTP_MFA
+}
+
+enum TestType {
+  E2E
+  SMOKE
+  INTEGRATION
+  API
+  VISUAL
+  ACCESSIBILITY
+  LOAD
+  SECURITY_SMOKE
+  UNIT_GEN
+  CROSS_BROWSER
+  LOCALIZATION
+  EMAIL_OTP
+}
+
+enum Priority {
+  CRITICAL_PATH
+  IMPORTANT
+  NICE_TO_HAVE
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  PASSED
+  FAILED
+  CANCELLED
+  ERRORED
+}
+
+enum RunTrigger {
+  MANUAL
+  SCHEDULE
+  CI
+  WEBHOOK
+  MONITOR
+}
+
+enum TestResultStatus {
+  PASSED
+  FAILED
+  SKIPPED
+  FLAKY
+  TIMED_OUT
+}
+
+enum StepStatus {
+  PASSED
+  FAILED
+  SKIPPED
+}
+
+enum Verdict {
+  REAL_BUG
+  INTENDED_CHANGE
+  FLAKE
+  ENV_ISSUE
+}
+
+enum VerdictReviewState {
+  PENDING
+  ACCEPTED
+  OVERRIDDEN
+  MUTED
+}
+
+enum HealRisk {
+  SELECTOR_ONLY
+  ASSERTION_CHANGE
+  STRUCTURAL
+}
+
+enum HealState {
+  PROPOSED
+  APPROVED
+  REJECTED
+  APPLIED
+  AUTO_APPLIED
+}
+
+enum Language {
+  TYPESCRIPT
+  JAVASCRIPT
+  JAVA
+  PYTHON
+  CSHARP
+  RUBY
+  KOTLIN
+  GO
+  PHP
+}
+
+enum UiFramework {
+  PLAYWRIGHT
+  CYPRESS
+  WEBDRIVERIO
+  PUPPETEER
+  NIGHTWATCH
+  TESTCAFE
+  SELENIUM
+  CAPYBARA
+  PANTHER
+  CODECEPTION
+  CHROMEDP
+  APPIUM
+  MAESTRO
+  DETOX
+  ESPRESSO
+  XCUITEST
+}
+
+enum FindingKind {
+  ACCESSIBILITY
+  SECURITY
+  PERFORMANCE
+  LOCALIZATION
+  VISUAL
+}
+
+enum FindingSeverity {
+  CRITICAL
+  SERIOUS
+  MODERATE
+  MINOR
+}
+
+enum AgentKind {
+  EXPLORER
+  GENERATOR
+  TRIAGE
+  HEALER
+  CHAT
+}
+
+enum IntegrationKind {
+  GITHUB
+  GITLAB
+  BITBUCKET
+  SLACK
+  MSTEAMS
+  DISCORD
+  JIRA
+  LINEAR
+  PAGERDUTY
+  WEBHOOK
+}
+
+enum PlanItemState {
+  PROPOSED
+  APPROVED
+  REJECTED
+  GENERATED
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Identity (§1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  emailVerified  DateTime?
+  name           String
+  /// Null for users who only ever signed in with OAuth.
+  passwordHash   String?
+  avatarUrl      String?
+  /// §11 — grants access to /admin. Never settable through the public API.
+  isSuperuser    Boolean   @default(false)
+  /// Encrypted TOTP seed (§1 2FA). Null until the user enrols.
+  totpSecretEnc  String?
+  totpEnabledAt  DateTime?
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  memberships    Membership[]
+  sessions       Session[]
+  oauthAccounts  OAuthAccount[]
+  auditLogs      AuditLog[]
+  chatMessages   ChatMessage[]
+
+  @@index([email])
+}
+
+model OAuthAccount {
+  id                String   @id @default(cuid())
+  userId            String
+  provider          String // "google" | "github"
+  providerAccountId String
+  accessTokenEnc    String?
+  refreshTokenEnc   String?
+  expiresAt         DateTime?
+  createdAt         DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  /// SHA-256 of the cookie value. The raw token is never stored.
+  tokenHash    String   @unique
+  /// The org this session is currently acting in; switchable without re-login.
+  activeOrgId  String?
+  ip           String?
+  userAgent    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// Email verification and password reset both use this table, discriminated by `purpose`.
+model VerificationToken {
+  id        String   @id @default(cuid())
+  email     String
+  tokenHash String   @unique
+  purpose   String // "EMAIL_VERIFY" | "PASSWORD_RESET" | "INVITE"
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([email, purpose])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Organizations (§1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  plan      Plan     @default(FREE)
+  /// Per-org overrides on top of PLAN_LIMITS; used for trials and enterprise deals.
+  limitOverrides Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships   Membership[]
+  invites       Invite[]
+  projects      Project[]
+  apiKeys       ApiKey[]
+  auditLogs     AuditLog[]
+  subscription  Subscription?
+  usageRecords  UsageRecord[]
+  agentCalls    AgentCall[]
+  integrations  Integration[]
+  featureFlags  FeatureFlagOverride[]
+
+  @@index([slug])
+}
+
+model Membership {
+  id        String   @id @default(cuid())
+  orgId     String
+  userId    String
+  role      OrgRole  @default(MEMBER)
+  createdAt DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+}
+
+model Invite {
+  id        String   @id @default(cuid())
+  orgId     String
+  email     String
+  role      OrgRole  @default(MEMBER)
+  tokenHash String   @unique
+  invitedBy String
+  expiresAt DateTime
+  acceptedAt DateTime?
+  createdAt DateTime @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, email])
+  @@index([orgId])
+}
+
+/// API keys and personal access tokens (§1). `userId` set = PAT, null = org key.
+model ApiKey {
+  id         String    @id @default(cuid())
+  orgId      String
+  userId     String?
+  name       String
+  /// SHA-256 of the full key. Only the prefix is recoverable for display.
+  keyHash    String    @unique
+  keyPrefix  String
+  scopes     String[]  @default([])
+  lastUsedAt DateTime?
+  expiresAt  DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([keyPrefix])
+}
+
+/// §1 — every mutating action. Append-only; there is no update or delete path.
+model AuditLog {
+  id         String   @id @default(cuid())
+  orgId      String
+  userId     String?
+  /// "project.create", "secret.update", "verdict.override", ...
+  action     String
+  targetType String
+  targetId   String?
+  /// Diff or payload summary, already secret-masked.
+  metadata   Json?
+  ip         String?
+  userAgent  String?
+  requestId  String?
+  /// Set when a superuser was impersonating (§11).
+  impersonatedBy String?
+  createdAt  DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt])
+  @@index([orgId, action])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Projects & environments (§2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Project {
+  id               String      @id @default(cuid())
+  orgId            String
+  name             String
+  slug             String
+  repoUrl          String?
+  /// Owner/name, set when the GitHub App is installed on the repo.
+  repoFullName     String?
+  repoInstallationId String?
+  defaultBranch    String      @default("main")
+  primaryLanguage  Language    @default(TYPESCRIPT)
+  primaryFramework UiFramework @default(PLAYWRIGHT)
+  /// GateRule[] — see packages/shared types.
+  gateRules        Json        @default("[]")
+  /// Org-level opt-in to auto-approving SELECTOR_ONLY heals (§3.4).
+  autoApproveSelectorHeals Boolean @default(false)
+  archivedAt       DateTime?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  org           Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  environments  Environment[]
+  suites        Suite[]
+  tests         Test[]
+  runs          Run[]
+  flowMaps      FlowMap[]
+  testPlans     TestPlan[]
+  schedules     Schedule[]
+  monitors      Monitor[]
+  conversations ChatConversation[]
+  baselines     VisualBaseline[]
+
+  @@unique([orgId, slug])
+  @@index([orgId])
+}
+
+model Environment {
+  id        String          @id @default(cuid())
+  orgId     String
+  projectId String
+  name      String
+  kind      EnvironmentKind
+  baseUrl   String
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  secrets      Secret[]
+  authProfiles AuthProfile[]
+  runs         Run[]
+  flowMaps     FlowMap[]
+  schedules    Schedule[]
+  monitors     Monitor[]
+
+  @@unique([projectId, name])
+  @@index([orgId])
+}
+
+/// §1 secrets vault. `valueEnc` is AES-256-GCM; see apps/api/src/lib/vault.ts.
+model Secret {
+  id            String   @id @default(cuid())
+  orgId         String
+  environmentId String
+  name          String
+  valueEnc      String
+  /// Key version, so the master key can be rotated without a big-bang re-encrypt.
+  keyVersion    Int      @default(1)
+  /// Last 4 chars of the plaintext, for "is this the right value?" without decrypting.
+  hint          String?
+  createdBy     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@unique([environmentId, name])
+  @@index([orgId])
+}
+
+model AuthProfile {
+  id            String          @id @default(cuid())
+  orgId         String
+  environmentId String
+  name          String
+  kind          AuthProfileKind
+  /// Non-secret config; secret-bearing fields reference Secret.name.
+  config        Json
+  /// Cached Playwright storageState, refreshed on expiry (§2).
+  storageState  Json?
+  storageStateExpiresAt DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@unique([environmentId, name])
+  @@index([orgId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flow map & plan (§3.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FlowMap {
+  id            String   @id @default(cuid())
+  orgId         String
+  projectId     String
+  environmentId String
+  version       Int
+  /// Serialised FlowMap from packages/shared. Kept whole rather than normalised:
+  /// it is written once per crawl, read as a unit, and diffed version-to-version.
+  graph         Json
+  nodeCount     Int      @default(0)
+  edgeCount     Int      @default(0)
+  journeyCount  Int      @default(0)
+  truncatedReason String?
+  createdAt     DateTime @default(now())
+
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  testPlans   TestPlan[]
+
+  @@unique([projectId, environmentId, version])
+  @@index([orgId])
+}
+
+model TestPlan {
+  id          String   @id @default(cuid())
+  orgId       String
+  projectId   String
+  flowMapId   String?
+  summary     String
+  skipped     Json     @default("[]")
+  createdAt   DateTime @default(now())
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  flowMap FlowMap?   @relation(fields: [flowMapId], references: [id], onDelete: SetNull)
+  items   PlanItem[]
+
+  @@index([orgId, projectId])
+}
+
+model PlanItem {
+  id            String        @id @default(cuid())
+  orgId         String
+  testPlanId    String
+  title         String
+  rationale     String
+  feature       String
+  priority      Priority
+  testType      TestType
+  steps         Json // string[]
+  assertions    Json // string[]
+  journeyId     String?
+  authProfileId String?
+  state         PlanItemState @default(PROPOSED)
+  decidedBy     String?
+  decidedAt     DateTime?
+  /// Set once the Generator turns this into a Test.
+  generatedTestId String?
+  createdAt     DateTime      @default(now())
+
+  testPlan TestPlan @relation(fields: [testPlanId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([testPlanId, state])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suites & tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Suite {
+  id          String   @id @default(cuid())
+  orgId       String
+  projectId   String
+  name        String
+  description String?
+  /// Tests are also selectable by tag; a suite is a saved selection.
+  tagFilter   String[] @default([])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tests     Test[]
+  runs      Run[]
+  schedules Schedule[]
+  monitors  Monitor[]
+
+  @@unique([projectId, name])
+  @@index([orgId])
+}
+
+model Test {
+  id        String   @id @default(cuid())
+  orgId     String
+  projectId String
+  suiteId   String?
+  name      String
+  type      TestType
+  feature   String?
+  priority  Priority @default(IMPORTANT)
+  /// Current source. History lives in TestVersion.
+  code      String
+  filePath  String
+  /// Type-specific config: the API request chain, the k6 thresholds, the viewports.
+  spec      Json?
+  tags      String[] @default([])
+  timeoutMs Int      @default(60000)
+
+  /// Flake radar (§5). Maintained by the run finaliser, not computed on read.
+  quarantined      Boolean   @default(false)
+  quarantinedAt    DateTime?
+  quarantineReason String?
+  flakeRate        Float     @default(0)
+  lastRunAt        DateTime?
+  consecutiveFailures Int    @default(0)
+
+  /// Selectors the Generator was unsure about; the cockpit shows a review badge.
+  reviewFlags String[] @default([])
+  /// Which plan item produced this, when it came from the Explorer.
+  planItemId  String?
+  disabledAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  project  Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite    Suite?        @relation(fields: [suiteId], references: [id], onDelete: SetNull)
+  versions TestVersion[]
+  results  TestResult[]
+  heals    HealProposal[]
+  baselines VisualBaseline[]
+
+  @@index([orgId])
+  @@index([projectId, type])
+  @@index([suiteId])
+}
+
+/// Every code change to a test, whether from a human, the Generator, or a Heal.
+model TestVersion {
+  id        String   @id @default(cuid())
+  orgId     String
+  testId    String
+  version   Int
+  code      String
+  /// "GENERATOR" | "HEAL" | "HUMAN" | "IMPORT"
+  source    String
+  authorId  String?
+  message   String?
+  createdAt DateTime @default(now())
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@unique([testId, version])
+  @@index([orgId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Runs (§5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Run {
+  id            String     @id @default(cuid())
+  orgId         String
+  projectId     String
+  suiteId       String?
+  environmentId String
+  status        RunStatus  @default(QUEUED)
+  trigger       RunTrigger @default(MANUAL)
+  triggeredBy   String?
+
+  /// CI context, when the run came from a PR or a deploy.
+  commitSha     String?
+  branch        String?
+  prNumber      Int?
+  /// Preview-deploy runs override the environment's base URL (§6).
+  baseUrlOverride String?
+
+  queuedAt   DateTime  @default(now())
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  totalCount   Int @default(0)
+  passedCount  Int @default(0)
+  failedCount  Int @default(0)
+  flakyCount   Int @default(0)
+  skippedCount Int @default(0)
+
+  /// GateResult from packages/shared. Null until the run finalises.
+  gateResult Json?
+  /// Set when the run itself blew up rather than tests failing.
+  errorMessage String?
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite       Suite?       @relation(fields: [suiteId], references: [id], onDelete: SetNull)
+  environment Environment  @relation(fields: [environmentId], references: [id])
+  results     TestResult[]
+  artifacts   Artifact[]
+
+  @@index([orgId])
+  @@index([projectId, queuedAt])
+  @@index([status])
+  @@index([commitSha])
+}
+
+model TestResult {
+  id         String           @id @default(cuid())
+  orgId      String
+  runId      String
+  testId     String
+  status     TestResultStatus
+  durationMs Int              @default(0)
+  errorMessage String?
+  /// §5 — a retry that passes is not a pass. Recorded so the gate can see it.
+  retriedAndPassed Boolean    @default(false)
+  /// NetworkEntry[] and ConsoleEntry[], already secret-masked.
+  network    Json?
+  consoleLog Json?
+  videoKey   String?
+  traceKey   String?
+  createdAt  DateTime         @default(now())
+
+  run      Run              @relation(fields: [runId], references: [id], onDelete: Cascade)
+  test     Test             @relation(fields: [testId], references: [id], onDelete: Cascade)
+  steps    Step[]
+  findings Finding[]
+  verdict  TriageVerdict?
+
+  @@unique([runId, testId])
+  @@index([orgId])
+  @@index([testId, createdAt])
+}
+
+model Step {
+  id            String     @id @default(cuid())
+  orgId         String
+  testResultId  String
+  index         Int
+  title         String
+  status        StepStatus
+  durationMs    Int        @default(0)
+  screenshotKey String?
+  errorMessage  String?
+  errorStack    String?
+  /// The locator that failed, when the failure was a locator failure.
+  selector      String?
+  expected      String?
+  actual        String?
+  startedAt     DateTime?
+
+  testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+
+  @@unique([testResultId, index])
+  @@index([orgId])
+}
+
+/// a11y / security / perf / l10n / visual results — first-class, not pass-fail noise.
+model Finding {
+  id           String          @id @default(cuid())
+  orgId        String
+  testResultId String
+  kind         FindingKind
+  severity     FindingSeverity
+  code         String
+  message      String
+  location     String
+  helpUrl      String?
+  /// Muted findings still record but never gate.
+  mutedAt      DateTime?
+  createdAt    DateTime        @default(now())
+
+  testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([testResultId])
+  @@index([code])
+}
+
+model Artifact {
+  id          String   @id @default(cuid())
+  orgId       String
+  runId       String
+  /// S3 object key, or a path under .artifacts when ARTIFACTS_LOCAL=true.
+  key         String   @unique
+  contentType String
+  sizeBytes   Int      @default(0)
+  /// Retention is by plan (§5); a sweeper deletes rows and objects past this.
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+
+  run Run @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([runId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Triage & healing (§3.3, §3.4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model TriageVerdict {
+  id           String             @id @default(cuid())
+  orgId        String
+  testResultId String             @unique
+  verdict      Verdict
+  confidence   Float
+  explanation  String
+  /// Evidence[] from packages/shared.
+  evidence     Json
+  suspectCommit Json?
+  model        String
+  /// A human can disagree; the override is what gates and what trains prompts.
+  reviewState  VerdictReviewState @default(PENDING)
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  overriddenTo Verdict?
+  /// Set when this verdict was filed as a bug (§7).
+  issueUrl     String?
+  createdAt    DateTime           @default(now())
+
+  testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, verdict])
+  @@index([orgId, reviewState])
+}
+
+model HealProposal {
+  id          String    @id @default(cuid())
+  orgId       String
+  testId      String
+  /// The verdict that triggered this heal.
+  verdictId   String?
+  diff        String
+  explanation String
+  riskLevel   HealRisk
+  confidence  Float
+  state       HealState @default(PROPOSED)
+  decidedBy   String?
+  decidedAt   DateTime?
+  /// PR opened when the repo is connected.
+  prUrl       String?
+  createdAt   DateTime  @default(now())
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, state])
+  @@index([testId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Visual regression (§4)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model VisualBaseline {
+  id         String   @id @default(cuid())
+  orgId      String
+  projectId  String
+  testId     String
+  /// One baseline per (test, viewport, browser).
+  viewport   String
+  browser    String
+  imageKey   String
+  /// Rectangles to exclude from the diff, from the ignore-region editor.
+  ignoreRegions Json  @default("[]")
+  approvedBy String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  test    Test    @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@unique([testId, viewport, browser])
+  @@index([orgId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduling & monitoring (§6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Schedule {
+  id            String   @id @default(cuid())
+  orgId         String
+  projectId     String
+  suiteId       String
+  environmentId String
+  name          String
+  cron          String
+  timezone      String   @default("UTC")
+  enabled       Boolean  @default(true)
+  lastRunAt     DateTime?
+  nextRunAt     DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite       Suite       @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([enabled, nextRunAt])
+}
+
+/// Synthetic monitoring (§6) — a smoke suite against prod every N minutes.
+model Monitor {
+  id             String   @id @default(cuid())
+  orgId          String
+  projectId      String
+  suiteId        String
+  environmentId  String
+  name           String
+  intervalMinutes Int     @default(15)
+  enabled        Boolean  @default(true)
+  /// Consecutive failures before alerting, to avoid paging on one blip.
+  failureThreshold Int    @default(2)
+  consecutiveFailures Int @default(0)
+  lastStatus     RunStatus?
+  lastCheckedAt  DateTime?
+  /// Integration ids to notify.
+  notifyVia      String[] @default([])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite       Suite       @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([enabled])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Integrations (§7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Integration {
+  id         String          @id @default(cuid())
+  orgId      String
+  projectId  String?
+  kind       IntegrationKind
+  name       String
+  /// Non-secret settings (channel, project key, repo). Tokens go in configEnc.
+  config     Json            @default("{}")
+  configEnc  String?
+  enabled    Boolean         @default(true)
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  org        Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([orgId, kind])
+}
+
+model WebhookDelivery {
+  id            String   @id @default(cuid())
+  orgId         String
+  integrationId String
+  event         String
+  payload       Json
+  /// HMAC-SHA256 signature sent with the request (§7 "signed").
+  signature     String
+  responseStatus Int?
+  attempts      Int      @default(0)
+  deliveredAt   DateTime?
+  lastError     String?
+  createdAt     DateTime @default(now())
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([integrationId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat copilot (§3.5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ChatConversation {
+  id        String   @id @default(cuid())
+  orgId     String
+  projectId String
+  title     String
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project  Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@index([orgId, projectId])
+}
+
+model ChatMessage {
+  id             String   @id @default(cuid())
+  orgId          String
+  conversationId String
+  role           String // "user" | "assistant" | "tool"
+  content        String
+  /// Tool calls the copilot made, so the UI can show its work (§3 "never a black box").
+  toolCalls      Json?
+  userId         String?
+  createdAt      DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user         User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+  @@index([conversationId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Billing & metering (§9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Subscription {
+  id                   String   @id @default(cuid())
+  orgId                String   @unique
+  stripeCustomerId     String?  @unique
+  stripeSubscriptionId String?  @unique
+  plan                 Plan     @default(FREE)
+  status               String   @default("active")
+  currentPeriodEnd     DateTime?
+  cancelAtPeriodEnd    Boolean  @default(false)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// Metered regardless of plan (§9), so pricing can change without a data migration.
+model UsageRecord {
+  id       String   @id @default(cuid())
+  orgId    String
+  /// "runs" | "agent_tokens" | "storage_bytes" | "worker_minutes"
+  metric   String
+  /// First day of the billing month, UTC. One row per (org, metric, period).
+  period   DateTime
+  quantity BigInt   @default(0)
+  updatedAt DateTime @updatedAt
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, metric, period])
+  @@index([orgId])
+}
+
+/// One row per LLM call (§0 token accounting). Rolled up nightly into UsageRecord.
+model AgentCall {
+  id              String    @id @default(cuid())
+  orgId           String
+  projectId       String?
+  agent           AgentKind
+  model           String
+  subjectId       String?
+  inputTokens     Int       @default(0)
+  outputTokens    Int       @default(0)
+  cacheReadTokens Int       @default(0)
+  cacheWriteTokens Int      @default(0)
+  costCents       Float     @default(0)
+  durationMs      Int       @default(0)
+  /// Set when the call failed after retries; kept so cost of failure is visible.
+  error           String?
+  createdAt       DateTime  @default(now())
+
+  org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@index([orgId, agent])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ops (§11)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model FeatureFlag {
+  key         String   @id
+  description String
+  /// Default for orgs with no override row.
+  enabled     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  overrides FeatureFlagOverride[]
+}
+
+model FeatureFlagOverride {
+  id        String   @id @default(cuid())
+  orgId     String
+  flagKey   String
+  enabled   Boolean
+  createdAt DateTime @default(now())
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  flag FeatureFlag  @relation(fields: [flagKey], references: [key], onDelete: Cascade)
+
+  @@unique([orgId, flagKey])
+}

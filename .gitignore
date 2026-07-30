@@ -1,0 +1,28 @@
+node_modules/
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Runtime artifacts (screenshots, videos, traces) — these go to S3/MinIO in prod
+.artifacts/
+playwright-report/
+test-results/
+.generated/
+
+# Local infra data dirs (docker-compose volumes are named, this is the no-docker path)
+.localdev/
+
+.DS_Store
+*.log
+npm-debug.log*
+coverage/
+
+# Ephemeral Playwright workspaces created by the runner
+.qaai-runs/

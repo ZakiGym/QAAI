@@ -1,0 +1,42 @@
+@import 'tailwindcss';
+
+/*
+ * Dark-first (§8). The light values exist so the marketing page is readable in
+ * a bright room, but the cockpit is designed for the dark palette — that is
+ * where a QA engineer spends the day.
+ */
+@theme {
+  --color-ink: #e8eaed;
+  --color-ink-dim: #9aa3ad;
+  --color-ink-faint: #6b7480;
+  --color-surface: #0e1013;
+  --color-surface-1: #14171c;
+  --color-surface-2: #1b1f26;
+  --color-line: #262b33;
+  --color-accent: #4c8dff;
+  --color-pass: #3fb950;
+  --color-fail: #f85149;
+  --color-flake: #d29922;
+  --color-skip: #6b7480;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+html,
+body {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* A scrollbar that does not scream in a dark UI. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-line);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

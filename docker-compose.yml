@@ -1,0 +1,142 @@
+# `docker compose up` → full stack + demo store boots (DoD §12.1).
+#
+# Everything reads config from .env (copy .env.example → .env first). The
+# service-to-service URLs below intentionally override the localhost defaults
+# in .env.example, because inside the compose network hosts are service names.
+
+name: qaai
+
+x-app-env: &app-env
+  NODE_ENV: development
+  DATABASE_URL: postgresql://qaai:qaai@postgres:5432/qaai?schema=public
+  REDIS_URL: redis://redis:6379
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: qaai-artifacts
+  S3_ACCESS_KEY_ID: qaaiminio
+  S3_SECRET_ACCESS_KEY: qaaiminio
+  S3_FORCE_PATH_STYLE: "true"
+  API_PUBLIC_URL: http://api:4000
+  WEB_PUBLIC_URL: http://localhost:3000
+  DEMO_PUBLIC_URL: http://demo:5050
+  SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+  VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:?set VAULT_MASTER_KEY in .env}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  QAAI_MODEL_CHEAP: ${QAAI_MODEL_CHEAP:-claude-haiku-4-5}
+  QAAI_MODEL_STRONG: ${QAAI_MODEL_STRONG:-claude-opus-5}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: qaai
+      POSTGRES_PASSWORD: qaai
+      POSTGRES_DB: qaai
+    ports: ["5432:5432"]
+    volumes: [qaai-pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qaai -d qaai"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: [qaai-redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: qaaiminio
+      MINIO_ROOT_PASSWORD: qaaiminio
+    ports: ["9000:9000", "9001:9001"]
+    volumes: [qaai-miniodata:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: creates the artifacts bucket then exits.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_healthy }
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 qaaiminio qaaiminio &&
+      mc mb --ignore-existing local/qaai-artifacts &&
+      echo 'bucket ready'"
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      <<: *app-env
+      API_PORT: "4000"
+    ports: ["4000:4000"]
+    volumes: [qaai-artifacts:/app/.artifacts]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # Migrations + seed run on boot so a fresh `up` lands in a usable state.
+    command:
+      - sh
+      - -c
+      - >-
+        npx prisma migrate deploy --schema apps/api/prisma/schema.prisma &&
+        npm run db:seed -w @qaai/api &&
+        npx tsx apps/api/src/index.ts
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: "4"
+    depends_on:
+      api: { condition: service_started }
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    # Playwright needs more than the default 64MB of shared memory for Chromium.
+    shm_size: 1gb
+    # Artifacts are written here when ARTIFACTS_LOCAL=true; the API reads the
+    # same volume, so both processes must agree on the path.
+    volumes: [qaai-artifacts:/app/.artifacts]
+
+  demo:
+    build:
+      context: .
+      dockerfile: apps/demo/Dockerfile
+    environment:
+      DEMO_PORT: "5050"
+      DEMO_SMTP_PORT: "5051"
+      DEMO_PLANTED_BUG: ${DEMO_PLANTED_BUG:-true}
+    ports: ["5050:5050", "5051:5051"]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      <<: *app-env
+      # Browser-side calls must reach the API on the host, not the compose network.
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    ports: ["3000:3000"]
+    depends_on:
+      api: { condition: service_started }
+
+volumes:
+  qaai-artifacts:
+  qaai-pgdata:
+  qaai-redisdata:
+  qaai-miniodata:

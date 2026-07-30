@@ -1,0 +1,27 @@
+{
+  "name": "@qaai/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "@qaai/agent": "^0.1.0",
+    "@qaai/runner": "^0.1.0",
+    "@qaai/shared": "^0.1.0",
+    "@qaai/storage": "^0.1.0",
+    "bullmq": "^5.81.3",
+    "cron-parser": "^5.6.2",
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.11.1",
+    "pg": "^8.22.0",
+    "pino": "^10.3.1",
+    "playwright": "^1.62.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "noEmit": false,
+    // Buffer/URL/AbortSignal appear in the runner contract; every consumer of
+    // this package runs on Node, so pulling the Node types in here is honest.
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}
