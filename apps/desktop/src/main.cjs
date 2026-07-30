@@ -129,13 +129,24 @@ function createSplash() {
 }
 
 function createMainWindow() {
+  const isMac = process.platform === 'darwin';
+
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1100,
     minHeight: 700,
     backgroundColor: '#0e1013',
-    titleBarStyle: 'hiddenInset',
+    // macOS keeps its traffic lights over the page; the header reserves space
+    // for them (see `.app-drag` in globals.css) and `trafficLightPosition`
+    // centres them against a 44px header rather than the default 12px inset.
+    //
+    // Windows and Linux get a normal frame — there is no equivalent overlay
+    // convention there, and a frameless window with no custom controls would
+    // leave those users unable to close it.
+    ...(isMac
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 18, y: 15 } }
+      : { frame: true }),
     show: false,
     webPreferences: {
       // The cockpit is a plain web client; it needs no privileged bridge, so it

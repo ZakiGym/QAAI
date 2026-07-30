@@ -56,7 +56,7 @@ export default function RunsPage() {
 
   return (
     <main className="mx-auto max-w-5xl px-6 py-10">
-      <header className="mb-10 flex items-baseline gap-4">
+      <header className="app-drag -mx-6 mb-10 flex items-baseline gap-4 px-6 py-3">
         <Link href="/" className="text-base font-semibold tracking-tight">
           QAAI
         </Link>

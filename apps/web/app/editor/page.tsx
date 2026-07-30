@@ -242,7 +242,7 @@ export default function EditorPage() {
 
   return (
     <div className="flex h-screen flex-col">
-      <header className="border-line flex shrink-0 items-center gap-4 border-b px-5 py-3">
+      <header className="app-drag border-line flex shrink-0 items-center gap-4 border-b px-5 py-3">
         <Link href="/runs" className="text-sm font-semibold tracking-tight">
           QAAI
         </Link>

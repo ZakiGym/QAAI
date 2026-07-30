@@ -28,6 +28,51 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/*
+ * Desktop window chrome.
+ *
+ * Only applies when DesktopChrome has marked the document, so the browser build
+ * is untouched. Two problems to solve, both created by hiding the title bar:
+ *
+ *  1. No draggable region — the window cannot be moved at all. Any element
+ *     marked `.app-drag` becomes one.
+ *  2. macOS draws the close/minimise/zoom buttons over the top-left of the
+ *     page. The header needs to start to the right of them.
+ *
+ * The child rule matters as much as the parent: a drag region swallows clicks
+ * from everything inside it, so every interactive descendant has to opt back
+ * out or the header's buttons stop working.
+ */
+[data-desktop] .app-drag {
+  -webkit-app-region: drag;
+}
+
+/* Only macOS overlays its window buttons on the page; other platforms keep a
+   real frame, so reserving 78px there would just be a gap. */
+[data-desktop][data-desktop-platform='mac'] .app-drag {
+  padding-left: 78px;
+}
+
+[data-desktop] .app-drag button,
+[data-desktop] .app-drag a,
+[data-desktop] .app-drag input,
+[data-desktop] .app-drag select,
+[data-desktop] .app-drag textarea,
+[data-desktop] .app-drag [role='button'] {
+  -webkit-app-region: no-drag;
+}
+
+/* Pages with no header of their own still need somewhere to grab. */
+[data-desktop] .app-drag-strip {
+  -webkit-app-region: drag;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 38px;
+  z-index: 40;
+}
+
 /* A scrollbar that does not scream in a dark UI. */
 ::-webkit-scrollbar {
   width: 10px;
