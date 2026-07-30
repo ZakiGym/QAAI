@@ -13,6 +13,7 @@ import { prisma } from '../lib/prisma.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
+import { subscribe } from '../lib/events.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
 
 export const agentRouter: Router = Router();
@@ -52,6 +53,25 @@ agentRouter.post('/projects/:projectId/explore', requireRole('MEMBER'), async (r
   });
 
   res.status(202).json({ jobId, status: 'queued' });
+});
+
+/**
+ * Live crawl progress. The Explorer publishes under a synthetic run id because
+ * a crawl is not a run and has no Run row to hang events off — reusing the
+ * /runs events route would 404 on the missing run.
+ */
+agentRouter.get('/projects/:projectId/explore/events', async (req, res) => {
+  const actor = actorOf(req);
+  const projectId = String(req.params.projectId);
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const unsubscribe = subscribe(actor.orgId, `explore:${projectId}`, res);
+  req.on('close', unsubscribe);
 });
 
 /** The most recent plan, with its items — what the approval screen renders. */

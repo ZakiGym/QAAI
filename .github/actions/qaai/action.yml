@@ -1,0 +1,48 @@
+# Reusable GitHub Action (§6).
+#
+# Runs a QAAI suite in the repo's own CI and fails the job when a test fails or
+# a quality gate blocks — the CLI's exit code does the work, this is just the
+# thin wrapper that surfaces JUnit to the Checks tab.
+
+name: QAAI
+description: Run a QAAI test suite and block the build on failures
+inputs:
+  api-key:
+    description: QAAI API key (store as a repository secret)
+    required: true
+  environment-id:
+    description: The environment to run against
+    required: true
+  api-url:
+    description: QAAI API base URL
+    required: false
+    default: http://localhost:4000
+  suite:
+    description: Run only this suite (default: the whole project)
+    required: false
+  junit-path:
+    description: Where to write JUnit XML
+    required: false
+    default: qaai-results.xml
+runs:
+  using: composite
+  steps:
+    - name: Run QAAI
+      shell: bash
+      env:
+        QAAI_API_KEY: ${{ inputs.api-key }}
+        QAAI_API_URL: ${{ inputs.api-url }}
+      run: |
+        npx --yes qaai run \
+          --env "${{ inputs.environment-id }}" \
+          ${{ inputs.suite && format('--suite {0}', inputs.suite) || '' }} \
+          --commit "${{ github.sha }}" \
+          --junit "${{ inputs.junit-path }}"
+
+    # Surfaces per-test results in the Checks tab even when the run passes.
+    - name: Publish results
+      if: always()
+      uses: mikepenz/action-junit-report@v4
+      with:
+        report_paths: ${{ inputs.junit-path }}
+        fail_on_failure: false

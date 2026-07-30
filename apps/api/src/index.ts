@@ -23,6 +23,7 @@ import { projectsRouter } from './routes/projects.js';
 import { agentRouter } from './routes/agent.js';
 import { runsRouter } from './routes/runs.js';
 import { copilotRouter } from './routes/copilot.js';
+import { settingsRouter } from './routes/settings.js';
 
 const app = express();
 
@@ -99,6 +100,7 @@ app.use('/auth', authRouter);
 app.use('/projects', projectsRouter);
 app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
+app.use('/settings', settingsRouter);
 app.use('/', agentRouter);
 
 app.use(notFoundHandler);

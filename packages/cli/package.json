@@ -1,0 +1,15 @@
+{
+  "name": "qaai",
+  "version": "0.1.0",
+  "description": "Run QAAI test suites from any CI",
+  "type": "module",
+  "bin": {
+    "qaai": "src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@qaai/shared": "^0.1.0"
+  }
+}

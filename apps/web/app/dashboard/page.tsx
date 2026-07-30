@@ -6,18 +6,22 @@ import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
 
-export default function RunsPage() {
+/**
+ * A read-only overview of the fleet. Everything shown is derived client-side
+ * from the runs list, so the page adds no endpoints — it is a different lens on
+ * the same data the runs page loads.
+ */
+export default function DashboardPage() {
   const router = useRouter();
   const [projects, setProjects] = useState<Project[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [starting, setStarting] = useState(false);
 
   const load = useCallback(async () => {
     try {
       const [p, r] = await Promise.all([
         api<{ projects: Project[] }>('/projects'),
-        api<{ runs: Run[] }>('/runs?limit=25'),
+        api<{ runs: Run[] }>('/runs?limit=100'),
       ]);
       setProjects(p.projects);
       setRuns(r.runs);
@@ -27,32 +31,26 @@ export default function RunsPage() {
         router.push('/login');
         return;
       }
-      setError(err instanceof Error ? err.message : 'Could not load runs');
+      setError(err instanceof Error ? err.message : 'Could not load the dashboard');
     }
   }, [router]);
 
   useEffect(() => {
     void load();
-    // A run in flight changes state without any user action, so the list polls.
-    // Cheap, and it means the page is never stale for more than a few seconds.
-    const timer = setInterval(() => void load(), 4000);
+    const timer = setInterval(() => void load(), 5000);
     return () => clearInterval(timer);
   }, [load]);
 
-  async function startRun(environmentId: string) {
-    setStarting(true);
-    try {
-      const { run } = await api<{ run: Run }>('/runs', {
-        method: 'POST',
-        body: JSON.stringify({ environmentId, trigger: 'MANUAL' }),
-      });
-      router.push(`/runs/${run.id}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not start the run');
-    } finally {
-      setStarting(false);
-    }
-  }
+  // Aggregates over the loaded window (§9-ish rollup, but purely for display).
+  const totalRuns = runs.length;
+  const totalTests = runs.reduce((sum, run) => sum + run.totalCount, 0);
+  const totalPassed = runs.reduce((sum, run) => sum + run.passedCount, 0);
+  const passRate = totalTests > 0 ? Math.round((totalPassed / totalTests) * 100) : null;
+  const flakeCount = runs.reduce((sum, run) => sum + run.flakyCount, 0);
+  const openFailures = runs.filter((run) => run.failedCount > 0).length;
+
+  // Oldest-to-newest, left-to-right, so the bar row reads like a timeline.
+  const timeline = runs.slice(0, 30).reverse();
 
   return (
     <main className="mx-auto max-w-5xl px-6 py-10">
@@ -60,12 +58,9 @@ export default function RunsPage() {
         <Link href="/" className="text-base font-semibold tracking-tight">
           QAAI
         </Link>
-        <h1 className="text-ink-dim text-sm">Runs</h1>
-        <Link href="/onboarding" className="text-ink-dim hover:text-ink ml-auto text-sm">
-          Add app
-        </Link>
-        <Link href="/dashboard" className="text-ink-dim hover:text-ink text-sm">
-          Dashboard
+        <h1 className="text-ink-dim text-sm">Dashboard</h1>
+        <Link href="/runs" className="text-ink-dim hover:text-ink ml-auto text-sm">
+          Runs
         </Link>
         <Link href="/editor" className="text-ink-dim hover:text-ink text-sm">
           Editor
@@ -84,6 +79,58 @@ export default function RunsPage() {
         </p>
       )}
 
+      <section className="mb-10 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Total runs</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight">{totalRuns}</p>
+        </div>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Pass rate</p>
+          <p className="text-pass mt-1 text-2xl font-semibold tracking-tight">
+            {passRate === null ? '—' : `${passRate}%`}
+          </p>
+        </div>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Flakes</p>
+          <p className="text-flake mt-1 text-2xl font-semibold tracking-tight">{flakeCount}</p>
+        </div>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Open failures</p>
+          <p className="text-fail mt-1 text-2xl font-semibold tracking-tight">{openFailures}</p>
+        </div>
+      </section>
+
+      <section className="mb-10">
+        <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
+          Pass rate over time
+        </h2>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          {timeline.length > 0 ? (
+            <div className="flex h-32 items-end gap-0.5">
+              {timeline.map((run) => {
+                const ratio = run.totalCount > 0 ? run.passedCount / run.totalCount : 0;
+                const gatePassed = run.gateResult?.passed ?? false;
+                return (
+                  <div
+                    key={run.id}
+                    title={`${run.id.slice(-8)} · ${run.passedCount}/${run.totalCount} passed · ${
+                      run.failedCount
+                    } failed`}
+                    style={{ height: `${Math.max(ratio * 100, 2)}%` }}
+                    className={`flex-1 rounded-sm ${gatePassed ? 'bg-pass' : 'bg-fail'}`}
+                  />
+                );
+              })}
+            </div>
+          ) : (
+            <p className="text-ink-faint text-sm">No runs to chart yet.</p>
+          )}
+          <p className="text-ink-faint mt-3 text-[11px]">
+            Last {timeline.length} runs · bar height is the pass ratio, colour is the gate result.
+          </p>
+        </div>
+      </section>
+
       <section className="mb-10">
         <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
           Projects
@@ -100,26 +147,9 @@ export default function RunsPage() {
               <p className="text-ink-faint mt-1 text-xs">
                 {project._count.tests} tests · {project._count.runs} runs
               </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                {project.environments.map((env) => (
-                  <button
-                    key={env.id}
-                    type="button"
-                    disabled={starting}
-                    onClick={() => void startRun(env.id)}
-                    className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
-                  >
-                    Run against {env.name}
-                  </button>
-                ))}
-              </div>
             </div>
           ))}
-          {projects.length === 0 && (
-            <p className="text-ink-faint text-sm">
-              No projects yet. Run <code className="font-mono">npm run db:seed</code>.
-            </p>
-          )}
+          {projects.length === 0 && <p className="text-ink-faint text-sm">No projects yet.</p>}
         </div>
       </section>
 
@@ -128,7 +158,7 @@ export default function RunsPage() {
           Recent runs
         </h2>
         <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
-          {runs.map((run) => (
+          {runs.slice(0, 10).map((run) => (
             <Link
               key={run.id}
               href={`/runs/${run.id}`}
