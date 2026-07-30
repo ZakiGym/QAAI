@@ -419,15 +419,21 @@ export async function processRun(job: RunJob): Promise<void> {
     );
   }
 
-  // A PR-triggered run reports itself back to the pull request. Fire-and-forget:
-  // a comment that fails to post must never fail the run that produced it.
-  if (run.prNumber) {
-    await enqueueNotify({
-      orgId,
-      event: 'run.finished',
-      payload: { runId: run.id, prNumber: run.prNumber },
-    }).catch((err) => logger.warn({ err, runId: run.id }, 'could not enqueue the PR comment'));
-  }
+  /**
+   * Every finished run notifies. The processor decides who hears about it: a
+   * PR-triggered run gets a comment, and any failing run reaches chat. Gating
+   * the enqueue on prNumber (as this used to) meant a nightly schedule could
+   * fail all night in silence, which is the exact failure a schedule exists to
+   * prevent.
+   *
+   * Fire-and-forget: a notification that fails to send must never fail the run
+   * that produced it.
+   */
+  await enqueueNotify({
+    orgId,
+    event: 'run.finished',
+    payload: { runId: run.id, ...(run.prNumber ? { prNumber: run.prNumber } : {}) },
+  }).catch((err) => logger.warn({ err, runId: run.id }, 'could not enqueue the notification'));
 
   publishEvent(orgId, {
     runId: run.id,
