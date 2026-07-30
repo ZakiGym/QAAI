@@ -167,7 +167,7 @@ export function SecretsPanel({
               >
                 Import into vault
               </button>
-              <span className="text-ink-faint text-[11px]">
+              <span className="text-ink-faint text-micro">
                 Parsed on the server; values are sealed and never shown again.
               </span>
             </div>

@@ -83,7 +83,7 @@ export function FileMenu({ x, y, items, onClose }: FileMenuProps) {
               onClose();
               item.onSelect();
             }}
-            className={`flex w-full items-center px-3 py-1.5 text-left text-[13px] disabled:opacity-40 ${
+            className={`flex w-full items-center px-3 py-1.5 text-left text-body-sm disabled:opacity-40 ${
               item.danger ? 'text-fail hover:bg-fail/10' : 'text-ink-dim hover:bg-surface-2 hover:text-ink'
             }`}
           >

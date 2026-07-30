@@ -185,7 +185,7 @@ export default function QualityPage() {
                 >
                   {'action' in rule ? rule.action.toLowerCase() : 'block'}
                 </span>
-                <p className="min-w-0 flex-1 text-[13px]">{describeRule(rule)}</p>
+                <p className="min-w-0 flex-1 text-body-sm">{describeRule(rule)}</p>
                 <button
                   type="button"
                   onClick={() => setRules(rules.filter((_, i) => i !== index))}
@@ -282,11 +282,11 @@ export default function QualityPage() {
                   {f.severity.toLowerCase()}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="text-[13px]">{f.message}</p>
-                  <p className="text-ink-faint mt-0.5 truncate font-mono text-[11px]">
+                  <p className="text-body-sm">{f.message}</p>
+                  <p className="text-ink-faint mt-0.5 truncate font-mono text-micro">
                     {f.location}
                   </p>
-                  <p className="text-ink-faint mt-1 text-[10px]">
+                  <p className="text-ink-faint mt-1 text-meta">
                     {f.kind.toLowerCase()} · {f.code} · seen {f.occurrences}×
                     {f.tests.length > 0 && ` · ${f.tests.slice(0, 2).join(', ')}`}
                   </p>
@@ -313,7 +313,7 @@ export default function QualityPage() {
           ))}
           {findings.length === 0 && (
             <p className="text-ink-faint px-4 py-10 text-center text-sm">
-              No findings yet. Accessibility and security checks record them as they run.
+              Nothing flagged. Accessibility and security checks record findings here as they run — an empty list means the last run was clean.
             </p>
           )}
         </div>
@@ -322,8 +322,8 @@ export default function QualityPage() {
           {flaky.map((t) => (
             <div key={t.id} className="flex items-center gap-3 px-4 py-3">
               <div className="min-w-0 flex-1">
-                <p className="truncate text-[13px]">{t.name}</p>
-                <p className="text-ink-faint truncate font-mono text-[11px]">{t.filePath}</p>
+                <p className="truncate text-body-sm">{t.name}</p>
+                <p className="text-ink-faint truncate font-mono text-micro">{t.filePath}</p>
               </div>
               <span
                 className={`shrink-0 font-mono text-xs ${
@@ -334,7 +334,7 @@ export default function QualityPage() {
                 {t.flakeRate.toFixed(1)}%
               </span>
               {t.quarantined && (
-                <span className="border-flake/40 text-flake shrink-0 rounded border px-1.5 py-0.5 text-[10px]">
+                <span className="border-flake/40 text-flake shrink-0 rounded border px-1.5 py-0.5 text-meta">
                   quarantined
                 </span>
               )}

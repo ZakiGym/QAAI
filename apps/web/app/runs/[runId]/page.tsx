@@ -124,7 +124,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         >
           <span aria-hidden>←</span> Runs
         </Link>
-        <span className="border-line rounded-md border px-2 py-0.5 font-mono text-[11px]">
+        <span className="border-line rounded-md border px-2 py-0.5 font-mono text-micro">
           {run.id.slice(-8)}
         </span>
         <span className="text-ink-dim text-sm">{run.environment.name}</span>
@@ -181,7 +181,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               </span>
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm">{result.test.name}</span>
-                <span className="text-ink-faint mt-0.5 flex items-center gap-2 font-mono text-[11px]">
+                <span className="text-ink-faint mt-0.5 flex items-center gap-2 font-mono text-micro">
                   {result.test.type}
                   {result.test.quarantined && <span className="text-flake">quarantined</span>}
                   {result.verdict && <span>{result.verdict.verdict}</span>}
@@ -223,9 +223,9 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                       }`}
                     >
                       <StatusDot status={s.status} />
-                      <span className="text-ink-faint font-mono text-[11px]">{s.index}</span>
+                      <span className="text-ink-faint font-mono text-micro">{s.index}</span>
                       <span className="flex-1 text-sm">{s.title}</span>
-                      <span className="text-ink-faint font-mono text-[11px]">
+                      <span className="text-ink-faint font-mono text-micro">
                         {duration(s.durationMs)}
                       </span>
                     </button>
@@ -249,10 +249,10 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                       <li key={f.id} className="px-3 py-2">
                         <div className="flex items-center gap-2">
                           <SeverityLabel severity={f.severity} />
-                          <code className="font-mono text-[11px]">{f.code}</code>
+                          <code className="font-mono text-micro">{f.code}</code>
                         </div>
                         <p className="text-ink-dim mt-1 text-xs">{f.message}</p>
-                        <p className="text-ink-faint mt-0.5 font-mono text-[11px]">{f.location}</p>
+                        <p className="text-ink-faint mt-0.5 font-mono text-micro">{f.location}</p>
                       </li>
                     ))}
                   </ul>
@@ -282,7 +282,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                 alt={`Screenshot at step ${step.index}: ${step.title}`}
                 className="border-line w-full rounded-md border"
               />
-              <figcaption className="text-ink-faint mt-1.5 text-[11px]">
+              <figcaption className="text-ink-faint mt-1.5 text-micro">
                 Captured at the failing step
               </figcaption>
             </figure>
@@ -301,7 +301,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                   <dd className="text-fail">{step.actual ?? '—'}</dd>
                 </dl>
               )}
-              <pre className="border-line overflow-x-auto rounded-md border p-3 font-mono text-[11px] whitespace-pre-wrap">
+              <pre className="border-line overflow-x-auto rounded-md border p-3 font-mono text-micro whitespace-pre-wrap">
                 {step.errorMessage}
               </pre>
             </div>
@@ -333,7 +333,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               <h3 className="text-ink-dim mb-2 text-xs font-semibold tracking-wider uppercase">
                 Live
               </h3>
-              <ul className="text-ink-faint space-y-0.5 font-mono text-[10px]">
+              <ul className="text-ink-faint space-y-0.5 font-mono text-meta">
                 {live.map((line, i) => (
                   <li key={i} className="truncate">
                     {line}
@@ -370,7 +370,7 @@ function VerdictCard({ result, onReviewed }: { result: TestResult; onReviewed: (
     <section className="border-line bg-surface-1 rounded-lg border p-4">
       <div className="flex items-center gap-2">
         <VerdictChip verdict={verdict.verdict} confidence={verdict.confidence} />
-        <span className="text-ink-faint ml-auto font-mono text-[11px]">{verdict.model}</span>
+        <span className="text-ink-faint ml-auto font-mono text-micro">{verdict.model}</span>
       </div>
 
       <p className="text-ink-dim mt-3 text-sm leading-relaxed">{verdict.explanation}</p>
@@ -379,7 +379,7 @@ function VerdictCard({ result, onReviewed }: { result: TestResult; onReviewed: (
         <ul className="border-line mt-3 space-y-1.5 border-t pt-3">
           {verdict.evidence.map((e, i) => (
             <li key={i} className="text-xs">
-              <code className="text-ink-faint font-mono text-[10px]">
+              <code className="text-ink-faint font-mono text-meta">
                 {e.kind} {e.ref}
               </code>
               <span className="text-ink-dim ml-2">{e.detail}</span>
@@ -424,7 +424,7 @@ function VerdictCard({ result, onReviewed }: { result: TestResult; onReviewed: (
           </button>
         </div>
       ) : (
-        <p className="text-ink-faint mt-4 font-mono text-[11px]">
+        <p className="text-ink-faint mt-4 font-mono text-micro">
           reviewed · {verdict.reviewState.toLowerCase()}
         </p>
       )}

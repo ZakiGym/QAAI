@@ -140,20 +140,20 @@ export default function FlowMapPage() {
               }`}
             >
               <div className="flex items-center gap-2">
-                <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{n.route}</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-micro">{n.route}</span>
                 {n.behindAuth && (
-                  <span className="text-flake shrink-0 text-[10px]" title="Behind a login">
+                  <span className="text-flake shrink-0 text-meta" title="Behind a login">
                     🔒
                   </span>
                 )}
                 {n.a11yViolationCount > 0 && (
-                  <span className="text-fail shrink-0 text-[10px]">
+                  <span className="text-fail shrink-0 text-meta">
                     {n.a11yViolationCount} a11y
                   </span>
                 )}
               </div>
-              <span className="text-ink-faint truncate text-[11px]">{n.title}</span>
-              <span className="text-ink-faint text-[10px]">
+              <span className="text-ink-faint truncate text-micro">{n.title}</span>
+              <span className="text-ink-faint text-meta">
                 {n.affordances.length} element(s)
               </span>
             </button>
@@ -166,7 +166,7 @@ export default function FlowMapPage() {
               <div className="mb-5">
                 <h2 className="font-mono text-lg">{node.route}</h2>
                 <p className="text-ink-dim mt-1 text-sm">{node.title}</p>
-                <p className="text-ink-faint mt-1 font-mono text-[11px]">{node.url}</p>
+                <p className="text-ink-faint mt-1 font-mono text-micro">{node.url}</p>
                 {node.behindAuth && (
                   <p className="text-flake mt-2 text-xs">
                     Behind a login wall
@@ -184,12 +184,12 @@ export default function FlowMapPage() {
                     <span className="border-line text-ink-faint shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase">
                       {a.kind}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-[13px]">{a.label}</span>
-                    <span className="text-ink-faint shrink-0 font-mono text-[10px]">
+                    <span className="min-w-0 flex-1 truncate text-body-sm">{a.label}</span>
+                    <span className="text-ink-faint shrink-0 font-mono text-meta">
                       {a.selector.strategy}
                     </span>
                     <span
-                      className={`shrink-0 font-mono text-[10px] ${
+                      className={`shrink-0 font-mono text-meta ${
                         a.selector.confidence >= 0.8
                           ? 'text-pass'
                           : a.selector.confidence >= 0.6

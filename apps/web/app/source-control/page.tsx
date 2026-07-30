@@ -168,7 +168,7 @@ export default function SourceControlPage() {
                   · {(preview.totalBytes / 1024).toFixed(1)} kB · no secret values
                 </span>
               </p>
-              <ul className="max-h-56 space-y-0.5 overflow-y-auto font-mono text-[11px]">
+              <ul className="max-h-56 space-y-0.5 overflow-y-auto font-mono text-micro">
                 {preview.files.map((f) => (
                   <li key={f.path} className="text-ink-dim flex justify-between gap-4">
                     <span className="truncate">{f.path}</span>
@@ -189,7 +189,7 @@ export default function SourceControlPage() {
               ↓ Download as zip
             </a>
           )}
-          <p className="text-ink-faint mt-2 text-[11px]">
+          <p className="text-ink-faint mt-2 text-micro">
             The zip needs no credentials — push it yourself if you prefer.
           </p>
         </div>
@@ -244,7 +244,7 @@ export default function SourceControlPage() {
               autoComplete="off"
               className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-1.5 text-xs outline-none"
             />
-            <p className="text-ink-faint text-[11px]">
+            <p className="text-ink-faint text-micro">
               The token is encrypted with AES-256-GCM and never shown again. It is used only during
               a push, and never appears in a URL or a log.
             </p>
@@ -267,7 +267,7 @@ export default function SourceControlPage() {
                   {integration.kind.toLowerCase()}
                 </span>
                 {integration.hasToken && (
-                  <span className="text-pass text-[10px]" title="A token is stored">
+                  <span className="text-pass text-meta" title="A token is stored">
                     ● token stored
                   </span>
                 )}
@@ -293,13 +293,13 @@ export default function SourceControlPage() {
                     value={pushBranch}
                     onChange={(e) => setPushBranch(e.target.value)}
                     placeholder={integration.defaultBranch}
-                    className="border-line bg-surface w-full rounded-md border px-2.5 py-1 font-mono text-[11px] outline-none"
+                    className="border-line bg-surface w-full rounded-md border px-2.5 py-1 font-mono text-micro outline-none"
                   />
                   <input
                     value={message}
                     onChange={(e) => setMessage(e.target.value)}
                     placeholder="commit message (optional)"
-                    className="border-line bg-surface w-full rounded-md border px-2.5 py-1 text-[11px] outline-none"
+                    className="border-line bg-surface w-full rounded-md border px-2.5 py-1 text-micro outline-none"
                   />
                   <div className="flex gap-2">
                     <button
@@ -318,7 +318,7 @@ export default function SourceControlPage() {
                       Cancel
                     </button>
                   </div>
-                  <p className="text-ink-faint text-[11px]">
+                  <p className="text-ink-faint text-micro">
                     Adds a commit on that branch. Never force-pushes, never rewrites history.
                   </p>
                 </div>

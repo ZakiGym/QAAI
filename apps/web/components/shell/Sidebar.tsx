@@ -94,7 +94,7 @@ export function Sidebar({ collapsed, mounted, onToggle, onOpenPalette }: Sidebar
           {!collapsed && (
             <>
               <span>Search</span>
-              <kbd className="border-line text-ink-faint ml-auto rounded border px-1 py-0.5 font-mono text-[10px]">
+              <kbd className="border-line text-ink-faint ml-auto rounded border px-1 py-0.5 font-mono text-meta">
                 ⌘K
               </kbd>
             </>

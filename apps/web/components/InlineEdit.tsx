@@ -104,7 +104,7 @@ export function InlineEdit({
   return (
     <div className="border-line bg-surface-1 absolute inset-x-4 top-4 z-20 overflow-hidden rounded-lg border shadow-2xl">
       <form onSubmit={submit} className="flex items-center gap-2 px-3 py-2.5">
-        <span className="text-accent shrink-0 font-mono text-[11px]">⌘K</span>
+        <span className="text-accent shrink-0 font-mono text-micro">⌘K</span>
         <input
           ref={inputRef}
           value={instruction}

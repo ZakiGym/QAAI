@@ -53,7 +53,7 @@ const SEVERITY_STYLE: Record<string, string> = {
 
 export function SeverityLabel({ severity }: { severity: string }) {
   return (
-    <span className={`font-mono text-[11px] ${SEVERITY_STYLE[severity] ?? 'text-ink-faint'}`}>
+    <span className={`font-mono text-micro ${SEVERITY_STYLE[severity] ?? 'text-ink-faint'}`}>
       {severity}
     </span>
   );

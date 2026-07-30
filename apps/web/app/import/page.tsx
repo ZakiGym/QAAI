@@ -245,7 +245,7 @@ export default function ImportPage() {
             {/* No project yet — name the one this import will create. */}
             {files.length > 0 && loadedProjects && !project && (
               <div className="border-line mt-4 space-y-3 rounded-lg border p-4">
-                <p className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
+                <p className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
                   New project
                 </p>
                 <p className="text-ink-dim text-xs">
@@ -331,7 +331,7 @@ export default function ImportPage() {
           <div className="mt-6">
             <div
               ref={logRef}
-              className="border-line bg-surface-1 h-56 overflow-y-auto rounded-md border p-3 font-mono text-[11px]"
+              className="border-line bg-surface-1 h-56 overflow-y-auto rounded-md border p-3 font-mono text-micro"
             >
               {log.map((line, i) => (
                 <div key={i} className="text-ink-dim">

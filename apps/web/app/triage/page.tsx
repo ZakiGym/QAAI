@@ -165,8 +165,8 @@ export default function TriagePage() {
                   selectedId === v.id ? 'bg-surface-2' : 'hover:bg-surface-1'
                 }`}
               >
-                <span className="truncate text-[13px] font-medium">{v.testResult.test.name}</span>
-                <div className="text-ink-faint flex items-center gap-2 text-[10px]">
+                <span className="truncate text-body-sm font-medium">{v.testResult.test.name}</span>
+                <div className="text-ink-faint flex items-center gap-2 text-meta">
                   <span className={`rounded border px-1.5 py-0.5 font-mono ${meta.className}`}>
                     {meta.label}
                   </span>
@@ -193,19 +193,19 @@ export default function TriagePage() {
                 <h2 className="truncate font-medium">{selected.testResult.test.name}</h2>
                 <Link
                   href={`/runs/${selected.testResult.runId}`}
-                  className="text-ink-faint hover:text-accent font-mono text-[11px]"
+                  className="text-ink-faint hover:text-accent font-mono text-micro"
                 >
                   {selected.testResult.test.filePath} →
                 </Link>
               </div>
               <span
-                className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px] ${
+                className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta ${
                   (VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).className
                 }`}
               >
                 {(VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).label}
               </span>
-              <span className="border-line text-ink-dim shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px]">
+              <span className="border-line text-ink-dim shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta">
                 {Math.round(selected.confidence * 100)}% confident
               </span>
             </div>
@@ -225,16 +225,18 @@ export default function TriagePage() {
                     <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-[9px]">
                       {e.kind}
                     </span>
-                    <span className="text-ink-faint font-mono text-[10px]">{e.ref}</span>
+                    <span className="text-ink-faint font-mono text-meta">{e.ref}</span>
                   </div>
                   <p className="text-ink-dim mt-1 text-xs">{e.detail}</p>
                 </div>
               ))}
               {selected.evidence.length === 0 && (
-                <p className="text-ink-faint px-4 py-3 text-xs">No evidence was recorded.</p>
+                <p className="text-ink-faint text-micro px-4 py-3">
+                  No screenshot, trace or console output was captured for this failure.
+                </p>
               )}
             </div>
-            <p className="text-ink-faint mt-2 text-[11px]">Decided by {selected.model}.</p>
+            <p className="text-ink-faint mt-2 text-micro">Decided by {selected.model}.</p>
 
             {selected.reviewState === 'PENDING' ? (
               <div className="border-line mt-6 rounded-lg border p-4">
@@ -265,7 +267,7 @@ export default function TriagePage() {
                       type="button"
                       onClick={() => void review(selected, 'override', o)}
                       disabled={busy}
-                      className="border-line hover:border-accent text-ink-dim rounded-md border px-2.5 py-1 text-[11px] disabled:opacity-50"
+                      className="border-line hover:border-accent text-ink-dim rounded-md border px-2.5 py-1 text-micro disabled:opacity-50"
                     >
                       {(VERDICT_META[o] ?? VERDICT_META.ENV_ISSUE!).label}
                     </button>

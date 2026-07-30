@@ -154,18 +154,20 @@ export default function EnvironmentsPage() {
                 <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase">
                   {env.kind.toLowerCase()}
                 </span>
-                <span className="text-ink-faint ml-auto text-[11px]">
+                <span className="text-ink-faint ml-auto text-micro">
                   {env._count?.secrets ?? 0} 🔑
                 </span>
               </button>
             ))}
             {envs.length === 0 && (
-              <p className="text-ink-faint px-3 py-4 text-center text-xs">No environments yet.</p>
+              <p className="text-ink-faint text-micro px-3 py-4 text-center">
+                No environments. Add one to point runs at staging or production.
+              </p>
             )}
           </div>
 
           <form onSubmit={createEnv} className="border-line space-y-2 rounded-lg border p-3">
-            <p className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
+            <p className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
               New environment
             </p>
             <input
@@ -219,14 +221,14 @@ export default function EnvironmentsPage() {
                     Delete
                   </button>
                 </div>
-                <label className="text-ink-faint mb-1 block text-[11px]">Base URL</label>
+                <label className="text-ink-faint mb-1 block text-micro">Base URL</label>
                 <input
                   defaultValue={selectedEnv.baseUrl}
                   key={selectedEnv.id}
                   onBlur={(e) => void saveBaseUrl(selectedEnv, e.target.value)}
                   className="border-line bg-surface focus:border-accent w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none"
                 />
-                <p className="text-ink-faint mt-1 text-[11px]">
+                <p className="text-ink-faint mt-1 text-micro">
                   Tests run against this URL. Changes save on blur.
                 </p>
               </div>

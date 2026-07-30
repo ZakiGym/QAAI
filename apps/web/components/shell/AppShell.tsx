@@ -268,16 +268,16 @@ function ShortcutSheet({ onClose }: { onClose: () => void }) {
         <div className="space-y-5 px-5 py-4">
           {GROUPS.map(([group, rows]) => (
             <div key={group}>
-              <p className="text-ink-faint mb-2 text-[11px] font-semibold tracking-wider uppercase">
+              <p className="text-ink-faint mb-2 text-micro font-semibold tracking-wider uppercase">
                 {group}
               </p>
               <dl className="space-y-1.5">
                 {rows.map(([keys, what]) => (
                   <div key={keys + what} className="flex items-baseline gap-3">
-                    <dt className="border-line text-ink-dim w-24 shrink-0 rounded border px-1.5 py-0.5 text-center font-mono text-[11px]">
+                    <dt className="border-line text-ink-dim w-24 shrink-0 rounded border px-1.5 py-0.5 text-center font-mono text-micro">
                       {keys}
                     </dt>
-                    <dd className="text-ink-dim text-[13px]">{what}</dd>
+                    <dd className="text-ink-dim text-body-sm">{what}</dd>
                   </div>
                 ))}
               </dl>

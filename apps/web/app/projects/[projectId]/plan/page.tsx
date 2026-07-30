@@ -161,11 +161,11 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
                         <div className="flex items-baseline gap-2">
                           <span className="text-sm font-medium">{item.title}</span>
                           <span
-                            className={`ml-auto shrink-0 font-mono text-[10px] ${PRIORITY_STYLE[item.priority]}`}
+                            className={`ml-auto shrink-0 font-mono text-meta ${PRIORITY_STYLE[item.priority]}`}
                           >
                             {PRIORITY_LABEL[item.priority]}
                           </span>
-                          <span className="text-ink-faint shrink-0 font-mono text-[10px]">
+                          <span className="text-ink-faint shrink-0 font-mono text-meta">
                             {item.testType}
                           </span>
                         </div>
@@ -181,7 +181,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
                               return next;
                             })
                           }
-                          className="text-ink-faint hover:text-ink mt-1.5 text-[11px]"
+                          className="text-ink-faint hover:text-ink mt-1.5 text-micro"
                         >
                           {isOpen ? 'Hide steps' : 'Show steps'}
                         </button>
@@ -194,7 +194,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
                               ))}
                             </ol>
                             <div>
-                              <p className="text-ink-faint mb-0.5 font-mono text-[10px] uppercase">
+                              <p className="text-ink-faint mb-0.5 font-mono text-meta uppercase">
                                 Asserts
                               </p>
                               <ul className="text-ink-dim space-y-0.5">

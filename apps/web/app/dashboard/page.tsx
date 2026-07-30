@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
+import { EmptyState } from '../../components/ui/EmptyState';
 
 /**
  * A read-only overview of the fleet. Everything shown is derived client-side
@@ -109,9 +110,11 @@ export default function DashboardPage() {
               })}
             </div>
           ) : (
-            <p className="text-ink-faint text-sm">No runs to chart yet.</p>
+            <p className="text-ink-faint text-body-sm py-8 text-center">
+              Pass rate over time appears once there are a few runs to compare.
+            </p>
           )}
-          <p className="text-ink-faint mt-3 text-[11px]">
+          <p className="text-ink-faint mt-3 text-micro">
             Last {timeline.length} runs · bar height is the pass ratio, colour is the gate result.
           </p>
         </div>
@@ -135,7 +138,13 @@ export default function DashboardPage() {
               </p>
             </div>
           ))}
-          {projects.length === 0 && <p className="text-ink-faint text-sm">No projects yet.</p>}
+          {projects.length === 0 && (
+            <EmptyState
+              title="No apps connected"
+              body="Connect one and QAAI explores it, writes a test plan, and starts running. This dashboard fills itself in."
+              action={{ label: 'Add your app', href: '/onboarding' }}
+            />
+          )}
         </div>
       </section>
 
@@ -164,7 +173,11 @@ export default function DashboardPage() {
             </Link>
           ))}
           {runs.length === 0 && (
-            <p className="text-ink-faint px-4 py-8 text-center text-sm">No runs yet.</p>
+            <EmptyState
+              title="No runs yet"
+              body="Every run shows up here with its failures already triaged — real bug, intended change, or flake."
+              action={{ label: 'Go to runs', href: '/runs' }}
+            />
           )}
         </div>
       </section>

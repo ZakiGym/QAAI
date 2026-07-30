@@ -96,7 +96,7 @@ function diffLines(before: string, after: string): Array<{ kind: ' ' | '-' | '+'
 function DiffView({ before, after }: { before: string; after: string }) {
   const lines = diffLines(before, after);
   return (
-    <pre className="border-line max-h-72 overflow-auto rounded-md border font-mono text-[11px] leading-[1.5]">
+    <pre className="border-line max-h-72 overflow-auto rounded-md border font-mono text-micro leading-[1.5]">
       {lines.map((line, i) => (
         <div
           key={i}
@@ -237,7 +237,7 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-line flex shrink-0 items-center gap-2 border-b px-3 py-2">
-        <span className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
+        <span className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
           Agent
         </span>
         {conversationId && (
@@ -248,7 +248,7 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
               setMessages([]);
               setProposals([]);
             }}
-            className="text-ink-faint hover:text-ink ml-auto text-[11px]"
+            className="text-ink-faint hover:text-ink ml-auto text-micro"
           >
             New chat
           </button>
@@ -284,7 +284,7 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
                   {message.toolCalls?.map((call) => (
                     <div
                       key={call.id}
-                      className={`flex items-center gap-2 rounded border px-2 py-1 font-mono text-[10px] ${
+                      className={`flex items-center gap-2 rounded border px-2 py-1 font-mono text-meta ${
                         call.isError ? 'border-fail/40 text-fail' : 'border-line text-ink-faint'
                       }`}
                     >
@@ -311,8 +311,8 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
                       className="border-line bg-surface-1 rounded-lg border p-3"
                     >
                       <div className="mb-2 flex items-center gap-2">
-                        <span className="font-mono text-[11px]">{proposal.filePath}</span>
-                        <span className="text-ink-faint ml-auto font-mono text-[10px]">
+                        <span className="font-mono text-micro">{proposal.filePath}</span>
+                        <span className="text-ink-faint ml-auto font-mono text-meta">
                           {proposal.testId ? 'edit' : 'new file'}
                         </span>
                       </div>
@@ -339,7 +339,7 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
                           </button>
                         </div>
                       ) : (
-                        <p className="text-ink-faint mt-2 font-mono text-[10px]">
+                        <p className="text-ink-faint mt-2 font-mono text-meta">
                           {proposal.state.toLowerCase()}
                         </p>
                       )}
@@ -352,7 +352,7 @@ export function AgentPanel({ projectId, onApplied }: AgentPanelProps) {
         })}
 
         {liveTool && (
-          <div className="text-ink-faint flex items-center gap-2 font-mono text-[10px]">
+          <div className="text-ink-faint flex items-center gap-2 font-mono text-meta">
             <span className="bg-accent inline-block h-1.5 w-1.5 animate-pulse rounded-full" />
             {liveTool}…
           </div>

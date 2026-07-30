@@ -165,19 +165,19 @@ export default function HealsPage() {
               >
                 <div className="flex items-center gap-2">
                   <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${risk.dot}`} />
-                  <span className="min-w-0 flex-1 truncate text-[13px] font-medium">
+                  <span className="min-w-0 flex-1 truncate text-body-sm font-medium">
                     {heal.test.name}
                   </span>
                   {heal.state !== 'PROPOSED' && (
-                    <span className="text-ink-faint shrink-0 text-[10px]">
+                    <span className="text-ink-faint shrink-0 text-meta">
                       {STATE_LABEL[heal.state] ?? heal.state}
                     </span>
                   )}
                 </div>
-                <span className="text-ink-faint truncate font-mono text-[10px]">
+                <span className="text-ink-faint truncate font-mono text-meta">
                   {heal.test.filePath}
                 </span>
-                <div className="text-ink-faint flex items-center gap-2 text-[10px]">
+                <div className="text-ink-faint flex items-center gap-2 text-meta">
                   <span>{risk.label}</span>
                   <span>·</span>
                   <span>{Math.round(heal.confidence * 100)}% sure</span>
@@ -205,19 +205,19 @@ export default function HealsPage() {
                   <h2 className="truncate font-medium">{selected.test.name}</h2>
                   <Link
                     href={`/editor?test=${selected.test.id}`}
-                    className="text-ink-faint hover:text-accent font-mono text-[11px]"
+                    className="text-ink-faint hover:text-accent font-mono text-micro"
                   >
                     {selected.test.filePath} →
                   </Link>
                 </div>
                 <span
-                  className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px] ${
+                  className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta ${
                     (RISK[selected.riskLevel] ?? RISK.STRUCTURAL!).className
                   }`}
                 >
                   {(RISK[selected.riskLevel] ?? RISK.STRUCTURAL!).label}
                 </span>
-                <span className="border-line text-ink-dim shrink-0 rounded-md border px-2 py-0.5 font-mono text-[10px]">
+                <span className="border-line text-ink-dim shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta">
                   {Math.round(selected.confidence * 100)}% confident
                 </span>
               </div>
@@ -259,7 +259,7 @@ export default function HealsPage() {
                   >
                     Reject
                   </button>
-                  <span className="text-ink-faint ml-2 text-[11px]">
+                  <span className="text-ink-faint ml-2 text-micro">
                     Applying updates the test and records a version you can revert.
                   </span>
                 </div>
@@ -274,7 +274,7 @@ export default function HealsPage() {
                   language={selected.test.filePath.endsWith('.json') ? 'json' : 'typescript'}
                 />
               ) : (
-                <pre className="text-ink-dim h-full overflow-auto p-6 font-mono text-[11px] whitespace-pre-wrap">
+                <pre className="text-ink-dim h-full overflow-auto p-6 font-mono text-micro whitespace-pre-wrap">
                   {selected.diff}
                 </pre>
               )}

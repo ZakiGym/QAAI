@@ -86,7 +86,7 @@ export default function RunsPage() {
               <div key={project.id} className="border-line bg-surface-1 lift rounded-xl border p-5">
                 <div className="flex items-baseline justify-between">
                   <h3 className="font-medium">{project.name}</h3>
-                  <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-[10px]">
+                  <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-meta">
                     {project.primaryFramework.toLowerCase()}
                   </span>
                 </div>
@@ -129,7 +129,7 @@ export default function RunsPage() {
                 className="hover:bg-surface-2 flex items-center gap-4 px-4 py-3.5 transition-colors"
               >
                 <StatusDot status={run.status} />
-                <span className="border-line text-ink-dim rounded border px-1.5 py-0.5 font-mono text-[11px]">
+                <span className="border-line text-ink-dim rounded border px-1.5 py-0.5 font-mono text-micro">
                   {run.id.slice(-8)}
                 </span>
                 <span className="text-ink-dim text-sm">

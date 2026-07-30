@@ -299,7 +299,7 @@ function ApiKeysTab() {
           <div key={key.id} className="flex items-center gap-4 px-4 py-3">
             <span className="text-sm font-medium">{key.name}</span>
             <code className="text-ink-faint font-mono text-xs">{key.keyPrefix}…</code>
-            <span className="text-ink-faint font-mono text-[10px]">{key.scopes.join(' ')}</span>
+            <span className="text-ink-faint font-mono text-meta">{key.scopes.join(' ')}</span>
             <button
               type="button"
               onClick={() => void revoke(key.id)}
@@ -311,7 +311,7 @@ function ApiKeysTab() {
         ))}
         {keys.length === 0 && (
           <p className="text-ink-faint px-4 py-6 text-center text-sm">
-            No keys yet. Create one to run QAAI from CI.
+            No API keys. Create one to run QAAI from your own CI, or to drive it from a script.
           </p>
         )}
       </div>
@@ -378,18 +378,18 @@ function UsageTab() {
           <div key={row.agent} className="flex items-center gap-4 px-4 py-3">
             <span className="w-24 text-sm font-medium">{row.agent.toLowerCase()}</span>
             <span className="text-ink-faint text-xs">{row.calls} calls</span>
-            <span className="text-ink-faint font-mono text-[11px]">
+            <span className="text-ink-faint font-mono text-micro">
               {(row.inputTokens / 1000).toFixed(1)}k in / {(row.outputTokens / 1000).toFixed(1)}k out
             </span>
             {row.failures > 0 && (
-              <span className="text-flake text-[11px]">{row.failures} failed</span>
+              <span className="text-flake text-micro">{row.failures} failed</span>
             )}
             <span className="ml-auto font-mono text-sm">{money(row.costCents)}</span>
           </div>
         ))}
         {data.byAgent.length === 0 && (
           <p className="text-ink-faint px-4 py-6 text-center text-sm">
-            No model calls recorded yet.
+            No model calls yet. Once the agent explores or writes tests, every call and its cost is itemised here.
           </p>
         )}
       </div>
@@ -445,14 +445,14 @@ function AuditTab() {
         {shown.map((entry) => (
           <div key={entry.id} className="px-4 py-2.5">
             <div className="flex items-baseline gap-2">
-              <span className="font-mono text-[11px]">{entry.action}</span>
+              <span className="font-mono text-micro">{entry.action}</span>
               <span className="text-ink-faint text-xs">{entry.actor}</span>
-              <span className="text-ink-faint ml-auto text-[10px]">
+              <span className="text-ink-faint ml-auto text-meta">
                 {new Date(entry.createdAt).toLocaleString()}
               </span>
             </div>
             {entry.metadata && Object.keys(entry.metadata).length > 0 && (
-              <p className="text-ink-faint mt-0.5 truncate font-mono text-[10px]">
+              <p className="text-ink-faint mt-0.5 truncate font-mono text-meta">
                 {JSON.stringify(entry.metadata)}
               </p>
             )}

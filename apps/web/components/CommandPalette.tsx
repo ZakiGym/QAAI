@@ -162,7 +162,7 @@ export function CommandPalette({ open, mode, items, onClose }: CommandPalettePro
             return (
               <li key={item.id}>
                 {header && (
-                  <p className="text-ink-faint px-4 pt-2 pb-1 font-mono text-[10px] tracking-wider uppercase">
+                  <p className="text-ink-faint px-4 pt-2 pb-1 font-mono text-meta tracking-wider uppercase">
                     {header}
                   </p>
                 )}
@@ -176,7 +176,7 @@ export function CommandPalette({ open, mode, items, onClose }: CommandPalettePro
                 >
                   <span className="min-w-0 flex-1 truncate">{item.label}</span>
                   {item.detail && (
-                    <span className="text-ink-faint shrink-0 font-mono text-[11px]">
+                    <span className="text-ink-faint shrink-0 font-mono text-micro">
                       {item.detail}
                     </span>
                   )}

@@ -478,7 +478,7 @@ export default function EditorPage() {
         {/* ── File tree ───────────────────────────────────────────────────── */}
         <aside className="border-line min-h-0 overflow-y-auto border-r">
           <div className="border-line flex items-center justify-between border-b px-3 py-2">
-            <span className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
+            <span className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
               {project?.name ?? 'Files'}
             </span>
             <button
@@ -538,7 +538,7 @@ export default function EditorPage() {
                 return (
                   <div
                     key={tab.test.id}
-                    className={`group border-line flex shrink-0 items-center gap-2 border-r px-3 py-1.5 text-[12px] ${
+                    className={`group border-line flex shrink-0 items-center gap-2 border-r px-3 py-1.5 text-micro ${
                       active ? 'bg-surface text-ink' : 'text-ink-faint hover:bg-surface-1'
                     }`}
                   >
@@ -623,7 +623,7 @@ export default function EditorPage() {
           <div className="border-line max-h-[45%] overflow-y-auto border-t px-3 py-3">
             {openTest?.reviewFlags.length ? (
               <div className="border-flake/40 bg-flake/10 mb-4 rounded-md border p-3">
-                <p className="text-flake mb-1.5 text-[11px] font-semibold tracking-wider uppercase">
+                <p className="text-flake mb-1.5 text-micro font-semibold tracking-wider uppercase">
                   Generator flagged
                 </p>
                 <ul className="text-ink-dim space-y-1 text-xs">
@@ -631,7 +631,7 @@ export default function EditorPage() {
                     <li key={i}>{flag}</li>
                   ))}
                 </ul>
-                <p className="text-ink-faint mt-2 text-[11px]">Saving clears these.</p>
+                <p className="text-ink-faint mt-2 text-micro">Saving clears these.</p>
               </div>
             ) : null}
 
@@ -655,7 +655,7 @@ export default function EditorPage() {
                     >
                       <StatusDot status={s.status} />
                       <span className="flex-1 truncate">{s.title}</span>
-                      <span className="text-ink-faint font-mono text-[10px]">
+                      <span className="text-ink-faint font-mono text-meta">
                         {duration(s.durationMs)}
                       </span>
                     </li>
@@ -663,7 +663,7 @@ export default function EditorPage() {
                 </ol>
 
                 {(result.errorMessage || result.steps.some((s) => s.errorMessage)) && (
-                  <pre className="border-fail/40 bg-fail/5 text-fail mt-3 overflow-x-auto rounded-md border p-2.5 font-mono text-[11px] whitespace-pre-wrap">
+                  <pre className="border-fail/40 bg-fail/5 text-fail mt-3 overflow-x-auto rounded-md border p-2.5 font-mono text-micro whitespace-pre-wrap">
                     {result.errorMessage ?? result.steps.find((s) => s.errorMessage)?.errorMessage}
                   </pre>
                 )}

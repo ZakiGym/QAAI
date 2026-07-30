@@ -274,7 +274,7 @@ export default function OnboardingPage() {
 
             <div
               ref={logRef}
-              className="border-line bg-surface-1 h-64 overflow-y-auto rounded-md border p-3 font-mono text-[11px]"
+              className="border-line bg-surface-1 h-64 overflow-y-auto rounded-md border p-3 font-mono text-micro"
             >
               {log.map((line, i) => (
                 <div key={i} className="text-ink-dim">

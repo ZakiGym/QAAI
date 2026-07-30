@@ -106,7 +106,7 @@ export function VersionHistory({
         <aside className="border-line min-h-0 overflow-y-auto border-r">
           <div className="border-line flex items-baseline gap-2 border-b px-4 py-3">
             <h2 className="text-sm font-medium">History</h2>
-            <span className="text-ink-faint truncate font-mono text-[10px]">{filePath}</span>
+            <span className="text-ink-faint truncate font-mono text-meta">{filePath}</span>
           </div>
 
           {loading && <p className="text-ink-faint px-4 py-4 text-xs">Loading…</p>}
@@ -124,15 +124,15 @@ export function VersionHistory({
               }`}
             >
               <div className="flex items-baseline gap-2">
-                <span className="font-mono text-[11px]">v{version.version}</span>
-                <span className={`text-[11px] ${SOURCE_TINT[version.source] ?? 'text-ink-dim'}`}>
+                <span className="font-mono text-micro">v{version.version}</span>
+                <span className={`text-micro ${SOURCE_TINT[version.source] ?? 'text-ink-dim'}`}>
                   {SOURCE_LABEL[version.source] ?? version.source}
                 </span>
               </div>
               {version.message && (
-                <span className="text-ink-faint line-clamp-2 text-[11px]">{version.message}</span>
+                <span className="text-ink-faint line-clamp-2 text-micro">{version.message}</span>
               )}
-              <span className="text-ink-faint text-[10px]">
+              <span className="text-ink-faint text-meta">
                 {new Date(version.createdAt).toLocaleString()}
               </span>
             </button>

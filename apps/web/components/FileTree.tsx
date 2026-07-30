@@ -156,7 +156,7 @@ export function FileTree({
         <div key={`dir:${node.path}`}>
           <div
             onContextMenu={(e) => folderMenu(e, node.path)}
-            className="group text-ink-dim hover:bg-surface-1 flex items-center gap-1.5 rounded px-1.5 py-1 text-[13px]"
+            className="group text-ink-dim hover:bg-surface-1 flex items-center gap-1.5 rounded px-1.5 py-1 text-body-sm"
             style={{ paddingLeft: depth * IND + 6 }}
           >
             <button
@@ -170,7 +170,7 @@ export function FileTree({
               </span>
               <span className="truncate font-medium">{node.name}</span>
               {node.flagCount > 0 && (
-                <span className="text-flake text-[10px]" title={`${node.flagCount} flagged`}>
+                <span className="text-flake text-meta" title={`${node.flagCount} flagged`}>
                   ⚑{node.flagCount}
                 </span>
               )}
@@ -200,7 +200,7 @@ export function FileTree({
         onContextMenu={(e) => fileMenu(e, node.test)}
         title={node.test.name}
         style={{ paddingLeft: depth * IND + 6 }}
-        className={`flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[13px] ${
+        className={`flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-body-sm ${
           active ? 'bg-surface-2 text-ink' : 'hover:bg-surface-1 text-ink-dim'
         }`}
       >
@@ -210,11 +210,11 @@ export function FileTree({
         </span>
         <span className="min-w-0 flex-1 truncate">{node.name}</span>
         {node.test.reviewFlags.length > 0 && (
-          <span className="text-flake shrink-0 text-[10px]" title="Generator flagged this for review">
+          <span className="text-flake shrink-0 text-meta" title="Generator flagged this for review">
             ⚑
           </span>
         )}
-        {dirty && <span className="text-flake shrink-0 text-[11px]" title="Unsaved changes">●</span>}
+        {dirty && <span className="text-flake shrink-0 text-micro" title="Unsaved changes">●</span>}
       </button>
     );
   };
