@@ -42,6 +42,7 @@ import { zipTree } from '../lib/zip.js';
 import { pushRepo, repoHttpsUrl } from '../lib/git.js';
 import { performCookieInjection, performFormLogin, performSsoToken } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
+import { canCreateProject, planFor } from '../lib/plan.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
 
 /**
@@ -85,18 +86,13 @@ projectsRouter.post('/', requireRole('MEMBER'), async (req, res) => {
   const actor = actorOf(req);
   const input = createProjectSchema.parse(req.body);
 
-  // Plan limits are enforced here rather than trusted to the UI (§9).
-  const org = await prisma.organization.findUniqueOrThrow({
-    where: { id: actor.orgId },
-    select: { plan: true },
-  });
-  const used = await prisma.project.count({ where: { archivedAt: null } });
-  const limit = PLAN_LIMITS[org.plan].maxProjects;
-  if (used >= limit) {
-    throw planLimit(`The ${PLAN_LIMITS[org.plan].label} plan allows ${limit} project(s)`, {
-      limit: 'maxProjects',
-      plan: org.plan,
-    });
+  // Plan limits are enforced here rather than trusted to the UI (§9). See the
+  // note in runs.ts on why this asks canCreateProject() rather than reading
+  // Organization.plan, which records what was bought and not what is paid for.
+  const verdict = await canCreateProject(actor.orgId);
+  if (!verdict.allowed) {
+    const { plan } = await planFor(actor.orgId);
+    throw planLimit(verdict.reason ?? 'Plan limit reached', { limit: 'maxProjects', plan });
   }
 
   const slug = input.slug ?? slugify(input.name);

@@ -24,6 +24,7 @@ import { enqueue } from '../lib/queues.js';
 import { badRequest, unauthorized } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { env } from '../env.js';
+import { registerStripeWebhook } from './billing.js';
 
 export const webhooksRouter: Router = Router();
 
@@ -194,3 +195,11 @@ webhooksRouter.post('/github', async (req, res) => {
   logger.info({ repoFullName, pr: pr.number, runId: queued }, 'queued a run for a pull request');
   res.status(202).json({ ok: true, runId: queued });
 });
+
+/*
+ * Stripe mounts here rather than on /billing because signature verification has
+ * to see the exact bytes Stripe signed, and only this prefix is parsed with
+ * express.raw(). Registered from billing.ts so the Stripe client and the
+ * price→plan mapping stay in one file.
+ */
+registerStripeWebhook(webhooksRouter);

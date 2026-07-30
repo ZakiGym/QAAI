@@ -4,9 +4,10 @@
  */
 
 import { Router } from 'express';
-import { FIXTURE_PREFIX, PLAN_LIMITS, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
+import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, notFound, planLimit } from '../lib/errors.js';
+import { canStartRun, planFor } from '../lib/plan.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
 import { subscribe } from '../lib/events.js';
@@ -34,21 +35,22 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
   });
   if (!environment) throw notFound('Environment');
 
-  // Free plan caps monthly runs; paid plans are unlimited by design (§9), which
-  // is the differentiator, so the check is deliberately narrow.
-  const org = await prisma.organization.findUniqueOrThrow({
-    where: { id: actor.orgId },
-    select: { plan: true },
-  });
-  const monthlyCap = PLAN_LIMITS[org.plan].maxRunsPerMonth;
-  if (monthlyCap !== null) {
-    const used = await prisma.run.count({ where: { queuedAt: { gte: currentPeriod() } } });
-    if (used >= monthlyCap) {
-      throw planLimit(
-        `The ${PLAN_LIMITS[org.plan].label} plan includes ${monthlyCap} runs per month`,
-        { limit: 'maxRunsPerMonth', plan: org.plan },
-      );
-    }
+  /*
+   * Free plan caps monthly runs; paid plans are unlimited by design (§9).
+   *
+   * Asked via canStartRun() rather than reading Organization.plan directly:
+   * that field records what was BOUGHT, not what is currently PAID FOR. An org
+   * whose card has failed keeps its label — so the UI can say "your Team plan
+   * is past due" — but is metered at free limits until it clears. Reading the
+   * raw field would hand a cancelled org unlimited runs indefinitely.
+   */
+  const verdict = await canStartRun(actor.orgId);
+  if (!verdict.allowed) {
+    const { plan } = await planFor(actor.orgId);
+    throw planLimit(verdict.reason ?? 'Plan limit reached', {
+      limit: 'maxRunsPerMonth',
+      plan,
+    });
   }
 
   /**

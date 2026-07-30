@@ -61,6 +61,12 @@ const schema = z.object({
 
   STRIPE_SECRET_KEY: z.string().default(''),
   STRIPE_WEBHOOK_SECRET: z.string().default(''),
+  /**
+   * Which Stripe price sells which plan. Absent means "not purchasable online" —
+   * the correct state for a self-hosted install, and permanently for Enterprise.
+   */
+  STRIPE_PRICE_TEAM: z.string().default(''),
+  STRIPE_PRICE_BUSINESS: z.string().default(''),
 
   SLACK_WEBHOOK_URL: z.string().default(''),
   LINEAR_API_KEY: z.string().default(''),
