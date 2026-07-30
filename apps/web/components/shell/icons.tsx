@@ -86,6 +86,17 @@ export function IconPlusSquare(props: IconProps) {
   );
 }
 
+/** Self-healing — a bandage / mend. */
+export function IconHeal(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M12 21s-7-4.35-9-8.5A5.5 5.5 0 0 1 12 6.5a5.5 5.5 0 0 1 9 6c-2 4.15-9 8.5-9 8.5Z" />
+      <path d="M9.5 12h5" />
+      <path d="M12 9.5v5" />
+    </Svg>
+  );
+}
+
 /** Source control — a git branch. */
 export function IconBranch(props: IconProps) {
   return (

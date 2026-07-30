@@ -168,6 +168,26 @@ export interface GitPreview {
   totalBytes: number;
 }
 
+/** A Healer proposal, with the patched result the server computed for review. */
+export interface Heal {
+  id: string;
+  testId: string;
+  diff: string;
+  explanation: string;
+  riskLevel: 'SELECTOR_ONLY' | 'ASSERTION_CHANGE' | 'STRUCTURAL';
+  confidence: number;
+  state: 'PROPOSED' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'AUTO_APPLIED';
+  createdAt: string;
+  test: { id: string; name: string; filePath: string; code: string };
+  /** Applying the diff server-side, so the UI can show a true before/after. */
+  preview: {
+    applies: boolean;
+    code: string | null;
+    reason: string | null;
+    fuzz: number | null;
+  };
+}
+
 export const gitExportUrl = (projectId: string) => `${API_URL}/projects/${projectId}/git/export`;
 
 export const artifactUrl = (runId: string, key: string) =>

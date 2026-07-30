@@ -9,8 +9,9 @@
 
 import { Router } from 'express';
 import { QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
+import { applyHealDiff } from '@qaai/agent';
 import { prisma } from '../lib/prisma.js';
-import { badRequest, conflict, notFound } from '../lib/errors.js';
+import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
 import { subscribe } from '../lib/events.js';
@@ -226,13 +227,41 @@ agentRouter.post('/verdicts/:verdictId/review', requireRole('MEMBER'), async (re
 
 // ─── Heals (§3.4) ────────────────────────────────────────────────────────────
 
-agentRouter.get('/heals', async (_req, res) => {
-  const heals = await prisma.healProposal.findMany({
-    where: { state: 'PROPOSED' },
+/**
+ * Heal proposals for the review screen. Defaults to what needs a decision;
+ * `?state=all` includes decided ones so the screen can show what happened.
+ * The test's current code ships alongside each diff so the client can render a
+ * real before/after without a second round-trip per row.
+ */
+agentRouter.get('/heals', async (req, res) => {
+  const all = String(req.query.state ?? '') === 'all';
+  const rows = await prisma.healProposal.findMany({
+    where: all ? {} : { state: 'PROPOSED' },
     orderBy: { createdAt: 'desc' },
     take: 50,
-    include: { test: { select: { id: true, name: true, filePath: true } } },
+    include: {
+      test: { select: { id: true, name: true, filePath: true, code: true } },
+    },
   });
+
+  /**
+   * The patched result is computed here, with the same applier approval uses, so
+   * the reviewer sees the real before/after and is told up front when a proposal
+   * has gone stale — rather than finding out by clicking Approve.
+   */
+  const heals = rows.map((heal) => {
+    const applied = applyHealDiff(heal.test.code, heal.diff);
+    return {
+      ...heal,
+      preview: {
+        applies: applied.ok,
+        code: applied.code ?? null,
+        reason: applied.reason ?? null,
+        fuzz: applied.fuzz ?? null,
+      },
+    };
+  });
+
   res.json({ heals });
 });
 
@@ -257,25 +286,65 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
     return;
   }
 
-  // Applying the diff to the working copy is the repo integration's job (§7).
-  // Until a repo is connected, approval records intent and surfaces the diff
-  // for a human to apply — which is honest, and better than pretending.
-  const approved = await prisma.healProposal.update({
-    where: { id: heal.id },
-    data: { state: 'APPROVED', decidedBy: actor.userId, decidedAt: new Date() },
+  /**
+   * Approving applies the diff to the test and records a version, so the fix is
+   * real the moment a human accepts it. The test lives in the database, so this
+   * is the working copy — Source control then pushes it like any other change.
+   *
+   * A patch that no longer applies (the test was edited after the proposal) is
+   * refused with a 422 rather than force-fitted; the proposal stays PROPOSED so
+   * it can be re-run.
+   */
+  const applied = applyHealDiff(heal.test.code, heal.diff);
+  if (!applied.ok || !applied.code) {
+    throw unprocessable(applied.reason ?? 'The diff could not be applied');
+  }
+
+  const latest = await prisma.testVersion.findFirst({
+    where: { testId: heal.testId },
+    orderBy: { version: 'desc' },
+    select: { version: true },
   });
+
+  const [, updatedHeal] = await prisma.$transaction([
+    prisma.test.update({
+      where: { id: heal.testId },
+      data: {
+        code: applied.code,
+        // The Generator's review flags describe code a human has now signed off on.
+        reviewFlags: [],
+        versions: {
+          create: {
+            orgId: actor.orgId,
+            version: (latest?.version ?? 0) + 1,
+            code: applied.code,
+            source: 'HEALER',
+            authorId: actor.userId,
+            message: `Applied heal: ${heal.explanation.slice(0, 200)}`,
+          },
+        },
+      },
+    }),
+    prisma.healProposal.update({
+      where: { id: heal.id },
+      data: { state: 'APPLIED', decidedBy: actor.userId, decidedAt: new Date() },
+    }),
+  ]);
 
   await audit({
     actor,
-    action: 'heal.approve',
+    action: 'heal.apply',
     targetType: 'HealProposal',
     targetId: heal.id,
-    metadata: { riskLevel: heal.riskLevel, testId: heal.testId },
+    metadata: { riskLevel: heal.riskLevel, testId: heal.testId, fuzz: applied.fuzz },
   });
 
   res.json({
-    heal: approved,
-    note: 'Approved. Connect a repository to have QAAI open the pull request automatically.',
+    heal: updatedHeal,
+    note:
+      applied.fuzz && applied.fuzz > 0
+        ? `Applied, but the patch needed ${applied.fuzz} line(s) of fuzz — worth a glance in the editor.`
+        : 'Applied to the test. Push it from Source control when you are ready.',
   });
 });
 

@@ -6,7 +6,7 @@
  * into auto-approving selector-only fixes and the diff genuinely is one.
  */
 
-import { isAutoApprovable, proposeHeal, triageFailure } from '@qaai/agent';
+import { applyHealDiff, isAutoApprovable, proposeHeal, triageFailure } from '@qaai/agent';
 import type { FlowMap, StepResult, TestExecution, TriageJob } from '@qaai/shared';
 import { llm, logger, prisma, publishEvent } from '../context.js';
 
@@ -185,21 +185,67 @@ async function proposeHealFor(
 
     const auto = isAutoApprovable(proposal, project?.autoApproveSelectorHeals ?? false);
 
+    /**
+     * Auto-approval has to actually write the code. Recording AUTO_APPLIED while
+     * leaving the test untouched would claim work that never happened — and an
+     * org that opted in would believe its suite was self-healing when nothing had
+     * changed. If the patch refuses to apply, the proposal stays PROPOSED for a
+     * human, with the reason attached.
+     */
+    let state: 'PROPOSED' | 'AUTO_APPLIED' = 'PROPOSED';
+    let applyNote: string | null = null;
+
+    if (auto.allowed) {
+      const applied = applyHealDiff(test.code, proposal.diff);
+      if (applied.ok && applied.code) {
+        const latest = await prisma.testVersion.findFirst({
+          where: { testId: test.id },
+          orderBy: { version: 'desc' },
+          select: { version: true },
+        });
+        await prisma.test.update({
+          where: { id: test.id },
+          data: {
+            code: applied.code,
+            versions: {
+              create: {
+                orgId,
+                version: (latest?.version ?? 0) + 1,
+                code: applied.code,
+                source: 'HEALER',
+                message: `Auto-applied selector heal: ${proposal.explanation.slice(0, 200)}`,
+              },
+            },
+          },
+        });
+        state = 'AUTO_APPLIED';
+      } else {
+        applyNote = applied.reason ?? 'The diff could not be applied';
+      }
+    }
+
     await prisma.healProposal.create({
       data: {
         orgId,
         testId: test.id,
         verdictId,
         diff: proposal.diff,
-        explanation: proposal.explanation,
+        explanation: applyNote
+          ? `${proposal.explanation}\n\nAuto-apply was declined: ${applyNote}`
+          : proposal.explanation,
         riskLevel: proposal.riskLevel,
         confidence: proposal.confidence,
-        state: auto.allowed ? 'AUTO_APPLIED' : 'PROPOSED',
+        state,
       },
     });
 
     logger.info(
-      { testId: test.id, risk: proposal.riskLevel, autoApplied: auto.allowed, reason: auto.reason },
+      {
+        testId: test.id,
+        risk: proposal.riskLevel,
+        autoApplied: state === 'AUTO_APPLIED',
+        reason: applyNote ?? auto.reason,
+      },
       'heal proposed',
     );
   } catch (err) {
