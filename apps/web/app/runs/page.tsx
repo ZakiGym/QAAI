@@ -61,6 +61,9 @@ export default function RunsPage() {
           QAAI
         </Link>
         <h1 className="text-ink-dim text-sm">Runs</h1>
+        <Link href="/editor" className="text-ink-dim hover:text-ink ml-auto text-sm">
+          Editor
+        </Link>
       </header>
 
       {error && (

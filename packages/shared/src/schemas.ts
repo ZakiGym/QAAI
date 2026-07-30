@@ -185,6 +185,35 @@ export const generatedTestSchema = z.object({
   reviewFlags: z.array(z.string()).default([]),
 });
 
+// ─── Hand-authored tests (§8 editor) ─────────────────────────────────────────
+
+/** A path that is safe to write to disk — the runner turns this into a real file. */
+const relativeFilePath = z
+  .string()
+  .min(1)
+  .max(300)
+  .refine((p) => !p.includes('..') && !p.startsWith('/'), 'must be relative and cannot contain ..');
+
+export const updateTestSchema = z.object({
+  code: z.string().max(500_000),
+  name: z.string().min(1).max(160).optional(),
+  /** Type-specific config for the non-Playwright plugins (API, a11y, security). */
+  spec: z.unknown().optional(),
+  /** Shown in the version history. */
+  message: z.string().max(300).optional(),
+});
+
+export const createTestSchema = z.object({
+  name: z.string().min(1).max(160),
+  type: z.enum(TEST_TYPES).default('E2E'),
+  feature: z.string().min(1).max(80).optional(),
+  priority: z.enum(PRIORITIES).default('IMPORTANT'),
+  code: z.string().max(500_000),
+  filePath: relativeFilePath,
+  spec: z.unknown().optional(),
+  tags: z.array(z.string().max(40)).max(20).default([]),
+});
+
 // ─── Triage (§3.3) ───────────────────────────────────────────────────────────
 
 export const triageVerdictSchema = z.object({

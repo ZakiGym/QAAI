@@ -8,6 +8,8 @@ import {
   SECRET_MASK,
   createEnvironmentSchema,
   createProjectSchema,
+  createTestSchema,
+  updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
@@ -224,6 +226,149 @@ projectsRouter.get('/:projectId/tests/:testId', async (req, res) => {
   const test = await prisma.test.findUnique({ where: { id: String(req.params.testId) } });
   if (!test || test.projectId !== req.params.projectId) throw notFound('Test');
   res.json({ test });
+});
+
+/**
+ * Hand-edit a test (§8 — the editor).
+ *
+ * Every save writes a TestVersion with source HUMAN, so a human edit sits in
+ * the same history as a Generator write or an applied Heal. That matters for
+ * triage: "who last touched this test, and why" has one answer, not two.
+ *
+ * Saving also clears the Generator's review flags. They mean "a machine wrote
+ * this and was unsure"; once a person has read and edited the file, that
+ * warning is stale and leaving it up trains people to ignore the badge.
+ */
+projectsRouter.put('/:projectId/tests/:testId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = updateTestSchema.parse(req.body);
+
+  const test = await prisma.test.findUnique({ where: { id: String(req.params.testId) } });
+  if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
+
+  if (input.code === test.code && input.name === undefined && input.spec === undefined) {
+    res.json({ test, saved: false });
+    return;
+  }
+
+  const latest = await prisma.testVersion.findFirst({
+    where: { testId: test.id },
+    orderBy: { version: 'desc' },
+    select: { version: true },
+  });
+
+  const updated = await prisma.test.update({
+    where: { id: test.id },
+    data: {
+      code: input.code,
+      ...(input.name ? { name: input.name } : {}),
+      ...(input.spec !== undefined ? { spec: input.spec as object } : {}),
+      reviewFlags: [],
+      versions: {
+        create: {
+          orgId: actor.orgId,
+          version: (latest?.version ?? 0) + 1,
+          code: input.code,
+          source: 'HUMAN',
+          authorId: actor.userId,
+          message: input.message ?? 'Edited in the QAAI editor',
+        },
+      },
+    },
+  });
+
+  await audit({
+    actor,
+    action: 'test.update',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { name: updated.name, bytes: input.code.length },
+  });
+
+  res.json({ test: updated, saved: true });
+});
+
+/** Version history for the editor's sidebar. */
+projectsRouter.get('/:projectId/tests/:testId/versions', async (req, res) => {
+  const versions = await prisma.testVersion.findMany({
+    where: { testId: String(req.params.testId) },
+    orderBy: { version: 'desc' },
+    take: 50,
+    select: {
+      id: true,
+      version: true,
+      source: true,
+      message: true,
+      authorId: true,
+      createdAt: true,
+    },
+  });
+  res.json({ versions });
+});
+
+/**
+ * Create a test by hand, with no plan item behind it (§8).
+ *
+ * The spec's flow is Explorer proposes → human approves → Generator writes. This
+ * is the escape hatch for the QA engineer who already knows exactly what they
+ * want to write and does not want to negotiate with an agent about it.
+ */
+projectsRouter.post('/:projectId/tests', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = createTestSchema.parse(req.body);
+
+  const project = await prisma.project.findUnique({
+    where: { id: String(req.params.projectId) },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const suite = await prisma.suite.upsert({
+    where: { projectId_name: { projectId: project.id, name: 'Hand-written' } },
+    create: {
+      orgId: actor.orgId,
+      projectId: project.id,
+      name: 'Hand-written',
+      description: 'Tests authored directly in the editor',
+    },
+    update: {},
+  });
+
+  const test = await prisma.test.create({
+    data: {
+      orgId: actor.orgId,
+      projectId: project.id,
+      suiteId: suite.id,
+      name: input.name,
+      type: input.type,
+      feature: input.feature ?? 'Uncategorised',
+      priority: input.priority,
+      code: input.code,
+      filePath: input.filePath,
+      spec: (input.spec as object) ?? undefined,
+      tags: input.tags,
+      versions: {
+        create: {
+          orgId: actor.orgId,
+          version: 1,
+          code: input.code,
+          source: 'HUMAN',
+          authorId: actor.userId,
+          message: 'Created in the QAAI editor',
+        },
+      },
+    },
+  });
+
+  await audit({
+    actor,
+    action: 'test.create',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: { name: test.name, type: test.type },
+  });
+
+  res.status(201).json({ test });
 });
 
 /** Latest flow map, for the Flow Map screen (§8). */

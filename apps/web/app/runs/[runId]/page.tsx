@@ -111,6 +111,9 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               gate {run.gateResult.passed ? 'pass' : 'block'}
             </span>
           )}
+          <Link href="/editor" className="text-ink-faint hover:text-ink">
+            Editor
+          </Link>
           <a href={`${API_URL}/runs/${run.id}/junit.xml`} className="text-ink-faint hover:text-ink">
             JUnit XML
           </a>
