@@ -19,12 +19,14 @@ interface Me {
   orgs: Org[];
 }
 
-type Tab = 'organization' | 'members' | 'apiKeys';
+type Tab = 'organization' | 'members' | 'apiKeys' | 'usage' | 'audit';
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'organization', label: 'Organization' },
   { id: 'members', label: 'Members' },
   { id: 'apiKeys', label: 'API keys' },
+  { id: 'usage', label: 'Usage' },
+  { id: 'audit', label: 'Audit log' },
 ];
 
 export default function SettingsPage() {
@@ -89,8 +91,12 @@ export default function SettingsPage() {
         <OrganizationTab org={activeOrg} />
       ) : tab === 'members' ? (
         <MembersTab me={me} activeOrg={activeOrg} />
-      ) : (
+      ) : tab === 'apiKeys' ? (
         <ApiKeysTab />
+      ) : tab === 'usage' ? (
+        <UsageTab />
+      ) : (
+        <AuditTab />
       )}
     </main>
   );
@@ -314,6 +320,148 @@ function ApiKeysTab() {
         Use a key with the CLI: <code className="font-mono">QAAI_API_KEY=… qaai run --env …</code>.
         See docs/ci.md.
       </p>
+    </div>
+  );
+}
+
+/**
+ * What the AI has cost. Every model call has always recorded its tokens and
+ * price; none of it was visible, which is a poor property for a product that
+ * bills partly on model usage.
+ */
+function UsageTab() {
+  const [data, setData] = useState<{
+    days: number;
+    totalCalls: number;
+    totalCostCents: number;
+    byAgent: Array<{
+      agent: string;
+      calls: number;
+      inputTokens: number;
+      outputTokens: number;
+      costCents: number;
+      failures: number;
+    }>;
+  } | null>(null);
+
+  useEffect(() => {
+    void api<typeof data>('/settings/usage')
+      .then(setData)
+      .catch(() => setData(null));
+  }, []);
+
+  if (!data) return <p className="text-ink-faint text-sm">Loading…</p>;
+
+  const money = (cents: number) => `$${(cents / 100).toFixed(2)}`;
+
+  return (
+    <div className="space-y-6">
+      <div className="grid grid-cols-3 gap-3">
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Last {data.days} days</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight">{money(data.totalCostCents)}</p>
+        </div>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Model calls</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight">{data.totalCalls}</p>
+        </div>
+        <div className="border-line bg-surface-1 rounded-lg border p-4">
+          <p className="text-ink-faint text-xs">Failed calls</p>
+          <p className="text-flake mt-1 text-2xl font-semibold tracking-tight">
+            {data.byAgent.reduce((sum, a) => sum + a.failures, 0)}
+          </p>
+        </div>
+      </div>
+
+      <div className="border-line divide-line overflow-hidden rounded-lg border">
+        {data.byAgent.map((row) => (
+          <div key={row.agent} className="flex items-center gap-4 px-4 py-3">
+            <span className="w-24 text-sm font-medium">{row.agent.toLowerCase()}</span>
+            <span className="text-ink-faint text-xs">{row.calls} calls</span>
+            <span className="text-ink-faint font-mono text-[11px]">
+              {(row.inputTokens / 1000).toFixed(1)}k in / {(row.outputTokens / 1000).toFixed(1)}k out
+            </span>
+            {row.failures > 0 && (
+              <span className="text-flake text-[11px]">{row.failures} failed</span>
+            )}
+            <span className="ml-auto font-mono text-sm">{money(row.costCents)}</span>
+          </div>
+        ))}
+        {data.byAgent.length === 0 && (
+          <p className="text-ink-faint px-4 py-6 text-center text-sm">
+            No model calls recorded yet.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The audit trail. Recorded since the first commit, never once readable — which
+ * makes an audit log a compliance checkbox rather than a tool.
+ */
+function AuditTab() {
+  const [entries, setEntries] = useState<
+    Array<{
+      id: string;
+      actor: string;
+      action: string;
+      targetType: string;
+      targetId: string | null;
+      metadata: Record<string, unknown> | null;
+      ip: string | null;
+      createdAt: string;
+    }>
+  >([]);
+  const [filter, setFilter] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void api<{ entries: typeof entries }>('/settings/audit')
+      .then((d) => setEntries(d.entries))
+      .catch((err) => setError(err instanceof Error ? err.message : 'Could not load the audit log'));
+  }, []);
+
+  const shown = entries.filter(
+    (e) =>
+      !filter ||
+      e.action.includes(filter) ||
+      e.actor.toLowerCase().includes(filter.toLowerCase()),
+  );
+
+  if (error) return <p className="text-fail text-sm">{error}</p>;
+
+  return (
+    <div className="space-y-4">
+      <input
+        value={filter}
+        onChange={(e) => setFilter(e.target.value)}
+        placeholder="Filter by action or person…"
+        className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-1.5 text-sm outline-none"
+      />
+
+      <div className="border-line divide-line max-h-[60vh] overflow-y-auto rounded-lg border">
+        {shown.map((entry) => (
+          <div key={entry.id} className="px-4 py-2.5">
+            <div className="flex items-baseline gap-2">
+              <span className="font-mono text-[11px]">{entry.action}</span>
+              <span className="text-ink-faint text-xs">{entry.actor}</span>
+              <span className="text-ink-faint ml-auto text-[10px]">
+                {new Date(entry.createdAt).toLocaleString()}
+              </span>
+            </div>
+            {entry.metadata && Object.keys(entry.metadata).length > 0 && (
+              <p className="text-ink-faint mt-0.5 truncate font-mono text-[10px]">
+                {JSON.stringify(entry.metadata)}
+              </p>
+            )}
+          </div>
+        ))}
+        {shown.length === 0 && (
+          <p className="text-ink-faint px-4 py-6 text-center text-sm">Nothing recorded yet.</p>
+        )}
+      </div>
     </div>
   );
 }
