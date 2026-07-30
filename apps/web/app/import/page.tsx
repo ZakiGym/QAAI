@@ -56,13 +56,26 @@ export default function ImportPage() {
   const [convertedCount, setConvertedCount] = useState(0);
   const [summary, setSummary] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Import used to require a project to already exist — so someone arriving WITH
+   * a Cypress suite and nothing else hit a screen that silently did nothing.
+   * When there is no project, these fields appear and one is created on the way
+   * through.
+   */
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newBaseUrl, setNewBaseUrl] = useState('');
+  const [loadedProjects, setLoadedProjects] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     void api<{ projects: Project[] }>('/projects')
-      .then((d) => setProject(d.projects[0] ?? null))
+      .then((d) => {
+        setProject(d.projects[0] ?? null);
+        setLoadedProjects(true);
+      })
       .catch((err) => {
         if (err instanceof ApiError && err.status === 401) router.push('/login');
+        setLoadedProjects(true);
       });
   }, [router]);
 
@@ -87,14 +100,48 @@ export default function ImportPage() {
       ),
     );
     setFiles(read);
+
+    // Name the project after the folder they dropped, when they have none yet.
+    if (!newProjectName) {
+      const top = read
+        .map((f) => f.path.split('/')[0])
+        .find((seg) => seg && !seg.includes('.'));
+      setNewProjectName(top ? top.replace(/[-_]/g, ' ') : 'Imported tests');
+    }
   }
 
   async function detect() {
-    if (!project || files.length === 0) return;
+    if (files.length === 0) return;
     setError(null);
     try {
+      // No project yet? Make one, plus an environment for the tests to run
+      // against later. Imported tests are converted to Playwright.
+      let target = project;
+      if (!target) {
+        const created = await api<{ project: Project }>('/projects', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: newProjectName.trim() || 'Imported tests',
+            primaryLanguage: 'TYPESCRIPT',
+            primaryFramework: 'PLAYWRIGHT',
+          }),
+        });
+        target = created.project;
+        await api(`/projects/${target.id}/environments`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: 'local',
+            kind: 'LOCAL',
+            baseUrl: newBaseUrl.trim() || 'http://localhost:3000',
+          }),
+        }).catch(() => {
+          /* the suite still imports without an environment; runs need one later */
+        });
+        setProject(target);
+      }
+
       const res = await api<{ batch: { id: string }; detection: Detection }>(
-        `/projects/${project.id}/import`,
+        `/projects/${target.id}/import`,
         { method: 'POST', body: JSON.stringify({ files }) },
       );
       setBatchId(res.batch.id);
@@ -194,6 +241,30 @@ export default function ImportPage() {
             <p className="text-ink-faint mt-2 text-center text-xs">
               Nothing leaves your machine except the file contents, sent to your QAAI instance.
             </p>
+
+            {/* No project yet — name the one this import will create. */}
+            {files.length > 0 && loadedProjects && !project && (
+              <div className="border-line mt-4 space-y-3 rounded-lg border p-4">
+                <p className="text-ink-faint text-[11px] font-semibold tracking-wider uppercase">
+                  New project
+                </p>
+                <p className="text-ink-dim text-xs">
+                  You have no project yet, so this import will create one.
+                </p>
+                <input
+                  value={newProjectName}
+                  onChange={(e) => setNewProjectName(e.target.value)}
+                  placeholder="Project name"
+                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 text-sm outline-none"
+                />
+                <input
+                  value={newBaseUrl}
+                  onChange={(e) => setNewBaseUrl(e.target.value)}
+                  placeholder="https://staging.example.com (where these tests run)"
+                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 font-mono text-xs outline-none"
+                />
+              </div>
+            )}
 
             {files.length > 0 && phase !== 'detected' && (
               <button

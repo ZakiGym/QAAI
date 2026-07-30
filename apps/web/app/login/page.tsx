@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
 
@@ -76,7 +77,14 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <p className="text-ink-faint mt-6 text-xs">
+        <p className="text-ink-faint mt-6 text-sm">
+          New here?{' '}
+          <Link href="/signup" className="text-accent hover:underline">
+            Create an account
+          </Link>
+        </p>
+
+        <p className="text-ink-faint mt-4 text-xs">
           Seeded demo account: <code className="font-mono">owner@qaai.local</code> /{' '}
           <code className="font-mono">qaai-demo-password-1</code>
         </p>

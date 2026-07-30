@@ -8,6 +8,7 @@ import { z } from 'zod';
 import {
   AUTH_PROFILE_KINDS,
   ENVIRONMENT_KINDS,
+  FRAMEWORKS_BY_LANGUAGE,
   GIT_INTEGRATION_KINDS,
   LANGUAGES,
   ORG_ROLES,
@@ -59,13 +60,30 @@ export const inviteSchema = z.object({
 
 // ─── Projects & environments (§2) ────────────────────────────────────────────
 
-export const createProjectSchema = z.object({
-  name: z.string().min(1).max(120),
-  slug: slug.optional(),
-  repoUrl: httpUrl.nullish(),
-  primaryLanguage: z.enum(LANGUAGES).default('TYPESCRIPT'),
-  primaryFramework: z.enum(UI_FRAMEWORKS).default('PLAYWRIGHT'),
-});
+export const createProjectSchema = z
+  .object({
+    name: z.string().min(1).max(120),
+    slug: slug.optional(),
+    repoUrl: httpUrl.nullish(),
+    primaryLanguage: z.enum(LANGUAGES).default('TYPESCRIPT'),
+    primaryFramework: z.enum(UI_FRAMEWORKS).default('PLAYWRIGHT'),
+  })
+  /**
+   * The pair has to be one the generator can actually emit. Selenium with
+   * TypeScript passed validation happily and then produced tests that could
+   * never run — a failure the user only discovered after a crawl, a plan, an
+   * approval and a generation.
+   */
+  .superRefine((value, ctx) => {
+    const allowed = FRAMEWORKS_BY_LANGUAGE[value.primaryLanguage];
+    if (!allowed.includes(value.primaryFramework)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['primaryFramework'],
+        message: `${value.primaryFramework} is not available for ${value.primaryLanguage}. Choose one of: ${allowed.join(', ')}`,
+      });
+    }
+  });
 
 export const createEnvironmentSchema = z.object({
   name: z.string().min(1).max(60),

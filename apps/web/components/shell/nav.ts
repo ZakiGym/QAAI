@@ -42,7 +42,7 @@ export const SETTINGS_ITEM: NavItemDef = {
 };
 
 /** Routes that must NOT get the app shell (marketing + auth stand alone). */
-export const SHELL_EXCLUDED = new Set(['/', '/login']);
+export const SHELL_EXCLUDED = new Set(['/', '/login', '/signup']);
 
 export function isNavActive(pathname: string, href: string): boolean {
   if (href === '/runs') {
