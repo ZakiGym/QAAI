@@ -22,6 +22,7 @@ import {
   moveTestSchema,
   locatorsFromFlowMap,
   updateEnvironmentSchema,
+  updateGateRulesSchema,
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
@@ -846,6 +847,48 @@ projectsRouter.post(
   res.json({ push: result });
 });
 
+
+/** The gate rules for a project — what blocks a deploy. */
+projectsRouter.get('/:projectId/gate-rules', async (req, res) => {
+  const project = await prisma.project.findUnique({
+    where: { id: String(req.params.projectId) },
+    select: { gateRules: true },
+  });
+  if (!project) throw notFound('Project');
+  res.json({ rules: project.gateRules ?? [] });
+});
+
+/**
+ * Replace the gate rules. Validated as a discriminated union so a malformed
+ * rule cannot be stored — a gate that throws at evaluation time would fail
+ * open, which is the one behaviour a deploy gate must never have.
+ */
+projectsRouter.put('/:projectId/gate-rules', requireRole('ADMIN'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = updateGateRulesSchema.parse(req.body);
+
+  const project = await prisma.project.findUnique({
+    where: { id: String(req.params.projectId) },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const updated = await prisma.project.update({
+    where: { id: project.id },
+    data: { gateRules: input.rules as unknown as object },
+    select: { gateRules: true },
+  });
+
+  await audit({
+    actor,
+    action: 'project.gate-rules.update',
+    targetType: 'Project',
+    targetId: project.id,
+    metadata: { count: input.rules.length, kinds: input.rules.map((r) => r.kind) },
+  });
+
+  res.json({ rules: updated.gateRules });
+});
 
 // ─── Quality surfaces (§4, §5) ───────────────────────────────────────────────
 

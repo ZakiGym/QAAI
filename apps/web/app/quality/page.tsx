@@ -27,6 +27,30 @@ interface Finding {
   tests: string[];
 }
 
+type GateRule =
+  | { kind: 'BLOCK_ON_VERDICT'; verdict: string; onlyPriorities: string[] }
+  | { kind: 'MAX_FLAKE_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' }
+  | { kind: 'MAX_P95_LATENCY_MS'; ms: number; action: 'WARN' | 'BLOCK' }
+  | { kind: 'MIN_PASS_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' };
+
+/** Plain-English for each rule, because "MAX_FLAKE_RATE" is not a sentence. */
+function describeRule(rule: GateRule): string {
+  switch (rule.kind) {
+    case 'BLOCK_ON_VERDICT':
+      return `Block the deploy when triage calls a failure a ${rule.verdict.toLowerCase().replace('_', ' ')}${
+        rule.onlyPriorities.length
+          ? `, but only for ${rule.onlyPriorities.map((p) => p.toLowerCase().replace('_', ' ')).join(' or ')} tests`
+          : ''
+      }.`;
+    case 'MAX_FLAKE_RATE':
+      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when more than ${rule.ratePercent}% of tests are flaky.`;
+    case 'MAX_P95_LATENCY_MS':
+      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when the 95th-percentile test takes longer than ${rule.ms}ms.`;
+    case 'MIN_PASS_RATE':
+      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when the pass rate falls below ${rule.ratePercent}%.`;
+  }
+}
+
 interface FlakyTest {
   id: string;
   name: string;
@@ -46,7 +70,10 @@ const SEVERITY: Record<string, string> = {
 export default function QualityPage() {
   const router = useRouter();
   const [project, setProject] = useState<Project | null>(null);
-  const [tab, setTab] = useState<'findings' | 'flaky'>('findings');
+  const [tab, setTab] = useState<'findings' | 'flaky' | 'gates'>('findings');
+  const [rules, setRules] = useState<GateRule[]>([]);
+  const [savingRules, setSavingRules] = useState(false);
+  const [ruleNote, setRuleNote] = useState<string | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [flaky, setFlaky] = useState<FlakyTest[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +89,10 @@ export default function QualityPage() {
     ]);
     setFindings(f.findings);
     setFlaky(q.tests);
+    const g = await api<{ rules: GateRule[] }>(`/projects/${projectId}/gate-rules`).catch(() => ({
+      rules: [] as GateRule[],
+    }));
+    setRules(g.rules);
   }, []);
 
   useEffect(() => {
@@ -118,6 +149,7 @@ export default function QualityPage() {
           [
             ['findings', `Findings (${findings.length})`],
             ['flaky', `Flake radar (${flaky.length})`],
+            ['gates', `Deploy gates (${rules.length})`],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -133,7 +165,111 @@ export default function QualityPage() {
         ))}
       </nav>
 
-      {tab === 'findings' ? (
+      {tab === 'gates' ? (
+        <div className="space-y-4">
+          <p className="text-ink-dim text-sm">
+            These decide whether a run blocks a deploy. A <span className="text-fail">block</span>{' '}
+            fails the CI gate; a <span className="text-flake">warn</span> is recorded and lets the
+            merge through.
+          </p>
+
+          <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
+            {rules.map((rule, index) => (
+              <div key={index} className="flex items-start gap-3 px-4 py-3">
+                <span
+                  className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] ${
+                    ('action' in rule ? rule.action : 'BLOCK') === 'BLOCK'
+                      ? 'border-fail/40 text-fail'
+                      : 'border-flake/40 text-flake'
+                  }`}
+                >
+                  {'action' in rule ? rule.action.toLowerCase() : 'block'}
+                </span>
+                <p className="min-w-0 flex-1 text-[13px]">{describeRule(rule)}</p>
+                <button
+                  type="button"
+                  onClick={() => setRules(rules.filter((_, i) => i !== index))}
+                  className="text-fail shrink-0 text-xs hover:underline"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            {rules.length === 0 && (
+              <p className="text-ink-faint px-4 py-8 text-center text-sm">
+                No gates. Every run passes, whatever it finds.
+              </p>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() =>
+                setRules([
+                  ...rules,
+                  { kind: 'BLOCK_ON_VERDICT', verdict: 'REAL_BUG', onlyPriorities: ['CRITICAL_PATH'] },
+                ])
+              }
+              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+            >
+              + Block on real bugs
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRules([...rules, { kind: 'MAX_FLAKE_RATE', ratePercent: 5, action: 'WARN' }])
+              }
+              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+            >
+              + Flake ceiling
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRules([...rules, { kind: 'MIN_PASS_RATE', ratePercent: 90, action: 'BLOCK' }])
+              }
+              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+            >
+              + Minimum pass rate
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRules([...rules, { kind: 'MAX_P95_LATENCY_MS', ms: 30000, action: 'WARN' }])
+              }
+              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+            >
+              + Latency ceiling
+            </button>
+
+            <button
+              type="button"
+              disabled={savingRules || !project}
+              onClick={async () => {
+                if (!project) return;
+                setSavingRules(true);
+                setRuleNote(null);
+                try {
+                  await api(`/projects/${project.id}/gate-rules`, {
+                    method: 'PUT',
+                    body: JSON.stringify({ rules }),
+                  });
+                  setRuleNote('Saved. New runs are gated on these.');
+                } catch (err) {
+                  setRuleNote(err instanceof Error ? err.message : 'Could not save');
+                } finally {
+                  setSavingRules(false);
+                }
+              }}
+              className="bg-accent ml-auto rounded-md px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+            >
+              {savingRules ? 'Saving…' : 'Save gates'}
+            </button>
+          </div>
+          {ruleNote && <p className="text-ink-dim text-xs">{ruleNote}</p>}
+        </div>
+      ) : tab === 'findings' ? (
         <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
           {findings.map((f) => (
             <div key={f.id} className={`px-4 py-3 ${f.mutedAt ? 'opacity-50' : ''}`}>

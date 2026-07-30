@@ -377,6 +377,43 @@ export const apiTestSpecSchema = z.object({
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
 
+// ─── Quality gates (§5) ──────────────────────────────────────────────────────
+
+/**
+ * The rules that decide whether a run blocks a deploy.
+ *
+ * A discriminated union so an invalid combination cannot be stored: a
+ * BLOCK_ON_VERDICT rule has no rate, and a MAX_FLAKE_RATE rule has no verdict.
+ * These have lived on Project.gateRules as untyped JSON with no way to edit
+ * them — the product's teeth, configurable only by hand-editing the database.
+ */
+export const gateRuleSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('BLOCK_ON_VERDICT'),
+    verdict: z.enum(VERDICTS),
+    onlyPriorities: z.array(z.enum(PRIORITIES)).default([]),
+  }),
+  z.object({
+    kind: z.literal('MAX_FLAKE_RATE'),
+    ratePercent: z.number().min(0).max(100),
+    action: z.enum(['WARN', 'BLOCK']),
+  }),
+  z.object({
+    kind: z.literal('MAX_P95_LATENCY_MS'),
+    ms: z.number().int().positive().max(600_000),
+    action: z.enum(['WARN', 'BLOCK']),
+  }),
+  z.object({
+    kind: z.literal('MIN_PASS_RATE'),
+    ratePercent: z.number().min(0).max(100),
+    action: z.enum(['WARN', 'BLOCK']),
+  }),
+]);
+
+export const updateGateRulesSchema = z.object({
+  rules: z.array(gateRuleSchema).max(20),
+});
+
 // ─── Visual regression (§4) ──────────────────────────────────────────────────
 
 const ignoreRegionSchema = z.object({
