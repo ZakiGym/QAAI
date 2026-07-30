@@ -26,6 +26,34 @@ import { playwrightCliPath } from './playwright-harness.js';
 /** A recording browser left open forever should not leak a process indefinitely. */
 const MAX_RECORD_MS = 20 * 60_000;
 
+/**
+ * Every live codegen child, so a process exit can take its browsers down with
+ * it. Without this, a graceful API restart (SIGTERM to the parent PID only)
+ * leaves the non-detached children reparented to init with their in-process
+ * kill timer gone — an orphaned browser that survives past MAX_RECORD_MS until
+ * a human closes the window. The `exit` handler below is the belt; the API's
+ * shutdown path reaches process.exit, which fires it.
+ */
+const liveChildren = new Set<ReturnType<typeof spawn>>();
+let exitHandlerRegistered = false;
+
+function ensureExitHandler(): void {
+  if (exitHandlerRegistered) return;
+  exitHandlerRegistered = true;
+  // 'exit' only runs synchronous code, and child.kill is synchronous — exactly
+  // what is needed. It fires on any process.exit, including the API's graceful
+  // shutdown, so the codegen browsers die with their parent.
+  process.on('exit', () => {
+    for (const child of liveChildren) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  });
+}
+
 export interface RecordingSession {
   /** Resolves with the generated spec source once the browser window is closed. */
   done: Promise<string>;
@@ -42,6 +70,7 @@ export interface RecordingSession {
  * surface even if that assumption were ever wrong.
  */
 export function startRecording(url: string): RecordingSession {
+  ensureExitHandler();
   let child: ReturnType<typeof spawn> | null = null;
   let timeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -55,6 +84,7 @@ export function startRecording(url: string): RecordingSession {
           ['codegen', '--target', 'playwright-test', '--output', outputPath, url],
           { stdio: ['ignore', 'ignore', 'pipe'] },
         );
+        liveChildren.add(child);
 
         let stderr = '';
         child.stderr?.on('data', (chunk: Buffer) => {
@@ -65,12 +95,14 @@ export function startRecording(url: string): RecordingSession {
 
         child.on('error', (err) => {
           if (timeout) clearTimeout(timeout);
+          liveChildren.delete(child!);
           void rm(dir, { recursive: true, force: true });
           reject(new Error(`Could not launch the recorder: ${err.message}`));
         });
 
         child.on('exit', async (code, signal) => {
           if (timeout) clearTimeout(timeout);
+          liveChildren.delete(child!);
           try {
             // A cancelled recording (SIGTERM) has no spec to read; that is the
             // user backing out, not a failure to report as one.

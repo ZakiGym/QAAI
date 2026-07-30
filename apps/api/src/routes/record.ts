@@ -52,6 +52,12 @@ function sweepStale(): void {
   }
 }
 
+// Sweep on a timer, not only when a new recording arrives — otherwise a
+// low-traffic instance where each org records once and stops never reclaims
+// completed sessions, and the map grows for the life of the process. `unref`
+// so this interval never keeps the process alive on its own.
+setInterval(sweepStale, 10 * 60_000).unref();
+
 recordRouter.post('/projects/:projectId/record', requireRole('MEMBER'), async (req, res) => {
   sweepStale();
   const actor = actorOf(req);

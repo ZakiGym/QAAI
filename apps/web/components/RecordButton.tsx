@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { api } from '../lib/api';
+import { API_URL, api } from '../lib/api';
 
 /**
  * Record mode entry point (§C) — the fusion of the agent and the editor.
@@ -36,7 +36,21 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
   useEffect(
     () => () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      // Unmounting mid-recording (navigating away, closing the tab) must not
+      // orphan the browser window and the server session. keepalive lets this
+      // DELETE outlive the page it fires from.
+      const sid = sessionRef.current;
+      if (sid) {
+        void fetch(`${API_URL}/projects/${projectId}/record/${sid}`, {
+          method: 'DELETE',
+          credentials: 'include',
+          keepalive: true,
+        }).catch(() => {});
+      }
     },
+    // projectId is stable for the editor's lifetime; capturing the mount value
+    // is correct here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
   );
 
@@ -66,6 +80,12 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
           `/projects/${projectId}/record/${sessionId}`,
         ).catch(() => null);
         if (!res) return;
+
+        // The GET above is an await: a cancel could have landed while it was in
+        // flight. cancel() nulls the ref, so if it no longer points at this
+        // session, this callback is stale — bail before saving a cancelled
+        // recording. (The TOCTOU the review caught.)
+        if (sessionRef.current !== sessionId) return;
 
         if (res.status === 'ready' && res.code) {
           stopPolling();
@@ -103,6 +123,7 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
           tags: ['recorded'],
         }),
       });
+      sessionRef.current = null;
       setPhase('idle');
       onRecorded(test.id);
     } catch (err) {
@@ -113,12 +134,14 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
 
   async function cancel() {
     stopPolling();
-    if (sessionRef.current) {
-      await api(`/projects/${projectId}/record/${sessionRef.current}`, { method: 'DELETE' }).catch(
-        () => {},
-      );
-    }
+    // Null the ref *before* awaiting, so an in-flight poll iteration that
+    // resumes after this sees a mismatched session and bails (finding 1).
+    const sid = sessionRef.current;
+    sessionRef.current = null;
     setPhase('idle');
+    if (sid) {
+      await api(`/projects/${projectId}/record/${sid}`, { method: 'DELETE' }).catch(() => {});
+    }
   }
 
   if (phase === 'recording') {
