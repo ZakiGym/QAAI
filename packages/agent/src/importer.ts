@@ -20,6 +20,7 @@
 
 import { z } from 'zod';
 import type { ApiTestSpec } from '@qaai/shared';
+import { LlmError } from './llm.js';
 import type { CallContext, LlmService } from './llm.js';
 
 // ─── Framework detection ─────────────────────────────────────────────────────
@@ -207,13 +208,20 @@ const RULES: Rule[] = [
   {
     framework: 'KARATE',
     filenames: [/\.feature$/],
-    // Must beat GHERKIN on a .feature file, so its own signals score higher.
+    // Karate and Cucumber share the .feature extension and Gherkin keywords, so
+    // detection keys on Karate's HTTP-DSL steps — `Given url`, `When method`,
+    // `Then status`, `And match`, `And request` — plus the `*`-shorthand. These
+    // never appear in a natural-language Cucumber scenario. Weighted high enough
+    // to win outright, not just on a filename tie (the earlier gap).
     patterns: [
       /\bkarate\.\w+/,
       /\*\s+def\s+\w+/,
-      /\*\s+url\s+/,
-      /\*\s+method\s+(get|post|put|delete)/i,
-      /And\s+match\b/,
+      /\*\s+(url|method|path|request|header)\b/i,
+      /Given\s+url\b/i,
+      /Given\s+path\b/i,
+      /When\s+method\s+(get|post|put|delete|patch|head|options)/i,
+      /Then\s+status\s+\d/i,
+      /And\s+(match|request|path|header)\b/i,
     ],
     weight: 4,
   },
@@ -351,27 +359,59 @@ interface PostmanItem {
   event?: Array<{ listen?: string; script?: { exec?: string[] } }>;
 }
 
-/** Pulls a `path` (and query) out of a Postman raw URL, dropping `{{baseUrl}}`. */
+/**
+ * Pulls the path (and query) out of a Postman raw URL.
+ *
+ * Two things a naive implementation gets wrong, both caught in review:
+ *  - A leading `{{baseUrl}}` maps to the environment's base URL and is stripped.
+ *  - But a `{{var}}` *inside* the path (`/users/{{userId}}`) is a real template
+ *    variable the QAAI API runner interpolates, so it is preserved verbatim.
+ *    Replacing every `{{var}}` to force the string through `new URL()` baked the
+ *    placeholder scheme into the middle of the path — the earlier bug.
+ */
 function extractPath(raw: string | undefined): string {
   if (!raw) return '/';
-  const withoutVars = raw.replace(/^\{\{[^}]+\}\}/, ''); // drop a leading {{baseUrl}}
-  try {
-    const url = new URL(raw.replace(/\{\{[^}]+\}\}/g, 'https://placeholder'));
-    return url.pathname + url.search || '/';
-  } catch {
-    return withoutVars.startsWith('/') ? withoutVars : `/${withoutVars}`;
+
+  // Drop a single leading base-URL variable, e.g. `{{baseUrl}}`.
+  let rest = raw.replace(/^\s*\{\{[^}]+\}\}/, '');
+
+  // If what remains still starts with a real scheme+host, parse that off —
+  // mid-path `{{var}}` tokens survive because they are never at the front.
+  if (/^https?:\/\//i.test(rest)) {
+    try {
+      const url = new URL(rest);
+      rest = url.pathname + url.search;
+    } catch {
+      /* fall through to the string handling below */
+    }
   }
+
+  if (!rest) return '/';
+  return rest.startsWith('/') ? rest : `/${rest}`;
 }
 
-/** Reads a status assertion out of a Postman test script, if one is there. */
+/**
+ * Reads a status assertion out of a Postman test script.
+ *
+ * Postman scripts express the same check several ways, and the earlier regex
+ * only matched two of them — a `.to.equal(200)` was silently dropped, leaving
+ * the imported test asserting nothing about status. Handles the common Chai
+ * and pm.* forms.
+ */
 function extractStatusAssertion(events: PostmanItem['event']): number | undefined {
   const script = events?.find((e) => e.listen === 'test')?.script?.exec?.join('\n') ?? '';
-  const match =
-    /\.to\.have\.status\((\d{3})\)|response\.code\)?\.to\.eql\((\d{3})\)|status\((\d{3})\)/.exec(
-      script,
-    );
-  const code = match?.[1] ?? match?.[2] ?? match?.[3];
-  return code ? Number(code) : undefined;
+
+  const patterns = [
+    /\.to\.have\.status\((\d{3})\)/,
+    /\bstatus\((\d{3})\)/,
+    // pm.expect(pm.response.code).to.equal(200) — and .eql / .eq / .be.equal
+    /\.code\b[\s\S]{0,24}?\.to\.(?:be\.)?(?:eql|equal|equals|eq)\((\d{3})\)/,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(script);
+    if (match?.[1]) return Number(match[1]);
+  }
+  return undefined;
 }
 
 export function convertPostmanCollection(json: string): ConvertedTest[] {
@@ -386,11 +426,16 @@ export function convertPostmanCollection(json: string): ConvertedTest[] {
       }
       if (!item.request) continue;
 
-      const method = (item.request.method ?? 'GET').toUpperCase();
+      const rawMethod = (item.request.method ?? 'GET').toUpperCase();
+      // The API runner accepts any letters-only method; a method with spaces or
+      // symbols is malformed, so fall back to GET and say so rather than emit a
+      // spec that fails validation.
+      const method = /^[A-Z]+$/.test(rawMethod) ? rawMethod : 'GET';
       const raw = typeof item.request.url === 'string' ? item.request.url : item.request.url?.raw;
       const path = extractPath(raw);
       const status = extractStatusAssertion(item.event);
       const notes: string[] = [];
+      if (method !== rawMethod) notes.push(`Unusual HTTP method "${rawMethod}" replaced with GET`);
 
       const headers: Record<string, string> = {};
       for (const h of item.request.header ?? []) {
@@ -431,7 +476,7 @@ export function convertPostmanCollection(json: string): ConvertedTest[] {
           steps: [
             {
               name: item.name ?? `${method} ${path}`,
-              method: method as 'GET',
+              method,
               path,
               headers,
               ...(body !== undefined ? { body } : {}),
@@ -562,6 +607,11 @@ honest notes on anything that did not convert cleanly.`;
       summaries.push(`${file.path}: ${result.summary}`);
       args.onFile?.(file.path, result.tests.length);
     } catch (err) {
+      // An auth failure (no key, rejected key, budget) will hit every remaining
+      // file identically — stop and let the caller report the real cause,
+      // rather than grinding through the whole suite and 3x job retries against
+      // a key that will never work.
+      if (err instanceof LlmError && err.kind === 'AUTH') throw err;
       summaries.push(
         `${file.path}: conversion failed — ${err instanceof Error ? err.message : String(err)}`,
       );

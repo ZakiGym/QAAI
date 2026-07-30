@@ -251,9 +251,28 @@ export const healProposalSchema = z.object({
 
 // ─── API test spec (§4) ──────────────────────────────────────────────────────
 
+/** The methods a hand-written spec will normally use; documented, not exhaustive. */
+export const COMMON_HTTP_METHODS = [
+  'GET',
+  'POST',
+  'PUT',
+  'PATCH',
+  'DELETE',
+  'HEAD',
+  'OPTIONS',
+] as const;
+
 export const apiRequestStepSchema = z.object({
   name: z.string().min(1),
-  method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']),
+  /**
+   * Any uppercase HTTP method. `fetch` executes whatever it is given, so an
+   * imported Postman request using PURGE or PROPFIND runs rather than failing
+   * spec validation — the earlier `z.enum` rejected those outright.
+   */
+  method: z
+    .string()
+    .transform((m) => m.toUpperCase())
+    .pipe(z.string().regex(/^[A-Z]+$/, 'HTTP method must be letters only')),
   /** Relative to the environment base URL, or absolute. Supports {{var}}. */
   path: z.string().min(1),
   headers: z.record(z.string(), z.string()).default({}),

@@ -44,11 +44,15 @@ function queueFor(name: string): Queue {
 export async function enqueue<K extends keyof JobPayloads>(
   name: K,
   payload: JobPayloads[K],
-  opts: { jobId?: string; delayMs?: number } = {},
+  // `attempts` overrides the queue default (3). A job whose processor is not
+  // idempotent — like import, which inserts rows — must pass attempts:1 so a
+  // transient failure does not silently re-run and double its writes.
+  opts: { jobId?: string; delayMs?: number; attempts?: number } = {},
 ): Promise<string> {
   const job = await queueFor(name).add(name, payload, {
     ...(opts.jobId ? { jobId: opts.jobId } : {}),
     ...(opts.delayMs ? { delay: opts.delayMs } : {}),
+    ...(opts.attempts ? { attempts: opts.attempts } : {}),
   });
   logger.info({ queue: name, jobId: job.id }, 'job enqueued');
   return String(job.id);

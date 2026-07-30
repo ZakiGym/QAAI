@@ -92,52 +92,97 @@ export async function processImport(job: ImportJob): Promise<void> {
       summary = result.summary;
     }
 
+    // Zero tests is a valid outcome — a docs-only Postman collection, a suite of
+    // only config files — not a failure. Finish DONE with a plain summary rather
+    // than ERRORED-and-retry.
     if (converted.length === 0) {
-      throw new Error('Nothing was converted — check the framework detection and the files');
-    }
-
-    // One suite for the whole migration, so the coverage gained is legible.
-    const suite = await prisma.suite.upsert({
-      where: { projectId_name: { projectId, name: 'Imported' } },
-      create: {
-        orgId,
-        projectId,
-        name: 'Imported',
-        description: `Migrated from ${FRAMEWORK_LABELS[framework] ?? framework}`,
-      },
-      update: {},
-    });
-
-    for (const test of converted) {
-      await prisma.test.create({
+      await prisma.importBatch.update({
+        where: { id: batch.id },
         data: {
-          orgId,
-          projectId,
-          suiteId: suite.id,
-          name: test.name.slice(0, 160),
-          type: test.type,
-          feature: 'Imported',
-          priority: 'IMPORTANT',
-          code: test.code,
-          filePath: test.filePath,
-          spec: test.spec ? (test.spec as unknown as object) : undefined,
-          tags: ['imported', framework.toLowerCase()],
-          reviewFlags: [
-            `Converted from ${FRAMEWORK_LABELS[framework] ?? framework} — review before trusting`,
-            ...test.notes,
-          ],
-          versions: {
-            create: {
-              orgId,
-              version: 1,
-              code: test.code || '// spec-driven test',
-              source: 'IMPORT',
-              message: `Imported from ${test.sourceFile}`,
-            },
-          },
+          state: 'DONE',
+          summary: summary || 'No tests were found to import.',
+          convertedCount: 0,
         },
       });
+      emit('No tests found to import.');
+      publishEvent(orgId, {
+        runId: `import:${importBatchId}`,
+        type: 'run.finished',
+        data: { convertedCount: 0, framework },
+        at: new Date().toISOString(),
+      });
+      return;
     }
+
+    // Two converted tests can slug to the same file path (distinct requests with
+    // near-identical names, or the model reusing a path across source files).
+    // Distinct paths on disk are the whole no-lock-in promise, so a collision
+    // gets a numeric suffix rather than one test silently overwriting another.
+    const usedPaths = new Set<string>();
+    for (const test of converted) {
+      let path = test.filePath;
+      if (usedPaths.has(path)) {
+        const dot = path.lastIndexOf('.');
+        for (let n = 2; ; n++) {
+          const candidate =
+            dot > 0 ? `${path.slice(0, dot)}-${n}${path.slice(dot)}` : `${path}-${n}`;
+          if (!usedPaths.has(candidate)) {
+            path = candidate;
+            break;
+          }
+        }
+      }
+      usedPaths.add(path);
+      test.filePath = path;
+    }
+
+    // One transaction for the whole batch: a failure partway through rolls back
+    // every insert, so a retry can never find half the tests already written.
+    // With attempts:1 on the queue there is no auto-retry either — belt and
+    // braces against the duplication the review found.
+    await prisma.$transaction(async (tx) => {
+      const suite = await tx.suite.upsert({
+        where: { projectId_name: { projectId, name: 'Imported' } },
+        create: {
+          orgId,
+          projectId,
+          name: 'Imported',
+          description: `Migrated from ${FRAMEWORK_LABELS[framework] ?? framework}`,
+        },
+        update: {},
+      });
+
+      for (const test of converted) {
+        await tx.test.create({
+          data: {
+            orgId,
+            projectId,
+            suiteId: suite.id,
+            name: test.name.slice(0, 160),
+            type: test.type,
+            feature: 'Imported',
+            priority: 'IMPORTANT',
+            code: test.code,
+            filePath: test.filePath,
+            spec: test.spec ? (test.spec as unknown as object) : undefined,
+            tags: ['imported', framework.toLowerCase()],
+            reviewFlags: [
+              `Converted from ${FRAMEWORK_LABELS[framework] ?? framework} — review before trusting`,
+              ...test.notes,
+            ],
+            versions: {
+              create: {
+                orgId,
+                version: 1,
+                code: test.code || '// spec-driven test',
+                source: 'IMPORT',
+                message: `Imported from ${test.sourceFile}`,
+              },
+            },
+          },
+        });
+      }
+    });
 
     await prisma.importBatch.update({
       where: { id: batch.id },
@@ -154,10 +199,21 @@ export async function processImport(job: ImportJob): Promise<void> {
 
     logger.info({ importBatchId, converted: converted.length, framework }, 'import complete');
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    // Distinguish "the key is missing/rejected" from a genuine conversion
+    // problem — the fix differs, and the earlier code buried the AUTH cause
+    // under a generic "nothing converted" message.
+    const isAuth = err instanceof Error && /API key|ANTHROPIC_API_KEY/i.test(err.message);
+    const message = isAuth
+      ? 'Conversion needs a working ANTHROPIC_API_KEY. Postman collections import without one.'
+      : err instanceof Error
+        ? err.message
+        : String(err);
+
     await prisma.importBatch.update({
       where: { id: batch.id },
-      data: { state: 'ERRORED', error: message },
+      // Keep the per-file summary too, so the honest detail survives a failure
+      // rather than being replaced by the headline error.
+      data: { state: 'ERRORED', error: message, summary: summary || null },
     });
     emit(`Import failed: ${message}`);
     logger.error({ err, importBatchId }, 'import failed');
