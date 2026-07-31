@@ -14,6 +14,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { Mailbox, startSmtpCatcher } from './mailbox.js';
+import { attachWebSocket, mountProtocols } from './protocols.js';
 import {
   PRODUCTS,
   USERS,
@@ -53,6 +54,9 @@ let state: DemoState = freshState();
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+// GraphQL, SSE and WebSocket — so QAAI's protocol tests have a real target.
+mountProtocols(app, () => state);
 app.disable('x-powered-by');
 
 // ─── Session handling ────────────────────────────────────────────────────────
@@ -421,6 +425,8 @@ const server = app.listen(PORT, () => {
     `demo store on http://localhost:${PORT} (planted bug: ${PLANTED_BUG ? 'ON' : 'off'})`,
   );
 });
+
+attachWebSocket(server);
 
 const smtp = startSmtpCatcher(mailbox, SMTP_PORT);
 
