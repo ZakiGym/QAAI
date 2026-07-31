@@ -1,0 +1,167 @@
+[
+  {
+    "description": "  Arithmetic the till can be trusted with",
+    "elements": [
+      {
+        "description": "",
+        "id": "calculator;a-clean-till",
+        "keyword": "Background",
+        "line": 3,
+        "name": "a clean till",
+        "steps": [
+          {
+            "arguments": [],
+            "keyword": "Given ",
+            "line": 4,
+            "name": "the till is empty",
+            "match": { "location": "features/step_definitions/till.js:4" },
+            "result": { "status": "passed", "duration": 812000 }
+          }
+        ],
+        "type": "background"
+      },
+      {
+        "description": "",
+        "id": "calculator;add-two-numbers",
+        "keyword": "Scenario",
+        "line": 7,
+        "name": "Add two numbers",
+        "steps": [
+          {
+            "arguments": [],
+            "keyword": "Given ",
+            "line": 8,
+            "name": "I have entered 1",
+            "match": { "location": "features/step_definitions/till.js:9" },
+            "result": { "status": "passed", "duration": 1234567 }
+          },
+          {
+            "arguments": [],
+            "keyword": "When ",
+            "line": 9,
+            "name": "I add 2",
+            "match": { "location": "features/step_definitions/till.js:14" },
+            "result": { "status": "passed", "duration": 234567 }
+          },
+          {
+            "arguments": [],
+            "keyword": "Then ",
+            "line": 10,
+            "name": "the result is 3",
+            "match": { "location": "features/step_definitions/till.js:19" },
+            "result": { "status": "passed", "duration": 345678 }
+          }
+        ],
+        "tags": [{ "name": "@smoke", "line": 6 }],
+        "type": "scenario"
+      },
+      {
+        "description": "",
+        "id": "calculator;divide-by-zero",
+        "keyword": "Scenario",
+        "line": 12,
+        "name": "Divide by zero",
+        "steps": [
+          {
+            "arguments": [],
+            "keyword": "Given ",
+            "line": 13,
+            "name": "I have entered 1",
+            "match": { "location": "features/step_definitions/till.js:9" },
+            "result": { "status": "passed", "duration": 500000 }
+          },
+          {
+            "arguments": [],
+            "keyword": "When ",
+            "line": 14,
+            "name": "I divide by 0",
+            "match": { "location": "features/step_definitions/till.js:24" },
+            "result": {
+              "status": "failed",
+              "duration": 2000000,
+              "error_message": "AssertionError: expected 'Infinity' to equal 'Error'\n    at World.<anonymous> (features/step_definitions/till.js:26:24)\n    at processTicksAndRejections (node:internal/process/task_queues:95:5)"
+            }
+          },
+          {
+            "arguments": [],
+            "keyword": "Then ",
+            "line": 15,
+            "name": "the till shows an error",
+            "match": { "location": "features/step_definitions/till.js:31" },
+            "result": { "status": "skipped", "duration": 0 }
+          }
+        ],
+        "tags": [],
+        "type": "scenario"
+      },
+      {
+        "before": [
+          {
+            "match": { "location": "features/support/hooks.js:8" },
+            "result": {
+              "status": "failed",
+              "duration": 4100000,
+              "error_message": "Error: coupon service unavailable\n    at Object.<anonymous> (features/support/hooks.js:11:11)"
+            }
+          }
+        ],
+        "description": "",
+        "id": "calculator;apply-a-coupon",
+        "keyword": "Scenario",
+        "line": 17,
+        "name": "Apply a coupon",
+        "steps": [
+          {
+            "arguments": [],
+            "keyword": "Given ",
+            "line": 18,
+            "name": "I have entered 10",
+            "match": { "location": "features/step_definitions/till.js:9" },
+            "result": { "status": "skipped", "duration": 0 }
+          },
+          {
+            "arguments": [],
+            "keyword": "Then ",
+            "line": 19,
+            "name": "the total is 9",
+            "match": { "location": "features/step_definitions/till.js:36" },
+            "result": { "status": "skipped", "duration": 0 }
+          }
+        ],
+        "tags": [],
+        "type": "scenario"
+      },
+      {
+        "description": "",
+        "id": "calculator;refund-an-order",
+        "keyword": "Scenario",
+        "line": 21,
+        "name": "Refund an order",
+        "steps": [
+          {
+            "arguments": [],
+            "keyword": "Given ",
+            "line": 22,
+            "name": "I have paid for an order",
+            "result": { "status": "undefined", "duration": 0 }
+          },
+          {
+            "arguments": [],
+            "keyword": "Then ",
+            "line": 23,
+            "name": "I can refund it",
+            "result": { "status": "skipped", "duration": 0 }
+          }
+        ],
+        "tags": [],
+        "type": "scenario"
+      }
+    ],
+    "id": "calculator",
+    "keyword": "Feature",
+    "line": 1,
+    "name": "Calculator",
+    "tags": [],
+    "uri": "features/calculator.feature"
+  }
+]

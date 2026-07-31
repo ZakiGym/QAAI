@@ -1,0 +1,105 @@
+{
+  "created": 1785492724.123456,
+  "duration": 0.2341,
+  "exitcode": 1,
+  "root": "/repo",
+  "environment": {
+    "Python": "3.12.4",
+    "Platform": "Linux-6.8.0-x86_64-with-glibc2.39",
+    "Packages": { "pytest": "8.3.2", "pluggy": "1.5.0" }
+  },
+  "summary": { "passed": 1, "failed": 1, "skipped": 1, "xfailed": 1, "error": 1, "total": 5, "collected": 5 },
+  "collectors": [
+    {
+      "nodeid": "",
+      "outcome": "passed",
+      "result": [{ "nodeid": "tests/test_cart.py", "type": "Module" }]
+    },
+    {
+      "nodeid": "tests/test_cart.py",
+      "outcome": "passed",
+      "result": [
+        { "nodeid": "tests/test_cart.py::test_adds_item", "type": "Function", "lineno": 8 },
+        { "nodeid": "tests/test_cart.py::TestTotals::test_total_with_tax", "type": "Function", "lineno": 24 }
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "nodeid": "tests/test_cart.py::test_adds_item",
+      "lineno": 8,
+      "outcome": "passed",
+      "keywords": ["test_adds_item", "test_cart.py", "tests", "repo"],
+      "setup": { "duration": 0.000123456, "outcome": "passed" },
+      "call": { "duration": 0.001234567, "outcome": "passed" },
+      "teardown": { "duration": 0.000045678, "outcome": "passed" }
+    },
+    {
+      "nodeid": "tests/test_cart.py::TestTotals::test_total_with_tax",
+      "lineno": 24,
+      "outcome": "failed",
+      "keywords": ["test_total_with_tax", "TestTotals", "test_cart.py"],
+      "setup": { "duration": 0.000101, "outcome": "passed" },
+      "call": {
+        "duration": 0.004321,
+        "outcome": "failed",
+        "crash": {
+          "path": "/repo/tests/test_cart.py",
+          "lineno": 31,
+          "message": "assert 10.8 == 10.79"
+        },
+        "traceback": [
+          { "path": "tests/test_cart.py", "lineno": 31, "message": "AssertionError" }
+        ],
+        "longrepr": "self = <tests.test_cart.TestTotals object at 0x7f2b1c0d5e50>\n\n    def test_total_with_tax(self):\n        cart = Cart([Item(\"widget\", 9.0)])\n>       assert cart.total(tax=0.2) == 10.79\nE       assert 10.8 == 10.79\n\ntests/test_cart.py:31: AssertionError"
+      },
+      "teardown": { "duration": 0.000098, "outcome": "passed" }
+    },
+    {
+      "nodeid": "tests/test_cart.py::test_checkout_needs_network",
+      "lineno": 44,
+      "outcome": "skipped",
+      "keywords": ["test_checkout_needs_network", "skip"],
+      "setup": {
+        "duration": 0.000112,
+        "outcome": "skipped",
+        "longrepr": "('/repo/tests/test_cart.py', 44, 'Skipped: needs network')"
+      },
+      "teardown": { "duration": 0.000034, "outcome": "passed" }
+    },
+    {
+      "nodeid": "tests/test_cart.py::test_legacy_rounding",
+      "lineno": 52,
+      "outcome": "xfailed",
+      "keywords": ["test_legacy_rounding", "xfail"],
+      "setup": { "duration": 0.000091, "outcome": "passed" },
+      "call": {
+        "duration": 0.000512,
+        "outcome": "failed",
+        "longrepr": "assert 2.67 == 2.68"
+      },
+      "teardown": { "duration": 0.00003, "outcome": "passed" }
+    },
+    {
+      "nodeid": "tests/test_cart.py::test_teardown_leaks",
+      "lineno": 60,
+      "outcome": "error",
+      "keywords": ["test_teardown_leaks"],
+      "setup": { "duration": 0.000088, "outcome": "passed" },
+      "call": { "duration": 0.000771, "outcome": "passed" },
+      "teardown": {
+        "duration": 0.002145,
+        "outcome": "failed",
+        "longrepr": "E   RuntimeError: connection pool was not drained\n\ntests/conftest.py:22: RuntimeError"
+      }
+    }
+  ],
+  "warnings": [
+    {
+      "code": "PT004",
+      "path": "/repo/tests/conftest.py",
+      "nodeid": "",
+      "message": "fixture 'db' does not return anything"
+    }
+  ]
+}

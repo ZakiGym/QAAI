@@ -18,6 +18,11 @@ import { externalPlugin } from './plugins/external.js';
 import { visualPlugin } from './plugins/visual.js';
 import { crossBrowserPlugin, localizationPlugin } from './plugins/matrix.js';
 import { emailOtpPlugin } from './plugins/email-otp.js';
+import { databasePlugin } from './plugins/database.js';
+import { cliPlugin } from './plugins/cli.js';
+import { mutationPlugin } from './plugins/mutation.js';
+import { contractPlugin } from './plugins/contract.js';
+import { protocolPlugin } from './plugins/protocol.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -30,6 +35,11 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   CROSS_BROWSER: crossBrowserPlugin,
   LOCALIZATION: localizationPlugin,
   EMAIL_OTP: emailOtpPlugin,
+  DATABASE: databasePlugin,
+  CLI: cliPlugin,
+  MUTATION: mutationPlugin,
+  CONTRACT: contractPlugin,
+  PROTOCOL: protocolPlugin,
   // Any runner QAAI does not implement natively — Vitest, Jest, Cypress, Newman,
   // Pa11y, Maestro… — runs through the external-command plugin and reports via
   // its own JUnit output. UNIT_GEN shares it for the same reason.

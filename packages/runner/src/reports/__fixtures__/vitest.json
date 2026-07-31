@@ -1,0 +1,53 @@
+{
+  "numTotalTestSuites": 1,
+  "numPassedTestSuites": 0,
+  "numFailedTestSuites": 1,
+  "numPendingTestSuites": 0,
+  "numTotalTests": 3,
+  "numPassedTests": 1,
+  "numFailedTests": 1,
+  "numPendingTests": 1,
+  "numTodoTests": 0,
+  "startTime": 1785492800000,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": ["locators", "css"],
+          "fullName": "locators css prefers a data-testid",
+          "status": "passed",
+          "title": "prefers a data-testid",
+          "duration": 2.4718,
+          "failureMessages": [],
+          "meta": {}
+        },
+        {
+          "ancestorTitles": ["locators", "css"],
+          "fullName": "locators css falls back to role",
+          "status": "failed",
+          "title": "falls back to role",
+          "duration": 11.9032,
+          "failureMessages": [
+            "AssertionError: expected 'button' to be 'link' // Object.is equality\n\n- Expected\n+ Received\n\n- link\n+ button\n\n ❯ src/locators.test.ts:41:26"
+          ],
+          "meta": {}
+        },
+        {
+          "ancestorTitles": ["locators", "xpath"],
+          "fullName": "locators xpath escapes quotes",
+          "status": "skipped",
+          "title": "escapes quotes",
+          "duration": 0,
+          "failureMessages": [],
+          "meta": {}
+        }
+      ],
+      "startTime": 1785492800100,
+      "endTime": 1785492800420,
+      "status": "failed",
+      "message": "",
+      "name": "/repo/packages/shared/src/locators.test.ts"
+    }
+  ]
+}

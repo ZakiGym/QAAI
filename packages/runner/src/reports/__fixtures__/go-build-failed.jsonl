@@ -1,0 +1,5 @@
+{"Time":"2026-07-31T10:14:01.001000Z","Action":"start","Package":"example.com/shop/checkout"}
+{"Time":"2026-07-31T10:14:01.410000Z","Action":"output","Package":"example.com/shop/checkout","Output":"# example.com/shop/checkout [example.com/shop/checkout.test]\n"}
+{"Time":"2026-07-31T10:14:01.410100Z","Action":"output","Package":"example.com/shop/checkout","Output":"./checkout_test.go:12:2: undefined: NewCheckout\n"}
+{"Time":"2026-07-31T10:14:01.410200Z","Action":"output","Package":"example.com/shop/checkout","Output":"FAIL\texample.com/shop/checkout [build failed]\n"}
+{"Time":"2026-07-31T10:14:01.410300Z","Action":"fail","Package":"example.com/shop/checkout","Elapsed":0}

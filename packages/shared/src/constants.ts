@@ -21,6 +21,11 @@ export const TEST_TYPES = [
   'CROSS_BROWSER',
   'LOCALIZATION',
   'EMAIL_OTP',
+  'DATABASE',
+  'CLI',
+  'PROTOCOL',
+  'CONTRACT',
+  'MUTATION',
 ] as const;
 export type TestType = (typeof TEST_TYPES)[number];
 
@@ -38,6 +43,11 @@ export const TEST_TYPE_LABELS: Record<TestType, string> = {
   CROSS_BROWSER: 'Cross-browser',
   LOCALIZATION: 'Localization',
   EMAIL_OTP: 'Email / OTP',
+  DATABASE: 'Database',
+  CLI: 'CLI / command',
+  PROTOCOL: 'Protocol / streaming',
+  CONTRACT: 'Contract (Pact / OpenAPI)',
+  MUTATION: 'Mutation',
 };
 
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────

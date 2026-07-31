@@ -65,6 +65,11 @@ enum TestType {
   CROSS_BROWSER
   LOCALIZATION
   EMAIL_OTP
+  DATABASE
+  CLI
+  PROTOCOL
+  CONTRACT
+  MUTATION
 }
 
 enum Priority {

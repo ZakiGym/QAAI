@@ -573,8 +573,32 @@ export type LoadTestSpec = z.infer<typeof loadTestSpecSchema>;
 
 // ─── External command tests (§4) ─────────────────────────────────────────────
 
-/** Report shapes QAAI can turn into per-test results. */
-export const EXTERNAL_REPORT_FORMATS = ['junit', 'json-summary', 'exit-code'] as const;
+/**
+ * Report shapes QAAI can turn into per-test results.
+ *
+ * One id per parser in packages/runner/src/reports, plus two that are not
+ * parsers: `exit-code` (the process's own verdict, with no file read at all)
+ * and `auto` (sniff the format from the file's first bytes).
+ *
+ * `junit` and `json-summary` are the ids that existed before the parsers landed
+ * and are kept so specs already stored against them keep working — they resolve
+ * to `junit-xml` and `auto`.
+ */
+export const EXTERNAL_REPORT_FORMATS = [
+  'junit-xml',
+  'tap',
+  'go-json',
+  'trx',
+  'nunit3',
+  'jest-json',
+  'pytest-json',
+  'rspec-json',
+  'cucumber-json',
+  'auto',
+  'exit-code',
+  'junit',
+  'json-summary',
+] as const;
 export type ExternalReportFormat = (typeof EXTERNAL_REPORT_FORMATS)[number];
 
 /**
@@ -602,6 +626,615 @@ export const externalTestSpecSchema = z.object({
 });
 
 export type ExternalTestSpec = z.infer<typeof externalTestSpecSchema>;
+
+// ─── Database tests (§4) ─────────────────────────────────────────────────────
+
+/**
+ * Engines the DATABASE plugin can actually talk to. Postgres only, deliberately:
+ * `pg` is already in the tree, and a plugin that claims MySQL/SQLite without a
+ * driver behind it would fail at run time instead of at validation time.
+ */
+export const DATABASE_ENGINES = ['POSTGRES'] as const;
+export type DatabaseEngine = (typeof DATABASE_ENGINES)[number];
+
+/**
+ * What a `sql` step expects to see. Every field is optional; a step with no
+ * expectation still asserts something real — that the statement executes.
+ */
+const sqlExpectationSchema = z.object({
+  rowCount: z.number().int().min(0).optional(),
+  minRowCount: z.number().int().min(0).optional(),
+  maxRowCount: z.number().int().min(0).optional(),
+  /**
+   * The first row's `column` (or its first column) must equal this. Compared
+   * loosely against the string form too, because Postgres returns `count(*)`
+   * and every bigint as a string — `rowCount: 1, value: 3` is what a user means
+   * even when they wrote `3` and the driver handed back `"3"`.
+   */
+  value: z.unknown().optional(),
+  column: z.string().max(120).optional(),
+});
+
+const databaseSqlStepSchema = z.object({
+  kind: z.literal('sql'),
+  name: z.string().min(1).max(160),
+  sql: z.string().min(1).max(50_000),
+  /** Bound as $1, $2… — never interpolated into the statement. */
+  params: z.array(z.unknown()).max(64).default([]),
+  expect: sqlExpectationSchema.default({}),
+});
+
+/**
+ * A constraint that must REJECT the row that violates it.
+ *
+ * This is the step type that catches the silent disaster: a unique index that
+ * was dropped in a migration and never recreated, a foreign key that came back
+ * as `NOT VALID`, a check constraint someone disabled to unblock a deploy.
+ * Nothing else in a test suite notices until the data is already wrong.
+ */
+const databaseConstraintStepSchema = z.object({
+  kind: z.literal('constraint'),
+  name: z.string().min(1).max(160),
+  /** The constraint expected to do the rejecting, e.g. `users_email_key`. */
+  constraint: z.string().min(1).max(120),
+  /** A statement that violates it. If this SUCCEEDS, the test fails. */
+  sql: z.string().min(1).max(50_000),
+  params: z.array(z.unknown()).max(64).default([]),
+  /**
+   * Expected SQLSTATE. Defaults to the integrity-violation class `23xxx`
+   * (23505 unique, 23503 foreign key, 23514 check, 23502 not-null).
+   */
+  expectSqlState: z
+    .string()
+    .regex(/^[0-9A-Z]{5}$/, 'a SQLSTATE is five characters, e.g. 23505')
+    .optional(),
+});
+
+/**
+ * A migration and its rollback, applied forward and then back, with the schema
+ * compared before and after. The rollback half of a migration is the thing
+ * nobody exercises until an incident makes them run it for the first time.
+ */
+const databaseMigrationStepSchema = z.object({
+  kind: z.literal('migration'),
+  name: z.string().min(1).max(160),
+  up: z.array(z.string().min(1).max(50_000)).min(1).max(50),
+  down: z.array(z.string().min(1).max(50_000)).min(1).max(50),
+  /**
+   * Fail when `up` left the schema byte-identical. A migration that changes
+   * nothing is usually a migration that silently did not apply — but set this
+   * to false for a data-only migration, where no schema change is the point.
+   */
+  expectSchemaChange: z.boolean().default(true),
+});
+
+export const databaseStepSchema = z.discriminatedUnion('kind', [
+  databaseSqlStepSchema,
+  databaseConstraintStepSchema,
+  databaseMigrationStepSchema,
+]);
+export type DatabaseStep = z.infer<typeof databaseStepSchema>;
+
+/**
+ * A database test.
+ *
+ * The connection string is named, never inline: a spec is org-authored data that
+ * ends up in a git repo, and a DSN carries a password. The runner resolves
+ * `connectionSecretName` out of the environment's vault at execution time.
+ */
+export const databaseTestSpecSchema = z.object({
+  engine: z.enum(DATABASE_ENGINES).default('POSTGRES'),
+  /** Vault secret holding the DSN. Never the DSN itself. */
+  connectionSecretName: secretName.default('DATABASE_URL'),
+  /** Schemas included in the migration fingerprint. */
+  schemas: z.array(z.string().min(1).max(63)).min(1).max(20).default(['public']),
+  statementTimeoutMs: z.number().int().min(100).max(600_000).default(15_000),
+  /**
+   * Opt in to running write steps against a database whose name or host looks
+   * like production. Off by default; see the guard in the plugin.
+   */
+  allowProductionDatabase: z.boolean().default(false),
+  /** Runs first, inside the same transaction that gets rolled back at the end. */
+  seed: z.array(z.string().min(1).max(50_000)).max(50).default([]),
+  steps: z.array(databaseStepSchema).min(1).max(100),
+});
+
+export type DatabaseTestSpec = z.infer<typeof databaseTestSpecSchema>;
+
+// ─── CLI tests (§4) ──────────────────────────────────────────────────────────
+
+/** A regex a spec supplied as a string — rejected at validation if it will not compile. */
+const regexSource = z
+  .string()
+  .min(1)
+  .max(2000)
+  .refine((source) => {
+    try {
+      new RegExp(source);
+      return true;
+    } catch {
+      return false;
+    }
+  }, 'is not a valid regular expression');
+
+/**
+ * What one output stream must look like. Every assertion present becomes its own
+ * cockpit step, so a failure points at the one that broke rather than at
+ * "output did not match".
+ */
+const streamExpectationSchema = z.object({
+  equals: z.string().max(200_000).optional(),
+  contains: z.array(z.string().min(1).max(2000)).max(50).default([]),
+  notContains: z.array(z.string().min(1).max(2000)).max(50).default([]),
+  matches: regexSource.optional(),
+  /** Flags for `matches`; `s` and `i` are the useful ones. */
+  matchFlags: z
+    .string()
+    .max(8)
+    .regex(/^[gimsuy]*$/, 'only the standard regex flags are allowed')
+    .default(''),
+  /** Assert the stream is empty (after normalisation) — the usual stderr check. */
+  empty: z.boolean().optional(),
+});
+
+const cliExpectationSchema = z.object({
+  /** null means "do not assert an exit code". 0 is the default because it is the point. */
+  exitCode: z.number().int().min(0).max(255).nullable().default(0),
+  stdout: streamExpectationSchema.optional(),
+  stderr: streamExpectationSchema.optional(),
+  maxDurationMs: z.number().int().positive().max(3_600_000).optional(),
+  /**
+   * Normalise CRLF to LF, strip trailing whitespace per line, and drop trailing
+   * blank lines before comparing. On by default: line endings and a stray
+   * trailing newline are the overwhelming majority of false CLI failures.
+   */
+  normalizeWhitespace: z.boolean().default(true),
+});
+
+/**
+ * Run a command-line program and assert on what it did.
+ *
+ * The command is spawned WITHOUT a shell and args are passed as an array — a
+ * spec is data, and `shell: true` would make it remote code execution.
+ */
+export const cliTestSpecSchema = z.object({
+  /** The executable. Resolved on PATH; never passed through a shell. */
+  command: z.string().min(1).max(200),
+  args: z.array(z.string().max(4000)).max(128).default([]),
+  /** Piped to the process's stdin, which is then closed. */
+  stdin: z.string().max(1_000_000).optional(),
+  /** Working directory, relative to the run workspace. Cannot escape it. */
+  cwd: z.string().max(300).default('.'),
+  env: z.record(z.string(), z.string()).default({}),
+  /** Secret names to expose as env vars, resolved from the vault. */
+  secretNames: z.array(secretName).max(50).default([]),
+  timeoutSeconds: z.number().int().min(1).max(3600).default(60),
+  /** Shown when the binary is missing, e.g. `brew install jq`. */
+  installHint: z.string().max(200).optional(),
+  expect: cliExpectationSchema.default(cliExpectationSchema.parse({})),
+});
+
+export type CliTestSpec = z.infer<typeof cliTestSpecSchema>;
+
+// ─── Protocol tests — GraphQL / WebSocket / SSE / gRPC (§4) ──────────────────
+
+/**
+ * The four protocols a modern backend speaks that plain REST assertions cannot
+ * reach. One TestType rather than four, because they share everything that
+ * matters: a connection, an ordered sequence of messages, and per-message
+ * assertions with a deadline.
+ */
+export const PROTOCOL_KINDS = ['GRAPHQL', 'WEBSOCKET', 'SSE', 'GRPC'] as const;
+export type ProtocolKind = (typeof PROTOCOL_KINDS)[number];
+
+/**
+ * Interpolation bag shared by every protocol. `{{NAME}}` resolves against the
+ * environment's vault secrets first, then these literals — so a bearer token is
+ * referenced BY NAME and its value never appears in the spec the customer
+ * commits. Identical semantics to the API plugin's variables.
+ */
+const protocolVariables = z.record(z.string(), z.string()).default({});
+
+// GraphQL ────────────────────────────────────────────────────────────────────
+
+/**
+ * GraphQL assertions.
+ *
+ * There is deliberately no `status` field. A GraphQL server reports resolver
+ * failures as `errors` inside the body with HTTP 200, so a status-code assertion
+ * passes on exactly the responses you most want to catch. `expectErrors` is the
+ * real switch: false (the default) fails the step when `errors` is non-empty,
+ * true fails it when the operation did NOT error.
+ */
+const graphqlAssertionsSchema = z.object({
+  /** Dotted path INTO `data` → expected literal, e.g. `viewer.email`. */
+  dataMatches: z.record(z.string(), z.unknown()).optional(),
+  /** Substring search over `JSON.stringify(data)` — never over `errors`. */
+  dataContains: z.string().optional(),
+  expectErrors: z.boolean().default(false),
+  /** Checked against the joined `errors[].message` list. Implies expectErrors. */
+  errorMessageContains: z.string().optional(),
+  maxLatencyMs: z.number().int().positive().optional(),
+});
+
+export const graphqlOperationSchema = z.object({
+  name: z.string().min(1).max(160),
+  /** The document. Supports `{{var}}`. */
+  query: z.string().min(1).max(100_000),
+  /** GraphQL variables. String values support `{{var}}`. */
+  variables: z.record(z.string(), z.unknown()).default({}),
+  /** Required when the document declares more than one operation. */
+  operationName: z.string().max(160).optional(),
+  assertions: graphqlAssertionsSchema.default(graphqlAssertionsSchema.parse({})),
+  /** Name → dotted path into `data`, for later operations to interpolate. */
+  extract: z.record(z.string(), z.string()).default({}),
+});
+
+export const graphqlProtocolSpecSchema = z.object({
+  protocol: z.literal('GRAPHQL'),
+  /** Relative to the environment base URL, or absolute. */
+  endpoint: z.string().min(1).max(2000).default('/graphql'),
+  headers: z.record(z.string(), z.string()).default({}),
+  variables: protocolVariables,
+  /**
+   * Fetch the schema by introspection and check each operation's ROOT fields
+   * exist before sending it. When introspection is disabled on the server (as it
+   * usually is in production) the check is reported SKIPPED, never FAILED — a
+   * closed schema is a hardening choice, not a bug in the operation.
+   */
+  introspect: z.boolean().default(false),
+  timeoutMs: z.number().int().min(100).max(300_000).default(30_000),
+  operations: z.array(graphqlOperationSchema).min(1).max(50),
+});
+
+// WebSocket ──────────────────────────────────────────────────────────────────
+
+/**
+ * One step of a socket conversation. EXPECT defaults to MATCH rather than NEXT
+ * because a real socket interleaves heartbeats, presence events and other
+ * subscriptions with the message you care about; asserting on "the next frame"
+ * makes a test that passes only when the server happens to be quiet.
+ */
+export const websocketStepSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('SEND'),
+    name: z.string().min(1).max(160),
+    /** Strings are sent verbatim (after `{{var}}`); anything else is JSON-encoded. */
+    payload: z.unknown(),
+  }),
+  z.object({
+    action: z.literal('EXPECT'),
+    name: z.string().min(1).max(160),
+    /** MATCH scans past non-matching frames; NEXT asserts on the very next one. */
+    mode: z.enum(['MATCH', 'NEXT']).default('MATCH'),
+    contains: z.string().max(2000).optional(),
+    /** Dotted path in the frame's JSON → expected literal. */
+    jsonMatches: z.record(z.string(), z.unknown()).optional(),
+    matchesRegex: z.string().max(500).optional(),
+    /** Name → dotted path, captured off the frame that matched. */
+    extract: z.record(z.string(), z.string()).default({}),
+    timeoutMs: z.number().int().min(1).max(300_000).default(10_000),
+  }),
+  z.object({
+    action: z.literal('WAIT'),
+    name: z.string().min(1).max(160),
+    ms: z.number().int().min(0).max(60_000),
+  }),
+  z.object({
+    action: z.literal('CLOSE'),
+    name: z.string().min(1).max(160),
+    code: z.number().int().min(1000).max(4999).default(1000),
+  }),
+]);
+
+export const websocketProtocolSpecSchema = z.object({
+  protocol: z.literal('WEBSOCKET'),
+  /** `ws://`, `wss://`, or a path — a path inherits the base URL's host, http→ws. */
+  url: z.string().min(1).max(2000).default('/ws'),
+  /** Sent on the upgrade request. Values support `{{var}}` so tokens come from the vault. */
+  headers: z.record(z.string(), z.string()).default({}),
+  subprotocols: z.array(z.string().max(120)).max(8).default([]),
+  variables: protocolVariables,
+  openTimeoutMs: z.number().int().min(1).max(120_000).default(10_000),
+  steps: z.array(websocketStepSchema).min(1).max(200),
+});
+
+// Server-sent events ─────────────────────────────────────────────────────────
+
+export const sseExpectationSchema = z.object({
+  name: z.string().min(1).max(160),
+  /** The `event:` name. Omit to match any event, including unnamed ones. */
+  event: z.string().max(200).optional(),
+  dataContains: z.string().max(2000).optional(),
+  /** Dotted path in the event's JSON payload → expected literal. */
+  jsonMatches: z.record(z.string(), z.unknown()).optional(),
+  /** Wait for this many matching events before the step passes. */
+  count: z.number().int().min(1).max(1000).default(1),
+  timeoutMs: z.number().int().min(1).max(300_000).default(15_000),
+  /** Name → dotted path, captured off the last matching event. */
+  extract: z.record(z.string(), z.string()).default({}),
+});
+
+export const sseProtocolSpecSchema = z.object({
+  protocol: z.literal('SSE'),
+  path: z.string().min(1).max(2000).default('/events'),
+  /** POST streams are common for LLM and agent endpoints, so the method is open. */
+  method: z
+    .string()
+    .transform((m) => m.toUpperCase())
+    .pipe(z.string().regex(/^[A-Z]+$/, 'HTTP method must be letters only'))
+    .default('GET'),
+  headers: z.record(z.string(), z.string()).default({}),
+  body: z.unknown().optional(),
+  variables: protocolVariables,
+  connectTimeoutMs: z.number().int().min(1).max(120_000).default(10_000),
+  expect: z.array(sseExpectationSchema).min(1).max(50),
+});
+
+// gRPC ───────────────────────────────────────────────────────────────────────
+
+const grpcAssertionsSchema = z.object({
+  /** Expected gRPC status name, e.g. `OK`, `NOT_FOUND`, `PERMISSION_DENIED`. */
+  status: z.string().max(40).default('OK'),
+  /** Dotted path into the decoded response message → expected literal. */
+  responseMatches: z.record(z.string(), z.unknown()).optional(),
+  responseContains: z.string().max(2000).optional(),
+  maxLatencyMs: z.number().int().positive().optional(),
+});
+
+export const grpcCallSchema = z.object({
+  name: z.string().min(1).max(160),
+  /** Fully-qualified `package.Service/Method`. */
+  method: z
+    .string()
+    .min(3)
+    .max(300)
+    .regex(/^[A-Za-z_][\w.]*\/[A-Za-z_]\w*$/, 'use package.Service/Method'),
+  /** The request message. Omit for an empty message. */
+  request: z.unknown().optional(),
+  /** Call metadata. Values support `{{var}}`, so a token comes from the vault. */
+  metadata: z.record(z.string(), z.string()).default({}),
+  assertions: grpcAssertionsSchema.default(grpcAssertionsSchema.parse({})),
+  extract: z.record(z.string(), z.string()).default({}),
+});
+
+export const grpcProtocolSpecSchema = z.object({
+  protocol: z.literal('GRPC'),
+  /** `host:port`. Defaults to the environment base URL's host. */
+  target: z.string().max(300).default(''),
+  /** grpcurl defaults to TLS and so does this — opt in to plaintext explicitly. */
+  plaintext: z.boolean().default(false),
+  /**
+   * Server reflection is used when the target exposes it. Point `protoPath` at a
+   * committed `.proto` for servers that do not. Workspace-relative: a spec is
+   * org-authored data and must not read arbitrary paths off the worker.
+   */
+  protoPath: relativeFilePath.optional(),
+  importPaths: z.array(relativeFilePath).max(10).default([]),
+  variables: protocolVariables,
+  timeoutSeconds: z.number().int().min(1).max(600).default(60),
+  calls: z.array(grpcCallSchema).min(1).max(50),
+});
+
+/**
+ * A protocol test. Discriminated on `protocol` so an invalid combination cannot
+ * be stored — a WEBSOCKET spec has no `operations`, a GRAPHQL spec has no
+ * `calls`, and the plugin never has to guess which shape it was handed.
+ */
+export const protocolTestSpecSchema = z.discriminatedUnion('protocol', [
+  graphqlProtocolSpecSchema,
+  websocketProtocolSpecSchema,
+  sseProtocolSpecSchema,
+  grpcProtocolSpecSchema,
+]);
+
+export type ProtocolTestSpec = z.infer<typeof protocolTestSpecSchema>;
+export type GraphqlProtocolSpec = z.infer<typeof graphqlProtocolSpecSchema>;
+export type WebsocketProtocolSpec = z.infer<typeof websocketProtocolSpecSchema>;
+export type SseProtocolSpec = z.infer<typeof sseProtocolSpecSchema>;
+export type GrpcProtocolSpec = z.infer<typeof grpcProtocolSpecSchema>;
+
+// ─── Contract tests — Pact & OpenAPI (§4) ────────────────────────────────────
+
+/**
+ * How the provider (or the broker holding the document) is authenticated.
+ *
+ * Only the NAME of the vault secret lives in the spec, mirroring the
+ * SSO_BYPASS_TOKEN auth profile: a verification can carry a real bearer token
+ * without that token ever being written into the file the customer keeps in
+ * their repo.
+ */
+const contractAuthSchema = z.object({
+  secretName,
+  header: z.string().min(1).max(80).default('Authorization'),
+  /** `{token}` is replaced with the secret's value. */
+  valueTemplate: z.string().min(1).max(300).default('Bearer {token}'),
+});
+
+/**
+ * Where a contract document comes from: an http(s) URL (a pact broker, a served
+ * `/openapi.json`), or a workspace-relative path — which also resolves against
+ * the run's `fixtures/` test data, so a pact can be committed with the tests.
+ */
+const contractDocumentRef = z
+  .string()
+  .min(1)
+  .max(2000)
+  .refine(
+    (v) => /^https?:\/\//i.test(v) || (!v.includes('..') && !v.startsWith('/')),
+    'use an http(s) URL or a workspace-relative path without ..',
+  );
+
+const contractCommonShape = {
+  /** The provider under verification. Defaults to the environment's base URL. */
+  providerBaseUrl: httpUrl.optional(),
+  /** Extra headers sent on every replayed request. */
+  headers: z.record(z.string(), z.string()).default({}),
+  auth: contractAuthSchema.optional(),
+  requestTimeoutSeconds: z.number().int().min(1).max(300).default(30),
+};
+
+/**
+ * Verify a provider against a consumer's pact.
+ *
+ * The pact file is the consumer's declaration of what it needs; every
+ * interaction in it is replayed against the running provider and the response
+ * compared to the expectation. Matching rules are honoured — a pact that
+ * demands exact values is a pact nobody can keep green.
+ */
+export const pactContractSpecSchema = z.object({
+  kind: z.literal('pact'),
+  pactPath: contractDocumentRef,
+  /** When the document holds several consumers, verify only this one. */
+  consumer: z.string().max(200).optional(),
+  /** Verify only interactions whose description or provider state matches this regex. */
+  only: z.string().max(300).optional(),
+  /**
+   * Provider-state hook. Pact's own protocol: before each interaction QAAI
+   * POSTs `{ consumer, state, params, action: "setup" }` here, so the provider
+   * can put itself into the state the interaction was recorded against.
+   */
+  stateChangeUrl: z.string().max(2000).optional(),
+  ...contractCommonShape,
+});
+export type PactContractSpec = z.infer<typeof pactContractSpecSchema>;
+
+/**
+ * Check a live API against its own OpenAPI document: call the documented
+ * operations and assert the responses conform to the declared schema.
+ */
+export const openApiContractSpecSchema = z.object({
+  kind: z.literal('openapi'),
+  specPath: contractDocumentRef,
+  /**
+   * Which operations to check — `GET /pets/{petId}`, a bare path, or an
+   * operationId. Naming an operation is an explicit opt-in, so `methods` is
+   * ignored when this is non-empty. Empty means every documented operation
+   * whose method is in `methods`.
+   */
+  operations: z.array(z.string().min(1).max(300)).max(200).default([]),
+  /**
+   * Read-only by default, and deliberately so: this runs against a live
+   * provider, and a contract check that POSTs is a contract check that creates
+   * orders. Widen it only for an environment you are happy to mutate.
+   */
+  methods: z
+    .array(
+      z
+        .string()
+        .transform((m) => m.toUpperCase())
+        .pipe(z.string().regex(/^[A-Z]+$/, 'HTTP method must be letters only')),
+    )
+    .min(1)
+    .max(8)
+    .default(['GET']),
+  /** Values for templated path segments, keyed by parameter name. */
+  pathParams: z.record(z.string(), z.string()).default({}),
+  /** Query sent with every request, on top of any required parameters. */
+  query: z.record(z.string(), z.string()).default({}),
+  /** Request bodies for operations that need one, keyed by `POST /pets`. */
+  bodies: z.record(z.string(), z.unknown()).default({}),
+  ...contractCommonShape,
+});
+export type OpenApiContractSpec = z.infer<typeof openApiContractSpecSchema>;
+
+export const contractTestSpecSchema = z.discriminatedUnion('kind', [
+  pactContractSpecSchema,
+  openApiContractSpecSchema,
+]);
+export type ContractTestSpec = z.infer<typeof contractTestSpecSchema>;
+
+// ─── Mutation testing (§4) ───────────────────────────────────────────────────
+
+/**
+ * The mutation tools QAAI drives — one per ecosystem.
+ *
+ * QAAI does not implement a mutation engine. Mutating source correctly (parse,
+ * rewrite one operator, rebuild, rerun only the covering tests) is
+ * language-specific work each ecosystem has already done, and mutants from a
+ * home-grown engine are ones no reviewer trusts. Same build-vs-buy call as k6
+ * for load: run the real tool, read the report it already emits.
+ */
+export const MUTATION_TOOLS = [
+  'stryker',
+  'stryker-net',
+  'pit',
+  'mutmut',
+  'mutant',
+  'go-mutesting',
+  'infection',
+] as const;
+export type MutationTool = (typeof MUTATION_TOOLS)[number];
+
+/** Shown next to the tool picker in the spec editor. */
+export const MUTATION_TOOL_LABELS: Record<MutationTool, string> = {
+  stryker: 'Stryker — JavaScript / TypeScript',
+  'stryker-net': 'Stryker.NET — C#',
+  pit: 'PIT — Java, via Maven',
+  mutmut: 'mutmut — Python',
+  mutant: 'mutant — Ruby',
+  'go-mutesting': 'go-mutesting — Go',
+  infection: 'Infection — PHP',
+};
+
+/** A path a spec supplies that has to stay inside the run workspace. */
+const workspaceRelativePath = z
+  .string()
+  .max(300)
+  .refine(
+    (p) => !p.startsWith('/') && !p.split(/[\\/]/).includes('..'),
+    'must be a relative path inside the workspace',
+  );
+
+/**
+ * A mutation test.
+ *
+ * `minScore` is the assertion, and it has a default for the same reason the
+ * load thresholds do: a mutation run that reports a score without saying what
+ * was acceptable always passes, which is worse than not running it. 60% is a
+ * starting bar, not a target — raise it once a suite clears it.
+ *
+ * `scope` and `timeoutSeconds` are not conveniences. Every mutant reruns the
+ * covering tests, so a whole repo takes hours; pointing a run at one module is
+ * the difference between a nightly job and an unusable one.
+ */
+export const mutationTestSpecSchema = z
+  .object({
+    tool: z.enum(MUTATION_TOOLS).default('stryker'),
+    /**
+     * What to mutate, in whatever dialect the tool speaks: globs for Stryker and
+     * Infection, paths for mutmut, class patterns for PIT, subject expressions
+     * for mutant, packages for go-mutesting. Empty means the tool's own
+     * configured scope.
+     */
+    scope: z.array(z.string().min(1).max(300)).max(50).default([]),
+    /** The gate: the test fails when the mutation score drops below this percentage. */
+    minScore: z.number().min(0).max(100).default(60),
+    /** Mutation runs are slow. Default 30 minutes, ceiling 6 hours. */
+    timeoutSeconds: z.number().int().min(30).max(21_600).default(1_800),
+    /** Working directory inside the workspace. */
+    cwd: workspaceRelativePath.default('.'),
+    /** Overrides where the tool's report is read from, relative to `cwd`. */
+    reportPath: workspaceRelativePath.optional(),
+    /** Extra flags appended to the built-in command for the chosen tool. */
+    extraArgs: z.array(z.string().max(500)).max(64).default([]),
+    /** Escape hatch: run this executable instead of the tool's built-in command. */
+    command: z.string().min(1).max(200).optional(),
+    /** The complete argv when `command` is set. Never passed through a shell. */
+    args: z.array(z.string().max(500)).max(64).default([]),
+    env: z.record(z.string(), z.string()).default({}),
+    /** Secret names to expose to the child process, resolved from the vault. */
+    secretNames: z.array(z.string().max(80)).max(50).default([]),
+    /** How many surviving mutants become steps before the list is truncated. */
+    maxSurvivorsReported: z.number().int().min(1).max(500).default(100),
+  })
+  .refine((s) => s.args.length === 0 || s.command !== undefined, {
+    path: ['args'],
+    message:
+      'only applies together with command — use extraArgs to add flags to the built-in command',
+  });
+
+export type MutationTestSpec = z.infer<typeof mutationTestSpecSchema>;
 
 // ─── Runs (§5) ───────────────────────────────────────────────────────────────
 
@@ -645,7 +1278,10 @@ const gitBranch = z
   .min(1)
   .max(120)
   .regex(/^[^\s~^:?*[\\]+$/, 'invalid branch name')
-  .refine((b) => !b.includes('..') && !b.startsWith('-') && !b.startsWith('/'), 'invalid branch name');
+  .refine(
+    (b) => !b.includes('..') && !b.startsWith('-') && !b.startsWith('/'),
+    'invalid branch name',
+  );
 
 export const createIntegrationSchema = z.object({
   kind: z.enum(GIT_INTEGRATION_KINDS),

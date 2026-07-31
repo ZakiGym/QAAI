@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="0" failures="1" skipped="1" tests="4" time="0.147" timestamp="2026-07-31T10:12:04.129384+00:00" hostname="runner-7f9c"><testcase classname="tests.test_cart" name="test_adds_item" time="0.001" /><testcase classname="tests.test_cart" name="test_total_with_tax" time="0.004"><failure message="assert 10.8 == 10.79">self = &lt;tests.test_cart.TestTotals object at 0x7f2b1c0d5e50&gt;
+
+    def test_total_with_tax(self):
+        cart = Cart([Item("widget", 9.0)])
+&gt;       assert cart.total(tax=0.2) == 10.79
+E       assert 10.8 == 10.79
+E        +  where 10.8 = &lt;bound method Cart.total of Cart(items=1)&gt;(tax=0.2)
+
+tests/test_cart.py:31: AssertionError</failure></testcase><testcase classname="tests.test_cart" name="test_checkout_needs_network" time="0.000"><skipped type="pytest.skip" message="needs network">/repo/tests/test_cart.py:44: needs network</skipped></testcase><testcase classname="tests.test_cart" name="test_currency_symbol" time="0.002" /></testsuite></testsuites>

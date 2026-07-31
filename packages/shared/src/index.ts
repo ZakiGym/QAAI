@@ -1,4 +1,6 @@
 export * from './constants.js';
+export * from './detect.js';
+export * from './ecosystems.js';
 export * from './flow-map.js';
 export * from './locators.js';
 export * from './types.js';

@@ -1,0 +1,105 @@
+{
+  "numFailedTestSuites": 2,
+  "numFailedTests": 1,
+  "numPassedTestSuites": 0,
+  "numPassedTests": 2,
+  "numPendingTestSuites": 0,
+  "numPendingTests": 1,
+  "numRuntimeErrorTestSuites": 1,
+  "numTodoTests": 0,
+  "numTotalTestSuites": 2,
+  "numTotalTests": 4,
+  "openHandles": [],
+  "snapshot": {
+    "added": 0,
+    "didUpdate": false,
+    "failure": false,
+    "filesAdded": 0,
+    "filesRemoved": 0,
+    "filesUnmatched": 0,
+    "filesUpdated": 0,
+    "matched": 0,
+    "total": 0,
+    "unchecked": 0,
+    "unmatched": 0,
+    "updated": 0
+  },
+  "startTime": 1785492724000,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": ["total"],
+          "duration": 6,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "total sums line items",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 1,
+          "retryReasons": [],
+          "status": "passed",
+          "title": "sums line items"
+        },
+        {
+          "ancestorTitles": ["total"],
+          "duration": 3,
+          "failureDetails": [{ "matcherResult": { "pass": false } }],
+          "failureMessages": [
+            "Error: expect(received).toBe(expected) // Object.is equality\n\nExpected: 10.79\nReceived: 10.8\n    at Object.<anonymous> (/repo/src/checkout/total.test.ts:22:31)\n    at Promise.then.completed (/repo/node_modules/jest-circus/build/utils.js:298:28)"
+          ],
+          "fullName": "total applies the tax rate",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryReasons": [],
+          "status": "failed",
+          "title": "applies the tax rate"
+        },
+        {
+          "ancestorTitles": ["total"],
+          "duration": 1,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "total rounds half up",
+          "invocations": 1,
+          "location": null,
+          "numPassingAsserts": 2,
+          "retryReasons": [],
+          "status": "passed",
+          "title": "rounds half up"
+        },
+        {
+          "ancestorTitles": ["total"],
+          "duration": null,
+          "failureDetails": [],
+          "failureMessages": [],
+          "fullName": "total handles foreign currency",
+          "invocations": 0,
+          "location": null,
+          "numPassingAsserts": 0,
+          "retryReasons": [],
+          "status": "pending",
+          "title": "handles foreign currency"
+        }
+      ],
+      "endTime": 1785492726104,
+      "message": "  ● total › applies the tax rate\n\n    expect(received).toBe(expected)\n",
+      "name": "/repo/src/checkout/total.test.ts",
+      "startTime": 1785492724000,
+      "status": "failed",
+      "summary": ""
+    },
+    {
+      "assertionResults": [],
+      "endTime": 1785492724412,
+      "message": "  ● Test suite failed to run\n\n    Cannot find module '../lib/pricing' from 'src/checkout/discount.test.ts'\n\n      3 | import { applyDiscount } from '../lib/pricing';\n\n      at Resolver._throwModNotFoundError (node_modules/jest-resolve/build/resolver.js:427:11)",
+      "name": "/repo/src/checkout/discount.test.ts",
+      "startTime": 1785492724300,
+      "status": "failed",
+      "summary": ""
+    }
+  ],
+  "wasInterrupted": false
+}

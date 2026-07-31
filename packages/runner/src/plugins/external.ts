@@ -5,12 +5,16 @@
  * CodeceptJS, Newman, Pa11y, Lighthouse CI, BackstopJS, Maestro, Detox — the
  * list is long and it will keep growing, so QAAI does not reimplement any of
  * them. It runs the tool's own command and reads the report the tool already
- * knows how to emit. Almost every runner in that list can produce JUnit XML,
- * which is why that is the default format.
+ * knows how to emit.
  *
  * This is the honest version of "we support your framework": your suite runs on
  * its own runner, with its own config and plugins, and QAAI supplies the
  * environment, the secrets, the scheduling, the history, and the triage.
+ *
+ * Reading the report is the second half of that promise, and all of it lives in
+ * ../reports — one parser per format, every one returning the same normalised
+ * shape. This plugin does not know whether the tool wrote JUnit XML, TAP, TRX,
+ * or `go test -json`, which is the point.
  *
  * Security note: the command is spawned WITHOUT a shell, and args are passed as
  * an array. A test spec is org-authored data, and `shell: true` here would turn
@@ -26,93 +30,24 @@ import type {
   ExternalTestSpec,
   RunContext,
   RunnerPlugin,
-  StepResult,
   TestExecution,
 } from '@qaai/shared';
-
-/** One `<testcase>` from a JUnit report. */
-interface JUnitCase {
-  name: string;
-  time: number;
-  failure: string | null;
-  skipped: boolean;
-}
-
-function decodeXmlEntities(value: string): string {
-  return value
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, code: string) => String.fromCharCode(Number(code)))
-    .replace(/&amp;/g, '&');
-}
-
-/**
- * Minimal JUnit XML reader.
- *
- * A dependency-free regex pass rather than an XML parser: the JUnit surface we
- * need is four attributes and two child elements, every runner emits the same
- * shape, and adding an XML parser to the runner for this would be more risk
- * (and more bytes) than the parsing is worth.
- */
-export function parseJUnit(xml: string): JUnitCase[] {
-  const cases: JUnitCase[] = [];
-  const caseRe = /<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g;
-
-  for (const match of xml.matchAll(caseRe)) {
-    const attrs = match[1] ?? '';
-    const body = match[3] ?? '';
-
-    const name =
-      /\bname="([^"]*)"/.exec(attrs)?.[1] ??
-      /\bname='([^']*)'/.exec(attrs)?.[1] ??
-      'unnamed test';
-    const classname = /\bclassname="([^"]*)"/.exec(attrs)?.[1] ?? '';
-    const time = Number(/\btime="([^"]*)"/.exec(attrs)?.[1] ?? '0');
-
-    const failureMatch = /<(failure|error)\b([^>]*?)(\/>|>([\s\S]*?)<\/\1>)/.exec(body);
-    let failure: string | null = null;
-    if (failureMatch) {
-      const failAttrs = failureMatch[2] ?? '';
-      const message = /\bmessage="([^"]*)"/.exec(failAttrs)?.[1] ?? '';
-      const text = (failureMatch[4] ?? '').replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').trim();
-      failure = decodeXmlEntities([message, text].filter(Boolean).join('\n')) || 'failed';
-    }
-
-    cases.push({
-      name: decodeXmlEntities(classname ? `${classname} › ${name}` : name),
-      time: Number.isFinite(time) ? time * 1000 : 0,
-      failure,
-      skipped: /<skipped\b/.test(body),
-    });
-  }
-
-  return cases;
-}
+import {
+  detectReportFormat,
+  parseReport,
+  resolveReportFormat,
+  summariseReport,
+  toStepResults,
+} from '../reports/index.js';
 
 /** Guard: a spec-supplied report path must stay inside the workspace. */
-function safeReportPath(workspace: string, relPath: string): string {
+export function safeReportPath(workspace: string, relPath: string): string {
   if (isAbsolute(relPath)) throw new Error('reportPath must be relative to the workspace');
   const full = resolve(join(workspace, relPath));
   if (full !== resolve(workspace) && !full.startsWith(resolve(workspace) + sep)) {
     throw new Error('reportPath escapes the workspace');
   }
   return full;
-}
-
-function toSteps(cases: JUnitCase[]): StepResult[] {
-  return cases.map((c, index) => ({
-    index,
-    title: c.name,
-    status: c.skipped ? 'SKIPPED' : c.failure ? 'FAILED' : 'PASSED',
-    startedAt: new Date().toISOString(),
-    durationMs: Math.round(c.time),
-    screenshotKey: null,
-    error: c.failure
-      ? { message: c.failure, stack: null, selector: null, expected: null, actual: null }
-      : null,
-  }));
 }
 
 export const externalPlugin: RunnerPlugin = {
@@ -236,7 +171,9 @@ export async function runExternal(
       status: ok ? 'PASSED' : 'FAILED',
       durationMs: Date.now() - startedAt,
       steps: [],
-      errorMessage: ok ? null : (result.stderr || result.stdout).slice(-2000) || `exit ${result.code}`,
+      errorMessage: ok
+        ? null
+        : (result.stderr || result.stdout).slice(-2000) || `exit ${result.code}`,
     };
   }
 
@@ -258,20 +195,43 @@ export async function runExternal(
     };
   }
 
-  const cases = parseJUnit(report);
-  const steps = toSteps(cases);
-  const failures = steps.filter((s) => s.status === 'FAILED');
+  // `auto` (and the legacy `json-summary` id) sniff the file; everything else
+  // reads it as the format the spec declared, and says so when that fails.
+  const declared = resolveReportFormat(spec.reportFormat);
+  const format = declared ?? detectReportFormat(report);
+  if (!format) {
+    return {
+      ...base,
+      status: 'SKIPPED',
+      durationMs: Date.now() - startedAt,
+      steps: [],
+      errorMessage: `The report at ${spec.reportPath} is not in a format QAAI recognises. Set reportFormat explicitly.`,
+    };
+  }
+
+  const parsed = parseReport(format, report);
+  const steps = toStepResults(parsed, new Date(startedAt));
+  const summary = summariseReport(parsed, spec.reportPath);
+
+  // A report we could not read, from a process that said it failed, is a
+  // failure — the tool's own exit code is the evidence we still have. The
+  // reverse never applies: a clean exit cannot upgrade an unreadable or empty
+  // report into a pass, because there is nothing there to have passed.
+  const status =
+    summary.status === 'SKIPPED' && result.code !== 0 && parsed.presence !== 'ok'
+      ? 'FAILED'
+      : summary.status;
+
+  const hint =
+    declared && parsed.presence === 'unreadable'
+      ? ` The file looks like ${detectReportFormat(report) ?? 'no format QAAI knows'}, not ${format}.`
+      : '';
 
   return {
     ...base,
-    status: failures.length > 0 ? 'FAILED' : steps.length === 0 ? 'SKIPPED' : 'PASSED',
+    status,
     durationMs: Date.now() - startedAt,
     steps,
-    errorMessage:
-      failures.length > 0
-        ? `${failures.length} of ${steps.length} failed. First: ${failures[0]?.error?.message ?? ''}`.slice(0, 2000)
-        : steps.length === 0
-          ? 'The report contained no test cases.'
-          : null,
+    errorMessage: summary.errorMessage ? `${summary.errorMessage}${hint}`.slice(0, 2000) : null,
   };
 }

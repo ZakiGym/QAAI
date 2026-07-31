@@ -1,0 +1,60 @@
+TAP version 13
+# Subtest: cart
+    # Subtest: adds an item
+    ok 1 - adds an item
+      ---
+      duration_ms: 0.314
+      type: 'test'
+      ...
+    # Subtest: applies the tax rate
+    not ok 2 - applies the tax rate
+      ---
+      duration_ms: 0.488625
+      type: 'test'
+      location: '/repo/cart.test.js:6:11'
+      failureType: 'testCodeFailure'
+      error: |-
+        Expected values to be strictly equal:
+        
+        10.8 !== 10.79
+        
+      code: 'ERR_ASSERTION'
+      name: 'AssertionError'
+      expected: 10.79
+      actual: 10.8
+      operator: 'strictEqual'
+      stack: |-
+        TestContext.<anonymous> (/repo/cart.test.js:6:55)
+        Test.runInAsyncScope (node:async_hooks:226:14)
+        Test.run (node:internal/test_runner/test:1118:25)
+        Test.start (node:internal/test_runner/test:1015:17)
+        TestContext.test (node:internal/test_runner/test:368:20)
+        TestContext.<anonymous> (/repo/cart.test.js:6:11)
+        async Test.run (node:internal/test_runner/test:1125:7)
+        async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3)
+      ...
+    # Subtest: handles foreign currency
+    ok 3 - handles foreign currency # SKIP no fixtures yet
+      ---
+      duration_ms: 0.165417
+      type: 'test'
+      ...
+    1..3
+not ok 1 - cart
+  ---
+  duration_ms: 1.523875
+  type: 'test'
+  location: '/repo/cart.test.js:4:1'
+  failureType: 'subtestsFailed'
+  error: '1 subtest failed'
+  code: 'ERR_TEST_FAILURE'
+  ...
+1..1
+# tests 4
+# suites 0
+# pass 1
+# fail 2
+# cancelled 0
+# skipped 1
+# todo 0
+# duration_ms 57.73425

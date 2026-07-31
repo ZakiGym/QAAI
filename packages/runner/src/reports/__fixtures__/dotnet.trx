@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="8f2b1c0d-5e50-4a11-9c2e-7f9c1b4d0a33" name="runner@runner-7f9c 2026-07-31 10:12:04" runUser="runner" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-07-31T10:12:04.0000000+00:00" queuing="2026-07-31T10:12:04.0000000+00:00" start="2026-07-31T10:12:04.0000000+00:00" finish="2026-07-31T10:12:06.1230000+00:00" />
+  <TestSettings name="default" id="4d2f8e11-7a90-4f4a-8c5e-1b0c9a5f6e21">
+    <Deployment runDeploymentRoot="runner_runner-7f9c_2026-07-31_10_12_04" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="e1000001-0000-0000-0000-000000000001" testId="a1000001-0000-0000-0000-000000000001" testName="Shop.Tests.CalculatorTests.Add_ReturnsSum" computerName="runner-7f9c" duration="00:00:00.0123456" startTime="2026-07-31T10:12:04.5000000+00:00" endTime="2026-07-31T10:12:04.5123456+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e1000001-0000-0000-0000-000000000001" />
+    <UnitTestResult executionId="e1000001-0000-0000-0000-000000000002" testId="a1000001-0000-0000-0000-000000000002" testName="Shop.Tests.CalculatorTests.Divide_ByZero_Throws" computerName="runner-7f9c" duration="00:00:01.2345678" startTime="2026-07-31T10:12:04.5200000+00:00" endTime="2026-07-31T10:12:05.7545678+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e1000001-0000-0000-0000-000000000002">
+      <Output>
+        <ErrorInfo>
+          <Message>Assert.Throws() Failure: No exception was thrown&#xD;&#xA;Expected: typeof(System.DivideByZeroException)</Message>
+          <StackTrace>   at Shop.Tests.CalculatorTests.Divide_ByZero_Throws() in /repo/tests/Shop.Tests/CalculatorTests.cs:line 42&#xD;&#xA;   at System.RuntimeMethodHandle.InvokeMethod(Object target, Void** arguments, Signature sig, Boolean isConstructor)</StackTrace>
+        </ErrorInfo>
+        <StdOut>calculating 1 / 0</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="e1000001-0000-0000-0000-000000000003" testId="a1000001-0000-0000-0000-000000000003" testName="Shop.Tests.CalculatorTests.Persists_ToDatabase" computerName="runner-7f9c" duration="00:00:00.0000000" startTime="2026-07-31T10:12:05.7600000+00:00" endTime="2026-07-31T10:12:05.7600000+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e1000001-0000-0000-0000-000000000003">
+      <Output>
+        <StdOut>Skipped: requires a database</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="e1000001-0000-0000-0000-000000000004" testId="a1000001-0000-0000-0000-000000000004" testName="Shop.Tests.CalculatorTests.Rounds" computerName="runner-7f9c" duration="00:00:00.0130000" startTime="2026-07-31T10:12:05.8000000+00:00" endTime="2026-07-31T10:12:05.8130000+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e1000001-0000-0000-0000-000000000004">
+      <InnerResults>
+        <UnitTestResult executionId="e1000001-0000-0000-0000-000000000005" parentExecutionId="e1000001-0000-0000-0000-000000000004" testId="a1000001-0000-0000-0000-000000000004" testName="Shop.Tests.CalculatorTests.Rounds(value: 1.005)" computerName="runner-7f9c" duration="00:00:00.0056000" outcome="Passed" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" />
+        <UnitTestResult executionId="e1000001-0000-0000-0000-000000000006" parentExecutionId="e1000001-0000-0000-0000-000000000004" testId="a1000001-0000-0000-0000-000000000004" testName="Shop.Tests.CalculatorTests.Rounds(value: 2.675)" computerName="runner-7f9c" duration="00:00:00.0074000" outcome="Failed" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b">
+          <Output>
+            <ErrorInfo>
+              <Message>Assert.Equal() Failure: Values differ&#xD;&#xA;Expected: 2.68&#xD;&#xA;Actual:   2.67</Message>
+              <StackTrace>   at Shop.Tests.CalculatorTests.Rounds(Decimal value) in /repo/tests/Shop.Tests/CalculatorTests.cs:line 58</StackTrace>
+            </ErrorInfo>
+          </Output>
+        </UnitTestResult>
+      </InnerResults>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="Add_ReturnsSum" storage="/repo/tests/shop.tests/bin/debug/net8.0/shop.tests.dll" id="a1000001-0000-0000-0000-000000000001">
+      <Execution id="e1000001-0000-0000-0000-000000000001" />
+      <TestMethod codeBase="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Shop.Tests.CalculatorTests" name="Add_ReturnsSum" />
+    </UnitTest>
+    <UnitTest name="Divide_ByZero_Throws" storage="/repo/tests/shop.tests/bin/debug/net8.0/shop.tests.dll" id="a1000001-0000-0000-0000-000000000002">
+      <Execution id="e1000001-0000-0000-0000-000000000002" />
+      <TestMethod codeBase="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Shop.Tests.CalculatorTests" name="Divide_ByZero_Throws" />
+    </UnitTest>
+    <UnitTest name="Persists_ToDatabase" storage="/repo/tests/shop.tests/bin/debug/net8.0/shop.tests.dll" id="a1000001-0000-0000-0000-000000000003">
+      <Execution id="e1000001-0000-0000-0000-000000000003" />
+      <TestMethod codeBase="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Shop.Tests.CalculatorTests" name="Persists_ToDatabase" />
+    </UnitTest>
+    <UnitTest name="Rounds" storage="/repo/tests/shop.tests/bin/debug/net8.0/shop.tests.dll" id="a1000001-0000-0000-0000-000000000004">
+      <Execution id="e1000001-0000-0000-0000-000000000004" />
+      <TestMethod codeBase="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner2/netcoreapp" className="Shop.Tests.CalculatorTests" name="Rounds" />
+    </UnitTest>
+  </TestDefinitions>
+  <ResultSummary outcome="Failed">
+    <Counters total="5" executed="4" passed="2" failed="2" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="1" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdErr>xUnit.net VSTest Adapter v2.8.2</StdErr>
+    </Output>
+  </ResultSummary>
+</TestRun>

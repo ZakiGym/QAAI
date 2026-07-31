@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="4" failures="1" errors="0" time="2.311">
+  <testsuite name="src/checkout/total.test.ts" errors="0" failures="1" skipped="1" timestamp="2026-07-31T10:12:04" time="2.104" tests="4">
+    <testcase classname="total sums line items" name="total sums line items" time="0.006">
+    </testcase>
+    <testcase classname="total applies the tax rate" name="total applies the tax rate" time="0.003">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 10.79
+Received: 10.8
+    at Object.&lt;anonymous&gt; (/repo/src/checkout/total.test.ts:22:31)
+    at Promise.then.completed (/repo/node_modules/jest-circus/build/utils.js:298:28)
+    at new Promise (&lt;anonymous&gt;)</failure>
+    </testcase>
+    <testcase classname="total rounds half up" name="total rounds half up" time="0.001">
+    </testcase>
+    <testcase classname="total handles foreign currency" name="total handles foreign currency" time="0">
+      <skipped/>
+    </testcase>
+  </testsuite>
+</testsuites>

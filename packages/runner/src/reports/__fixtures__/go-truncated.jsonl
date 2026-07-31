@@ -1,0 +1,6 @@
+{"Time":"2026-07-31T10:12:04.101228Z","Action":"start","Package":"example.com/shop/cart"}
+{"Time":"2026-07-31T10:12:04.201310Z","Action":"run","Package":"example.com/shop/cart","Test":"TestAddItem"}
+{"Time":"2026-07-31T10:12:04.203140Z","Action":"pass","Package":"example.com/shop/cart","Test":"TestAddItem","Elapsed":0.002}
+{"Time":"2026-07-31T10:12:04.203200Z","Action":"run","Package":"example.com/shop/cart","Test":"TestTotal"}
+{"Time":"2026-07-31T10:12:04.203260Z","Action":"output","Package":"example.com/shop/cart","Test":"TestTotal","Output":"=== RUN   TestTotal\n"}
+{"Time":"2026-07-31T10:12:04.205

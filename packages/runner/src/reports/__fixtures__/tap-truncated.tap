@@ -1,0 +1,8 @@
+TAP version 13
+1..40
+ok 1 - loads the config
+ok 2 - connects to the database
+not ok 3 - migrates the schema
+  ---
+  message: 'relation "users" already exists'
+  severity: fail

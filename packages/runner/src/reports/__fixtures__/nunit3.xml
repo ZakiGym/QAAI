@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<test-run id="2" testcasecount="5" result="Failed" total="5" passed="2" failed="2" inconclusive="0" skipped="1" asserts="6" engine-version="3.16.3.0" clr-version="8.0.7" start-time="2026-07-31 10:12:04Z" end-time="2026-07-31 10:12:04Z" duration="0.512345" fullname="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll">
+  <command-line><![CDATA[nunit3-console Shop.Tests.dll --result=TestResult.xml]]></command-line>
+  <test-suite type="Assembly" id="0-1005" name="Shop.Tests.dll" fullname="/repo/tests/Shop.Tests/bin/Debug/net8.0/Shop.Tests.dll" runstate="Runnable" testcasecount="5" result="Failed" start-time="2026-07-31 10:12:04Z" duration="0.421210" total="5" passed="2" failed="2" inconclusive="0" skipped="1" asserts="6">
+    <environment framework-version="3.13.3.0" clr-version="8.0.7" os-version="Linux 6.8.0" platform="Linux" cwd="/repo" machine-name="runner-7f9c" user="runner" />
+    <settings>
+      <setting name="NumberOfTestWorkers" value="4" />
+    </settings>
+    <test-suite type="TestSuite" id="0-1004" name="Shop" fullname="Shop" runstate="Runnable" testcasecount="5" result="Failed" duration="0.401110" total="5" passed="2" failed="2" inconclusive="0" skipped="1" asserts="6">
+      <test-suite type="TestFixture" id="0-1000" name="CalculatorTests" fullname="Shop.Tests.CalculatorTests" classname="Shop.Tests.CalculatorTests" runstate="Runnable" testcasecount="4" result="Failed" start-time="2026-07-31 10:12:04Z" duration="0.301220" total="4" passed="2" failed="1" inconclusive="0" skipped="1" asserts="5">
+        <test-case id="0-1001" name="Add_ReturnsSum" fullname="Shop.Tests.CalculatorTests.Add_ReturnsSum" methodname="Add_ReturnsSum" classname="Shop.Tests.CalculatorTests" runstate="Runnable" seed="1739301884" result="Passed" start-time="2026-07-31 10:12:04Z" duration="0.002153" asserts="1" />
+        <test-case id="0-1002" name="Divide_ByZero_Throws" fullname="Shop.Tests.CalculatorTests.Divide_ByZero_Throws" methodname="Divide_ByZero_Throws" classname="Shop.Tests.CalculatorTests" runstate="Runnable" seed="284511118" result="Failed" label="" start-time="2026-07-31 10:12:04Z" duration="0.015423" asserts="1">
+          <failure>
+            <message><![CDATA[  Expected: <System.DivideByZeroException>
+  But was:  no exception thrown
+]]></message>
+            <stack-trace><![CDATA[   at Shop.Tests.CalculatorTests.Divide_ByZero_Throws() in /repo/tests/Shop.Tests/CalculatorTests.cs:line 42
+]]></stack-trace>
+          </failure>
+        </test-case>
+        <test-case id="0-1003" name="Persists_ToDatabase" fullname="Shop.Tests.CalculatorTests.Persists_ToDatabase" methodname="Persists_ToDatabase" classname="Shop.Tests.CalculatorTests" runstate="Ignored" result="Skipped" label="Ignored" start-time="2026-07-31 10:12:04Z" duration="0.000123" asserts="0">
+          <properties>
+            <property name="_SKIPREASON" value="requires a database" />
+          </properties>
+          <reason>
+            <message><![CDATA[requires a database]]></message>
+          </reason>
+        </test-case>
+        <test-case id="0-1006" name="Rounds_HalfUp" fullname="Shop.Tests.CalculatorTests.Rounds_HalfUp" methodname="Rounds_HalfUp" classname="Shop.Tests.CalculatorTests" runstate="Runnable" seed="909112733" result="Passed" start-time="2026-07-31 10:12:04Z" duration="0.001004" asserts="3" />
+      </test-suite>
+      <test-suite type="TestFixture" id="0-1010" name="CheckoutTests" fullname="Shop.Tests.CheckoutTests" classname="Shop.Tests.CheckoutTests" runstate="Runnable" testcasecount="1" result="Failed" site="SetUp" duration="0.099890" total="0" passed="0" failed="0" inconclusive="0" skipped="0" asserts="0">
+        <failure>
+          <message><![CDATA[OneTimeSetUp: System.InvalidOperationException : STRIPE_KEY is not configured]]></message>
+          <stack-trace><![CDATA[   at Shop.Tests.CheckoutTests.OneTimeSetUp() in /repo/tests/Shop.Tests/CheckoutTests.cs:line 17
+]]></stack-trace>
+        </failure>
+      </test-suite>
+    </test-suite>
+  </test-suite>
+</test-run>

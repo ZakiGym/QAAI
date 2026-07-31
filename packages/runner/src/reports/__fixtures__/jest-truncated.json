@@ -1,0 +1,33 @@
+{
+  "numFailedTestSuites": 0,
+  "numFailedTests": 0,
+  "numPassedTestSuites": 0,
+  "numPassedTests": 2,
+  "numPendingTests": 0,
+  "numTotalTestSuites": 3,
+  "numTotalTests": 12,
+  "startTime": 1785492724000,
+  "success": false,
+  "testResults": [
+    {
+      "assertionResults": [
+        {
+          "ancestorTitles": ["total"],
+          "duration": 6,
+          "failureMessages": [],
+          "fullName": "total sums line items",
+          "status": "passed",
+          "title": "sums line items"
+        },
+        {
+          "ancestorTitles": ["total"],
+          "duration": 3,
+          "failureMessages": [],
+          "fullName": "total rounds half up",
+          "status": "passed",
+          "title": "rounds half up"
+        },
+        {
+          "ancestorTitles": ["total"],
+          "duration": 4,
+          "failureMess
