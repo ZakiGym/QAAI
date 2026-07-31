@@ -165,13 +165,49 @@ export async function processRun(job: RunJob): Promise<void> {
   let runErrored: string | null = null;
 
   try {
-    for (const result of run.results) {
+    for (const [index, result] of run.results.entries()) {
       const test = result.test;
+
+      /*
+       * Cooperative cancellation, checked between tests.
+       *
+       * A run could not be stopped at all — while one was in flight the
+       * cockpit's only control was a disabled Re-run button. Killing the worker
+       * process is not an option, since it is running every other org's runs
+       * too, so the cancel endpoint writes the status and this loop notices.
+       *
+       * Between tests rather than mid-test: a half-executed test would be
+       * recorded as a failure, which is exactly the false signal this product
+       * exists to remove. The cost is that cancelling waits for the current
+       * test to finish, and that is the right trade.
+       */
+      const current = await prisma.run.findUnique({
+        where: { id: run.id },
+        select: { status: true },
+      });
+      if (current?.status === 'CANCELLED') {
+        logger.info({ runId: run.id, completed: index }, 'run cancelled; stopping');
+        publishEvent(orgId, {
+          runId: run.id,
+          type: 'run.finished',
+          data: { status: 'CANCELLED', completed: index, total: run.results.length },
+          at: new Date().toISOString(),
+        });
+        return;
+      }
 
       publishEvent(orgId, {
         runId: run.id,
         type: 'test.started',
-        data: { testId: test.id, name: test.name, type: test.type },
+        data: {
+          testId: test.id,
+          name: test.name,
+          type: test.type,
+          // Progress, so the cockpit can say "4 of 11" rather than leaving the
+          // user to guess whether anything is happening at all.
+          index,
+          total: run.results.length,
+        },
         at: new Date().toISOString(),
       });
 

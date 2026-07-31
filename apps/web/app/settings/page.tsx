@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
+import { Button } from '../../components/ui/Button';
+import { Field } from '../../components/ui/Field';
+import { ConfirmDialog } from '../../components/ui/Modal';
+import { Page, PageHeader, SectionLabel, Tabs } from '../../components/ui/layout';
 
 /** The shape of GET /auth/me — declared here since it is settings-specific. */
 interface Org {
@@ -56,8 +60,8 @@ export default function SettingsPage() {
   const activeOrg = me?.orgs.find((org) => org.id === me.activeOrgId) ?? null;
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-10">
-      <h1 className="mb-8 text-2xl font-semibold tracking-tight">Settings</h1>
+    <Page width="narrow">
+      <PageHeader title="Settings" />
 
       {error && (
         <p
@@ -68,22 +72,7 @@ export default function SettingsPage() {
         </p>
       )}
 
-      <nav className="border-line mb-8 flex gap-1 border-b">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            type="button"
-            onClick={() => setTab(t.id)}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm ${
-              tab === t.id
-                ? 'border-accent text-ink'
-                : 'text-ink-faint hover:text-ink border-transparent'
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
 
       {!me ? (
         <p className="text-ink-faint text-sm">Loading…</p>
@@ -98,7 +87,7 @@ export default function SettingsPage() {
       ) : (
         <AuditTab />
       )}
-    </main>
+    </Page>
   );
 }
 
@@ -150,9 +139,7 @@ function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
   return (
     <div className="space-y-8">
       <section>
-        <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
-          {activeOrg ? `Members of ${activeOrg.name}` : 'Members'}
-        </h2>
+        <SectionLabel>{activeOrg ? `Members of ${activeOrg.name}` : 'Members'}</SectionLabel>
         <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
           {members.map((member) => (
             <div key={member.userId} className="flex items-center gap-4 px-4 py-3">
@@ -181,9 +168,7 @@ function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
       </section>
 
       <section>
-        <h2 className="text-ink-dim mb-3 text-xs font-semibold tracking-wider uppercase">
-          Your organizations
-        </h2>
+        <SectionLabel>Your organizations</SectionLabel>
         <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
           {me.orgs.map((org) => (
             <div key={org.id} className="flex items-center gap-4 px-4 py-3">
@@ -220,6 +205,10 @@ function ApiKeysTab() {
   const [freshSecret, setFreshSecret] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The key awaiting confirmation. Held as the whole record so the dialog can
+  // name it — a confirm that does not say what it is about is a coin flip.
+  const [pendingRevoke, setPendingRevoke] = useState<ApiKey | null>(null);
+  const [revoking, setRevoking] = useState(false);
 
   const load = useCallback(async () => {
     const data = await api<{ keys: ApiKey[] }>('/settings/api-keys').catch(() => ({ keys: [] }));
@@ -251,9 +240,14 @@ function ApiKeysTab() {
   }
 
   async function revoke(id: string) {
-    if (!confirm('Revoke this key? Anything using it will stop working immediately.')) return;
-    await api(`/settings/api-keys/${id}`, { method: 'DELETE' }).catch(() => {});
-    await load();
+    setRevoking(true);
+    try {
+      await api(`/settings/api-keys/${id}`, { method: 'DELETE' }).catch(() => {});
+      await load();
+      setPendingRevoke(null);
+    } finally {
+      setRevoking(false);
+    }
   }
 
   return (
@@ -264,33 +258,32 @@ function ApiKeysTab() {
           <code className="border-line bg-surface block overflow-x-auto rounded border px-3 py-2 font-mono text-xs">
             {freshSecret}
           </code>
-          <button
-            type="button"
+          <Button
+            variant="primary"
+            size="sm"
+            className="mt-3"
             onClick={() => {
               void navigator.clipboard.writeText(freshSecret);
               setFreshSecret(null);
             }}
-            className="bg-accent mt-3 rounded-md px-3 py-1 text-xs font-medium text-white"
           >
             Copy and dismiss
-          </button>
+          </Button>
         </div>
       )}
 
-      <form onSubmit={create} className="flex gap-2">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. github-ci"
-          className="border-line bg-surface-1 focus:border-accent flex-1 rounded-md border px-3 py-1.5 text-sm outline-none"
-        />
-        <button
-          type="submit"
-          disabled={busy}
-          className="bg-accent rounded-md px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
+      <form onSubmit={create} className="flex items-start gap-2">
+        <div className="flex-1">
+          <Field
+            aria-label="API key name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. github-ci"
+          />
+        </div>
+        <Button type="submit" variant="primary" loading={busy}>
           New key
-        </button>
+        </Button>
       </form>
       {error && <p className="text-fail text-xs">{error}</p>}
 
@@ -300,13 +293,14 @@ function ApiKeysTab() {
             <span className="text-sm font-medium">{key.name}</span>
             <code className="text-ink-faint font-mono text-xs">{key.keyPrefix}…</code>
             <span className="text-ink-faint font-mono text-meta">{key.scopes.join(' ')}</span>
-            <button
-              type="button"
-              onClick={() => void revoke(key.id)}
-              className="text-fail ml-auto text-xs hover:underline"
+            <Button
+              variant="danger"
+              size="sm"
+              className="ml-auto"
+              onClick={() => setPendingRevoke(key)}
             >
               Revoke
-            </button>
+            </Button>
           </div>
         ))}
         {keys.length === 0 && (
@@ -320,6 +314,18 @@ function ApiKeysTab() {
         Use a key with the CLI: <code className="font-mono">QAAI_API_KEY=… qaai run --env …</code>.
         See docs/ci.md.
       </p>
+
+      <ConfirmDialog
+        open={pendingRevoke !== null}
+        onClose={() => setPendingRevoke(null)}
+        onConfirm={() => {
+          if (pendingRevoke) void revoke(pendingRevoke.id);
+        }}
+        title="Revoke this key?"
+        body="Anything using it will stop working immediately."
+        confirmLabel="Revoke key"
+        busy={revoking}
+      />
     </div>
   );
 }
@@ -359,15 +365,19 @@ function UsageTab() {
       <div className="grid grid-cols-3 gap-3">
         <div className="border-line bg-surface-1 rounded-lg border p-4">
           <p className="text-ink-faint text-xs">Last {data.days} days</p>
-          <p className="mt-1 text-2xl font-semibold tracking-tight">{money(data.totalCostCents)}</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight tabular-nums">
+            {money(data.totalCostCents)}
+          </p>
         </div>
         <div className="border-line bg-surface-1 rounded-lg border p-4">
           <p className="text-ink-faint text-xs">Model calls</p>
-          <p className="mt-1 text-2xl font-semibold tracking-tight">{data.totalCalls}</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight tabular-nums">
+            {data.totalCalls}
+          </p>
         </div>
         <div className="border-line bg-surface-1 rounded-lg border p-4">
           <p className="text-ink-faint text-xs">Failed calls</p>
-          <p className="text-flake mt-1 text-2xl font-semibold tracking-tight">
+          <p className="text-flake mt-1 text-2xl font-semibold tracking-tight tabular-nums">
             {data.byAgent.reduce((sum, a) => sum + a.failures, 0)}
           </p>
         </div>

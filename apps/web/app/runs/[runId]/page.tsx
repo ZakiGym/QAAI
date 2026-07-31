@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { API_URL, api, artifactUrl, type Run, type TestResult } from '../../../lib/api';
 import { SeverityLabel, StatusDot, VerdictChip, duration } from '../../../components/ui';
+import { Button } from '../../../components/ui/Button';
+import { useToast } from '../../../components/ui/Toast';
 
 /**
  * The cockpit (§8).
@@ -77,6 +79,9 @@ function describeEvent(label: string, data: Record<string, unknown>): LiveLine |
   }
 }
 
+/** A run in one of these states will never emit another event. */
+const TERMINAL = new Set(['PASSED', 'FAILED', 'ERRORED', 'CANCELLED']);
+
 export default function CockpitPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = use(params);
 
@@ -87,6 +92,10 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const [live, setLive] = useState<LiveLine[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [rerunning, setRerunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  /** Live progress from test.started events — the worker now sends index/total. */
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const toast = useToast();
 
   /**
    * Re-run the exact same tests against the same environment. Passing the
@@ -109,6 +118,35 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not start the re-run');
       setRerunning(false);
+    }
+  }
+
+  /**
+   * Stop the run.
+   *
+   * The API writes the status and the worker notices between tests, so this is
+   * not instant. The toast says which of the two happened rather than implying
+   * the run halted on the spot — otherwise the next thing the user does is
+   * click Cancel three more times.
+   */
+  async function cancel() {
+    if (!run || cancelling) return;
+    setCancelling(true);
+    try {
+      const { stopsAfterCurrentTest } = await api<{ stopsAfterCurrentTest: boolean }>(
+        `/runs/${runId}/cancel`,
+        { method: 'POST' },
+      );
+      toast.success(
+        stopsAfterCurrentTest
+          ? 'Cancelling — the test already running will finish first.'
+          : 'Run cancelled before it started.',
+      );
+      await load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not cancel the run');
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -141,7 +179,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   // Live events while the run is in flight; the stream closes itself when the
   // run reaches a terminal state, and a final reload picks up the verdicts.
   useEffect(() => {
-    if (!run || run.status === 'PASSED' || run.status === 'FAILED' || run.status === 'ERRORED') {
+    if (!run || TERMINAL.has(run.status)) {
       return;
     }
     const source = new EventSource(`${API_URL}/runs/${runId}/events`, { withCredentials: true });
@@ -151,6 +189,14 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         const parsed = JSON.parse(event.data) as { data: Record<string, unknown> };
         const line = describeEvent(label, parsed.data);
         if (line) setLive((prev) => [line, ...prev].slice(0, 60));
+
+        // The worker stamps index/total on test.started so the header can say
+        // "4 of 11". index is 0-based and names the test about to run, so the
+        // count of finished tests is the index itself.
+        const { index, total } = parsed.data as { index?: number; total?: number };
+        if (label === 'test.started' && typeof index === 'number' && typeof total === 'number') {
+          setProgress({ done: index, total });
+        }
       } catch {
         /* a malformed frame is not worth surfacing */
       }
@@ -175,6 +221,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   }
   if (!run) return <main className="text-ink-faint p-10 text-sm">Loading…</main>;
 
+  const inFlight = run.status === 'RUNNING' || run.status === 'QUEUED';
   const results = run.results ?? [];
   const selected = results.find((r) => r.test.id === selectedTestId) ?? results[0] ?? null;
   const step = selected?.steps.find((s) => s.index === selectedStep) ?? null;
@@ -208,15 +255,31 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               gate {run.gateResult.passed ? 'pass' : 'block'}
             </span>
           )}
-          <button
-            type="button"
-            onClick={() => void rerun()}
-            disabled={rerunning || run.status === 'RUNNING' || run.status === 'QUEUED'}
-            className="bg-accent rounded-md px-2.5 py-1 font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
-            title="Run the same tests again"
-          >
-            {rerunning ? 'Starting…' : '↻ Re-run'}
-          </button>
+          {/*
+            While a run is in flight the only useful action is stopping it, so
+            the button becomes Cancel rather than a greyed-out Re-run with no
+            explanation of why it is disabled.
+          */}
+          {inFlight ? (
+            <>
+              <span className="text-ink-dim tabular-nums" aria-live="polite">
+                {progress ? `${progress.done} of ${progress.total}` : run.status.toLowerCase()}
+              </span>
+              <Button size="sm" variant="danger" loading={cancelling} onClick={() => void cancel()}>
+                Cancel
+              </Button>
+            </>
+          ) : (
+            <Button
+              size="sm"
+              variant="primary"
+              loading={rerunning}
+              onClick={() => void rerun()}
+              title="Run the same tests again"
+            >
+              ↻ Re-run
+            </Button>
+          )}
           <a
             href={`${API_URL}/runs/${run.id}/junit.xml`}
             className="text-ink-faint hover:text-ink transition-colors"

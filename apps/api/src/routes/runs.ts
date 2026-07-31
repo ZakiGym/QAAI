@@ -134,6 +134,63 @@ runsRouter.get('/', async (req, res) => {
   res.json({ runs });
 });
 
+/**
+ * Cancel a run.
+ *
+ * `CANCELLED` has been in the RunStatus enum from the beginning and nothing
+ * could produce it — a run in flight was unstoppable, and the cockpit's only
+ * control was a Re-run button greyed out with no explanation.
+ *
+ * This writes the status and returns; the worker checks it between tests and
+ * stops. That means cancelling is not instant — it waits for the current test —
+ * and the response says so rather than implying the run halted on the spot.
+ */
+runsRouter.post(
+  '/:runId/cancel',
+  requireRole('MEMBER'),
+  requireScope('runs:write'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const run = await prisma.run.findUnique({
+      where: { id: String(req.params.runId) },
+      select: { id: true, status: true },
+    });
+    if (!run) throw notFound('Run');
+
+    // Cancelling a finished run would rewrite history — the results are real and
+    // already reported. Idempotent on an already-cancelled run so a double-click
+    // is not an error.
+    if (run.status !== 'QUEUED' && run.status !== 'RUNNING') {
+      if (run.status === 'CANCELLED') {
+        res.json({ run, alreadyCancelled: true });
+        return;
+      }
+      throw badRequest(`This run already finished as ${run.status.toLowerCase()}.`);
+    }
+
+    const updated = await prisma.run.update({
+      where: { id: run.id },
+      data: { status: 'CANCELLED', finishedAt: new Date() },
+    });
+
+    await audit({
+      actor,
+      action: 'run.cancel',
+      targetType: 'Run',
+      targetId: run.id,
+      metadata: { previousStatus: run.status },
+    });
+
+    res.json({
+      run: updated,
+      // A QUEUED run stops before it starts; a RUNNING one finishes its current
+      // test first. Saying which is the difference between a user trusting the
+      // button and clicking it three more times.
+      stopsAfterCurrentTest: run.status === 'RUNNING',
+    });
+  },
+);
+
 runsRouter.get('/:runId', async (req, res) => {
   const run = await prisma.run.findUnique({
     where: { id: String(req.params.runId) },
