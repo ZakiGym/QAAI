@@ -248,6 +248,17 @@ export default function TriagePage() {
             <p className="text-ink-dim mt-4 text-sm leading-relaxed">{selected.explanation}</p>
             <p className="text-ink-faint mt-2 text-xs">
               {(VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).blurb}
+              {/* The blurb has always said "the healer proposes a fix" and then
+                  left the user to find /heals in the sidebar on their own. The
+                  triage loop was described but never linked together. */}
+              {selected.verdict === 'INTENDED_CHANGE' && (
+                <>
+                  {' '}
+                  <Link href="/heals" className="text-accent hover:underline">
+                    Review proposed fixes →
+                  </Link>
+                </>
+              )}
             </p>
 
             <div className="mt-6">

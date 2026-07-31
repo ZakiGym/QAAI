@@ -29,6 +29,11 @@ import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
 import { webhooksRouter } from './routes/webhooks.js';
+import { clustersRouter } from './routes/clusters.js';
+import { compareRouter } from './routes/compare.js';
+import { impactRouter } from './routes/impact.js';
+import { issuesRouter } from './routes/issues.js';
+import { testsRouter } from './routes/tests.js';
 
 const app = express();
 
@@ -112,6 +117,11 @@ app.use('/settings', settingsRouter);
 app.use('/billing', billingRouter);
 app.use('/integrations', integrationsRouter);
 app.use('/webhooks', webhooksRouter);
+app.use('/clusters', clustersRouter);
+app.use('/compare', compareRouter);
+app.use('/impact', impactRouter);
+app.use('/issues', issuesRouter);
+app.use('/tests', testsRouter);
 app.use('/', recordRouter);
 app.use('/', importRouter);
 app.use('/', agentRouter);

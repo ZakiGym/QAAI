@@ -280,6 +280,16 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               ↻ Re-run
             </Button>
           )}
+          {/* "Is this failure new?" is the first question of any triage, and
+              until now there was no way to ask it — re-running pushed you to a
+              new run id with no link back to the one you were comparing. */}
+          <Link
+            href={`/runs/${run.id}/compare`}
+            className="text-ink-faint hover:text-ink transition-colors"
+            title="Compare with the previous run on this environment"
+          >
+            Compare
+          </Link>
           <a
             href={`${API_URL}/runs/${run.id}/junit.xml`}
             className="text-ink-faint hover:text-ink transition-colors"
@@ -325,7 +335,18 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
             <>
               <h2 className="text-lg font-medium">{selected.test.name}</h2>
               <p className="text-ink-faint mt-1 font-mono text-xs">
-                {selected.test.filePath} · {duration(selected.durationMs)} ·{' '}
+                {/* This was dead text on the highest-traffic triage screen,
+                    while /heals and /triage both made the same string a link.
+                    It goes to the test's own history, which answers the
+                    question you ask next: has this always been unreliable? */}
+                <Link
+                  href={`/tests/${selected.test.id}`}
+                  className="hover:text-ink transition-colors hover:underline"
+                  title="This test's history"
+                >
+                  {selected.test.filePath}
+                </Link>{' '}
+                · <span className="tabular-nums">{duration(selected.durationMs)}</span> ·{' '}
                 {selected.test.priority.toLowerCase().replace('_', ' ')}
               </p>
 
