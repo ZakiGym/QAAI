@@ -5,6 +5,8 @@ import { usePathname, useRouter } from 'next/navigation';
 import { Sidebar } from './Sidebar';
 import { NAV, SETTINGS_ITEM, SHELL_EXCLUDED } from './nav';
 import { CommandPalette, type PaletteItem, type PaletteMode } from '../CommandPalette';
+import { ProjectProvider } from './ProjectContext';
+import { TopBar } from './TopBar';
 import { api } from '../../lib/api';
 
 /**
@@ -187,24 +189,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (!inShell) return <>{children}</>;
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar
-        collapsed={collapsed}
-        mounted={mounted}
-        onToggle={toggle}
-        onOpenPalette={openCommands}
-      />
-      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
-        {children}
+    <ProjectProvider>
+      <div className="flex h-screen overflow-hidden">
+        <Sidebar
+          collapsed={collapsed}
+          mounted={mounted}
+          onToggle={toggle}
+          onOpenPalette={openCommands}
+        />
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
+          {/* The bar owns project, breadcrumb and account for every screen, so
+              no page has to grow its own header to hold them. */}
+          <TopBar />
+          {children}
+        </div>
+        <CommandPalette
+          open={paletteOpen}
+          mode={paletteMode}
+          items={items}
+          onClose={() => setPaletteOpen(false)}
+        />
+        {shortcutsOpen && <ShortcutSheet onClose={() => setShortcutsOpen(false)} />}
       </div>
-      <CommandPalette
-        open={paletteOpen}
-        mode={paletteMode}
-        items={items}
-        onClose={() => setPaletteOpen(false)}
-      />
-      {shortcutsOpen && <ShortcutSheet onClose={() => setShortcutsOpen(false)} />}
-    </div>
+    </ProjectProvider>
   );
 }
 
