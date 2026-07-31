@@ -4,6 +4,8 @@ import { Suspense, useCallback, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { api, ApiError } from '../../../lib/api';
 import { useToast } from '../../../components/ui/Toast';
+import { Button } from '../../../components/ui/Button';
+import { Card, Page, PageHeader, SectionLabel } from '../../../components/ui/layout';
 
 /**
  * Billing.
@@ -127,19 +129,19 @@ function BillingInner() {
 
   if (error) {
     return (
-      <main className="mx-auto max-w-3xl px-6 py-10">
+      <Page width="narrow">
         <p role="alert" className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm">
           {error}
         </p>
-      </main>
+      </Page>
     );
   }
 
   if (!billing) {
     return (
-      <main className="mx-auto max-w-3xl px-6 py-10">
+      <Page width="narrow">
         <p className="text-ink-faint text-body-sm">Loading…</p>
-      </main>
+      </Page>
     );
   }
 
@@ -147,18 +149,22 @@ function BillingInner() {
   const runCap = limits.maxRunsPerMonth;
 
   return (
-    <main className="mx-auto max-w-3xl px-6 py-10">
-      <h1 className="mb-1 text-2xl font-semibold tracking-tight">Billing</h1>
-      <p className="text-ink-dim text-body-sm mb-8">
-        You are on <span className="text-ink font-medium">{limits.label}</span>
+    <Page width="narrow">
+      <PageHeader
+        title="Billing"
+        subtitle={
+          <>
+            You are on <span className="text-ink font-medium">{limits.label}</span>
         {billing.currentPeriodEnd && billing.paying && (
           <>
             {' · '}
             {billing.cancelAtPeriodEnd ? 'ends' : 'renews'}{' '}
             {new Date(billing.currentPeriodEnd).toLocaleDateString()}
+              </>
+            )}
           </>
-        )}
-      </p>
+        }
+      />
 
       {activating && (
         <p className="border-accent/50 bg-accent/10 text-body-sm mb-6 rounded-md border p-3">
@@ -183,9 +189,7 @@ function BillingInner() {
       )}
 
       <section className="mb-10">
-        <h2 className="text-micro text-ink-faint mb-3 font-semibold tracking-wider uppercase">
-          This month
-        </h2>
+        <SectionLabel>This month</SectionLabel>
         <div className="grid gap-3 sm:grid-cols-2">
           <Meter
             label="Runs"
@@ -199,16 +203,17 @@ function BillingInner() {
 
       <section>
         <div className="mb-3 flex items-baseline justify-between">
-          <h2 className="text-micro text-ink-faint font-semibold tracking-wider uppercase">Plans</h2>
+          <SectionLabel>Plans</SectionLabel>
           {billing.paying && (
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => void portal()}
               disabled={busy !== null}
-              className="text-accent text-body-sm hover:underline disabled:opacity-50"
+              className="text-accent"
             >
-              Manage payment & invoices →
-            </button>
+              Manage payment &amp; invoices →
+            </Button>
           )}
         </div>
 
@@ -258,14 +263,15 @@ function BillingInner() {
                 </div>
                 <div className="w-24 text-right">
                   {!current && row.purchasable && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="primary"
+                      size="sm"
                       onClick={() => void checkout(row.plan)}
-                      disabled={busy !== null}
-                      className="bg-accent text-body-sm rounded-md px-3 py-1.5 font-medium text-white hover:opacity-90 disabled:opacity-50"
+                      disabled={busy !== null && busy !== row.plan}
+                      loading={busy === row.plan}
                     >
-                      {busy === row.plan ? '…' : 'Upgrade'}
-                    </button>
+                      Upgrade
+                    </Button>
                   )}
                   {!current && !row.purchasable && row.monthlyPriceUsd === null && (
                     <a
@@ -281,7 +287,7 @@ function BillingInner() {
           })}
         </div>
       </section>
-    </main>
+    </Page>
   );
 }
 
