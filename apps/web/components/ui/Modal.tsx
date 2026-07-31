@@ -34,12 +34,72 @@ export function Modal({
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreFocusTo = useRef<HTMLElement | null>(null);
 
+  /*
+   * Focus is its own effect, keyed on `open` ALONE.
+   *
+   * It started life inside the keydown effect, whose deps include `onClose`.
+   * Callers pass an inline arrow for that more often than not, so the effect
+   * tore down and re-ran on every render — and its cleanup calls
+   * `restoreFocusTo.current.focus()`, which yanked focus straight back out of
+   * the dialog. The observable result was a dialog that opened with focus still
+   * on `<body>`: a keyboard user had to Tab into it, and a screen reader
+   * announced nothing.
+   */
   useEffect(() => {
     if (!open) return;
 
     // Remember where focus came from so closing returns it there. Without this
     // a keyboard user is dumped at the top of the document every time.
     restoreFocusTo.current = document.activeElement as HTMLElement | null;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    /*
+     * `[data-autofocus]` must be checked in its OWN query.
+     *
+     * A single grouped selector looks equivalent and is not: querySelector
+     * returns the first match in DOCUMENT order, not in selector order, and the
+     * ✕ close button is the first focusable element in the panel. So every
+     * dialog opened with focus on Close — one stray Return from dismissing the
+     * thing you had just opened, and a screen reader announcing "Close" instead
+     * of the field.
+     */
+    const focusFirst = () => {
+      const panel = panelRef.current;
+      if (!panel) return;
+      const preferred = panel.querySelector<HTMLElement>('[data-autofocus]');
+      (preferred ?? panel.querySelector<HTMLElement>('input, button, a[href]'))?.focus();
+    };
+
+    /*
+     * Focus synchronously first, then retry on the next frame.
+     *
+     * This was rAF-only, and rAF does not fire in a background or hidden tab —
+     * so a dialog opened in one never received focus at all, and the effect was
+     * observable even in a foreground automation context: the dialog opened
+     * with `document.activeElement` still on `<body>`.
+     *
+     * The effect runs after commit, so the panel is already in the DOM and the
+     * synchronous call is the one that normally lands. The frame-later retry
+     * exists for content that mounts a tick late (a list still resolving), and
+     * it checks first so it cannot steal focus back from a field the user has
+     * already started typing in.
+     */
+    focusFirst();
+    const timer = requestAnimationFrame(() => {
+      if (!panelRef.current?.contains(document.activeElement)) focusFirst();
+    });
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      cancelAnimationFrame(timer);
+      restoreFocusTo.current?.focus?.();
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -68,23 +128,7 @@ export function Modal({
 
     // Capture, so a dialog opened from inside Monaco still gets its Escape.
     window.addEventListener('keydown', onKey, true);
-
-    // The page behind must not scroll under the overlay.
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-
-    const timer = requestAnimationFrame(() => {
-      panelRef.current
-        ?.querySelector<HTMLElement>('[data-autofocus], button, a[href], input')
-        ?.focus();
-    });
-
-    return () => {
-      window.removeEventListener('keydown', onKey, true);
-      document.body.style.overflow = previousOverflow;
-      cancelAnimationFrame(timer);
-      restoreFocusTo.current?.focus?.();
-    };
+    return () => window.removeEventListener('keydown', onKey, true);
   }, [open, onClose]);
 
   if (!open) return null;

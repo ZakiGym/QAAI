@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { Suspense, useCallback, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { api, ApiError } from '../../../lib/api';
 import { useToast } from '../../../components/ui/Toast';
@@ -44,7 +44,7 @@ interface Billing {
   catalogue: PlanRow[];
 }
 
-export default function BillingPage() {
+function BillingInner() {
   const router = useRouter();
   const params = useSearchParams();
   const toast = useToast();
@@ -317,5 +317,20 @@ function Meter({
       )}
       {note && <p className="text-ink-faint text-micro mt-2">{note}</p>}
     </div>
+  );
+}
+
+/**
+ * `useSearchParams()` forces a client-side bailout, and Next refuses to
+ * statically prerender a page that does so without a Suspense boundary — it
+ * failed the production build outright ("useSearchParams() should be wrapped in
+ * a suspense boundary"). The boundary lets the shell prerender and the
+ * param-dependent part hydrate on the client.
+ */
+export default function BillingPage() {
+  return (
+    <Suspense fallback={<main className="text-ink-faint p-10 text-body-sm">Loading…</main>}>
+      <BillingInner />
+    </Suspense>
   );
 }

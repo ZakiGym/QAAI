@@ -4,6 +4,17 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
+import { relativeTime } from '../../components/ui';
+import { Button } from '../../components/ui/Button';
+import { EmptyState } from '../../components/ui/EmptyState';
+import {
+  Badge,
+  Page,
+  PageHeader,
+  SectionLabel,
+  Skeleton,
+  SkeletonRows,
+} from '../../components/ui/layout';
 
 /**
  * Triage review (§3.3) — the screen where a human agrees or disagrees with the
@@ -32,26 +43,28 @@ interface Verdict {
   };
 }
 
-const VERDICT_META: Record<string, { label: string; blurb: string; className: string }> = {
+type Tone = 'neutral' | 'accent' | 'pass' | 'fail' | 'flake';
+
+const VERDICT_META: Record<string, { label: string; blurb: string; tone: Tone }> = {
   REAL_BUG: {
     label: 'Real bug',
     blurb: 'The application is wrong. This is the only verdict that blocks a merge by default.',
-    className: 'border-fail/40 bg-fail/10 text-fail',
+    tone: 'fail',
   },
   INTENDED_CHANGE: {
     label: 'Intended change',
     blurb: 'The app changed on purpose and the test is now out of date — the healer proposes a fix.',
-    className: 'border-flake/40 bg-flake/10 text-flake',
+    tone: 'flake',
   },
   FLAKE: {
     label: 'Flake',
     blurb: 'Nothing is broken; the test is unreliable. Consider quarantining it.',
-    className: 'border-flake/40 bg-flake/10 text-flake',
+    tone: 'flake',
   },
   ENV_ISSUE: {
     label: 'Environment issue',
     blurb: 'The environment failed, not the app. Alerts, never gates.',
-    className: 'border-ink-faint/40 bg-surface-2 text-ink-dim',
+    tone: 'neutral',
   },
 };
 
@@ -62,7 +75,11 @@ export default function TriagePage() {
   const [verdicts, setVerdicts] = useState<Verdict[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showReviewed, setShowReviewed] = useState(false);
-  const [busy, setBusy] = useState(false);
+  // `[]` is indistinguishable from "not fetched yet", so without this the empty
+  // state — "Nothing to review." — is what rendered during every load.
+  const [loading, setLoading] = useState(true);
+  /** Which action is in flight, so only that button spins. Null when idle. */
+  const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
@@ -83,6 +100,10 @@ export default function TriagePage() {
           return;
         }
         setError(err instanceof Error ? err.message : 'Could not load verdicts');
+      } finally {
+        // Only the first fetch shows skeletons; refetches after a review keep
+        // the list on screen rather than blinking it away.
+        setLoading(false);
       }
     },
     [router],
@@ -95,7 +116,7 @@ export default function TriagePage() {
   const selected = verdicts.find((v) => v.id === selectedId) ?? null;
 
   async function review(verdict: Verdict, action: 'accept' | 'override' | 'mute', overrideTo?: string) {
-    setBusy(true);
+    setBusy(overrideTo ?? action);
     setError(null);
     setNote(null);
     try {
@@ -114,27 +135,28 @@ export default function TriagePage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not record the review');
     } finally {
-      setBusy(false);
+      setBusy(null);
     }
   }
 
   return (
-    <main className="flex h-full flex-col">
-      <header className="border-line flex shrink-0 items-baseline gap-3 border-b px-6 py-4">
-        <h1 className="text-lg font-semibold tracking-tight">Triage</h1>
-        <p className="text-ink-faint text-xs">
-          The agent&rsquo;s call on every failure. You get the last word.
-        </p>
-        <label className="text-ink-dim ml-auto flex items-center gap-2 text-xs">
-          <input
-            type="checkbox"
-            checked={showReviewed}
-            onChange={(e) => setShowReviewed(e.target.checked)}
-            className="accent-accent"
-          />
-          Include reviewed
-        </label>
-      </header>
+    <Page width="full">
+      <PageHeader
+        title="Triage"
+        subtitle={<>The agent&rsquo;s call on every failure. You get the last word.</>}
+        actions={
+          <label className="text-ink-dim flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={showReviewed}
+              onChange={(e) => setShowReviewed(e.target.checked)}
+              className="accent-accent"
+            />
+            Include reviewed
+          </label>
+        }
+        className="border-line mb-0 shrink-0 items-center border-b px-6 py-4"
+      />
 
       {(error || note) && (
         <div className="shrink-0 px-6 pt-4">
@@ -151,42 +173,55 @@ export default function TriagePage() {
 
       <div className="grid min-h-0 flex-1 grid-cols-[320px_1fr]">
         <aside className="border-line min-h-0 overflow-y-auto border-r">
-          {verdicts.map((v) => {
-            const meta = VERDICT_META[v.verdict] ?? VERDICT_META.ENV_ISSUE!;
-            return (
-              <button
-                key={v.id}
-                type="button"
-                onClick={() => {
-                  setSelectedId(v.id);
-                  setNote(null);
-                }}
-                className={`border-line/60 flex w-full flex-col gap-1 border-b px-4 py-3 text-left ${
-                  selectedId === v.id ? 'bg-surface-2' : 'hover:bg-surface-1'
-                }`}
-              >
-                <span className="truncate text-body-sm font-medium">{v.testResult.test.name}</span>
-                <div className="text-ink-faint flex items-center gap-2 text-meta">
-                  <span className={`rounded border px-1.5 py-0.5 font-mono ${meta.className}`}>
-                    {meta.label}
-                  </span>
-                  <span>{Math.round(v.confidence * 100)}%</span>
-                  {v.reviewState !== 'PENDING' && <span>· {v.reviewState.toLowerCase()}</span>}
-                </div>
-              </button>
-            );
-          })}
-          {verdicts.length === 0 && (
-            <div className="px-4 py-10 text-center">
-              <p className="text-ink-dim text-sm">Nothing to review.</p>
-              <p className="text-ink-faint mt-1 text-xs">
-                Verdicts appear when a failing test is triaged.
-              </p>
+          {loading ? (
+            <SkeletonRows rows={7} />
+          ) : verdicts.length === 0 ? (
+            <div className="p-4">
+              <EmptyState
+                title="Nothing to review."
+                body="Verdicts appear when a failing test is triaged."
+              />
             </div>
+          ) : (
+            verdicts.map((v) => {
+              const meta = VERDICT_META[v.verdict] ?? VERDICT_META.ENV_ISSUE!;
+              return (
+                <button
+                  key={v.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(v.id);
+                    setNote(null);
+                  }}
+                  className={`border-line/60 flex w-full flex-col gap-1 border-b px-4 py-3 text-left ${
+                    selectedId === v.id ? 'bg-surface-2' : 'hover:bg-surface-1'
+                  }`}
+                >
+                  <span className="truncate text-body-sm font-medium">{v.testResult.test.name}</span>
+                  <div className="text-ink-faint flex items-center gap-2 text-meta">
+                    <Badge tone={meta.tone} mono>
+                      {meta.label}
+                    </Badge>
+                    <span className="tabular-nums">{Math.round(v.confidence * 100)}%</span>
+                    {v.reviewState !== 'PENDING' && <span>· {v.reviewState.toLowerCase()}</span>}
+                    <span className="ml-auto shrink-0 tabular-nums">{relativeTime(v.createdAt)}</span>
+                  </div>
+                </button>
+              );
+            })
           )}
         </aside>
 
-        {selected ? (
+        {loading ? (
+          <section className="min-h-0 overflow-y-auto px-6 py-5">
+            <Skeleton className="h-4 w-64" />
+            <Skeleton className="mt-2.5 h-3 w-44" />
+            <Skeleton className="mt-6 h-3 w-full" />
+            <Skeleton className="mt-2 h-3 w-11/12" />
+            <Skeleton className="mt-2 h-3 w-3/5" />
+            <Skeleton className="mt-8 h-28 w-full" />
+          </section>
+        ) : selected ? (
           <section className="min-h-0 overflow-y-auto px-6 py-5">
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
@@ -198,16 +233,16 @@ export default function TriagePage() {
                   {selected.testResult.test.filePath} →
                 </Link>
               </div>
-              <span
-                className={`shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta ${
-                  (VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).className
-                }`}
+              <Badge
+                tone={(VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).tone}
+                mono
+                className="rounded-md px-2"
               >
                 {(VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).label}
-              </span>
-              <span className="border-line text-ink-dim shrink-0 rounded-md border px-2 py-0.5 font-mono text-meta">
+              </Badge>
+              <Badge mono className="text-ink-dim rounded-md px-2 tabular-nums">
                 {Math.round(selected.confidence * 100)}% confident
-              </span>
+              </Badge>
             </div>
 
             <p className="text-ink-dim mt-4 text-sm leading-relaxed">{selected.explanation}</p>
@@ -215,16 +250,14 @@ export default function TriagePage() {
               {(VERDICT_META[selected.verdict] ?? VERDICT_META.ENV_ISSUE!).blurb}
             </p>
 
-            <h3 className="text-ink-dim mt-6 mb-2 text-xs font-semibold tracking-wider uppercase">
-              Evidence it used
-            </h3>
+            <div className="mt-6">
+              <SectionLabel>Evidence it used</SectionLabel>
+            </div>
             <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
               {selected.evidence.map((e, i) => (
                 <div key={i} className="px-4 py-2.5">
                   <div className="flex items-baseline gap-2">
-                    <span className="border-line text-ink-faint rounded border px-1.5 py-0.5 font-mono text-[9px]">
-                      {e.kind}
-                    </span>
+                    <Badge mono>{e.kind}</Badge>
                     <span className="text-ink-faint font-mono text-meta">{e.ref}</span>
                   </div>
                   <p className="text-ink-dim mt-1 text-xs">{e.detail}</p>
@@ -236,41 +269,43 @@ export default function TriagePage() {
                 </p>
               )}
             </div>
-            <p className="text-ink-faint mt-2 text-micro">Decided by {selected.model}.</p>
+            <p className="text-ink-faint mt-2 text-micro">
+              Decided by {selected.model}.{' '}
+              <span className="tabular-nums">{relativeTime(selected.createdAt)}</span>
+            </p>
 
             {selected.reviewState === 'PENDING' ? (
               <div className="border-line mt-6 rounded-lg border p-4">
                 <p className="mb-3 text-sm font-medium">Do you agree?</p>
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
+                  <Button
+                    variant="primary"
                     onClick={() => void review(selected, 'accept')}
-                    disabled={busy}
-                    className="bg-accent rounded-md px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+                    disabled={busy !== null}
+                    loading={busy === 'accept'}
                   >
                     Agree
-                  </button>
-                  <button
-                    type="button"
+                  </Button>
+                  <Button
                     onClick={() => void review(selected, 'mute')}
-                    disabled={busy}
-                    className="border-line hover:border-accent rounded-md border px-3 py-1.5 text-xs disabled:opacity-50"
+                    disabled={busy !== null}
+                    loading={busy === 'mute'}
                   >
                     Mute
-                  </button>
+                  </Button>
                 </div>
                 <p className="text-ink-faint mt-4 mb-2 text-xs">Or say what it really was:</p>
                 <div className="flex flex-wrap gap-2">
                   {OVERRIDES.filter((o) => o !== selected.verdict).map((o) => (
-                    <button
+                    <Button
                       key={o}
-                      type="button"
+                      size="sm"
                       onClick={() => void review(selected, 'override', o)}
-                      disabled={busy}
-                      className="border-line hover:border-accent text-ink-dim rounded-md border px-2.5 py-1 text-micro disabled:opacity-50"
+                      disabled={busy !== null}
+                      loading={busy === o}
                     >
                       {(VERDICT_META[o] ?? VERDICT_META.ENV_ISSUE!).label}
-                    </button>
+                    </Button>
                   ))}
                 </div>
               </div>
@@ -286,6 +321,6 @@ export default function TriagePage() {
           </section>
         )}
       </div>
-    </main>
+    </Page>
   );
 }

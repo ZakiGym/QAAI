@@ -2,6 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { api, type Secret } from '../lib/api';
+import { Button } from './ui/Button';
+import { Field } from './ui/Field';
+import { ConfirmDialog } from './ui/Modal';
 
 /**
  * The secrets of one environment.
@@ -27,6 +30,8 @@ export function SecretsPanel({
   const [showImport, setShowImport] = useState(false);
   const [envText, setEnvText] = useState('');
   const [importNote, setImportNote] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<Secret | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(async () => {
     const data = await api<{ secrets: Secret[] }>(base).catch(() => ({ secrets: [] }));
@@ -55,9 +60,14 @@ export function SecretsPanel({
   }
 
   async function remove(secret: Secret) {
-    if (!confirm(`Delete ${secret.name}? Any test using it will fail until it is set again.`)) return;
-    await api(`${base}/${secret.id}`, { method: 'DELETE' }).catch(() => {});
-    await load();
+    setDeleting(true);
+    try {
+      await api(`${base}/${secret.id}`, { method: 'DELETE' }).catch(() => {});
+      await load();
+      setPendingDelete(null);
+    } finally {
+      setDeleting(false);
+    }
   }
 
   async function importEnv() {
@@ -101,13 +111,14 @@ export function SecretsPanel({
           <div key={secret.id} className="flex items-center gap-4 px-4 py-2.5">
             <span className="font-mono text-xs font-medium">{secret.name}</span>
             <span className="text-ink-faint font-mono text-xs">{secret.value}</span>
-            <button
-              type="button"
-              onClick={() => void remove(secret)}
-              className="text-fail ml-auto text-xs hover:underline"
+            <Button
+              variant="danger"
+              size="sm"
+              className="ml-auto"
+              onClick={() => setPendingDelete(secret)}
             >
               Delete
-            </button>
+            </Button>
           </div>
         ))}
         {secrets.length === 0 && (
@@ -117,38 +128,38 @@ export function SecretsPanel({
         )}
       </div>
 
-      <form onSubmit={add} className="flex gap-2">
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value.toUpperCase())}
-          placeholder="SECRET_NAME"
-          className="border-line bg-surface-1 focus:border-accent w-48 rounded-md border px-3 py-1.5 font-mono text-xs outline-none"
-        />
-        <input
-          type="password"
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="value"
-          autoComplete="off"
-          className="border-line bg-surface-1 focus:border-accent flex-1 rounded-md border px-3 py-1.5 text-xs outline-none"
-        />
-        <button
-          type="submit"
-          disabled={busy}
-          className="bg-accent rounded-md px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
-        >
+      <form onSubmit={add} className="flex items-center gap-2">
+        {/* Neither input had a label of any kind — the placeholder was the only
+            thing naming the field, and it disappears the moment you type. */}
+        <div className="w-48 shrink-0">
+          <Field
+            aria-label="Secret name"
+            value={name}
+            onChange={(e) => setName(e.target.value.toUpperCase())}
+            placeholder="SECRET_NAME"
+            className="font-mono text-xs"
+          />
+        </div>
+        <div className="min-w-0 flex-1">
+          <Field
+            aria-label="Secret value"
+            type="password"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="value"
+            autoComplete="off"
+            className="text-xs"
+          />
+        </div>
+        <Button type="submit" variant="primary" size="sm" loading={busy}>
           Set
-        </button>
+        </Button>
       </form>
 
       <div>
-        <button
-          type="button"
-          onClick={() => setShowImport((s) => !s)}
-          className="text-ink-faint hover:text-ink text-xs"
-        >
+        <Button variant="ghost" size="sm" className="-ml-2.5" onClick={() => setShowImport((s) => !s)}>
           {showImport ? '– Hide .env import' : '+ Import a .env file'}
-        </button>
+        </Button>
         {showImport && (
           <div className="mt-2 space-y-2">
             <textarea
@@ -159,14 +170,9 @@ export function SecretsPanel({
               className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 font-mono text-xs outline-none"
             />
             <div className="flex items-center gap-3">
-              <button
-                type="button"
-                onClick={() => void importEnv()}
-                disabled={busy}
-                className="border-line hover:border-accent rounded-md border px-3 py-1.5 text-xs disabled:opacity-50"
-              >
+              <Button size="sm" onClick={() => void importEnv()} loading={busy}>
                 Import into vault
-              </button>
+              </Button>
               <span className="text-ink-faint text-micro">
                 Parsed on the server; values are sealed and never shown again.
               </span>
@@ -175,8 +181,20 @@ export function SecretsPanel({
         )}
       </div>
 
-      {importNote && <p className="text-ink-dim text-xs">{importNote}</p>}
+      {importNote && <p className="text-ink-dim text-xs tabular-nums">{importNote}</p>}
       {error && <p className="text-fail text-xs">{error}</p>}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        onClose={() => setPendingDelete(null)}
+        onConfirm={() => {
+          if (pendingDelete) void remove(pendingDelete);
+        }}
+        title={pendingDelete ? `Delete ${pendingDelete.name}?` : 'Delete secret'}
+        body="Any test using it will fail until it is set again."
+        confirmLabel="Delete secret"
+        busy={deleting}
+      />
     </div>
   );
 }

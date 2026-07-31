@@ -4,6 +4,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { API_URL, api, ApiError, type Project } from '../../lib/api';
+import { useProject } from '../../components/shell/ProjectContext';
+import { Button } from '../../components/ui/Button';
+import { Field } from '../../components/ui/Field';
+import { Page, PageHeader, SectionLabel } from '../../components/ui/layout';
 
 /**
  * Suite import (§7) — the migration wedge, on the landing page as a headline.
@@ -42,11 +46,19 @@ const FRAMEWORK_LABEL: Record<string, string> = {
 
 const OVERRIDES = Object.keys(FRAMEWORK_LABEL).filter((f) => f !== 'UNKNOWN');
 
+/** What an unfilled base URL becomes. Stated in the UI rather than only here. */
+const DEFAULT_BASE_URL = 'http://localhost:3000';
+
 type Phase = 'upload' | 'detected' | 'converting' | 'done' | 'error';
 
 export default function ImportPage() {
   const router = useRouter();
-  const [project, setProject] = useState<Project | null>(null);
+  /**
+   * Which project this imports into is the shell's answer, not `projects[0]`.
+   * Someone with three apps under test was silently importing a Cypress suite
+   * into whichever project happened to sort first.
+   */
+  const { project, loading: projectsLoading, reload } = useProject();
   const [files, setFiles] = useState<Array<{ path: string; content: string }>>([]);
   const [phase, setPhase] = useState<Phase>('upload');
   const [batchId, setBatchId] = useState<string | null>(null);
@@ -64,20 +76,11 @@ export default function ImportPage() {
    */
   const [newProjectName, setNewProjectName] = useState('');
   const [newBaseUrl, setNewBaseUrl] = useState('');
-  const [loadedProjects, setLoadedProjects] = useState(false);
+  /** The project this page created, before the shell's list has caught up. */
+  const [createdProject, setCreatedProject] = useState<Project | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    void api<{ projects: Project[] }>('/projects')
-      .then((d) => {
-        setProject(d.projects[0] ?? null);
-        setLoadedProjects(true);
-      })
-      .catch((err) => {
-        if (err instanceof ApiError && err.status === 401) router.push('/login');
-        setLoadedProjects(true);
-      });
-  }, [router]);
+  const activeProjectId = createdProject?.id ?? project?.id ?? null;
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -116,8 +119,8 @@ export default function ImportPage() {
     try {
       // No project yet? Make one, plus an environment for the tests to run
       // against later. Imported tests are converted to Playwright.
-      let target = project;
-      if (!target) {
+      let targetId = activeProjectId;
+      if (!targetId) {
         const created = await api<{ project: Project }>('/projects', {
           method: 'POST',
           body: JSON.stringify({
@@ -126,22 +129,24 @@ export default function ImportPage() {
             primaryFramework: 'PLAYWRIGHT',
           }),
         });
-        target = created.project;
-        await api(`/projects/${target.id}/environments`, {
+        targetId = created.project.id;
+        await api(`/projects/${targetId}/environments`, {
           method: 'POST',
           body: JSON.stringify({
             name: 'local',
             kind: 'LOCAL',
-            baseUrl: newBaseUrl.trim() || 'http://localhost:3000',
+            baseUrl: newBaseUrl.trim() || DEFAULT_BASE_URL,
           }),
         }).catch(() => {
           /* the suite still imports without an environment; runs need one later */
         });
-        setProject(target);
+        setCreatedProject(created.project);
+        // So the switcher in the top bar knows about it too.
+        void reload();
       }
 
       const res = await api<{ batch: { id: string }; detection: Detection }>(
-        `/projects/${target.id}/import`,
+        `/projects/${targetId}/import`,
         { method: 'POST', body: JSON.stringify({ files }) },
       );
       setBatchId(res.batch.id);
@@ -149,6 +154,12 @@ export default function ImportPage() {
       setFramework(res.detection.framework);
       setPhase('detected');
     } catch (err) {
+      // The page no longer fetches /projects itself, so this is where a
+      // signed-out session surfaces.
+      if (err instanceof ApiError && err.status === 401) {
+        router.push('/login');
+        return;
+      }
       setError(err instanceof Error ? err.message : 'Detection failed');
       setPhase('error');
     }
@@ -210,154 +221,147 @@ export default function ImportPage() {
   }
 
   return (
-    <main className="mx-auto max-w-2xl px-6 py-14">
-      <h1 className="text-3xl font-semibold tracking-tight">Import an existing suite</h1>
-        <p className="text-ink-dim mt-2">
-          Cypress, Selenium, WebdriverIO, Puppeteer, TestCafe, Nightwatch, Robot Framework, Postman,
-          Karate, or Cucumber. QAAI detects it, converts to Playwright, and reports what you gained.
-        </p>
+    <Page width="narrow">
+      <PageHeader
+        title="Import an existing suite"
+        subtitle="Cypress, Selenium, WebdriverIO, Puppeteer, TestCafe, Nightwatch, Robot Framework, Postman, Karate, or Cucumber. QAAI detects it, converts to Playwright, and reports what you gained."
+      />
 
-        {(phase === 'upload' || phase === 'detected' || phase === 'error') && (
-          <div className="mt-8">
-            <label
-              htmlFor="files"
-              className="border-line hover:border-accent block cursor-pointer rounded-lg border border-dashed p-8 text-center"
-            >
-              <span className="text-ink-dim text-sm">
-                {files.length > 0
-                  ? `${files.length} file(s) selected`
-                  : 'Choose your test files (or a whole folder)'}
-              </span>
-              <input
-                id="files"
-                type="file"
-                multiple
-                // @ts-expect-error — non-standard but widely supported folder upload
-                webkitdirectory=""
-                onChange={(e) => void onPick(e.target.files)}
-                className="hidden"
+      {(phase === 'upload' || phase === 'detected' || phase === 'error') && (
+        <div>
+          <label
+            htmlFor="files"
+            className="border-line hover:border-accent block cursor-pointer rounded-lg border border-dashed p-8 text-center"
+          >
+            <span className="text-ink-dim text-sm tabular-nums">
+              {files.length > 0
+                ? `${files.length} file(s) selected`
+                : 'Choose your test files (or a whole folder)'}
+            </span>
+            <input
+              id="files"
+              type="file"
+              multiple
+              // @ts-expect-error — non-standard but widely supported folder upload
+              webkitdirectory=""
+              onChange={(e) => void onPick(e.target.files)}
+              className="hidden"
+            />
+          </label>
+          <p className="text-ink-faint mt-2 text-center text-xs">
+            Nothing leaves your machine except the file contents, sent to your QAAI instance.
+          </p>
+
+          {/* No project yet — name the one this import will create. */}
+          {files.length > 0 && !projectsLoading && !activeProjectId && (
+            <div className="border-line mt-4 space-y-3 rounded-lg border p-4">
+              <SectionLabel>New project</SectionLabel>
+              <p className="text-ink-dim text-xs">
+                You have no project yet, so this import will create one.
+              </p>
+              <Field
+                aria-label="Project name"
+                value={newProjectName}
+                onChange={(e) => setNewProjectName(e.target.value)}
+                placeholder="Project name"
               />
-            </label>
-            <p className="text-ink-faint mt-2 text-center text-xs">
-              Nothing leaves your machine except the file contents, sent to your QAAI instance.
-            </p>
+              <Field
+                aria-label="Base URL"
+                value={newBaseUrl}
+                onChange={(e) => setNewBaseUrl(e.target.value)}
+                placeholder="https://staging.example.com (where these tests run)"
+                // The default was silent: leaving this blank quietly pointed the
+                // environment at localhost, which is nobody's staging server.
+                hint={`Leave this blank and the environment is created against ${DEFAULT_BASE_URL}.`}
+                className="font-mono"
+              />
+            </div>
+          )}
 
-            {/* No project yet — name the one this import will create. */}
-            {files.length > 0 && loadedProjects && !project && (
-              <div className="border-line mt-4 space-y-3 rounded-lg border p-4">
-                <p className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
-                  New project
-                </p>
-                <p className="text-ink-dim text-xs">
-                  You have no project yet, so this import will create one.
-                </p>
-                <input
-                  value={newProjectName}
-                  onChange={(e) => setNewProjectName(e.target.value)}
-                  placeholder="Project name"
-                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 text-sm outline-none"
-                />
-                <input
-                  value={newBaseUrl}
-                  onChange={(e) => setNewBaseUrl(e.target.value)}
-                  placeholder="https://staging.example.com (where these tests run)"
-                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 font-mono text-xs outline-none"
-                />
-              </div>
-            )}
+          {files.length > 0 && phase !== 'detected' && (
+            <Button variant="primary" onClick={() => void detect()} className="mt-4 w-full">
+              Detect framework
+            </Button>
+          )}
+        </div>
+      )}
 
-            {files.length > 0 && phase !== 'detected' && (
-              <button
-                type="button"
-                onClick={() => void detect()}
-                className="bg-accent mt-4 w-full rounded-md py-2.5 font-medium text-white hover:opacity-90"
+      {detection && (phase === 'detected' || phase === 'converting' || phase === 'done') && (
+        <div className="border-line bg-surface-1 mt-6 rounded-lg border p-5">
+          <div className="flex items-baseline justify-between">
+            <div>
+              <p className="text-ink-faint text-xs">Detected</p>
+              <p className="text-lg font-semibold">{FRAMEWORK_LABEL[detection.framework]}</p>
+            </div>
+            <span className="text-ink-faint font-mono text-xs tabular-nums">
+              {Math.round(detection.confidence * 100)}% · {detection.fileCount} files
+            </span>
+          </div>
+
+          {phase === 'detected' && (
+            <>
+              <label htmlFor="override" className="text-ink-faint mt-4 mb-1 block text-xs">
+                Not right? Convert as:
+              </label>
+              <select
+                id="override"
+                value={framework}
+                onChange={(e) => setFramework(e.target.value)}
+                className="border-line bg-surface focus:border-accent w-full rounded-md border px-3 py-2 text-sm outline-none"
               >
-                Detect framework
-              </button>
-            )}
-          </div>
-        )}
+                {OVERRIDES.map((f) => (
+                  <option key={f} value={f}>
+                    {FRAMEWORK_LABEL[f]}
+                  </option>
+                ))}
+              </select>
 
-        {detection && (phase === 'detected' || phase === 'converting' || phase === 'done') && (
-          <div className="border-line bg-surface-1 mt-6 rounded-lg border p-5">
-            <div className="flex items-baseline justify-between">
-              <div>
-                <p className="text-ink-faint text-xs">Detected</p>
-                <p className="text-lg font-semibold">{FRAMEWORK_LABEL[detection.framework]}</p>
-              </div>
-              <span className="text-ink-faint font-mono text-xs">
-                {Math.round(detection.confidence * 100)}% · {detection.fileCount} files
-              </span>
-            </div>
-
-            {phase === 'detected' && (
-              <>
-                <label htmlFor="override" className="text-ink-faint mt-4 mb-1 block text-xs">
-                  Not right? Convert as:
-                </label>
-                <select
-                  id="override"
-                  value={framework}
-                  onChange={(e) => setFramework(e.target.value)}
-                  className="border-line bg-surface focus:border-accent w-full rounded-md border px-3 py-2 text-sm outline-none"
-                >
-                  {OVERRIDES.map((f) => (
-                    <option key={f} value={f}>
-                      {FRAMEWORK_LABEL[f]}
-                    </option>
-                  ))}
-                </select>
-
-                {framework !== 'POSTMAN' && (
-                  <p className="text-flake mt-3 text-xs">
-                    Code conversion uses the model — it needs ANTHROPIC_API_KEY set. Postman
-                    collections convert without a key.
-                  </p>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => void convert()}
-                  className="bg-accent mt-4 w-full rounded-md py-2.5 font-medium text-white hover:opacity-90"
-                >
-                  Convert to Playwright
-                </button>
-              </>
-            )}
-          </div>
-        )}
-
-        {(phase === 'converting' || phase === 'done') && (
-          <div className="mt-6">
-            <div
-              ref={logRef}
-              className="border-line bg-surface-1 h-56 overflow-y-auto rounded-md border p-3 font-mono text-micro"
-            >
-              {log.map((line, i) => (
-                <div key={i} className="text-ink-dim">
-                  {line}
-                </div>
-              ))}
-            </div>
-
-            {phase === 'done' && (
-              <div className="border-pass/40 bg-pass/10 mt-4 rounded-lg border p-4">
-                <p className="text-pass font-medium">
-                  Migrated {convertedCount} test{convertedCount === 1 ? '' : 's'} to the Imported
-                  suite.
+              {framework !== 'POSTMAN' && (
+                <p className="text-flake mt-3 text-xs">
+                  Code conversion uses the model — it needs ANTHROPIC_API_KEY set. Postman
+                  collections convert without a key.
                 </p>
-                {summary && (
-                  <p className="text-ink-dim mt-2 text-xs whitespace-pre-wrap">{summary}</p>
-                )}
-                <Link href="/editor" className="text-accent mt-3 inline-block text-sm">
-                  Open them in the editor →
-                </Link>
-              </div>
-            )}
-          </div>
-        )}
+              )}
 
-        {error && <p className="text-fail mt-6 text-sm">{error}</p>}
-    </main>
+              <Button variant="primary" onClick={() => void convert()} className="mt-4 w-full">
+                Convert to Playwright
+              </Button>
+            </>
+          )}
+        </div>
+      )}
+
+      {(phase === 'converting' || phase === 'done') && (
+        <div className="mt-6">
+          <div
+            ref={logRef}
+            className="border-line bg-surface-1 h-56 overflow-y-auto rounded-md border p-3 font-mono text-micro"
+          >
+            {log.map((line, i) => (
+              <div key={i} className="text-ink-dim">
+                {line}
+              </div>
+            ))}
+          </div>
+
+          {phase === 'done' && (
+            <div className="border-pass/40 bg-pass/10 mt-4 rounded-lg border p-4">
+              <p className="text-pass font-medium">
+                Migrated <span className="tabular-nums">{convertedCount}</span> test
+                {convertedCount === 1 ? '' : 's'} to the Imported suite.
+              </p>
+              {summary && (
+                <p className="text-ink-dim mt-2 text-xs whitespace-pre-wrap">{summary}</p>
+              )}
+              <Link href="/editor" className="text-accent mt-3 inline-block text-sm">
+                Open them in the editor →
+              </Link>
+            </div>
+          )}
+        </div>
+      )}
+
+      {error && <p className="text-fail mt-6 text-sm">{error}</p>}
+    </Page>
   );
 }

@@ -2,7 +2,9 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { api, ApiError, type Project } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
+import { useProject } from '../../components/shell/ProjectContext';
+import { Badge, Page, PageHeader } from '../../components/ui/layout';
 
 /**
  * The flow map (§3.1) — what QAAI found when it crawled your app.
@@ -44,40 +46,60 @@ interface FlowMap {
 
 export default function FlowMapPage() {
   const router = useRouter();
-  const [project, setProject] = useState<Project | null>(null);
+  /**
+   * The map belongs to a project, and the project is the shell's choice now —
+   * this screen used to render `projects[0]`'s crawl with nothing on the page
+   * saying whose app it was.
+   */
+  const { project, projectId, loading: projectsLoading } = useProject();
   const [flowMap, setFlowMap] = useState<FlowMap | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // Wait for the shell to settle before concluding there is no project —
+    // otherwise the first paint claims "no map" for everyone.
+    if (projectsLoading) return;
+    if (!projectId) {
+      setFlowMap(null);
+      setLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
     void (async () => {
       try {
-        const { projects } = await api<{ projects: Project[] }>('/projects');
-        const first = projects[0];
-        if (!first) {
-          setLoading(false);
-          return;
-        }
-        setProject(first);
         const { flowMap } = await api<{ flowMap: { graph: FlowMap } }>(
-          `/projects/${first.id}/flow-map`,
+          `/projects/${projectId}/flow-map`,
         )
           .then((d) => ({ flowMap: d.flowMap.graph }))
-          .catch(() => ({ flowMap: null as unknown as FlowMap }));
+          .catch((err) => {
+            // A project that has never been crawled has no map, and that is the
+            // "No map yet" screen rather than an error. Signed out is not.
+            if (err instanceof ApiError && err.status === 401) throw err;
+            return { flowMap: null as unknown as FlowMap };
+          });
+        if (cancelled) return;
         setFlowMap(flowMap);
         setSelected(flowMap?.nodes[0]?.id ?? null);
       } catch (err) {
+        if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
           router.push('/login');
           return;
         }
         setError(err instanceof Error ? err.message : 'Could not load the flow map');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [router]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, projectsLoading, router]);
 
   const node = useMemo(
     () => flowMap?.nodes.find((n) => n.id === selected) ?? null,
@@ -85,37 +107,50 @@ export default function FlowMapPage() {
   );
 
   if (loading) {
-    return <main className="text-ink-faint p-10 text-sm">Loading the map…</main>;
+    return (
+      <Page width="wide" className="text-ink-faint text-sm">
+        Loading the map…
+      </Page>
+    );
   }
 
   if (!flowMap) {
     return (
-      <main className="mx-auto max-w-2xl px-6 py-16 text-center">
-        <h1 className="text-2xl font-semibold tracking-tight">No map yet</h1>
-        <p className="text-ink-dim mt-2 text-sm">
-          {project
-            ? 'QAAI builds this when it crawls your app. Start a crawl from Add app.'
-            : 'Add an app first — QAAI maps it while it crawls.'}
-        </p>
+      <Page width="narrow" className="text-center">
+        <PageHeader
+          title="No map yet"
+          subtitle={
+            project
+              ? 'QAAI builds this when it crawls your app. Start a crawl from Add app.'
+              : 'Add an app first — QAAI maps it while it crawls.'
+          }
+        />
         <a
           href="/onboarding"
-          className="bg-accent mt-6 inline-block rounded-md px-4 py-2 text-sm font-medium text-white"
+          className="bg-accent inline-block rounded-md px-4 py-2 text-sm font-medium text-white"
         >
           Add an app
         </a>
-      </main>
+      </Page>
     );
   }
 
   return (
-    <main className="flex h-full flex-col">
-      <header className="border-line flex shrink-0 items-baseline gap-3 border-b px-6 py-4">
-        <h1 className="text-lg font-semibold tracking-tight">Flow map</h1>
-        <span className="text-ink-faint text-xs">
-          v{flowMap.version} · {flowMap.nodes.length} pages · {flowMap.edges.length} links ·{' '}
-          <span className="font-mono">{flowMap.baseUrl}</span>
-        </span>
-      </header>
+    <Page width="full">
+      <div className="border-line shrink-0 border-b px-6 py-4">
+        <PageHeader
+          className="mb-0"
+          title="Flow map"
+          subtitle={
+            <>
+              <span className="tabular-nums">v{flowMap.version}</span> ·{' '}
+              <span className="tabular-nums">{flowMap.nodes.length}</span> pages ·{' '}
+              <span className="tabular-nums">{flowMap.edges.length}</span> links ·{' '}
+              <span className="font-mono">{flowMap.baseUrl}</span>
+            </>
+          }
+        />
+      </div>
 
       {error && (
         <p className="border-fail/40 bg-fail/10 text-fail mx-6 mt-4 rounded-md border p-3 text-sm">
@@ -147,13 +182,13 @@ export default function FlowMapPage() {
                   </span>
                 )}
                 {n.a11yViolationCount > 0 && (
-                  <span className="text-fail shrink-0 text-meta">
+                  <span className="text-fail shrink-0 text-meta tabular-nums">
                     {n.a11yViolationCount} a11y
                   </span>
                 )}
               </div>
               <span className="text-ink-faint truncate text-micro">{n.title}</span>
-              <span className="text-ink-faint text-meta">
+              <span className="text-ink-faint text-meta tabular-nums">
                 {n.affordances.length} element(s)
               </span>
             </button>
@@ -181,15 +216,15 @@ export default function FlowMapPage() {
               <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
                 {node.affordances.map((a, i) => (
                   <div key={i} className="flex items-center gap-3 px-4 py-2">
-                    <span className="border-line text-ink-faint shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase">
+                    <Badge mono className="uppercase">
                       {a.kind}
-                    </span>
+                    </Badge>
                     <span className="min-w-0 flex-1 truncate text-body-sm">{a.label}</span>
                     <span className="text-ink-faint shrink-0 font-mono text-meta">
                       {a.selector.strategy}
                     </span>
                     <span
-                      className={`shrink-0 font-mono text-meta ${
+                      className={`shrink-0 font-mono text-meta tabular-nums ${
                         a.selector.confidence >= 0.8
                           ? 'text-pass'
                           : a.selector.confidence >= 0.6
@@ -214,6 +249,6 @@ export default function FlowMapPage() {
           )}
         </section>
       </div>
-    </main>
+    </Page>
   );
 }

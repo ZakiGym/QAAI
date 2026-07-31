@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { FIXTURE_PREFIX, buildTree, type TreeNode, type TreeTest } from '../lib/tree';
 import { FileMenu, type MenuItem } from './FileMenu';
+import { Button } from './ui/Button';
+import { cn } from '../lib/cn';
 
 /**
  * The editor's file explorer — a real, collapsible folder tree built from each
@@ -17,7 +19,7 @@ const IND = 12; // px of indent per depth level
 function Chevron({ open }: { open: boolean }) {
   return (
     <svg
-      className={`h-3 w-3 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`}
+      className={cn('h-3 w-3 shrink-0 transition-transform', open && 'rotate-90')}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -170,19 +172,24 @@ export function FileTree({
               </span>
               <span className="truncate font-medium">{node.name}</span>
               {node.flagCount > 0 && (
-                <span className="text-flake text-meta" title={`${node.flagCount} flagged`}>
+                <span
+                  className="text-flake text-meta tabular-nums"
+                  title={`${node.flagCount} flagged`}
+                >
                   ⚑{node.flagCount}
                 </span>
               )}
             </button>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={() => onAdd(node.path)}
               title={`New file in ${node.name}/`}
-              className="text-ink-faint hover:text-ink shrink-0 px-1 opacity-0 group-hover:opacity-100"
+              aria-label={`New file in ${node.name}/`}
+              className="text-ink-faint text-body-sm px-1 py-0 opacity-0 group-hover:opacity-100"
             >
               +
-            </button>
+            </Button>
           </div>
           {open && node.children.map((child) => renderNode(child, depth + 1))}
         </div>
@@ -200,9 +207,10 @@ export function FileTree({
         onContextMenu={(e) => fileMenu(e, node.test)}
         title={node.test.name}
         style={{ paddingLeft: depth * IND + 6 }}
-        className={`flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-body-sm ${
-          active ? 'bg-surface-2 text-ink' : 'hover:bg-surface-1 text-ink-dim'
-        }`}
+        className={cn(
+          'text-body-sm flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left',
+          active ? 'bg-surface-2 text-ink' : 'hover:bg-surface-1 text-ink-dim',
+        )}
       >
         <span className="w-3 shrink-0" />
         <span className={isFixture ? 'text-accent-2' : 'text-ink-faint'}>

@@ -4,6 +4,8 @@ import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../../../lib/api';
+import { Button } from '../../../../components/ui/Button';
+import { Page, PageHeader, SectionLabel } from '../../../../components/ui/layout';
 
 /**
  * Plan approval (§3.1) — the human gate between the Explorer and the Generator.
@@ -108,15 +110,20 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
 
   if (error && !plan) {
     return (
-      <main className="mx-auto max-w-2xl px-6 py-16">
+      <Page width="narrow">
         <p className="text-fail">{error}</p>
         <Link href="/onboarding" className="text-accent mt-4 inline-block text-sm">
           Run the Explorer
         </Link>
-      </main>
+      </Page>
     );
   }
-  if (!plan) return <main className="text-ink-faint p-16 text-sm">Loading the plan…</main>;
+  if (!plan)
+    return (
+      <Page width="narrow" className="text-ink-faint text-sm">
+        Loading the plan…
+      </Page>
+    );
 
   const proposable = plan.items.filter((i) => i.state === 'PROPOSED');
   const alreadyGenerated = plan.items.filter((i) => i.state === 'GENERATED').length;
@@ -128,22 +135,26 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
   }
 
   return (
-    <main className="mx-auto max-w-2xl px-6 py-12">
-      <h1 className="text-3xl font-semibold tracking-tight">Proposed test plan</h1>
-      <p className="text-ink-dim mt-2">{plan.summary}</p>
+    <Page width="narrow">
+      <PageHeader
+        title="Proposed test plan"
+        subtitle={
+          <>
+            {plan.summary}
+            {alreadyGenerated > 0 && (
+              <span className="text-ink-faint mt-2 block">
+                <span className="tabular-nums">{alreadyGenerated}</span> item
+                {alreadyGenerated === 1 ? '' : 's'} already generated.
+              </span>
+            )}
+          </>
+        }
+      />
 
-      {alreadyGenerated > 0 && (
-        <p className="text-ink-faint mt-2 text-sm">
-          {alreadyGenerated} item{alreadyGenerated === 1 ? '' : 's'} already generated.
-        </p>
-      )}
-
-      <div className="mt-8 space-y-6">
+      <div className="space-y-6">
         {[...groups.entries()].map(([feature, items]) => (
           <section key={feature}>
-            <h2 className="text-ink-faint mb-2 text-xs font-semibold tracking-wider uppercase">
-              {feature}
-            </h2>
+            <SectionLabel>{feature}</SectionLabel>
             <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
               {items.map((item) => {
                 const isOpen = expanded.has(item.id);
@@ -171,8 +182,9 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
                         </div>
                         <p className="text-ink-dim mt-1 text-xs">{item.rationale}</p>
 
-                        <button
-                          type="button"
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={() =>
                             setExpanded((prev) => {
                               const next = new Set(prev);
@@ -181,10 +193,10 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
                               return next;
                             })
                           }
-                          className="text-ink-faint hover:text-ink mt-1.5 text-micro"
+                          className="mt-1 -ml-2.5"
                         >
                           {isOpen ? 'Hide steps' : 'Show steps'}
-                        </button>
+                        </Button>
 
                         {isOpen && (
                           <div className="mt-2 space-y-2 text-xs">
@@ -217,9 +229,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
 
       {plan.skipped.length > 0 && (
         <section className="mt-8">
-          <h2 className="text-ink-faint mb-2 text-xs font-semibold tracking-wider uppercase">
-            Deliberately skipped
-          </h2>
+          <SectionLabel>Deliberately skipped</SectionLabel>
           <ul className="text-ink-faint space-y-1 text-xs">
             {plan.skipped.map((s, i) => (
               <li key={i}>
@@ -235,20 +245,22 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
       {proposable.length > 0 && (
         <div className="border-line bg-surface sticky bottom-0 mt-8 flex items-center gap-3 border-t py-4">
           <span className="text-ink-dim text-sm">
-            {selected.size} of {proposable.length} selected
+            <span className="tabular-nums">{selected.size}</span> of{' '}
+            <span className="tabular-nums">{proposable.length}</span> selected
           </span>
-          <button
-            type="button"
-            disabled={busy || selected.size === 0}
+          <Button
+            variant="primary"
+            className="ml-auto tabular-nums"
+            disabled={selected.size === 0}
+            loading={busy}
             onClick={() => void approve()}
-            className="bg-accent ml-auto rounded-md px-5 py-2 font-medium text-white hover:opacity-90 disabled:opacity-40"
           >
             {busy
               ? 'Generating…'
               : `Generate ${selected.size} test${selected.size === 1 ? '' : 's'}`}
-          </button>
+          </Button>
         </div>
       )}
-    </main>
+    </Page>
   );
 }

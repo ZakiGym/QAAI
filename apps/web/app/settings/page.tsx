@@ -387,14 +387,14 @@ function UsageTab() {
         {data.byAgent.map((row) => (
           <div key={row.agent} className="flex items-center gap-4 px-4 py-3">
             <span className="w-24 text-sm font-medium">{row.agent.toLowerCase()}</span>
-            <span className="text-ink-faint text-xs">{row.calls} calls</span>
-            <span className="text-ink-faint font-mono text-micro">
+            <span className="text-ink-faint text-xs tabular-nums">{row.calls} calls</span>
+            <span className="text-ink-faint font-mono text-micro tabular-nums">
               {(row.inputTokens / 1000).toFixed(1)}k in / {(row.outputTokens / 1000).toFixed(1)}k out
             </span>
             {row.failures > 0 && (
-              <span className="text-flake text-micro">{row.failures} failed</span>
+              <span className="text-flake text-micro tabular-nums">{row.failures} failed</span>
             )}
-            <span className="ml-auto font-mono text-sm">{money(row.costCents)}</span>
+            <span className="ml-auto font-mono text-sm tabular-nums">{money(row.costCents)}</span>
           </div>
         ))}
         {data.byAgent.length === 0 && (
@@ -444,11 +444,11 @@ function AuditTab() {
 
   return (
     <div className="space-y-4">
-      <input
+      <Field
+        aria-label="Filter by action or person…"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
         placeholder="Filter by action or person…"
-        className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-1.5 text-sm outline-none"
       />
 
       <div className="border-line divide-line max-h-[60vh] overflow-y-auto rounded-lg border">
@@ -457,7 +457,7 @@ function AuditTab() {
             <div className="flex items-baseline gap-2">
               <span className="font-mono text-micro">{entry.action}</span>
               <span className="text-ink-faint text-xs">{entry.actor}</span>
-              <span className="text-ink-faint ml-auto text-meta">
+              <span className="text-ink-faint ml-auto text-meta tabular-nums">
                 {new Date(entry.createdAt).toLocaleString()}
               </span>
             </div>

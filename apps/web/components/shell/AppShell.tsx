@@ -5,7 +5,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { Sidebar } from './Sidebar';
 import { NAV, SETTINGS_ITEM, SHELL_EXCLUDED } from './nav';
 import { CommandPalette, type PaletteItem, type PaletteMode } from '../CommandPalette';
-import { ProjectProvider } from './ProjectContext';
+import { useProject } from './ProjectContext';
 import { TopBar } from './TopBar';
 import { api } from '../../lib/api';
 
@@ -32,6 +32,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const inShell = !SHELL_EXCLUDED.has(pathname);
+  const { projectId } = useProject();
 
   const [collapsed, setCollapsed] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -74,17 +75,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   // The project's tests power ⌘P quick-open. Loaded on first use, not on mount —
   // most sessions never open the palette in files mode.
+  //
+  // Reads the SELECTED project, not projects[0]. It used to re-fetch /projects
+  // and take index 0, so after switching apps in the top bar ⌘P still listed
+  // the first project's files; picking one pushed /editor?test=<id>, the editor
+  // fetched it under the selected project, 404'd, and nothing opened — no
+  // toast, no error, the palette just closed.
   const loadFiles = useCallback(async () => {
+    if (!projectId) return;
     try {
-      const { projects } = await api<{ projects: { id: string }[] }>('/projects');
-      const first = projects[0];
-      if (!first) return;
-      const { tests } = await api<{ tests: TestLite[] }>(`/projects/${first.id}/tests`);
+      const { tests } = await api<{ tests: TestLite[] }>(`/projects/${projectId}/tests`);
       setFiles(tests);
     } catch {
       /* signed out or no project — the palette just shows no files */
     }
-  }, []);
+  }, [projectId]);
+
+  useEffect(() => {
+    setFiles([]);
+  }, [projectId]);
 
   const openCommands = useCallback(() => {
     setPaletteMode('commands');
@@ -189,8 +198,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   if (!inShell) return <>{children}</>;
 
   return (
-    <ProjectProvider>
-      <div className="flex h-screen overflow-hidden">
+    <div className="flex h-screen overflow-hidden">
         <Sidebar
           collapsed={collapsed}
           mounted={mounted}
@@ -211,7 +219,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         />
         {shortcutsOpen && <ShortcutSheet onClose={() => setShortcutsOpen(false)} />}
       </div>
-    </ProjectProvider>
   );
 }
 

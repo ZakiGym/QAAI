@@ -1,9 +1,12 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { API_URL, api, ApiError, type Project } from '../../lib/api';
+import { Button } from '../../components/ui/Button';
+import { Field } from '../../components/ui/Field';
+import { Page, PageHeader } from '../../components/ui/layout';
 
 /**
  * Onboarding (§10) — the first-run path the spec targets at "under 15 minutes".
@@ -25,8 +28,9 @@ const FRAMEWORKS = [
   { value: 'SELENIUM', label: 'Selenium' },
 ];
 
-export default function OnboardingPage() {
+function OnboardingInner() {
   const router = useRouter();
+  const searchParams = useSearchParams();
 
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -46,6 +50,17 @@ export default function OnboardingPage() {
    */
   const stopWatchingRef = useRef<(() => void) | null>(null);
   useEffect(() => () => stopWatchingRef.current?.(), []);
+
+  /**
+   * "Import existing tests" on /runs links here with ?mode=import, and this
+   * screen ignored the parameter entirely — so someone who said they already
+   * have a suite landed on the crawl form and was asked to point us at a URL
+   * instead. The parameter has one meaning: you are here to import.
+   */
+  const mode = searchParams.get('mode');
+  useEffect(() => {
+    if (mode === 'import') router.replace('/import');
+  }, [mode, router]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -158,141 +173,151 @@ export default function OnboardingPage() {
     }
   }
 
+  // Mid-redirect to /import — rendering the crawl form here would flash the
+  // exact screen the parameter says the user did not want.
+  if (mode === 'import') return null;
+
   return (
-    <main className="mx-auto max-w-xl px-6 py-16">
-      <h1 className="text-3xl font-semibold tracking-tight">Add your app</h1>
-        <p className="text-ink-dim mt-2">
-          QAAI will crawl it, map the flows, and propose a test plan you approve.
-        </p>
+    <Page width="narrow">
+      <PageHeader
+        title="Add your app"
+        subtitle="QAAI will crawl it, map the flows, and propose a test plan you approve."
+      />
 
-        {phase === 'form' || phase === 'error' ? (
-          <form onSubmit={start} className="mt-10 space-y-5">
-            <div>
-              <label htmlFor="name" className="mb-1.5 block text-sm font-medium">
-                Project name
-              </label>
-              <input
-                id="name"
-                required
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Acme Storefront"
-                className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
-              />
-            </div>
+      {phase === 'form' || phase === 'error' ? (
+        <form onSubmit={start} className="space-y-5">
+          <Field
+            id="name"
+            label="Project name"
+            required
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Acme Storefront"
+          />
 
-            <div>
-              <label htmlFor="url" className="mb-1.5 block text-sm font-medium">
-                URL to test
-              </label>
-              <input
-                id="url"
-                type="url"
-                required
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder="https://staging.acme.com"
-                className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
-              />
-              <p className="text-ink-faint mt-1.5 text-xs">
-                A staging or preview URL is best. To test the bundled demo, use{' '}
-                <button
-                  type="button"
-                  onClick={() => setBaseUrl('http://localhost:5050')}
-                  className="text-accent underline"
-                >
-                  http://localhost:5050
-                </button>
-                .
-              </p>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label htmlFor="framework" className="mb-1.5 block text-sm font-medium">
-                  Test framework
-                </label>
-                <select
-                  id="framework"
-                  value={framework}
-                  onChange={(e) => setFramework(e.target.value)}
-                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
-                >
-                  {FRAMEWORKS.map((f) => (
-                    <option key={f.value} value={f.value}>
-                      {f.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label htmlFor="env" className="mb-1.5 block text-sm font-medium">
-                  Environment
-                </label>
-                <select
-                  id="env"
-                  value={envKind}
-                  onChange={(e) => setEnvKind(e.target.value)}
-                  className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
-                >
-                  <option value="LOCAL">Local</option>
-                  <option value="PREVIEW">Preview</option>
-                  <option value="STAGING">Staging</option>
-                  <option value="PRODUCTION">Production</option>
-                </select>
-              </div>
-            </div>
-
-            {error && (
-              <p
-                role="alert"
-                className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm"
+          <div>
+            <Field
+              id="url"
+              label="URL to test"
+              type="url"
+              required
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://staging.acme.com"
+              aria-describedby="url-hint"
+            />
+            {/* Not the Field's own `hint`, because this one has a control in it. */}
+            <p id="url-hint" className="text-ink-faint mt-1.5 text-xs">
+              A staging or preview URL is best. To test the bundled demo, use{' '}
+              <button
+                type="button"
+                onClick={() => setBaseUrl('http://localhost:5050')}
+                className="text-accent underline"
               >
-                {error}
-              </p>
-            )}
-
-            <button
-              type="submit"
-              className="bg-accent w-full rounded-md py-2.5 font-medium text-white hover:opacity-90"
-            >
-              Crawl and propose tests
-            </button>
-          </form>
-        ) : (
-          <div className="mt-10">
-            <div className="mb-4 flex items-center gap-2">
-              {phase === 'crawling' && (
-                <span className="bg-accent inline-block h-2 w-2 animate-pulse rounded-full" />
-              )}
-              {phase === 'done' && <span className="bg-pass inline-block h-2 w-2 rounded-full" />}
-              <span className="text-sm font-medium">
-                {phase === 'crawling' ? 'Exploring your app…' : 'Crawl complete'}
-              </span>
-            </div>
-
-            <div
-              ref={logRef}
-              className="border-line bg-surface-1 h-64 overflow-y-auto rounded-md border p-3 font-mono text-micro"
-            >
-              {log.map((line, i) => (
-                <div key={i} className="text-ink-dim">
-                  {line}
-                </div>
-              ))}
-            </div>
-
-            {phase === 'done' && project && (
-              <Link
-                href={`/projects/${project.id}/plan`}
-                className="bg-accent mt-5 inline-block rounded-md px-5 py-2.5 font-medium text-white hover:opacity-90"
-              >
-                Review the proposed plan →
-              </Link>
-            )}
+                http://localhost:5050
+              </button>
+              .
+            </p>
           </div>
-        )}
-    </main>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label htmlFor="framework" className="text-ink-dim text-body-sm mb-1.5 block">
+                Test framework
+              </label>
+              <select
+                id="framework"
+                value={framework}
+                onChange={(e) => setFramework(e.target.value)}
+                className="border-line bg-surface-1 text-body-sm focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
+              >
+                {FRAMEWORKS.map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div>
+              <label htmlFor="env" className="text-ink-dim text-body-sm mb-1.5 block">
+                Environment
+              </label>
+              <select
+                id="env"
+                value={envKind}
+                onChange={(e) => setEnvKind(e.target.value)}
+                className="border-line bg-surface-1 text-body-sm focus:border-accent w-full rounded-md border px-3 py-2 outline-none"
+              >
+                <option value="LOCAL">Local</option>
+                <option value="PREVIEW">Preview</option>
+                <option value="STAGING">Staging</option>
+                <option value="PRODUCTION">Production</option>
+              </select>
+            </div>
+          </div>
+
+          {error && (
+            <p
+              role="alert"
+              className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm"
+            >
+              {error}
+            </p>
+          )}
+
+          <Button type="submit" variant="primary" className="w-full">
+            Crawl and propose tests
+          </Button>
+        </form>
+      ) : (
+        <div>
+          <div className="mb-4 flex items-center gap-2">
+            {phase === 'crawling' && (
+              <span className="bg-accent inline-block h-2 w-2 animate-pulse rounded-full" />
+            )}
+            {phase === 'done' && <span className="bg-pass inline-block h-2 w-2 rounded-full" />}
+            <span className="text-sm font-medium">
+              {phase === 'crawling' ? 'Exploring your app…' : 'Crawl complete'}
+            </span>
+          </div>
+
+          <div
+            ref={logRef}
+            className="border-line bg-surface-1 h-64 overflow-y-auto rounded-md border p-3 font-mono text-micro"
+          >
+            {log.map((line, i) => (
+              <div key={i} className="text-ink-dim">
+                {line}
+              </div>
+            ))}
+          </div>
+
+          {phase === 'done' && project && (
+            <Link
+              href={`/projects/${project.id}/plan`}
+              className="bg-accent mt-5 inline-block rounded-md px-5 py-2.5 font-medium text-white hover:opacity-90"
+            >
+              Review the proposed plan →
+            </Link>
+          )}
+        </div>
+      )}
+    </Page>
+  );
+}
+
+/**
+ * `useSearchParams()` forces a client-side bailout, and Next refuses to
+ * statically prerender a page that does so without a Suspense boundary — it
+ * failed the production build outright ("useSearchParams() should be wrapped in
+ * a suspense boundary"). The boundary lets the shell prerender and the
+ * param-dependent part hydrate on the client.
+ */
+export default function OnboardingPage() {
+  return (
+    <Suspense fallback={<main className="text-ink-faint p-10 text-body-sm">Loading…</main>}>
+      <OnboardingInner />
+    </Suspense>
   );
 }

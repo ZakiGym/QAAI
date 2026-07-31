@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { API_URL, api } from '../lib/api';
+import { PromptDialog } from './ui/Field';
 
 /**
  * Record mode entry point (§C) — the fusion of the agent and the editor.
@@ -29,6 +30,7 @@ type Phase = 'idle' | 'recording' | 'saving' | 'error';
 
 export function RecordButton({ projectId, environmentId, onRecorded }: RecordButtonProps) {
   const [phase, setPhase] = useState<Phase>('idle');
+  const [naming, setNaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sessionRef = useRef<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -54,15 +56,12 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
     [],
   );
 
-  async function start() {
+  async function start(name: string) {
     if (!environmentId) {
       setError('Add an environment first — recording needs a URL to open.');
       setPhase('error');
       return;
     }
-
-    const name = prompt('Name this recording', 'Recorded flow');
-    if (!name) return;
 
     setError(null);
     setPhase('recording');
@@ -166,7 +165,7 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
     <div className="flex items-center gap-2">
       <button
         type="button"
-        onClick={() => void start()}
+        onClick={() => setNaming(true)}
         disabled={phase === 'saving'}
         className="border-line hover:border-accent flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
         title="Click through your app and QAAI writes the test"
@@ -175,6 +174,22 @@ export function RecordButton({ projectId, environmentId, onRecorded }: RecordBut
         {phase === 'saving' ? 'Saving…' : 'Record'}
       </button>
       {error && <span className="text-fail max-w-xs truncate text-xs">{error}</span>}
+
+      {/*
+        The last native dialog in the app. It sat on the one screen whose six
+        other prompts had already been converted, so clicking Record still
+        dropped you into an OS dialog in the system font, outside the dark UI.
+      */}
+      <PromptDialog
+        open={naming}
+        onClose={() => setNaming(false)}
+        onSubmit={(name) => void start(name)}
+        title="New recording"
+        label="Name this recording"
+        hint="A real browser opens. Click through your app, then close the window to finish."
+        initialValue="Recorded flow"
+        confirmLabel="Start recording"
+      />
     </div>
   );
 }

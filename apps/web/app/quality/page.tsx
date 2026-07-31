@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { api, ApiError, type Project } from '../../lib/api';
+import { api, ApiError } from '../../lib/api';
+import { relativeTime } from '../../components/ui';
+import { useProject } from '../../components/shell/ProjectContext';
+import { Button } from '../../components/ui/Button';
+import { EmptyState } from '../../components/ui/EmptyState';
+import { Badge, Card, Page, PageHeader, SkeletonRows, Tabs } from '../../components/ui/layout';
 
 /**
  * Quality — findings and the flake radar, on one screen.
@@ -60,83 +65,114 @@ interface FlakyTest {
   lastRunAt: string | null;
 }
 
-const SEVERITY: Record<string, string> = {
-  CRITICAL: 'border-fail/50 bg-fail/10 text-fail',
-  SERIOUS: 'border-fail/40 bg-fail/5 text-fail',
-  MODERATE: 'border-flake/40 bg-flake/10 text-flake',
-  MINOR: 'border-line text-ink-dim',
+const SEVERITY_TONE: Record<string, 'fail' | 'flake' | 'neutral'> = {
+  CRITICAL: 'fail',
+  SERIOUS: 'fail',
+  MODERATE: 'flake',
+  MINOR: 'neutral',
 };
 
 export default function QualityPage() {
   const router = useRouter();
-  const [project, setProject] = useState<Project | null>(null);
+  // Was `projects[0]` — this screen silently reported on whichever project came
+  // back first and never said which one that was.
+  const { projectId, loading: projectLoading } = useProject();
   const [tab, setTab] = useState<'findings' | 'flaky' | 'gates'>('findings');
   const [rules, setRules] = useState<GateRule[]>([]);
   const [savingRules, setSavingRules] = useState(false);
   const [ruleNote, setRuleNote] = useState<string | null>(null);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [flaky, setFlaky] = useState<FlakyTest[]>([]);
+  // Every collection starts `[]`, so the empty state — "Nothing flagged." — was
+  // what a user saw while the fetch was still in flight.
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async (projectId: string) => {
-    const [f, q] = await Promise.all([
-      api<{ findings: Finding[] }>(`/projects/${projectId}/findings`).catch(() => ({
-        findings: [] as Finding[],
-      })),
-      api<{ tests: FlakyTest[] }>(`/projects/${projectId}/flaky`).catch(() => ({
-        tests: [] as FlakyTest[],
-      })),
-    ]);
-    setFindings(f.findings);
-    setFlaky(q.tests);
-    const g = await api<{ rules: GateRule[] }>(`/projects/${projectId}/gate-rules`).catch(() => ({
-      rules: [] as GateRule[],
-    }));
-    setRules(g.rules);
-  }, []);
+  const load = useCallback(
+    async (id: string) => {
+      // A dead endpoint falls back to empty rather than blanking the screen,
+      // exactly as before — but a 401 still sends you to sign in, which is what
+      // this page's own /projects call used to do before the shell owned it.
+      const onFail =
+        <T,>(fallback: T) =>
+        (err: unknown): T => {
+          if (err instanceof ApiError && err.status === 401) router.push('/login');
+          return fallback;
+        };
+
+      const [f, q] = await Promise.all([
+        api<{ findings: Finding[] }>(`/projects/${id}/findings`).catch(
+          onFail({ findings: [] as Finding[] }),
+        ),
+        api<{ tests: FlakyTest[] }>(`/projects/${id}/flaky`).catch(
+          onFail({ tests: [] as FlakyTest[] }),
+        ),
+      ]);
+      setFindings(f.findings);
+      setFlaky(q.tests);
+      const g = await api<{ rules: GateRule[] }>(`/projects/${id}/gate-rules`).catch(
+        onFail({ rules: [] as GateRule[] }),
+      );
+      setRules(g.rules);
+    },
+    [router],
+  );
 
   useEffect(() => {
+    // Wait for the shell to settle on a project before deciding there is
+    // nothing to show.
+    if (projectLoading) return;
+    if (!projectId) {
+      setLoading(false);
+      return;
+    }
+    let cancelled = false;
+    // Also on a project switch: the previous project's findings must not sit
+    // there looking like they belong to the one you just picked.
+    setLoading(true);
     void (async () => {
       try {
-        const { projects } = await api<{ projects: Project[] }>('/projects');
-        const first = projects[0];
-        if (!first) return;
-        setProject(first);
-        await load(first.id);
+        await load(projectId);
       } catch (err) {
-        if (err instanceof ApiError && err.status === 401) {
-          router.push('/login');
-          return;
-        }
+        if (cancelled) return;
         setError(err instanceof Error ? err.message : 'Could not load quality data');
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     })();
-  }, [router, load]);
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, projectLoading, load]);
 
   async function mute(finding: Finding) {
-    if (!project) return;
-    await api(`/projects/${project.id}/findings/${finding.id}/mute`, {
+    if (!projectId) return;
+    await api(`/projects/${projectId}/findings/${finding.id}/mute`, {
       method: 'POST',
       body: JSON.stringify({ muted: !finding.mutedAt }),
     }).catch(() => {});
-    await load(project.id);
+    await load(projectId);
   }
 
   async function quarantine(test: FlakyTest) {
-    if (!project) return;
-    await api(`/projects/${project.id}/tests/${test.id}/quarantine`, {
+    if (!projectId) return;
+    await api(`/projects/${projectId}/tests/${test.id}/quarantine`, {
       method: 'POST',
       body: JSON.stringify({ quarantined: !test.quarantined }),
     }).catch(() => {});
-    await load(project.id);
+    await load(projectId);
   }
 
+  const busy = loading || projectLoading;
+
   return (
-    <main className="mx-auto max-w-5xl px-6 py-10">
-      <h1 className="text-2xl font-semibold tracking-tight">Quality</h1>
-      <p className="text-ink-dim mt-1 mb-6 text-sm">
-        What&rsquo;s wrong with the app, and what&rsquo;s wrong with the tests.
-      </p>
+    <Page width="wide">
+      <PageHeader
+        title="Quality"
+        subtitle={
+          <>What&rsquo;s wrong with the app, and what&rsquo;s wrong with the tests.</>
+        }
+      />
 
       {error && (
         <p className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm">
@@ -144,26 +180,15 @@ export default function QualityPage() {
         </p>
       )}
 
-      <nav className="border-line mb-6 flex gap-1 border-b">
-        {(
-          [
-            ['findings', `Findings (${findings.length})`],
-            ['flaky', `Flake radar (${flaky.length})`],
-            ['gates', `Deploy gates (${rules.length})`],
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            onClick={() => setTab(id)}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm ${
-              tab === id ? 'border-accent text-ink' : 'text-ink-faint hover:text-ink border-transparent'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
+      <Tabs
+        tabs={[
+          { id: 'findings', label: 'Findings', count: findings.length },
+          { id: 'flaky', label: 'Flake radar', count: flaky.length },
+          { id: 'gates', label: 'Deploy gates', count: rules.length },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
 
       {tab === 'gates' ? (
         <div className="space-y-4">
@@ -173,85 +198,86 @@ export default function QualityPage() {
             merge through.
           </p>
 
-          <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
-            {rules.map((rule, index) => (
-              <div key={index} className="flex items-start gap-3 px-4 py-3">
-                <span
-                  className={`mt-0.5 shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] ${
-                    ('action' in rule ? rule.action : 'BLOCK') === 'BLOCK'
-                      ? 'border-fail/40 text-fail'
-                      : 'border-flake/40 text-flake'
-                  }`}
-                >
-                  {'action' in rule ? rule.action.toLowerCase() : 'block'}
-                </span>
-                <p className="min-w-0 flex-1 text-body-sm">{describeRule(rule)}</p>
-                <button
-                  type="button"
-                  onClick={() => setRules(rules.filter((_, i) => i !== index))}
-                  className="text-fail shrink-0 text-xs hover:underline"
-                >
-                  Remove
-                </button>
-              </div>
-            ))}
-            {rules.length === 0 && (
-              <p className="text-ink-faint px-4 py-8 text-center text-sm">
-                No gates. Every run passes, whatever it finds.
-              </p>
-            )}
-          </div>
+          {busy ? (
+            <Card className="overflow-hidden">
+              <SkeletonRows rows={3} />
+            </Card>
+          ) : rules.length === 0 ? (
+            <EmptyState title="No gates." body="Every run passes, whatever it finds." />
+          ) : (
+            <Card className="divide-line divide-y overflow-hidden">
+              {rules.map((rule, index) => (
+                <div key={index} className="flex items-start gap-3 px-4 py-3">
+                  <Badge
+                    tone={('action' in rule ? rule.action : 'BLOCK') === 'BLOCK' ? 'fail' : 'flake'}
+                    mono
+                    className="mt-0.5"
+                  >
+                    {'action' in rule ? rule.action.toLowerCase() : 'block'}
+                  </Badge>
+                  <p className="min-w-0 flex-1 text-body-sm">{describeRule(rule)}</p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setRules(rules.filter((_, i) => i !== index))}
+                    className="text-fail hover:text-fail"
+                  >
+                    Remove
+                  </Button>
+                </div>
+              ))}
+            </Card>
+          )}
 
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
+            <Button
+              size="sm"
               onClick={() =>
                 setRules([
                   ...rules,
                   { kind: 'BLOCK_ON_VERDICT', verdict: 'REAL_BUG', onlyPriorities: ['CRITICAL_PATH'] },
                 ])
               }
-              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
             >
               + Block on real bugs
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              size="sm"
               onClick={() =>
                 setRules([...rules, { kind: 'MAX_FLAKE_RATE', ratePercent: 5, action: 'WARN' }])
               }
-              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
             >
               + Flake ceiling
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              size="sm"
               onClick={() =>
                 setRules([...rules, { kind: 'MIN_PASS_RATE', ratePercent: 90, action: 'BLOCK' }])
               }
-              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
             >
               + Minimum pass rate
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              size="sm"
               onClick={() =>
                 setRules([...rules, { kind: 'MAX_P95_LATENCY_MS', ms: 30000, action: 'WARN' }])
               }
-              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
             >
               + Latency ceiling
-            </button>
+            </Button>
 
-            <button
-              type="button"
-              disabled={savingRules || !project}
+            <Button
+              variant="primary"
+              size="sm"
+              className="ml-auto"
+              loading={savingRules}
+              disabled={!projectId}
               onClick={async () => {
-                if (!project) return;
+                if (!projectId) return;
                 setSavingRules(true);
                 setRuleNote(null);
                 try {
-                  await api(`/projects/${project.id}/gate-rules`, {
+                  await api(`/projects/${projectId}/gate-rules`, {
                     method: 'PUT',
                     body: JSON.stringify({ rules }),
                   });
@@ -262,98 +288,97 @@ export default function QualityPage() {
                   setSavingRules(false);
                 }
               }}
-              className="bg-accent ml-auto rounded-md px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
             >
               {savingRules ? 'Saving…' : 'Save gates'}
-            </button>
+            </Button>
           </div>
           {ruleNote && <p className="text-ink-dim text-xs">{ruleNote}</p>}
         </div>
       ) : tab === 'findings' ? (
-        <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
-          {findings.map((f) => (
-            <div key={f.id} className={`px-4 py-3 ${f.mutedAt ? 'opacity-50' : ''}`}>
-              <div className="flex items-start gap-3">
-                <span
-                  className={`shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] ${
-                    SEVERITY[f.severity] ?? SEVERITY.MINOR
-                  }`}
-                >
-                  {f.severity.toLowerCase()}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <p className="text-body-sm">{f.message}</p>
-                  <p className="text-ink-faint mt-0.5 truncate font-mono text-micro">
-                    {f.location}
-                  </p>
-                  <p className="text-ink-faint mt-1 text-meta">
-                    {f.kind.toLowerCase()} · {f.code} · seen {f.occurrences}×
-                    {f.tests.length > 0 && ` · ${f.tests.slice(0, 2).join(', ')}`}
-                  </p>
+        busy ? (
+          <Card className="overflow-hidden">
+            <SkeletonRows rows={5} />
+          </Card>
+        ) : findings.length === 0 ? (
+          <EmptyState
+            title="Nothing flagged."
+            body="Accessibility and security checks record findings here as they run — an empty list means the last run was clean."
+          />
+        ) : (
+          <Card className="divide-line divide-y overflow-hidden">
+            {findings.map((f) => (
+              <div key={f.id} className={`px-4 py-3 ${f.mutedAt ? 'opacity-50' : ''}`}>
+                <div className="flex items-start gap-3">
+                  <Badge tone={SEVERITY_TONE[f.severity] ?? 'neutral'} mono>
+                    {f.severity.toLowerCase()}
+                  </Badge>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-body-sm">{f.message}</p>
+                    <p className="text-ink-faint mt-0.5 truncate font-mono text-micro">
+                      {f.location}
+                    </p>
+                    <p className="text-ink-faint mt-1 text-meta">
+                      {f.kind.toLowerCase()} · {f.code} · seen{' '}
+                      <span className="tabular-nums">{f.occurrences}</span>×
+                      {f.tests.length > 0 && ` · ${f.tests.slice(0, 2).join(', ')}`}
+                    </p>
+                  </div>
+                  {f.helpUrl && (
+                    <a
+                      href={f.helpUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-accent shrink-0 text-xs hover:underline"
+                    >
+                      How to fix
+                    </a>
+                  )}
+                  <Button variant="ghost" size="sm" onClick={() => void mute(f)}>
+                    {f.mutedAt ? 'Unmute' : 'Mute'}
+                  </Button>
                 </div>
-                {f.helpUrl && (
-                  <a
-                    href={f.helpUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-accent shrink-0 text-xs hover:underline"
-                  >
-                    How to fix
-                  </a>
-                )}
-                <button
-                  type="button"
-                  onClick={() => void mute(f)}
-                  className="text-ink-faint hover:text-ink shrink-0 text-xs"
-                >
-                  {f.mutedAt ? 'Unmute' : 'Mute'}
-                </button>
               </div>
-            </div>
-          ))}
-          {findings.length === 0 && (
-            <p className="text-ink-faint px-4 py-10 text-center text-sm">
-              Nothing flagged. Accessibility and security checks record findings here as they run — an empty list means the last run was clean.
-            </p>
-          )}
-        </div>
+            ))}
+          </Card>
+        )
+      ) : busy ? (
+        <Card className="overflow-hidden">
+          <SkeletonRows rows={5} />
+        </Card>
+      ) : flaky.length === 0 ? (
+        <EmptyState
+          title="No unstable tests."
+          body="A quarantined test still runs — it just stops gating a deploy."
+        />
       ) : (
-        <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-xl border">
+        <Card className="divide-line divide-y overflow-hidden">
           {flaky.map((t) => (
             <div key={t.id} className="flex items-center gap-3 px-4 py-3">
               <div className="min-w-0 flex-1">
                 <p className="truncate text-body-sm">{t.name}</p>
                 <p className="text-ink-faint truncate font-mono text-micro">{t.filePath}</p>
               </div>
+              {t.lastRunAt && (
+                <span className="text-ink-faint shrink-0 text-meta tabular-nums">
+                  {relativeTime(t.lastRunAt)}
+                </span>
+              )}
               <span
-                className={`shrink-0 font-mono text-xs ${
+                className={`shrink-0 font-mono text-xs tabular-nums ${
                   t.flakeRate > 20 ? 'text-fail' : t.flakeRate > 5 ? 'text-flake' : 'text-ink-dim'
                 }`}
                 title="Share of recent runs that were unstable"
               >
                 {t.flakeRate.toFixed(1)}%
               </span>
-              {t.quarantined && (
-                <span className="border-flake/40 text-flake shrink-0 rounded border px-1.5 py-0.5 text-meta">
-                  quarantined
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={() => void quarantine(t)}
-                className="border-line hover:border-accent shrink-0 rounded-md border px-2.5 py-1 text-xs"
-              >
+              {t.quarantined && <Badge tone="flake">quarantined</Badge>}
+              <Button size="sm" onClick={() => void quarantine(t)}>
                 {t.quarantined ? 'Release' : 'Quarantine'}
-              </button>
+              </Button>
             </div>
           ))}
-          {flaky.length === 0 && (
-            <p className="text-ink-faint px-4 py-10 text-center text-sm">
-              No unstable tests. A quarantined test still runs — it just stops gating a deploy.
-            </p>
-          )}
-        </div>
+        </Card>
       )}
-    </main>
+    </Page>
   );
 }
