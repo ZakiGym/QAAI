@@ -7,8 +7,8 @@
  * violation is present, which is the one severity nobody argues about.
  */
 
-import { chromium } from 'playwright';
 import { AxeBuilder } from '@axe-core/playwright';
+import { acquireBrowser } from '../browser-pool.js';
 import type {
   ExecutableTest,
   Finding,
@@ -54,8 +54,11 @@ export const accessibilityPlugin: RunnerPlugin = {
     const { routes, tags } = parseSpec(test);
     const startedAt = Date.now();
 
-    const browser = await chromium.launch();
-    const context = await browser.newContext(
+    // Borrowed, not launched: the browser process is shared with every other
+    // test in this worker. The CONTEXT below is still this test's alone, which
+    // is what keeps one scan from seeing another's cookies or storage.
+    const lease = await acquireBrowser();
+    const context = await lease.browser.newContext(
       ctx.storageState ? { storageState: ctx.storageState as never } : {},
     );
     const page = await context.newPage();
@@ -115,7 +118,7 @@ export const accessibilityPlugin: RunnerPlugin = {
       }
     } finally {
       await context.close().catch(() => {});
-      await browser.close().catch(() => {});
+      await lease.release();
     }
 
     const criticals = findings.filter((f) => f.severity === 'CRITICAL');

@@ -131,8 +131,17 @@ export interface LimitVerdict {
   allowed: boolean;
   /** Written for the person who hit it, not for a log. */
   reason?: string;
-  /** Which limit bit — lets the UI deep-link the right upgrade. */
-  limit?: 'runs' | 'projects';
+  /**
+   * Which limit bit — lets the UI deep-link the right upgrade.
+   *
+   * `concurrency` is the odd one out and worth knowing about: it is the only
+   * limit here that is TEMPORARY. Hitting `runs` or `projects` means buying
+   * something; hitting `concurrency` means waiting, and the reason string that
+   * comes with it says roughly how long. A UI that renders all three as the
+   * same "upgrade to continue" wall would be lying about two of them. See
+   * lib/concurrency.ts.
+   */
+  limit?: 'runs' | 'projects' | 'concurrency';
 }
 
 /**

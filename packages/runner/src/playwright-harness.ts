@@ -24,6 +24,14 @@ import type {
   TestExecution,
   TestResultStatus,
 } from '@qaai/shared';
+import {
+  determinismRecord,
+  planDeterminism,
+  reproduceHint,
+  resolveDeterminism,
+  type DeterminismOptions,
+  type DeterminismPlan,
+} from './determinism.js';
 
 /** Hard ceiling for a whole spec file, independent of per-test timeouts. */
 const PROCESS_TIMEOUT_MS = 10 * 60_000;
@@ -213,6 +221,15 @@ const CONFIG_TEMPLATE = (opts: {
    * different `use` block — so they share this rather than forking the harness.
    */
   projects?: Array<{ name: string; browserName?: string; locale?: string; timezoneId?: string }>;
+  /**
+   * Determinism's timezone/locale pinning. It goes in the top-level `use` block
+   * rather than into every project, so a localisation matrix that names its own
+   * locale still wins — Playwright merges project `use` over the root, and a
+   * run that deliberately varies locale must not be flattened by a knob whose
+   * job is only to stop the *ambient* machine leaking in.
+   */
+  timezoneId?: string | null;
+  locale?: string | null;
 }) => `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
@@ -246,6 +263,18 @@ ${opts.projects
   }
   use: {
     baseURL: ${JSON.stringify(opts.baseUrl)},${
+      opts.timezoneId
+        ? `
+    // Pinned by the determinism kit — the worker's own zone must not decide
+    // whether a date rolls over mid-suite.
+    timezoneId: ${JSON.stringify(opts.timezoneId)},`
+        : ''
+    }${
+      opts.locale
+        ? `
+    locale: ${JSON.stringify(opts.locale)},`
+        : ''
+    }${
       opts.gridWsEndpoint
         ? `
     // Runs on a cloud grid instead of this machine's browser (§6).
@@ -264,6 +293,7 @@ ${opts.projects
 async function createWorkspace(
   ctx: RunContext,
   test: ExecutableTest,
+  plan: DeterminismPlan,
   projects?: HarnessOptions['projects'],
 ): Promise<Workspace> {
   await mkdir(runsRoot, { recursive: true });
@@ -274,7 +304,8 @@ async function createWorkspace(
 
   const specPath = safeSpecPath(dir, test.filePath);
   await mkdir(dirname(specPath), { recursive: true });
-  await writeFile(specPath, test.code, 'utf8');
+  // `plan.code` is `test.code` verbatim unless the run asked for determinism.
+  await writeFile(specPath, plan.code, 'utf8');
 
   await writeFile(
     join(dir, 'playwright.config.ts'),
@@ -285,6 +316,8 @@ async function createWorkspace(
       outputDir,
       gridWsEndpoint: ctx.grid?.wsEndpoint ?? null,
       projects,
+      timezoneId: plan.determinism.timezoneId,
+      locale: plan.determinism.locale,
     }),
     'utf8',
   );
@@ -321,8 +354,9 @@ interface SpawnOutcome {
   timedOut: boolean;
 }
 
-function runPlaywright(ws: Workspace, ctx: RunContext): Promise<SpawnOutcome> {
+function runPlaywright(ws: Workspace, ctx: RunContext, plan: DeterminismPlan): Promise<SpawnOutcome> {
   return new Promise((resolvePromise) => {
+    const d = plan.determinism;
     const child = spawn(cliPath, ['test', '--config', 'playwright.config.ts'], {
       cwd: ws.dir,
       env: {
@@ -333,10 +367,15 @@ function runPlaywright(ws: Workspace, ctx: RunContext): Promise<SpawnOutcome> {
         QAAI_BASE_URL: ctx.baseUrl,
         QAAI_RUN_ID: ctx.runId,
         QAAI_STORAGE_STATE: ctx.storageState ? join(ws.dir, 'storage-state.json') : '',
-        QAAI_SEED: String(ctx.determinism.randomSeed),
-        ...(ctx.determinism.freezeClockAt
-          ? { QAAI_FROZEN_CLOCK: ctx.determinism.freezeClockAt }
-          : {}),
+        // The seed the run actually used, so a spec that generates its own data
+        // reads the same number that decided the test order.
+        QAAI_SEED: String(d.seed),
+        QAAI_DETERMINISM_SEED: String(d.seed),
+        ...(d.clockAtIso ? { QAAI_FROZEN_CLOCK: d.clockAtIso } : {}),
+        // Node reads TZ at startup, and the test process formats dates too —
+        // pinning only the browser would leave the assertions in a different
+        // zone from the page they are asserting on.
+        ...(d.timezoneId ? { TZ: d.timezoneId } : {}),
         CI: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -415,6 +454,46 @@ async function uploadArtifacts(
 
   return { videoKey, traceKey, screenshotKeys };
 }
+
+/**
+ * One test's verdict: its final attempt, and whether it needed a retry to pass.
+ *
+ * `retry` is per TEST in Playwright's report, and a spec file holds many tests.
+ * Flattening every result in the file into one list and asking "did the last one
+ * pass after an earlier one failed" answers a different question — with two
+ * tests where the FIRST fails and the second passes, that list is
+ * [failed, passed] and the run is reported FLAKY. A real, deterministic,
+ * repeatable failure downgraded to a flake, which is precisely the signal §5
+ * exists to protect. Order randomisation makes it routine: shuffling only means
+ * anything in a file with several tests, and it moves the failing one off the
+ * end on purpose.
+ */
+interface TestOutcome {
+  final: PwResult | undefined;
+  retriedAndPassed: boolean;
+}
+
+function outcomeFor(test: PwTest): TestOutcome {
+  const results = test.results;
+  const final = results[results.length - 1];
+  return {
+    final,
+    // §5: a retry that passes is a flake candidate, not a pass.
+    retriedAndPassed:
+      results.length > 1 &&
+      final?.status === 'passed' &&
+      results.some((r) => r.status === 'failed' || r.status === 'timedOut'),
+  };
+}
+
+/** Worst-wins, so one failing test is never masked by the ones that passed. */
+const STATUS_SEVERITY: Record<TestResultStatus, number> = {
+  TIMED_OUT: 4,
+  FAILED: 3,
+  FLAKY: 2,
+  PASSED: 1,
+  SKIPPED: 0,
+};
 
 function mapStatus(result: PwResult | undefined, retriedAndPassed: boolean): TestResultStatus {
   if (retriedAndPassed) return 'FLAKY';
@@ -497,6 +576,39 @@ export interface HarnessOptions {
   network?: NetworkEntry[];
   /** Run the spec once per entry — a browser matrix, or a locale matrix. */
   projects?: Array<{ name: string; browserName?: string; locale?: string; timezoneId?: string }>;
+  /**
+   * Build determinism controls — order randomisation, clock, seeded randomness,
+   * timezone/locale. Every knob is off unless named here, because each one
+   * changes what the suite exercises and that is the run owner's decision.
+   */
+  determinism?: DeterminismOptions;
+}
+
+/**
+ * Writes the seed, and the order it produced, somewhere it will outlive the run
+ * log — a shuffled failure is only actionable if the order can be replayed, and
+ * a seed that exists solely in a log line is a seed nobody will find.
+ *
+ * Wrapped, because a reporting problem must never lose a run: if the artifact
+ * store is unavailable the test result still stands, and the seed is still in
+ * the failure message and the log.
+ */
+async function recordDeterminism(
+  ctx: RunContext,
+  test: ExecutableTest,
+  plan: DeterminismPlan,
+): Promise<void> {
+  const record = determinismRecord(plan);
+  ctx.logger.info('determinism', { testId: test.id, ...record });
+  try {
+    await ctx.artifacts.put(
+      `${test.id}_determinism.json`,
+      Buffer.from(`${JSON.stringify(record, null, 2)}\n`, 'utf8'),
+      'application/json',
+    );
+  } catch (err) {
+    ctx.logger.warn('determinism record upload failed', { testId: test.id, err: String(err) });
+  }
 }
 
 /** Runs one generated spec file and maps the result into QAAI's shape. */
@@ -505,12 +617,43 @@ export async function runPlaywrightSpec(
   test: ExecutableTest,
   options: HarnessOptions = {},
 ): Promise<TestExecution> {
-  const ws = await createWorkspace(ctx, test, options.projects);
+  const plan = planDeterminism(
+    test.code,
+    resolveDeterminism(ctx.determinism, options.determinism),
+  );
+  const hint = reproduceHint(plan);
+
+  /**
+   * Determinism metadata rides on the console pane rather than a new field on
+   * TestExecution: the reader looking at a red run needs the seed in front of
+   * them, and this is the channel that already reaches them. Notes appear even
+   * on a pass, because "the shuffle declined and why" is exactly the thing that
+   * would otherwise be silent.
+   */
+  const determinismConsole: ConsoleEntry[] = plan.determinism.enabled
+    ? [
+        ...(hint ? [{ level: 'log' as const, text: hint, at: new Date().toISOString() }] : []),
+        ...plan.notes.map((text) => ({
+          level: 'warn' as const,
+          text: `Determinism: ${text}`,
+          at: new Date().toISOString(),
+        })),
+      ]
+    : [];
+
+  const ws = await createWorkspace(ctx, test, plan, options.projects);
   const startedAt = Date.now();
 
+  /** Appends the seed to whatever the failure already said, never replacing it. */
+  const withHint = (message: string | null): string | null => {
+    if (!hint) return message;
+    return message ? `${message}\n\n${hint}` : hint;
+  };
+
   try {
+    if (plan.determinism.enabled) await recordDeterminism(ctx, test, plan);
     ctx.logger.info('running spec', { testId: test.id, file: test.filePath });
-    const outcome = await runPlaywright(ws, ctx);
+    const outcome = await runPlaywright(ws, ctx, plan);
 
     let report: PwReport | null = null;
     try {
@@ -536,9 +679,11 @@ export async function runPlaywrightSpec(
         durationMs: Date.now() - startedAt,
         steps: [],
         network: options.network ?? [],
-        console: [],
+        console: determinismConsole,
         videoKey,
         traceKey,
+        // No determinism hint here on purpose: nothing was evaluated, so a seed
+        // would be inviting someone to "reproduce" a missing browser.
         errorMessage:
           `${engine} is not installed on this worker, so the test was not evaluated. ` +
           `Run \`npx playwright install ${engine === 'a browser' ? '' : engine}\`.`,
@@ -556,24 +701,39 @@ export async function runPlaywrightSpec(
         durationMs: Date.now() - startedAt,
         steps: [],
         network: options.network ?? [],
-        console: [],
+        console: determinismConsole,
         videoKey,
         traceKey,
-        errorMessage: outcome.timedOut
-          ? `Playwright did not finish within ${PROCESS_TIMEOUT_MS / 1000}s`
-          : `Playwright produced no report.\n${stripAnsi(outcome.stderr || outcome.stdout).slice(0, 4000)}`,
+        errorMessage: withHint(
+          outcome.timedOut
+            ? `Playwright did not finish within ${PROCESS_TIMEOUT_MS / 1000}s`
+            : `Playwright produced no report.\n${stripAnsi(outcome.stderr || outcome.stdout).slice(0, 4000)}`,
+        ),
         retriedAndPassed: false,
         findings: [],
       };
     }
 
     const specs = flattenSpecs(report.suites);
-    const results = specs.flatMap((s) => s.tests).flatMap((t) => t.results);
-    const last = results[results.length - 1];
+    const outcomes = specs.flatMap((s) => s.tests).map(outcomeFor);
 
-    // §5: a retry that passes is a flake candidate, not a pass.
-    const retriedAndPassed =
-      results.length > 1 && last?.status === 'passed' && results.some((r) => r.status === 'failed');
+    // The reported test is the worst one in the file, not the last one to run.
+    // Steps, error and screenshot all come from it, so the cockpit opens on the
+    // thing that broke rather than on whatever happened to finish last.
+    let worst: TestOutcome | undefined = outcomes[0];
+    let status: TestResultStatus = mapStatus(worst?.final, worst?.retriedAndPassed ?? false);
+    for (const candidate of outcomes.slice(1)) {
+      const candidateStatus = mapStatus(candidate.final, candidate.retriedAndPassed);
+      if (STATUS_SEVERITY[candidateStatus] > STATUS_SEVERITY[status]) {
+        worst = candidate;
+        status = candidateStatus;
+      }
+    }
+
+    const last = worst?.final;
+    // Reported for the whole file: a retry that passed anywhere in it is still
+    // a flake candidate, even when another test failed outright.
+    const retriedAndPassed = outcomes.some((o) => o.retriedAndPassed);
 
     const userSteps = collectUserSteps(last?.steps);
     const failingIndex = userSteps.findIndex((s) => Boolean(s.error));
@@ -585,16 +745,20 @@ export async function runPlaywrightSpec(
         ? stripAnsi(outcome.stderr || outcome.stdout).slice(0, 2000)
         : undefined);
 
+    const errorMessage = topLevelError ? stripAnsi(topLevelError) : null;
+
     return {
       testId: test.id,
-      status: mapStatus(last, retriedAndPassed),
+      status,
       durationMs: Date.now() - startedAt,
       steps: toStepResults(userSteps, screenshotKeys, failingIndex === -1 ? null : failingIndex),
       network: options.network ?? [],
-      console: toConsoleEntries(last),
+      console: [...determinismConsole, ...toConsoleEntries(last)],
       videoKey,
       traceKey,
-      errorMessage: topLevelError ? stripAnsi(topLevelError) : null,
+      // "Your suite fails in THIS order, here is the seed" is the whole feature.
+      // A green run does not need it; a red one is useless without it.
+      errorMessage: status === 'PASSED' ? errorMessage : withHint(errorMessage),
       retriedAndPassed,
       findings: [],
     };

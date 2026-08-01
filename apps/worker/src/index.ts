@@ -20,7 +20,7 @@ import type {
   TriageJob,
 } from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
-import { armScheduleTick, closeProducers } from './queues.js';
+import { armFlakeTick, armScheduleTick, closeProducers } from './queues.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
 import { processRun, sweepStalledShardedRuns } from './processors/run.js';
@@ -30,6 +30,7 @@ import { processEdit } from './processors/edit.js';
 import { processNotify } from './processors/notify.js';
 import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
+import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
 
 const workers: Worker[] = [];
 
@@ -98,6 +99,16 @@ register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
 });
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
+
+// The flake sweep: one tick, concurrency 1, its own queue. It shares nothing
+// with the scheduler tick deliberately — confirming a flake has nothing to do
+// with cron, and a slow sweep of quarantine candidates must not be able to hold
+// up a nightly run that is due.
+//
+// It creates runs on the run queue rather than executing anything itself, so
+// this worker stays cheap even while an investigation is in flight.
+register<FlakeTickJob>(QUEUE_NAMES.flake, 1, processFlakeTick);
+void armFlakeTick().catch((err) => logger.error({ err }, 'could not arm the flake sweep'));
 
 logger.info(
   {

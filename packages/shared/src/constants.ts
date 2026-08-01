@@ -276,6 +276,180 @@ export const FRAMEWORKS_BY_LANGUAGE: Record<Language, readonly UiFramework[]> = 
   PHP: ['PANTHER', 'CODECEPTION'],
 };
 
+// ─── Flake automation (§5) ───────────────────────────────────────────────────
+
+/**
+ * `Run.triggeredBy` on a flake-confirmation re-run, followed by
+ * `<testId>:<investigationId>`.
+ *
+ * A confirmation re-run is a real run — same environment, same plugin, same
+ * retries — because a rate measured through a shadow execution path is a
+ * measurement of the shadow path. The marker is how everything downstream can
+ * tell "QAAI re-ran this ten times to measure it" from "a person asked for a
+ * run", and it is a string rather than a RunTrigger member so it needed no
+ * enum migration.
+ */
+export const FLAKE_RUN_PREFIX = 'flake-radar:';
+
+/** True for a run the flake radar created to measure a suspected flake. */
+export function isFlakeConfirmationRun(triggeredBy: string | null | undefined): boolean {
+  return typeof triggeredBy === 'string' && triggeredBy.startsWith(FLAKE_RUN_PREFIX);
+}
+
+/**
+ * Opening words of every machine-written `Test.quarantineReason`.
+ *
+ * Auto-release reads this: only a quarantine QAAI can prove it wrote is one
+ * QAAI may lift. A reason it does not recognise belongs to a person, and a
+ * person's decision is not ours to undo.
+ */
+export const AUTO_QUARANTINE_REASON_PREFIX = 'Auto-quarantined';
+
+/**
+ * Audit actions the flake automation writes. Every decision gets one — including
+ * the decision to do nothing — because the row IS the record that an
+ * investigation concluded, and because a human who disagrees needs to see the
+ * measurement that convinced the machine.
+ */
+export const FLAKE_AUDIT_ACTIONS = {
+  quarantined: 'test.flake.quarantined',
+  released: 'test.flake.released',
+  measured: 'test.flake.measured',
+  abandoned: 'test.flake.abandoned',
+} as const;
+export type FlakeAuditAction = (typeof FLAKE_AUDIT_ACTIONS)[keyof typeof FLAKE_AUDIT_ACTIONS];
+
+/** What the quarantine endpoint writes when a person flips the switch by hand. */
+export const MANUAL_QUARANTINE_ACTIONS = ['test.quarantine', 'test.unquarantine'] as const;
+
+/**
+ * Per-project flake automation policy (§5).
+ *
+ * Every default here leans the same way: an auto-quarantined test stops gating,
+ * so the expensive mistake is quarantining a test that was catching a real
+ * intermittent bug — a green board over a broken build. Hence a measured rate
+ * over a real sample, a REAL_BUG veto, and critical-path tests left alone.
+ */
+export interface FlakePolicy {
+  /** Master switch. Off means suspicions are never even measured. */
+  readonly confirm: boolean;
+  /** How many re-runs an investigation attempts. */
+  readonly samples: number;
+  /** How many of those must yield a usable result before ANY action is taken. */
+  readonly minSamples: number;
+  readonly autoQuarantine: boolean;
+  /** Measured failure rate must be strictly above this to quarantine. */
+  readonly quarantineRatePercent: number;
+  readonly autoRelease: boolean;
+  /** Measured failure rate must be at or below this to release. */
+  readonly releaseRatePercent: number;
+  /** Never auto-quarantine a CRITICAL_PATH test; ask a human instead. */
+  readonly protectCriticalPath: boolean;
+  /** A REAL_BUG verdict this recent vetoes a quarantine outright. */
+  readonly realBugLookbackDays: number;
+  /** How long a quarantined test waits before it is re-measured for release. */
+  readonly recheckQuarantinedAfterHours: number;
+  /** Cooldown before the same test may be investigated again. */
+  readonly reinvestigateAfterHours: number;
+  /** Yield: no confirmation run is queued while the project has this many waiting. */
+  readonly maxQueuedRunsBeforeYielding: number;
+  /** An investigation that has not finished in this long is abandoned. */
+  readonly investigationDeadlineMinutes: number;
+}
+
+export const FLAKE_POLICY_DEFAULTS: FlakePolicy = {
+  confirm: true,
+  samples: 10,
+  minSamples: 8,
+  autoQuarantine: true,
+  quarantineRatePercent: 30,
+  autoRelease: true,
+  releaseRatePercent: 5,
+  protectCriticalPath: true,
+  realBugLookbackDays: 30,
+  recheckQuarantinedAfterHours: 24,
+  reinvestigateAfterHours: 24,
+  maxQueuedRunsBeforeYielding: 3,
+  investigationDeadlineMinutes: 360,
+};
+
+function flakeNumber(raw: unknown, fallback: number, min: number, max: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, raw));
+}
+
+function flakeBoolean(raw: unknown, fallback: boolean): boolean {
+  return typeof raw === 'boolean' ? raw : fallback;
+}
+
+/**
+ * Merge a stored per-project override onto the defaults, clamping every field.
+ *
+ * Never throws and never trusts: the input is JSON from a settings screen, and
+ * a policy that cannot be parsed must resolve to the conservative default
+ * rather than to zero — `minSamples: 0` would quarantine on no evidence at all,
+ * which is the one outcome this whole module exists to prevent.
+ */
+export function resolveFlakePolicy(raw: unknown): FlakePolicy {
+  const d = FLAKE_POLICY_DEFAULTS;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return d;
+  const o = raw as Record<string, unknown>;
+
+  const samples = flakeNumber(o.samples, d.samples, 3, 25);
+  const quarantineRatePercent = flakeNumber(
+    o.quarantineRatePercent,
+    d.quarantineRatePercent,
+    1,
+    100,
+  );
+
+  return {
+    confirm: flakeBoolean(o.confirm, d.confirm),
+    samples,
+    // Evidence can never be allowed to exceed what the investigation collects,
+    // or the policy asks for proof it has no way of producing.
+    minSamples: Math.min(
+      samples,
+      flakeNumber(o.minSamples, Math.min(d.minSamples, samples), 2, 25),
+    ),
+    autoQuarantine: flakeBoolean(o.autoQuarantine, d.autoQuarantine),
+    quarantineRatePercent,
+    autoRelease: flakeBoolean(o.autoRelease, d.autoRelease),
+    // A release bar above the quarantine bar would quarantine and release the
+    // same measurement forever.
+    releaseRatePercent: Math.min(
+      quarantineRatePercent,
+      flakeNumber(o.releaseRatePercent, d.releaseRatePercent, 0, 100),
+    ),
+    protectCriticalPath: flakeBoolean(o.protectCriticalPath, d.protectCriticalPath),
+    realBugLookbackDays: flakeNumber(o.realBugLookbackDays, d.realBugLookbackDays, 0, 365),
+    recheckQuarantinedAfterHours: flakeNumber(
+      o.recheckQuarantinedAfterHours,
+      d.recheckQuarantinedAfterHours,
+      1,
+      24 * 30,
+    ),
+    reinvestigateAfterHours: flakeNumber(
+      o.reinvestigateAfterHours,
+      d.reinvestigateAfterHours,
+      1,
+      24 * 30,
+    ),
+    maxQueuedRunsBeforeYielding: flakeNumber(
+      o.maxQueuedRunsBeforeYielding,
+      d.maxQueuedRunsBeforeYielding,
+      0,
+      1000,
+    ),
+    investigationDeadlineMinutes: flakeNumber(
+      o.investigationDeadlineMinutes,
+      d.investigationDeadlineMinutes,
+      5,
+      24 * 60,
+    ),
+  };
+}
+
 // ─── Queues (§5) ─────────────────────────────────────────────────────────────
 
 export const QUEUE_NAMES = {
@@ -288,6 +462,7 @@ export const QUEUE_NAMES = {
   import: 'qaai.import',
   schedule: 'qaai.schedule',
   notify: 'qaai.notify',
+  flake: 'qaai.flake',
 } as const;
 export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 

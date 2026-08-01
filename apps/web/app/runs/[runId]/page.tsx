@@ -32,6 +32,101 @@ interface LiveLine {
   tone: string;
 }
 
+// ─── Shards ──────────────────────────────────────────────────────────────────
+
+/**
+ * `GET /runs/:id` has returned `shards` since sharding shipped; the shared `Run`
+ * interface in lib/api.ts — which this page does not own — never described
+ * them, which is most of the reason a split run has looked exactly like an
+ * unsplit one. Declared here so the panel below is typed; they belong in
+ * lib/api.ts next time that file is opened.
+ */
+type RunShardStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'ABANDONED';
+
+interface RunShard {
+  id: string;
+  index: number;
+  total: number;
+  status: RunShardStatus;
+  testCount: number;
+  /** What the packer predicted this slice would cost, in ms. */
+  estimatedMs: number;
+  passedCount: number;
+  failedCount: number;
+  flakyCount: number;
+  skippedCount: number;
+  startedAt: string | null;
+  finishedAt: string | null;
+  errorMessage: string | null;
+}
+
+type ShardedRun = Run & { shardCount?: number; shards?: RunShard[] };
+
+/**
+ * Kept in sync with RUN_SHARD_TERMINAL in @qaai/shared. Duplicated as a plain
+ * list rather than imported, because that package ships source TS and the web
+ * build has no transpilePackages entry for it.
+ *
+ * This is the definition the whole feature rests on: a run is finished when
+ * every shard is in this set, and never before.
+ */
+const SHARD_TERMINAL = new Set<RunShardStatus>(['COMPLETED', 'FAILED', 'CANCELLED', 'ABANDONED']);
+
+const SHARD_STATUS_LABEL: Record<RunShardStatus, string> = {
+  QUEUED: 'queued',
+  RUNNING: 'running',
+  COMPLETED: 'done',
+  FAILED: 'died',
+  CANCELLED: 'cancelled',
+  // The word matters: an abandoned shard did not fail its tests, it never ran
+  // them, and those tests are sitting at their placeholder status right now.
+  ABANDONED: 'never ran',
+};
+
+/**
+ * The dot for a shard.
+ *
+ * A shard's own status says whether the worker got through its slice, not
+ * whether the tests in it passed — COMPLETED with four failures is a completed
+ * shard. So a shard that finished cleanly is coloured by its counts, and the
+ * error colour is kept for a slice whose tests did not run at all.
+ */
+function shardDotStatus(shard: RunShard): string {
+  switch (shard.status) {
+    case 'COMPLETED':
+      if (shard.failedCount > 0) return 'FAILED';
+      return shard.flakyCount > 0 ? 'FLAKY' : 'PASSED';
+    case 'FAILED':
+    case 'ABANDONED':
+      return 'ERRORED';
+    default:
+      return shard.status;
+  }
+}
+
+/**
+ * How long a shard has been going, or took.
+ *
+ * `duration()` renders everything above a second in seconds, which is right for
+ * a step and wrong for a slice of a nightly: an eight-minute shard reading
+ * "480.0s" is a number nobody can compare at a glance, and comparing shards is
+ * the entire point of the panel. Under a minute it defers to the primitive so
+ * the two never disagree.
+ */
+function wallClock(ms: number): string {
+  if (ms < 60_000) return duration(ms);
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+}
+
+/** Elapsed for a shard. A finished one is fixed; a running one is still counting. */
+function shardElapsedMs(shard: RunShard, now: number): number | null {
+  if (!shard.startedAt) return null;
+  const end = shard.finishedAt ? new Date(shard.finishedAt).getTime() : now;
+  return Math.max(0, end - new Date(shard.startedAt).getTime());
+}
+
 function describeEvent(label: string, data: Record<string, unknown>): LiveLine | null {
   const str = (key: string): string | null =>
     typeof data[key] === 'string' ? (data[key] as string) : null;
@@ -72,6 +167,31 @@ function describeEvent(label: string, data: Record<string, unknown>): LiveLine |
         ? { text: `Triaged as ${verdict.toLowerCase().replace(/_/g, ' ')}`, tone: 'bg-flake' }
         : null;
     }
+    // Five workers interleaving their test lines is confusing without something
+    // saying how many there are and when each one is done.
+    case 'shard.started': {
+      const index = num('shard');
+      const total = num('shards');
+      const tests = num('tests');
+      if (index === null || total === null) return null;
+      return {
+        text: `Shard ${index} of ${total} started${tests === null ? '' : ` · ${tests} tests`}`,
+        tone: 'bg-accent',
+      };
+    }
+    case 'shard.finished': {
+      const index = num('shard');
+      const total = num('shards');
+      if (index === null || total === null) return null;
+      if (data.errored === true) {
+        return { text: `Shard ${index} of ${total} did not complete`, tone: 'bg-fail' };
+      }
+      const failed = num('failed') ?? 0;
+      return {
+        text: `Shard ${index} of ${total} finished${failed > 0 ? ` · ${failed} failed` : ''}`,
+        tone: failed > 0 ? 'bg-fail' : 'bg-pass',
+      };
+    }
     case 'run.finished':
       return { text: 'Run finished', tone: 'bg-accent' };
     default:
@@ -86,15 +206,31 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const { runId } = use(params);
 
   const router = useRouter();
-  const [run, setRun] = useState<Run | null>(null);
+  const [run, setRun] = useState<ShardedRun | null>(null);
   const [selectedTestId, setSelectedTestId] = useState<string | null>(null);
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
   const [live, setLive] = useState<LiveLine[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [rerunning, setRerunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
-  /** Live progress from test.started events — the worker now sends index/total. */
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  /**
+   * Live progress from test.started events, kept per shard.
+   *
+   * This used to be one `{done, total}`, which was right for one worker and a
+   * lie for five: the worker scopes index/total to the slice it is executing,
+   * so on a sharded run each shard reports "3 of 8" about a different eighth of
+   * the suite and the last event to land overwrote the rest — a 40-test run
+   * cheerfully announcing "3 of 8". Keyed by shard index (`-1` for the single
+   * worker of an unsharded run) the parts add up to a number about the run.
+   */
+  const [doneByShard, setDoneByShard] = useState<Record<number, number>>({});
+  const [suiteTotal, setSuiteTotal] = useState<number | null>(null);
+  /**
+   * A clock, so a running shard's elapsed time counts up between events rather
+   * than freezing on whatever the last refetch happened to catch. Only ticks
+   * while there is something to tick for.
+   */
+  const [now, setNow] = useState(() => Date.now());
   const toast = useToast();
 
   /**
@@ -152,7 +288,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
 
   const load = useCallback(async () => {
     try {
-      const { run } = await api<{ run: Run }>(`/runs/${runId}`);
+      const { run } = await api<{ run: ShardedRun }>(`/runs/${runId}`);
       setRun(run);
       setError(null);
       return run;
@@ -190,12 +326,28 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         const line = describeEvent(label, parsed.data);
         if (line) setLive((prev) => [line, ...prev].slice(0, 60));
 
-        // The worker stamps index/total on test.started so the header can say
-        // "4 of 11". index is 0-based and names the test about to run, so the
-        // count of finished tests is the index itself.
-        const { index, total } = parsed.data as { index?: number; total?: number };
-        if (label === 'test.started' && typeof index === 'number' && typeof total === 'number') {
-          setProgress({ done: index, total });
+        /*
+         * The worker stamps index/total on test.started so the header can say
+         * "4 of 11". index is 0-based and names the test about to run, so the
+         * count of finished tests is the index itself.
+         *
+         * On a sharded run those two are the emitting shard's own slice — five
+         * workers cannot share one counter without a round trip per test — and
+         * `runTotal` carries the size of the whole suite. So the index is
+         * banked against the shard that reported it and only the totals speak
+         * for the run.
+         */
+        const { index, total, shard, runTotal } = parsed.data as {
+          index?: number;
+          total?: number;
+          shard?: number;
+          runTotal?: number;
+        };
+        if (label === 'test.started' && typeof index === 'number') {
+          const key = typeof shard === 'number' ? shard : -1;
+          setDoneByShard((prev) => (prev[key] === index ? prev : { ...prev, [key]: index }));
+          const forRun = typeof runTotal === 'number' ? runTotal : total;
+          if (typeof forRun === 'number') setSuiteTotal(forRun);
         }
       } catch {
         /* a malformed frame is not worth surfacing */
@@ -203,11 +355,31 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
       void load();
     };
 
-    for (const type of ['test.started', 'test.finished', 'step', 'verdict', 'run.finished']) {
+    for (const type of [
+      'test.started',
+      'test.finished',
+      'step',
+      'verdict',
+      'shard.started',
+      'shard.finished',
+      'run.finished',
+    ]) {
       source.addEventListener(type, record(type));
     }
     return () => source.close();
   }, [run?.status, runId, load, run]);
+
+  /*
+   * The elapsed clock for a running shard. Bound to the run's status so it
+   * stops the moment there is nothing moving — a finished run must not hold a
+   * timer open for as long as the tab is.
+   */
+  const ticking = run !== null && !TERMINAL.has(run.status) && (run.shards?.length ?? 0) > 0;
+  useEffect(() => {
+    if (!ticking) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [ticking]);
 
   if (error) {
     return (
@@ -225,6 +397,12 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const results = run.results ?? [];
   const selected = results.find((r) => r.test.id === selectedTestId) ?? results[0] ?? null;
   const step = selected?.steps.find((s) => s.index === selectedStep) ?? null;
+
+  // Empty on every run that was not split, which is most of them.
+  const shards = run.shards ?? [];
+  const pendingShards = shards.filter((s) => !SHARD_TERMINAL.has(s.status));
+  const doneShards = shards.length - pendingShards.length;
+  const testsDone = Object.values(doneByShard).reduce((a, b) => a + b, 0);
 
   return (
     <div className="flex h-full flex-col">
@@ -263,7 +441,18 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           {inFlight ? (
             <>
               <span className="text-ink-dim tabular-nums" aria-live="polite">
-                {progress ? `${progress.done} of ${progress.total}` : run.status.toLowerCase()}
+                {suiteTotal !== null
+                  ? `${testsDone} of ${suiteTotal}`
+                  : run.status.toLowerCase()}
+                {/* The one number that must never be missing from a sharded run
+                    in flight: a suite where four of five workers are done still
+                    has a fifth of its tests unrun. */}
+                {shards.length > 0 && (
+                  <span className="text-ink-faint">
+                    {' · '}
+                    {doneShards} of {shards.length} shards
+                  </span>
+                )}
               </span>
               <Button size="sm" variant="danger" loading={cancelling} onClick={() => void cancel()}>
                 Cancel
@@ -298,6 +487,62 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           </a>
         </div>
       </header>
+
+      {/*
+        ── The shards ──────────────────────────────────────────────────────
+        A full-width strip rather than a column, because it is about the run and
+        not about the selected test, and because a slow shard is only obvious
+        when the others are next to it. Absent entirely on an unsharded run.
+      */}
+      {shards.length > 0 && (
+        <section
+          aria-label="Shards"
+          className="border-line flex shrink-0 items-center gap-2 overflow-x-auto border-b px-5 py-2"
+        >
+          <p className="text-ink-dim shrink-0 text-xs">
+            <span className="tabular-nums">{doneShards}</span> of{' '}
+            <span className="tabular-nums">{shards.length}</span> shards done
+            {pendingShards.length > 0 && (
+              // Named, not counted. "Waiting on shard 3" is the sentence that
+              // stops someone reading a partial suite as a finished one.
+              <span className="text-ink-faint">
+                {' · waiting on '}
+                {pendingShards.map((s) => `#${s.index}`).join(', ')}
+              </span>
+            )}
+          </p>
+
+          {shards.map((shard) => {
+            const elapsed = shardElapsedMs(shard, now);
+            const failedItsTests = shard.status === 'FAILED' || shard.status === 'ABANDONED';
+            return (
+              <div
+                key={shard.id}
+                title={`Shard ${shard.index} of ${shard.total} · ${shard.testCount} tests · predicted ${wallClock(
+                  shard.estimatedMs,
+                )}${shard.errorMessage ? ` · ${shard.errorMessage}` : ''}`}
+                className={`flex shrink-0 items-center gap-2.5 rounded-md border px-2.5 py-1 ${
+                  failedItsTests ? 'border-fail/40 bg-fail/5' : 'border-line bg-surface-1'
+                }`}
+              >
+                <StatusDot status={shardDotStatus(shard)} />
+                <span className="text-ink-faint font-mono text-micro tabular-nums">
+                  #{shard.index}
+                </span>
+                <span className="text-xs">{SHARD_STATUS_LABEL[shard.status]}</span>
+                <span className="text-ink-faint text-micro tabular-nums">
+                  {shard.testCount} tests
+                </span>
+                {/* A shard that has not started has no elapsed time to show, and
+                    a dash is more honest than a zero. */}
+                <span className="text-ink-dim text-micro tabular-nums">
+                  {elapsed === null ? '—' : wallClock(elapsed)}
+                </span>
+              </div>
+            );
+          })}
+        </section>
+      )}
 
       <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr_380px]">
         {/* ── Left: the suite ─────────────────────────────────────────────── */}

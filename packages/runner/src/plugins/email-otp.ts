@@ -13,8 +13,9 @@
  * MailHog / Mailpit / Mailosaur expose the same shape.
  */
 
-import { chromium } from 'playwright';
 import { emailOtpSpecSchema } from '@qaai/shared';
+import { acquireBrowser } from '../browser-pool.js';
+import type { BrowserContext } from 'playwright';
 import type {
   ExecutableTest,
   RunContext,
@@ -128,9 +129,13 @@ export const emailOtpPlugin: RunnerPlugin = {
       ? spec.mailboxUrl
       : new URL(spec.mailboxUrl, ctx.baseUrl).toString();
 
-    const browser = await chromium.launch();
+    // A shared browser, a private context. This flow signs a user in, so its
+    // session cookies are the last thing that should survive into another test.
+    const lease = await acquireBrowser();
+    let context: BrowserContext | null = null;
+
     try {
-      const context = await browser.newContext();
+      context = await lease.browser.newContext();
       const page = await context.newPage();
 
       // 1. Ask the app to send a code.
@@ -184,7 +189,9 @@ export const emailOtpPlugin: RunnerPlugin = {
       );
       return finish(err instanceof Error ? err.message.slice(0, 300) : 'The flow could not run');
     } finally {
-      await browser.close().catch(() => {});
+      // The signed-in session dies with the test that created it.
+      if (context) await context.close().catch(() => {});
+      await lease.release();
     }
   },
 };

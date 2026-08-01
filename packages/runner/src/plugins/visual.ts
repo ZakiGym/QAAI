@@ -21,10 +21,11 @@
  *    finding.
  */
 
-import { chromium } from 'playwright';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import { visualTestSpecSchema } from '@qaai/shared';
+import { acquireBrowser } from '../browser-pool.js';
+import type { BrowserContext } from 'playwright';
 import type {
   ExecutableTest,
   Finding,
@@ -108,10 +109,16 @@ export const visualPlugin: RunnerPlugin = {
     };
 
     const viewportLabel = `${spec.viewport.width}x${spec.viewport.height}`;
-    const browser = await chromium.launch();
+
+    // Borrowed from the pool, so a suite of visual tests pays for one browser
+    // rather than one per screenshot. The context is per-test and disposable:
+    // the viewport below is exactly the kind of state that must not leak into
+    // whatever runs next.
+    const lease = await acquireBrowser();
+    let context: BrowserContext | null = null;
 
     try {
-      const context = await browser.newContext({
+      context = await lease.browser.newContext({
         viewport: spec.viewport,
         deviceScaleFactor: 1,
         ...(ctx.storageState ? { storageState: ctx.storageState as never } : {}),
@@ -281,7 +288,10 @@ export const visualPlugin: RunnerPlugin = {
         errorMessage: message,
       };
     } finally {
-      await browser.close().catch(() => {});
+      // Closed here rather than left to the pool's safety net, because this
+      // test's viewport and storage state end when this test does.
+      if (context) await context.close().catch(() => {});
+      await lease.release();
     }
   },
 };

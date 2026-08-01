@@ -1,10 +1,21 @@
 /**
  * Runs (§5) — enqueue, read, stream, and the artifact endpoint the cockpit's
  * screenshots and trace viewer load from.
+ *
+ * POST /runs also decides how much of a suite a run has to execute. Three
+ * optional inputs, all off unless asked for, all reasoned about in
+ * lib/run-selection.ts and all reported back in the response:
+ *
+ *   changedPaths  select the tests the diff can reach (lib/impact.ts)
+ *   useCache      report which of the skipped tests have a recent clean pass
+ *   failFast      stop at the first real failure — accepted, not yet enforced
+ *
+ * Nothing about the default path changed: a POST that asks for none of them
+ * loads the same column, queues the same job and executes the same suite it
+ * always has.
  */
 
 import { Router } from 'express';
-import { z } from 'zod';
 import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 import type { ShardAssignment, ShardPlan, ShardedRunJob } from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
@@ -16,6 +27,24 @@ import { subscribe } from '../lib/events.js';
 import { storage } from '../lib/storage.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
 import { env } from '../env.js';
+import { MAX_CHANGED_PATHS } from '../lib/impact.js';
+import {
+  MAX_CACHE_CANDIDATES,
+  MAX_REPORTED_DECISIONS,
+  cacheWindowMs,
+  describeSelection,
+  groupPriorsByTest,
+  planCacheReuse,
+  planFailFast,
+  selectTestsForRun,
+} from '../lib/run-selection.js';
+import type {
+  CacheCandidate,
+  CacheDecision,
+  PriorPass,
+  SelectionReport,
+  SelectionResult,
+} from '../lib/run-selection.js';
 
 export const runsRouter: Router = Router();
 
@@ -28,19 +57,6 @@ function currentPeriod(): Date {
 }
 
 // ─── Build sharding (§5) ─────────────────────────────────────────────────────
-
-/**
- * Sharding is opt-in per run.
- *
- * Parsed separately from `createRunSchema` rather than added to it: that schema
- * is the shared contract the CLI, the GitHub Action and the web app all compile
- * against, and a zod object ignores unknown keys, so `shards` arrives on the
- * body untouched and is validated here. Absent or 1 means the run behaves
- * exactly as it always has — one job, one worker, no shard rows.
- */
-const shardRequestSchema = z.object({
-  shards: z.number().int().min(1).max(50).nullish(),
-});
 
 /**
  * How many recent results per test to average. Five is enough to smooth a
@@ -187,14 +203,245 @@ async function planShards(orgId: string, testIds: string[], requested: number): 
   };
 }
 
+// ─── Result caching (§5) ─────────────────────────────────────────────────────
+
+/** Everything the selection and the cache need to read off a test row. */
+interface DetailedTest {
+  id: string;
+  name: string;
+  filePath: string;
+  code: string;
+  spec: unknown;
+  tags: string[];
+  feature: string | null;
+  priority: 'CRITICAL_PATH' | 'IMPORTANT' | 'NICE_TO_HAVE';
+  type: string;
+  quarantined: boolean;
+}
+
+interface CacheReport {
+  requested: boolean;
+  /**
+   * Whether reuse changed what this run executes. Always false today, and named
+   * so that nobody has to infer it — see `note`.
+   */
+  changesThisRun: boolean;
+  windowHours: number;
+  considered: number;
+  reusable: number;
+  note: string;
+  results: CacheDecision[];
+  resultsTruncated: number;
+}
+
+/**
+ * Why a cache hit does not (yet) shorten a run.
+ *
+ * Reuse is only ever offered for a test the diff cannot reach, which is a test
+ * impact analysis has already excluded — so the executed set is identical with
+ * and without `useCache`, and turning the cache on cannot make this run skip
+ * anything it would otherwise have done. What it adds is evidence: "these 31
+ * tests are not running AND were green an hour ago on this exact code" is a
+ * different claim from "these 31 tests are not running".
+ *
+ * Presenting that pass as a result OF THIS RUN — a green row in the cockpit, a
+ * pass the gate counts — is the part that needs storage: `TestResult.cacheKey`
+ * to make the match authoritative instead of reconstructed, and a
+ * `reusedFromResultId` so no view can ever render a cached pass as a fresh one.
+ * Both are columns, and columns are not this change's to add.
+ */
+const CACHE_EFFECT_NOTE =
+  'Reuse applies only to tests the change cannot reach, which are already excluded from this run — so this did not shorten the run, it recorded what is known about the tests being skipped. Counting a reused pass as a result of this run needs TestResult.cacheKey and a reused-from marker, so that no view can show a cached pass as a fresh one.';
+
+/**
+ * Which of the skipped tests have a recent clean pass we can stand behind.
+ *
+ * Two extra queries, both bounded and both only issued when a caller asked for
+ * this. The lookup is deliberately narrow: same environment, a run that actually
+ * reported, a pass that was not a retry, inside the window.
+ */
+async function evaluateResultCache(args: {
+  selection: SelectionResult | null;
+  detailed: DetailedTest[];
+  environment: { id: string; baseUrl: string; updatedAt: Date };
+  windowHours: number | null | undefined;
+}): Promise<CacheReport> {
+  const windowMs = cacheWindowMs(args.windowHours);
+  const windowHours = Math.round(windowMs / 3_600_000);
+
+  const inert = (note: string): CacheReport => ({
+    requested: true,
+    changesThisRun: false,
+    windowHours,
+    considered: 0,
+    reusable: 0,
+    note,
+    results: [],
+    resultsTruncated: 0,
+  });
+
+  if (!args.selection) {
+    return inert(
+      'Caching needs `changedPaths`. A previous pass can only stand in for a test the change cannot reach, and with no diff there is no way to know which tests those are, so nothing was reused.',
+    );
+  }
+
+  const skipped = args.selection.analysis.skip;
+  if (skipped.length === 0) {
+    return inert(
+      `Impact analysis skipped nothing (${args.selection.analysis.reason}), so there was no test a cached pass could speak for.`,
+    );
+  }
+  if (skipped.length > MAX_CACHE_CANDIDATES) {
+    // Declining costs nothing: these tests are excluded from the run either way.
+    return inert(
+      `${skipped.length} skipped tests is past the ${MAX_CACHE_CANDIDATES}-test lookup limit, so no cached evidence was gathered. The tests are excluded from this run regardless — that decision came from impact analysis, not from here.`,
+    );
+  }
+
+  const byId = new Map(args.detailed.map((test) => [test.id, test]));
+  const candidates: CacheCandidate[] = [];
+  for (const decision of skipped) {
+    const test = byId.get(decision.testId);
+    if (!test) continue;
+    candidates.push({
+      testId: test.id,
+      name: test.name,
+      testType: test.type,
+      code: test.code,
+      spec: test.spec,
+      quarantined: test.quarantined,
+      impactDecision: 'skip',
+      lastEditedAt: null,
+    });
+  }
+  if (candidates.length === 0) return inert('No skipped test could be matched to a test row.');
+
+  const candidateIds = candidates.map((c) => c.testId);
+  // One clock for the query and for the ageing decision — two calls to now()
+  // would let a result be inside the window for one and outside for the other.
+  const now = new Date();
+  const windowStart = new Date(now.getTime() - windowMs);
+
+  /*
+   * Only passes, only from this environment, only from runs that reported.
+   *
+   * Every one of these conditions is checked again in run-selection.ts. The
+   * duplication is the point: the query is an optimisation that can be edited by
+   * someone tuning performance, and the rule about what may be reused must not
+   * live somewhere an index change can quietly relax it.
+   */
+  const priorRows = await prisma.testResult.findMany({
+    where: {
+      testId: { in: candidateIds },
+      status: 'PASSED',
+      retriedAndPassed: false,
+      createdAt: { gte: windowStart },
+      run: {
+        environmentId: args.environment.id,
+        finishedAt: { not: null },
+        status: { in: ['PASSED', 'FAILED'] },
+      },
+    },
+    orderBy: { createdAt: 'desc' },
+    // Enough to hold several attempts per test without becoming an unbounded
+    // scan. Under-fetching can only cool the cache, never warm it wrongly.
+    take: Math.min(candidateIds.length * 4, 2000),
+    select: {
+      id: true,
+      testId: true,
+      status: true,
+      retriedAndPassed: true,
+      durationMs: true,
+      createdAt: true,
+      run: {
+        select: {
+          id: true,
+          environmentId: true,
+          baseUrlOverride: true,
+          status: true,
+          finishedAt: true,
+        },
+      },
+    },
+  });
+
+  // Grouped by `groupPriorsByTest` rather than inline: the inline version got
+  // this wrong once in a way that silently emptied the map and turned the whole
+  // cache into a no-op, so the loop now lives next to its test.
+  const priorsByTest = groupPriorsByTest(
+    priorRows.map(
+      (row): PriorPass => ({
+        resultId: row.id,
+        runId: row.run.id,
+        testId: row.testId,
+        status: row.status,
+        retriedAndPassed: row.retriedAndPassed,
+        durationMs: row.durationMs,
+        createdAt: row.createdAt,
+        runStatus: row.run.status,
+        runFinishedAt: row.run.finishedAt,
+        environmentId: row.run.environmentId,
+        // A preview-deploy run pointed somewhere else entirely; its passes belong
+        // to that URL, not to this environment's.
+        effectiveBaseUrl: row.run.baseUrlOverride ?? args.environment.baseUrl,
+        // No column to read it from yet — the reconstruction in run-selection.ts
+        // takes over, and is treated as the weaker evidence it is.
+        cacheKey: null,
+      }),
+    ),
+  );
+
+  /*
+   * When each test was last edited. Every path that writes `code` or `spec`
+   * writes a TestVersion alongside it — the editor, an applied heal, the agent —
+   * so a version row newer than a result is the signal that the test moved
+   * underneath that result.
+   *
+   * Only edits inside the window are fetched, and that is exact rather than
+   * approximate: every candidate result is itself inside the window, so an edit
+   * older than the window start is necessarily older than the result too.
+   */
+  const editRows = await prisma.testVersion.findMany({
+    where: { testId: { in: candidateIds }, createdAt: { gte: windowStart } },
+    select: { testId: true, createdAt: true },
+  });
+  const lastEdit = new Map<string, Date>();
+  for (const row of editRows) {
+    const seen = lastEdit.get(row.testId);
+    if (!seen || row.createdAt > seen) lastEdit.set(row.testId, row.createdAt);
+  }
+  for (const candidate of candidates) {
+    candidate.lastEditedAt = lastEdit.get(candidate.testId) ?? null;
+  }
+
+  const plan = planCacheReuse(candidates, priorsByTest, {
+    environmentId: args.environment.id,
+    effectiveBaseUrl: args.environment.baseUrl,
+    environmentUpdatedAt: args.environment.updatedAt,
+    now,
+    windowMs,
+  });
+
+  return {
+    requested: true,
+    changesThisRun: false,
+    windowHours,
+    considered: plan.considered,
+    reusable: plan.reusable,
+    note: CACHE_EFFECT_NOTE,
+    results: plan.decisions.slice(0, MAX_REPORTED_DECISIONS),
+    resultsTruncated: Math.max(0, plan.decisions.length - MAX_REPORTED_DECISIONS),
+  };
+}
+
 runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (req, res) => {
   const actor = actorOf(req);
   const input = createRunSchema.parse(req.body);
-  const shardInput = shardRequestSchema.parse(req.body);
 
   const environment = await prisma.environment.findUnique({
     where: { id: input.environmentId },
-    select: { id: true, projectId: true },
+    select: { id: true, projectId: true, baseUrl: true, updatedAt: true },
   });
   if (!environment) throw notFound('Environment');
 
@@ -216,26 +463,113 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
     });
   }
 
+  /*
+   * Selection is opt-in twice over. Nothing is ruled out without `changedPaths`,
+   * and caching additionally needs `useCache`. A run that asks for neither takes
+   * exactly the path it always has — including reading only the `id` column,
+   * so a project with a thousand Playwright files does not pay to load every
+   * one of them to decide it is running all of them anyway.
+   */
+  const changedPaths = (input.changedPaths ?? []).map((path) => path.trim()).filter(Boolean);
+  const wantsSelection = changedPaths.length > 0;
+  const wantsCache = input.useCache === true;
+
   /**
    * Rows under `fixtures/` are test DATA, not tests — they hold no runnable code.
    * Excluded from both selection paths, so neither "run everything" nor an
    * explicit id list can queue one and report it as a failure.
    */
-  const runnable = await prisma.test.findMany({
-    where: {
-      projectId: environment.projectId,
-      disabledAt: null,
-      filePath: { not: { startsWith: FIXTURE_PREFIX } },
-      ...(input.testIds ? { id: { in: input.testIds } } : {}),
-      ...(input.suiteId && !input.testIds ? { suiteId: input.suiteId } : {}),
-    },
-    select: { id: true },
-  });
-  const testIds = runnable.map((t) => t.id);
+  const candidateWhere = {
+    projectId: environment.projectId,
+    disabledAt: null,
+    filePath: { not: { startsWith: FIXTURE_PREFIX } },
+    ...(input.testIds ? { id: { in: input.testIds } } : {}),
+    ...(input.suiteId && !input.testIds ? { suiteId: input.suiteId } : {}),
+  };
+
+  /*
+   * Loaded only for a run that is going to select. `useCache` on its own does
+   * not qualify: reuse is defined against the tests a diff cannot reach, so with
+   * no diff there is nothing for these columns to answer, and reading every
+   * test's source to conclude that would be a very expensive way to say nothing.
+   */
+  const detailed: DetailedTest[] | null = wantsSelection
+    ? await prisma.test.findMany({
+        where: candidateWhere,
+        select: {
+          id: true,
+          name: true,
+          filePath: true,
+          code: true,
+          spec: true,
+          tags: true,
+          feature: true,
+          priority: true,
+          type: true,
+          quarantined: true,
+        },
+      })
+    : null;
+
+  const runnable: Array<{ id: string }> =
+    detailed ?? (await prisma.test.findMany({ where: candidateWhere, select: { id: true } }));
+
+  let testIds = runnable.map((t) => t.id);
 
   if (testIds.length === 0) {
     throw badRequest('There are no tests to run for that suite or project');
   }
+
+  /*
+   * Impact selection (§5). The analysis lives in lib/impact.ts and is unchanged
+   * here; what is new is that a caller no longer has to make two round trips and
+   * hand the answer back as `testIds` to get it. Most people were never going to
+   * do that, which meant the feature existed and nobody used it.
+   *
+   * The analysis is handed the candidate set rather than the whole project, so
+   * it answers the question this endpoint is actually being asked: of the tests
+   * this run was about to execute, which can the change reach?
+   */
+  let selection: SelectionResult | null = null;
+  let selectionReport: SelectionReport | null = null;
+
+  if (detailed && wantsSelection) {
+    // Latest crawl only. An older FlowMap describes an app that has since moved,
+    // and its stale routes would attach tests to features that no longer exist.
+    const flowMap = await prisma.flowMap.findFirst({
+      where: { projectId: environment.projectId },
+      orderBy: { version: 'desc' },
+      select: { graph: true, version: true },
+    });
+
+    selection = selectTestsForRun({
+      changedPaths,
+      tests: detailed.map((test) => ({
+        id: test.id,
+        name: test.name,
+        filePath: test.filePath,
+        code: test.code,
+        spec: test.spec,
+        tags: test.tags,
+        feature: test.feature,
+        priority: test.priority,
+      })),
+      flowMapGraph: flowMap?.graph ?? null,
+    });
+    selectionReport = describeSelection(selection, flowMap?.version ?? null);
+    testIds = selection.testIds;
+  }
+
+  const cacheReport = wantsCache
+    ? await evaluateResultCache({
+        selection,
+        detailed: detailed ?? [],
+        environment,
+        windowHours: input.cacheWindowHours,
+      })
+    : null;
+
+  const failFast = planFailFast(input.failFast === true);
 
   /*
    * The split, decided before anything is written so the run row, the result
@@ -247,8 +581,8 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
    * job, no shard rows, `shardIndex` null on every result.
    */
   const shardPlan =
-    shardInput.shards != null && shardInput.shards > 1
-      ? await planShards(actor.orgId, testIds, shardInput.shards)
+    input.shards != null && input.shards > 1
+      ? await planShards(actor.orgId, testIds, input.shards)
       : null;
   const grantedShards = shardPlan?.granted ?? 1;
   const sharded = grantedShards > 1;
@@ -350,6 +684,28 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       tests: testIds.length,
       trigger: input.trigger,
       ...(sharded ? { shards: grantedShards } : {}),
+      /*
+       * A run that executed 6 of 200 tests is a different event from one that
+       * executed 200, and six months later the audit log is the only place that
+       * still remembers which this was. The strategy and the counts are recorded
+       * for that reason; the per-test reasons stay in the response, because an
+       * audit row is not a place to put a thousand sentences.
+       */
+      ...(selectionReport
+        ? {
+            selection: {
+              strategy: selectionReport.strategy,
+              confidence: selectionReport.confidence,
+              changedPaths: changedPaths.length,
+              skipped: selectionReport.totals.skip,
+              of: selectionReport.totals.tests,
+            },
+          }
+        : {}),
+      ...(cacheReport
+        ? { cache: { considered: cacheReport.considered, reusable: cacheReport.reusable } }
+        : {}),
+      ...(failFast.requested ? { failFast: { enforced: failFast.enforced } } : {}),
     },
   });
 
@@ -359,6 +715,23 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
     // full list rather than replacing it.
     jobId: jobIds[0],
     ...(jobIds.length > 1 ? { jobIds } : {}),
+    /*
+     * What this run decided not to do, and why.
+     *
+     * Present whenever the caller asked for selection, including when the answer
+     * was "nothing could be ruled out" — a CI step that sends a diff and gets
+     * back a full suite needs to see the sentence explaining which file cost it
+     * the saving, or it will assume the feature is broken. A selection nobody
+     * can audit is a selection nobody should trust.
+     */
+    ...(selectionReport
+      ? { selection: { ...selectionReport, limits: { maxChangedPaths: MAX_CHANGED_PATHS } } }
+      : {}),
+    ...(cacheReport ? { cache: cacheReport } : {}),
+    // Echoed even though it changed nothing, precisely because it changed
+    // nothing: silently accepting a flag is how a caller comes to believe their
+    // runs stop early when every one of them has been running to the end.
+    ...(failFast.requested ? { failFast } : {}),
     // Reported whenever the caller asked, including when the answer is "no".
     // Asking for 20 workers on a plan that allows 5 gets 5, and finding that
     // out from a wall-clock that did not improve is a terrible way to learn it.

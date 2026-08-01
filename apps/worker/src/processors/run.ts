@@ -63,6 +63,38 @@ const SHARD_HEARTBEAT_MS = 30_000;
  */
 const STALE_SHARD_MS = 5 * 60_000;
 
+/**
+ * How long a shard may sit QUEUED before the sweep declares its job lost.
+ *
+ * ── The rule, stated plainly ────────────────────────────────────────────────
+ * **A shard that has been QUEUED for more than two hours is declared ABANDONED
+ * by the scheduler sweep, and only by the scheduler sweep.**
+ *
+ * Two hours is not a guess at how long a queue is; it is a deliberate refusal
+ * to guess. A queued shard is the NORMAL state on a busy pool — four workers
+ * and fifteen shards means the last one waits for the first eleven, and a load
+ * test in front of it can legitimately execute for twenty minutes. There is no
+ * signal that distinguishes "waiting its turn" from "its job no longer exists",
+ * because a lost job leaves nothing behind to look at: BullMQ's queue is the
+ * only record that it was ever enqueued, and a flushed Redis takes that with
+ * it. All that is left is age.
+ *
+ * So the threshold is set where the two errors stop being symmetrical. Reaping
+ * too early throws away tests that were about to run and reports a run as
+ * ERRORED that would have passed — the worst outcome this product can produce.
+ * Reaping too late costs a stuck run some extra hours of being stuck. At two
+ * hours a shard is either behind a backlog so deep that its verdict is already
+ * worthless, or its job is genuinely gone; and the reap does not destroy
+ * anything, because the run finalises ERRORED naming the shard and a human
+ * re-runs it. Nothing is silently skipped: an abandoned shard can never let a
+ * run report PASSED.
+ *
+ * It is deliberately more than twenty times STALE_SHARD_MS. A missing heartbeat
+ * is positive evidence that a worker died; sitting in a queue is evidence of
+ * nothing, so it takes far longer to act on.
+ */
+const STALE_QUEUED_SHARD_MS = 2 * 60 * 60_000;
+
 interface RunCounts {
   passed: number;
   failed: number;
@@ -182,6 +214,11 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         `Cloud grid ${gridIntegration.kind} is configured but its credentials could not be used: ${
           err instanceof Error ? err.message : 'unknown error'
         }`,
+        // The message says what broke; the cause says which of the vault open,
+        // the key version lookup or the endpoint build actually threw. That
+        // stack is the whole diagnosis, and this error ends up in a run's
+        // errorMessage being read by someone who was not here when it happened.
+        { cause: err },
       );
     }
   }
@@ -503,7 +540,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           counts.failed += 1;
       }
 
-      await updateFlakeStats(test.id, execution.status, execution.retriedAndPassed);
+      await updateFlakeStats(test.id, execution.status);
 
       publishEvent(orgId, {
         runId: run.id,
@@ -718,19 +755,31 @@ async function claimShard(orgId: string, runId: string, shard: RunShardRef): Pro
  * PASSED.** Something has to say so, or one crashed worker leaves a run RUNNING
  * forever and the suite it was gating never reports at all.
  *
- * QUEUED shards are deliberately NOT reaped. A shard sitting in the queue has
- * not been picked up yet, which on a busy pool is normal and expected: with
- * four workers and fifteen shards, the last shard is queued for as long as the
- * first eleven take. Reaping on age would abandon work that was about to run.
- * The consequence is honest and worth stating — if a shard's queue job is lost
- * outright (a flushed Redis), the run stays RUNNING until someone re-runs it.
- * A maximum-run-age sweep belongs in the scheduler tick, not here, because this
- * function only ever executes when some *other* shard finishes.
+ * QUEUED shards are reaped only on age, only by the scheduler sweep, and only
+ * past STALE_QUEUED_SHARD_MS — see `queuedSince` below. A shard sitting in the
+ * queue has not been picked up yet, which on a busy pool is normal and expected:
+ * with four workers and fifteen shards, the last shard is queued for as long as
+ * the first eleven take. Reaping one on the sibling path would abandon work that
+ * was about to run, so this function's callers on that path pass null and the
+ * queue is left alone entirely.
  *
  * The update is conditional on the same staleness it tested, so a shard that
- * comes back to life between the read and the write keeps its slice.
+ * comes back to life between the read and the write keeps its slice. The same
+ * holds for the queued sweep: a worker that picks the job up first wins the
+ * `status: 'QUEUED'` match, and one that picks it up after the reap finds the
+ * row ABANDONED and `claimShard` declines it. There is no window in which both
+ * happen.
  */
-async function reapDeadShards(orgId: string, runId: string): Promise<number> {
+async function reapDeadShards(
+  orgId: string,
+  runId: string,
+  /**
+   * When set, ALSO reap shards that have been QUEUED since before this instant
+   * — their queue job is gone and nothing will ever pick them up. Null on the
+   * sibling path, where a queued shard means "not yet", not "never".
+   */
+  queuedSince: Date | null = null,
+): Promise<number> {
   const staleBefore = new Date(Date.now() - STALE_SHARD_MS);
 
   const reaped = await prisma.runShard.updateMany({
@@ -753,7 +802,35 @@ async function reapDeadShards(orgId: string, runId: string): Promise<number> {
   if (reaped.count > 0) {
     logger.error({ runId, shards: reaped.count }, 'reaped shards whose worker went silent');
   }
-  return reaped.count;
+  if (!queuedSince) return reaped.count;
+
+  /*
+   * The lost-job case. This shard was never picked up by anybody: no startedAt,
+   * no heartbeat, nothing above would ever match it, and `completeShardedRun`
+   * counts it as pending forever. It is the reason a sharded run whose jobs are
+   * flushed out of Redis hangs with no verdict.
+   *
+   * Filtered on the shard's own `queuedAt` rather than the run's age, because
+   * that is when THIS slice started waiting.
+   */
+  const lost = await prisma.runShard.updateMany({
+    where: { orgId, runId, status: 'QUEUED', queuedAt: { lt: queuedSince } },
+    data: {
+      status: 'ABANDONED',
+      finishedAt: new Date(),
+      errorMessage:
+        `Queued for over ${Math.round(STALE_QUEUED_SHARD_MS / 60_000)} minutes and never picked up — ` +
+        `the job for this shard is gone. The tests in it did not run; re-run to execute them.`,
+    },
+  });
+
+  if (lost.count > 0) {
+    logger.error(
+      { runId, shards: lost.count, queuedSince },
+      'reaped shards whose queue job was never delivered',
+    );
+  }
+  return reaped.count + lost.count;
 }
 
 /**
@@ -788,13 +865,43 @@ async function completeShardedRun(args: {
   const { orgId, run, shardIndex } = args;
   const bySweep = shardIndex === null;
 
-  await reapDeadShards(orgId, run.id);
+  /*
+   * Only the sweep may reap on queue age. A shard finishing has no idea how
+   * long the pool is, and reaping a sibling that is simply waiting its turn
+   * would skip its tests — so the sibling path passes null and never touches a
+   * QUEUED row.
+   */
+  await reapDeadShards(
+    orgId,
+    run.id,
+    bySweep ? new Date(Date.now() - STALE_QUEUED_SHARD_MS) : null,
+  );
 
   const shards = await prisma.runShard.findMany({
     where: { orgId, runId: run.id },
     select: { index: true, status: true, errorMessage: true },
     orderBy: { index: 'asc' },
   });
+
+  /*
+   * No shard rows at all. Every check below is a question about rows, and an
+   * empty set answers all of them with "nothing is pending" — which would
+   * finalise the run on the spot, over placeholder results, as a clean pass
+   * across a suite that never executed. That is the single worst outcome this
+   * feature has, so it is refused rather than reasoned about.
+   *
+   * Callers are supposed to make it impossible: a shard only calls in after
+   * writing its own row, and the sweep filters on `shardCount > 1`. Reaching
+   * here anyway means the run row and the shard table disagree, and a run stuck
+   * with no verdict is a much better failure than a green one.
+   */
+  if (shards.length === 0) {
+    logger.error(
+      { runId: run.id, shard: shardIndex },
+      'a run marked as sharded has no shard rows; refusing to finalise a suite whose slices are unknown',
+    );
+    return;
+  }
 
   const pending = shards.filter((s) => !RUN_SHARD_TERMINAL.includes(s.status));
   if (pending.length > 0) {
@@ -871,19 +978,44 @@ async function completeShardedRun(args: {
  * code path: reap what is stale, and if that leaves every shard terminal,
  * finalise exactly as the last shard would have. A run with living shards is
  * untouched however long it takes.
+ *
+ * ── The second hole: a run that never started ───────────────────────────────
+ * This used to look only at runs already in RUNNING, which meant it could not
+ * see the case where the jobs are lost while every shard is still QUEUED — a
+ * flushed Redis, or a queue drained by hand. Nothing had picked a slice up, so
+ * `startedAt` was null and the run's status was still QUEUED, and the sweep's
+ * own filter excluded it from the sweep that exists to rescue it. That run hung
+ * forever with no verdict at all.
+ *
+ * Both statuses are candidates now, aged on `queuedAt` (which every run has)
+ * rather than `startedAt` (which a never-started run does not). `queuedAt` is
+ * always at or before `startedAt`, so this admits strictly more than the old
+ * filter did and can never miss a run it used to catch — the reaping conditions,
+ * not the prefilter, are what decide anything.
  */
 export async function sweepStalledShardedRuns(): Promise<number> {
   // Only runs old enough that a dead shard would already be past the staleness
   // window. Younger ones cannot have anything to reap, and a shard that is
-  // simply queued behind a busy pool must never be mistaken for a dead one.
+  // simply queued behind a busy pool must never be mistaken for a dead one —
+  // that one is held to the far longer STALE_QUEUED_SHARD_MS, applied per shard
+  // inside reapDeadShards.
   const before = new Date(Date.now() - STALE_SHARD_MS);
 
   const candidates = await prisma.run.findMany({
     where: {
-      status: 'RUNNING',
+      status: { in: ['QUEUED', 'RUNNING'] },
+      /*
+       * Sharded runs only, and this filter is load-bearing rather than an
+       * optimisation. An UNSHARDED run has no RunShard rows, so handing one to
+       * `completeShardedRun` would ask "are all its shards terminal?" of an
+       * empty set. That guard is now inside the function too, but the run also
+       * simply does not belong here: a stuck unsharded run needs a different
+       * remedy, and inventing one on this tick is how a suite that never
+       * executed reports a clean pass.
+       */
       shardCount: { gt: 1 },
       finalizedAt: null,
-      startedAt: { lt: before },
+      queuedAt: { lt: before },
     },
     select: {
       id: true,
@@ -892,6 +1024,11 @@ export async function sweepStalledShardedRuns(): Promise<number> {
       prNumber: true,
       project: { select: { gateRules: true } },
     },
+    // Oldest first. With the cap below, a pool holding more than 100 live
+    // sharded runs would otherwise leave the same unlucky run unswept tick
+    // after tick — and age is exactly the signal that says which ones are worth
+    // looking at, since a healthy run leaves the candidate set by finishing.
+    orderBy: { queuedAt: 'asc' },
     // A bounded sweep: whatever is left waits for the next tick rather than
     // holding the tick open behind an unbounded scan.
     take: 100,
@@ -1046,12 +1183,14 @@ async function persistExecution(args: {
  * Flake radar (§5). Maintained incrementally on write rather than computed on
  * read — the cockpit sorts and filters on flake rate, and a scan of every past
  * result per test would make the suite tree slow the moment history exists.
+ *
+ * It took a `retriedAndPassed` argument and never read it. Not an oversight
+ * worth restoring: `persistExecution` writes the current result BEFORE this is
+ * called, so the row is already inside the fifty this reads back and passing
+ * the flag in would have counted it twice. The parameter is gone rather than
+ * underscore-prefixed so nobody re-plumbs it on the assumption it was needed.
  */
-async function updateFlakeStats(
-  testId: string,
-  status: TestResultStatus,
-  retriedAndPassed: boolean,
-): Promise<void> {
+async function updateFlakeStats(testId: string, status: TestResultStatus): Promise<void> {
   const recent = await prisma.testResult.findMany({
     where: { testId },
     orderBy: { createdAt: 'desc' },
@@ -1064,30 +1203,38 @@ async function updateFlakeStats(
 
   const test = await prisma.test.findUnique({
     where: { id: testId },
-    select: { consecutiveFailures: true, quarantined: true },
+    // `quarantined` was read only by the auto-quarantine that used to live
+    // here; the streak is all this function needs now.
+    select: { consecutiveFailures: true },
   });
 
   const consecutiveFailures =
     status === 'PASSED' ? 0 : (test?.consecutiveFailures ?? 0) + (status === 'FAILED' ? 1 : 0);
 
-  // Auto-quarantine: a test flaking more than a fifth of the time is noise, and
-  // noise that gates a build gets the whole gate ignored. It keeps running.
-  const shouldQuarantine = !test?.quarantined && flakeRate > 20 && recent.length >= 5;
-
+  /*
+   * This function records the flake RATE. It deliberately no longer decides
+   * anything.
+   *
+   * It used to auto-quarantine inline: `flakeRate > 20 && recent.length >= 5`.
+   * That predates processors/flake.ts, and once that existed the two were
+   * competing policies over the same column — with the weaker one winning,
+   * because it fired first, on every run.
+   *
+   * Weaker in every respect that matters. It had no REAL_BUG veto, so a test
+   * whose failures a human had already triaged as a genuine bug could be
+   * quarantined and quietly stop gating — verified: a CRITICAL_PATH test with
+   * five REAL_BUG verdicts was quarantined at "83% flake rate" here. It had no
+   * critical-path protection. It acted on five runs where the policy requires a
+   * minimum sample size. It wrote NO audit row, so the suppression was
+   * invisible. And "flaked 20% of the last 5 runs" is a suspicion, where
+   * flake.ts re-runs the test and measures the actual rate.
+   *
+   * Suppressing a signal is the most dangerous thing this product does, so it
+   * happens in exactly one place, with evidence, and always audited.
+   */
   await prisma.test.update({
     where: { id: testId },
-    data: {
-      flakeRate,
-      lastRunAt: new Date(),
-      consecutiveFailures,
-      ...(shouldQuarantine
-        ? {
-            quarantined: true,
-            quarantinedAt: new Date(),
-            quarantineReason: `Auto-quarantined at a ${flakeRate.toFixed(0)}% flake rate over the last ${recent.length} runs`,
-          }
-        : {}),
-    },
+    data: { flakeRate, lastRunAt: new Date(), consecutiveFailures },
   });
 }
 

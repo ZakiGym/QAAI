@@ -1544,6 +1544,73 @@ export const createRunSchema = z.object({
   trigger: z.enum(['MANUAL', 'SCHEDULE', 'CI', 'WEBHOOK', 'MONITOR']).default('MANUAL'),
   commitSha: z.string().nullish(),
   prNumber: z.number().int().nullish(),
+
+  /**
+   * Split the suite across this many parallel workers (§5 build sharding).
+   *
+   * Folded in from a second schema that parsed the same body inside the runs
+   * route. Zod objects ignore unknown keys, so that arrangement worked — and it
+   * meant the one contract the CLI, the GitHub Action and the web app compile
+   * against did not mention the feature at all, so a caller could only discover
+   * sharding by reading the server. Absent or 1 keeps the old behaviour
+   * exactly: one job, one worker, no shard rows.
+   */
+  shards: z.number().int().min(1).max(50).nullish(),
+
+  /**
+   * The PR's changed files, so a run can execute only the tests that change can
+   * actually reach (apps/api/src/lib/impact.ts does the reasoning).
+   *
+   * Paths exactly as the diff reports them — `git diff --name-only
+   * --no-renames`, or GitHub's files API. BOTH SIDES OF A RENAME MUST BE SENT:
+   * the analysis reasons about the routes a path serves, and a rename it hears
+   * only the new half of reads as "a new page appeared" rather than "the old
+   * page is gone", which parks every test that still visits the old URL on the
+   * exact commit that 404s them.
+   *
+   * Omitted or empty means no selection at all — the whole suite runs.
+   * Selection is never something a caller gets by accident.
+   *
+   * The cap is a request-size guard, not the analysis limit: a diff wider than
+   * the analysis can attribute is answered with "run everything", never with an
+   * error, because a caller with a huge diff wants a safe answer rather than a
+   * 400. Matches the cap on POST /impact/analyze so the same array can be sent
+   * to either endpoint.
+   */
+  changedPaths: z.array(z.string().min(1).max(1024)).max(10_000).nullish(),
+
+  /**
+   * Let a test whose own code and spec have not changed reuse its previous
+   * PASSED result instead of running again.
+   *
+   * Opt-in per run, and inert without `changedPaths`: "this test has not
+   * changed" is only half the question, and the other half — "and nothing in
+   * the diff can reach it" — cannot be answered without a diff.
+   */
+  useCache: z.boolean().nullish(),
+
+  /**
+   * How old a passing result may be and still be reused. Configurable because
+   * the right number is a property of the deployment rather than of this code:
+   * an app that ships once a fortnight can trust a week-old green, and one that
+   * ships hourly cannot trust yesterday's. Absent means the server default.
+   */
+  cacheWindowHours: z
+    .number()
+    .int()
+    .min(1)
+    .max(24 * 14)
+    .nullish(),
+
+  /**
+   * Stop the run at the first real failure, for when the only question is "is
+   * this PR safe to merge" and the rest of the suite's answers are not worth
+   * the minutes.
+   *
+   * A flake, a quarantined test and a skipped one are not real failures and
+   * stop nothing — a fail-fast that trips on noise is one people turn off.
+   */
+  failFast: z.boolean().nullish(),
 });
 
 // ─── Chat (§3.5) ─────────────────────────────────────────────────────────────

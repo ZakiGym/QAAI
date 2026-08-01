@@ -43,14 +43,90 @@ function matchesFilter(run: Run, filter: StatusFilter): boolean {
   }
 }
 
+// ─── Parallelism ─────────────────────────────────────────────────────────────
+
+/**
+ * `shardCount` is a column on Run and comes back on every row, but the shared
+ * `Run` interface in lib/api.ts — which this page does not own — does not
+ * describe it yet. Narrowed here rather than cast away; it belongs in lib/api.ts
+ * next time that file is opened.
+ */
+type RunRow = Run & { shardCount?: number };
+
+/** Only the parts of GET /billing this page needs: the ceiling, and its name. */
+interface PlanCap {
+  plan: string;
+  limits: { label: string; maxParallelWorkers: number };
+}
+
+/** What the API answered when asked to split — reported whether or not it could. */
+interface ShardingReport {
+  requested: number;
+  granted: number;
+  cappedBy: 'plan' | 'tests' | null;
+  maxParallelWorkers: number;
+}
+
+/**
+ * The counts offered in the picker.
+ *
+ * A ladder rather than 1…N: the ceiling is 50 on the top plan, and a fifty-item
+ * dropdown is not a choice, it is a list. Every rung a plan actually allows is
+ * on it, and the ceiling itself is always offered even if it lands off-ladder.
+ */
+const SHARD_LADDER = [1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50];
+
+function shardOptionsFor(max: number): number[] {
+  const rungs = SHARD_LADDER.filter((n) => n <= max);
+  return rungs.includes(max) ? rungs : [...rungs, max];
+}
+
+/**
+ * What actually happened, said plainly.
+ *
+ * The endpoint clamps a request to what the plan and the suite allow, and a
+ * user who asked for eight workers and got five must be told that here — the
+ * alternative is learning it from a wall clock that did not improve as much as
+ * expected, which is a terrible way to find out what you are paying for.
+ */
+function describeSharding(report: ShardingReport | undefined, planLabel: string | null): string {
+  // Reported even when the answer is "it could not be split at all", because a
+  // request that quietly became one shard is the case worth naming.
+  if (!report) return 'Run queued.';
+  if (report.granted < 2) {
+    return report.cappedBy === 'plan'
+      ? `Run queued on one worker. Your ${planLabel ?? 'current'} plan does not include parallel workers.`
+      : 'Run queued on one worker — there is only one test to run.';
+  }
+
+  const across = `Run queued across ${report.granted} shards.`;
+  if (report.cappedBy === 'plan') {
+    return `${across} You asked for ${report.requested}; your ${planLabel ?? 'current'} plan allows ${report.maxParallelWorkers} parallel workers.`;
+  }
+  if (report.cappedBy === 'tests') {
+    return `${across} You asked for ${report.requested}, and the suite only has ${report.granted} tests to fill them.`;
+  }
+  return across;
+}
+
 export default function RunsPage() {
   const router = useRouter();
   const toast = useToast();
   const [projects, setProjects] = useState<Project[]>([]);
-  const [runs, setRuns] = useState<Run[]>([]);
+  const [runs, setRuns] = useState<RunRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [startingEnv, setStartingEnv] = useState<string | null>(null);
   const [filter, setFilter] = useState<StatusFilter>('all');
+  /**
+   * The org's parallel-worker ceiling, or null while we do not know it.
+   *
+   * Null hides the picker entirely, and that is the fail-safe direction: if
+   * /billing is slow or unreachable, the page keeps working and every run
+   * behaves exactly as it did before this control existed. Offering a choice we
+   * cannot honour would be worse than not offering one.
+   */
+  const [planCap, setPlanCap] = useState<PlanCap | null>(null);
+  const [shardCount, setShardCount] = useState(1);
   // Both collections initialise to `[]`, so without this the empty state — "No
   // runs yet" — is what renders during the very first fetch, telling the user
   // there is nothing there before we know. Only the first load shows skeletons;
@@ -61,7 +137,7 @@ export default function RunsPage() {
     try {
       const [p, r] = await Promise.all([
         api<{ projects: Project[] }>('/projects'),
-        api<{ runs: Run[] }>('/runs?limit=25'),
+        api<{ runs: RunRow[] }>('/runs?limit=25'),
       ]);
       setProjects(p.projects);
       setRuns(r.runs);
@@ -85,6 +161,24 @@ export default function RunsPage() {
     return () => clearInterval(timer);
   }, [load]);
 
+  // Fetched once and kept out of the poll: a plan does not change every four
+  // seconds, and a billing hiccup must not take the runs list down with it.
+  useEffect(() => {
+    let live = true;
+    api<PlanCap>('/billing')
+      .then((billing) => {
+        if (live) setPlanCap(billing);
+      })
+      .catch(() => {
+        /* the picker simply stays hidden; runs still start */
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const maxWorkers = planCap?.limits.maxParallelWorkers ?? 1;
+
   const counts = useMemo<Record<StatusFilter, number>>(
     () => ({
       all: runs.length,
@@ -103,11 +197,17 @@ export default function RunsPage() {
   async function startRun(environmentId: string) {
     setStartingEnv(environmentId);
     try {
-      const { run } = await api<{ run: Run }>('/runs', {
+      const { run, sharding } = await api<{ run: Run; sharding?: ShardingReport }>('/runs', {
         method: 'POST',
-        body: JSON.stringify({ environmentId, trigger: 'MANUAL' }),
+        body: JSON.stringify({
+          environmentId,
+          trigger: 'MANUAL',
+          // Omitted, not sent as 1: a body without `shards` takes the exact
+          // path every manual run took before this control existed.
+          ...(shardCount > 1 ? { shards: shardCount } : {}),
+        }),
       });
-      toast.success('Run queued.', {
+      toast.success(describeSharding(sharding, planCap?.limits.label ?? null), {
         label: 'View it',
         run: () => router.push(`/runs/${run.id}`),
       });
@@ -141,6 +241,56 @@ export default function RunsPage() {
             </Link>
           }
         />
+
+        {/*
+          The parallelism control sits above the Run buttons rather than inside
+          each card: it is one choice that applies to whichever button you press
+          next, and repeating it per environment would imply otherwise.
+        */}
+        {planCap && (
+          <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <label htmlFor="shard-count" className="text-ink-dim shrink-0 text-sm">
+              Split across
+            </label>
+            <select
+              id="shard-count"
+              value={shardCount}
+              disabled={maxWorkers < 2}
+              onChange={(e) => setShardCount(Number(e.target.value))}
+              className="border-line bg-surface-1 rounded-md border px-2.5 py-1.5 text-sm tabular-nums disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {shardOptionsFor(maxWorkers).map((n) => (
+                <option key={n} value={n}>
+                  {n === 1 ? '1 shard' : `${n} shards`}
+                </option>
+              ))}
+            </select>
+            {/*
+              The cap is stated, never silently applied. A Free-plan user who
+              cannot split needs to know that is the plan talking and not a
+              broken control — and where to go if they want it.
+            */}
+            <p className="text-ink-faint text-micro">
+              {maxWorkers < 2 ? (
+                <>
+                  Your <span className="text-ink-dim">{planCap.limits.label}</span> plan runs one
+                  worker at a time, so a suite cannot be split.{' '}
+                  <Link href="/settings/billing" className="text-accent hover:underline">
+                    Compare plans
+                  </Link>
+                </>
+              ) : (
+                <>
+                  Up to <span className="tabular-nums">{maxWorkers}</span> parallel workers on your{' '}
+                  <span className="text-ink-dim">{planCap.limits.label}</span> plan. Tests are
+                  divided between shards by how long they recently took, so each one finishes at
+                  about the same time.
+                </>
+              )}
+            </p>
+          </div>
+        )}
+
         <div className="grid gap-3 sm:grid-cols-2">
           {loading ? (
             <>
@@ -235,6 +385,14 @@ export default function RunsPage() {
                     {run.environment.name}
                     <span className="text-ink-faint"> · {run.trigger.toLowerCase()}</span>
                   </span>
+                  {/* Only on runs that were actually split — 1 is the default
+                      and saying "1 shard" on every row would be noise. */}
+                  {(run.shardCount ?? 1) > 1 && (
+                    <Badge tone="accent">
+                      <span className="tabular-nums">{run.shardCount}</span>
+                      <span className="ml-1">shards</span>
+                    </Badge>
+                  )}
                   <span className="ml-auto flex items-center gap-3 text-xs tabular-nums">
                     {run.passedCount > 0 && (
                       <span className="text-pass">{run.passedCount} passed</span>

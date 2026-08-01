@@ -29,20 +29,39 @@
  *  - A runner whose report QAAI cannot read from a single file — a Surefire
  *    glob, a `go test -json` stream — falls back to the process's own exit code
  *    rather than inventing per-test rows it does not have.
+ *
+ * This plugin is also where HERMETIC REPLAY is wired in (../har.ts). A test
+ * whose spec asks for `har.mode` gets the recorder or the replayer installed
+ * into its Playwright process, and — the part that matters — every result says
+ * whether the run actually was hermetic. See `runWithHar`.
  */
 
-import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { Buffer } from 'node:buffer';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, extname, join, normalize, relative, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EXTERNAL_REPORT_FORMATS, ecosystemById, externalTestSpecSchema, resolveEcosystemCommand } from '@qaai/shared';
 import type {
   Ecosystem,
   ExecutableTest,
   ExternalReportFormat,
   ExternalTestSpec,
+  NetworkEntry,
   RunContext,
   RunnerPlugin,
   TestExecution,
 } from '@qaai/shared';
+import {
+  archiveRecordedAt,
+  parseArchive,
+  parseHarConfig,
+  readHarRunDir,
+  stalenessWarning,
+  summariseHarRun,
+  unroutableTransports,
+} from '../har.js';
+import type { HarConfig, HarRunReport, HarRuntimeOptions } from '../har.js';
 import { runPlaywrightSpec } from '../playwright-harness.js';
 import { runExternal } from './external.js';
 
@@ -410,28 +429,296 @@ async function runInEcosystem(
   }
 }
 
+// ─── Hermetic replay ─────────────────────────────────────────────────────────
+
+/**
+ * The HAR runtime is copied into the run workspace beside the spec.
+ *
+ * Beside, rather than at the workspace root, because `test.filePath` can be
+ * nested to any depth and a sibling import (`./__qaai_har__.js`) is the one
+ * relative path that does not depend on how deep it is. The name matches
+ * nothing in Playwright's default `testMatch`, so the runner will not try to
+ * collect it as a test.
+ */
+const HAR_RUNTIME_MODULE = '__qaai_har__.ts';
+
+let harSourceCache: string | null = null;
+
+/**
+ * The runtime shipped into the Playwright process is `../har.ts` ITSELF, read
+ * off disk and copied verbatim.
+ *
+ * The alternative — a template string that reimplements matching and redaction
+ * for the browser process — is the same logic written twice, and the copy that
+ * runs is the one nothing tests. Copying the real module means the matcher the
+ * unit tests exercise is byte-for-byte the matcher that decides whether a
+ * request is served from a recording. `.js` is tried after `.ts` so a compiled
+ * build works too.
+ */
+async function harRuntimeSource(): Promise<string> {
+  if (harSourceCache !== null) return harSourceCache;
+  const problems: string[] = [];
+  for (const candidate of ['../har.ts', '../har.js']) {
+    try {
+      const source = await readFile(fileURLToPath(new URL(candidate, import.meta.url)), 'utf8');
+      harSourceCache = source;
+      return source;
+    } catch (err) {
+      problems.push(`${candidate}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  throw new Error(`QAAI could not read its own HAR runtime (${problems.join('; ')})`);
+}
+
+/** Where the runtime goes, mirroring how the harness places the spec itself. */
+function harModuleFixturePath(filePath: string): string | null {
+  const cleaned = filePath.replace(/^[/\\]+/, '');
+  const withExt = extname(cleaned) ? cleaned : `${cleaned}.spec.ts`;
+  const dir = dirname(withExt);
+  const rel = normalize(join('tests', dir === '.' ? '' : dir, HAR_RUNTIME_MODULE));
+  return rel === '..' || rel.startsWith(`..${sep}`) ? null : rel;
+}
+
+/**
+ * The block appended to the spec. Appended, not prepended, so every line number
+ * in a failure still points at the line the author wrote.
+ *
+ * `test` is imported here rather than reusing whatever the spec called it: it
+ * is the same module instance, so it is the same object, and Playwright records
+ * hooks against the file's suite rather than against a test type — which means
+ * this also works for a spec that runs on a `base.extend()` fixture of its own.
+ */
+function harEpilogue(options: HarRuntimeOptions): string {
+  const specifier = `./${HAR_RUNTIME_MODULE.replace(/\.ts$/, '.js')}`;
+  return `
+
+/* ── injected by QAAI: hermetic network ${options.config.mode} ────────────────
+ * Not part of your test. This block exists only inside the temporary run
+ * workspace — the spec QAAI stores and exports stays a plain Playwright spec
+ * with no QAAI import in it.
+ */
+import { test as __qaaiTest } from '@playwright/test';
+import { installHar as __qaaiInstallHar } from ${JSON.stringify(specifier)};
+__qaaiInstallHar(__qaaiTest, ${JSON.stringify(options)});
+`;
+}
+
+/**
+ * Puts the hermeticity verdict where a human will read it: the top of the
+ * result message, ahead of the test's own error, because a truncated message
+ * must not be the one that loses "this run was not actually hermetic".
+ */
+function withNotice(execution: TestExecution, notice: string): TestExecution {
+  return {
+    ...execution,
+    errorMessage: execution.errorMessage ? `${notice}\n\n${execution.errorMessage}` : notice,
+  };
+}
+
+/**
+ * The network the run actually made, from the HAR report.
+ *
+ * E2E has always returned an empty `network` array — Playwright puts network in
+ * the trace, not in the JSON report — so interception is the first time triage
+ * gets to see the requests. URLs and bodies arrive already redacted, because
+ * they were redacted at capture.
+ */
+function harNetworkEntries(report: HarRunReport | null): NetworkEntry[] {
+  return (report?.entries ?? []).map((entry) => ({
+    method: entry.method,
+    url: entry.url,
+    status: entry.status,
+    durationMs: entry.durationMs,
+    responseBodySnippet: entry.bodySnippet,
+  }));
+}
+
+/**
+ * Run a Playwright spec with record or replay installed.
+ *
+ * Every exit from this function states the hermeticity of the run. There is no
+ * path where interception silently does not happen: a missing recording is a
+ * SKIP with the fix, a runtime that would not load is a SKIP that blames QAAI
+ * and not the application, and a run that reached the live network says NOT
+ * HERMETIC in the first line of its message even when the test passed.
+ */
+async function runWithHar(
+  ctx: RunContext,
+  test: ExecutableTest,
+  config: HarConfig,
+): Promise<TestExecution> {
+  const startedAt = Date.now();
+  const fixtures = ctx.fixtures ?? {};
+
+  // Replay needs a recording, and the honest time to discover it does not have
+  // one is before a browser is paid for. A missing or unreadable recording is a
+  // configuration gap: nothing was evaluated, and nothing is claimed about the app.
+  let staleness: string | null = null;
+  if (config.mode === 'replay') {
+    const raw = fixtures[config.path];
+    if (raw === undefined) {
+      return notEvaluated(
+        test,
+        startedAt,
+        `"${test.name}" asks to replay network from ${config.path}, and this run has no such fixture, so nothing was executed. Record one first: set the test's spec to {"har": {"mode": "record", "path": "${config.path}"}}, run it once against a live environment, then commit the artifact it produces as ${config.path}.`,
+      );
+    }
+    try {
+      staleness = stalenessWarning(archiveRecordedAt(parseArchive(raw)), config.maxAgeDays);
+    } catch (err) {
+      return notEvaluated(
+        test,
+        startedAt,
+        `"${test.name}" was not evaluated: the recording at ${config.path} cannot be read — ${
+          err instanceof Error ? err.message : String(err)
+        }. Re-record it with har.mode = "record".`,
+      );
+    }
+  }
+
+  const modulePath = harModuleFixturePath(test.filePath);
+  let source: string | null = null;
+  let setupProblem: string | null = null;
+  if (!modulePath) {
+    setupProblem = `the test's file path (${test.filePath}) does not resolve inside the run workspace`;
+  } else {
+    try {
+      source = await harRuntimeSource();
+    } catch (err) {
+      setupProblem = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // QAAI could not set interception up. Running the test anyway is right — the
+  // customer still gets their verdict — but the run is not hermetic and the
+  // result has to say so rather than let a "replay" label stand.
+  if (!modulePath || source === null) {
+    const execution = await runPlaywrightSpec(ctx, test);
+    return withNotice(
+      execution,
+      `NOT HERMETIC: HAR ${config.mode} was requested but could not be set up (${setupProblem}); this run used the live network.`,
+    );
+  }
+
+  const dir = await mkdtemp(join(tmpdir(), 'qaai-har-'));
+  try {
+    const options: HarRuntimeOptions = {
+      config,
+      baseUrl: ctx.baseUrl,
+      // Names only. The Playwright process already has the values in its
+      // environment (the harness puts them there); sending them through the
+      // workspace would write secrets to disk to stop them reaching disk.
+      secretNames: Object.keys(ctx.secrets),
+      // A directory, because Playwright loads the spec in the collection
+      // process AND in every worker: each one writes its own file here and they
+      // are merged below.
+      reportDir: dir,
+    };
+
+    const execution = await runPlaywrightSpec(
+      { ...ctx, fixtures: { ...fixtures, [modulePath]: source } },
+      { ...test, code: `${test.code}${harEpilogue(options)}` },
+    );
+
+    const { report, archive } = readHarRunDir(dir);
+
+    // Our injected module failed to compile or import. That is QAAI's file in
+    // QAAI's workspace, so it is an environment gap — reporting it as a failing
+    // test would blame the application for our code.
+    if (!report && execution.errorMessage?.includes(HAR_RUNTIME_MODULE.replace(/\.ts$/, ''))) {
+      return notEvaluated(
+        test,
+        startedAt,
+        `"${test.name}" was not evaluated: QAAI's hermetic-replay module could not be loaded into the Playwright process. This is a QAAI problem, not a failure of the application under test. Playwright said: ${
+          execution.errorMessage ?? '(no output)'
+        }`.slice(0, 2000),
+      );
+    }
+
+    let artifactKey: string | null = null;
+    if (config.mode === 'record' && archive && archive.log.entries.length > 0) {
+      try {
+        // Persistent, not run-scoped: a recording that retention sweeps in
+        // thirty days is a recording nobody can replay in thirty-one.
+        artifactKey = await ctx.artifacts.putPersistent(
+          `${test.id}_network.har.json`,
+          Buffer.from(JSON.stringify(archive, null, 2), 'utf8'),
+          'application/json',
+        );
+      } catch (err) {
+        ctx.logger.warn('har artifact upload failed', { testId: test.id, err: String(err) });
+      }
+    }
+
+    /*
+     * Read off the ORIGINAL spec, not the one the epilogue was appended to: the
+     * epilogue is QAAI's own code, and matching `request` inside it would put a
+     * caveat on every run. What matters is whether the CUSTOMER's test sends
+     * traffic the route handler is structurally unable to see.
+     */
+    const unroutable = unroutableTransports(test.code);
+    const summary = summariseHarRun(report, config, { staleness, artifactKey, unroutable });
+    ctx.logger.info('har run', {
+      testId: test.id,
+      mode: config.mode,
+      hermetic: summary.hermetic,
+      served: report?.served ?? 0,
+      recorded: report?.recorded ?? 0,
+      misses: report?.misses.length ?? 0,
+      unroutable,
+    });
+
+    return {
+      ...withNotice(execution, summary.notice),
+      network: [...execution.network, ...harNetworkEntries(report)],
+    };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 /**
  * Execute an E2E test with whatever it is written in. Shared with SMOKE, which
  * differs only in its timeout and its refusal to retry.
  */
-export function runE2ETest(ctx: RunContext, test: ExecutableTest): Promise<TestExecution> {
+export async function runE2ETest(ctx: RunContext, test: ExecutableTest): Promise<TestExecution> {
   const route = routeFor(test);
-  switch (route.kind) {
-    case 'playwright':
-      return runPlaywrightSpec(ctx, test);
-    case 'declared':
-      return runExternal(ctx, test, route.spec);
-    case 'catalogue':
-      return runInEcosystem(ctx, test, route.entry);
-    case 'unknown':
-      return Promise.resolve(
-        notEvaluated(
-          test,
-          Date.now(),
-          `"${test.name}" was not evaluated: ${route.why}. Set the test's spec to {"ecosystem": "<id>"} naming a runner from the QAAI catalogue (pytest, junit5-maven, rspec, cypress, …), or to a full external spec ({"command": …, "args": [...], "reportPath": …}) to run it from your own repo.`,
-        ),
+  const { config, problem } = parseHarConfig(test.spec, process.env);
+
+  if (route.kind === 'playwright') {
+    if (problem) {
+      // A HAR config we could not read is not a reason to skip the test, but it
+      // is absolutely a reason not to let anyone believe the run was hermetic.
+      const execution = await runPlaywrightSpec(ctx, test);
+      return withNotice(
+        execution,
+        `NOT HERMETIC: this test's "har" settings were ignored — ${problem}. The run used the live network.`,
       );
+    }
+    return config ? runWithHar(ctx, test, config) : runPlaywrightSpec(ctx, test);
   }
+
+  const execution =
+    route.kind === 'declared'
+      ? await runExternal(ctx, test, route.spec)
+      : route.kind === 'catalogue'
+        ? await runInEcosystem(ctx, test, route.entry)
+        : notEvaluated(
+            test,
+            Date.now(),
+            `"${test.name}" was not evaluated: ${route.why}. Set the test's spec to {"ecosystem": "<id>"} naming a runner from the QAAI catalogue (pytest, junit5-maven, rspec, cypress, …), or to a full external spec ({"command": …, "args": [...], "reportPath": …}) to run it from your own repo.`,
+          );
+
+  // Interception lives in the Playwright process, so a routed pytest or RSpec
+  // run cannot have it. Saying nothing here would let a spec that asked for
+  // replay produce a result that looks hermetic and is not.
+  if (config || problem) {
+    return withNotice(
+      execution,
+      'NOT HERMETIC: HAR record/replay is only available for Playwright specs, and this test runs on its own ecosystem\'s runner — the run used the live network. Use your runner\'s own network stubbing, or convert the test to a Playwright spec.',
+    );
+  }
+  return execution;
 }
 
 export const e2ePlugin: RunnerPlugin = {
