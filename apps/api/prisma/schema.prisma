@@ -70,6 +70,7 @@ enum TestType {
   PROTOCOL
   CONTRACT
   MUTATION
+  MOBILE
 }
 
 enum Priority {
@@ -93,6 +94,21 @@ enum RunTrigger {
   CI
   WEBHOOK
   MONITOR
+}
+
+/// Lifecycle of one shard of a sharded run. Deliberately not RunStatus: a shard
+/// does not pass or fail — it either executed its slice or it did not, and the
+/// pass/fail verdict belongs to the run that aggregates them.
+///
+/// ABANDONED is the one that matters: it means a worker died holding this slice
+/// and the tests in it never ran. A run containing one can never report PASSED.
+enum RunShardStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  ABANDONED
 }
 
 enum TestResultStatus {
@@ -700,16 +716,67 @@ model Run {
   /// Set when the run itself blew up rather than tests failing.
   errorMessage String?
 
+  /// How many shards the suite was split across (§5 build sharding). 1 means the
+  /// run was not sharded, which is every run unless the caller asked for more.
+  shardCount Int @default(1)
+  /// The finalisation claim. Set by a conditional UPDATE, so exactly one shard
+  /// can win it and write the run's terminal status; see apps/worker run.ts.
+  /// Distinct from `finishedAt`, which the cancel endpoint also writes.
+  finalizedAt DateTime?
+
   project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
   suite       Suite?       @relation(fields: [suiteId], references: [id], onDelete: SetNull)
   environment Environment  @relation(fields: [environmentId], references: [id])
   results     TestResult[]
   artifacts   Artifact[]
+  shards      RunShard[]
 
   @@index([orgId])
   @@index([projectId, queuedAt])
   @@index([status])
   @@index([commitSha])
+}
+
+/// One slice of a sharded run: its own queue job, its own worker, its own tests.
+///
+/// A sharded run finishes only when every one of these rows is terminal — the
+/// row is the durable record of that, because the worker holding a shard can
+/// die and nothing in Redis would tell the other shards whether it ever ran.
+model RunShard {
+  id     String         @id @default(cuid())
+  orgId  String
+  runId  String
+  /// 0-based, and matches TestResult.shardIndex.
+  index  Int
+  /// Denormalised sibling count so a shard knows the split it belongs to.
+  total  Int
+  status RunShardStatus @default(QUEUED)
+
+  /// What the duration-balanced packer put here, and what it predicted. Kept so
+  /// "why did shard 3 take twice as long" is answerable after the fact.
+  testCount   Int @default(0)
+  estimatedMs Int @default(0)
+
+  passedCount  Int @default(0)
+  failedCount  Int @default(0)
+  flakyCount   Int @default(0)
+  skippedCount Int @default(0)
+
+  queuedAt   DateTime  @default(now())
+  startedAt  DateTime?
+  finishedAt DateTime?
+  /// Stamped on a timer while the shard executes. A worker that dies stops
+  /// stamping, which is how the surviving shards notice and reap it instead of
+  /// leaving the run open forever.
+  heartbeatAt DateTime?
+
+  errorMessage String?
+
+  run Run @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, index])
+  @@index([orgId])
+  @@index([runId, status])
 }
 
 model TestResult {
@@ -728,6 +795,10 @@ model TestResult {
   videoKey   String?
   traceKey   String?
   createdAt  DateTime         @default(now())
+  /// Which shard of a sharded run owns this test. Null on an unsharded run,
+  /// which is what makes sharding additive: every existing row and every
+  /// existing code path reads null and behaves exactly as before.
+  shardIndex Int?
 
   run      Run              @relation(fields: [runId], references: [id], onDelete: Cascade)
   test     Test             @relation(fields: [testId], references: [id], onDelete: Cascade)
@@ -738,6 +809,8 @@ model TestResult {
   @@unique([runId, testId])
   @@index([orgId])
   @@index([testId, createdAt])
+  /// The shard's own query: "give me my slice of this run".
+  @@index([runId, shardIndex])
 }
 
 model Step {

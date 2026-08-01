@@ -11,11 +11,28 @@
  * Every case asserts the top candidate **and its evidence**. The evidence is not
  * decoration: it is the whole reason the import screen can offer "Not right?"
  * and get an informed override instead of a shrug. A test that only checked
- * `runner === 'PYTEST'` would pass just as happily on a lucky guess.
+ * `runner === 'pytest'` would pass just as happily on a lucky guess.
+ *
+ * A candidate names a runner by its *catalogue id* — 'pytest', 'junit5-maven' —
+ * because ecosystems.ts is the only runner vocabulary. The last section of this
+ * file is what keeps it that way.
  */
 
 import { describe, expect, it } from 'vitest';
-import { detectProject, type RepoFile, type RunnerCandidate } from './detect.js';
+import {
+  DETECTABLE_RUNNERS,
+  detectProject,
+  type RepoFile,
+  type RunnerCandidate,
+} from './detect.js';
+import {
+  ECOSYSTEMS,
+  PACKAGE_MANAGER_LANGUAGES,
+  ecosystemById,
+  ecosystemRunArgs,
+  junitPlanFor,
+  type Ecosystem,
+} from './ecosystems.js';
 
 const f = (path: string, content?: string): RepoFile =>
   content === undefined ? { path } : { path, content };
@@ -54,7 +71,7 @@ describe('a Next.js app tested with Playwright', () => {
   const top = result.candidates[0]!;
 
   it('nominates Playwright, and says why', () => {
-    expect(top.runner).toBe('PLAYWRIGHT');
+    expect(top.runner).toBe('playwright');
     expect(top.language).toBe('TYPESCRIPT');
     expect(top.testType).toBe('E2E');
 
@@ -82,7 +99,7 @@ describe('a Next.js app tested with Playwright', () => {
 
   it('does not invent a unit runner from the .spec.ts files alone', () => {
     // Vitest and Jest both claim `*.spec.ts`, and neither is installed here.
-    expect(runners(result.candidates)).toEqual(['PLAYWRIGHT']);
+    expect(runners(result.candidates)).toEqual(['playwright']);
     expect(result.languages[0]?.language).toBe('TYPESCRIPT');
     expect(result.hasTests).toBe(true);
     expect(result.monorepo).toBe(false);
@@ -114,13 +131,17 @@ describe('a Django project tested with pytest', () => {
   const top = result.candidates[0]!;
 
   it('nominates pytest on its config file', () => {
-    expect(top.runner).toBe('PYTEST');
+    expect(top.runner).toBe('pytest');
     expect(top.language).toBe('PYTHON');
     expect(shows(top, 'found pytest.ini')).toBe(true);
     expect(shows(top, 'pytest in requirements.txt')).toBe(true);
     expect(shows(top, '**/test_*.py')).toBe(true);
     expect(top.testDirs).toEqual(['polls/tests']);
-    expect(top.invocation.command).toBe('pytest');
+    // `python3 -m pytest`, not a bare `pytest`: the catalogue record spells it
+    // that way so the interpreter that owns the venv is the one that runs, and
+    // a `pytest` on PATH can belong to a different environment entirely.
+    expect(top.invocation.command).toBe('python3');
+    expect(top.invocation.args).toEqual(['-m', 'pytest', '-q']);
     expect(top.invocation.junit.args).toContain('--junitxml=reports/junit.xml');
     expect(top.packageManager).toBe('pip');
   });
@@ -128,7 +149,7 @@ describe('a Django project tested with pytest', () => {
   it('still offers the Django runner, ranked below and explained', () => {
     // `python3 manage.py test` genuinely works here. Hiding it would be a lie
     // about the repo; ranking it above pytest.ini would be a worse one.
-    const django = result.candidates.find((c) => c.runner === 'DJANGO_TEST')!;
+    const django = result.candidates.find((c) => c.runner === 'django-test')!;
     expect(django).toBeDefined();
     expect(django.score).toBeLessThan(top.score);
     expect(shows(django, 'manage.py')).toBe(true);
@@ -188,7 +209,10 @@ describe('a Spring Boot service on Maven with JUnit 5', () => {
   const top = result.candidates[0]!;
 
   it('nominates JUnit 5 from the POM and the standard layout', () => {
-    expect(top.runner).toBe('JUNIT5');
+    // The Maven record, specifically: JUnit 5 under Gradle is a different
+    // record because it writes its reports somewhere else entirely, and a
+    // candidate that named the wrong one would point at an empty directory.
+    expect(top.runner).toBe('junit5-maven');
     expect(top.language).toBe('JAVA');
     expect(shows(top, 'junit-jupiter in dependencies (pom.xml)')).toBe(true);
     expect(shows(top, 'src/test/java')).toBe(true);
@@ -199,9 +223,11 @@ describe('a Spring Boot service on Maven with JUnit 5', () => {
 
   it('runs it through the wrapper the repo ships', () => {
     // ./mvnw over mvn: the wrapper pins the version the project expects, and it
-    // is the one command guaranteed to exist on a fresh worker.
+    // is the one command guaranteed to exist on a fresh worker. Re-pointing the
+    // command is all detection does — `-B` comes from the catalogue record,
+    // which wants batch mode so the ANSI progress spinner stays out of the log.
     expect(top.invocation.command).toBe('./mvnw');
-    expect(top.invocation.args).toEqual(['test']);
+    expect(top.invocation.args).toEqual(['-B', 'test']);
     expect(top.packageManager).toBe('maven');
     // Surefire writes one XML per class, so there is no single reportPath to
     // hand the external runner. Saying so beats inventing a path.
@@ -210,7 +236,8 @@ describe('a Spring Boot service on Maven with JUnit 5', () => {
   });
 
   it('does not also claim JUnit 4 just because the filenames fit', () => {
-    expect(runners(result.candidates)).not.toContain('JUNIT4');
+    expect(runners(result.candidates)).not.toContain('junit4-maven');
+    expect(runners(result.candidates)).not.toContain('junit4-gradle');
   });
 });
 
@@ -245,7 +272,7 @@ describe('a Rails app tested with RSpec', () => {
   const top = result.candidates[0]!;
 
   it('nominates RSpec on .rspec and the gem', () => {
-    expect(top.runner).toBe('RSPEC');
+    expect(top.runner).toBe('rspec');
     expect(top.language).toBe('RUBY');
     expect(shows(top, 'found .rspec')).toBe(true);
     expect(shows(top, 'rspec-rails in Gemfile')).toBe(true);
@@ -262,7 +289,7 @@ describe('a Rails app tested with RSpec', () => {
   });
 
   it('does not nominate Minitest, which this repo does not use', () => {
-    expect(runners(result.candidates)).not.toContain('MINITEST');
+    expect(runners(result.candidates)).not.toContain('minitest');
   });
 });
 
@@ -286,14 +313,17 @@ describe('a Go module', () => {
   const top = result.candidates[0]!;
 
   it('nominates go test from the toolchain, not from a config file it has none of', () => {
-    expect(top.runner).toBe('GO_TEST');
+    expect(top.runner).toBe('go-test');
     expect(top.language).toBe('GO');
     expect(top.evidence[0]?.kind).toBe('toolchain');
     expect(shows(top, 'go.mod')).toBe(true);
     expect(shows(top, '**/*_test.go')).toBe(true);
     expect(top.testDirs).toEqual(['internal/api', 'internal/store']);
     expect(top.invocation.command).toBe('go');
-    expect(top.invocation.args).toEqual(['test', './...']);
+    // `-count=1` rides along from the catalogue record, and it is load-bearing:
+    // without it Go replays a cached PASS without running anything, and a suite
+    // that never executed looks exactly like a fast one.
+    expect(top.invocation.args).toEqual(['test', './...', '-count=1']);
     expect(top.packageManager).toBe('go');
   });
 
@@ -336,7 +366,7 @@ describe('a .NET solution tested with xUnit', () => {
   const top = result.candidates[0]!;
 
   it('nominates xUnit from the test project, not from the solution file', () => {
-    expect(top.runner).toBe('XUNIT');
+    expect(top.runner).toBe('xunit');
     expect(top.language).toBe('CSHARP');
     expect(shows(top, 'xunit in PackageReference')).toBe(true);
     expect(shows(top, 'Microsoft.NET.Test.Sdk')).toBe(true);
@@ -352,7 +382,7 @@ describe('a .NET solution tested with xUnit', () => {
   });
 
   it('does not also claim NUnit and MSTest off the same filenames', () => {
-    expect(runners(result.candidates)).toEqual(['XUNIT']);
+    expect(runners(result.candidates)).toEqual(['xunit']);
   });
 });
 
@@ -401,15 +431,15 @@ describe('a pnpm monorepo running Vitest in one package and Cypress in another',
   const result = detectProject(pnpmMonorepo);
 
   it('returns both runners rather than picking one', () => {
-    expect(runners(result.candidates).sort()).toEqual(['CYPRESS', 'VITEST']);
+    expect(runners(result.candidates).sort()).toEqual(['cypress', 'vitest']);
     expect(result.monorepo).toBe(true);
     expect(result.roots).toEqual(['.', 'apps/web', 'packages/core']);
     expect(result.notes.some((note) => note.includes('All are listed'))).toBe(true);
   });
 
   it('scopes each runner to its own workspace, with its own evidence', () => {
-    const cypress = result.candidates.find((c) => c.runner === 'CYPRESS')!;
-    const vitest = result.candidates.find((c) => c.runner === 'VITEST')!;
+    const cypress = result.candidates.find((c) => c.runner === 'cypress')!;
+    const vitest = result.candidates.find((c) => c.runner === 'vitest')!;
 
     expect(cypress.root).toBe('apps/web');
     expect(shows(cypress, 'found apps/web/cypress.config.ts')).toBe(true);
@@ -502,7 +532,7 @@ describe('a repo with nothing to detect', () => {
       f('vitest.config.ts'),
       f('src/server.ts'),
     ]);
-    expect(result.candidates[0]?.runner).toBe('VITEST');
+    expect(result.candidates[0]?.runner).toBe('vitest');
     expect(result.candidates[0]?.testFileCount).toBe(0);
     expect(result.hasTests).toBe(false);
     expect(result.notes.join(' ')).toContain('no files matched its test conventions');
@@ -528,11 +558,11 @@ describe('conflicting signals in one package', () => {
   ]);
 
   it('ranks Vitest above Jest because a config file outranks a dependency', () => {
-    expect(result.candidates[0]?.runner).toBe('VITEST');
-    expect(runners(result.candidates)).toContain('JEST');
+    expect(result.candidates[0]?.runner).toBe('vitest');
+    expect(runners(result.candidates)).toContain('jest');
 
     const vitest = result.candidates[0]!;
-    const jest = result.candidates.find((c) => c.runner === 'JEST')!;
+    const jest = result.candidates.find((c) => c.runner === 'jest')!;
     expect(vitest.evidence[0]?.kind).toBe('config-file');
     expect(jest.evidence[0]?.kind).toBe('dependency');
     expect(vitest.score).toBeGreaterThan(jest.score);
@@ -549,7 +579,7 @@ describe('conflicting signals in one package', () => {
   it('still returns Jest, with the files it would claim', () => {
     // Keeping the loser visible is the point: if this repo really is mid-
     // migration, the user knows more than the file listing does.
-    const jest = result.candidates.find((c) => c.runner === 'JEST')!;
+    const jest = result.candidates.find((c) => c.runner === 'jest')!;
     expect(jest.testFileCount).toBe(1);
     expect(jest.invocation.args).toEqual(['jest', '--ci']);
   });
@@ -571,8 +601,8 @@ describe('a manifest that is present but unreadable', () => {
 
     // Without the manifest, `sum.test.ts` fits Vitest and Jest equally well, so
     // both are offered — and neither is offered confidently.
-    expect(runners(result.candidates)).toContain('VITEST');
-    expect(runners(result.candidates)).toContain('JEST');
+    expect(runners(result.candidates)).toContain('vitest');
+    expect(runners(result.candidates)).toContain('jest');
     for (const candidate of result.candidates) {
       expect(candidate.confidence).toBeLessThan(0.5);
       expect(candidate.evidence.every((e) => e.kind === 'file-convention')).toBe(true);
@@ -589,8 +619,37 @@ describe('a manifest that is present but unreadable', () => {
     expect(result.warnings.join(' ')).toContain('not valid JSON');
     // The config file is still a fact, so Playwright is still the answer — it
     // just cannot be corroborated by a dependency any more.
-    expect(result.candidates[0]?.runner).toBe('PLAYWRIGHT');
+    expect(result.candidates[0]?.runner).toBe('playwright');
     expect(result.candidates[0]?.evidence.some((e) => e.kind === 'dependency')).toBe(false);
+  });
+});
+
+// ─── The catalogue command, pointed at what the repo actually has ────────────
+
+describe('adapting a catalogue command to the repo it will run in', () => {
+  it('runs the WebdriverIO config that exists, not the one the record names', () => {
+    // The record says `wdio run wdio.conf.js` because that is the common case.
+    // This repo is TypeScript, and the .js file is not there at all — running it
+    // would fail with "config not found" rather than with a test failure.
+    const result = detectProject([
+      f(
+        'package.json',
+        JSON.stringify({
+          name: 'acme-e2e',
+          devDependencies: { '@wdio/cli': '^9.4.1', '@wdio/junit-reporter': '^9.4.0' },
+        }),
+      ),
+      f('package-lock.json'),
+      f('wdio.conf.ts'),
+      f('test/specs/login.e2e.ts'),
+    ]);
+
+    const top = result.candidates[0]!;
+    expect(top.runner).toBe('webdriverio');
+    expect(top.invocation.args).toEqual(['wdio', 'run', 'wdio.conf.ts']);
+    // And it still admits the reporter has to be configured by a human.
+    expect(top.invocation.junit.support).toBe('needs-plugin');
+    expect(top.invocation.junit.note).toContain('@wdio/junit-reporter');
   });
 });
 
@@ -636,5 +695,109 @@ describe('invariants that hold for every fixture', () => {
     const twice = detectProject([...files].reverse());
     expect(runners(twice.candidates)).toEqual(runners(once.candidates));
     expect(twice.candidates.map((c) => c.score)).toEqual(once.candidates.map((c) => c.score));
+  });
+
+  it.each(fixtures)('%s: every candidate is a catalogue record, not a name', (_name, files) => {
+    // The point of the whole reconciliation: a candidate's runner is an id you
+    // can look up, and what comes back agrees with what was reported.
+    for (const candidate of detectProject(files).candidates) {
+      const entry = ecosystemById(candidate.runner);
+      expect(entry, `${candidate.runner} is not in the catalogue`).toBeDefined();
+      expect(candidate.label).toBe(entry!.label);
+      expect(candidate.testType).toBe(entry!.defaultTestType);
+      expect(entry!.languages).toContain(candidate.language.toLowerCase());
+    }
+  });
+});
+
+// ─── One vocabulary, and the checks that keep it that way ────────────────────
+
+/**
+ * These are the tests that would have caught the drift twice already: a runner
+ * detection knows and the catalogue does not, a manager whose languages nobody
+ * agreed on, a record whose command cannot actually be assembled.
+ *
+ * The strongest check is not here at all — `RunnerRule.ecosystem` is typed
+ * `EcosystemId`, so a rule naming a runner the catalogue lacks fails `tsc`
+ * before any of this runs. What is left is everything a type cannot say.
+ */
+describe('the ecosystem catalogue is the only runner vocabulary', () => {
+  const all: readonly Ecosystem[] = ECOSYSTEMS;
+
+  it('has a record for every runner detection can nominate', () => {
+    expect(DETECTABLE_RUNNERS.length).toBeGreaterThan(0);
+    for (const id of DETECTABLE_RUNNERS) {
+      expect(ecosystemById(id), `${id} has a detection rule but no catalogue record`).toBeDefined();
+    }
+  });
+
+  it('gives every record a runnable command, report flags removed', () => {
+    for (const entry of all) {
+      // Throws when reportArgs is not an in-order subsequence of args, which is
+      // the one way these two fields can silently disagree.
+      const plain = ecosystemRunArgs(entry, entry.defaultTestPath ?? 'tests');
+      expect(plain.length + entry.reportArgs.length).toBe(entry.args.length);
+      expect(entry.command).not.toMatch(/\s/);
+      for (const arg of plain) {
+        expect(arg).not.toContain('{{');
+      }
+    }
+  });
+
+  it('never leaves a placeholder in a report plan', () => {
+    for (const entry of all) {
+      const plan = junitPlanFor(entry, { file: 'reports/junit.xml', directory: 'reports' });
+      for (const value of [...plan.args, ...Object.values(plan.env)]) {
+        expect(value, `${entry.id} left a placeholder in its JUnit plan`).not.toContain('{{');
+      }
+      // A path is only claimed when there is a single file to read; a glob or a
+      // stdout stream gets null and a note saying so.
+      if (plan.reportPath === null) expect(plan.note).not.toBeNull();
+    }
+  });
+
+  it('keeps the runners that cannot report honest about it', () => {
+    const plans = new Map(
+      all.map((entry) => [
+        entry.id,
+        junitPlanFor(entry, { file: 'reports/junit.xml', directory: 'reports' }),
+      ]),
+    );
+
+    // Named individually on purpose: these are the records whose whole value is
+    // that they refuse to claim per-test results, and a refactor that quietly
+    // promoted one to "built-in" would produce green runs with no test rows.
+    for (const id of ['ava', 'xcodebuild', 'k6', 'pa11y-ci']) {
+      expect(plans.get(id)?.support, `${id} should not claim JUnit support`).toBe('none');
+      expect(plans.get(id)?.reportPath).toBeNull();
+    }
+    for (const id of [
+      'jest',
+      'rspec',
+      'go-test',
+      'unittest',
+      'django-test',
+      'minitest',
+      'cargo-test',
+    ]) {
+      expect(plans.get(id)?.support, `${id} needs something installed first`).toBe('needs-plugin');
+    }
+    expect(plans.get('go-test')?.note).toContain('gotestsum');
+    expect(plans.get('unittest')?.note).toContain('unittest-xml-reporting');
+  });
+
+  it('agrees with itself about which languages a package manager serves', () => {
+    for (const entry of all) {
+      const served = PACKAGE_MANAGER_LANGUAGES[entry.packageManager];
+      for (const language of entry.languages) {
+        expect(served, `${entry.id}: ${entry.packageManager} does not serve ${language}`).toContain(
+          language,
+        );
+      }
+    }
+  });
+
+  it('has no two records claiming the same id', () => {
+    expect(new Set(all.map((e) => e.id)).size).toBe(all.length);
   });
 });

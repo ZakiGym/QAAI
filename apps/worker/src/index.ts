@@ -23,7 +23,7 @@ import { config, connection, logger, prisma } from './context.js';
 import { armScheduleTick, closeProducers } from './queues.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
-import { processRun } from './processors/run.js';
+import { processRun, sweepStalledShardedRuns } from './processors/run.js';
 import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
@@ -83,7 +83,19 @@ register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
 register<NotifyJob>(QUEUE_NAMES.notify, config.concurrency, processNotify);
 // One repeating sweep rather than a timer per schedule: timers drift, do not
 // survive a restart, and a scheduler that quietly stops is worse than none.
-register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, processScheduleTick);
+//
+// The tick also carries the sharded-run sweep. It is wired here rather than
+// inside processScheduleTick so the two stay independent — a sharded run left
+// open by a dead worker has nothing to do with cron — and so run.ts and
+// schedule.ts do not have to import each other.
+register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
+  await processScheduleTick(job);
+  // Never fails the tick: the schedules and monitors it just fired are the
+  // tick's real work, and a sweep that throws must not cost them their retry.
+  await sweepStalledShardedRuns().catch((err) =>
+    logger.error({ err }, 'the sharded-run sweep failed'),
+  );
+});
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
 

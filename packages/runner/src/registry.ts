@@ -23,6 +23,7 @@ import { cliPlugin } from './plugins/cli.js';
 import { mutationPlugin } from './plugins/mutation.js';
 import { contractPlugin } from './plugins/contract.js';
 import { protocolPlugin } from './plugins/protocol.js';
+import { mobilePlugin } from './plugins/mobile.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -40,6 +41,10 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   MUTATION: mutationPlugin,
   CONTRACT: contractPlugin,
   PROTOCOL: protocolPlugin,
+  // Appium is driven over its own W3C API; Maestro, Detox, Espresso and
+  // XCUITest shell out to their CLIs. All five live behind one plugin because
+  // they differ in transport, not in shape.
+  MOBILE: mobilePlugin,
   // Any runner QAAI does not implement natively — Vitest, Jest, Cypress, Newman,
   // Pa11y, Maestro… — runs through the external-command plugin and reports via
   // its own JUnit output. UNIT_GEN shares it for the same reason.

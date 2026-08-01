@@ -130,7 +130,10 @@ function BillingInner() {
   if (error) {
     return (
       <Page width="narrow">
-        <p role="alert" className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm">
+        <p
+          role="alert"
+          className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm"
+        >
           {error}
         </p>
       </Page>
@@ -155,11 +158,11 @@ function BillingInner() {
         subtitle={
           <>
             You are on <span className="text-ink font-medium">{limits.label}</span>
-        {billing.currentPeriodEnd && billing.paying && (
-          <>
-            {' · '}
-            {billing.cancelAtPeriodEnd ? 'ends' : 'renews'}{' '}
-            {new Date(billing.currentPeriodEnd).toLocaleDateString()}
+            {billing.currentPeriodEnd && billing.paying && (
+              <>
+                {' · '}
+                {billing.cancelAtPeriodEnd ? 'ends' : 'renews'}{' '}
+                {new Date(billing.currentPeriodEnd).toLocaleDateString()}
               </>
             )}
           </>
@@ -175,8 +178,8 @@ function BillingInner() {
       {!activating && pending && !billing.paying && (
         <p className="border-flake/40 bg-flake/10 text-body-sm mb-6 rounded-md border p-3">
           Payment went through, but we have not had the confirmation from Stripe yet. It usually
-          arrives within a minute — refresh, and if it is still not here, contact us and we will sort
-          it out. You have not been charged twice.
+          arrives within a minute — refresh, and if it is still not here, contact us and we will
+          sort it out. You have not been charged twice.
         </p>
       )}
 
@@ -241,7 +244,9 @@ function BillingInner() {
                   <p className="text-ink-faint text-micro mt-1">
                     {row.maxProjects > 1000 ? 'Unlimited' : row.maxProjects} project
                     {row.maxProjects === 1 ? '' : 's'} ·{' '}
-                    {row.maxRunsPerMonth === null ? 'unlimited runs' : `${row.maxRunsPerMonth} runs`}{' '}
+                    {row.maxRunsPerMonth === null
+                      ? 'unlimited runs'
+                      : `${row.maxRunsPerMonth} runs`}{' '}
                     · {row.maxParallelWorkers} parallel · {row.artifactRetentionDays}d artifacts
                     {row.sso && ' · SSO'}
                     {row.auditLog && ' · audit log'}

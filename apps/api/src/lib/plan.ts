@@ -58,14 +58,40 @@ export async function planFor(orgId: string): Promise<PlanState> {
     }),
   );
 
+  // The org's own plan is the fallback for every install that never went
+  // through Stripe checkout.
+  const org = await unscoped(() =>
+    prisma.organization.findUnique({ where: { id: orgId }, select: { plan: true } }),
+  );
+
   const status = subscription?.status ?? 'active';
   const paying = subscription ? PAYING_STATUSES.has(status) : false;
 
+  /*
+   * With no Subscription row, fall back to Organization.plan.
+   *
+   * This function used to read the Subscription alone, on the reasoning that
+   * Stripe is the source of truth. That is right for anyone who bought through
+   * Stripe and wrong for everyone else: a seeded org, a self-hosted install, an
+   * enterprise contract signed offline, and any plan an operator set by hand all
+   * have `Organization.plan` set and no Subscription at all. Every one of them
+   * was silently metered at FREE.
+   *
+   * It was invisible until sharding, because FREE's other limits are generous
+   * enough not to bite — but maxParallelWorkers is 1 on FREE, so every sharding
+   * request on the seeded project clamped to a single shard and the feature
+   * looked like it did nothing.
+   *
+   * A Subscription still wins when one exists: that is the paid path, and its
+   * status is what decides whether the plan is currently honoured.
+   */
+  const plan = subscription?.plan ?? org?.plan ?? 'FREE';
+
   // An org that has stopped paying keeps its plan *label* — so the UI can say
   // "your Team plan is past due" rather than silently pretending they were
-  // always free — but is metered at free limits.
-  const plan = subscription?.plan ?? 'FREE';
-  const effective: Plan = paying || plan === 'FREE' ? plan : 'FREE';
+  // always free — but is metered at free limits. An org with no Subscription is
+  // not "not paying"; it never had one, so its plan is honoured as set.
+  const effective: Plan = !subscription || paying || plan === 'FREE' ? plan : 'FREE';
 
   return {
     plan,

@@ -26,6 +26,7 @@ export const TEST_TYPES = [
   'PROTOCOL',
   'CONTRACT',
   'MUTATION',
+  'MOBILE',
 ] as const;
 export type TestType = (typeof TEST_TYPES)[number];
 
@@ -48,6 +49,7 @@ export const TEST_TYPE_LABELS: Record<TestType, string> = {
   PROTOCOL: 'Protocol / streaming',
   CONTRACT: 'Contract (Pact / OpenAPI)',
   MUTATION: 'Mutation',
+  MOBILE: 'Mobile (native app)',
 };
 
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────

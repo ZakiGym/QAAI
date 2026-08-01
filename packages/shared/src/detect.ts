@@ -30,12 +30,35 @@
  * function of a file listing, which is what makes it testable against a repo we
  * do not have to clone.
  *
- * The runner union lives here rather than in constants.ts on purpose: these are
- * *observations about someone else's repo*, not QAAI domain enums, so they have
- * no Prisma mirror and are exempt from the enum-drift check.
+ * What this file does *not* own is the runner vocabulary. A candidate's id,
+ * label, suite type, command, arguments and report plan all come from the
+ * catalogue in ecosystems.ts, because a detector that also describes how to run
+ * things is a second copy of the same facts — and this repo has already been
+ * bitten twice by the copies disagreeing. Every rule below names an
+ * `EcosystemId`, so a rule pointing at a runner the catalogue does not have is
+ * a compile error, not a candidate with no command.
+ *
+ * Detection's own concern is what is left: what the repo *says*, how strongly,
+ * where its workspaces are, and how sure any of it makes us. Those observations
+ * live here rather than in constants.ts on purpose — they are facts about
+ * someone else's repo, not QAAI domain enums, so they have no Prisma mirror and
+ * are exempt from the enum-drift check.
  */
 
 import { LANGUAGES, type Language, type TestType } from './constants.js';
+import {
+  ECOSYSTEM_LANGUAGES,
+  PACKAGE_MANAGERS,
+  PACKAGE_MANAGER_LANGUAGES,
+  ecosystemById,
+  ecosystemRunArgs,
+  junitPlanFor,
+  type Ecosystem,
+  type EcosystemId,
+  type EcosystemLanguage,
+  type JUnitPlan,
+  type PackageManager,
+} from './ecosystems.js';
 
 // ─── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -51,110 +74,38 @@ export interface RepoFile {
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
-export const TEST_RUNNERS = [
-  // JavaScript / TypeScript
-  'VITEST',
-  'JEST',
-  'MOCHA',
-  'AVA',
-  'NODE_TEST',
-  'PLAYWRIGHT',
-  'CYPRESS',
-  'WEBDRIVERIO',
-  'NIGHTWATCH',
-  'K6',
-  'PA11Y',
-  'NEWMAN',
-  // Python
-  'PYTEST',
-  'UNITTEST',
-  'DJANGO_TEST',
-  'BEHAVE',
-  'ROBOT',
-  // JVM
-  'JUNIT5',
-  'JUNIT4',
-  'TESTNG',
-  'KARATE',
-  // Ruby
-  'RSPEC',
-  'MINITEST',
-  'CUCUMBER_RUBY',
-  // Go
-  'GO_TEST',
-  // .NET
-  'XUNIT',
-  'NUNIT',
-  'MSTEST',
-  // PHP
-  'PHPUNIT',
-  'PEST',
-  // Rust / Swift
-  'CARGO_TEST',
-  'XCTEST',
-] as const;
-export type TestRunner = (typeof TEST_RUNNERS)[number];
+/**
+ * The runners detection can nominate are catalogue records, named by their
+ * catalogue id. There is no second list here to fall out of step with the first
+ * one — `DETECTABLE_RUNNERS` below is derived from the rule table, and the rule
+ * table cannot name a runner ecosystems.ts does not define.
+ */
+export type { EcosystemId } from './ecosystems.js';
 
 /**
- * Languages we can *observe*. Deliberately wider than `LANGUAGES` in
- * constants.ts, which is the narrower set the generator can emit: a repo is
- * allowed to be Rust even though QAAI cannot write Rust tests, and saying so is
- * more useful than refusing to name it.
+ * Languages we can *observe*, in the SHOUTING spelling the DB-backed `Language`
+ * enum uses. The same list as the catalogue's `ECOSYSTEM_LANGUAGES`, cased
+ * differently and derived from it rather than retyped — this is exactly the
+ * kind of "two lists of the same thing" that drifts.
+ *
+ * Deliberately wider than `LANGUAGES` in constants.ts, which is the narrower set
+ * the generator can emit: a repo is allowed to be Rust even though QAAI cannot
+ * write Rust tests, and saying so is more useful than refusing to name it.
  */
-export const DETECTED_LANGUAGES = [
-  'TYPESCRIPT',
-  'JAVASCRIPT',
-  'PYTHON',
-  'JAVA',
-  'KOTLIN',
-  'CSHARP',
-  'RUBY',
-  'GO',
-  'PHP',
-  'RUST',
-  'SWIFT',
-] as const;
-export type DetectedLanguage = (typeof DETECTED_LANGUAGES)[number];
+export type DetectedLanguage = Uppercase<EcosystemLanguage>;
 
-export const DETECTED_PACKAGE_MANAGERS = [
-  'npm',
-  'pnpm',
-  'yarn',
-  'bun',
-  'pip',
-  'poetry',
-  'uv',
-  'pipenv',
-  'maven',
-  'gradle',
-  'bundler',
-  'go',
-  'dotnet',
-  'composer',
-  'cargo',
-  'swiftpm',
-] as const;
-export type DetectedPackageManager = (typeof DETECTED_PACKAGE_MANAGERS)[number];
+const asDetected = (slug: EcosystemLanguage): DetectedLanguage =>
+  slug.toUpperCase() as DetectedLanguage;
 
-/** Which language family a package manager serves; used to pair it with a runner. */
-const PM_FAMILY: Record<DetectedPackageManager, DetectedLanguage[]> = {
-  npm: ['TYPESCRIPT', 'JAVASCRIPT'],
-  pnpm: ['TYPESCRIPT', 'JAVASCRIPT'],
-  yarn: ['TYPESCRIPT', 'JAVASCRIPT'],
-  bun: ['TYPESCRIPT', 'JAVASCRIPT'],
-  pip: ['PYTHON'],
-  poetry: ['PYTHON'],
-  uv: ['PYTHON'],
-  pipenv: ['PYTHON'],
-  maven: ['JAVA', 'KOTLIN'],
-  gradle: ['JAVA', 'KOTLIN'],
-  bundler: ['RUBY'],
-  go: ['GO'],
-  dotnet: ['CSHARP'],
-  composer: ['PHP'],
-  cargo: ['RUST'],
-  swiftpm: ['SWIFT'],
-};
+export const DETECTED_LANGUAGES: readonly DetectedLanguage[] = ECOSYSTEM_LANGUAGES.map(asDetected);
+
+/**
+ * Which languages a package manager serves; used to pair one found in a repo
+ * with a runner found in the same repo. The pairing is the catalogue's —
+ * detection only recases it.
+ */
+const familyOf = (pm: PackageManager): DetectedLanguage[] =>
+  PACKAGE_MANAGER_LANGUAGES[pm].map(asDetected);
 
 // ─── Evidence ────────────────────────────────────────────────────────────────
 
@@ -199,32 +150,27 @@ export interface Evidence {
 
 // ─── Results ─────────────────────────────────────────────────────────────────
 
-/** How to get JUnit XML out of a runner — the shape `externalTestSpec` wants. */
-export interface JUnitPlan {
-  /** `none` means the tool has no JUnit path we trust; fall back to the exit code. */
-  support: 'built-in' | 'needs-plugin' | 'none';
-  /** Appended to `Invocation.args` to make the tool write the report. */
-  args: string[];
-  env: Record<string, string>;
-  /** Report location relative to `Invocation.cwd`, or null when there is no single file. */
-  reportPath: string | null;
-  /** What is missing or surprising — shown verbatim, never silently assumed away. */
-  note: string | null;
-}
-
 export interface Invocation {
   /** The executable. argv-style, because the runner spawns without a shell. */
   command: string;
   args: string[];
   /** Working directory relative to the repo root; '.' for the root itself. */
   cwd: string;
+  /** Env the runner needs for an ordinary run — `mix test` wants MIX_ENV=test. */
+  env: Record<string, string>;
   /** The existing package script that already runs this tool, if there is one. */
   script: string | null;
+  /**
+   * What it takes to get a report QAAI can read, from the catalogue record.
+   * `JUnitPlan` is defined in ecosystems.ts because it is an answer about the
+   * runner, not about this repo — every repo running Jest gets the same one.
+   */
   junit: JUnitPlan;
 }
 
 export interface RunnerCandidate {
-  runner: TestRunner;
+  /** The catalogue id — `ecosystemById(candidate.runner)` is always a record. */
+  runner: EcosystemId;
   label: string;
   language: DetectedLanguage;
   /** The QAAI suite type this runner maps onto, so the import screen can pre-fill it. */
@@ -243,7 +189,7 @@ export interface RunnerCandidate {
   /** A few real paths, so a human can confirm we looked at the right files. */
   sampleTests: string[];
   invocation: Invocation;
-  packageManager: DetectedPackageManager | null;
+  packageManager: PackageManager | null;
   /** Null when QAAI's generator cannot emit this language — worth admitting early. */
   generatorLanguage: Language | null;
 }
@@ -256,7 +202,7 @@ export interface LanguageDetection {
 }
 
 export interface PackageManagerDetection {
-  manager: DetectedPackageManager;
+  manager: PackageManager;
   root: string;
   evidence: Evidence[];
 }
@@ -337,13 +283,6 @@ function globToRe(glob: string): RegExp {
 
 // ─── Rules ───────────────────────────────────────────────────────────────────
 
-interface InvokeCtx {
-  pm: DetectedPackageManager | null;
-  /** Root-relative existence check. */
-  has: (relPath: string) => boolean;
-  testFiles: string[];
-}
-
 interface ToolchainRule {
   detail: string;
   /** Root-relative path that must exist for the marker to count. */
@@ -358,11 +297,34 @@ interface RuleCtx {
   testFiles: string[];
 }
 
+/**
+ * Maven and Gradle are separate catalogue records — same runner, same tests,
+ * report in a completely different directory — so the repo has to say which one
+ * a rule means. Nominating the Maven record for a Gradle project would send a
+ * reader to target/surefire-reports and find nothing there.
+ */
+const byBuildTool =
+  (maven: EcosystemId, gradle: EcosystemId) =>
+  (has: (relPath: string) => boolean): EcosystemId =>
+    has('pom.xml') || has('mvnw') ? maven : gradle;
+
 interface RunnerRule {
-  runner: TestRunner;
-  label: string;
+  /**
+   * The catalogue record this rule detects, and the whole reason detection no
+   * longer describes runners itself: the id, label, suite type, command,
+   * arguments and report plan are all read from it. A function when one
+   * detection covers two records that differ only in how they are built.
+   *
+   * Typed as `EcosystemId`, so a rule for a runner the catalogue does not carry
+   * does not compile.
+   */
+  ecosystem: EcosystemId | ((has: (relPath: string) => boolean) => EcosystemId);
+  /**
+   * The language to report for this runner. The catalogue lists every language
+   * a runner *can* run; detection has to name the one this repo is in, and
+   * `languageByExt` refines it further from the files actually found.
+   */
   language: DetectedLanguage;
-  testType: TestType;
   /** Root-relative globs whose presence is the strongest signal there is. */
   configGlobs?: string[];
   /** Top-level package.json keys that carry this runner's config. */
@@ -373,7 +335,11 @@ interface RunnerRule {
   deps?: string[];
   /** Dependency name patterns, for scoped or versioned families. */
   depPatterns?: RegExp[];
-  /** CLI name as it appears in a package script, used for `script` evidence. */
+  /**
+   * CLI name as it appears in a package script, used for `script` evidence.
+   * Only set where a script mentioning it means something: `node` and `python3`
+   * appear in scripts that have nothing to do with tests.
+   */
   bin?: string;
   toolchain?: ToolchainRule[];
   /** Ordered most-specific-first; a file counts once, for the first glob it matches. */
@@ -386,88 +352,25 @@ interface RunnerRule {
   builtin?: boolean;
   /** For JVM rules: pick the language from the test files actually found. */
   languageByExt?: Record<string, DetectedLanguage>;
-  invoke: (ctx: InvokeCtx) => { command: string; args: string[] };
-  junit: JUnitPlan;
 }
 
+/** Where detection asks for reports. A file for most runners, a directory for a few. */
 const REPORT = 'reports/junit.xml';
-
-function jsExec(
-  pm: DetectedPackageManager | null,
-  bin: string,
-  args: string[],
-): {
-  command: string;
-  args: string[];
-} {
-  switch (pm) {
-    case 'pnpm':
-      return { command: 'pnpm', args: ['exec', bin, ...args] };
-    case 'yarn':
-      return { command: 'yarn', args: [bin, ...args] };
-    case 'bun':
-      return { command: 'bunx', args: [bin, ...args] };
-    default:
-      return { command: 'npx', args: [bin, ...args] };
-  }
-}
-
-function pyExec(
-  pm: DetectedPackageManager | null,
-  command: string,
-  args: string[],
-): {
-  command: string;
-  args: string[];
-} {
-  if (pm === 'poetry' || pm === 'uv' || pm === 'pipenv') {
-    return { command: pm, args: ['run', command, ...args] };
-  }
-  return { command, args };
-}
-
-/** Maven and Gradle both run tests through the build tool; the wrapper wins when present. */
-function jvmExec(ctx: InvokeCtx): { command: string; args: string[] } {
-  if (ctx.has('mvnw')) return { command: './mvnw', args: ['test'] };
-  if (ctx.has('gradlew')) return { command: './gradlew', args: ['test'] };
-  if (ctx.has('pom.xml')) return { command: 'mvn', args: ['test'] };
-  return { command: 'gradle', args: ['test'] };
-}
-
-const BUILT_IN = (
-  args: string[],
-  reportPath: string | null,
-  env: Record<string, string> = {},
-  note: string | null = null,
-): JUnitPlan => ({ support: 'built-in', args, env, reportPath, note });
-
-const NEEDS = (note: string, args: string[] = [], reportPath: string | null = null): JUnitPlan => ({
-  support: 'needs-plugin',
-  args,
-  env: {},
-  reportPath,
-  note,
-});
-
-const NO_JUNIT = (note: string): JUnitPlan => ({
-  support: 'none',
-  args: [],
-  env: {},
-  reportPath: null,
-  note,
-});
+const REPORT_DIR = 'reports';
 
 /**
  * The rule table. Ordering is irrelevant — ranking comes from evidence, not from
  * position — so entries are grouped by language for reading, not for precedence.
+ *
+ * Every entry is evidence and nothing else. If you find yourself wanting to add
+ * a command, a flag or a report path here, it belongs in the catalogue record
+ * this rule points at.
  */
 const RULES: RunnerRule[] = [
   // ── JavaScript / TypeScript: unit ─────────────────────────────────────────
   {
-    runner: 'VITEST',
-    label: 'Vitest',
+    ecosystem: 'vitest',
     language: 'TYPESCRIPT',
-    testType: 'UNIT_GEN',
     configGlobs: ['vitest.config.{ts,js,mts,mjs,cts,cjs}', 'vitest.workspace.{ts,js,json}'],
     deps: ['vitest', '@vitest/ui', '@vitest/coverage-v8'],
     bin: 'vitest',
@@ -476,14 +379,10 @@ const RULES: RunnerRule[] = [
       'tests/**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}',
       '**/*.{test,spec}.{ts,tsx,js,jsx,mts,mjs}',
     ],
-    invoke: (ctx) => jsExec(ctx.pm, 'vitest', ['run']),
-    junit: BUILT_IN(['--reporter=junit', `--outputFile=${REPORT}`], REPORT),
   },
   {
-    runner: 'JEST',
-    label: 'Jest',
+    ecosystem: 'jest',
     language: 'TYPESCRIPT',
-    testType: 'UNIT_GEN',
     configGlobs: ['jest.config.{ts,js,mjs,cjs,json}', 'jest.setup.{ts,js}'],
     pkgKeys: ['jest'],
     deps: ['jest', 'ts-jest', 'babel-jest', 'jest-environment-jsdom', '@jest/globals'],
@@ -494,63 +393,37 @@ const RULES: RunnerRule[] = [
       'tests/**/*.{test,spec}.{ts,tsx,js,jsx}',
       '**/*.{test,spec}.{ts,tsx,js,jsx}',
     ],
-    invoke: (ctx) => jsExec(ctx.pm, 'jest', ['--ci']),
-    junit: NEEDS(
-      'Jest needs the `jest-junit` reporter installed before it can emit JUnit XML.',
-      ['--reporters=default', '--reporters=jest-junit'],
-      REPORT,
-    ),
   },
   {
-    runner: 'MOCHA',
-    label: 'Mocha',
+    ecosystem: 'mocha',
     language: 'JAVASCRIPT',
-    testType: 'UNIT_GEN',
     configGlobs: ['.mocharc.{json,jsonc,yml,yaml,js,cjs}'],
     pkgKeys: ['mocha'],
     deps: ['mocha'],
     bin: 'mocha',
     testGlobs: ['test/**/*.{js,mjs,cjs,ts}'],
-    invoke: (ctx) => jsExec(ctx.pm, 'mocha', []),
-    junit: NEEDS(
-      'Mocha needs `mocha-junit-reporter` installed before it can emit JUnit XML.',
-      ['--reporter', 'mocha-junit-reporter'],
-      REPORT,
-    ),
   },
   {
-    runner: 'AVA',
-    label: 'AVA',
+    ecosystem: 'ava',
     language: 'JAVASCRIPT',
-    testType: 'UNIT_GEN',
     configGlobs: ['ava.config.{js,cjs,mjs}'],
     pkgKeys: ['ava'],
     deps: ['ava'],
     bin: 'ava',
     testGlobs: ['test/**/*.{js,mjs,cjs,ts}', '**/*.test.{js,mjs,cjs,ts}'],
-    invoke: (ctx) => jsExec(ctx.pm, 'ava', []),
-    junit: NO_JUNIT(
-      'AVA reports TAP; converting it to JUnit needs a pipe, so QAAI reads the exit code.',
-    ),
   },
   {
-    runner: 'NODE_TEST',
-    label: 'node:test',
+    ecosystem: 'node-test',
     language: 'JAVASCRIPT',
-    testType: 'UNIT_GEN',
     builtin: true,
     // Narrow on purpose: `**/*.test.js` alone is far more often Jest or Vitest,
     // and nominating node:test for every such file would be noise, not detection.
     testGlobs: ['test/**/*.{test,spec}.{js,mjs,cjs}', '**/*.test.{mjs,mts}'],
-    invoke: () => ({ command: 'node', args: ['--test'] }),
-    junit: BUILT_IN(['--test-reporter=junit', `--test-reporter-destination=${REPORT}`], REPORT),
   },
   // ── JavaScript / TypeScript: browser ──────────────────────────────────────
   {
-    runner: 'PLAYWRIGHT',
-    label: 'Playwright',
+    ecosystem: 'playwright',
     language: 'TYPESCRIPT',
-    testType: 'E2E',
     configGlobs: ['playwright.config.{ts,js,mts,mjs,cts,cjs}', 'playwright-ct.config.{ts,js}'],
     deps: ['@playwright/test', 'playwright'],
     depPatterns: [/^@playwright\//],
@@ -561,14 +434,10 @@ const RULES: RunnerRule[] = [
       'playwright/**/*.{spec,test}.{ts,js}',
       '**/*.{spec,test}.{ts,tsx,js,mjs}',
     ],
-    invoke: (ctx) => jsExec(ctx.pm, 'playwright', ['test']),
-    junit: BUILT_IN(['--reporter=junit'], REPORT, { PLAYWRIGHT_JUNIT_OUTPUT_NAME: REPORT }),
   },
   {
-    runner: 'CYPRESS',
-    label: 'Cypress',
+    ecosystem: 'cypress',
     language: 'TYPESCRIPT',
-    testType: 'E2E',
     configGlobs: ['cypress.config.{ts,js,mjs,cjs}', 'cypress.json'],
     deps: ['cypress'],
     depPatterns: [/^@cypress\//],
@@ -579,91 +448,50 @@ const RULES: RunnerRule[] = [
       'cypress/**/*.cy.{ts,tsx,js,jsx}',
       '**/*.cy.{ts,tsx,js,jsx}',
     ],
-    invoke: (ctx) => jsExec(ctx.pm, 'cypress', ['run']),
-    junit: NEEDS(
-      'Cypress needs `mocha-junit-reporter` installed before it can emit JUnit XML.',
-      ['--reporter', 'junit', '--reporter-options', `mochaFile=${REPORT}`],
-      REPORT,
-    ),
   },
   {
-    runner: 'WEBDRIVERIO',
-    label: 'WebdriverIO',
+    ecosystem: 'webdriverio',
     language: 'TYPESCRIPT',
-    testType: 'E2E',
     configGlobs: ['wdio.conf.{ts,js,mjs,cjs}', '**/wdio.conf.{ts,js}'],
     depPatterns: [/^@wdio\//],
     deps: ['webdriverio'],
     bin: 'wdio',
     testGlobs: ['test/specs/**/*.{ts,js}', '**/*.e2e.{ts,js}'],
-    invoke: (ctx) =>
-      jsExec(ctx.pm, 'wdio', ['run', ctx.has('wdio.conf.ts') ? 'wdio.conf.ts' : 'wdio.conf.js']),
-    junit: NEEDS(
-      'WebdriverIO needs `@wdio/junit-reporter` configured before it can emit JUnit XML.',
-    ),
   },
   {
-    runner: 'NIGHTWATCH',
-    label: 'Nightwatch',
+    ecosystem: 'nightwatch',
     language: 'JAVASCRIPT',
-    testType: 'E2E',
     configGlobs: ['nightwatch.conf.{ts,js,cjs}', 'nightwatch.json'],
     deps: ['nightwatch'],
     bin: 'nightwatch',
     testGlobs: ['tests/**/*.{ts,js}', 'nightwatch/**/*.{ts,js}'],
-    invoke: (ctx) => jsExec(ctx.pm, 'nightwatch', []),
-    junit: {
-      support: 'built-in',
-      args: [],
-      env: {},
-      reportPath: null,
-      note: 'Nightwatch writes one XML per suite into tests_output/; point reportPath at the file you want.',
-    },
   },
   {
-    runner: 'K6',
-    label: 'k6',
+    ecosystem: 'k6',
     language: 'JAVASCRIPT',
-    testType: 'LOAD',
     deps: ['k6'],
     depPatterns: [/^@?k6(\/|$)/],
     bin: 'k6',
     testGlobs: ['load/**/*.{js,ts}', 'k6/**/*.{js,ts}', 'perf/**/*.{js,ts}'],
-    invoke: (ctx) => ({ command: 'k6', args: ['run', ctx.testFiles[0] ?? 'script.js'] }),
-    junit: NO_JUNIT(
-      'k6 reports through handleSummary(); QAAI reads its thresholds via the exit code.',
-    ),
   },
   {
-    runner: 'PA11Y',
-    label: 'Pa11y',
+    ecosystem: 'pa11y-ci',
     language: 'JAVASCRIPT',
-    testType: 'ACCESSIBILITY',
     configGlobs: ['.pa11yci', '.pa11yci.json', 'pa11y.json', '.pa11yci.js'],
     deps: ['pa11y', 'pa11y-ci'],
     bin: 'pa11y-ci',
-    invoke: (ctx) => jsExec(ctx.pm, 'pa11y-ci', []),
-    junit: NEEDS(
-      'pa11y-ci reports JSON; a JUnit reporter has to be added before QAAI can read cases.',
-    ),
   },
   {
-    runner: 'NEWMAN',
-    label: 'Newman (Postman)',
+    ecosystem: 'newman',
     language: 'JAVASCRIPT',
-    testType: 'API',
     deps: ['newman'],
     bin: 'newman',
     testGlobs: ['**/*.postman_collection.json'],
-    invoke: (ctx) => jsExec(ctx.pm, 'newman', ['run', ctx.testFiles[0] ?? 'collection.json']),
-    junit: BUILT_IN(['-r', 'junit', `--reporter-junit-export=${REPORT}`], REPORT),
   },
   // ── Python ────────────────────────────────────────────────────────────────
   {
-    runner: 'PYTEST',
-    label: 'pytest',
+    ecosystem: 'pytest',
     language: 'PYTHON',
-    testType: 'UNIT_GEN',
     configGlobs: ['pytest.ini', 'conftest.py', '**/conftest.py'],
     manifestSections: [
       {
@@ -677,14 +505,10 @@ const RULES: RunnerRule[] = [
     deps: ['pytest'],
     depPatterns: [/^pytest[-_]/],
     testGlobs: ['tests/**/test_*.py', 'test/**/test_*.py', '**/test_*.py', '**/*_test.py'],
-    invoke: (ctx) => pyExec(ctx.pm, 'pytest', []),
-    junit: BUILT_IN([`--junitxml=${REPORT}`], REPORT),
   },
   {
-    runner: 'DJANGO_TEST',
-    label: 'Django test runner',
+    ecosystem: 'django-test',
     language: 'PYTHON',
-    testType: 'UNIT_GEN',
     toolchain: [
       {
         detail: 'manage.py at the project root (Django ships its own test runner)',
@@ -693,52 +517,31 @@ const RULES: RunnerRule[] = [
     ],
     deps: ['django'],
     testGlobs: ['**/tests/test_*.py', '**/tests.py', '**/test_*.py'],
-    invoke: (ctx) => pyExec(ctx.pm, 'python3', ['manage.py', 'test']),
-    junit: NEEDS('The Django runner needs `unittest-xml-reporting` before it can emit JUnit XML.'),
   },
   {
-    runner: 'UNITTEST',
-    label: 'unittest (stdlib)',
+    ecosystem: 'unittest',
     language: 'PYTHON',
-    testType: 'UNIT_GEN',
     builtin: true,
     testGlobs: ['tests/**/test_*.py', 'test/**/test_*.py', '**/test_*.py'],
-    invoke: (ctx) => pyExec(ctx.pm, 'python3', ['-m', 'unittest', 'discover']),
-    junit: NEEDS('unittest needs `unittest-xml-reporting` before it can emit JUnit XML.'),
   },
   {
-    runner: 'BEHAVE',
-    label: 'behave',
+    ecosystem: 'behave',
     language: 'PYTHON',
-    testType: 'E2E',
     configGlobs: ['behave.ini'],
     deps: ['behave'],
     testGlobs: ['features/**/*.feature'],
-    invoke: (ctx) => pyExec(ctx.pm, 'behave', []),
-    junit: BUILT_IN(
-      ['--junit', '--junit-directory', 'reports'],
-      null,
-      {},
-      'behave writes one XML per feature into reports/; point reportPath at the file you want.',
-    ),
   },
   {
-    runner: 'ROBOT',
-    label: 'Robot Framework',
+    ecosystem: 'robot-framework',
     language: 'PYTHON',
-    testType: 'E2E',
     deps: ['robotframework'],
     depPatterns: [/^robotframework-/],
     testGlobs: ['**/*.robot'],
-    invoke: (ctx) => pyExec(ctx.pm, 'robot', ['--outputdir', 'reports', 'tests']),
-    junit: NEEDS('Robot writes its own output.xml; converting it to JUnit needs an external step.'),
   },
   // ── JVM ───────────────────────────────────────────────────────────────────
   {
-    runner: 'JUNIT5',
-    label: 'JUnit 5',
+    ecosystem: byBuildTool('junit5-maven', 'junit5-gradle'),
     language: 'JAVA',
-    testType: 'UNIT_GEN',
     languageByExt: { '.kt': 'KOTLIN', '.java': 'JAVA' },
     deps: [
       'junit-jupiter',
@@ -759,129 +562,62 @@ const RULES: RunnerRule[] = [
       'src/test/kotlin/**/*{Test,Tests}.kt',
       '**/src/test/java/**/*{Test,Tests}.{java,kt}',
     ],
-    invoke: jvmExec,
-    junit: {
-      support: 'built-in',
-      args: [],
-      env: {},
-      reportPath: null,
-      note: 'Surefire/Gradle write one XML per class under target/surefire-reports or build/test-results/test.',
-    },
   },
   {
-    runner: 'JUNIT4',
-    label: 'JUnit 4',
+    ecosystem: byBuildTool('junit4-maven', 'junit4-gradle'),
     language: 'JAVA',
-    testType: 'UNIT_GEN',
     languageByExt: { '.kt': 'KOTLIN', '.java': 'JAVA' },
     deps: ['junit', 'junit-vintage-engine'],
     testGlobs: ['src/test/java/**/*{Test,Tests}.java'],
-    invoke: jvmExec,
-    junit: {
-      support: 'built-in',
-      args: [],
-      env: {},
-      reportPath: null,
-      note: 'Surefire/Gradle write one XML per class under target/surefire-reports or build/test-results/test.',
-    },
   },
   {
-    runner: 'TESTNG',
-    label: 'TestNG',
+    ecosystem: byBuildTool('testng', 'testng-gradle'),
     language: 'JAVA',
-    testType: 'UNIT_GEN',
     configGlobs: ['testng.xml', 'src/test/resources/testng.xml'],
     deps: ['testng'],
     testGlobs: ['src/test/java/**/*{Test,Tests}.java'],
-    invoke: jvmExec,
-    junit: {
-      support: 'built-in',
-      args: [],
-      env: {},
-      reportPath: null,
-      note: 'TestNG writes JUnit-compatible XML under target/surefire-reports.',
-    },
   },
   {
-    runner: 'KARATE',
-    label: 'Karate',
+    ecosystem: 'karate',
     language: 'JAVA',
-    testType: 'API',
     deps: ['karate-junit5', 'karate-core'],
     depPatterns: [/^karate-/],
     testGlobs: ['src/test/**/*.feature'],
-    invoke: jvmExec,
-    junit: {
-      support: 'built-in',
-      args: [],
-      env: {},
-      reportPath: null,
-      note: 'Karate writes JUnit XML under target/karate-reports.',
-    },
   },
   // ── Ruby ──────────────────────────────────────────────────────────────────
   {
-    runner: 'RSPEC',
-    label: 'RSpec',
+    ecosystem: 'rspec',
     language: 'RUBY',
-    testType: 'UNIT_GEN',
     configGlobs: ['.rspec', 'spec/spec_helper.rb', 'spec/rails_helper.rb'],
     deps: ['rspec', 'rspec-rails', 'rspec-core'],
     testGlobs: ['spec/**/*_spec.rb'],
-    invoke: () => ({ command: 'bundle', args: ['exec', 'rspec'] }),
-    junit: NEEDS(
-      'RSpec needs the `rspec_junit_formatter` gem before it can emit JUnit XML.',
-      ['--format', 'RspecJunitFormatter', '--out', REPORT],
-      REPORT,
-    ),
   },
   {
-    runner: 'MINITEST',
-    label: 'Minitest',
+    ecosystem: 'minitest',
     language: 'RUBY',
-    testType: 'UNIT_GEN',
     builtin: true,
     configGlobs: ['test/test_helper.rb'],
     deps: ['minitest', 'minitest-reporters'],
     testGlobs: ['test/**/*_test.rb'],
-    invoke: () => ({ command: 'bundle', args: ['exec', 'rake', 'test'] }),
-    junit: NEEDS('Minitest needs `minitest-reporters` before it can emit JUnit XML.'),
   },
   {
-    runner: 'CUCUMBER_RUBY',
-    label: 'Cucumber (Ruby)',
+    ecosystem: 'cucumber-ruby',
     language: 'RUBY',
-    testType: 'E2E',
     deps: ['cucumber', 'cucumber-rails'],
     testGlobs: ['features/**/*.feature'],
-    invoke: () => ({ command: 'bundle', args: ['exec', 'cucumber'] }),
-    junit: BUILT_IN(
-      ['--format', 'junit', '--out', 'reports'],
-      null,
-      {},
-      'Cucumber writes one XML per feature into reports/; point reportPath at the file you want.',
-    ),
   },
   // ── Go ────────────────────────────────────────────────────────────────────
   {
-    runner: 'GO_TEST',
-    label: 'go test',
+    ecosystem: 'go-test',
     language: 'GO',
-    testType: 'UNIT_GEN',
     builtin: true,
     toolchain: [{ detail: 'go.mod (the Go toolchain runs tests with `go test`)', file: 'go.mod' }],
     testGlobs: ['**/*_test.go'],
-    invoke: () => ({ command: 'go', args: ['test', './...'] }),
-    junit: NEEDS(
-      '`go test` prints text; `gotestsum --junitfile` is the usual way to get JUnit XML.',
-    ),
   },
   // ── .NET ──────────────────────────────────────────────────────────────────
   {
-    runner: 'XUNIT',
-    label: 'xUnit.net',
+    ecosystem: 'xunit',
     language: 'CSHARP',
-    testType: 'UNIT_GEN',
     deps: ['xunit', 'xunit.runner.visualstudio', 'xunit.v3'],
     depPatterns: [/^xunit(\.|$)/],
     toolchain: [
@@ -891,64 +627,40 @@ const RULES: RunnerRule[] = [
       },
     ],
     testGlobs: ['**/*Tests/**/*.cs', 'tests/**/*.cs', 'test/**/*.cs'],
-    invoke: () => ({ command: 'dotnet', args: ['test'] }),
-    junit: NEEDS(
-      '`dotnet test` writes TRX; the JUnitTestLogger package adds a JUnit logger.',
-      ['--logger', `junit;LogFilePath=${REPORT}`],
-      REPORT,
-    ),
   },
   {
-    runner: 'NUNIT',
-    label: 'NUnit',
+    ecosystem: 'nunit',
     language: 'CSHARP',
-    testType: 'UNIT_GEN',
     deps: ['nunit', 'nunit3testadapter', 'nunit.analyzers'],
     testGlobs: ['**/*Tests/**/*.cs', 'tests/**/*.cs'],
-    invoke: () => ({ command: 'dotnet', args: ['test'] }),
-    junit: NEEDS('`dotnet test` writes TRX; the JUnitTestLogger package adds a JUnit logger.'),
   },
   {
-    runner: 'MSTEST',
-    label: 'MSTest',
+    ecosystem: 'mstest',
     language: 'CSHARP',
-    testType: 'UNIT_GEN',
     deps: ['mstest', 'mstest.testframework', 'mstest.testadapter'],
     testGlobs: ['**/*Tests/**/*.cs', 'tests/**/*.cs'],
-    invoke: () => ({ command: 'dotnet', args: ['test'] }),
-    junit: NEEDS('`dotnet test` writes TRX; the JUnitTestLogger package adds a JUnit logger.'),
   },
   // ── PHP ───────────────────────────────────────────────────────────────────
   {
-    runner: 'PHPUNIT',
-    label: 'PHPUnit',
+    ecosystem: 'phpunit',
     language: 'PHP',
-    testType: 'UNIT_GEN',
     configGlobs: ['phpunit.xml', 'phpunit.xml.dist', 'phpunit.dist.xml'],
     deps: ['phpunit/phpunit'],
     depPatterns: [/^phpunit\//],
     testGlobs: ['tests/**/*Test.php', 'test/**/*Test.php'],
-    invoke: () => ({ command: './vendor/bin/phpunit', args: [] }),
-    junit: BUILT_IN(['--log-junit', REPORT], REPORT),
   },
   {
-    runner: 'PEST',
-    label: 'Pest',
+    ecosystem: 'pest',
     language: 'PHP',
-    testType: 'UNIT_GEN',
     configGlobs: ['tests/Pest.php'],
     deps: ['pestphp/pest'],
     depPatterns: [/^pestphp\//],
     testGlobs: ['tests/**/*Test.php'],
-    invoke: () => ({ command: './vendor/bin/pest', args: [] }),
-    junit: BUILT_IN(['--log-junit', REPORT], REPORT),
   },
   // ── Rust / Swift ──────────────────────────────────────────────────────────
   {
-    runner: 'CARGO_TEST',
-    label: 'cargo test',
+    ecosystem: 'cargo-test',
     language: 'RUST',
-    testType: 'UNIT_GEN',
     builtin: true,
     toolchain: [
       {
@@ -957,23 +669,89 @@ const RULES: RunnerRule[] = [
       },
     ],
     testGlobs: ['tests/**/*.rs'],
-    invoke: () => ({ command: 'cargo', args: ['test'] }),
-    junit: NEEDS('`cargo test` prints text; `cargo2junit` converts it to JUnit XML.'),
   },
   {
-    runner: 'XCTEST',
-    label: 'XCTest (SwiftPM)',
+    ecosystem: 'swift-test',
     language: 'SWIFT',
-    testType: 'UNIT_GEN',
     builtin: true,
     toolchain: [
       { detail: 'Package.swift (SwiftPM runs tests with `swift test`)', file: 'Package.swift' },
     ],
     testGlobs: ['Tests/**/*.swift'],
-    invoke: () => ({ command: 'swift', args: ['test'] }),
-    junit: BUILT_IN(['--xunit-output', REPORT], REPORT),
   },
 ];
+
+/**
+ * Every runner detection can nominate, as catalogue ids. Derived from the rule
+ * table so it cannot describe a coverage we do not have.
+ */
+export const DETECTABLE_RUNNERS: readonly EcosystemId[] = [
+  ...new Set(
+    RULES.flatMap((rule) =>
+      typeof rule.ecosystem === 'function'
+        ? [rule.ecosystem(() => true), rule.ecosystem(() => false)]
+        : [rule.ecosystem],
+    ),
+  ),
+];
+
+/**
+ * The catalogue record a rule means, for this repo. Never undefined while
+ * `EcosystemId` types the field — the throw is here because "that cannot
+ * happen" is what the last two drifts were called.
+ */
+function recordFor(
+  rule: RunnerRule,
+  has: (relPath: string) => boolean,
+): { id: EcosystemId; entry: Ecosystem } {
+  const id = typeof rule.ecosystem === 'function' ? rule.ecosystem(has) : rule.ecosystem;
+  const entry = ecosystemById(id);
+  if (!entry) throw new Error(`detect.ts names "${id}", which the ecosystem catalogue does not`);
+  return { id, entry };
+}
+
+/**
+ * The catalogue says how a runner is invoked in general. Detection has read the
+ * repo and knows which of its interchangeable front-ends is actually there — so
+ * an adapter may only *re-point* a command at the client that will resolve it.
+ * It never adds arguments: arguments are the record's, and a second place to
+ * keep them is how these two files drifted apart in the first place.
+ */
+function adaptToRepo(
+  base: { command: string; args: string[] },
+  pm: PackageManager | null,
+  has: (relPath: string) => boolean,
+): { command: string; args: string[] } {
+  // A config file named in the command has to be the one that is actually
+  // there: a TypeScript WebdriverIO project keeps wdio.conf.ts, and the .js
+  // name would fail with "config not found" rather than with a test failure.
+  // Only fires when the named file is absent and its twin is present.
+  const args = base.args.map((arg) => {
+    if (!arg.endsWith('.js') || has(arg)) return arg;
+    const ts = `${arg.slice(0, -3)}.ts`;
+    return has(ts) ? ts : arg;
+  });
+
+  // Every npm-compatible client spells "run the project-local binary" its own way.
+  if (base.command === 'npx') {
+    const [bin, ...rest] = args;
+    if (bin) {
+      if (pm === 'pnpm') return { command: 'pnpm', args: ['exec', bin, ...rest] };
+      if (pm === 'yarn') return { command: 'yarn', args: [bin, ...rest] };
+      if (pm === 'bun') return { command: 'bunx', args: [bin, ...rest] };
+    }
+    return { command: base.command, args };
+  }
+  // These three own the virtualenv; a bare python3 would be the system one.
+  if (base.command === 'python3' && (pm === 'poetry' || pm === 'uv' || pm === 'pipenv')) {
+    return { command: pm, args: ['run', base.command, ...args] };
+  }
+  // The wrapper a repo ships pins the build-tool version the project expects,
+  // and is the one command guaranteed to exist on a fresh worker.
+  if (base.command === 'mvn' && has('mvnw')) return { command: './mvnw', args };
+  if (base.command === './gradlew' && !has('gradlew')) return { command: 'gradle', args };
+  return { command: base.command, args };
+}
 
 // ─── Manifests ───────────────────────────────────────────────────────────────
 
@@ -986,7 +764,7 @@ interface DepEntry {
 }
 
 /** Files that make a directory a project root, and the manager they imply. */
-const ROOT_MARKERS: Array<{ name: string; pm: DetectedPackageManager | null }> = [
+const ROOT_MARKERS: Array<{ name: string; pm: PackageManager | null }> = [
   { name: 'package.json', pm: null },
   { name: 'pyproject.toml', pm: null },
   { name: 'setup.py', pm: 'pip' },
@@ -1004,7 +782,7 @@ const ROOT_MARKERS: Array<{ name: string; pm: DetectedPackageManager | null }> =
   { name: 'Package.swift', pm: 'swiftpm' },
 ];
 
-const LOCKFILE_PM: Array<{ name: string; pm: DetectedPackageManager }> = [
+const LOCKFILE_PM: Array<{ name: string; pm: PackageManager }> = [
   { name: 'pnpm-lock.yaml', pm: 'pnpm' },
   { name: 'pnpm-workspace.yaml', pm: 'pnpm' },
   { name: 'yarn.lock', pm: 'yarn' },
@@ -1415,17 +1193,17 @@ function detectRoots(files: RepoFile[]): {
   }
 
   for (const root of roots.values()) {
-    const found = new Map<DetectedPackageManager, Evidence[]>();
+    const found = new Map<PackageManager, Evidence[]>();
     const abs = (rel: string) => (root.dir === '.' ? rel : `${root.dir}/${rel}`);
-    const note = (pm: DetectedPackageManager, evidence: Evidence) => {
+    const note = (pm: PackageManager, evidence: Evidence) => {
       found.set(pm, [...(found.get(pm) ?? []), evidence]);
     };
 
     const pmField = root.pkgJson?.['packageManager'];
     if (typeof pmField === 'string') {
       const name = pmField.split('@')[0] ?? '';
-      if ((DETECTED_PACKAGE_MANAGERS as readonly string[]).includes(name)) {
-        note(name as DetectedPackageManager, {
+      if ((PACKAGE_MANAGERS as readonly string[]).includes(name)) {
+        note(name as PackageManager, {
           kind: 'manifest-config',
           detail: `packageManager: "${pmField}" in package.json`,
           path: abs('package.json'),
@@ -1488,11 +1266,11 @@ function pmForLanguage(
   root: Root,
   roots: Map<string, Root>,
   language: DetectedLanguage,
-): DetectedPackageManager | null {
+): PackageManager | null {
   const chain = [root, ...ancestorsOf(root.dir, roots)];
   for (const candidate of chain) {
     for (const detection of candidate.pms) {
-      if (PM_FAMILY[detection.manager].includes(language)) return detection.manager;
+      if (familyOf(detection.manager).includes(language)) return detection.manager;
     }
   }
   return null;
@@ -1518,19 +1296,26 @@ function buildCandidate(
   const pm = pmForLanguage(root, roots, draft.language);
   const relTests = draft.testFiles.map((p) => relativeTo(root.dir, p));
 
+  const has = (rel: string): boolean => root.rel.has(rel);
   const scriptName = draft.rule.bin ? findScript(root.scripts, draft.rule.bin) : null;
 
-  const { command, args } = draft.rule.invoke({
+  // Everything about the runner itself is read from here: what it is called,
+  // what it runs, and what it can report. Detection contributes only what it
+  // observed — the client that will resolve the binary, the build wrapper the
+  // repo ships, and the one test file the runners with a positional argument
+  // need.
+  const { id, entry } = recordFor(draft.rule, has);
+  const { command, args } = adaptToRepo(
+    { command: entry.command, args: ecosystemRunArgs(entry, relTests[0] ?? null) },
     pm,
-    has: (rel) => root.rel.has(rel),
-    testFiles: relTests,
-  });
+    has,
+  );
 
   return {
-    runner: draft.rule.runner,
-    label: draft.rule.label,
+    runner: id,
+    label: entry.label,
     language: draft.language,
-    testType: draft.rule.testType,
+    testType: entry.defaultTestType,
     root: root.dir,
     score,
     confidence: toConfidence(score),
@@ -1543,8 +1328,9 @@ function buildCandidate(
       command,
       args,
       cwd: root.dir,
+      env: { ...entry.env },
       script: scriptName,
-      junit: draft.rule.junit,
+      junit: junitPlanFor(entry, { file: REPORT, directory: REPORT_DIR }),
     },
     packageManager: pm,
     generatorLanguage: GENERATOR_LANGUAGES.has(draft.language)

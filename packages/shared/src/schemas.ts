@@ -10,6 +10,7 @@ import {
   ENVIRONMENT_KINDS,
   FRAMEWORKS_BY_LANGUAGE,
   GIT_INTEGRATION_KINDS,
+  GRID_INTEGRATION_KINDS,
   LANGUAGES,
   ORG_ROLES,
   PRIORITIES,
@@ -1235,6 +1236,299 @@ export const mutationTestSpecSchema = z
   });
 
 export type MutationTestSpec = z.infer<typeof mutationTestSpecSchema>;
+
+// ─── Mobile native tests (§4) ────────────────────────────────────────────────
+
+/**
+ * The five ways a team actually tests a native app, and the only five listed in
+ * `UI_FRAMEWORKS`. One TestType rather than five, for the reason PROTOCOL is
+ * one: they differ in transport, not in shape — install or address an app on a
+ * device, drive an ordered sequence of interactions, assert on what the screen
+ * shows.
+ *
+ * APPIUM is driven directly over its W3C HTTP API. The other four are their
+ * ecosystem's own CLI and are shelled out to, exactly as LOAD does with k6 and
+ * MUTATION does with Stryker: reimplementing `xcodebuild` or Gradle's
+ * instrumentation runner is not a thing anyone should attempt, and the report
+ * those tools already emit is the one their users trust.
+ */
+export const MOBILE_DRIVERS = ['APPIUM', 'MAESTRO', 'DETOX', 'ESPRESSO', 'XCUITEST'] as const;
+export type MobileDriver = (typeof MOBILE_DRIVERS)[number];
+
+/** Shown next to the driver picker in the spec editor. */
+export const MOBILE_DRIVER_LABELS: Record<MobileDriver, string> = {
+  APPIUM: 'Appium — Android + iOS, over the W3C protocol',
+  MAESTRO: 'Maestro — YAML flows',
+  DETOX: 'Detox — React Native',
+  ESPRESSO: 'Espresso — Android, via Gradle',
+  XCUITEST: 'XCUITest — iOS, via xcodebuild',
+};
+
+export const MOBILE_PLATFORMS = ['ANDROID', 'IOS'] as const;
+export type MobilePlatform = (typeof MOBILE_PLATFORMS)[number];
+
+/**
+ * Locator strategies Appium accepts. The W3C set plus the two platform engines
+ * every real suite ends up using — a UiAutomator selector and an iOS predicate
+ * are what you reach for when a screen has no accessibility id.
+ *
+ * `accessibility id` is the default on purpose: it is the one locator that is
+ * stable across a redesign, works on both platforms, and improves the app for
+ * screen-reader users when a developer has to add it.
+ */
+export const MOBILE_LOCATOR_STRATEGIES = [
+  'accessibility id',
+  'id',
+  'xpath',
+  'class name',
+  '-android uiautomator',
+  '-ios predicate string',
+  '-ios class chain',
+] as const;
+export type MobileLocatorStrategy = (typeof MOBILE_LOCATOR_STRATEGIES)[number];
+
+export const mobileSelectorSchema = z.object({
+  using: z.enum(MOBILE_LOCATOR_STRATEGIES).default('accessibility id'),
+  value: z.string().min(1).max(2000),
+});
+export type MobileSelector = z.infer<typeof mobileSelectorSchema>;
+
+/**
+ * One interaction. Every step becomes a cockpit step, so a broken checkout
+ * names the tap that never landed rather than "the test failed".
+ *
+ * String fields support `{{NAME}}`, resolved against the vault first — a login
+ * step types a real password without the password being in the spec.
+ */
+export const appiumStepSchema = z.discriminatedUnion('action', [
+  z.object({
+    action: z.literal('TAP'),
+    name: z.string().min(1).max(160),
+    selector: mobileSelectorSchema,
+    /** How long to keep looking for the element before giving up. */
+    timeoutMs: z.number().int().min(1).max(300_000).default(10_000),
+  }),
+  z.object({
+    action: z.literal('TYPE'),
+    name: z.string().min(1).max(160),
+    selector: mobileSelectorSchema,
+    text: z.string().max(10_000),
+    /** Clear the field first. On by default: a rerun otherwise appends. */
+    clearFirst: z.boolean().default(true),
+    timeoutMs: z.number().int().min(1).max(300_000).default(10_000),
+  }),
+  z.object({
+    action: z.literal('ASSERT_VISIBLE'),
+    name: z.string().min(1).max(160),
+    selector: mobileSelectorSchema,
+    /** Set false to assert the element is NOT on screen. */
+    visible: z.boolean().default(true),
+    timeoutMs: z.number().int().min(1).max(300_000).default(10_000),
+  }),
+  z.object({
+    action: z.literal('ASSERT_TEXT'),
+    name: z.string().min(1).max(160),
+    selector: mobileSelectorSchema,
+    equals: z.string().max(4000).optional(),
+    contains: z.string().max(4000).optional(),
+    timeoutMs: z.number().int().min(1).max(300_000).default(10_000),
+  }),
+  z.object({
+    action: z.literal('WAIT'),
+    name: z.string().min(1).max(160),
+    ms: z.number().int().min(0).max(120_000),
+  }),
+  /** Coordinates are fractions of the screen (0–1), so one spec fits every device. */
+  z.object({
+    action: z.literal('SWIPE'),
+    name: z.string().min(1).max(160),
+    fromX: z.number().min(0).max(1).default(0.5),
+    fromY: z.number().min(0).max(1).default(0.7),
+    toX: z.number().min(0).max(1).default(0.5),
+    toY: z.number().min(0).max(1).default(0.3),
+    durationMs: z.number().int().min(50).max(10_000).default(600),
+  }),
+  /** Android's hardware back button; on iOS the driver rejects it and the step fails. */
+  z.object({
+    action: z.literal('PRESS_BACK'),
+    name: z.string().min(1).max(160),
+  }),
+  z.object({
+    action: z.literal('SCREENSHOT'),
+    name: z.string().min(1).max(160),
+  }),
+]);
+export type AppiumStep = z.infer<typeof appiumStepSchema>;
+
+/**
+ * A device farm — BrowserStack, Sauce Labs, LambdaTest, Perfecto.
+ *
+ * Only the NAMES of the vault secrets live here. The endpoint is NOT taken from
+ * the spec: it is derived from the provider and host-pinned in the plugin, the
+ * same discipline `apps/api/src/lib/git.ts` applies to a push token. A spec is
+ * org-authored data that ends up in the customer's repo, and an endpoint read
+ * out of it would be an access key handed to whatever host it named.
+ */
+export const mobileDeviceFarmSchema = z.object({
+  provider: z.enum(GRID_INTEGRATION_KINDS),
+  usernameSecretName: secretName.default('DEVICE_FARM_USERNAME'),
+  accessKeySecretName: secretName.default('DEVICE_FARM_ACCESS_KEY'),
+  /** Shown in the provider's dashboard so a session is traceable back to QAAI. */
+  buildName: z.string().max(120).default('QAAI'),
+  projectName: z.string().max(120).default('QAAI'),
+});
+export type MobileDeviceFarm = z.infer<typeof mobileDeviceFarmSchema>;
+
+/**
+ * Drive a real Appium server over its W3C HTTP API.
+ *
+ * No new dependency: the protocol is JSON over HTTP, and `appium` itself is a
+ * server the worker (or the device farm) runs, not a library QAAI links against.
+ */
+export const appiumMobileSpecSchema = z
+  .object({
+    driver: z.literal('APPIUM'),
+    platform: z.enum(MOBILE_PLATFORMS),
+    /**
+     * A self-hosted Appium server. Optional so that setting it together with
+     * `deviceFarm` can be rejected rather than silently ignored — see the
+     * refinement below.
+     */
+    serverUrl: z.string().max(2000).optional(),
+    deviceFarm: mobileDeviceFarmSchema.optional(),
+    /**
+     * Appium capabilities. `platformName` comes from `platform`; anything here
+     * that is not already a W3C standard capability is given the `appium:`
+     * prefix by the plugin, because an unprefixed vendor capability is the most
+     * common reason a W3C session is refused.
+     */
+    capabilities: z.record(z.string(), z.unknown()).default({}),
+    /** Convenience for `appium:app` — a path, or the app id the farm assigned. */
+    app: z.string().max(2000).optional(),
+    /** `{{NAME}}` values for step text, resolved against the vault first. */
+    variables: z.record(z.string(), z.string()).default({}),
+    /** Per-request ceiling. Session creation gets its own, longer, budget. */
+    requestTimeoutMs: z.number().int().min(1000).max(600_000).default(60_000),
+    newSessionTimeoutMs: z.number().int().min(1000).max(900_000).default(180_000),
+    /** Capture a screenshot when a step fails. The single most useful triage artifact. */
+    screenshotOnFailure: z.boolean().default(true),
+    steps: z.array(appiumStepSchema).min(1).max(200),
+  })
+  .refine((s) => !(s.deviceFarm && s.serverUrl), {
+    path: ['serverUrl'],
+    message:
+      'a device farm supplies its own hub endpoint — remove serverUrl, or remove deviceFarm to use your own server',
+  });
+export type AppiumMobileSpec = z.infer<typeof appiumMobileSpecSchema>;
+
+/**
+ * Fields every shelled-out mobile driver shares.
+ *
+ * `command` is an escape hatch with a real job: the binary is `./gradlew` in one
+ * repo and `gradle` in the next, and Maestro is as often invoked through a
+ * version manager as it is off PATH. Never passed through a shell.
+ */
+const mobileCliShape = {
+  command: z.string().min(1).max(200).optional(),
+  /** The complete argv when `command` is set. */
+  args: z.array(z.string().max(500)).max(64).default([]),
+  /** Appended to the built-in command line. */
+  extraArgs: z.array(z.string().max(500)).max(64).default([]),
+  env: z.record(z.string(), z.string()).default({}),
+  /** Secret names to expose to the child process, resolved from the vault. */
+  secretNames: z.array(secretName).max(50).default([]),
+  cwd: workspaceRelativePath.default('.'),
+  /** A device build is slow. Default 20 minutes, ceiling 2 hours. */
+  timeoutSeconds: z.number().int().min(10).max(7200).default(1200),
+};
+
+/** `maestro test` against a flow file or a directory of them. */
+export const maestroMobileSpecSchema = z.object({
+  driver: z.literal('MAESTRO'),
+  flowPath: workspaceRelativePath,
+  /** `--device`. Omit to let Maestro pick the only running device. */
+  deviceId: z.string().max(120).optional(),
+  /** Flow parameters, passed as `-e KEY=VALUE`. */
+  flowEnv: z.record(z.string(), z.string()).default({}),
+  /** Where `--format junit --output` writes. Read back with the JUnit parser. */
+  reportPath: workspaceRelativePath.default('maestro-report.xml'),
+  ...mobileCliShape,
+});
+export type MaestroMobileSpec = z.infer<typeof maestroMobileSpecSchema>;
+
+/** `detox test` — React Native's own harness, driving its own Jest run. */
+export const detoxMobileSpecSchema = z.object({
+  driver: z.literal('DETOX'),
+  /** A `configurations` key from .detoxrc, e.g. `ios.sim.debug`. */
+  configuration: z.string().min(1).max(120),
+  /** JUnit XML from the Jest reporter, when the project is set up to emit it. */
+  reportPath: workspaceRelativePath.optional(),
+  ...mobileCliShape,
+});
+export type DetoxMobileSpec = z.infer<typeof detoxMobileSpecSchema>;
+
+/**
+ * Espresso through Gradle. The instrumentation runner already writes JUnit XML
+ * under `build/outputs/androidTest-results`, so `reportPath` may name that whole
+ * directory — one XML per device, which is what a multi-device run produces.
+ */
+export const espressoMobileSpecSchema = z.object({
+  driver: z.literal('ESPRESSO'),
+  gradleTask: z.string().min(1).max(160).default('connectedAndroidTest'),
+  /** Gradle module, e.g. `:app`. Prefixed to the task when set. */
+  module: z.string().max(120).optional(),
+  /** `-Pandroid.testInstrumentationRunnerArguments.class=…`, for a single class. */
+  testClass: z.string().max(300).optional(),
+  reportPath: workspaceRelativePath.default('app/build/outputs/androidTest-results/connected'),
+  ...mobileCliShape,
+});
+export type EspressoMobileSpec = z.infer<typeof espressoMobileSpecSchema>;
+
+/**
+ * XCUITest through xcodebuild.
+ *
+ * `reportPath` is optional because xcodebuild does not write JUnit itself — a
+ * project piping through xcbeautify does. Without one, the plugin reads
+ * xcodebuild's own `Test Case '-[Suite test]' passed` lines, which it has
+ * printed unchanged for a decade.
+ */
+export const xcuitestMobileSpecSchema = z
+  .object({
+    driver: z.literal('XCUITEST'),
+    scheme: z.string().min(1).max(160),
+    /** One of these, not both — xcodebuild rejects the pair. */
+    project: workspaceRelativePath.optional(),
+    workspace: workspaceRelativePath.optional(),
+    destination: z
+      .string()
+      .min(1)
+      .max(300)
+      .default('platform=iOS Simulator,name=iPhone 15,OS=latest'),
+    testPlan: z.string().max(160).optional(),
+    /** `-only-testing:` entries, e.g. `UITests/CheckoutTests/testApplePay`. */
+    onlyTesting: z.array(z.string().min(1).max(300)).max(50).default([]),
+    reportPath: workspaceRelativePath.optional(),
+    ...mobileCliShape,
+  })
+  .refine((s) => !(s.project && s.workspace), {
+    path: ['workspace'],
+    message: 'set project or workspace, not both — xcodebuild accepts only one',
+  });
+export type XcuitestMobileSpec = z.infer<typeof xcuitestMobileSpecSchema>;
+
+/**
+ * A mobile test. Discriminated on `driver` so an impossible combination cannot
+ * be stored — a MAESTRO spec has no capabilities, an APPIUM spec has no Gradle
+ * task — and the plugin never has to guess which shape it was handed.
+ */
+export const mobileTestSpecSchema = z.discriminatedUnion('driver', [
+  appiumMobileSpecSchema,
+  maestroMobileSpecSchema,
+  detoxMobileSpecSchema,
+  espressoMobileSpecSchema,
+  xcuitestMobileSpecSchema,
+]);
+export type MobileTestSpec = z.infer<typeof mobileTestSpecSchema>;
 
 // ─── Runs (§5) ───────────────────────────────────────────────────────────────
 

@@ -32,6 +32,7 @@ import type {
   RunnerPlugin,
   TestExecution,
 } from '@qaai/shared';
+import type { ParsedReport } from '../reports/types.js';
 import {
   detectReportFormat,
   parseReport,
@@ -67,6 +68,51 @@ export const externalPlugin: RunnerPlugin = {
 };
 
 /** Shared by the external plugin and any type that wants to shell out. */
+/**
+ * The signatures every ecosystem uses when a suite fails to import.
+ *
+ * Matched against failure MESSAGES only, never against a test name — a test
+ * legitimately called "reports a helpful error when the module is missing"
+ * must not be swept up.
+ */
+const LOAD_ERROR = new RegExp(
+  [
+    'ModuleNotFoundError',
+    'ImportError',
+    'No module named',
+    "Cannot find module",
+    'ERR_MODULE_NOT_FOUND',
+    'NoClassDefFoundError',
+    'ClassNotFoundException',
+    'could not resolve',
+    'collection failure',
+    'error during collection',
+    'LoadError',
+    'cannot load such file',
+    'undefined method .* for nil',
+    'package .* is not in',
+    'error: could not compile',
+  ].join('|'),
+  'i',
+);
+
+/**
+ * Returns the load-error message when EVERY failure in the report is one, or
+ * null when any failure looks like a real assertion.
+ */
+export function onlyLoadErrors(parsed: ParsedReport): string | null {
+  const failures = parsed.tests.filter((t) => t.status === 'failed');
+  if (failures.length === 0) return null;
+
+  const messages = failures.map((t) =>
+    `${t.failureMessage ?? ''} ${t.stack ?? ''}`.trim(),
+  );
+  if (!messages.every((m) => LOAD_ERROR.test(m))) return null;
+
+  // Report the first one, trimmed to a sentence a person can act on.
+  return (messages[0] ?? 'the suite failed to load').split('\n')[0]!.slice(0, 300);
+}
+
 export async function runExternal(
   ctx: RunContext,
   test: ExecutableTest,
@@ -222,6 +268,24 @@ export async function runExternal(
       ? 'FAILED'
       : summary.status;
 
+  /*
+   * A suite that could not even LOAD is a configuration gap, not a failing test.
+   *
+   * The report is well-formed, so nothing above catches it — but every "failure"
+   * in it is a collection error reading `ModuleNotFoundError: No module named
+   * 'playwright'`, or `Cannot find module`, or `NoClassDefFoundError`. That is a
+   * dependency missing from the WORKER, and recording it as FAILED blames the
+   * customer's application for our environment. This repo has now fixed that
+   * same mistake three times — a missing Firefox binary, a missing mutation
+   * tool, a missing CLI — and it came back through the one path that does
+   * produce a readable report.
+   *
+   * Deliberately narrow: it only downgrades when EVERY failure looks like a load
+   * error. A suite where one test fails on a bad import and forty pass is still
+   * a failing suite, and is left alone.
+   */
+  const loadGap = onlyLoadErrors(parsed);
+
   const hint =
     declared && parsed.presence === 'unreadable'
       ? ` The file looks like ${detectReportFormat(report) ?? 'no format QAAI knows'}, not ${format}.`
@@ -229,9 +293,15 @@ export async function runExternal(
 
   return {
     ...base,
-    status,
+    status: loadGap ? 'SKIPPED' : status,
     durationMs: Date.now() - startedAt,
     steps,
-    errorMessage: summary.errorMessage ? `${summary.errorMessage}${hint}`.slice(0, 2000) : null,
+    errorMessage: loadGap
+      ? `The suite could not be loaded, so no test was evaluated: ${loadGap}. ` +
+        'This is a dependency missing from the worker, not a failure of the application under test — ' +
+        'install it in the worker image and re-run.'
+      : summary.errorMessage
+        ? `${summary.errorMessage}${hint}`.slice(0, 2000)
+        : null,
   };
 }

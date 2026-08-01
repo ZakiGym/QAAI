@@ -13,9 +13,16 @@
  * runner, how to *invoke* it, which flag makes it emit a *machine-readable*
  * report, and *where that report ends up*.
  *
+ * This file is the runner vocabulary for the whole package. `detect.ts` decides
+ * *which* runner a repository uses and how sure it is; what that runner is
+ * called, what it is written in, how it is invoked and what it can report are
+ * answered here and nowhere else. `EcosystemId` is the id type detection
+ * returns, so a rule pointing at a record that does not exist is a build error
+ * rather than a runtime shrug.
+ *
  * Rules for this file:
  *
- *  1. A record is DATA. Adding the 47th runner is a new entry, never a new
+ *  1. A record is DATA. Adding the 54th runner is a new entry, never a new
  *     branch. Nothing here imports the runner package, and nothing here
  *     executes anything — it is a lookup table with a doc comment.
  *
@@ -222,22 +229,43 @@ export const LANGUAGE_TO_ECOSYSTEM_LANGUAGE: Record<Language, EcosystemLanguage>
 };
 
 /**
- * Not "how you install the runner" — *which manifest the project already has*.
- * That is what detection reads, and what tells you whether `npx`, `bundle
- * exec` or `./vendor/bin/` is the right prefix. `npm` covers any npm-compatible
- * client (npm, pnpm, yarn); Bun and Deno are separate because their commands are.
+ * Not "how you install the runner" — *which manifest the project already has*,
+ * named after the command you would type. That is what detection reads, and
+ * what tells you whether `npx`, `pnpm exec`, `poetry run`, `bundle exec` or
+ * `./vendor/bin/` is the right prefix.
+ *
+ * One list, two granularities, on purpose. A record names the *coarse* member
+ * for its language — a Jest record says `npm`, because every npm-compatible
+ * client resolves it the same way — while detection may report the finer client
+ * it actually found in the repo (`pnpm`, `yarn`, `poetry`, `uv`, `pipenv`).
+ * They are the same vocabulary because they answer the same question; splitting
+ * them into a catalogue list and a detection list is what let the two drift.
+ *
+ * `go` and `dotnet` are named for the tool, not for go.mod or NuGet: nobody
+ * types `nuget` any more, and every other member here is already a command.
  */
 export const PACKAGE_MANAGERS = [
+  // JavaScript / TypeScript. The last three are npm-compatible clients whose
+  // *commands* differ (`pnpm exec` vs `yarn` vs `bunx`), which is the only
+  // reason detection needs to tell them apart.
   'npm',
+  'pnpm',
+  'yarn',
   'bun',
   'deno',
+  // Python. pip is the floor; the rest own the virtualenv and want `<pm> run`.
   'pip',
+  'poetry',
+  'uv',
+  'pipenv',
+  // JVM
   'maven',
   'gradle',
   'sbt',
-  'nuget',
+  // .NET
+  'dotnet',
   'bundler',
-  'gomod',
+  'go',
   'composer',
   'cargo',
   'swiftpm',
@@ -247,12 +275,52 @@ export const PACKAGE_MANAGERS = [
 ] as const;
 export type PackageManager = (typeof PACKAGE_MANAGERS)[number];
 
+/**
+ * Which languages a manager serves. Detection uses it to pair a manager it
+ * found with a runner it found — a repo with both a Gemfile and a package.json
+ * must not run Vitest through `bundle exec`.
+ *
+ * Not derived from the records: `pnpm`, `poetry` and friends serve languages no
+ * record names them for, and a table that only listed the managers some record
+ * happened to use would quietly answer "no language" for the rest.
+ */
+export const PACKAGE_MANAGER_LANGUAGES: Record<PackageManager, readonly EcosystemLanguage[]> = {
+  npm: ['typescript', 'javascript'],
+  pnpm: ['typescript', 'javascript'],
+  yarn: ['typescript', 'javascript'],
+  bun: ['typescript', 'javascript'],
+  deno: ['typescript', 'javascript'],
+  pip: ['python'],
+  poetry: ['python'],
+  uv: ['python'],
+  pipenv: ['python'],
+  maven: ['java', 'kotlin', 'groovy'],
+  gradle: ['java', 'kotlin', 'groovy', 'scala'],
+  sbt: ['scala'],
+  dotnet: ['csharp'],
+  bundler: ['ruby'],
+  go: ['go'],
+  composer: ['php'],
+  cargo: ['rust'],
+  swiftpm: ['swift'],
+  xcode: ['swift'],
+  pub: ['dart'],
+  hex: ['elixir'],
+};
+
 // ─── The record ──────────────────────────────────────────────────────────────
 
 /**
  * Evidence that a runner is in use. Any single hit is a signal; a scanner is
  * free to weight them. Every field is optional so a new record only fills in
  * what actually applies to it.
+ *
+ * Deliberately coarse, and deliberately not what detect.ts runs on. Detection
+ * ranks — a config file outranks a dependency outranks a filename — and that
+ * needs tiers, dependency patterns, manifest sections and workspace scoping
+ * that do not belong in a lookup table. These hints are the starting point for
+ * the runners detection has no rule for yet, and the record is still the only
+ * place that says how to *invoke* any of them.
  */
 export interface EcosystemDetect {
   /** Paths or globs, relative to the repo root. */
@@ -289,6 +357,36 @@ export type ReportAvailability = 'native' | 'config' | 'plugin' | 'none';
 /** Substituted into `args` by `resolveEcosystemCommand`. */
 export const REPORT_PATH_PLACEHOLDER = '{{reportPath}}';
 
+/**
+ * Substituted the same way, for the handful of runners that take the test file
+ * itself as a positional argument (`k6 run script.js`). `defaultTestPath` is
+ * what it falls back to when the caller has no concrete file yet — a literal
+ * `{{testPath}}` must never reach a spawn.
+ */
+export const TEST_PATH_PLACEHOLDER = '{{testPath}}';
+
+/**
+ * How to get JUnit XML out of a runner whose own report is something else.
+ *
+ * `runExternal` reads JUnit XML or an exit code, and nothing in between (see
+ * `REPORT_FORMAT_INFO[…].externalSpecFormat`). So a record whose `reportFormat`
+ * is jest-json, rspec-json, trx or go-json has a second, worse route to a
+ * report QAAI can actually parse, and that route is data too — writing it out
+ * in prose in `notes` is how detection ended up hand-rolling its own copy.
+ */
+export interface JUnitRoute {
+  /** Appended to the plain run. Empty when the route is a config file or another tool. */
+  readonly args?: readonly string[];
+  /** Env the route needs, e.g. where jest-junit writes. */
+  readonly env?: Readonly<Record<string, string>>;
+  /** The package that must be installed first. Absent when nothing is missing. */
+  readonly requires?: string;
+  /** Where the XML lands. Absent when it is a glob, or when there is no single file. */
+  readonly reportPath?: string;
+  /** Said in full, because this is the part a user has to act on. */
+  readonly note: string;
+}
+
 export interface Ecosystem {
   readonly id: string;
   readonly label: string;
@@ -299,10 +397,26 @@ export interface Ecosystem {
   readonly detect: EcosystemDetect;
   /** argv[0]. Never interpolated, never passed to a shell. */
   readonly command: string;
-  /** argv[1..], possibly containing REPORT_PATH_PLACEHOLDER. */
+  /**
+   * argv[1..] for the *whole* command, report flags included, in the order the
+   * runner needs them — `robot` wants `--xunit` before its test directory, and
+   * `gotestsum` wants `--junitfile` before the `--`. This is the authoritative
+   * invocation; `reportArgs` says which of these tokens are only here for the
+   * report, so a caller that just wants the tests run can drop them.
+   */
   readonly args: readonly string[];
-  /** Env the runner needs, for tools that take the report path that way. */
+  /**
+   * The subset of `args` that exists solely to produce `reportFormat`, in the
+   * same order — an in-order subsequence, checked by `ecosystemRunArgs`.
+   * Removing it leaves a command that still runs the suite and reports nothing.
+   */
+  readonly reportArgs: readonly string[];
+  /** Env the runner needs for an ordinary run. */
   readonly env?: Readonly<Record<string, string>>;
+  /** Env that exists only to place the report — Playwright takes its path this way. */
+  readonly reportEnv?: Readonly<Record<string, string>>;
+  /** Stands in for TEST_PATH_PLACEHOLDER when the caller has no file to name. */
+  readonly defaultTestPath?: string;
   readonly reportFormat: EcosystemReportFormat;
   readonly reportAvailability: ReportAvailability;
   /** What the placeholder stands for — pytest takes a file, behave a directory. */
@@ -314,6 +428,8 @@ export interface Ecosystem {
   readonly alternateReportFormats?: readonly EcosystemReportFormat[];
   /** The package that has to exist for `reportAvailability: 'plugin'`. */
   readonly reporterPackage?: string;
+  /** Set when `reportFormat` is not junit-xml but JUnit XML is reachable anyway. */
+  readonly junitRoute?: JUnitRoute;
   readonly installHint: string;
   readonly notes: string;
 }
@@ -335,6 +451,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['jest', '--ci', '--json', `--outputFile=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--json', `--outputFile=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'jest-json',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -342,6 +459,13 @@ export const ECOSYSTEMS = [
     reportPath: 'reports/jest.json',
     alternateReportFormats: ['junit-xml'],
     reporterPackage: 'jest-junit',
+    junitRoute: {
+      args: ['--reporters=default', '--reporters=jest-junit'],
+      env: { JEST_JUNIT_OUTPUT_FILE: REPORT_PATH_PLACEHOLDER },
+      requires: 'jest-junit',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: 'Jest needs the `jest-junit` reporter installed before it can emit JUnit XML, and jest-junit takes its path from JEST_JUNIT_OUTPUT_FILE rather than from a flag — without the env var it writes ./junit.xml wherever the run started.',
+    },
     installHint: 'npm install --save-dev jest',
     notes:
       "`--json --outputFile` is built in and needs no extra package, which is why it is the default here. The junit alternative takes its path from an env var, not a flag: `--reporters=jest-junit` plus JEST_JUNIT_OUTPUT_FILE. `--ci` stops Jest writing new snapshots on a mismatch — without it a snapshot test can 'pass' by rewriting the thing it was checking.",
@@ -359,6 +483,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['vitest', 'run', '--reporter=junit', `--outputFile=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--reporter=junit', `--outputFile=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -388,6 +513,7 @@ export const ECOSYSTEMS = [
       '--reporter-option',
       `output=${REPORT_PATH_PLACEHOLDER}`,
     ],
+    reportArgs: ['--reporter', 'xunit', '--reporter-option', `output=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -411,6 +537,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['ava', '--tap'],
+    reportArgs: ['--tap'],
     reportFormat: 'tap',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -437,6 +564,7 @@ export const ECOSYSTEMS = [
       '--test-reporter=junit',
       `--test-reporter-destination=${REPORT_PATH_PLACEHOLDER}`,
     ],
+    reportArgs: ['--test-reporter=junit', `--test-reporter-destination=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -459,6 +587,7 @@ export const ECOSYSTEMS = [
     },
     command: 'bun',
     args: ['test', '--reporter=junit', `--reporter-outfile=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--reporter=junit', `--reporter-outfile=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -480,6 +609,7 @@ export const ECOSYSTEMS = [
     },
     command: 'deno',
     args: ['test', '--allow-all', `--junit-path=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: [`--junit-path=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -508,6 +638,12 @@ export const ECOSYSTEMS = [
       '--reporter-options',
       `mochaFile=${REPORT_PATH_PLACEHOLDER}`,
     ],
+    reportArgs: [
+      '--reporter',
+      'junit',
+      '--reporter-options',
+      `mochaFile=${REPORT_PATH_PLACEHOLDER}`,
+    ],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -530,7 +666,8 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['playwright', 'test', '--reporter=junit'],
-    env: { PLAYWRIGHT_JUNIT_OUTPUT_NAME: REPORT_PATH_PLACEHOLDER },
+    reportEnv: { PLAYWRIGHT_JUNIT_OUTPUT_NAME: REPORT_PATH_PLACEHOLDER },
+    reportArgs: ['--reporter=junit'],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -552,6 +689,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['wdio', 'run', 'wdio.conf.js'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'plugin',
     reportFlagTakes: 'none',
@@ -574,6 +712,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['nightwatch', '--output', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--output', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'directory',
@@ -601,6 +740,7 @@ export const ECOSYSTEMS = [
       '--reporter',
       `xunit:${REPORT_PATH_PLACEHOLDER}`,
     ],
+    reportArgs: ['--reporter', `xunit:${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -622,6 +762,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['jasmine'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'plugin',
     reportFlagTakes: 'none',
@@ -644,6 +785,7 @@ export const ECOSYSTEMS = [
     },
     command: 'npx',
     args: ['karma', 'start', '--single-run', '--reporters', 'junit'],
+    reportArgs: ['--reporters', 'junit'],
     reportFormat: 'junit-xml',
     reportAvailability: 'plugin',
     reportFlagTakes: 'none',
@@ -653,6 +795,82 @@ export const ECOSYSTEMS = [
     installHint: 'npm install --save-dev karma karma-junit-reporter',
     notes:
       "Karma was deprecated by its team in 2023 — a repo on Karma is a migration candidate (Vitest, Web Test Runner, or Angular's esbuild builder). `--single-run` is essential or the browser stays open forever. The path comes from `junitReporter.outputDir`/`outputFile` in karma.conf.js, and it defaults to one file per browser.",
+  },
+  {
+    id: 'k6',
+    label: 'k6',
+    languages: ['typescript', 'javascript'],
+    packageManager: 'npm',
+    defaultTestType: 'LOAD',
+    detect: {
+      files: ['load/**/*.js', 'k6/**/*.js', 'perf/**/*.js'],
+      dependencies: ['k6', '@types/k6'],
+      imports: ["from 'k6'", "from 'k6/http'"],
+    },
+    command: 'k6',
+    args: ['run', TEST_PATH_PLACEHOLDER],
+    reportArgs: [],
+    defaultTestPath: 'script.js',
+    reportFormat: 'exit-code',
+    reportAvailability: 'none',
+    reportFlagTakes: 'none',
+    reportTarget: 'none',
+    reportPath: '',
+    installHint: 'brew install k6  # or https://grafana.com/docs/k6/latest/set-up/install-k6/',
+    notes:
+      'The script is a positional argument, and there is one per run — k6 has no `./...`. The verdict lives in the *thresholds* the script declares: a breach exits 99, and a run with no thresholds is green no matter how slow it was. Reports come from `handleSummary()` inside the script, so a repo that has not written one cannot be flagged into producing a file. k6 is a Go binary despite the JavaScript, so `npm install k6` does not put it on PATH.',
+  },
+  {
+    id: 'newman',
+    label: 'Newman (Postman)',
+    languages: ['typescript', 'javascript'],
+    packageManager: 'npm',
+    defaultTestType: 'API',
+    detect: {
+      files: ['**/*.postman_collection.json'],
+      dependencies: ['newman'],
+    },
+    command: 'npx',
+    args: [
+      'newman',
+      'run',
+      TEST_PATH_PLACEHOLDER,
+      '-r',
+      'junit',
+      `--reporter-junit-export=${REPORT_PATH_PLACEHOLDER}`,
+    ],
+    reportArgs: ['-r', 'junit', `--reporter-junit-export=${REPORT_PATH_PLACEHOLDER}`],
+    defaultTestPath: 'collection.json',
+    reportFormat: 'junit-xml',
+    reportAvailability: 'native',
+    reportFlagTakes: 'file',
+    reportTarget: 'file',
+    reportPath: 'reports/newman-junit.xml',
+    installHint: 'npm install --save-dev newman',
+    notes:
+      'The collection file is positional and mandatory. `-r junit` replaces the console reporter outright; `-r cli,junit` keeps both. A collection that reads variables needs `-e environment.json` or every request 404s against a placeholder host, which surfaces as dozens of assertion failures rather than as a configuration error.',
+  },
+  {
+    id: 'pa11y-ci',
+    label: 'Pa11y CI',
+    languages: ['typescript', 'javascript'],
+    packageManager: 'npm',
+    defaultTestType: 'ACCESSIBILITY',
+    detect: {
+      files: ['.pa11yci', '.pa11yci.json', '.pa11yci.js', 'pa11y.json'],
+      dependencies: ['pa11y', 'pa11y-ci'],
+    },
+    command: 'npx',
+    args: ['pa11y-ci'],
+    reportArgs: [],
+    reportFormat: 'exit-code',
+    reportAvailability: 'none',
+    reportFlagTakes: 'none',
+    reportTarget: 'none',
+    reportPath: '',
+    installHint: 'npm install --save-dev pa11y-ci',
+    notes:
+      'The URLs come from .pa11yci, never from the CLI, so a run against a repo without that file checks nothing and still exits 0. `--json` puts a summary on stdout; no reporter writes a file, and none of them emit JUnit, so per-issue rows need a converter QAAI does not have. Chrome is required on the worker image.',
   },
 
   // ── Python ─────────────────────────────────────────────────────────────────
@@ -669,6 +887,7 @@ export const ECOSYSTEMS = [
     },
     command: 'python3',
     args: ['-m', 'pytest', '-q', `--junitxml=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: [`--junitxml=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -679,6 +898,33 @@ export const ECOSYSTEMS = [
     installHint: 'python3 -m pip install pytest',
     notes:
       '`python3 -m pytest` rather than bare `pytest`, so the interpreter that owns the venv is the one that runs: a bare `pytest` on PATH can belong to a different environment entirely and fail on imports that work by hand. Emits xunit2 by default; `-o junit_family=legacy` for consumers stuck on the old schema. pytest also runs plain unittest classes, which is the usual escape route from the record below.',
+  },
+  {
+    id: 'django-test',
+    label: 'Django test runner',
+    languages: ['python'],
+    packageManager: 'pip',
+    defaultTestType: 'UNIT_GEN',
+    detect: {
+      files: ['manage.py', '**/tests.py', '**/tests/test_*.py'],
+      dependencies: ['django'],
+      imports: ['from django.test import'],
+    },
+    command: 'python3',
+    args: ['manage.py', 'test'],
+    reportArgs: [],
+    reportFormat: 'exit-code',
+    reportAvailability: 'none',
+    reportFlagTakes: 'none',
+    reportTarget: 'none',
+    reportPath: '',
+    junitRoute: {
+      requires: 'unittest-xml-reporting',
+      note: "Django's runner is unittest's, so it reports nothing either. unittest-xml-reporting adds one through settings — `TEST_RUNNER = 'xmlrunner.extra.djangotestrunner.XMLTestRunner'` plus TEST_OUTPUT_DIR — which is a change to the project's own configuration, not a flag QAAI can pass.",
+    },
+    installHint: 'ships with Django — python3 -m pip install django',
+    notes:
+      'manage.py is the entry point and it must run from the directory that holds it, because DJANGO_SETTINGS_MODULE is resolved relative to there. The runner creates and destroys a test database on every run, so it needs a reachable server and credentials — a failure here is usually infrastructure, not a test. Most Django projects with a pytest.ini have moved to pytest-django and this record is the older path they still support.',
   },
   {
     id: 'unittest',
@@ -692,11 +938,16 @@ export const ECOSYSTEMS = [
     },
     command: 'python3',
     args: ['-m', 'unittest', 'discover', '-v'],
+    reportArgs: [],
     reportFormat: 'exit-code',
     reportAvailability: 'none',
     reportFlagTakes: 'none',
     reportTarget: 'none',
     reportPath: '',
+    junitRoute: {
+      requires: 'unittest-xml-reporting',
+      note: 'No flag can make the stdlib runner report. unittest-xml-reporting replaces the command outright — `python3 -m xmlrunner discover -o reports/` — and running the same tests under pytest is the other honest fix.',
+    },
     installHint: 'built into Python — nothing to install',
     notes:
       'The stdlib runner has no XML, no JSON, no report of any kind — `python3 -m unittest --help` offers verbosity and nothing else. Do not pretend otherwise: this record gives a pass/fail and no per-test rows. Two honest fixes, both changing the command: run the same tests under pytest (`python3 -m pytest --junitxml=…`, no code changes needed), or install unittest-xml-reporting and run `python3 -m xmlrunner discover -o reports/`.',
@@ -713,6 +964,7 @@ export const ECOSYSTEMS = [
     },
     command: 'python3',
     args: ['-m', 'nose2', '--plugin', 'nose2.plugins.junitxml', '--junit-xml'],
+    reportArgs: ['--plugin', 'nose2.plugins.junitxml', '--junit-xml'],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -734,6 +986,7 @@ export const ECOSYSTEMS = [
     },
     command: 'python3',
     args: ['-m', 'robot', '--xunit', REPORT_PATH_PLACEHOLDER, 'tests'],
+    reportArgs: ['--xunit', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -755,6 +1008,7 @@ export const ECOSYSTEMS = [
     },
     command: 'python3',
     args: ['-m', 'behave', '--junit', '--junit-directory', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--junit', '--junit-directory', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'directory',
@@ -770,7 +1024,7 @@ export const ECOSYSTEMS = [
   {
     id: 'junit4-maven',
     label: 'JUnit 4 (Maven Surefire)',
-    languages: ['java'],
+    languages: ['java', 'kotlin'],
     packageManager: 'maven',
     defaultTestType: 'UNIT_GEN',
     detect: {
@@ -781,6 +1035,7 @@ export const ECOSYSTEMS = [
     },
     command: 'mvn',
     args: ['-B', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -790,6 +1045,30 @@ export const ECOSYSTEMS = [
       'add junit:junit:4.13.2 with <scope>test</scope> to pom.xml (no install command — Maven resolves it on the next build)',
     notes:
       'Surefire writes the XML with no flag; the path is fixed and there is one file per test class, hence the glob. `-B` (batch mode) drops the ANSI progress spinner that otherwise fills the log. The report is written before the build fails, so a non-zero exit still leaves results to read — add -Dmaven.test.failure.ignore=true if the exit code is getting in the way.',
+  },
+  {
+    id: 'junit4-gradle',
+    label: 'JUnit 4 (Gradle)',
+    languages: ['java', 'kotlin'],
+    packageManager: 'gradle',
+    defaultTestType: 'UNIT_GEN',
+    detect: {
+      files: ['build.gradle', 'build.gradle.kts', 'gradlew'],
+      dependencies: ['junit:junit'],
+      manifestContains: ['junit:junit'],
+      imports: ['import org.junit.Test;'],
+    },
+    command: './gradlew',
+    args: ['test', '--no-daemon'],
+    reportArgs: [],
+    reportFormat: 'junit-xml',
+    reportAvailability: 'native',
+    reportFlagTakes: 'none',
+    reportTarget: 'glob',
+    reportPath: 'build/test-results/test/TEST-*.xml',
+    installHint: 'add testImplementation("junit:junit:4.13.2") to build.gradle',
+    notes:
+      'The counterpart to junit5-gradle, and the reason both exist: the runner is the same but the report lands somewhere completely different from Maven, so a candidate that names the wrong one sends a reader to an empty directory. JUnit 4 is what Gradle runs *without* `useJUnitPlatform()`, so a build file that has that line is a junit5-gradle project no matter which junit artifact is on the classpath. Android modules are the common case and they use `./gradlew testDebugUnitTest`, writing to build/test-results/testDebugUnitTest/.',
   },
   {
     id: 'junit5-maven',
@@ -805,6 +1084,7 @@ export const ECOSYSTEMS = [
     },
     command: 'mvn',
     args: ['-B', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -827,6 +1107,7 @@ export const ECOSYSTEMS = [
     },
     command: './gradlew',
     args: ['test', '--no-daemon'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -849,6 +1130,7 @@ export const ECOSYSTEMS = [
     },
     command: 'mvn',
     args: ['-B', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -857,6 +1139,30 @@ export const ECOSYSTEMS = [
     installHint: 'add org.testng:testng:7.x with <scope>test</scope> to pom.xml',
     notes:
       "Surefire's JUnit-shaped XML is the interop path. TestNG also writes its own target/surefire-reports/testng-results.xml, which carries groups, dependencies and data-provider parameters the JUnit schema cannot express — richer, but a different schema with no parser here. Standalone: `java -cp … org.testng.TestNG testng.xml -d out`.",
+  },
+  {
+    id: 'testng-gradle',
+    label: 'TestNG (Gradle)',
+    languages: ['java', 'kotlin'],
+    packageManager: 'gradle',
+    defaultTestType: 'UNIT_GEN',
+    detect: {
+      files: ['testng.xml', 'build.gradle', 'build.gradle.kts'],
+      dependencies: ['org.testng:testng'],
+      manifestContains: ['useTestNG()', 'org.testng:testng'],
+      imports: ['import org.testng.annotations.Test;'],
+    },
+    command: './gradlew',
+    args: ['test', '--no-daemon'],
+    reportArgs: [],
+    reportFormat: 'junit-xml',
+    reportAvailability: 'native',
+    reportFlagTakes: 'none',
+    reportTarget: 'glob',
+    reportPath: 'build/test-results/test/TEST-*.xml',
+    installHint: 'add testImplementation("org.testng:testng:7.x") and `test { useTestNG() }`',
+    notes:
+      'Without `test { useTestNG() }` Gradle runs the JUnit engine, finds none of the TestNG annotations, and reports a green build with zero tests — the same silent failure as Surefire below 2.22.0. The XML is Gradle\'s own JUnit-shaped output, not Surefire\'s, which is why this is a separate record from `testng`; the suite file goes in as `useTestNG { suites("src/test/resources/testng.xml") }`.',
   },
   {
     id: 'spock',
@@ -871,6 +1177,7 @@ export const ECOSYSTEMS = [
     },
     command: './gradlew',
     args: ['test', '--no-daemon'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -893,6 +1200,7 @@ export const ECOSYSTEMS = [
     },
     command: './gradlew',
     args: ['test', '--no-daemon'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -915,6 +1223,7 @@ export const ECOSYSTEMS = [
     },
     command: 'mvn',
     args: ['-B', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
@@ -924,6 +1233,29 @@ export const ECOSYSTEMS = [
     installHint: 'add io.cucumber:cucumber-java and io.cucumber:cucumber-junit-platform-engine',
     notes:
       'With cucumber-junit-platform-engine each scenario is a JUnit test and Surefire covers it with no extra configuration. The older route — `--plugin junit:target/cucumber.xml` on a standalone CLI — still exists but is legacy; `--plugin json:target/cucumber.json` gives the Cucumber JSON shape, and `message` NDJSON is what the Cucumber project itself now recommends.',
+  },
+  {
+    id: 'karate',
+    label: 'Karate',
+    languages: ['java'],
+    packageManager: 'maven',
+    defaultTestType: 'API',
+    detect: {
+      files: ['src/test/**/*.feature', 'karate-config.js'],
+      dependencies: ['com.intuit.karate:karate-junit5', 'com.intuit.karate:karate-core'],
+      manifestContains: ['karate-junit5', 'karate-core'],
+    },
+    command: 'mvn',
+    args: ['-B', 'test'],
+    reportArgs: [],
+    reportFormat: 'junit-xml',
+    reportAvailability: 'native',
+    reportFlagTakes: 'none',
+    reportTarget: 'glob',
+    reportPath: 'target/karate-reports/*.xml',
+    installHint: 'add com.intuit.karate:karate-junit5 with <scope>test</scope> to pom.xml',
+    notes:
+      'Karate writes its own target/karate-reports/*.xml (one per feature, alongside an HTML report) *and*, because the features are launched from a JUnit 5 runner class, Surefire writes target/surefire-reports for that one class — read the karate-reports glob or you get a single row called "runner". The environment comes from karate-config.js and is switched with `-Dkarate.env=`; the wrong one usually looks like a wall of connection failures.',
   },
   {
     id: 'scalatest',
@@ -937,6 +1269,7 @@ export const ECOSYSTEMS = [
     },
     command: 'sbt',
     args: ['-batch', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'config',
     reportFlagTakes: 'none',
@@ -952,7 +1285,7 @@ export const ECOSYSTEMS = [
     id: 'nunit',
     label: 'NUnit',
     languages: ['csharp'],
-    packageManager: 'nuget',
+    packageManager: 'dotnet',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['**/*.csproj'],
@@ -961,6 +1294,7 @@ export const ECOSYSTEMS = [
     },
     command: 'dotnet',
     args: ['test', '--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'trx',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -968,6 +1302,12 @@ export const ECOSYSTEMS = [
     reportPath: 'TestResults/report.trx',
     alternateReportFormats: ['nunit3', 'junit-xml'],
     reporterPackage: 'JunitXml.TestLogger',
+    junitRoute: {
+      args: ['--logger', `junit;LogFilePath=${REPORT_PATH_PLACEHOLDER}`],
+      requires: 'JunitXml.TestLogger',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: '`dotnet test` writes TRX with no extra package; the JunitXml.TestLogger package adds a `junit` logger that writes JUnit XML instead. LogFilePath is resolved inside --results-directory, same as the TRX one.',
+    },
     installHint: 'dotnet add package NUnit && dotnet add package NUnit3TestAdapter',
     notes:
       'LogFileName is resolved *inside* --results-directory (./TestResults by default), so substituting `report.trx` yields TestResults/report.trx — pass --results-directory to move it, not a path in LogFileName. Without a LogFileName, dotnet invents a machine-and-timestamp name and you are left globbing. NUnit3TestAdapter is what makes `dotnet test` see the tests at all; a project with only the NUnit package finds zero.',
@@ -976,7 +1316,7 @@ export const ECOSYSTEMS = [
     id: 'xunit',
     label: 'xUnit.net',
     languages: ['csharp'],
-    packageManager: 'nuget',
+    packageManager: 'dotnet',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['**/*.csproj'],
@@ -985,6 +1325,7 @@ export const ECOSYSTEMS = [
     },
     command: 'dotnet',
     args: ['test', '--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'trx',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -992,6 +1333,12 @@ export const ECOSYSTEMS = [
     reportPath: 'TestResults/report.trx',
     alternateReportFormats: ['junit-xml'],
     reporterPackage: 'JunitXml.TestLogger',
+    junitRoute: {
+      args: ['--logger', `junit;LogFilePath=${REPORT_PATH_PLACEHOLDER}`],
+      requires: 'JunitXml.TestLogger',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: '`dotnet test` writes TRX with no extra package; the JunitXml.TestLogger package adds a `junit` logger that writes JUnit XML instead. LogFilePath is resolved inside --results-directory, same as the TRX one.',
+    },
     installHint: 'dotnet add package xunit && dotnet add package xunit.runner.visualstudio',
     notes:
       'Same VSTest plumbing as NUnit and MSTest — the runner differs, the report does not. xUnit v3 adds a standalone executable runner with its own `--report` options; under `dotnet test` the visualstudio adapter is still doing the work. Theories appear as one row per data case.',
@@ -1000,7 +1347,7 @@ export const ECOSYSTEMS = [
     id: 'mstest',
     label: 'MSTest',
     languages: ['csharp'],
-    packageManager: 'nuget',
+    packageManager: 'dotnet',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['**/*.csproj'],
@@ -1009,6 +1356,7 @@ export const ECOSYSTEMS = [
     },
     command: 'dotnet',
     args: ['test', '--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'trx',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1016,6 +1364,12 @@ export const ECOSYSTEMS = [
     reportPath: 'TestResults/report.trx',
     alternateReportFormats: ['junit-xml'],
     reporterPackage: 'JunitXml.TestLogger',
+    junitRoute: {
+      args: ['--logger', `junit;LogFilePath=${REPORT_PATH_PLACEHOLDER}`],
+      requires: 'JunitXml.TestLogger',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: '`dotnet test` writes TRX with no extra package; the JunitXml.TestLogger package adds a `junit` logger that writes JUnit XML instead. LogFilePath is resolved inside --results-directory, same as the TRX one.',
+    },
     installHint: 'dotnet add package MSTest.TestAdapter && dotnet add package MSTest.TestFramework',
     notes:
       'TRX is MSTest\'s native shape — it is the one .NET format that needs no extra package, which is why all three .NET records default to it. Every one of them needs Microsoft.NET.Test.Sdk in the project or `dotnet test` reports "no test is available".',
@@ -1024,7 +1378,7 @@ export const ECOSYSTEMS = [
     id: 'specflow',
     label: 'SpecFlow / Reqnroll',
     languages: ['csharp'],
-    packageManager: 'nuget',
+    packageManager: 'dotnet',
     defaultTestType: 'E2E',
     detect: {
       files: ['**/*.feature', 'specflow.json', 'reqnroll.json'],
@@ -1032,11 +1386,18 @@ export const ECOSYSTEMS = [
     },
     command: 'dotnet',
     args: ['test', '--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--logger', `trx;LogFileName=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'trx',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
     reportTarget: 'file',
     reportPath: 'TestResults/report.trx',
+    junitRoute: {
+      args: ['--logger', `junit;LogFilePath=${REPORT_PATH_PLACEHOLDER}`],
+      requires: 'JunitXml.TestLogger',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: '`dotnet test` writes TRX with no extra package; the JunitXml.TestLogger package adds a `junit` logger that writes JUnit XML instead. LogFilePath is resolved inside --results-directory, same as the TRX one.',
+    },
     installHint:
       'dotnet add package Reqnroll.NUnit  # SpecFlow is end-of-life; Reqnroll succeeds it',
     notes:
@@ -1057,6 +1418,7 @@ export const ECOSYSTEMS = [
     },
     command: 'bundle',
     args: ['exec', 'rspec', '--format', 'json', '--out', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--format', 'json', '--out', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'rspec-json',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1064,6 +1426,12 @@ export const ECOSYSTEMS = [
     reportPath: 'reports/rspec.json',
     alternateReportFormats: ['junit-xml'],
     reporterPackage: 'rspec_junit_formatter',
+    junitRoute: {
+      args: ['--format', 'RspecJunitFormatter', '--out', REPORT_PATH_PLACEHOLDER],
+      requires: 'rspec_junit_formatter',
+      reportPath: REPORT_PATH_PLACEHOLDER,
+      note: 'RSpec needs the `rspec_junit_formatter` gem before it can emit JUnit XML. Its own JSON formatter is built in and needs nothing, but no parser here reads that shape yet.',
+    },
     installHint: 'add gem "rspec" to the Gemfile, then bundle install',
     notes:
       'The JSON formatter is built in and needs no gem, so it is the default here; for JUnit add rspec_junit_formatter and use `--format RspecJunitFormatter --out report.xml`. Formatters can be stacked (`--format progress --format json --out …`) to keep human output alongside the file. `bundle exec` matters — a bare `rspec` can resolve to a different gem version than the lockfile pins.',
@@ -1081,6 +1449,7 @@ export const ECOSYSTEMS = [
     },
     command: 'bundle',
     args: ['exec', 'rake', 'test'],
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'plugin',
     reportFlagTakes: 'none',
@@ -1104,6 +1473,7 @@ export const ECOSYSTEMS = [
     },
     command: 'bundle',
     args: ['exec', 'cucumber', '--format', 'junit', '--out', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--format', 'junit', '--out', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'directory',
@@ -1120,18 +1490,23 @@ export const ECOSYSTEMS = [
     id: 'go-test',
     label: 'go test',
     languages: ['go'],
-    packageManager: 'gomod',
+    packageManager: 'go',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['go.mod', '**/*_test.go'],
     },
     command: 'go',
     args: ['test', './...', '-json', '-count=1'],
+    reportArgs: ['-json'],
     reportFormat: 'go-json',
     reportAvailability: 'native',
     reportFlagTakes: 'none',
     reportTarget: 'stdout',
     reportPath: '',
+    junitRoute: {
+      requires: 'gotestsum',
+      note: '`go test -json` is an event stream on stdout and has no JUnit mode at all; gotestsum wraps the same run and writes the XML (`gotestsum --junitfile`, the gotestsum record below).',
+    },
     installHint: 'built into the Go toolchain — install Go from https://go.dev/dl',
     notes:
       '`-json` is a stream of events on stdout, not a document, and there is no flag that writes it to a file. `-count=1` defeats the test cache: without it Go replays a previous PASS without running anything, and a "0.00s" suite that never executed looks exactly like a fast one. A package that fails to *compile* appears as a fail action with no test names attached, which a parser has to handle or the failure vanishes.',
@@ -1140,7 +1515,7 @@ export const ECOSYSTEMS = [
     id: 'gotestsum',
     label: 'gotestsum',
     languages: ['go'],
-    packageManager: 'gomod',
+    packageManager: 'go',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['go.mod', 'tools.go'],
@@ -1149,6 +1524,7 @@ export const ECOSYSTEMS = [
     },
     command: 'gotestsum',
     args: ['--junitfile', REPORT_PATH_PLACEHOLDER, '--', './...', '-count=1'],
+    reportArgs: ['--junitfile', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1163,7 +1539,7 @@ export const ECOSYSTEMS = [
     id: 'ginkgo',
     label: 'Ginkgo',
     languages: ['go'],
-    packageManager: 'gomod',
+    packageManager: 'go',
     defaultTestType: 'UNIT_GEN',
     detect: {
       files: ['**/*_suite_test.go'],
@@ -1172,6 +1548,7 @@ export const ECOSYSTEMS = [
     },
     command: 'ginkgo',
     args: ['-r', '--output-dir', 'reports', `--junit-report=${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: ['--output-dir', 'reports', `--junit-report=${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1195,6 +1572,7 @@ export const ECOSYSTEMS = [
     },
     command: './vendor/bin/phpunit',
     args: ['--log-junit', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--log-junit', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1216,6 +1594,7 @@ export const ECOSYSTEMS = [
     },
     command: './vendor/bin/pest',
     args: ['--log-junit', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--log-junit', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1237,6 +1616,7 @@ export const ECOSYSTEMS = [
     },
     command: './vendor/bin/behat',
     args: ['--format', 'junit', '--out', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--format', 'junit', '--out', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'directory',
@@ -1260,11 +1640,16 @@ export const ECOSYSTEMS = [
     },
     command: 'cargo',
     args: ['test', '--all-features'],
+    reportArgs: [],
     reportFormat: 'exit-code',
     reportAvailability: 'none',
     reportFlagTakes: 'none',
     reportTarget: 'none',
     reportPath: '',
+    junitRoute: {
+      requires: 'cargo-nextest',
+      note: 'Stable `cargo test` has no machine-readable output, and cargo2junit needs a pipe the no-shell spawn cannot give. cargo-nextest (the record below) is the realistic route to JUnit XML.',
+    },
     installHint: 'built into cargo — install Rust from https://rustup.rs',
     notes:
       "Stable Rust has no machine-readable test output. libtest's `--format json` still requires nightly and `-Z unstable-options`, so a stable toolchain gives an exit code and human text, and this record says so rather than inventing per-test rows. The realistic fix is cargo-nextest (below); cargo2junit can convert the nightly JSON but needs a pipe, which the no-shell spawn cannot provide.",
@@ -1281,6 +1666,7 @@ export const ECOSYSTEMS = [
     },
     command: 'cargo',
     args: ['nextest', 'run', '--profile', 'ci'],
+    reportArgs: ['--profile', 'ci'],
     reportFormat: 'junit-xml',
     reportAvailability: 'config',
     reportFlagTakes: 'none',
@@ -1304,6 +1690,7 @@ export const ECOSYSTEMS = [
     },
     command: 'swift',
     args: ['test', '--parallel', '--xunit-output', REPORT_PATH_PLACEHOLDER],
+    reportArgs: ['--parallel', '--xunit-output', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'junit-xml',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
@@ -1332,6 +1719,7 @@ export const ECOSYSTEMS = [
       '-resultBundlePath',
       REPORT_PATH_PLACEHOLDER,
     ],
+    reportArgs: ['-resultBundlePath', REPORT_PATH_PLACEHOLDER],
     reportFormat: 'exit-code',
     reportAvailability: 'none',
     reportFlagTakes: 'file',
@@ -1355,11 +1743,16 @@ export const ECOSYSTEMS = [
     },
     command: 'flutter',
     args: ['test', `--file-reporter=json:${REPORT_PATH_PLACEHOLDER}`],
+    reportArgs: [`--file-reporter=json:${REPORT_PATH_PLACEHOLDER}`],
     reportFormat: 'dart-json',
     reportAvailability: 'native',
     reportFlagTakes: 'file',
     reportTarget: 'file',
     reportPath: 'reports/flutter-test.json',
+    junitRoute: {
+      requires: 'junitreport',
+      note: 'The package:test JSON stream becomes JUnit XML only through a second command (`tojunit`, from the junitreport package), so one invocation cannot produce it.',
+    },
     installHint: 'ships with the Flutter SDK (https://docs.flutter.dev/get-started/install)',
     notes:
       '`--file-reporter=json:<path>` writes the event stream to a file while the console keeps its normal output; `--machine` is the same stream on stdout. It is newline-delimited events (testStart, testDone, done), not a single document, and a parser must fold them — the last `done` event carries the real verdict. Pure-Dart packages use `dart test` with the same flags. JUnit needs the junitreport package and a second command (`tojunit`).',
@@ -1379,6 +1772,7 @@ export const ECOSYSTEMS = [
     command: 'mix',
     args: ['test'],
     env: { MIX_ENV: 'test' },
+    reportArgs: [],
     reportFormat: 'junit-xml',
     reportAvailability: 'plugin',
     reportFlagTakes: 'none',
@@ -1392,6 +1786,13 @@ export const ECOSYSTEMS = [
 ] as const satisfies readonly Ecosystem[];
 
 export type EcosystemId = (typeof ECOSYSTEMS)[number]['id'];
+
+/**
+ * The runner vocabulary, as values. `EcosystemId` is the same list as a type —
+ * anything that names a runner (detection included) uses one of these and gets
+ * a compile error for a name that is not here.
+ */
+export const ECOSYSTEM_IDS: readonly EcosystemId[] = ECOSYSTEMS.map((e) => e.id);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1430,9 +1831,13 @@ export function ecosystemsForLanguage(
 }
 
 /**
- * The runners a repository scan can find on its own — anything with a file,
- * dependency or manifest signal. Import signals alone do not count: they need
- * the source of every test file, which a manifest-level scan does not have.
+ * The runners a repository scan *could* find — anything with a file, dependency
+ * or manifest signal. Import signals alone do not count: they need the source of
+ * every test file, which a manifest-level scan does not have.
+ *
+ * Not the same question as `DETECTABLE_RUNNERS` in detect.ts, which is the
+ * narrower "what does detection have a ranked rule for today". This one is the
+ * ceiling; that one is the coverage.
  *
  * Today every record qualifies. The filter exists so that a future entry with
  * no evidence behind it stays out of the scanner instead of being guessed at.
@@ -1447,6 +1852,24 @@ export function detectableEcosystems(): readonly Ecosystem[] {
   );
 }
 
+/** Substitutions a record's argv may need before it can be spawned. */
+export interface EcosystemPaths {
+  /** Where the report should land. */
+  readonly reportPath?: string | null;
+  /** The test file a runner takes as a positional argument (k6, Newman). */
+  readonly testPath?: string | null;
+}
+
+function filler(entry: Ecosystem, paths: EcosystemPaths): (value: string) => string {
+  const testPath = paths.testPath ?? entry.defaultTestPath ?? null;
+  return (value) => {
+    let out = value;
+    if (paths.reportPath != null) out = out.split(REPORT_PATH_PLACEHOLDER).join(paths.reportPath);
+    if (testPath != null) out = out.split(TEST_PATH_PLACEHOLDER).join(testPath);
+    return out;
+  };
+}
+
 /**
  * Fill in the report path. Returns argv and env ready for `spawn` — still no
  * shell, still an array, and the substitution happens inside a single argv
@@ -1458,21 +1881,163 @@ export function detectableEcosystems(): readonly Ecosystem[] {
 export function resolveEcosystemCommand(
   entry: Ecosystem,
   reportPath: string | null,
+  testPath?: string | null,
 ): { command: string; args: string[]; env: Record<string, string> } {
+  const env = { ...entry.env, ...entry.reportEnv };
   const needsPath =
     entry.args.some((a) => a.includes(REPORT_PATH_PLACEHOLDER)) ||
-    Object.values(entry.env ?? {}).some((v) => v.includes(REPORT_PATH_PLACEHOLDER));
+    Object.values(env).some((v) => v.includes(REPORT_PATH_PLACEHOLDER));
 
   if (needsPath && !reportPath) {
     throw new Error(`${entry.id} needs a report path — its command has no default location`);
   }
 
-  const fill = (value: string): string =>
-    reportPath === null ? value : value.split(REPORT_PATH_PLACEHOLDER).join(reportPath);
+  const fill = filler(entry, { reportPath, testPath });
 
   return {
     command: entry.command,
     args: entry.args.map(fill),
-    env: Object.fromEntries(Object.entries(entry.env ?? {}).map(([k, v]) => [k, fill(v)])),
+    env: Object.fromEntries(Object.entries(env).map(([k, v]) => [k, fill(v)])),
   };
+}
+
+/**
+ * The command that only runs the suite: `args` with `reportArgs` taken back out.
+ *
+ * Detection shows this on the import screen and keeps the report flags in the
+ * JUnit plan beside it, because "how do I run your tests" and "what do I have
+ * to add before I can read the results" are two different answers and a user
+ * overruling us needs to see which is which.
+ *
+ * Throws when `reportArgs` is not an in-order subsequence of `args`. That is a
+ * malformed record rather than bad input, and it must fail where it is cheap —
+ * silently returning the full argv would hand a caller flags it did not ask for.
+ */
+export function ecosystemRunArgs(entry: Ecosystem, testPath?: string | null): string[] {
+  const fill = filler(entry, { testPath });
+  const out: string[] = [];
+  let next = 0;
+
+  for (const arg of entry.args) {
+    if (next < entry.reportArgs.length && arg === entry.reportArgs[next]) {
+      next += 1;
+      continue;
+    }
+    out.push(fill(arg));
+  }
+
+  if (next < entry.reportArgs.length) {
+    throw new Error(
+      `${entry.id}: reportArgs is not a subsequence of args — ` +
+        `"${entry.reportArgs[next]}" is not there, in that order`,
+    );
+  }
+  return out;
+}
+
+/**
+ * Can this runner give QAAI a report it can actually parse, and what does that
+ * cost?
+ *
+ * The answer is deliberately about JUnit XML and nothing else: `runExternal`
+ * reads JUnit XML or an exit code (see `REPORT_FORMAT_INFO[…].externalSpecFormat`),
+ * so a record whose native report is jest-json or TRX is `needs-plugin` here
+ * even though it reports perfectly well on its own. Saying "built-in" because
+ * *some* machine-readable file appears would produce a run with zero test rows.
+ */
+export interface JUnitPlan {
+  /** `none` means there is no JUnit path we trust; fall back to the exit code. */
+  support: 'built-in' | 'needs-plugin' | 'none';
+  /** Appended to `ecosystemRunArgs` to make the tool write the report. */
+  args: string[];
+  env: Record<string, string>;
+  /** Report location, or null when there is no single file to read. */
+  reportPath: string | null;
+  /** What is missing or surprising — shown verbatim, never silently assumed away. */
+  note: string | null;
+}
+
+/**
+ * Where a caller wants reports written. Two paths because runners disagree
+ * about what the flag takes: pytest names a file, behave a directory.
+ */
+export interface ReportDestination {
+  readonly file: string;
+  readonly directory: string;
+}
+
+export function junitPlanFor(entry: Ecosystem, into: ReportDestination): JUnitPlan {
+  const target = entry.reportFlagTakes === 'directory' ? into.directory : into.file;
+  const fill = (value: string): string => value.split(REPORT_PATH_PLACEHOLDER).join(target);
+  const env = (source: Readonly<Record<string, string>> | undefined): Record<string, string> =>
+    Object.fromEntries(Object.entries(source ?? {}).map(([k, v]) => [k, fill(v)]));
+
+  // 1. The runner writes JUnit XML itself.
+  if (entry.reportFormat === 'junit-xml') {
+    // One file, and we can say where: either the flag moves it (`target`) or the
+    // runner has a fixed location we cannot move but can still read. A glob is
+    // neither, and gets a null path rather than a made-up one that will be empty.
+    const fixed = entry.reportFlagTakes === 'none';
+    const where = fixed ? entry.reportPath : target;
+    const single = entry.reportTarget === 'file';
+
+    let note: string | null = null;
+    if (entry.reportAvailability === 'plugin') {
+      note =
+        `${entry.label} needs \`${entry.reporterPackage ?? 'a JUnit reporter'}\` installed and ` +
+        `wired into its config before it writes anything; the reports then land at ${where}.`;
+    } else if (entry.reportAvailability === 'config') {
+      note =
+        `${entry.label} emits JUnit XML only when its config file asks for it — there is no ` +
+        `flag — and the file lands at ${where}.`;
+    } else if (entry.reportTarget === 'glob' && entry.reportFlagTakes === 'directory') {
+      note =
+        `${entry.label} writes one report per suite into ${where}/; point reportPath at the ` +
+        `one you want.`;
+    } else if (entry.reportTarget === 'glob' && entry.reportFlagTakes === 'file') {
+      // The trap this case exists for: the flag accepts a filename, so the run
+      // looks configured, and then the runner writes one report per suite
+      // anyway — Cypress overwrites the name once per spec, Ginkgo prefixes it.
+      // Either way a twelve-spec run can end up looking like a suite of one.
+      note =
+        `${entry.label} takes a filename but writes one report per suite, so ${where} will not ` +
+        `hold all of them — read the directory it lives in, and see this runner's notes for ` +
+        `what it does to the name.`;
+    } else if (entry.reportTarget === 'glob') {
+      note =
+        `${entry.label} writes one report per suite at ${where}, so there is no single file ` +
+        `to read; point reportPath at the one you want.`;
+    } else if (fixed) {
+      note = `${entry.label} writes its report to ${where} and has no flag to move it.`;
+    }
+
+    return {
+      support: entry.reportAvailability === 'native' ? 'built-in' : 'needs-plugin',
+      args: entry.reportArgs.map(fill),
+      env: env(entry.reportEnv),
+      reportPath: single ? where : null,
+      note,
+    };
+  }
+
+  // 2. Some other route to JUnit XML exists, and it costs something.
+  if (entry.junitRoute) {
+    const route = entry.junitRoute;
+    return {
+      support: route.requires ? 'needs-plugin' : 'built-in',
+      args: (route.args ?? []).map(fill),
+      env: env(route.env),
+      reportPath: route.reportPath ? fill(route.reportPath) : null,
+      note: route.note,
+    };
+  }
+
+  // 3. There is none. Say which, and stop.
+  const note =
+    entry.reportFormat === 'exit-code'
+      ? `${entry.label} has no machine-readable report at all; QAAI reads its exit code.`
+      : `${entry.label} reports ${REPORT_FORMAT_INFO[entry.reportFormat].label}, which QAAI ` +
+        `cannot parse yet and cannot convert without a pipe, so it reads the exit code.`;
+
+  return { support: 'none', args: [], env: {}, reportPath: null, note };
 }

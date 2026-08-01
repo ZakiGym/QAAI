@@ -28,12 +28,28 @@ loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 
 const SCHEMA = fileURLToPath(new URL('../prisma/schema.prisma', import.meta.url));
 const CONSTANTS = fileURLToPath(new URL('../../../packages/shared/src/constants.ts', import.meta.url));
+const TYPES = fileURLToPath(new URL('../../../packages/shared/src/types.ts', import.meta.url));
 
-/** Enums that must exist identically on both sides, and the const that mirrors each. */
-const PAIRS: Array<{ prismaEnum: string; tsConst: string }> = [
+/**
+ * Enums that must exist identically on both sides, and the TS declaration that
+ * mirrors each.
+ *
+ * `kind` matters: most mirrors are a `const X = [...] as const` array, but
+ * RunShardStatus is a union TYPE. It was added after this script existed and
+ * landed outside it — the newest enum in the repo was the one enum the drift
+ * guard could not see, which is exactly the hole this script was written to
+ * close.
+ */
+const PAIRS: Array<{
+  prismaEnum: string;
+  tsConst: string;
+  source?: 'constants' | 'types';
+  kind?: 'array' | 'union';
+}> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
   { prismaEnum: 'Verdict', tsConst: 'VERDICTS' },
   { prismaEnum: 'Language', tsConst: 'LANGUAGES' },
+  { prismaEnum: 'RunShardStatus', tsConst: 'RunShardStatus', source: 'types', kind: 'union' },
 ];
 
 function prismaEnumMembers(source: string, name: string): string[] | null {
@@ -52,13 +68,24 @@ function tsConstMembers(source: string, name: string): string[] | null {
   return [...block[1]!.matchAll(/'([A-Z][A-Z0-9_]*)'/g)].map((m) => m[1]!);
 }
 
+/** Matches `export type Name = 'A' | 'B' | 'C';` across line breaks. */
+function tsUnionMembers(source: string, name: string): string[] | null {
+  const block = new RegExp(`export type ${name}\\s*=([^;]*);`).exec(source);
+  if (!block) return null;
+  const members = [...block[1]!.matchAll(/'([A-Z][A-Z0-9_]*)'/g)].map((m) => m[1]!);
+  return members.length > 0 ? members : null;
+}
+
 const schema = readFileSync(SCHEMA, 'utf8');
 const constants = readFileSync(CONSTANTS, 'utf8');
+const types = readFileSync(TYPES, 'utf8');
 const problems: string[] = [];
 
-for (const { prismaEnum, tsConst } of PAIRS) {
+for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIRS) {
+  const text = source === 'types' ? types : constants;
   const fromPrisma = prismaEnumMembers(schema, prismaEnum);
-  const fromTs = tsConstMembers(constants, tsConst);
+  const fromTs =
+    kind === 'union' ? tsUnionMembers(text, tsConst) : tsConstMembers(text, tsConst);
 
   // A missing declaration is drift too — silently skipping it is how a renamed
   // enum stops being checked without anyone noticing.
@@ -67,7 +94,7 @@ for (const { prismaEnum, tsConst } of PAIRS) {
     continue;
   }
   if (!fromTs) {
-    problems.push(`const ${tsConst} was not found in constants.ts`);
+    problems.push(`${tsConst} was not found in ${source === 'types' ? 'types.ts' : 'constants.ts'}`);
     continue;
   }
 
@@ -78,7 +105,7 @@ for (const { prismaEnum, tsConst } of PAIRS) {
     problems.push(`${prismaEnum}: in schema.prisma but not ${tsConst} — ${onlyPrisma.join(', ')}`);
   }
   if (onlyTs.length > 0) {
-    problems.push(`${tsConst}: in constants.ts but not enum ${prismaEnum} — ${onlyTs.join(', ')}`);
+    problems.push(`${tsConst}: in TypeScript but not enum ${prismaEnum} — ${onlyTs.join(', ')}`);
   }
 }
 

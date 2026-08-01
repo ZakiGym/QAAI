@@ -9,18 +9,27 @@
  * enqueued but scored on the verdicts that exist at finalisation. A run whose
  * triage is still in flight reports its gate as provisional rather than
  * blocking a merge on a verdict nobody has produced yet.
+ *
+ * ── Sharding ────────────────────────────────────────────────────────────────
+ * A job may carry a `shard`, in which case it executes only the slice of tests
+ * routed to that shard (`TestResult.shardIndex`) and hands finalisation to the
+ * distributed rule in `completeShardedRun` below. A job WITHOUT a shard — every
+ * run from a schedule, a monitor, or a caller who did not ask — runs the whole
+ * suite and finalises inline, exactly as it did before sharding existed. That
+ * split is deliberate: the unsharded path touches no new table, so a sharding
+ * bug cannot reach a run that never asked to be sharded.
  */
 
 import { evaluateGates, pluginFor, reasonUnsupported } from '@qaai/runner';
-import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS } from '@qaai/shared';
-import type { GridIntegrationKind } from '@qaai/shared';
+import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS, RUN_SHARD_TERMINAL } from '@qaai/shared';
+import type { GridIntegrationKind, RunShardRef } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
 import { open as openSecret } from '../vault.js';
 import type {
   ExecutableTest,
   GateRule,
   RunContext,
-  RunJob,
+  ShardedRunJob,
   TestExecution,
   TestResultStatus,
 } from '@qaai/shared';
@@ -39,18 +48,59 @@ const RETENTION_DAYS: Record<string, number> = {
   ENTERPRISE: 365,
 };
 
-export async function processRun(job: RunJob): Promise<void> {
+/** How often a running shard stamps `heartbeatAt`. */
+const SHARD_HEARTBEAT_MS = 30_000;
+
+/**
+ * How long a shard may go without a heartbeat before its siblings declare it
+ * dead. Ten missed beats: long enough to ride out a paused event loop or a
+ * database blip, short enough that a genuinely dead worker does not hold a run
+ * open for the rest of the afternoon.
+ *
+ * The heartbeat runs on a timer rather than after each test on purpose — a
+ * load test can legitimately execute for twenty minutes, and a per-test stamp
+ * would have its siblings reap a shard that is working perfectly.
+ */
+const STALE_SHARD_MS = 5 * 60_000;
+
+interface RunCounts {
+  passed: number;
+  failed: number;
+  flaky: number;
+  skipped: number;
+}
+
+export async function processRun(job: ShardedRunJob): Promise<void> {
   const { orgId, runId } = job;
+  const shard: RunShardRef | null = job.shard ?? null;
 
   const run = await prisma.run.findFirst({
     where: { id: runId, orgId },
     include: {
       environment: { select: { id: true, baseUrl: true } },
       project: { select: { id: true, gateRules: true } },
-      results: { include: { test: true } },
+      // A shard executes only its own slice. An unsharded job passes no filter
+      // and gets every result, which is the whole suite.
+      results: { where: shard ? { shardIndex: shard.index } : {}, include: { test: true } },
     },
   });
   if (!run) throw new Error(`Run ${runId} not found for org ${orgId}`);
+
+  /*
+   * A shard that arrives after the run has already been declared finished — a
+   * redelivered job, or one whose slice was reaped as abandoned — must not
+   * execute. Its results would land under a run that has already reported its
+   * verdict, notified a pull request and released a merge.
+   */
+  if (shard && run.finalizedAt) {
+    logger.warn(
+      { runId: run.id, shard: shard.index, finalizedAt: run.finalizedAt },
+      'shard job arrived after the run was finalised; not executing',
+    );
+    return;
+  }
+
+  if (shard && !(await claimShard(orgId, run.id, shard))) return;
 
   const org = await prisma.organization.findUniqueOrThrow({
     where: { id: orgId },
@@ -80,9 +130,7 @@ export async function processRun(job: RunJob): Promise<void> {
       row.filePath,
       // A fixture edited as JSON is stored in `spec`; anything else keeps its raw
       // text in `code`. Prefer whichever actually holds content.
-      row.spec !== null && row.spec !== undefined
-        ? JSON.stringify(row.spec, null, 2)
-        : row.code,
+      row.spec !== null && row.spec !== undefined ? JSON.stringify(row.spec, null, 2) : row.code,
     ]),
   );
 
@@ -149,20 +197,63 @@ export async function processRun(job: RunJob): Promise<void> {
       ? authProfile.storageState
       : null;
 
-  await prisma.run.update({
-    where: { id: run.id },
-    data: { status: 'RUNNING', startedAt: new Date() },
-  });
-  publishEvent(orgId, {
-    runId: run.id,
-    type: 'run.started',
-    data: { total: run.results.length, baseUrl },
-    at: new Date().toISOString(),
-  });
+  if (shard) {
+    /*
+     * Five shards start at once, and the run starts once. The conditional
+     * update is the arbiter: `startedAt: null` matches for exactly one of them,
+     * so exactly one publishes `run.started` and the cockpit does not show the
+     * run beginning five times.
+     */
+    const first = await prisma.run.updateMany({
+      where: { id: run.id, startedAt: null },
+      data: { status: 'RUNNING', startedAt: new Date() },
+    });
+    if (first.count === 1) {
+      publishEvent(orgId, {
+        runId: run.id,
+        type: 'run.started',
+        data: { total: run.totalCount, baseUrl, shards: shard.count },
+        at: new Date().toISOString(),
+      });
+    }
+    publishEvent(orgId, {
+      runId: run.id,
+      type: 'shard.started',
+      data: { shard: shard.index, shards: shard.count, tests: run.results.length },
+      at: new Date().toISOString(),
+    });
+  } else {
+    await prisma.run.update({
+      where: { id: run.id },
+      data: { status: 'RUNNING', startedAt: new Date() },
+    });
+    publishEvent(orgId, {
+      runId: run.id,
+      type: 'run.started',
+      data: { total: run.results.length, baseUrl },
+      at: new Date().toISOString(),
+    });
+  }
+
+  // Proof of life for this shard, on a timer. It dies with the process, which
+  // is exactly the signal the siblings' reaper is looking for.
+  const heartbeat = shard
+    ? setInterval(() => {
+        void prisma.runShard
+          .updateMany({
+            where: { orgId, runId: run.id, index: shard.index, status: 'RUNNING' },
+            data: { heartbeatAt: new Date() },
+          })
+          .catch((err) => logger.debug({ err, runId: run.id }, 'shard heartbeat failed'));
+      }, SHARD_HEARTBEAT_MS)
+    : null;
+  // Never hold the process open for a heartbeat.
+  heartbeat?.unref?.();
 
   const controller = new AbortController();
-  const counts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
+  const counts: RunCounts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
   let runErrored: string | null = null;
+  let cancelled = false;
 
   try {
     for (const [index, result] of run.results.entries()) {
@@ -180,20 +271,33 @@ export async function processRun(job: RunJob): Promise<void> {
        * recorded as a failure, which is exactly the false signal this product
        * exists to remove. The cost is that cancelling waits for the current
        * test to finish, and that is the right trade.
+       *
+       * Every shard polls this same row, so one cancel stops all of them — the
+       * mechanism scales to a sharded run without needing to reach individual
+       * workers. `finalizedAt` is checked alongside it so a shard that was
+       * reaped as dead, and has since come back, stops instead of writing
+       * results into a run that already reported.
        */
       const current = await prisma.run.findUnique({
         where: { id: run.id },
-        select: { status: true },
+        select: { status: true, finalizedAt: true },
       });
-      if (current?.status === 'CANCELLED') {
-        logger.info({ runId: run.id, completed: index }, 'run cancelled; stopping');
-        publishEvent(orgId, {
-          runId: run.id,
-          type: 'run.finished',
-          data: { status: 'CANCELLED', completed: index, total: run.results.length },
-          at: new Date().toISOString(),
-        });
-        return;
+      if (current?.status === 'CANCELLED' || (shard && current?.finalizedAt)) {
+        cancelled = current?.status === 'CANCELLED';
+        logger.info(
+          { runId: run.id, completed: index, shard: shard?.index },
+          cancelled ? 'run cancelled; stopping' : 'run already finalised; stopping',
+        );
+        if (!shard) {
+          publishEvent(orgId, {
+            runId: run.id,
+            type: 'run.finished',
+            data: { status: 'CANCELLED', completed: index, total: run.results.length },
+            at: new Date().toISOString(),
+          });
+          return;
+        }
+        break;
       }
 
       publishEvent(orgId, {
@@ -204,9 +308,13 @@ export async function processRun(job: RunJob): Promise<void> {
           name: test.name,
           type: test.type,
           // Progress, so the cockpit can say "4 of 11" rather than leaving the
-          // user to guess whether anything is happening at all.
+          // user to guess whether anything is happening at all. On a sharded
+          // run these count the shard's own slice — five workers cannot share
+          // one counter without a round trip per test — so the shard is named
+          // alongside them and `runTotal` carries the suite-wide figure.
           index,
           total: run.results.length,
+          ...(shard ? { shard: shard.index, shards: shard.count, runTotal: run.totalCount } : {}),
         },
         at: new Date().toISOString(),
       });
@@ -422,16 +530,84 @@ export async function processRun(job: RunJob): Promise<void> {
     // Redis, or artifact storage. That is a run-level error, not a test failure.
     runErrored = err instanceof Error ? err.message : String(err);
     controller.abort();
-    logger.error({ err, runId: run.id }, 'run aborted');
+    logger.error({ err, runId: run.id, shard: shard?.index }, 'run aborted');
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
   }
 
-  const gateResult = await evaluateRunGates(orgId, run.id, run.project.gateRules);
+  if (shard) {
+    // This shard is done moving. Recorded before anything else, because the
+    // completion rule below is a question about rows, and a shard that has
+    // finished but not said so is a shard that hangs the run.
+    await prisma.runShard.updateMany({
+      // The worker's client carries no tenancy extension, so every query here
+      // scopes itself on the orgId from the job.
+      where: { orgId, runId: run.id, index: shard.index },
+      data: {
+        status: cancelled ? 'CANCELLED' : runErrored ? 'FAILED' : 'COMPLETED',
+        finishedAt: new Date(),
+        heartbeatAt: new Date(),
+        passedCount: counts.passed,
+        failedCount: counts.failed,
+        flakyCount: counts.flaky,
+        skippedCount: counts.skipped,
+        errorMessage: runErrored,
+      },
+    });
 
-  const status = runErrored
-    ? 'ERRORED'
-    : counts.failed > 0 || !gateResult.passed
-      ? 'FAILED'
-      : 'PASSED';
+    publishEvent(orgId, {
+      runId: run.id,
+      type: 'shard.finished',
+      data: { shard: shard.index, shards: shard.count, ...counts, errored: runErrored !== null },
+      at: new Date().toISOString(),
+    });
+
+    await completeShardedRun({
+      orgId,
+      run: {
+        id: run.id,
+        trigger: run.trigger,
+        prNumber: run.prNumber,
+        gateRules: run.project.gateRules,
+      },
+      shardIndex: shard.index,
+    });
+    return;
+  }
+
+  await finalizeRun({
+    orgId,
+    run: {
+      id: run.id,
+      trigger: run.trigger,
+      prNumber: run.prNumber,
+      gateRules: run.project.gateRules,
+    },
+    counts,
+    errorMessage: runErrored,
+    forcedStatus: runErrored ? 'ERRORED' : null,
+  });
+}
+
+/**
+ * Write the run's terminal state: gates, counts, monitor streak, notification,
+ * SSE. Called once per run — inline by an unsharded job, or by whichever shard
+ * won the finalisation claim.
+ */
+async function finalizeRun(args: {
+  orgId: string;
+  run: { id: string; trigger: string; prNumber: number | null; gateRules: unknown };
+  counts: RunCounts;
+  errorMessage: string | null;
+  /** Overrides the pass/fail verdict: the run was cancelled, or a shard died. */
+  forcedStatus: 'CANCELLED' | 'ERRORED' | null;
+}): Promise<void> {
+  const { orgId, run, counts, errorMessage, forcedStatus } = args;
+
+  const gateResult = await evaluateRunGates(orgId, run.id, run.gateRules);
+
+  const status =
+    forcedStatus ?? (counts.failed > 0 || !gateResult.passed ? 'FAILED' : ('PASSED' as const));
 
   await prisma.run.update({
     where: { id: run.id },
@@ -443,7 +619,7 @@ export async function processRun(job: RunJob): Promise<void> {
       flakyCount: counts.flaky,
       skippedCount: counts.skipped,
       gateResult: gateResult as unknown as object,
-      errorMessage: runErrored,
+      errorMessage,
     },
   });
 
@@ -479,6 +655,312 @@ export async function processRun(job: RunJob): Promise<void> {
   });
 
   logger.info({ runId: run.id, status, ...counts }, 'run finished');
+}
+
+/**
+ * Take ownership of a shard's slice, or decline to run it.
+ *
+ * The conditional update is the lock. A shard is claimable when it is QUEUED,
+ * or when it is RUNNING but has stopped breathing — BullMQ moves a stalled job
+ * back to the queue when the worker holding it dies, and a redelivered job
+ * picking its own slice back up is much better than leaving it to be reaped.
+ * Anything else (terminal, or actively held by a live worker) means this job
+ * must not execute, and returning false is how it says so.
+ */
+async function claimShard(orgId: string, runId: string, shard: RunShardRef): Promise<boolean> {
+  const now = new Date();
+  const staleBefore = new Date(now.getTime() - STALE_SHARD_MS);
+
+  const claim = await prisma.runShard.updateMany({
+    where: {
+      orgId,
+      runId,
+      index: shard.index,
+      OR: [
+        { status: 'QUEUED' },
+        { status: 'RUNNING', heartbeatAt: { lt: staleBefore } },
+        { status: 'RUNNING', heartbeatAt: null, startedAt: { lt: staleBefore } },
+      ],
+    },
+    data: { status: 'RUNNING', startedAt: now, heartbeatAt: now, errorMessage: null },
+  });
+  if (claim.count > 0) return true;
+
+  const row = await prisma.runShard.findUnique({
+    where: { runId_index: { runId, index: shard.index } },
+    select: { status: true },
+  });
+
+  /*
+   * No row at all means the queue job and the split disagree — most likely a
+   * job enqueued before the shard tables existed. Guessing is the dangerous
+   * option: without `shardIndex` to filter on, the slice query returns nothing
+   * and the run would report a clean pass over zero tests.
+   */
+  if (!row) {
+    throw new Error(
+      `Run ${runId} has no shard ${shard.index}; refusing to run a slice whose membership is unknown`,
+    );
+  }
+
+  logger.info(
+    { runId, shard: shard.index, status: row.status },
+    'shard not claimable; it is already finished or another worker holds it',
+  );
+  return false;
+}
+
+/**
+ * Reap shards whose worker died.
+ *
+ * The rule, stated plainly: **a RUNNING shard that has not stamped a heartbeat
+ * for STALE_SHARD_MS is declared ABANDONED, and its run can never report
+ * PASSED.** Something has to say so, or one crashed worker leaves a run RUNNING
+ * forever and the suite it was gating never reports at all.
+ *
+ * QUEUED shards are deliberately NOT reaped. A shard sitting in the queue has
+ * not been picked up yet, which on a busy pool is normal and expected: with
+ * four workers and fifteen shards, the last shard is queued for as long as the
+ * first eleven take. Reaping on age would abandon work that was about to run.
+ * The consequence is honest and worth stating — if a shard's queue job is lost
+ * outright (a flushed Redis), the run stays RUNNING until someone re-runs it.
+ * A maximum-run-age sweep belongs in the scheduler tick, not here, because this
+ * function only ever executes when some *other* shard finishes.
+ *
+ * The update is conditional on the same staleness it tested, so a shard that
+ * comes back to life between the read and the write keeps its slice.
+ */
+async function reapDeadShards(orgId: string, runId: string): Promise<number> {
+  const staleBefore = new Date(Date.now() - STALE_SHARD_MS);
+
+  const reaped = await prisma.runShard.updateMany({
+    where: {
+      orgId,
+      runId,
+      status: 'RUNNING',
+      OR: [
+        { heartbeatAt: { lt: staleBefore } },
+        { heartbeatAt: null, startedAt: { lt: staleBefore } },
+      ],
+    },
+    data: {
+      status: 'ABANDONED',
+      finishedAt: new Date(),
+      errorMessage: `No heartbeat for ${Math.round(STALE_SHARD_MS / 1000)}s — the worker running this shard is gone, and the tests in it did not run.`,
+    },
+  });
+
+  if (reaped.count > 0) {
+    logger.error({ runId, shards: reaped.count }, 'reaped shards whose worker went silent');
+  }
+  return reaped.count;
+}
+
+/**
+ * The completion rule for a sharded run, and the single invariant this whole
+ * feature stands on:
+ *
+ *   **A sharded run is finished when EVERY shard is finished. Never before.**
+ *
+ * The failure this exists to prevent is specific and would be the worst bug in
+ * the product: shard 1 finishes green, writes PASSED, a merge gate opens, and
+ * shard 3 is still executing the tests that would have failed. So no shard
+ * writes the run's status on its own behalf. Each one records that *it* is
+ * done, then asks whether every sibling is; the last one to be able to answer
+ * yes finalises.
+ *
+ * Two shards can answer yes at the same instant. The tiebreak is a conditional
+ * UPDATE on `finalizedAt`: it matches only while the column is null, so exactly
+ * one of them gets a row back and the loser returns. No advisory lock, no
+ * Redis key — the database already serialises this for free.
+ *
+ * Order is load-bearing. The caller marks its own shard terminal *before*
+ * calling in, so the last shard to commit is guaranteed to see a complete
+ * picture. Read-then-mark would let two shards each see the other as still
+ * running and neither would finalise.
+ */
+async function completeShardedRun(args: {
+  orgId: string;
+  run: { id: string; trigger: string; prNumber: number | null; gateRules: unknown };
+  /** The shard that finished, or null when the scheduler sweep is asking. */
+  shardIndex: number | null;
+}): Promise<void> {
+  const { orgId, run, shardIndex } = args;
+  const bySweep = shardIndex === null;
+
+  await reapDeadShards(orgId, run.id);
+
+  const shards = await prisma.runShard.findMany({
+    where: { orgId, runId: run.id },
+    select: { index: true, status: true, errorMessage: true },
+    orderBy: { index: 'asc' },
+  });
+
+  const pending = shards.filter((s) => !RUN_SHARD_TERMINAL.includes(s.status));
+  if (pending.length > 0) {
+    // The sweep asks about every long-running sharded run once a minute, and
+    // "still running" is its normal answer — that is a debug line, not news.
+    const say = bySweep ? logger.debug.bind(logger) : logger.info.bind(logger);
+    say(
+      { runId: run.id, shard: shardIndex, waitingOn: pending.map((s) => s.index) },
+      bySweep
+        ? 'sweep: the run is still waiting on shards that are alive'
+        : 'shard finished; the run is still waiting on its siblings',
+    );
+    return;
+  }
+
+  const claim = await prisma.run.updateMany({
+    where: { id: run.id, orgId, finalizedAt: null },
+    data: { finalizedAt: new Date() },
+  });
+  if (claim.count === 0) {
+    logger.info(
+      { runId: run.id, shard: shardIndex },
+      'another shard is finalising this run; standing down',
+    );
+    return;
+  }
+
+  const counts = await aggregateCounts(orgId, run.id);
+  const current = await prisma.run.findUnique({
+    where: { id: run.id },
+    select: { status: true },
+  });
+
+  const cancelled = current?.status === 'CANCELLED' || shards.some((s) => s.status === 'CANCELLED');
+  // A shard that died or blew up leaves tests that never executed. Those results
+  // are still sitting at their placeholder SKIPPED, so the counts are honest —
+  // but the run's verdict must not be: an incomplete suite cannot pass a gate.
+  const broken = shards.filter((s) => s.status === 'ABANDONED' || s.status === 'FAILED');
+
+  const errorMessage =
+    broken.length > 0
+      ? `${broken.length} of ${shards.length} shards did not complete (${broken
+          .map((s) => `shard ${s.index}: ${s.errorMessage ?? s.status.toLowerCase()}`)
+          .join('; ')})`
+      : null;
+
+  await finalizeRun({
+    orgId,
+    run,
+    counts,
+    errorMessage,
+    forcedStatus: cancelled ? 'CANCELLED' : broken.length > 0 ? 'ERRORED' : null,
+  });
+}
+
+/**
+ * The safety net under the completion rule: sweep sharded runs nobody will
+ * finish.
+ *
+ * `completeShardedRun` only ever executes when *some* shard finishes, and that
+ * is the hole. Kill the worker holding shard 0 while its siblings are seconds
+ * from done, and the siblings finish first: each one looks, sees shard 0 still
+ * RUNNING with a heartbeat forty seconds old — not yet stale — and stands down.
+ * After that nothing ever asks again. BullMQ redelivers the dead shard's job
+ * about thirty seconds later, `claimShard` correctly declines because the
+ * heartbeat is still fresh, and the run sits at RUNNING for good: no verdict, no
+ * notification, and a merge gate waiting on a run that will never report.
+ *
+ * That was observed, not theorised — a three-shard run held RUNNING for eight
+ * minutes after its worker was killed, with every sibling terminal.
+ *
+ * So the reaper needs a caller that does not depend on a shard finishing. This
+ * is it, on the scheduler's one-minute tick, and it is deliberately the same
+ * code path: reap what is stale, and if that leaves every shard terminal,
+ * finalise exactly as the last shard would have. A run with living shards is
+ * untouched however long it takes.
+ */
+export async function sweepStalledShardedRuns(): Promise<number> {
+  // Only runs old enough that a dead shard would already be past the staleness
+  // window. Younger ones cannot have anything to reap, and a shard that is
+  // simply queued behind a busy pool must never be mistaken for a dead one.
+  const before = new Date(Date.now() - STALE_SHARD_MS);
+
+  const candidates = await prisma.run.findMany({
+    where: {
+      status: 'RUNNING',
+      shardCount: { gt: 1 },
+      finalizedAt: null,
+      startedAt: { lt: before },
+    },
+    select: {
+      id: true,
+      orgId: true,
+      trigger: true,
+      prNumber: true,
+      project: { select: { gateRules: true } },
+    },
+    // A bounded sweep: whatever is left waits for the next tick rather than
+    // holding the tick open behind an unbounded scan.
+    take: 100,
+  });
+
+  let finalised = 0;
+  for (const run of candidates) {
+    try {
+      const before = await prisma.run.findUnique({
+        where: { id: run.id },
+        select: { finalizedAt: true },
+      });
+      await completeShardedRun({
+        orgId: run.orgId,
+        run: {
+          id: run.id,
+          trigger: run.trigger,
+          prNumber: run.prNumber,
+          gateRules: run.project.gateRules,
+        },
+        shardIndex: null,
+      });
+      const after = await prisma.run.findUnique({
+        where: { id: run.id },
+        select: { finalizedAt: true, status: true },
+      });
+      if (before?.finalizedAt === null && after?.finalizedAt !== null) {
+        finalised += 1;
+        logger.error(
+          { runId: run.id, status: after?.status },
+          'sweep finalised a sharded run whose worker never came back',
+        );
+      }
+    } catch (err) {
+      // One unfinishable run must not stop the sweep reaching the next.
+      logger.error({ err, runId: run.id }, 'could not sweep this sharded run');
+    }
+  }
+  return finalised;
+}
+
+/**
+ * Counts for the whole run, read back from the result rows.
+ *
+ * A shard sees only its own slice, so the in-memory counters that serve an
+ * unsharded run cannot add up here. Summing the per-shard counters would work
+ * on a good day and lie on a bad one — an abandoned shard's counters were never
+ * written. The result rows are what the cockpit renders and what the gate
+ * scores, so counting them is counting the thing itself rather than a report
+ * of it. Tests that never ran are still at their placeholder SKIPPED and are
+ * counted as skipped, which is exactly what happened to them.
+ */
+async function aggregateCounts(orgId: string, runId: string): Promise<RunCounts> {
+  const grouped = await prisma.testResult.groupBy({
+    by: ['status'],
+    where: { orgId, runId },
+    _count: { _all: true },
+  });
+
+  const counts: RunCounts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
+  for (const row of grouped) {
+    const n = row._count._all;
+    if (row.status === 'PASSED') counts.passed += n;
+    else if (row.status === 'FLAKY') counts.flaky += n;
+    else if (row.status === 'SKIPPED') counts.skipped += n;
+    // FAILED and TIMED_OUT both mean the test did not pass.
+    else counts.failed += n;
+  }
+  return counts;
 }
 
 async function persistExecution(args: {

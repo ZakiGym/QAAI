@@ -11,6 +11,7 @@ export { cliPlugin } from './plugins/cli.js';
 export { contractPlugin } from './plugins/contract.js';
 export { protocolPlugin } from './plugins/protocol.js';
 export { mutationPlugin } from './plugins/mutation.js';
+export { mobilePlugin } from './plugins/mobile.js';
 export * from './record.js';
 export * from './login.js';
 export * from './visual-services.js';

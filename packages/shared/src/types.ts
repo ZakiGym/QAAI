@@ -16,6 +16,7 @@ import type {
   UiFramework,
   Verdict,
 } from './constants.js';
+import type { RunJob } from './jobs.js';
 
 // ─── Identity & tenancy ──────────────────────────────────────────────────────
 
@@ -260,6 +261,79 @@ export interface RunSummary {
   gateResult: GateResult | null;
   commitSha: string | null;
   prNumber: number | null;
+}
+
+// ─── Build sharding (§5) ─────────────────────────────────────────────────────
+
+/**
+ * Lifecycle of one slice of a sharded run. Mirrors the `RunShardStatus` enum in
+ * `apps/api/prisma/schema.prisma`.
+ *
+ * Terminal means "this shard will not execute another test", which is the only
+ * property the completion rule cares about. `ABANDONED` is terminal and means
+ * the tests in the slice never ran — see RUN_SHARD_TERMINAL below.
+ */
+export type RunShardStatus =
+  'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'ABANDONED';
+
+/**
+ * The statuses that mean a shard is done moving. A run is finished when — and
+ * only when — every one of its shards is in this set. Exported so the worker's
+ * completion check and any UI agree on the definition rather than each keeping
+ * its own list, which is how "the run passed while shard 3 was still running"
+ * gets shipped.
+ */
+export const RUN_SHARD_TERMINAL: readonly RunShardStatus[] = [
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+  'ABANDONED',
+];
+
+/** Which slice of a sharded run a job is responsible for. */
+export interface RunShardRef {
+  /** 0-based, and matches `TestResult.shardIndex`. */
+  index: number;
+  /** Total shards in this split, so a job can log "2 of 5" without a query. */
+  count: number;
+}
+
+/**
+ * A run job, optionally scoped to one shard.
+ *
+ * `shard` is absent on every run enqueued today, and its absence is the switch:
+ * a job without it executes the whole suite and finalises the run inline,
+ * exactly as before sharding existed. Schedules and monitors enqueue that shape.
+ */
+export interface ShardedRunJob extends RunJob {
+  shard?: RunShardRef | null;
+}
+
+/** One shard's slice, as decided by the packer before anything is enqueued. */
+export interface ShardAssignment {
+  index: number;
+  testIds: string[];
+  /** Predicted wall clock, in ms — the number the packer was balancing. */
+  estimatedMs: number;
+}
+
+/**
+ * What the API decided when asked to shard, and why. Returned on the create-run
+ * response so a caller who asked for 20 shards on a plan that allows 5 is told
+ * it got 5, rather than quietly getting a quarter of the parallelism it paid a
+ * queue's worth of latency to arrange.
+ */
+export interface ShardPlan {
+  requested: number;
+  granted: number;
+  /** What clamped it: the plan's worker ceiling, or simply having fewer tests. */
+  cappedBy: 'plan' | 'tests' | null;
+  /** The org's ceiling — PLAN_LIMITS[plan].maxParallelWorkers. */
+  maxParallelWorkers: number;
+  /** Per-shard slices, longest-first packed by recent duration. */
+  assignments: ShardAssignment[];
+  /** How many of the tests had duration history; the rest used the fallback. */
+  testsWithHistory: number;
 }
 
 // ─── Quality gates (§4) ──────────────────────────────────────────────────────
