@@ -29,6 +29,11 @@ loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 const SCHEMA = fileURLToPath(new URL('../prisma/schema.prisma', import.meta.url));
 const CONSTANTS = fileURLToPath(new URL('../../../packages/shared/src/constants.ts', import.meta.url));
 const TYPES = fileURLToPath(new URL('../../../packages/shared/src/types.ts', import.meta.url));
+// Not every mirror lives in @qaai/shared. RunnerJobStatus is declared next to
+// the lease and reaper logic that is its only reader, and moving it here just to
+// be checkable would be the tail wagging the dog.
+const RUNNERS = fileURLToPath(new URL('../src/lib/runners.ts', import.meta.url));
+const SSO = fileURLToPath(new URL('../src/lib/sso.ts', import.meta.url));
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -43,13 +48,26 @@ const TYPES = fileURLToPath(new URL('../../../packages/shared/src/types.ts', imp
 const PAIRS: Array<{
   prismaEnum: string;
   tsConst: string;
-  source?: 'constants' | 'types';
+  source?: 'constants' | 'types' | 'runners' | 'sso';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
   { prismaEnum: 'Verdict', tsConst: 'VERDICTS' },
   { prismaEnum: 'Language', tsConst: 'LANGUAGES' },
   { prismaEnum: 'RunShardStatus', tsConst: 'RunShardStatus', source: 'types', kind: 'union' },
+  // SSO (§1). The admin API validates `protocol` against SSO_PROTOCOLS, so a
+  // value in the database enum that TypeScript does not know about is a
+  // connection nobody can log in through.
+  { prismaEnum: 'SsoProtocol', tsConst: 'SSO_PROTOCOLS', source: 'sso' },
+  // On-prem runners (§5). Same shape as RunShardStatus — a union TYPE, not an
+  // array — and it lives beside the code that transitions it rather than in
+  // @qaai/shared, because the lease/reaper logic is the only thing that reads it.
+  {
+    prismaEnum: 'RunnerJobStatus',
+    tsConst: 'RunnerJobStatus',
+    source: 'runners',
+    kind: 'union',
+  },
 ];
 
 function prismaEnumMembers(source: string, name: string): string[] | null {
@@ -79,10 +97,19 @@ function tsUnionMembers(source: string, name: string): string[] | null {
 const schema = readFileSync(SCHEMA, 'utf8');
 const constants = readFileSync(CONSTANTS, 'utf8');
 const types = readFileSync(TYPES, 'utf8');
+const runners = readFileSync(RUNNERS, 'utf8');
+const sso = readFileSync(SSO, 'utf8');
+const SOURCES: Record<'constants' | 'types' | 'runners' | 'sso', { text: string; label: string }> =
+  {
+    constants: { text: constants, label: 'constants.ts' },
+    types: { text: types, label: 'types.ts' },
+    runners: { text: runners, label: 'lib/runners.ts' },
+    sso: { text: sso, label: 'lib/sso.ts' },
+  };
 const problems: string[] = [];
 
 for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIRS) {
-  const text = source === 'types' ? types : constants;
+  const { text, label } = SOURCES[source];
   const fromPrisma = prismaEnumMembers(schema, prismaEnum);
   const fromTs =
     kind === 'union' ? tsUnionMembers(text, tsConst) : tsConstMembers(text, tsConst);
@@ -94,7 +121,7 @@ for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIR
     continue;
   }
   if (!fromTs) {
-    problems.push(`${tsConst} was not found in ${source === 'types' ? 'types.ts' : 'constants.ts'}`);
+    problems.push(`${tsConst} was not found in ${label}`);
     continue;
   }
 

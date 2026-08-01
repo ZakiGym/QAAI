@@ -25,6 +25,12 @@ import { runsRouter } from './routes/runs.js';
 import { copilotRouter } from './routes/copilot.js';
 import { billingRouter, registerStripeWebhook } from './routes/billing.js';
 import { settingsRouter } from './routes/settings.js';
+import { ssoRouter } from './routes/sso.js';
+import { registerSamlVerifier } from './lib/sso.js';
+import { xmlCryptoSamlVerifier } from './lib/saml-verifier.js';
+import { githubRouter, githubWebhooksRouter } from './routes/github.js';
+import { runnersRouter } from './routes/runners.js';
+import { teamRouter } from './routes/team.js';
 import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
@@ -117,6 +123,20 @@ app.get('/health/ready', async (_req, res) => {
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.use('/auth', authRouter);
+// SSO sits beside /auth rather than inside it: most of its endpoints are
+// anonymous by necessity (the browser arriving from an IdP has no session yet),
+// and mixing those into the router that owns password login would put an
+// unauthenticated surface behind a file whose every other route is guarded.
+/*
+ * SAML signature verification is a PORT with no default implementation, and the
+ * ACS route refuses every assertion until one is registered — the safe failure
+ * for an unauthenticated endpoint that issues sessions. Registered here, at the
+ * composition root, so the security-critical wiring is visible in one place
+ * rather than buried in a module's import side effects.
+ */
+registerSamlVerifier(xmlCryptoSamlVerifier);
+
+app.use('/sso', ssoRouter);
 app.use('/projects', projectsRouter);
 app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
@@ -124,6 +144,19 @@ app.use('/settings', settingsRouter);
 app.use('/billing', billingRouter);
 app.use('/integrations', integrationsRouter);
 app.use('/webhooks', webhooksRouter);
+// The GitHub App's inbound half. MUST be under '/webhooks' — that is the only
+// prefix parsed with express.raw(), and the HMAC is computed over the raw bytes
+// GitHub signed. It is mounted after webhooksRouter because that router owns
+// '/github' (pull requests) and this one owns '/github-app'; the paths do not
+// collide, and keeping the existing router first means no PR webhook changes
+// hands.
+app.use('/webhooks', githubWebhooksRouter);
+app.use('/github', githubRouter);
+// On-prem runner agents. The router mounts its own '/agent' sub-router first
+// and terminates its own 404s, so an agent path never falls through into the
+// session-authenticated admin half.
+app.use('/runners', runnersRouter);
+app.use('/team', teamRouter);
 app.use('/clusters', clustersRouter);
 app.use('/compare', compareRouter);
 app.use('/impact', impactRouter);

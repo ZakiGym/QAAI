@@ -44,6 +44,14 @@ enum EnvironmentKind {
   PRODUCTION
 }
 
+/// Which SSO protocol a connection speaks. No @qaai/shared twin on purpose —
+/// the TypeScript union lives in `src/lib/sso.ts` next to the code that reads
+/// it, so there is nothing for `check:enums` to drift against.
+enum SsoProtocol {
+  SAML
+  OIDC
+}
+
 enum AuthProfileKind {
   FORM_LOGIN
   MAGIC_LINK
@@ -109,6 +117,31 @@ enum RunShardStatus {
   FAILED
   CANCELLED
   ABANDONED
+}
+
+/// Lifecycle of one unit of work offered to an on-prem runner agent (ENTERPRISE).
+///
+/// Deliberately not RunShardStatus even though the lease machinery underneath is
+/// the same one: a shard is held by OUR worker and dies with our process, while
+/// this is held by a process inside a customer's network that we cannot see,
+/// cannot signal and cannot kill. The two extra members are the whole difference.
+///
+/// SKIPPED means nothing in the org's pool could serve the job — a browser, a
+/// toolchain or the agent itself is missing. It is never FAILED: no part of the
+/// customer's application was exercised, so red would be a lie and green would
+/// be a worse one.
+///
+/// ABANDONED means a runner took the job and stopped breathing. The tests in it
+/// did not run, so a run containing one can never report PASSED.
+enum RunnerJobStatus {
+  QUEUED
+  CLAIMED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  ABANDONED
+  SKIPPED
 }
 
 enum TestResultStatus {
@@ -263,6 +296,9 @@ model User {
   auditLogs      AuditLog[]
   chatMessages   ChatMessage[]
 
+  teamMemberships TeamMember[]
+  ownedRules      OwnershipRule[]
+
   @@index([email])
 }
 
@@ -338,6 +374,8 @@ model Organization {
   agentCalls    AgentCall[]
   integrations  Integration[]
   featureFlags  FeatureFlagOverride[]
+  ssoConnections SsoConnection[]
+  runners       Runner[]
 
   @@index([slug])
 }
@@ -455,6 +493,10 @@ model Project {
   conversations ChatConversation[]
   baselines     VisualBaseline[]
 
+  ownershipRules OwnershipRule[]
+  triageBatches  TriageBatch[]
+  digest         DigestSubscription?
+
   @@unique([orgId, slug])
   @@index([orgId])
 }
@@ -466,6 +508,12 @@ model Environment {
   name      String
   kind      EnvironmentKind
   baseUrl   String
+  /// The on-prem runner pool this environment executes on, or null for the
+  /// cloud worker (ENTERPRISE). This is THE switch: a staging environment that
+  /// never faces the internet cannot be reached from our infrastructure at all,
+  /// so a run against it must be handed to an agent inside the customer's
+  /// network instead of being enqueued on our own queue. See Run.runnerPool.
+  runnerPool String?
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
 
@@ -612,6 +660,8 @@ model Suite {
   schedules Schedule[]
   monitors  Monitor[]
 
+  ownershipRules OwnershipRule[]
+
   @@unique([projectId, name])
   @@index([orgId])
 }
@@ -655,6 +705,8 @@ model Test {
   results  TestResult[]
   heals    HealProposal[]
   baselines VisualBaseline[]
+
+  ownershipRules OwnershipRule[]
 
   @@index([orgId])
   @@index([projectId, type])
@@ -724,12 +776,43 @@ model Run {
   /// Distinct from `finishedAt`, which the cancel endpoint also writes.
   finalizedAt DateTime?
 
+  /// §5 fail-fast: stop at the first real failure. Written when the run is
+  /// created, polled by the worker between tests.
+  ///
+  /// A column rather than a queue message or a Redis flag, because a sharded run
+  /// must have exactly one source of truth about whether it should still be
+  /// running. Five workers polling one row is how cancellation already works;
+  /// inventing a second channel for the same idea is how two shards come to
+  /// disagree about whether the run is over.
+  failFast Boolean @default(false)
+  /// Stamped the moment something decides this run should stop early: the worker
+  /// on the first real failure of a fail-fast run, or a human pressing stop.
+  ///
+  /// Deliberately NOT `status = CANCELLED`. A fail-fast stop is a FAILED run
+  /// that chose not to finish, and filing it as cancelled would hide a broken
+  /// build behind a word that means "nobody wanted the answer".
+  stopRequestedAt DateTime?
+  /// Why it stopped, in a sentence the run page can show verbatim — which test
+  /// tripped it, or who pressed stop.
+  stopReason String?
+
+  /// Copied from Environment.runnerPool when the run is created, and the reason
+  /// this column exists rather than being read through the relation: it is the
+  /// record of where this run was DISPATCHED, which must not change under it if
+  /// someone edits the environment mid-run.
+  ///
+  /// Non-null means the run was handed to the customer's own agents and NO job
+  /// was enqueued on our queue. Exactly one of the two dispatch paths runs a
+  /// given run — that is what stops a suite executing twice, once in each place.
+  runnerPool String?
+
   project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
   suite       Suite?       @relation(fields: [suiteId], references: [id], onDelete: SetNull)
   environment Environment  @relation(fields: [environmentId], references: [id])
   results     TestResult[]
   artifacts   Artifact[]
   shards      RunShard[]
+  runnerJobs  RunnerJob[]
 
   @@index([orgId])
   @@index([projectId, queuedAt])
@@ -902,6 +985,8 @@ model TriageVerdict {
   createdAt    DateTime           @default(now())
 
   testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+
+  batchItems TriageBatchItem[]
 
   @@index([orgId, verdict])
   @@index([orgId, reviewState])
@@ -1255,4 +1340,456 @@ model FeatureFlagOverride {
   flag FeatureFlag  @relation(fields: [flagKey], references: [key], onDelete: Cascade)
 
   @@unique([orgId, flagKey])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SSO (§1, gated on PLAN_LIMITS.sso — see src/lib/plan.ts)
+//
+// These four tables are org-owned and therefore scoped by the Prisma tenancy
+// extension like everything else. Note that the login path itself is
+// ANONYMOUS — there is no tenant in scope when a browser hits /sso/start — so
+// every read on the way in is an explicit `unscoped()` in routes/sso.ts, with
+// the orgId supplied from the row rather than from the caller.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An org's identity provider.
+model SsoConnection {
+  id          String      @id @default(cuid())
+  orgId       String
+  protocol    SsoProtocol
+  name        String
+  enabled     Boolean     @default(true)
+  /// Role a JIT-provisioned member is created with. Clamped below OWNER in
+  /// src/lib/sso.ts: an IdP assertion must never be able to mint someone who
+  /// can change billing or delete the org.
+  defaultRole OrgRole     @default(MEMBER)
+
+  // ── OIDC ───────────────────────────────────────────────────────────────────
+  /// The exact `iss` value we require in every ID token. It is also the ONLY
+  /// source of the discovery host — see ISSUER_ALLOWED_HOSTS in lib/sso.ts.
+  oidcIssuer          String?
+  oidcClientId        String?
+  /// Sealed by lib/vault.ts under the name `sso:<connectionId>:client_secret`.
+  /// Never returned by the API and never logged.
+  oidcClientSecretEnc String?
+  oidcKeyVersion      Int?
+  /// Extra scopes appended to the mandatory `openid email profile`.
+  oidcScopes          String[] @default([])
+
+  // ── SAML ───────────────────────────────────────────────────────────────────
+  samlIdpEntityId String?
+  samlSsoUrl      String?
+  /// IdP signing certificates, PEM. A list because rotation means publishing
+  /// the old and the new one at the same time.
+  samlIdpCertsPem String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  org        Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  domains    SsoDomain[]
+  requests   SsoLoginRequest[]
+  assertions SsoAssertionSeen[]
+
+  @@index([orgId])
+}
+
+/// An email domain routed to one connection.
+///
+/// `domain` is UNIQUE ACROSS THE WHOLE TABLE, not per org, and that is the
+/// single most important constraint in this feature. Users are global (one row
+/// per email) and a session can switch between every org the user belongs to,
+/// so an org that could claim a domain it does not own could assert any address
+/// in it, be handed that user's session, and switch straight into the victim's
+/// org. DNS ownership is therefore proved before `verifiedAt` is set, and
+/// nothing on the login path looks at an unverified row.
+model SsoDomain {
+  id           String @id @default(cuid())
+  orgId        String
+  connectionId String
+  /// Lowercase, trailing dot stripped, no leading `@`.
+  domain       String @unique
+  /// Published by the customer as a TXT record at `_qaai-verify.<domain>`.
+  verificationToken String
+  verifiedAt        DateTime?
+  createdAt         DateTime  @default(now())
+
+  connection SsoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([connectionId])
+}
+
+/// One in-flight login. Single-use: `consumedAt` is set by a conditional
+/// update, so a replayed callback loses the race instead of minting a session.
+model SsoLoginRequest {
+  id           String @id @default(cuid())
+  orgId        String
+  connectionId String
+  /// SHA-256 of the opaque `state`. The raw value exists only in the URL.
+  stateHash    String @unique
+  /// SHA-256 of the OIDC nonce, compared against the ID token's claim.
+  nonceHash    String?
+  /// PKCE verifier, sealed under `sso:<requestId>:pkce`. Sealed rather than
+  /// stored raw so a database read alone cannot complete a stolen code.
+  pkceVerifierEnc String?
+  keyVersion      Int?
+  /// SAML AuthnRequest ID, matched against the assertion's InResponseTo.
+  samlRequestId   String?
+  /// Where to land afterwards. Validated as a same-origin relative path before
+  /// it is stored, so the callback cannot be turned into an open redirect.
+  redirectTo      String?
+  ip              String?
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  connection SsoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([expiresAt])
+}
+
+/// SAML replay guard: an assertion ID may be consumed exactly once.
+///
+/// The unique index is the enforcement — a duplicate insert throws, which is
+/// what makes this safe under concurrency. Rows are disposable once `expiresAt`
+/// has passed, because an expired assertion is rejected on its NotOnOrAfter
+/// anyway.
+model SsoAssertionSeen {
+  id           String   @id @default(cuid())
+  orgId        String
+  connectionId String
+  assertionId  String
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  connection SsoConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, assertionId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// On-prem runners (ENTERPRISE)
+//
+// The whole design decision, stated once: the agent POLLS OUT. An enterprise
+// will not open an inbound port for us, and any protocol that needs one is dead
+// on arrival, so nothing in this section is reachable from our side — we never
+// dial a runner, we only answer one. Everything below is the durable state that
+// makes that safe: who is allowed to ask, what they can run, and who currently
+// holds a piece of work.
+//
+// The lease/heartbeat/reap machinery mirrors RunShard on purpose. A second
+// liveness protocol is a second set of liveness bugs, and this one is harder
+// than the shard case: the process holding the lease is inside a network we
+// cannot see into, so a missing heartbeat is the ONLY signal we will ever get.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One agent a customer runs inside their own network.
+model Runner {
+  id    String @id @default(cuid())
+  orgId String
+  name  String
+
+  /// SHA-256 of the runner token, exactly like ApiKey.keyHash.
+  ///
+  /// Hashed rather than vault-sealed, and the distinction is the point: this
+  /// credential is only ever VERIFIED, never replayed outbound, so there is no
+  /// reason for the plaintext to be recoverable. Sealing it would mean a
+  /// database read plus the master key hands out live runner tokens; a hash
+  /// means it hands out nothing. Vault sealing is for secrets we have to send
+  /// somewhere (see Integration.configEnc) — this is not one.
+  tokenHash   String @unique
+  /// `qaai_rt_a1b2c3d4` — enough to identify a token in the UI and in an audit
+  /// row without storing anything that can authenticate.
+  tokenPrefix String
+
+  /// RunnerCapabilities as reported by the agent and re-validated on arrival;
+  /// see parseCapabilities() in apps/api/src/lib/runners.ts. Agent-supplied and
+  /// therefore never trusted for anything but matching — it can only ever cause
+  /// LESS work to be sent to this runner, never more privilege.
+  capabilities Json     @default("{}")
+  /// Pool names this runner serves, matched against Run.runnerPool. Empty means
+  /// the default pool only.
+  pools        String[] @default([])
+
+  agentVersion String?
+  /// "linux-x64", "darwin-arm64" — reported, for support, never for routing.
+  platform     String?
+
+  /// Stamped on every authenticated call. Liveness is derived from this rather
+  /// than stored: a status column would need something to write OFFLINE, and
+  /// the thing that would write it is the process that just died.
+  lastSeenAt   DateTime?
+  lastClaimAt  DateTime?
+
+  tokenRotatedAt DateTime?
+  /// Revocation is a timestamp, not a delete, so the audit trail keeps pointing
+  /// at a row that still exists.
+  revokedAt      DateTime?
+  createdBy      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  jobs RunnerJob[]
+
+  @@index([orgId])
+  @@index([tokenPrefix])
+}
+
+/// One unit of work waiting for, or held by, an on-prem runner.
+///
+/// This row is the durable record that a shard's queue job is in Redis: an
+/// agent inside a customer's network can vanish without a packet, and this is
+/// the only place that remembers the work existed.
+model RunnerJob {
+  id     String          @id @default(cuid())
+  orgId  String
+  runId  String
+  /// 0-based and matching TestResult.shardIndex, or null for the whole run —
+  /// the same convention the cloud path uses.
+  shardIndex Int?
+  status     RunnerJobStatus @default(QUEUED)
+
+  /// Idempotency key, `<runId>:<shardIndex ?? 'all'>`.
+  ///
+  /// A composite unique on (runId, shardIndex) would NOT do this job: Postgres
+  /// treats NULLs as distinct, so the unsharded case — the common one — would
+  /// accept the same job twice and a suite would execute twice. A generated
+  /// string has no null to be clever about.
+  dedupeKey String @unique
+
+  /// JobRequirements: what a runner must have to be offered this. Derived from
+  /// the tests in the slice, never from the agent.
+  requirements Json   @default("{}")
+  /// Run.runnerPool at dispatch, so routing survives an environment edit.
+  pool         String?
+
+  /// Who holds it. Kept after the job finishes: "which runner ran this" is the
+  /// first question asked when an on-prem result looks wrong.
+  runnerId String?
+  /// The fencing token. Minted fresh on every claim and required on every
+  /// subsequent call, so a runner that lost its lease — paused VM, partitioned
+  /// network, a reap it never saw — cannot write results into work another
+  /// runner is now executing. Without this, "reclaimable" and "never executes
+  /// twice" are not both true.
+  leaseId  String?
+  /// The lease deadline. A job past it with a live status is reclaimable.
+  leaseExpiresAt DateTime?
+  /// Stamped by the agent while it works, exactly like RunShard.heartbeatAt.
+  heartbeatAt    DateTime?
+
+  /// Claims so far. A job that keeps being claimed and dropped is a runner that
+  /// keeps dying, and re-offering it forever is how a run hangs for a day.
+  attempt     Int @default(0)
+  maxAttempts Int @default(3)
+
+  queuedAt   DateTime  @default(now())
+  claimedAt  DateTime?
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  /// Always a sentence a customer can act on: which capability was missing,
+  /// which runner went silent, how long it waited.
+  errorMessage String?
+
+  run    Run     @relation(fields: [runId], references: [id], onDelete: Cascade)
+  runner Runner? @relation(fields: [runnerId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+  @@index([runId])
+  @@index([runnerId])
+  /// The claim query: oldest claimable job in this org's pool.
+  @@index([orgId, status, queuedAt])
+  /// The reaper's query: live leases that are past their deadline.
+  @@index([status, leaseExpiresAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Team workflow (§8) — ownership, bulk triage, and the nightly digest
+//
+// Everything above answers "what happened". These four tables answer the three
+// questions a team has once more than one person reads the answer: whose failure
+// is this, can I decide forty of them at once, and what did the suite do while
+// nobody was watching.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A named group of people that failures can be routed to.
+model Team {
+  id        String   @id @default(cuid())
+  orgId     String
+  name      String
+  /// URL-safe handle, and the name a digest mentions: "@payments".
+  slug      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members TeamMember[]
+  rules   OwnershipRule[]
+
+  @@unique([orgId, slug])
+  @@index([orgId])
+}
+
+model TeamMember {
+  id        String   @id @default(cuid())
+  orgId     String
+  teamId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([orgId])
+  @@index([userId])
+}
+
+/// Who hears about a failure.
+///
+/// Four subjects, exactly one set per row: a test, a suite, a feature, or a
+/// CODEOWNERS-style path pattern. The pattern is what makes this survive contact
+/// with a real suite — per-test ownership is a table nobody maintains by hand,
+/// and a repo that already has a CODEOWNERS file has already answered this
+/// question once.
+///
+/// Precedence and glob semantics live in apps/api/src/lib/ownership.ts, which is
+/// pure and tested. This table only stores the rules.
+///
+/// An unowned test is a normal state. There is no default owner column and no
+/// fallback: inventing one would page whoever happened to be listed first, and
+/// the second time that happens the whole feature gets turned off.
+model OwnershipRule {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// gitignore/CODEOWNERS-style glob, matched against Test.filePath.
+  pathPattern String?
+  testId      String?
+  suiteId     String?
+  /// Test.feature, matched case-insensitively.
+  feature     String?
+
+  /// Exactly one owner. Both null is not a rule, it is a routing hole that looks
+  /// like a rule — which is worse than no row at all.
+  ownerUserId String?
+  ownerTeamId String?
+
+  /// Order among path patterns. CODEOWNERS is last-match-wins and people expect
+  /// that, so the highest position that matches is the one that owns the file.
+  position Int @default(0)
+
+  createdBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  test      Test?   @relation(fields: [testId], references: [id], onDelete: Cascade)
+  suite     Suite?  @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  ownerUser User?   @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  ownerTeam Team?   @relation(fields: [ownerTeamId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([projectId, position])
+  @@index([testId])
+  @@index([suiteId])
+}
+
+/// One human decision applied to many failures (§3.3 bulk triage).
+///
+/// The row exists for two reasons: so the decision can be undone, and so the
+/// audit trail can be honest. The audit log gets N rows, one per verdict — a
+/// single "bulk" row would claim a person reviewed forty failures when they
+/// reviewed one cause, and the difference between those two sentences is the
+/// entire feature. This table is what lets both be true at once: N decisions,
+/// one act, reversible.
+model TriageBatch {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String?
+  /// The run the selection came from, when it came from one.
+  runId     String?
+  /// The failure cluster (apps/api/src/lib/cluster.ts) the batch was expanded
+  /// from, when the selection was "everything with this cause".
+  clusterId String?
+  /// "accept" | "override" | "mute" — applied to every member.
+  action    String
+  /// Set only when the action was an override.
+  overriddenTo Verdict?
+  /// The reviewer's note: why one verdict is right for all of them.
+  note      String?
+  appliedBy String
+  createdAt DateTime  @default(now())
+  undoneAt  DateTime?
+  undoneBy  String?
+
+  project Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  items   TriageBatchItem[]
+
+  @@index([orgId, createdAt])
+}
+
+model TriageBatchItem {
+  id           String @id @default(cuid())
+  orgId        String
+  batchId      String
+  verdictId    String
+  testResultId String
+
+  /// What the verdict held before the batch touched it. Undo restores exactly
+  /// this, and only while the verdict still holds what the batch wrote — a row
+  /// someone has since re-reviewed is left alone and reported back, because
+  /// silently reverting a colleague's decision is not an undo.
+  previousReviewState  VerdictReviewState
+  previousOverriddenTo Verdict?
+  previousReviewedBy   String?
+  previousReviewedAt   DateTime?
+
+  batch   TriageBatch   @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  verdict TriageVerdict @relation(fields: [verdictId], references: [id], onDelete: Cascade)
+
+  @@unique([batchId, verdictId])
+  @@index([orgId])
+}
+
+/// "Here is what your suite did overnight" (§7).
+///
+/// One per project. Schedules already say when to run and integrations already
+/// say where to send; this row is the missing third thing — when to SUMMARISE,
+/// and how far back the last summary actually got.
+model DigestSubscription {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String @unique
+
+  cron     String  @default("0 8 * * *")
+  timezone String  @default("UTC")
+  enabled  Boolean @default(true)
+
+  /// Integration ids to deliver to. Empty means every enabled chat integration
+  /// on the org — the same destination set a failing run already reaches, so an
+  /// empty list reads as "wherever the failures go", not "nowhere".
+  notifyVia String[] @default([])
+
+  lastRunAt DateTime?
+  nextRunAt DateTime?
+  /// The end of the window the last DELIVERED digest covered.
+  ///
+  /// Separate from `lastRunAt` on purpose. A digest that could not be delivered
+  /// must not advance this, or the news it was carrying is lost for good and
+  /// tomorrow's digest starts after it. `lastRunAt` says when we tried; this
+  /// says how far the story has actually been told.
+  lastCoveredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([enabled, nextRunAt])
 }

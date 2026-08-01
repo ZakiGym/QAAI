@@ -53,6 +53,40 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     return;
   }
 
+  /*
+   * body-parser rejections are the CLIENT's problem, not ours.
+   *
+   * Malformed JSON, a body over the limit, an unsupported charset: express.json
+   * and express.urlencoded throw an http-errors object carrying `type` and a 4xx
+   * `status`. Falling through to the block below answered every one of them with
+   * a 500 saying "something went wrong on our side" — untrue, and worse than
+   * untrue on the unauthenticated surface: POST /sso/saml/:id/acs takes a
+   * form-encoded body from a stranger, so anyone could mint 500s and error-level
+   * log lines at will, which is how a real incident gets lost in the noise.
+   */
+  const bodyParser = err as { type?: unknown; status?: unknown; statusCode?: unknown };
+  const parserStatus = typeof bodyParser.status === 'number' ? bodyParser.status : bodyParser.statusCode;
+  if (
+    typeof bodyParser.type === 'string' &&
+    bodyParser.type.startsWith('entity.') &&
+    typeof parserStatus === 'number' &&
+    parserStatus >= 400 &&
+    parserStatus < 500
+  ) {
+    logger.info({ err, type: bodyParser.type, status: parserStatus }, 'request body rejected');
+    res.status(parserStatus).json({
+      error: {
+        code: parserStatus === 413 ? 'PAYLOAD_TOO_LARGE' : 'BAD_REQUEST',
+        message:
+          parserStatus === 413
+            ? 'That request body is too large.'
+            : 'That request body could not be parsed.',
+        requestId,
+      },
+    });
+    return;
+  }
+
   logger.error({ err }, 'unhandled error');
   res.status(500).json({
     error: {

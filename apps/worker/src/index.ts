@@ -32,7 +32,10 @@ import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
 import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
 import { processBisect } from './processors/bisect.js';
+import { armCheckSweep, processChecks } from './processors/checks.js';
+import { processDigestTick } from './processors/digest.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
+import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
 const workers: Worker[] = [];
 
@@ -98,6 +101,11 @@ register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
   await sweepStalledShardedRuns().catch((err) =>
     logger.error({ err }, 'the sharded-run sweep failed'),
   );
+  // The nightly digest rides the same minute tick rather than arming a queue of
+  // its own: it is a cron sweep over DigestSubscription rows, it claims each
+  // subscription's next fire time before building anything, and a digest that
+  // throws must not cost the schedules their retry either.
+  await processDigestTick().catch((err) => logger.error({ err }, 'the digest sweep failed'));
 });
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
@@ -117,6 +125,12 @@ void armFlakeTick().catch((err) => logger.error({ err }, 'could not arm the flak
 // must be registered or POST /bisect enqueues into a queue nobody drains and
 // every investigation sits at "running" until its deadline expires.
 register<BisectJob>(BISECT_QUEUE, config.concurrency, processBisect);
+
+// GitHub check runs. Network-bound on GitHub's API; it never holds a browser.
+// Without this registration every check enqueued by routes/github.ts sits in
+// Redis and the merge box never shows a result.
+register<ChecksJob>(CHECKS_QUEUE, config.concurrency, processChecks);
+void armCheckSweep().catch((err) => logger.error({ err }, 'could not arm the check sweep'));
 
 logger.info(
   {
