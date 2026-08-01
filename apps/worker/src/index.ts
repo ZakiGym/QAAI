@@ -31,6 +31,8 @@ import { processNotify } from './processors/notify.js';
 import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
 import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
+import { processBisect } from './processors/bisect.js';
+import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 
 const workers: Worker[] = [];
 
@@ -109,6 +111,12 @@ register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
 // this worker stays cheap even while an investigation is in flight.
 register<FlakeTickJob>(QUEUE_NAMES.flake, 1, processFlakeTick);
 void armFlakeTick().catch((err) => logger.error({ err }, 'could not arm the flake sweep'));
+
+// Build bisect. Each tick only reads the database and enqueues the next probe
+// run — the browser work happens on the run queue — so this stays cheap, but it
+// must be registered or POST /bisect enqueues into a queue nobody drains and
+// every investigation sits at "running" until its deadline expires.
+register<BisectJob>(BISECT_QUEUE, config.concurrency, processBisect);
 
 logger.info(
   {

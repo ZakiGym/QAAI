@@ -6,6 +6,10 @@
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '@qaai/shared';
 import type { CopilotJob, GenerateJob, NotifyJob, ShardedRunJob, TriageJob } from '@qaai/shared';
+// Pure module — types, constants and the search, no Prisma and no Express. That
+// is what makes it importable here; apps/api/src/lib/plan.ts and vault.ts are
+// duplicated instead precisely because they are not.
+import { BISECT_QUEUE, MAX_BISECT_TICKS, type BisectJob } from '../../api/src/lib/bisect.js';
 import { connection } from './context.js';
 
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
@@ -15,15 +19,21 @@ const copilotQueue = new Queue(QUEUE_NAMES.copilot, { connection });
 const notifyQueue = new Queue(QUEUE_NAMES.notify, { connection });
 const scheduleQueue = new Queue(QUEUE_NAMES.schedule, { connection });
 const flakeQueue = new Queue(QUEUE_NAMES.flake, { connection });
+const bisectQueue = new Queue(BISECT_QUEUE, { connection });
 
 /**
- * Priority for a run nobody is waiting on — today, the flake radar's
- * confirmation re-runs.
+ * Priority for a run nobody is waiting on: the flake radar's confirmation
+ * re-runs, and a bisect's probes.
  *
  * BullMQ processes jobs with NO priority ahead of prioritised ones, so simply
  * stamping a priority is what keeps ten re-runs of one suspect test behind every
  * CI run, schedule and monitor check. The number is arbitrary; that it exists at
  * all is the point.
+ *
+ * It matters more for bisect than for flake. A bisect is asked for while a build
+ * is red, which is exactly when the run queue is busiest with the runs people
+ * are actually waiting on — and the answer to "what broke this" is worth having
+ * in ten minutes, not at the cost of everyone else's ten minutes.
  */
 const BACKGROUND_RUN_PRIORITY = 100;
 
@@ -71,6 +81,36 @@ export async function enqueueTriage(job: TriageJob): Promise<void> {
     // duplicate verdict rows.
     jobId: `triage-${job.testResultId}`,
     attempts: 2,
+  });
+}
+
+/**
+ * Advance a bisect by one step, later.
+ *
+ * The processor calls this on itself. A bisect is mostly waiting — for a probe
+ * run to reach a browser, execute, and finalise — and a job that sleeps through
+ * that occupies a worker slot for the whole investigation and loses everything
+ * when the process restarts. A delayed job costs a Redis key.
+ *
+ * `step` is in the job id, so a redelivered tick collapses onto the one job
+ * instead of forking the investigation into two racing searches; and it is
+ * bounded by MAX_BISECT_TICKS, so a bug in the step logic runs out rather than
+ * re-enqueueing forever.
+ *
+ * `attempts: 1`, deliberately. Every step reads its state back from the database
+ * (the probe runs and the audit rows), so BullMQ retrying a failed tick buys
+ * nothing that the NEXT tick would not do better — and a retry storm here means
+ * several ticks queueing probe runs for the same commit at once.
+ */
+export async function enqueueBisect(job: BisectJob, delayMs = 0): Promise<void> {
+  // `>` and not `>=`: the processor concludes when it SEES step MAX_BISECT_TICKS,
+  // so that tick has to be allowed to run. Refusing it here would strand the
+  // investigation one step short of the ceiling with no report ever written.
+  if (job.step > MAX_BISECT_TICKS) return;
+  await bisectQueue.add(BISECT_QUEUE, job, {
+    jobId: `bisect-${job.bisectId}-${job.step}`,
+    attempts: 1,
+    ...(delayMs > 0 ? { delay: delayMs } : {}),
   });
 }
 
@@ -129,5 +169,6 @@ export async function closeProducers(): Promise<void> {
     triageQueue.close(),
     copilotQueue.close(),
     flakeQueue.close(),
+    bisectQueue.close(),
   ]);
 }

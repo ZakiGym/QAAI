@@ -34,6 +34,13 @@ import { compareRouter } from './routes/compare.js';
 import { impactRouter } from './routes/impact.js';
 import { issuesRouter } from './routes/issues.js';
 import { testsRouter } from './routes/tests.js';
+import { bisectRouter } from './routes/bisect.js';
+import { coverageRouter } from './routes/coverage.js';
+import { domDiffRouter } from './routes/dom-diff.js';
+import { reproRouter } from './routes/repro.js';
+import { suiteHealthRouter } from './routes/suite-health.js';
+import { traceRouter } from './routes/trace.js';
+import { trafficRouter } from './routes/traffic.js';
 
 const app = express();
 
@@ -122,6 +129,15 @@ app.use('/compare', compareRouter);
 app.use('/impact', impactRouter);
 app.use('/issues', issuesRouter);
 app.use('/tests', testsRouter);
+app.use('/bisect', bisectRouter);
+app.use('/coverage', coverageRouter);
+app.use('/dom-diff', domDiffRouter);
+app.use('/repro', reproRouter);
+app.use('/suite-health', suiteHealthRouter);
+app.use('/trace', traceRouter);
+// Traffic declares its own `/traffic/...` paths (it installs a text body parser
+// on the analyze path), so it mounts at the root like record/import/agent.
+app.use('/', trafficRouter);
 app.use('/', recordRouter);
 app.use('/', importRouter);
 app.use('/', agentRouter);

@@ -1,12 +1,13 @@
 'use client';
 
-import { use, useCallback, useEffect, useState } from 'react';
+import { use, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { API_URL, api, artifactUrl, type Run, type TestResult } from '../../../lib/api';
-import { SeverityLabel, StatusDot, VerdictChip, duration } from '../../../components/ui';
+import { API_URL, api, type Run } from '../../../lib/api';
+import { SeverityLabel, StatusDot, duration } from '../../../components/ui';
 import { Button } from '../../../components/ui/Button';
 import { useToast } from '../../../components/ui/Toast';
+import { EvidenceRail, type EvidenceResult } from '../../../components/EvidenceRail';
 
 /**
  * The cockpit (§8).
@@ -60,7 +61,17 @@ interface RunShard {
   errorMessage: string | null;
 }
 
-type ShardedRun = Run & { shardCount?: number; shards?: RunShard[] };
+/**
+ * `results` is re-typed to `EvidenceResult`, which is the same row plus the
+ * three columns the API has always returned and lib/api.ts never described:
+ * `network`, `consoleLog` and each step's `startedAt` / `errorStack`. Those are
+ * what the rail correlates against; see components/EvidenceRail.tsx.
+ */
+type ShardedRun = Omit<Run, 'results'> & {
+  shardCount?: number;
+  shards?: RunShard[];
+  results?: EvidenceResult[];
+};
 
 /**
  * Kept in sync with RUN_SHARD_TERMINAL in @qaai/shared. Duplicated as a plain
@@ -202,6 +213,29 @@ function describeEvent(label: string, data: Record<string, unknown>): LiveLine |
 /** A run in one of these states will never emit another event. */
 const TERMINAL = new Set(['PASSED', 'FAILED', 'ERRORED', 'CANCELLED']);
 
+// ─── The evidence rail's width ───────────────────────────────────────────────
+//
+// It was a hard-coded 380px at every viewport, which is where "read this stack
+// trace" turned into "read this stack trace four words at a time". Draggable,
+// collapsible, and persisted with the same key convention and the same
+// try/catch-around-localStorage as the sidebar in components/shell/AppShell.
+
+const RAIL_WIDTH_KEY = 'qaai.cockpit.rail.width';
+const RAIL_COLLAPSED_KEY = 'qaai.cockpit.rail.collapsed';
+const RAIL_DEFAULT = 380;
+const RAIL_MIN = 300;
+const RAIL_MAX = 960;
+/** The strip left behind when collapsed — never zero, because a rail with no
+ *  handle is a rail you cannot get back. */
+const RAIL_RAIL = 34;
+
+/** Keep the middle pane usable no matter how far the rail is dragged. */
+function clampRail(width: number): number {
+  const viewportMax =
+    typeof window === 'undefined' ? RAIL_MAX : Math.max(RAIL_MIN, window.innerWidth - 620);
+  return Math.round(Math.min(Math.min(RAIL_MAX, viewportMax), Math.max(RAIL_MIN, width)));
+}
+
 export default function CockpitPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = use(params);
 
@@ -232,6 +266,124 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
    */
   const [now, setNow] = useState(() => Date.now());
   const toast = useToast();
+
+  /*
+   * Rail geometry. The initial state must match what the server rendered, so
+   * the persisted value is applied in an effect and `railReady` gates the width
+   * transition — restoring a collapsed rail should snap, not animate open then
+   * shut, which is the same reason AppShell has its `mounted` flag.
+   */
+  const [railWidth, setRailWidth] = useState(RAIL_DEFAULT);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [railReady, setRailReady] = useState(false);
+  const [railDragging, setRailDragging] = useState(false);
+  const railDrag = useRef<{ x: number; from: number } | null>(null);
+
+  useEffect(() => {
+    try {
+      const stored = Number(localStorage.getItem(RAIL_WIDTH_KEY));
+      if (Number.isFinite(stored) && stored > 0) setRailWidth(clampRail(stored));
+      setRailCollapsed(localStorage.getItem(RAIL_COLLAPSED_KEY) === '1');
+    } catch {
+      /* private mode / no storage — the defaults are fine */
+    }
+    let inner = 0;
+    const outer = requestAnimationFrame(() => {
+      inner = requestAnimationFrame(() => setRailReady(true));
+    });
+    return () => {
+      cancelAnimationFrame(outer);
+      if (inner) cancelAnimationFrame(inner);
+    };
+  }, []);
+
+  // A width that was legal on a wide monitor is not legal in a narrow window.
+  useEffect(() => {
+    const onResize = () => setRailWidth((w) => clampRail(w));
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const persistRailWidth = useCallback((width: number) => {
+    try {
+      localStorage.setItem(RAIL_WIDTH_KEY, String(width));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /** Set and persist in one go — the keyboard path, where every press commits. */
+  const commitRailWidth = useCallback(
+    (width: number) => {
+      const next = clampRail(width);
+      setRailWidth(next);
+      persistRailWidth(next);
+    },
+    [persistRailWidth],
+  );
+
+  /*
+   * The drag itself lives on the WINDOW, not on the handle.
+   *
+   * The handle is 8px wide; a pointer moving at any speed leaves it on the
+   * first frame, so listening on the element only works if pointer capture
+   * holds for the whole gesture — and if capture is ever refused or dropped
+   * (a synthetic pointer, a pen that goes out of range, a release outside the
+   * window) the rail sticks at whatever width it had reached and never commits.
+   * Window listeners have no such failure mode: the gesture ends when the
+   * pointer goes up anywhere, or when the window loses focus mid-drag.
+   */
+  const railWidthRef = useRef(railWidth);
+  railWidthRef.current = railWidth;
+
+  useEffect(() => {
+    if (!railDragging) return;
+
+    const onMove = (e: PointerEvent) => {
+      const drag = railDrag.current;
+      if (!drag) return;
+      // Dragging left widens the rail, so the delta is inverted.
+      setRailWidth(clampRail(drag.from - (e.clientX - drag.x)));
+    };
+    const onEnd = () => {
+      railDrag.current = null;
+      setRailDragging(false);
+      persistRailWidth(railWidthRef.current);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onEnd);
+    window.addEventListener('pointercancel', onEnd);
+    window.addEventListener('blur', onEnd);
+
+    // Own the cursor and kill text selection for the whole gesture — without
+    // this, dragging across the step list selects every step title on the way.
+    const previousCursor = document.body.style.cursor;
+    const previousSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onEnd);
+      window.removeEventListener('pointercancel', onEnd);
+      window.removeEventListener('blur', onEnd);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousSelect;
+    };
+  }, [railDragging, persistRailWidth]);
+
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((c) => {
+      const next = !c;
+      try {
+        localStorage.setItem(RAIL_COLLAPSED_KEY, next ? '1' : '0');
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   /**
    * Re-run the exact same tests against the same environment. Passing the
@@ -544,7 +696,14 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         </section>
       )}
 
-      <div className="grid min-h-0 flex-1 grid-cols-[280px_1fr_380px]">
+      <div
+        className={`grid min-h-0 flex-1 ${
+          railReady && !railDragging ? 'transition-[grid-template-columns] duration-150 ease-out' : ''
+        }`}
+        style={{
+          gridTemplateColumns: `280px minmax(0,1fr) ${railCollapsed ? RAIL_RAIL : railWidth}px`,
+        }}
+      >
         {/* ── Left: the suite ─────────────────────────────────────────────── */}
         <aside className="border-line min-h-0 overflow-y-auto border-r">
           {results.map((result) => (
@@ -659,91 +818,106 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         </section>
 
         {/* ── Right: evidence and verdict ─────────────────────────────────── */}
-        <aside className="border-line min-h-0 overflow-y-auto border-l px-4 py-4">
-          {selected?.verdict ? (
-            <VerdictCard result={selected} onReviewed={() => void load()} />
-          ) : selected && selected.status !== 'PASSED' && selected.status !== 'SKIPPED' ? (
-            <p className="border-line text-ink-faint rounded-md border border-dashed p-3 text-xs">
-              Triage has not produced a verdict yet. It runs on the worker right after the test
-              finishes and needs <code className="font-mono">ANTHROPIC_API_KEY</code> to be set.
-            </p>
-          ) : null}
-
-          {step?.screenshotKey && (
-            <figure className="mt-4">
-              <img
-                src={artifactUrl(run.id, step.screenshotKey)}
-                alt={`Screenshot at step ${step.index}: ${step.title}`}
-                className="border-line w-full rounded-md border"
-              />
-              <figcaption className="text-ink-faint mt-1.5 text-micro">
-                Captured at the failing step
-              </figcaption>
-            </figure>
-          )}
-
-          {step?.errorMessage && (
-            <div className="mt-4">
-              <h3 className="text-ink-dim mb-2 text-xs font-semibold tracking-wider uppercase">
-                Step {step.index}
-              </h3>
-              {(step.expected || step.actual) && (
-                <dl className="border-line mb-3 rounded-md border p-3 font-mono text-xs">
-                  <dt className="text-ink-faint">expected</dt>
-                  <dd className="text-pass mb-2">{step.expected ?? '—'}</dd>
-                  <dt className="text-ink-faint">actual</dt>
-                  <dd className="text-fail">{step.actual ?? '—'}</dd>
-                </dl>
-              )}
-              <pre className="border-line overflow-x-auto rounded-md border p-3 font-mono text-micro whitespace-pre-wrap">
-                {step.errorMessage}
-              </pre>
-            </div>
-          )}
-
-          {(selected?.traceKey || selected?.videoKey) && (
-            <div className="mt-4 flex gap-2">
-              {selected.traceKey && (
-                <a
-                  href={artifactUrl(run.id, selected.traceKey)}
-                  className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
-                >
-                  Download trace
-                </a>
-              )}
-              {selected.videoKey && (
-                <a
-                  href={artifactUrl(run.id, selected.videoKey)}
-                  className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
-                >
-                  Video
-                </a>
-              )}
-            </div>
-          )}
-
-          {live.length > 0 && (
-            <div className="mt-6">
-              <h3 className="text-ink-dim mb-2 flex items-center gap-2 text-xs font-semibold tracking-wider uppercase">
+        <aside className="border-line relative min-h-0 border-l" aria-label="Evidence">
+          {railCollapsed ? (
+            /* Collapsed to a strip, never to nothing: the live feed lives in
+               this rail, so a run in flight keeps a pulsing dot on the handle
+               rather than silently losing its only progress surface. */
+            <button
+              type="button"
+              onClick={toggleRail}
+              title="Show evidence"
+              aria-label="Show evidence"
+              aria-expanded={false}
+              className="text-ink-faint hover:text-ink hover:bg-surface-1 flex h-full w-full flex-col items-center gap-3 py-3"
+            >
+              <span aria-hidden>‹</span>
+              {live.length > 0 && (
                 <span className="bg-accent inline-block h-1.5 w-1.5 animate-pulse rounded-full" />
-                Live
-              </h3>
-              {/* Newest first, so the thing that just happened is where the eye
-                  already is — this list is watched, not scrolled. */}
-              <ul className="space-y-1" aria-live="polite">
-                {live.map((line, i) => (
-                  <li
-                    key={`${line.text}-${i}`}
-                    className={`text-micro flex items-baseline gap-2 ${
-                      i === 0 ? 'text-ink-dim' : 'text-ink-faint'
-                    }`}
+              )}
+              <span className="text-micro [writing-mode:vertical-rl]">Evidence</span>
+            </button>
+          ) : (
+            <>
+              {/*
+                The drag handle. It sits on the border rather than beside it, so
+                the rail does not jump the first time you grab it, and it is a
+                real focusable separator — arrow keys resize it, which is the
+                only way this is usable without a mouse.
+              */}
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize evidence rail"
+                aria-valuenow={railWidth}
+                aria-valuemin={RAIL_MIN}
+                aria-valuemax={RAIL_MAX}
+                tabIndex={0}
+                onPointerDown={(e) => {
+                  railDrag.current = { x: e.clientX, from: railWidth };
+                  setRailDragging(true);
+                  // preventDefault stops the browser starting a text selection,
+                  // and also suppresses the focus it would otherwise give — so
+                  // focus is taken explicitly, keeping the keyboard path alive
+                  // for anyone who grabs the handle with a mouse first.
+                  e.preventDefault();
+                  e.currentTarget.focus();
+                }}
+                onDoubleClick={() => commitRailWidth(RAIL_DEFAULT)}
+                onKeyDown={(e) => {
+                  const step = e.shiftKey ? 80 : 16;
+                  if (e.key === 'ArrowLeft') {
+                    e.preventDefault();
+                    commitRailWidth(railWidth + step);
+                  } else if (e.key === 'ArrowRight') {
+                    e.preventDefault();
+                    commitRailWidth(railWidth - step);
+                  } else if (e.key === 'Home') {
+                    e.preventDefault();
+                    commitRailWidth(RAIL_MAX);
+                  } else if (e.key === 'End') {
+                    e.preventDefault();
+                    commitRailWidth(RAIL_MIN);
+                  }
+                }}
+                title="Drag to resize · double-click to reset"
+                className={`hover:bg-accent/60 focus-visible:bg-accent absolute top-0 -left-1 z-10 h-full w-2 cursor-col-resize ${
+                  railDragging ? 'bg-accent/60' : 'bg-transparent'
+                }`}
+              />
+
+              <div className="flex h-full min-h-0 flex-col">
+                <div className="border-line flex shrink-0 items-center gap-2 border-b px-4 py-2">
+                  <h2 className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
+                    Evidence
+                  </h2>
+                  <span className="text-ink-faint ml-auto font-mono text-meta tabular-nums">
+                    {railWidth}px
+                  </span>
+                  <button
+                    type="button"
+                    onClick={toggleRail}
+                    title="Collapse evidence rail"
+                    aria-label="Collapse evidence rail"
+                    aria-expanded
+                    className="text-ink-faint hover:text-ink text-sm leading-none"
                   >
-                    <span className={`mt-1 h-1 w-1 shrink-0 rounded-full ${line.tone}`} />
-                    <span className="min-w-0 flex-1 truncate">{line.text}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
+                    ›
+                  </button>
+                </div>
+
+                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+                  <EvidenceRail
+                    runId={run.id}
+                    result={selected}
+                    step={step}
+                    onSelectStep={setSelectedStep}
+                    onReviewed={() => void load()}
+                    live={live}
+                  />
+                </div>
+              </div>
+            </>
           )}
         </aside>
       </div>
@@ -751,86 +925,3 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   );
 }
 
-/** The verdict card and its keyboard-first review actions (§8). */
-function VerdictCard({ result, onReviewed }: { result: TestResult; onReviewed: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const verdict = result.verdict!;
-
-  async function review(action: 'accept' | 'override' | 'mute', overrideTo?: string) {
-    setBusy(true);
-    try {
-      await api(`/verdicts/${verdict.id}/review`, {
-        method: 'POST',
-        body: JSON.stringify({ action, overrideTo }),
-      });
-      onReviewed();
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <section className="border-line bg-surface-1 rounded-lg border p-4">
-      <div className="flex items-center gap-2">
-        <VerdictChip verdict={verdict.verdict} confidence={verdict.confidence} />
-        <span className="text-ink-faint ml-auto font-mono text-micro">{verdict.model}</span>
-      </div>
-
-      <p className="text-ink-dim mt-3 text-sm leading-relaxed">{verdict.explanation}</p>
-
-      {verdict.evidence.length > 0 && (
-        <ul className="border-line mt-3 space-y-1.5 border-t pt-3">
-          {verdict.evidence.map((e, i) => (
-            <li key={i} className="text-xs">
-              <code className="text-ink-faint font-mono text-meta">
-                {e.kind} {e.ref}
-              </code>
-              <span className="text-ink-dim ml-2">{e.detail}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {verdict.reviewState === 'PENDING' ? (
-        <div className="mt-4 flex flex-wrap gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void review('accept')}
-            className="bg-accent rounded-md px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50"
-          >
-            Accept
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void review('override', 'FLAKE')}
-            className="border-line rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
-          >
-            It&rsquo;s a flake
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void review('override', 'INTENDED_CHANGE')}
-            className="border-line rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
-          >
-            Intended change
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => void review('mute')}
-            className="border-line text-ink-faint rounded-md border px-2.5 py-1 text-xs disabled:opacity-50"
-          >
-            Mute
-          </button>
-        </div>
-      ) : (
-        <p className="text-ink-faint mt-4 font-mono text-micro">
-          reviewed · {verdict.reviewState.toLowerCase()}
-        </p>
-      )}
-    </section>
-  );
-}
