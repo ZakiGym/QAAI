@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { api, artifactUrl, type Step, type TestResult } from '../lib/api';
 import { VerdictChip, duration } from './ui';
 import { Lightbox, type Shot } from './Lightbox';
@@ -638,13 +639,32 @@ export function EvidenceRail({
 
       {/* ── Whole-test artifacts ────────────────────────────────────────────── */}
       {(result?.traceKey || result?.videoKey) && (
-        <div className="mt-4 flex gap-2">
+        <div className="mt-4 flex flex-wrap gap-2">
+          {result.traceKey && (
+            /*
+             * The in-app viewer comes FIRST, and the download second.
+             *
+             * This rail has offered a .zip since traces shipped, and the trace
+             * screen this product actually builds — /runs/:id/trace, with the
+             * DOM, the network and the console at every action — was linked
+             * from nowhere at all. Handing someone a zip when the answer is one
+             * click away made the better tool the invisible one.
+             */
+            <Link
+              href={`/runs/${runId}/trace?result=${result.id}`}
+              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+              title="Step through the recorded session — DOM, network and console at every action"
+            >
+              Open trace →
+            </Link>
+          )}
           {result.traceKey && (
             <a
               href={artifactUrl(runId, result.traceKey)}
-              className="border-line hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+              className="border-line text-ink-dim hover:border-accent rounded-md border px-2.5 py-1 text-xs"
+              title="The raw Playwright trace, for trace.playwright.dev or your own tooling"
             >
-              Download trace
+              Download
             </a>
           )}
           {result.videoKey && (

@@ -8,6 +8,8 @@ import { SeverityLabel, StatusDot, duration } from '../../../components/ui';
 import { Button } from '../../../components/ui/Button';
 import { useToast } from '../../../components/ui/Toast';
 import { EvidenceRail, type EvidenceResult } from '../../../components/EvidenceRail';
+import { RunCauses } from '../../../components/RunCauses';
+import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
 
 /**
  * The cockpit (§8).
@@ -533,6 +535,68 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
     return () => clearInterval(timer);
   }, [ticking]);
 
+  /*
+   * ── The cockpit's own ⌘K commands ──────────────────────────────────────
+   *
+   * Registered here, above the early returns, because hooks cannot be
+   * conditional — and gated on real state, so nothing is offered that this run
+   * cannot service. `Open the trace` in particular exists only when a result
+   * actually kept one; offering it otherwise would send a person to a screen
+   * whose whole content is an apology.
+   */
+  const paletteRun = run;
+  const paletteTrace =
+    paletteRun?.results?.find(
+      (r) => r.traceKey && r.status !== 'PASSED' && r.status !== 'SKIPPED',
+    ) ??
+    paletteRun?.results?.find((r) => r.traceKey) ??
+    null;
+  const paletteInFlight = paletteRun?.status === 'RUNNING' || paletteRun?.status === 'QUEUED';
+
+  usePaletteCommands(
+    'cockpit',
+    () => {
+      if (!paletteRun) return [];
+      const items = [
+        {
+          id: 'run:compare',
+          label: 'Compare this run with the previous one',
+          detail: 'is this failure new?',
+          group: 'This run',
+          run: () => router.push(`/runs/${paletteRun.id}/compare`),
+        },
+      ];
+      if (paletteTrace) {
+        items.push({
+          id: 'run:trace',
+          label: 'Open the trace',
+          detail: 'DOM, network and console per action',
+          group: 'This run',
+          run: () => router.push(`/runs/${paletteRun.id}/trace?result=${paletteTrace.id}`),
+        });
+      }
+      if (paletteInFlight) {
+        items.push({
+          id: 'run:cancel',
+          label: 'Cancel this run',
+          detail: 'stops after the current test',
+          group: 'This run',
+          run: () => void cancel(),
+        });
+      } else {
+        items.push({
+          id: 'run:rerun',
+          label: 'Re-run these tests',
+          detail: 'same tests, same environment',
+          group: 'This run',
+          run: () => void rerun(),
+        });
+      }
+      return items;
+    },
+    [paletteRun?.id, paletteTrace?.id, paletteInFlight, router],
+  );
+
   if (error) {
     return (
       <main className="p-10">
@@ -547,6 +611,25 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
 
   const inFlight = run.status === 'RUNNING' || run.status === 'QUEUED';
   const results = run.results ?? [];
+
+  /*
+   * A failure that has not been triaged yet.
+   *
+   * The default gate is BLOCK_ON_VERDICT REAL_BUG, so it is scored against
+   * verdicts — and a failure with no verdict is not a REAL_BUG verdict, so it
+   * finds nothing to block on and the gate comes back `passed: true`. On a run
+   * with real failures that renders a green "gate pass" beside "2 failed",
+   * which is the one thing this screen must never do.
+   *
+   * The run processor's own docstring says a run whose triage is in flight
+   * "reports its gate as provisional"; nothing ever implemented that word. This
+   * is it, on the surface where it is read. The gate value is not altered —
+   * GitHub's check conclusion already treats an un-triaged failure as
+   * actionable and fails — only the claim the badge makes about it.
+   */
+  const awaitingTriage = results.some(
+    (r) => r.status !== 'PASSED' && r.status !== 'SKIPPED' && !r.verdict,
+  );
   const selected = results.find((r) => r.test.id === selectedTestId) ?? results[0] ?? null;
   const step = selected?.steps.find((s) => s.index === selectedStep) ?? null;
 
@@ -555,6 +638,26 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const pendingShards = shards.filter((s) => !SHARD_TERMINAL.has(s.status));
   const doneShards = shards.length - pendingShards.length;
   const testsDone = Object.values(doneByShard).reduce((a, b) => a + b, 0);
+
+  const failingResults = results.filter(
+    (r) => r.status === 'FAILED' || r.status === 'TIMED_OUT' || r.status === 'FLAKY',
+  ).length;
+
+  /*
+   * The trace viewer at /runs/:id/trace has existed since the trace feature
+   * shipped and NOTHING linked to it — the only route in was typing the URL.
+   * The evidence rail offered a .zip download instead, which is the trace for
+   * somebody who already has Playwright installed.
+   *
+   * The header link opens on the failure worth looking at; the per-test link
+   * below opens on the selected one. Both are conditional on a result that
+   * actually kept a trace, because the viewer's honest empty state ("this test
+   * kept no trace") is not somewhere to send a person on purpose.
+   */
+  const traceTarget =
+    results.find((r) => r.traceKey && r.status !== 'PASSED' && r.status !== 'SKIPPED') ??
+    results.find((r) => r.traceKey) ??
+    null;
 
   return (
     <div className="flex h-full flex-col">
@@ -575,16 +678,29 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           <span className="text-pass">{run.passedCount} passed</span>
           {run.failedCount > 0 && <span className="text-fail">{run.failedCount} failed</span>}
           {run.flakyCount > 0 && <span className="text-flake">{run.flakyCount} flaky</span>}
-          {run.gateResult && (
-            <span
-              className={`rounded-md border px-2 py-0.5 font-mono ${
-                run.gateResult.passed ? 'border-pass/40 text-pass' : 'border-fail/40 text-fail'
-              }`}
-              title={run.gateResult.evaluations.map((e) => e.detail).join('\n')}
-            >
-              gate {run.gateResult.passed ? 'pass' : 'block'}
-            </span>
-          )}
+          {run.gateResult &&
+            (() => {
+              const provisional = run.gateResult.passed && awaitingTriage;
+              const detail = run.gateResult.evaluations.map((e) => e.detail).join('\n');
+              return (
+                <span
+                  className={`rounded-md border px-2 py-0.5 font-mono ${
+                    provisional
+                      ? 'border-flake/40 text-flake'
+                      : run.gateResult.passed
+                        ? 'border-pass/40 text-pass'
+                        : 'border-fail/40 text-fail'
+                  }`}
+                  title={
+                    provisional
+                      ? `${detail}\n\nProvisional: the gate is scored on triage verdicts and at least one failure has not been triaged yet, so nothing has been cleared. It is not a pass.`
+                      : detail
+                  }
+                >
+                  gate {provisional ? 'provisional' : run.gateResult.passed ? 'pass' : 'block'}
+                </span>
+              );
+            })()}
           {/*
             While a run is in flight the only useful action is stopping it, so
             the button becomes Cancel rather than a greyed-out Re-run with no
@@ -631,6 +747,15 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           >
             Compare
           </Link>
+          {traceTarget && (
+            <Link
+              href={`/runs/${run.id}/trace?result=${traceTarget.id}`}
+              className="text-ink-faint hover:text-ink transition-colors"
+              title="Step through the recorded browser session — DOM, network and console at every action"
+            >
+              Trace
+            </Link>
+          )}
           <a
             href={`${API_URL}/runs/${run.id}/junit.xml`}
             className="text-ink-faint hover:text-ink transition-colors"
@@ -639,6 +764,22 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           </a>
         </div>
       </header>
+
+      {/*
+        ── What broke ──────────────────────────────────────────────────────
+        Above the shards because it is about the failures, and the failures are
+        why anyone opened this screen. Renders nothing at all on a green run.
+      */}
+      <RunCauses
+        runId={run.id}
+        failingResults={failingResults}
+        selectedTestId={selected?.test.id ?? null}
+        onSelectTest={(testId) => {
+          setSelectedTestId(testId);
+          const target = results.find((r) => r.test.id === testId);
+          setSelectedStep(target?.steps.find((s) => s.status === 'FAILED')?.index ?? null);
+        }}
+      />
 
       {/*
         ── The shards ──────────────────────────────────────────────────────
@@ -752,6 +893,22 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                 </Link>{' '}
                 · <span className="tabular-nums">{duration(selected.durationMs)}</span> ·{' '}
                 {selected.test.priority.toLowerCase().replace('_', ' ')}
+                {/* The trace viewer, on the test you are actually looking at.
+                    Only when this result kept one — sending someone to a viewer
+                    that has to explain there is nothing to view is worse than
+                    not offering the link. */}
+                {selected.traceKey && (
+                  <>
+                    {' · '}
+                    <Link
+                      href={`/runs/${run.id}/trace?result=${selected.id}`}
+                      className="hover:text-ink transition-colors hover:underline"
+                      title="Step through this test's recorded browser session"
+                    >
+                      trace
+                    </Link>
+                  </>
+                )}
               </p>
 
               {selected.retriedAndPassed && (

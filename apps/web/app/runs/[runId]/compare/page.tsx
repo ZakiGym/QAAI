@@ -343,9 +343,18 @@ function RunCard({ run, label }: { run: RunSummary; label: string }) {
         <span className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
           {label}
         </span>
-        <Badge mono className="ml-auto">
-          {run.id.slice(-8)}
-        </Badge>
+        {/*
+          The baseline was named here and could not be opened. "What was the
+          previous run doing?" is the second question this screen raises and the
+          answer was a run id you had to paste into the URL bar yourself.
+        */}
+        <Link
+          href={`/runs/${run.id}`}
+          className="hover:text-accent ml-auto"
+          title="Open this run in the cockpit"
+        >
+          <Badge mono>{run.id.slice(-8)} →</Badge>
+        </Link>
       </div>
       <p className="text-body-sm text-ink-dim mt-2">
         {run.environment.name}

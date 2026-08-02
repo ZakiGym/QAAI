@@ -68,11 +68,21 @@ const schema = z.object({
   STRIPE_PRICE_TEAM: z.string().default(''),
   STRIPE_PRICE_BUSINESS: z.string().default(''),
 
-  SLACK_WEBHOOK_URL: z.string().default(''),
-  LINEAR_API_KEY: z.string().default(''),
   GITHUB_WEBHOOK_SECRET: z.string().default(''),
 
-  SENTRY_DSN: z.string().default(''),
+  /*
+   * SLACK_WEBHOOK_URL, LINEAR_API_KEY and SENTRY_DSN used to be declared here.
+   * All three were parsed at boot and then referenced by nothing — no `env.`
+   * read anywhere in apps/ or packages/, no Sentry SDK in any package.json, and
+   * Slack and Linear are per-organisation Integration rows with vault-sealed
+   * credentials, which is the only shape that works when two orgs on one install
+   * point at two different workspaces.
+   *
+   * A key in this schema is a promise that setting it does something. Removing
+   * them is the honest half of that promise; the other half is that removal is
+   * behaviour-preserving, because every one of them had `.default('')` and no
+   * consumer. `npm run check:wiring` fails if one comes back unconsumed.
+   */
 });
 
 const parsed = schema.safeParse(process.env);

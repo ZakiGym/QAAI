@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
 import { relativeTime } from '../../components/ui';
@@ -354,8 +355,21 @@ export default function QualityPage() {
         <Card className="divide-line divide-y overflow-hidden">
           {flaky.map((t) => (
             <div key={t.id} className="flex items-center gap-3 px-4 py-3">
+              {/*
+                The flake radar could tell you a test was 22% unreliable and
+                give you exactly two things to do about it: quarantine it, or
+                nothing. The next question is always the same one — is it always
+                like this, or did it start on Tuesday? — and the answer is the
+                test's own history, with its run strip and its bisect.
+              */}
               <div className="min-w-0 flex-1">
-                <p className="truncate text-body-sm">{t.name}</p>
+                <Link
+                  href={`/tests/${t.id}`}
+                  className="hover:text-accent block truncate text-body-sm hover:underline"
+                  title="Pass rate over time, and when it started failing"
+                >
+                  {t.name}
+                </Link>
                 <p className="text-ink-faint truncate font-mono text-micro">{t.filePath}</p>
               </div>
               {t.lastRunAt && (

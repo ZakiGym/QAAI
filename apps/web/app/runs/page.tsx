@@ -304,34 +304,70 @@ export default function RunsPage() {
             </>
           ) : (
             <>
-              {projects.map((project) => (
-                <Card key={project.id} interactive className="p-5">
-                  <div className="flex items-baseline justify-between gap-3">
-                    <h3 className="font-medium">{project.name}</h3>
-                    <Badge mono>{project.primaryFramework.toLowerCase()}</Badge>
-                  </div>
-                  <p className="text-ink-faint mt-1.5 text-xs">
-                    <span className="tabular-nums">{project._count.tests}</span> tests ·{' '}
-                    <span className="tabular-nums">{project._count.runs}</span> runs
-                  </p>
-                  <div className="mt-4 flex flex-wrap gap-2">
-                    {project.environments.map((env) => (
-                      <Button
-                        key={env.id}
-                        variant="primary"
-                        size="sm"
-                        // Every trigger is disabled while one is in flight, as
-                        // before; only the one that was clicked spins.
-                        disabled={startingEnv !== null && startingEnv !== env.id}
-                        loading={startingEnv === env.id}
-                        onClick={() => void startRun(env.id)}
-                      >
-                        ▶ Run {env.name}
-                      </Button>
-                    ))}
-                  </div>
-                </Card>
-              ))}
+              {projects.map((project) => {
+                /*
+                 * A project with no tests cannot run anything, and this card was
+                 * the whole of a new user's first screen: "▶ Run staging" was
+                 * enabled, was the ONLY enabled control on the page, and pressing
+                 * it produced a toast explaining there were no tests. The toast
+                 * was right and the button was a trap — the app knew the answer
+                 * before the click and offered the click anyway.
+                 *
+                 * What that user actually needs is the plan the Explorer already
+                 * wrote for them, which nothing on /runs or /editor linked to.
+                 * So at zero tests the card leads with the plan and keeps the run
+                 * triggers visible-but-disabled, with the reason on the control
+                 * rather than in a toast after the fact.
+                 */
+                const runnable = project._count.tests > 0;
+                return (
+                  <Card key={project.id} interactive className="p-5">
+                    <div className="flex items-baseline justify-between gap-3">
+                      <h3 className="font-medium">{project.name}</h3>
+                      <Badge mono>{project.primaryFramework.toLowerCase()}</Badge>
+                    </div>
+                    <p className="text-ink-faint mt-1.5 text-xs">
+                      <span className="tabular-nums">{project._count.tests}</span> tests ·{' '}
+                      <span className="tabular-nums">{project._count.runs}</span> runs
+                    </p>
+                    <div className="mt-4 flex flex-wrap items-center gap-2">
+                      {!runnable && (
+                        <Link
+                          href={`/projects/${project.id}/plan`}
+                          className="bg-accent text-micro inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 font-medium text-white transition-opacity hover:opacity-90"
+                        >
+                          Review the test plan →
+                        </Link>
+                      )}
+                      {project.environments.map((env) => (
+                        <Button
+                          key={env.id}
+                          variant={runnable ? 'primary' : 'secondary'}
+                          size="sm"
+                          // Every trigger is disabled while one is in flight, as
+                          // before; only the one that was clicked spins.
+                          disabled={!runnable || (startingEnv !== null && startingEnv !== env.id)}
+                          loading={startingEnv === env.id}
+                          onClick={() => void startRun(env.id)}
+                          title={
+                            runnable
+                              ? undefined
+                              : `${project.name} has no tests yet — approve its plan first.`
+                          }
+                        >
+                          ▶ Run {env.name}
+                        </Button>
+                      ))}
+                    </div>
+                    {!runnable && (
+                      <p className="text-ink-faint mt-2.5 text-xs">
+                        No tests yet, so there is nothing to run. Approve a test plan and the
+                        Generator writes them.
+                      </p>
+                    )}
+                  </Card>
+                );
+              })}
               {projects.length === 0 && (
                 <EmptyState
                   title="No apps connected yet"

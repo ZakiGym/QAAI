@@ -1,5 +1,6 @@
 {
-  "name": "qaai",
+  "//name": "NOT `qaai` \u2014 that name belongs to packages/cli, the package customers install to run suites from their CI. When both this file and a workspace claimed it, `npm run <script> --workspaces` deduped by name and silently ran 9 of the 10 workspaces: packages/cli was excluded from typecheck, test and every other sweep, and the omission was invisible because the sweep still exited 0. This root is private and never published, so its name is cosmetic; the CLI's is not.",
+  "name": "qaai-monorepo",
   "private": true,
   "version": "0.1.0",
   "description": "QAAI \u2014 the AI QA engineer",
@@ -16,6 +17,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "vitest run",
+    "test:e2e": "playwright test --config e2e/playwright.config.ts",
+    "check:wiring": "tsx scripts/check-wiring.ts",
     "db:generate": "npm run db:generate -w @qaai/api",
     "db:migrate": "npm run db:migrate -w @qaai/api",
     "db:seed": "npm run db:seed -w @qaai/api",

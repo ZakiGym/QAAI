@@ -1,0 +1,164 @@
+# Repo CI.
+#
+# This file did not exist. `lint`, `typecheck`, `test` and `check:wiring` were
+# all defined in package.json and nothing ran any of them on a push — which is
+# the same defect the wiring check exists to find, applied to the checks
+# themselves.
+#
+# check:wiring is the one to understand here. It proves connectivity by
+# EXECUTION where it can: it logs into a running API and requests every declared
+# route, and it asks Redis which queues have a live BullMQ consumer. Neither
+# exists on a fresh runner, so both halves SKIP with a sentence saying what to
+# start, and the static half still runs — an unmounted router, a queue with no
+# consumer registration, a dead package module, an npm script pointing at a
+# missing file, an undocumented env var and a table nothing reads all fail here
+# with no services at all.
+#
+# To get the executed half in CI too, bring up Postgres, Redis, the API and the
+# worker before this step and the skips turn into proofs on their own.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # postinstall runs `prisma generate`, which needs no database.
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      # `npm run lint` is NOT a step yet, and the omission is deliberate rather
+      # than an oversight: at the time this file was written `eslint .` reported
+      # 5 errors on tracked files (plus 113 warnings from its ratchet). Adding a
+      # step that is red on its first run is how a pipeline gets marked
+      # `continue-on-error` and then ignored. Get eslint to zero errors, then
+      # add `- run: npm run lint` here.
+      #
+      # Separately: eslint currently walks e2e/.artifacts/, which is git-ignored
+      # Playwright trace output. It is invisible to CI (fresh checkout) but adds
+      # ~970 phantom errors locally. An `ignores` entry in eslint.config.js for
+      # `e2e/.artifacts/**` fixes that.
+
+      # Last, because its findings read best against a tree that already
+      # compiles: "correct code connected to nothing" presumes correct code.
+      - run: npm run check:wiring
+
+  # The dogfood suite: QAAI's own web app, tested by Playwright.
+  #
+  # It is a separate job because it needs the whole stack running — Postgres,
+  # Redis, the API, the worker and the web app — where `check` needs nothing but
+  # a checkout. Keeping them together would mean either paying for the services
+  # on every typecheck or letting the suite quietly not run, and the second is
+  # what happened: the suite existed with no trigger at all, which is precisely
+  # the defect check:wiring exists to find, applied to the thing that finds it.
+  dogfood:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: qaai
+          POSTGRES_PASSWORD: qaai
+          POSTGRES_DB: qaai
+        ports: ['5432:5432']
+        # Without this the API starts before Postgres accepts connections and
+        # the whole job fails on a race rather than on a real defect.
+        options: >-
+          --health-cmd "pg_isready -U qaai"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://qaai:qaai@localhost:5432/qaai
+      REDIS_URL: redis://localhost:6379
+      # Ephemeral and CI-only. Generated per run rather than committed, so this
+      # file never carries a key that also works against anything real.
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate ephemeral secrets
+        run: |
+          {
+            echo "SESSION_SECRET=$(openssl rand -base64 32)"
+            echo "VAULT_MASTER_KEY=$(openssl rand -base64 32)"
+          } >> "$GITHUB_ENV"
+
+      - run: npm run db:deploy -w @qaai/api
+
+      - run: npm run db:seed
+
+      # Compares the Prisma schema, the TypeScript constants in @qaai/shared AND
+      # the enum values in the live database. It needs a real Postgres, which is
+      # why it lives here and not in `check` — and until this job existed it ran
+      # nowhere at all, so the drift it detects could only be found by hand.
+      - run: npm run check:enums -w @qaai/api
+
+      - run: npx playwright install --with-deps chromium
+
+      # Backgrounded and then waited on: the suite drives the real product, so
+      # every service it touches has to be genuinely up first. A fixed sleep
+      # here is the flake this repo has spent the whole project removing from
+      # customer tests, so it polls instead.
+      #
+      # All three ports, including the demo store on :5050 — that is the app the
+      # runs actually drive, and a suite that starts against a dead one records
+      # real failures in the database that later assertions read back as fact.
+      - name: Start the stack
+        run: |
+          npm run dev > /tmp/stack.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:4000/health/live >/dev/null 2>&1 \
+               && curl -sf http://localhost:5050/__health >/dev/null 2>&1 \
+               && curl -sf http://localhost:3000 >/dev/null 2>&1; then
+              echo "stack up after $((i * 2))s" && exit 0
+            fi
+            sleep 2
+          done
+          echo "the stack never came up:" && tail -40 /tmp/stack.log && exit 1
+
+      - run: npm run test:e2e
+
+      # The stack's own output, always — a green suite that logged a stream of
+      # worker crashes is worth seeing, and on a red one this is usually the
+      # answer.
+      - name: Stack log
+        if: always()
+        run: tail -100 /tmp/stack.log
+
+      # The traces are the point of a failed UI run; without them a red CI job
+      # is a sentence with no evidence behind it.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: dogfood-traces
+          path: e2e/.artifacts/
+          retention-days: 7

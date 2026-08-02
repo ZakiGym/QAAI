@@ -99,13 +99,29 @@ function OnboardingInner() {
       }
     }, 3000);
 
-    // Give up after five minutes rather than spin forever if the worker is down.
+    /*
+     * Give up after five minutes rather than spin forever if the worker is
+     * down — but do not guess at why. This used to assert "The crawl did not
+     * finish" flatly, and the most common way to reach it was a crawl that had
+     * finished perfectly and was already in the database. Ask the flow map
+     * whether that happened before saying anything.
+     */
     const giveUp = setTimeout(() => {
       stop();
-      setError(
-        'The crawl did not finish. Is the worker running? Check that ANTHROPIC_API_KEY is set for the plan step.',
-      );
-      setPhase('error');
+      void api<{ flowMap: { version: number; nodeCount: number } }>(
+        `/projects/${projectId}/flow-map`,
+      )
+        .then((result) => {
+          setError(
+            `The crawl finished — flow map v${result.flowMap.version}, ${result.flowMap.nodeCount} states — but no test plan was written from it. That step runs in the worker: check that it is running and read its log for the reason.`,
+          );
+        })
+        .catch(() => {
+          setError(
+            'The crawl did not finish and no flow map was written. Is the worker running? Its log will say what stopped.',
+          );
+        })
+        .finally(() => setPhase('error'));
     }, 5 * 60_000);
 
     function stop() {
@@ -269,6 +285,25 @@ function OnboardingInner() {
           <Button type="submit" variant="primary" className="w-full">
             Crawl and propose tests
           </Button>
+
+          {/*
+            The error phase re-renders this form, which used to throw away the
+            crawl log with it — leaving someone who just watched twelve pages
+            get visited with a bare error and no evidence of what happened. It
+            is the only record of the crawl the screen has; keep it.
+          */}
+          {phase === 'error' && log.length > 0 && (
+            <div>
+              <p className="text-ink-faint mb-1.5 text-xs">What the crawl reported:</p>
+              <div className="border-line bg-surface-1 text-micro max-h-48 overflow-y-auto rounded-md border p-3 font-mono">
+                {log.map((line, i) => (
+                  <div key={i} className="text-ink-dim">
+                    {line}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </form>
       ) : (
         <div>

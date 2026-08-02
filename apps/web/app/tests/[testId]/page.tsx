@@ -3,9 +3,10 @@
 import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { api, ApiError } from '../../../lib/api';
+import { api, ApiError, type TestBehavior, type WeakAssertion } from '../../../lib/api';
 import { StatusDot, duration, relativeTime } from '../../../components/ui';
 import { BisectPanel } from '../../../components/BisectPanel';
+import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
 import { DomDiff } from '../../../components/DomDiff';
 import { EmptyState } from '../../../components/ui/EmptyState';
 import {
@@ -134,6 +135,16 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
    * other to compare, and the comparison is against the green run anyway.
    */
   const [openDiff, setOpenDiff] = useState<string | null>(null);
+  /**
+   * What this test actually checks, from the suite-health analyser.
+   *
+   * GET /suite-health/:projectId/tests/:testId has existed since suite health
+   * shipped and nothing called it — the project-wide report got a screen and
+   * the per-test one got nothing. It belongs here because the question it
+   * answers ("is this test any good?") is the one a bad pass rate raises, and
+   * the answer is frequently "it asserts almost nothing".
+   */
+  const [behavior, setBehavior] = useState<TestBehavior | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -153,6 +164,56 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Second, and only once the project id is known — it comes back on the test,
+  // not from the route. Failing quietly: this is an enrichment, and the history
+  // above is the page.
+  const projectId = history?.test.projectId ?? null;
+  /*
+   * ⌘K, on the test in front of you. Every one of these is gated on the thing
+   * it needs existing: no "latest run" command until there is a run.
+   */
+  const latestRunId = history?.results[0]?.run.id ?? null;
+  usePaletteCommands(
+    'test-detail',
+    () => {
+      const items = [
+        {
+          id: 'test:editor',
+          label: 'Open this test in the editor',
+          detail: 'its code',
+          group: 'This test',
+          run: () => router.push(`/editor?test=${testId}`),
+        },
+      ];
+      if (latestRunId) {
+        items.push({
+          id: 'test:latest-run',
+          label: 'Open its latest run',
+          detail: 'the cockpit',
+          group: 'This test',
+          run: () => router.push(`/runs/${latestRunId}`),
+        });
+      }
+      return items;
+    },
+    [testId, latestRunId, router],
+  );
+
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    api<TestBehavior>(`/suite-health/${projectId}/tests/${testId}`)
+      .then((data) => {
+        if (!cancelled) setBehavior(data);
+      })
+      .catch(() => {
+        if (!cancelled) setBehavior(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, testId]);
 
   if (loading) {
     return (
@@ -207,14 +268,29 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
           </span>
         }
         actions={
-          latest && (
+          <span className="flex items-center gap-2">
+            {/*
+              The code. This screen has always been able to tell you a test is
+              unreliable and never been able to show you the test — the editor
+              was reachable from /heals and from ⌘P and from nowhere that was
+              actually looking at a specific test's failures.
+            */}
             <Link
-              href={`/runs/${latest.run.id}`}
+              href={`/editor?test=${test.id}`}
               className="border-line text-ink-dim hover:text-ink hover:border-line-strong text-body-sm rounded-md border px-3.5 py-2"
+              title="Open this test's code"
             >
-              Latest run →
+              Open in editor
             </Link>
-          )
+            {latest && (
+              <Link
+                href={`/runs/${latest.run.id}`}
+                className="border-line text-ink-dim hover:text-ink hover:border-line-strong text-body-sm rounded-md border px-3.5 py-2"
+              >
+                Latest run →
+              </Link>
+            )}
+          </span>
         }
       />
 
@@ -381,6 +457,9 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
         currentlyRed={stats.streak ? stats.streak.outcome === 'fail' : undefined}
       />
 
+      {/* ── What this test actually checks ──────────────────────────────────── */}
+      {behavior && <BehaviorCard behavior={behavior} testId={test.id} />}
+
       {/* ── The failures ────────────────────────────────────────────────────── */}
       <section>
         <SectionLabel>Recent failures</SectionLabel>
@@ -407,6 +486,148 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
         </Card>
       </section>
     </Page>
+  );
+}
+
+const WEAK_TONE: Record<WeakAssertion['severity'], 'fail' | 'flake' | 'neutral'> = {
+  HIGH: 'fail',
+  MEDIUM: 'flake',
+  LOW: 'neutral',
+};
+
+/**
+ * What this test actually checks — the per-test half of suite health.
+ *
+ * A pass rate says how often a test went green. It cannot say whether green
+ * meant anything, and the two most common reasons it does not — the test
+ * asserts only that an element exists, or a `try/catch` swallows the assertion
+ * so it can never fail — are invisible from every other screen in this product.
+ *
+ * The weak-assertion list leads, because it is the finding. The assertion sites
+ * follow with the real source line quoted, so the claim can be checked without
+ * opening the file. `incomplete` is stated rather than swallowed: when the
+ * parse gave up, an empty finding list means nothing at all and must not read
+ * as a clean bill of health.
+ */
+function BehaviorCard({ behavior, testId }: { behavior: TestBehavior; testId: string }) {
+  const { routes, actions, assertions, assertionSites } = behavior.behavior;
+  const nothingRead =
+    routes.length === 0 &&
+    actions.length === 0 &&
+    assertions.length === 0 &&
+    assertionSites.length === 0;
+
+  // Nothing was read and nothing was found — there is no claim to make, and a
+  // card that says "0 weak assertions" about a file we could not parse would be
+  // the most misleading thing on the page.
+  if (nothingRead && behavior.weakAssertions.length === 0 && !behavior.incomplete) return null;
+
+  return (
+    <section className="mb-6">
+      <SectionLabel>What this test checks</SectionLabel>
+      <Card className="p-4">
+        {behavior.incomplete && (
+          <p className="border-flake/40 bg-flake/10 text-flake text-body-sm mb-4 rounded-md border p-2.5">
+            {behavior.incompleteReason ??
+              'This test could not be read in full, so nothing below is a complete account of it.'}{' '}
+            An empty findings list here is not a clean bill of health.
+          </p>
+        )}
+
+        {behavior.weakAssertions.length > 0 ? (
+          <ul className="divide-line mb-4 divide-y">
+            {behavior.weakAssertions.map((weak) => (
+              <li key={`${weak.kind}-${weak.line ?? 0}`} className="py-3 first:pt-0">
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <Badge tone={WEAK_TONE[weak.severity]} mono>
+                    {weak.kind.toLowerCase().replace(/_/g, ' ')}
+                  </Badge>
+                  {weak.line !== null && (
+                    <span className="text-ink-faint font-mono text-micro tabular-nums">
+                      line {weak.line}
+                    </span>
+                  )}
+                </div>
+                <p className="text-ink-dim text-body-sm mt-1.5 leading-relaxed">{weak.why}</p>
+                {weak.quote && (
+                  <pre className="border-line bg-surface-2/50 text-ink-dim mt-2 overflow-x-auto rounded-md border p-2 font-mono text-micro whitespace-pre-wrap">
+                    {weak.quote}
+                  </pre>
+                )}
+                <p className="text-ink-faint text-micro mt-1.5">
+                  Assert instead: {weak.assertInstead}{' '}
+                  <Link href={`/editor?test=${testId}`} className="text-accent hover:underline">
+                    Edit it →
+                  </Link>
+                </p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          !behavior.incomplete && (
+            /*
+             * Carefully NOT "this test is fine".
+             *
+             * The endpoint drops NO_NEGATIVE_PATH by construction — it is a
+             * judgement about a whole feature and one test alone cannot support
+             * it — so an empty list here is silence on that question, not a
+             * clean answer to it. Saying otherwise would suppress a finding the
+             * project report is holding right now.
+             */
+            <p className="text-ink-dim text-body-sm mb-4">
+              Every assertion this test makes has something to fail on. Whether the feature it
+              covers has an error path tested at all is a question about the whole suite —{' '}
+              <Link href="/insights/health" className="text-accent hover:underline">
+                the suite report answers it →
+              </Link>
+            </p>
+          )
+        )}
+
+        {assertionSites.length > 0 && (
+          <>
+            <p className="text-ink-faint text-micro mb-2 font-semibold tracking-wider uppercase">
+              Assertions ({assertionSites.length})
+            </p>
+            <ul className="border-line divide-line divide-y rounded-md border">
+              {assertionSites.map((site) => (
+                <li key={`${site.line}-${site.matcher}`} className="px-3 py-2">
+                  <div className="flex flex-wrap items-baseline gap-2">
+                    <Badge mono>{site.matcher}</Badge>
+                    <span className="text-ink-faint font-mono text-micro">{site.target}</span>
+                    {site.volatile && (
+                      // The reason is the useful half — "volatile" alone is a
+                      // label, "asserts on a timestamp" is a thing to fix.
+                      <Badge tone="flake">{site.volatileReason ?? 'volatile'}</Badge>
+                    )}
+                    {/* The worst finding in the whole analyser: an assertion
+                        inside a try/catch cannot fail, so this test has been
+                        green for reasons that have nothing to do with the app. */}
+                    {site.swallowed && <Badge tone="fail">cannot fail — swallowed</Badge>}
+                    <span className="text-ink-faint ml-auto font-mono text-micro tabular-nums">
+                      line {site.line}
+                    </span>
+                  </div>
+                  <pre className="text-ink-dim mt-1 overflow-x-auto font-mono text-micro whitespace-pre-wrap">
+                    {site.quote}
+                  </pre>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+
+        {routes.length > 0 && (
+          <p className="text-ink-faint text-micro mt-3">
+            Reaches {routes.map((r) => r.replace(/^nav:/, '')).join(', ')}
+            {' · '}
+            <Link href="/insights/impact" className="hover:text-accent hover:underline">
+              why it does or does not run on a diff →
+            </Link>
+          </p>
+        )}
+      </Card>
+    </section>
   );
 }
 

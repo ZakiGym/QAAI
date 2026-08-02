@@ -29,7 +29,11 @@ import { cn } from '../../lib/cn';
  * inside the files this change owns, and it drives the router rather than local
  * state so each view keeps a URL you can send to somebody.
  */
-export function InsightsTabs({ active }: { active: 'overview' | 'coverage' | 'health' }) {
+export function InsightsTabs({
+  active,
+}: {
+  active: 'overview' | 'coverage' | 'health' | 'impact';
+}) {
   const router = useRouter();
   return (
     <Tabs
@@ -37,6 +41,10 @@ export function InsightsTabs({ active }: { active: 'overview' | 'coverage' | 'he
         { id: 'overview', label: 'Overview' },
         { id: 'coverage', label: 'Coverage gaps' },
         { id: 'health', label: 'Suite health' },
+        // Impact analysis belongs with these two and not in the sidebar: it is
+        // the same kind of question — what nobody tested, whether the tests are
+        // worth running, and which of them this diff needs at all.
+        { id: 'impact', label: 'Impact' },
       ] as const}
       active={active}
       onChange={(id) =>

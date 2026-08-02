@@ -2,7 +2,6 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
 
 /**
@@ -19,7 +18,6 @@ import { api, ApiError } from '../../lib/api';
  * page never learns an org name from an address it was handed.
  */
 export default function LoginPage() {
-  const router = useRouter();
   const [email, setEmail] = useState('owner@qaai.local');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -46,7 +44,19 @@ export default function LoginPage() {
     setError(null);
     try {
       await api('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
-      router.push('/runs');
+      /*
+       * A full navigation, not router.push. ProjectProvider and the top bar's
+       * session both live at the root layout and fetch exactly once on mount;
+       * a client-side push does not remount them, so signing in as a second
+       * user left the previous user's project list, selected project and
+       * avatar on screen, and every context-driven screen went on querying a
+       * project id in an org this session cannot see.
+       *
+       * This is the same call the org switcher already makes, for the same
+       * reason it gives: every cached list on every screen belongs to the
+       * previous identity.
+       */
+      window.location.assign('/runs');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not sign in');
     } finally {

@@ -922,3 +922,220 @@ export interface ReproResponse {
   /** Present when the deterministic half ran but no test was written. */
   generation?: { skipped: true; reason: string };
 }
+
+// ─── Failure clusters (GET /clusters/run/:runId) ─────────────────────────────
+//
+// APPENDED. Mirrors apps/api/src/lib/cluster.ts, which is the source of truth.
+//
+// The endpoint has been mounted and answering since failure clustering shipped
+// and nothing in the web app had ever called it. The cockpit lists failures one
+// per row, which is right for three and useless for forty; this is the answer
+// to "how many *causes* am I looking at", which is the question a red build
+// actually raises.
+
+export interface ClusterFacets {
+  /** `TimeoutError`, `net::ERR_CONNECTION_REFUSED`, … */
+  errorClass: string | null;
+  /** The call that threw: `page.goto`, `locator.click`. */
+  call: string | null;
+  /** The matcher that failed: `toBeVisible`, `http-status`. */
+  assertion: string | null;
+  selector: string | null;
+  /** Failing URL, with dynamic segments and query values already removed. */
+  endpoint: string | null;
+  httpStatus: number | null;
+  message: string;
+}
+
+export interface ClusterMember {
+  testResultId: string;
+  testId: string;
+  testName: string;
+  filePath: string | null;
+  status: string;
+  retriedAndPassed: boolean;
+  /** The verdict already on this result, so an override stays visible. */
+  verdict: Verdict['verdict'] | null;
+}
+
+/**
+ * A recommendation attached to a group — never a decision. `basis` is carried
+ * so the UI can say where it came from rather than presenting a guess as a
+ * finding; accepting it stays a human action on the triage screen.
+ */
+export interface ClusterSuggestion {
+  verdict: Verdict['verdict'];
+  basis: 'HUMAN_OVERRIDE' | 'TRIAGE_MAJORITY' | 'SIGNATURE';
+  reason: string;
+}
+
+export interface FailureCluster {
+  id: string;
+  signature: string;
+  /** What a person would call this cause, in a sentence they could say aloud. */
+  label: string;
+  count: number;
+  facets: ClusterFacets;
+  members: ClusterMember[];
+  suggested: ClusterSuggestion;
+  /** One member's untouched error text, so the grouping can be audited. */
+  sample: string;
+}
+
+/** A failure that matched nothing else — same shape minus the plural claims. */
+export interface UnclusteredFailure {
+  id: string;
+  signature: string;
+  label: string;
+  facets: ClusterFacets;
+  member: ClusterMember;
+  sample: string;
+  /** NO_SIGNAL means the error carried nothing to group on — not "it is unique". */
+  reason: 'ONLY_OCCURRENCE' | 'NO_SIGNAL';
+}
+
+export interface ClusterReport {
+  run: {
+    id: string;
+    projectId: string;
+    status: string;
+    totalCount: number;
+    failedCount: number;
+    flakyCount: number;
+    finishedAt: string | null;
+  };
+  clusters: FailureCluster[];
+  unclustered: UnclusteredFailure[];
+  /**
+   * `failures` counts what was CLUSTERABLE, which can be lower than the run's
+   * failedCount when a result carried no error text. Both are returned so the
+   * UI never has to explain a number it cannot reconcile.
+   */
+  summary: { failures: number; clustered: number; clusters: number; largestCluster: number };
+}
+
+// ─── Impact analysis (POST /impact/analyze, GET /impact/signals) ─────────────
+//
+// APPENDED. Mirrors apps/api/src/lib/impact.ts. Also never called from the web
+// until now: the endpoints shipped with a curl recipe in their own doc comment
+// and no screen.
+
+export type ImpactConfidence = 'HIGH' | 'MEDIUM' | 'LOW' | 'NONE';
+export type ImpactStrategy = 'RUN_EVERYTHING' | 'SELECTIVE' | 'SMOKE_FLOOR';
+
+export interface ImpactRouteRef {
+  route: string;
+  /** True for layouts/templates: the change lands on everything BELOW this route. */
+  subtree: boolean;
+}
+
+export interface ImpactAttribution {
+  path: string;
+  kind:
+    | 'test-file'
+    | 'test-support'
+    | 'framework-page'
+    | 'framework-layout'
+    | 'server-route'
+    | 'named-source'
+    | 'global'
+    | 'documentation'
+    | 'unattributable';
+  routes: ImpactRouteRef[];
+  tokens: string[];
+  confidence: ImpactConfidence;
+  why: string;
+  /** True when this file alone forces the whole suite. */
+  blastRadius: boolean;
+  /** True when the file cannot affect the running app at all. */
+  ignored: boolean;
+}
+
+export interface ImpactDecision {
+  testId: string;
+  name: string;
+  filePath: string;
+  priority: string;
+  feature: string | null;
+  decision: 'run' | 'skip';
+  /** One sentence per test — the point of the feature is that this is readable. */
+  reason: string;
+  confidence: ImpactConfidence;
+  signals: string[];
+  matchedPaths: string[];
+}
+
+export interface ImpactAnalysis {
+  strategy: ImpactStrategy;
+  reason: string;
+  confidence: ImpactConfidence;
+  savedPercent: number;
+  run: ImpactDecision[];
+  skip: ImpactDecision[];
+  /** Ready to POST as `testIds` to /runs — no other endpoint has to change. */
+  testIds: string[];
+  attributions: ImpactAttribution[];
+  totals: { tests: number; run: number; skip: number; changedPaths: number };
+  /** Null when the app has never been crawled — then only route literals count. */
+  flowMapVersion: number | null;
+  limits: { maxChangedPaths: number };
+}
+
+export interface ImpactSignal {
+  testId: string;
+  name: string;
+  filePath: string;
+  priority: string;
+  feature: string | null;
+  tags: string[];
+  routes: string[];
+  tokens: string[];
+  /** False when the test declares nothing a diff can be checked against. */
+  known: boolean;
+  coverageTruncated: boolean;
+}
+
+export interface ImpactSignals {
+  signals: ImpactSignal[];
+  flowMapVersion: number | null;
+  unknownCount: number;
+}
+
+// ─── One test's behaviour (GET /suite-health/:projectId/tests/:testId) ───────
+//
+// APPENDED. The per-test half of the suite-health report. The project-wide
+// report has had a screen since Insights shipped; this one answers "is THIS
+// test any good", which is the question you have while looking at a flaky one.
+
+export interface AssertionSite {
+  line: number;
+  /** The real source line, so the finding can be checked without opening the file. */
+  quote: string;
+  target: string;
+  matcher: string;
+  negated: boolean;
+  arg: string;
+  argKind: string;
+  kind: string;
+  volatile: boolean;
+  volatileReason: string | null;
+  /** True when a try/catch swallows the failure — the assertion cannot fail. */
+  swallowed: boolean;
+  swallowLine: number | null;
+}
+
+export interface TestBehavior {
+  testId: string;
+  name: string;
+  behavior: {
+    routes: string[];
+    actions: string[];
+    assertions: string[];
+    data: string[];
+    assertionSites: AssertionSite[];
+  };
+  weakAssertions: WeakAssertion[];
+  /** True when the parse gave up — an empty finding list then means nothing. */
+  incomplete: boolean;
+  incompleteReason: string | null;
+}

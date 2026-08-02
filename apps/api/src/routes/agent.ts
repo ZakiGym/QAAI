@@ -11,6 +11,7 @@ import { Router } from 'express';
 import { QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
 import { applyHealDiff } from '@qaai/agent';
 import { prisma } from '../lib/prisma.js';
+import { env } from '../env.js';
 import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
@@ -131,13 +132,30 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
     });
   }
 
-  const jobId = await enqueue(QUEUE_NAMES.generate, {
-    orgId: actor.orgId,
-    projectId: plan.projectId,
-    testPlanId: plan.id,
-    planItemIds: input.approvedItemIds,
-    requestedBy: actor.userId,
-  });
+  /*
+   * Generation needs a model. Missing one is a MISSING TOOL, not a failure —
+   * the identical guard routes/coverage.ts and routes/traffic.ts already make,
+   * for the identical reason, and this is the one approval path every new
+   * customer walks.
+   *
+   * Without it this endpoint answered 202 `{ jobId, approved: 8 }`, the cockpit
+   * read that as success and sent the person to /editor, and the job died in
+   * the worker on "ANTHROPIC_API_KEY is not set". The only thing they ever saw
+   * was a green count and then an editor that stayed empty forever, with
+   * nothing anywhere to say why. The approval itself is real and is kept — the
+   * items are APPROVED and generate as soon as a key is set — so the honest
+   * answer is "approved, not queued, here is what to set".
+   */
+  const canGenerate = Boolean(env.ANTHROPIC_API_KEY);
+  const jobId = canGenerate
+    ? await enqueue(QUEUE_NAMES.generate, {
+        orgId: actor.orgId,
+        projectId: plan.projectId,
+        testPlanId: plan.id,
+        planItemIds: input.approvedItemIds,
+        requestedBy: actor.userId,
+      })
+    : null;
 
   await audit({
     actor,
@@ -147,10 +165,24 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
     metadata: {
       approved: input.approvedItemIds.length,
       rejected: known.size - input.approvedItemIds.length,
+      queued: canGenerate,
+      ...(canGenerate ? {} : { reason: 'no ANTHROPIC_API_KEY' }),
     },
   });
 
-  res.status(202).json({ jobId, approved: input.approvedItemIds.length });
+  res.status(202).json({
+    jobId,
+    approved: input.approvedItemIds.length,
+    generation: canGenerate
+      ? { queued: true }
+      : {
+          queued: false,
+          reason:
+            'ANTHROPIC_API_KEY is not set on this deployment, so the Generator cannot be run and no ' +
+            'test code was written. Your approval was saved — these items are APPROVED and will ' +
+            'generate as soon as the key is set and you approve the plan again.',
+        },
+  });
 });
 
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────

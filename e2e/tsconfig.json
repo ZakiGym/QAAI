@@ -1,0 +1,30 @@
+{
+  // NOT extending tsconfig.base.json on purpose. Playwright compiles this
+  // project to CommonJS (the repo root has no "type": "module"), so the config
+  // uses __dirname and the specs must not carry the .js import suffixes the
+  // NodeNext workspaces do. This file describes the code as Playwright actually
+  // loads it, so `tsc --noEmit` and the runtime agree.
+  "compilerOptions": {
+    "target": "ES2022",
+    // `Preserve` + `Bundler` describes what Playwright's loader does: it accepts
+    // ESM syntax with extensionless local imports and emits whatever the host
+    // needs. The old `Node`/`CommonJS` pair is deprecated in TypeScript 6.
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules", ".artifacts", ".auth"]
+}

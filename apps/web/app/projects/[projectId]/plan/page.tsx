@@ -74,6 +74,13 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Set when the approval succeeded but the Generator was NOT queued, which is
+   * what this deployment answers when it has no ANTHROPIC_API_KEY. Routing to
+   * /editor in that case sends someone to watch an empty screen for code that
+   * is never coming, so the sentence the API returned is shown here instead.
+   */
+  const [notGenerated, setNotGenerated] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -111,11 +118,28 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
     if (!plan || selected.size === 0) return;
     setBusy(true);
     setError(null);
+    // Clear last attempt's verdict before asking again. Without this, a retry
+    // that succeeds leaves "no test code was written" on screen underneath it.
+    setNotGenerated(null);
     try {
-      await api(`/plans/${plan.id}/approve`, {
+      const result = await api<{
+        approved: number;
+        generation?: { queued: boolean; reason?: string };
+      }>(`/plans/${plan.id}/approve`, {
         method: 'POST',
         body: JSON.stringify({ approvedItemIds: [...selected] }),
       });
+
+      // Only claim the Generator is running when the API says it was queued.
+      if (result.generation && result.generation.queued === false) {
+        setNotGenerated(
+          result.generation.reason ??
+            'The approval was saved, but no test code was written on this deployment.',
+        );
+        await load();
+        return;
+      }
+
       // The Generator now runs in the worker; the tests appear in the editor.
       router.push('/editor');
     } catch (err) {
@@ -161,13 +185,24 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
         subtitle={
           <>
             {plan.summary}
+            {/*
+              This sentence used to end "waiting on the Generator, not on you"
+              unconditionally. After an approval the Generator did not pick up,
+              `load()` brings those items back as APPROVED-without-a-test, so the
+              header said the Generator was coming while the banner at the bottom
+              of the same screen said no code had been written. Two claims, one
+              screen, opposite meanings — and the false one was the one that told
+              the user to sit and wait.
+            */}
             {preApproved > 0 && (
               <span className="text-ink-faint mt-2 block">
                 <span className="tabular-nums">{preApproved}</span> item
                 {preApproved === 1 ? ' was' : 's were'} already approved when{' '}
                 {preApproved === 1 ? 'it was' : 'they were'} selected — choosing the gap was the
-                approval. {preApproved === 1 ? 'It is' : 'They are'} waiting on the Generator, not
-                on you.
+                approval.{' '}
+                {notGenerated
+                  ? `${preApproved === 1 ? 'It is' : 'They are'} approved and unwritten; see below.`
+                  : `${preApproved === 1 ? 'It is' : 'They are'} waiting on the Generator, not on you.`}
               </span>
             )}
             {alreadyGenerated > 0 && (
@@ -279,6 +314,28 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
 
       {error && <p className="text-fail mt-6 text-sm">{error}</p>}
 
+      {/*
+        Approved, but nothing was generated. Deliberately not styled as an error
+        — the approval succeeded and is durable — and deliberately not a
+        redirect, because the place this used to send people has nothing in it.
+      */}
+      {notGenerated && (
+        <div
+          role="status"
+          className="border-flake/40 bg-flake/10 mt-6 rounded-lg border p-4 text-sm"
+        >
+          <p className="font-medium">Approved — but no test code was written.</p>
+          {/*
+            Every reason the API returns here already states that the approval
+            was saved — that is the one fact this banner must not omit. A second
+            sentence from the client repeating it read as two different messages
+            about the same thing, and the retry affordance is the button below,
+            which relabels itself rather than needing its own control.
+          */}
+          <p className="text-ink-dim mt-1.5">{notGenerated}</p>
+        </div>
+      )}
+
       {proposable.length > 0 && (
         <div className="border-line bg-surface sticky bottom-0 mt-8 flex items-center gap-3 border-t py-4">
           <span className="text-ink-dim text-sm">
@@ -292,9 +349,17 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
             loading={busy}
             onClick={() => void approve()}
           >
+            {/*
+              After a failed generation the label used to stay "Generate N
+              tests", which reads as an untried action — the user presses it,
+              gets the identical banner, and has no way to tell the second
+              attempt from the first.
+            */}
             {busy
               ? 'Generating…'
-              : `Generate ${selected.size} test${selected.size === 1 ? '' : 's'}`}
+              : notGenerated
+                ? `Try generating ${selected.size} test${selected.size === 1 ? '' : 's'} again`
+                : `Generate ${selected.size} test${selected.size === 1 ? '' : 's'}`}
           </Button>
         </div>
       )}

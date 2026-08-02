@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder"
+    "dist": "electron-builder",
+    "//typecheck": "This workspace is plain CommonJS with no build step, so there is no tsc to run. It still needs a `typecheck` script: `npm run typecheck --workspaces --if-present` SKIPS a workspace that has none, which is why this app was outside the repo's typecheck the whole time — 'all 10 workspaces are clean' was really 9. `node --check` is the strongest check that honestly applies: it parses main.cjs, so a syntax error is caught in CI rather than by the first person to launch the app. What it cannot see (does `@qaai/demo` still have a `dev` script?) is covered by check:wiring's desktop-services check.",
+    "typecheck": "node --check src/main.cjs"
   },
   "build": {
     "appId": "com.qaai.cockpit",

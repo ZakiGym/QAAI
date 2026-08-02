@@ -224,10 +224,31 @@ export default function EditorPage() {
           });
         const loaded = await loadTests(projectId);
         if (cancelled) return;
-        // ⌘P quick-open lands here as ?test=<id>; fall back to the first test.
+        /*
+         * ⌘P quick-open and the deep links from triage/heals arrive as
+         * ?test=<id>.
+         *
+         * This used to read `loaded.find(...) || loaded[0]`, which quietly
+         * opened an UNRELATED test whenever the requested one was not in the
+         * tree — deleted, moved to another project, or archived. Someone
+         * following "open the failing test" from triage would land in a
+         * different file, with the correct filename in the tab and no hint that
+         * the app had substituted it, and start editing the wrong test.
+         *
+         * `|| loaded[0]` is right for a bare /editor visit (open something so
+         * the screen is not blank) and wrong for a request that named a test.
+         */
         const wanted = new URLSearchParams(window.location.search).get('test');
-        const target = (wanted && loaded.find((t) => t.id === wanted)) || loaded[0];
-        if (target) void openFile(projectId, target.id);
+        if (wanted) {
+          const target = loaded.find((t) => t.id === wanted);
+          if (target) void openFile(projectId, target.id);
+          else
+            setStatus(
+              'That test is not in this app — it may have been deleted, or it belongs to another app. Pick one from the tree.',
+            );
+        } else if (loaded[0]) {
+          void openFile(projectId, loaded[0].id);
+        }
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError && err.status === 401) {
@@ -611,6 +632,34 @@ export default function EditorPage() {
               +
             </Button>
           </div>
+
+          {/*
+            An app is connected but has no tests — the state every new user is in
+            right after onboarding, and the one the sidebar rendered as a blank
+            panel. The plan the Explorer wrote for them is one route away and
+            nothing on this screen or on /runs linked to it, so the only ways
+            forward were writing a test by hand or guessing the URL.
+          */}
+          {project && tests.length === 0 && (
+            <div className="border-line/60 mx-2 mt-2 rounded-lg border border-dashed p-3">
+              {/*
+                Deliberately does not assert a plan exists — a project created
+                outside onboarding has none, and the plan page says so with a
+                working "Run the Explorer" button. Promising a plan that isn't
+                there is the same mistake as the triage fix-review link.
+              */}
+              <p className="text-ink-dim text-xs leading-relaxed">
+                No tests yet for {project.name}. Approve a test plan and the Generator writes them
+                here.
+              </p>
+              <Link
+                href={`/projects/${project.id}/plan`}
+                className="text-accent mt-2 inline-block text-xs hover:underline"
+              >
+                Review the test plan →
+              </Link>
+            </div>
+          )}
 
           {project && (
             <FileTree

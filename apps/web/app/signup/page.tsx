@@ -2,7 +2,6 @@
 
 import { useState } from 'react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../lib/api';
 
 /**
@@ -14,7 +13,6 @@ import { api, ApiError } from '../../lib/api';
  * organisation in one transaction, so this is genuinely one screen.
  */
 export default function SignupPage() {
-  const router = useRouter();
   const [name, setName] = useState('');
   const [orgName, setOrgName] = useState('');
   const [email, setEmail] = useState('');
@@ -31,8 +29,11 @@ export default function SignupPage() {
         method: 'POST',
         body: JSON.stringify({ email, password, name, orgName }),
       });
-      // Signup signs you in, so go straight to the thing you came to do.
-      router.push('/onboarding');
+      // Signup signs you in, so go straight to the thing you came to do — with
+      // a full navigation, so the root-layout ProjectProvider and top-bar
+      // session mount against the new session instead of whatever was on
+      // screen before. See the note in login/page.tsx.
+      window.location.assign('/onboarding');
     } catch (err) {
       setError(
         err instanceof ApiError ? err.message : 'Could not create the account',

@@ -48,7 +48,32 @@ x-app-env: &app-env
   QAAI_MODEL_STRONG: ${QAAI_MODEL_STRONG:-claude-opus-5}
   QAAI_MONTHLY_TOKEN_BUDGET: ${QAAI_MONTHLY_TOKEN_BUDGET:-0}
 
-  SENTRY_DSN: ${SENTRY_DSN:-}
+  # Billing. Blank means "not purchasable online", which is the right default
+  # for a self-hosted install. Without these lines a compose deployment could
+  # set STRIPE_SECRET_KEY in its .env and watch nothing happen: the variable
+  # never reached the container.
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+  STRIPE_PRICE_TEAM: ${STRIPE_PRICE_TEAM:-}
+  STRIPE_PRICE_BUSINESS: ${STRIPE_PRICE_BUSINESS:-}
+
+  # GitHub. The App gives check runs on the merge box; the plain webhook secret
+  # covers the personal-access-token path. Same story as above — the code reads
+  # all four and compose forwarded none of them.
+  GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+  GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+  GITHUB_APP_PRIVATE_KEY_ENC: ${GITHUB_APP_PRIVATE_KEY_ENC:-}
+  GITHUB_APP_WEBHOOK_SECRET: ${GITHUB_APP_WEBHOOK_SECRET:-}
+  GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+
+  # Retention deletes artifacts for real only when this says so, everywhere else
+  # it is a dry run. It belongs in compose precisely because it is the switch an
+  # operator most needs to be able to find.
+  QAAI_RETENTION_APPLY: ${QAAI_RETENTION_APPLY:-false}
+
+  # SENTRY_DSN was forwarded here and read by nothing — no Sentry SDK exists in
+  # any package.json — so it has been removed rather than left as a passthrough
+  # that quietly discards what an operator sets.
 
 # api, web, demo and the migration job all run the same image.
 x-app-build: &app-build

@@ -130,6 +130,17 @@ export default function TriagePage() {
   const [batch, setBatch] = useState<AppliedBatch | null>(null);
   /** testId → who owns it, when an ownership rule matched. */
   const [owners, setOwners] = useState<Map<string, OwnerRow>>(new Map());
+  /**
+   * Tests the healer has actually written a proposal for.
+   *
+   * The INTENDED_CHANGE blurb offered "Review the proposed fix for this test →"
+   * for every such verdict, on the assumption that a verdict of that kind always
+   * has a heal waiting. It does not: the healer runs separately and only for
+   * failures it can pattern-match, so the common case for a fresh INTENDED_CHANGE
+   * was a link to /heals?test=… that filtered a list down to nothing. Offering a
+   * fix and then showing an empty screen is worse than not offering one.
+   */
+  const [healedTestIds, setHealedTestIds] = useState<Set<string>>(new Set());
 
   const load = useCallback(
     async (all: boolean) => {
@@ -197,6 +208,37 @@ export default function TriagePage() {
       cancelled = true;
     };
   }, [project?.id, verdicts]);
+
+  /*
+   * Which failures actually have a fix to review. Same soft-failure contract as
+   * ownership above: if this call fails the link simply does not appear, which
+   * is the safe direction — a missing link costs a click through the sidebar, a
+   * dead one costs a click into an empty screen and the belief that the healer
+   * is broken.
+   *
+   * `state=all` on purpose. A proposal that has already been approved or
+   * rejected is still worth reading from the failure it came from — "what did we
+   * decide about this?" is the question the triage screen leaves people with.
+   */
+  useEffect(() => {
+    if (verdicts.length === 0) {
+      setHealedTestIds(new Set());
+      return;
+    }
+
+    let cancelled = false;
+    void api<{ heals: Array<{ testId: string }> }>('/heals?state=all')
+      .then(({ heals }) => {
+        if (!cancelled) setHealedTestIds(new Set(heals.map((h) => h.testId)));
+      })
+      .catch(() => {
+        if (!cancelled) setHealedTestIds(new Set());
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [verdicts]);
 
   const selected = verdicts.find((v) => v.id === selectedId) ?? null;
   const pickable = useMemo(() => verdicts.filter((v) => v.reviewState === 'PENDING'), [verdicts]);
@@ -521,12 +563,29 @@ export default function TriagePage() {
             <div className="flex items-start gap-3">
               <div className="min-w-0 flex-1">
                 <h2 className="truncate font-medium">{selected.testResult.test.name}</h2>
-                <Link
-                  href={`/runs/${selected.testResult.runId}`}
-                  className="text-ink-faint hover:text-accent font-mono text-micro"
-                >
-                  {selected.testResult.test.filePath} →
-                </Link>
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <Link
+                    href={`/runs/${selected.testResult.runId}`}
+                    className="text-ink-faint hover:text-accent font-mono text-micro"
+                  >
+                    {selected.testResult.test.filePath} →
+                  </Link>
+                  {/*
+                    The question every triage decision actually rests on, and
+                    this screen could not answer it: is this test always like
+                    this? A verdict of FLAKE on a test that has failed forty
+                    times running is a different call from the same verdict on
+                    one that has never failed before, and the flake rate,
+                    quarantine state and the bisect all live one click away.
+                  */}
+                  <Link
+                    href={`/tests/${selected.testResult.test.id}`}
+                    className="text-ink-faint hover:text-accent text-micro hover:underline"
+                    title="Pass rate, flake rate, quarantine state, and when it started failing"
+                  >
+                    Has it always done this? →
+                  </Link>
+                </div>
               </div>
               <Badge tone={metaFor(selected.verdict).tone} mono className="rounded-md px-2">
                 {metaFor(selected.verdict).label}
@@ -551,14 +610,35 @@ export default function TriagePage() {
               {/* The blurb has always said "the healer proposes a fix" and then
                   left the user to find /heals in the sidebar on their own. The
                   triage loop was described but never linked together. */}
-              {selected.verdict === 'INTENDED_CHANGE' && (
-                <>
-                  {' '}
-                  <Link href="/heals" className="text-accent hover:underline">
-                    Review proposed fixes →
-                  </Link>
-                </>
-              )}
+              {/* Only when a proposal exists — see healedTestIds. */}
+              {selected.verdict === 'INTENDED_CHANGE' &&
+                (healedTestIds.has(selected.testResult.test.id) ? (
+                  <>
+                    {' '}
+                    {/* Scoped to THIS test. The bare /heals link dropped you into
+                        a queue of every proposal in the project and left you to
+                        find the one for the failure you were just reading. */}
+                    <Link
+                      href={`/heals?test=${selected.testResult.test.id}`}
+                      className="text-accent hover:underline"
+                    >
+                      Review the proposed fix for this test →
+                    </Link>
+                  </>
+                ) : (
+                  <>
+                    {' '}
+                    <span className="text-ink-faint">
+                      The healer has not proposed a fix for this one — update the test in the editor.
+                    </span>{' '}
+                    <Link
+                      href={`/editor?test=${selected.testResult.test.id}`}
+                      className="text-accent hover:underline"
+                    >
+                      Open it →
+                    </Link>
+                  </>
+                ))}
             </p>
 
             <div className="mt-6">

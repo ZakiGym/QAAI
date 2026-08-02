@@ -34,6 +34,13 @@ import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
 import { processBisect } from './processors/bisect.js';
 import { armCheckSweep, processChecks } from './processors/checks.js';
 import { processDigestTick } from './processors/digest.js';
+import {
+  RETENTION_QUEUE,
+  armRetentionSweep,
+  closeRetentionQueue,
+  processRetentionTick,
+  type RetentionJob,
+} from './processors/retention.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
@@ -132,6 +139,25 @@ register<BisectJob>(BISECT_QUEUE, config.concurrency, processBisect);
 register<ChecksJob>(CHECKS_QUEUE, config.concurrency, processChecks);
 void armCheckSweep().catch((err) => logger.error({ err }, 'could not arm the check sweep'));
 
+// Artifact retention. Concurrency 1, deliberately: two sweeps running at once
+// would race over the same expired rows, and there is never a reason to hurry a
+// delete.
+//
+// This registration and the arming call below are what make the retention
+// feature exist at run time. Everything else was already here — the processor,
+// its unit tests, the OWNER-only POST /retention/sweep that enqueues onto
+// 'qaai.retention' — and none of it was reachable, because no worker drained
+// that queue. The endpoint answered "sweep queued" and the job sat in Redis
+// forever, which is the same class of bug as the bisect queue that had no
+// consumer. `npm run check:wiring` now fails if this line is ever removed.
+register<RetentionJob>(RETENTION_QUEUE, 1, processRetentionTick);
+// Daily repeatable sweep, de-duplicated by job key, so arming it on every boot
+// is safe. Without it the only sweeps that ever happen are the ones an owner
+// asks for by hand.
+void armRetentionSweep().catch((err) =>
+  logger.error({ err }, 'could not arm the retention sweep'),
+);
+
 logger.info(
   {
     concurrency: config.concurrency,
@@ -157,6 +183,10 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
     await Promise.all(workers.map((w) => w.close()));
     await closeProducers().catch(() => {});
+    // retention.ts builds its producer lazily and outside queues.ts, so
+    // closeProducers() does not know about it. Left open, it holds the process
+    // past the shutdown that is supposed to end it.
+    await closeRetentionQueue().catch(() => {});
     await prisma.$disconnect().catch(() => {});
     connection.disconnect();
     process.exit(0);

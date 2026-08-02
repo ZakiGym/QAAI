@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { StatusDot, relativeTime } from '../../components/ui';
+import { useProject } from '../../components/shell/ProjectContext';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { cn } from '../../lib/cn';
 import {
@@ -24,6 +25,10 @@ import {
  */
 export default function DashboardPage() {
   const router = useRouter();
+  // Opening an app from here has to SELECT it — every other screen reads the
+  // shell's selected project, so navigating without setting it lands you on a
+  // different app's data under the name you just clicked.
+  const { setProjectId } = useProject();
   const [projects, setProjects] = useState<Project[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -145,6 +150,13 @@ export default function DashboardPage() {
           ) : (
             <>
               {projects.map((project) => (
+                /*
+                 * This is the ONLY screen that shows every app at once, and its
+                 * cards went nowhere — "11 tests · 90 runs" with no way to see
+                 * either. Every other screen reads the selected project, so
+                 * opening one has to select it first, or you land on Runs still
+                 * looking at a different app.
+                 */
                 <Card key={project.id} className="p-4">
                   <div className="flex items-baseline justify-between gap-3">
                     <h3 className="font-medium">{project.name}</h3>
@@ -154,6 +166,39 @@ export default function DashboardPage() {
                     <span className="tabular-nums">{project._count.tests}</span> tests ·{' '}
                     <span className="tabular-nums">{project._count.runs}</span> runs
                   </p>
+                  <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 text-micro">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectId(project.id);
+                        router.push('/runs');
+                      }}
+                      className="text-accent hover:underline"
+                    >
+                      Its runs →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectId(project.id);
+                        router.push('/editor');
+                      }}
+                      className="text-ink-faint hover:text-accent hover:underline"
+                    >
+                      Its tests →
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectId(project.id);
+                        router.push('/insights');
+                      }}
+                      className="text-ink-faint hover:text-accent hover:underline"
+                      title="What it does not test, and whether the tests it has are worth running"
+                    >
+                      Its insights →
+                    </button>
+                  </div>
                 </Card>
               ))}
               {projects.length === 0 && (

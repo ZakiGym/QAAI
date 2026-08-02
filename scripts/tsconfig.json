@@ -1,0 +1,15 @@
+{
+  "//": "scripts/ is not a workspace, so `npm run typecheck --workspaces` never sees it. This project exists so check-wiring.ts is typechecked by the same rules as everything else: cd scripts && npx tsc --noEmit -p tsconfig.json",
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "include": ["*.ts"]
+}

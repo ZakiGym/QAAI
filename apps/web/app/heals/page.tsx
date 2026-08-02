@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useCallback, useEffect, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { api, ApiError, type Heal } from '../../lib/api';
 import { DiffView } from '../../components/DiffView';
@@ -71,8 +71,29 @@ function confirmBody(heal: Heal): string {
   return `${lead} The diff is written to ${heal.test.filePath} straight away and every later run uses the new version. A version is recorded first, so you can revert it.`;
 }
 
+/**
+ * `?test=<id>` arrives from triage, where an INTENDED_CHANGE verdict says "the
+ * healer proposes a fix" — that sentence pointed at the whole queue and left
+ * you to find the one proposal it meant. `useSearchParams` needs a Suspense
+ * boundary in the app router, so the page is split around one.
+ */
 export default function HealsPage() {
+  return (
+    <Suspense
+      fallback={
+        <Page width="full">
+          <SkeletonRows rows={7} />
+        </Page>
+      }
+    >
+      <HealsPageInner />
+    </Suspense>
+  );
+}
+
+function HealsPageInner() {
   const router = useRouter();
+  const focusTestId = useSearchParams().get('test');
   const [heals, setHeals] = useState<Heal[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
@@ -90,7 +111,14 @@ export default function HealsPage() {
       try {
         const { heals } = await api<{ heals: Heal[] }>(`/heals${all ? '?state=all' : ''}`);
         setHeals(heals);
-        setSelectedId((cur) => (cur && heals.some((h) => h.id === cur) ? cur : (heals[0]?.id ?? null)));
+        setSelectedId((cur) => {
+          if (cur && heals.some((h) => h.id === cur)) return cur;
+          // A ?test= link opens on that test's proposal. It does NOT filter the
+          // queue: the rest of the list is context you want while deciding, and
+          // hiding it would make the link feel like a different screen.
+          const focused = focusTestId ? heals.find((h) => h.test.id === focusTestId) : undefined;
+          return focused?.id ?? heals[0]?.id ?? null;
+        });
         setError(null);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
@@ -104,7 +132,7 @@ export default function HealsPage() {
         setLoading(false);
       }
     },
-    [router],
+    [router, focusTestId],
   );
 
   useEffect(() => {
@@ -158,6 +186,24 @@ export default function HealsPage() {
         }
         className="border-line mb-0 shrink-0 items-center border-b px-6 py-4"
       />
+
+      {/*
+        A ?test= link that matched nothing must say so. Silently showing the top
+        of the queue would make the triage screen's "review the proposed fix"
+        into a sentence that lands you on somebody else's test — which is worse
+        than the dead-end it replaced.
+      */}
+      {!loading && focusTestId && !heals.some((h) => h.test.id === focusTestId) && (
+        <div className="shrink-0 px-6 pt-4">
+          <p className="border-line bg-surface-1 text-ink-dim rounded-md border p-3 text-sm">
+            No proposal for that test{showAll ? '' : ' is awaiting review'}. The healer writes one
+            when triage decides a failure was an intended change{showAll ? '' : ', and decided ones are hidden — tick “Include decided” to see them'}.{' '}
+            <Link href={`/tests/${focusTestId}`} className="text-accent hover:underline">
+              Open the test →
+            </Link>
+          </p>
+        </div>
+      )}
 
       {(error || note) && (
         <div className="shrink-0 px-6 pt-4">

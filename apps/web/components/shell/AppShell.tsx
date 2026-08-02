@@ -6,7 +6,9 @@ import { Sidebar } from './Sidebar';
 import { NAV, SETTINGS_ITEM, SHELL_EXCLUDED } from './nav';
 import { CommandPalette, type PaletteItem, type PaletteMode } from '../CommandPalette';
 import { useProject } from './ProjectContext';
+import { PaletteCommandsProvider, usePaletteRegistry } from './PaletteCommands';
 import { TopBar } from './TopBar';
+import { useToast } from '../ui/Toast';
 import { api } from '../../lib/api';
 
 /**
@@ -28,11 +30,43 @@ interface TestLite {
   type: string;
 }
 
+/**
+ * Screens with no sidebar entry of their own.
+ *
+ * The palette listed exactly the sidebar, so six built screens could only be
+ * reached by knowing where their tab lived — and two of them (the trace viewer
+ * and, until now, impact analysis) had no tab at all. Anything reachable that
+ * does not need an id from the current page belongs here.
+ */
+const EXTRA_DESTINATIONS: ReadonlyArray<{ href: string; label: string; detail: string }> = [
+  { href: '/insights/coverage', label: 'Coverage gaps', detail: 'what nobody tested' },
+  { href: '/insights/health', label: 'Suite health', detail: 'duplicates, weak assertions' },
+  { href: '/insights/impact', label: 'Impact analysis', detail: 'which tests a diff needs' },
+  { href: '/settings/github', label: 'GitHub App', detail: 'checks on pull requests' },
+  { href: '/settings/billing', label: 'Billing and usage', detail: 'plan, seats, minutes' },
+];
+
 export function AppShell({ children }: { children: React.ReactNode }) {
+  /*
+   * The provider wraps BOTH the frame and the children, because the frame owns
+   * the palette (the reader) and the children contribute to it (the writers).
+   * Rendering it inside the frame would put the reader above its own context —
+   * the same mistake ProjectProvider was moved out of AppShell to fix.
+   */
+  return (
+    <PaletteCommandsProvider>
+      <ShellFrame>{children}</ShellFrame>
+    </PaletteCommandsProvider>
+  );
+}
+
+function ShellFrame({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const inShell = !SHELL_EXCLUDED.has(pathname);
-  const { projectId } = useProject();
+  const { project, projects, projectId, setProjectId } = useProject();
+  const toast = useToast();
+  const contributed = usePaletteRegistry();
 
   const [collapsed, setCollapsed] = useState(false);
   const [mounted, setMounted] = useState(false);
@@ -169,8 +203,76 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       group: 'Navigate',
       run: () => router.push(n.href),
     }));
+
+    const extras = EXTRA_DESTINATIONS.map((n) => ({
+      id: `go:${n.href}`,
+      label: `Go to ${n.label}`,
+      detail: n.detail,
+      group: 'Navigate',
+      run: () => router.push(n.href),
+    }));
+
+    /*
+     * The one action this product exists to perform, and it lived on a single
+     * button on a single screen. Not offered without an environment to run
+     * against — a command that can only fail is worse than no command.
+     */
+    const environmentId = project?.environments[0]?.id ?? null;
+    const runNow: PaletteItem[] = environmentId
+      ? [
+          {
+            id: 'act:run',
+            label: `Run the whole suite on ${project?.environments[0]?.name ?? 'this app'}`,
+            detail: 'starts a run',
+            group: 'Actions',
+            run: () => {
+              void (async () => {
+                try {
+                  const { run } = await api<{ run: { id: string } }>('/runs', {
+                    method: 'POST',
+                    body: JSON.stringify({ environmentId, testIds: null, trigger: 'MANUAL' }),
+                  });
+                  // Straight to the cockpit rather than a "queued!" toast: the
+                  // run page is the only thing that can say what actually
+                  // happened, and a toast that claims success for a job that
+                  // died in the worker is a bug this product has shipped before.
+                  router.push(`/runs/${run.id}`);
+                } catch (err) {
+                  toast.error(err instanceof Error ? err.message : 'Could not start the run');
+                }
+              })();
+            },
+          },
+        ]
+      : [];
+
+    /*
+     * Switching app is a top-bar dropdown, which is fine when you can see it
+     * and useless from the keyboard. Only offered when there is more than one —
+     * a command that switches to the app you are already in is noise.
+     */
+    const switchProject: PaletteItem[] =
+      projects.length > 1
+        ? projects
+            .filter((p) => p.id !== projectId)
+            .map((p) => ({
+              id: `act:project:${p.id}`,
+              label: `Switch to ${p.name}`,
+              detail: 'changes every screen',
+              group: 'Actions',
+              run: () => setProjectId(p.id),
+            }))
+        : [];
+
     return [
+      // Screen-contributed commands lead: they are about what is in front of
+      // you, and the palette is opened far more often to do something here than
+      // to leave for somewhere else.
+      ...contributed,
+      ...runNow,
+      ...switchProject,
       ...nav,
+      ...extras,
       {
         id: 'view:toggle',
         label: collapsed ? 'Expand sidebar' : 'Collapse sidebar',
@@ -193,7 +295,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         run: () => setShortcutsOpen(true),
       },
     ];
-  }, [paletteMode, files, collapsed, router, toggle, openFiles]);
+  }, [
+    paletteMode,
+    files,
+    collapsed,
+    router,
+    toggle,
+    openFiles,
+    contributed,
+    project,
+    projects,
+    projectId,
+    setProjectId,
+    toast,
+  ]);
 
   if (!inShell) return <>{children}</>;
 

@@ -66,8 +66,12 @@ export function TopBar() {
       // httpOnly so the client cannot clear it, but sending them to /login at
       // least ends the session from their point of view.
     }
-    router.push('/login');
-  }, [router]);
+    // A full navigation, for the same reason the org switcher reloads: the
+    // project list, the selected project and this session live at the root
+    // layout and are fetched once on mount. router.push left all of the signed
+    // -out user's data in memory behind the login form.
+    window.location.assign('/login');
+  }, []);
 
   const crumb = crumbFor(pathname);
   const activeOrg = me?.orgs.find((o) => o.id === me.activeOrgId);

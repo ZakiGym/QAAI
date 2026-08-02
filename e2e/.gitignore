@@ -1,0 +1,5 @@
+# A signed-in browser session. Never commit it — it is a live credential.
+.auth/
+
+# Reports, traces and screenshots from the last run.
+.artifacts/
