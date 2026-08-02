@@ -1682,3 +1682,287 @@ export const pageSchema = z.object({
   cursor: z.string().nullish(),
   limit: z.coerce.number().int().min(1).max(100).default(25),
 });
+
+// ─── Data-driven datasets (§4) ───────────────────────────────────────────────
+
+/**
+ * The ceiling on rows in one data-driven test.
+ *
+ * A dataset is a multiplier on everything a test does — requests, artifacts,
+ * step rows, triage tokens — so an unbounded one is a way to turn a typo in a
+ * generated range into an afternoon of queue. 1000 is far above every real
+ * dataset (thirty discount codes, eight currencies, the boundary values of a
+ * form) and far below the point where a run stops being reviewable.
+ *
+ * Enforced by the runner rather than by this schema on purpose: an oversized
+ * dataset is a configuration gap, and the runner reports those as SKIPPED with
+ * the count and this ceiling. Rejecting it here would surface as a FAILED test,
+ * which blames the application under test for a spec that never executed.
+ */
+export const MAX_DATASET_ROWS = 1000;
+
+/**
+ * A column name must be usable as a `{{placeholder}}`, because that is the only
+ * way a row's value can ever reach a request. Substitution is by NAME — the
+ * template is never compiled, evaluated, or built from data — so a column that
+ * cannot be a name is rejected here rather than silently never matching.
+ */
+const datasetColumn = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(
+    /^[A-Za-z_][A-Za-z0-9_]*$/,
+    'a column name must start with a letter or underscore and contain only letters, digits and underscores, because it is used as a {{placeholder}}',
+  );
+
+/** Scalars only. An object in a cell has no meaning in a `{{placeholder}}`. */
+const datasetValue = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+
+const datasetBase = z.object({
+  /**
+   * Which column names a row in the summary. "case 17 of 30" tells a human
+   * nothing; `case "SAVE10"` tells them which discount code broke.
+   *
+   * Optional: the runner falls back to a conventionally-named column and then
+   * to the first column.
+   */
+  keyColumn: datasetColumn.optional(),
+});
+
+export const datasetSchema = z.discriminatedUnion('source', [
+  datasetBase.extend({
+    source: z.literal('inline'),
+    /** Bounded by the runner, not here — see MAX_DATASET_ROWS. */
+    rows: z.array(z.record(datasetColumn, datasetValue)),
+  }),
+  datasetBase.extend({
+    source: z.literal('file'),
+    /**
+     * Relative to the run workspace, normally under `fixtures/`. Read out of the
+     * run's test data (RunContext.fixtures), never off the worker's disk, so
+     * there is no path for a spec to read a file it did not commit.
+     */
+    path: z
+      .string()
+      .min(1)
+      .max(400)
+      .refine(
+        (p) => !p.startsWith('/') && !p.includes('\\') && !p.split('/').includes('..'),
+        'must be a relative path inside the run workspace, e.g. fixtures/discounts.csv',
+      ),
+    format: z.enum(['auto', 'csv', 'json']).default('auto'),
+  }),
+  datasetBase.extend({
+    source: z.literal('range'),
+    /** The generated column, e.g. `quantity`. */
+    column: datasetColumn,
+    from: z.number(),
+    to: z.number(),
+    /**
+     * Positive, so a range always terminates. The runner refuses a descending
+     * range and one whose row count exceeds the ceiling — both as configuration
+     * gaps rather than as failures of the application under test.
+     */
+    step: z.number().positive().default(1),
+  }),
+]);
+
+export type DatasetConfig = z.infer<typeof datasetSchema>;
+
+// ─── Performance budgets — Core Web Vitals (§4) ───────────────────────────────
+
+/**
+ * The metrics a PERFORMANCE test can put a budget on.
+ *
+ * LOAD answers "how many requests per second does the server survive". None of
+ * these answer that, and that is the point: a page that serves in 20ms and
+ * paints in four seconds passes every server-side test ever written. These are
+ * what the person holding the laptop experiences.
+ *
+ * Every one is "lower is better", which is what lets the plugin treat them
+ * uniformly: a budget is always a ceiling and exceeding it always fails.
+ */
+export const PERFORMANCE_METRICS = ['lcpMs', 'clsScore', 'inpMs', 'tbtMs', 'fcpMs', 'ttfbMs'] as const;
+export type PerformanceMetric = (typeof PERFORMANCE_METRICS)[number];
+
+export const PERFORMANCE_METRIC_LABELS: Record<PerformanceMetric, string> = {
+  lcpMs: 'LCP — largest contentful paint',
+  clsScore: 'CLS — cumulative layout shift',
+  inpMs: 'INP — interaction to next paint',
+  tbtMs: 'TBT — total blocking time',
+  fcpMs: 'FCP — first contentful paint',
+  ttfbMs: 'TTFB — time to first byte',
+};
+
+/** Units, so a step can say "2100ms" and "0.14" rather than a bare number. */
+export const PERFORMANCE_METRIC_UNITS: Record<PerformanceMetric, 'ms' | 'score'> = {
+  lcpMs: 'ms',
+  clsScore: 'score',
+  inpMs: 'ms',
+  tbtMs: 'ms',
+  fcpMs: 'ms',
+  ttfbMs: 'ms',
+};
+
+/**
+ * Resource classes a byte budget can be set on.
+ *
+ * Bytes are here because they are the number a team can act on. "LCP regressed
+ * by 300ms" starts an investigation; "the JS bundle grew by 180 KB" names the
+ * commit. `total` is every request the page made, `document` is the HTML itself.
+ */
+export const PERFORMANCE_RESOURCE_TYPES = [
+  'js',
+  'css',
+  'image',
+  'font',
+  'media',
+  'document',
+  'other',
+  'total',
+] as const;
+export type PerformanceResourceType = (typeof PERFORMANCE_RESOURCE_TYPES)[number];
+
+export const PERFORMANCE_RESOURCE_LABELS: Record<PerformanceResourceType, string> = {
+  js: 'JavaScript',
+  css: 'CSS',
+  image: 'Images',
+  font: 'Fonts',
+  media: 'Audio / video',
+  document: 'HTML document',
+  other: 'Other',
+  total: 'All resources',
+};
+
+/**
+ * Budgets, defaulted to the thresholds web.dev publishes as "good".
+ *
+ * Defaults exist for the same reason `loadTestSpecSchema.thresholds` has them: a
+ * performance test that reports numbers without saying what was acceptable
+ * always passes, which is worse than not running it. `null` on any metric turns
+ * its gate off — the number is still measured and still reported, it just stops
+ * deciding the verdict.
+ */
+const performanceBudgetsSchema = z.object({
+  /** Largest contentful paint. web.dev "good" is ≤2500ms. */
+  lcpMs: z.number().int().positive().max(600_000).nullable().default(2500),
+  /** Cumulative layout shift, unitless. web.dev "good" is ≤0.1. */
+  clsScore: z.number().min(0).max(100).nullable().default(0.1),
+  /** Interaction to next paint. Only measurable when `interactions` are set. */
+  inpMs: z.number().int().positive().max(600_000).nullable().default(200),
+  /** Total blocking time — the lab stand-in for responsiveness. */
+  tbtMs: z.number().int().nonnegative().max(600_000).nullable().default(200),
+  /** First contentful paint. */
+  fcpMs: z.number().int().positive().max(600_000).nullable().default(1800),
+  /** Time to first byte. */
+  ttfbMs: z.number().int().positive().max(600_000).nullable().default(800),
+});
+
+/** Kilobytes over the wire (transfer size, i.e. after compression). */
+const kilobytes = z.number().positive().max(10_000_000).nullable().default(null);
+
+/**
+ * Byte budgets are OFF by default, unlike the metric budgets above.
+ *
+ * A "good" LCP is a number the web platform agrees on. A "good" JS payload is
+ * not — 400 KB is lean for a mapping app and obese for a blog — so inventing a
+ * default here would produce failures nobody asked for. Unbudgeted classes are
+ * still measured and still reported; they just do not gate.
+ */
+const performanceByteBudgetsSchema = z.object({
+  js: kilobytes,
+  css: kilobytes,
+  image: kilobytes,
+  font: kilobytes,
+  media: kilobytes,
+  document: kilobytes,
+  other: kilobytes,
+  total: kilobytes,
+});
+
+/**
+ * Network shaping presets, in Chrome DevTools' own numbers so a budget written
+ * against "fast-3g" means the same thing here as it does in the Network panel.
+ */
+export const PERFORMANCE_NETWORK_PRESETS = ['none', 'slow-3g', 'fast-3g', 'slow-4g'] as const;
+export type PerformanceNetworkPreset = (typeof PERFORMANCE_NETWORK_PRESETS)[number];
+
+/**
+ * A defined machine profile is what makes a budget portable.
+ *
+ * Unthrottled numbers are a property of the CI box, not of the site: the same
+ * page clears a 2500ms LCP budget on a developer's laptop and blows it on a
+ * shared runner, and the team learns to ignore the test. Pinning CPU and
+ * network makes the budget mean something everywhere — at the cost of amplifying
+ * contention on a busy box, which is why `iterations` and the median matter more
+ * once this is on, not less.
+ */
+const performanceThrottleSchema = z.object({
+  /** 1 = the host CPU. 4 is Lighthouse's mid-tier-phone default. */
+  cpuMultiplier: z.number().min(1).max(20).default(1),
+  network: z.enum(PERFORMANCE_NETWORK_PRESETS).default('none'),
+});
+
+/** One post-load interaction, so INP has something to measure. */
+const performanceInteractionSchema = z.object({
+  selector: z.string().min(1).max(500),
+  /** Let the handler and the paint it causes finish before the next click. */
+  settleMs: z.number().int().min(0).max(30_000).default(500),
+});
+
+/**
+ * A performance test.
+ *
+ * `iterations` is the honest part of this spec and the reason the default is not
+ * 1. A cold cache, a busy runner or a slow DNS lookup moves LCP by seconds; one
+ * sample cannot tell that apart from a regression, and a perf test that fails
+ * randomly is deleted within a week. The plugin runs `iterations` loads, gates
+ * on the MEDIAN, and reports the spread so a number that is really a range is
+ * never presented as a fact.
+ */
+export const performanceTestSpecSchema = z.object({
+  /** Path or absolute URL. Relative resolves against the environment's base URL. */
+  path: z.string().min(1).max(2000).default('/'),
+  /** Loads to perform. The median of these is what the budgets are checked against. */
+  iterations: z.number().int().min(1).max(25).default(5),
+  viewport: z
+    .object({
+      width: z.number().int().min(200).max(4000).default(1280),
+      height: z.number().int().min(200).max(4000).default(800),
+    })
+    .default({ width: 1280, height: 800 }),
+  budgets: performanceBudgetsSchema.default(performanceBudgetsSchema.parse({})),
+  byteBudgets: performanceByteBudgetsSchema.default(performanceByteBudgetsSchema.parse({})),
+  /**
+   * How long to keep observing after the load event. LCP is not final until the
+   * page stops painting and CLS keeps accumulating; cutting this to zero
+   * systematically under-reports both.
+   */
+  settleMs: z.number().int().min(0).max(60_000).default(3000),
+  navigationTimeoutMs: z.number().int().min(1_000).max(300_000).default(45_000),
+  /**
+   * Clicks performed after load so INP has real events to measure. Without
+   * these, INP is unmeasurable in a lab — nobody interacted — and the plugin
+   * says so rather than reporting a zero.
+   */
+  interactions: z.array(performanceInteractionSchema).max(10).default([]),
+  /**
+   * `auto` uses Lighthouse when it is installed and the built-in Web Vitals
+   * collector when it is not. `off` always uses the collector.
+   */
+  lighthouse: z.enum(['auto', 'off']).default('auto'),
+  /** Escape hatch for a Lighthouse that is not on PATH. Never run through a shell. */
+  lighthouseCommand: z.string().min(1).max(300).optional(),
+  lighthouseTimeoutSeconds: z.number().int().min(10).max(1_800).default(180),
+  throttle: performanceThrottleSchema.default(performanceThrottleSchema.parse({})),
+  /**
+   * Relative spread — (max − min) ÷ median — above which the plugin stops
+   * calling the median a fact and calls it a range.
+   */
+  spreadTolerance: z.number().min(0).max(100).default(0.25),
+  /** Largest individual resources named when a byte budget is blown. */
+  maxOffendersReported: z.number().int().min(0).max(50).default(5),
+});
+
+export type PerformanceTestSpec = z.infer<typeof performanceTestSpecSchema>;

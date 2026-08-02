@@ -203,6 +203,9 @@ const BROWSER_TEST_TYPES: ReadonlySet<TestType> = new Set<TestType>([
   'LOCALIZATION',
   'SECURITY_SMOKE',
   'EMAIL_OTP',
+  // Core Web Vitals are collected inside a real Chromium — a runner without one
+  // can only report the whole test SKIPPED.
+  'PERFORMANCE',
 ]);
 
 /**

@@ -24,6 +24,7 @@ import { mutationPlugin } from './plugins/mutation.js';
 import { contractPlugin } from './plugins/contract.js';
 import { protocolPlugin } from './plugins/protocol.js';
 import { mobilePlugin } from './plugins/mobile.js';
+import { performancePlugin } from './plugins/performance.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -50,6 +51,9 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   // its own JUnit output. UNIT_GEN shares it for the same reason.
   INTEGRATION: externalPlugin,
   UNIT_GEN: { ...externalPlugin, type: 'UNIT_GEN' },
+  // Core Web Vitals against a budget. LOAD measures what the server survives;
+  // this measures what the person holding the laptop waits for.
+  PERFORMANCE: performancePlugin,
 };
 
 /**

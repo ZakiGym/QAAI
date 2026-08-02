@@ -1,24 +1,39 @@
 /**
- * Contract testing (§4 CONTRACT) — Pact provider verification and OpenAPI
- * conformance.
+ * Contract testing (§4 CONTRACT) — Pact provider verification, OpenAPI and
+ * AsyncAPI conformance, and event shapes over the wire.
  *
  * The one microservice practice teams ask for by name. A consumer declares what
  * it needs from a provider; the provider is verified against every consumer's
  * expectation, so an API change that would break a consumer is caught before
  * deploy instead of in production.
  *
- * Two modes, both implemented natively over HTTP:
+ * Five modes. Two are synchronous, three are not:
  *
- *   pact     — replay every interaction in a consumer pact against the running
- *              provider and compare status, headers and body to what the
- *              consumer recorded. Matching rules are honoured, because exact
- *              value matching makes pacts unusably brittle: an `id` that is a
- *              new UUID on every request is not a contract violation.
+ *   pact      — replay every HTTP interaction in a consumer pact against the
+ *               running provider and compare status, headers and body to what
+ *               the consumer recorded. Matching rules are honoured, because
+ *               exact value matching makes pacts unusably brittle: an `id` that
+ *               is a new UUID on every request is not a contract violation.
  *
- *   openapi  — call the documented operations and check the live responses
- *              against the schema the document declares. Drift between the spec
- *              a team publishes and the API it ships is the same bug class,
- *              caught from the provider's side.
+ *   openapi   — call the documented operations and check the live responses
+ *               against the schema the document declares. Drift between the spec
+ *               a team publishes and the API it ships is the same bug class,
+ *               caught from the provider's side.
+ *
+ *   message   — the async half of Pact. A consumer's message pact declares the
+ *               shape of an event it can handle; the provider is verified by
+ *               getting it to produce that message — from its pact message
+ *               endpoint, or straight off an SSE/WebSocket/webhook transport —
+ *               and checking the shape with THE SAME matching rules. There is
+ *               one matcher in this file and every mode goes through it.
+ *
+ *   events    — the same check without a pact file, for the far more common team
+ *               that has an event stream and no broker: expected shapes are
+ *               written inline, in pact's own vocabulary.
+ *
+ *   asyncapi  — the async equivalent of the openapi mode: validate the messages
+ *               a provider actually emits against its declared channel schemas,
+ *               with the same schema validator.
  *
  * Why not shell out to the Pact CLI: provider verification is a replay loop and
  * a matcher, and requiring a Ruby/JVM toolchain on every worker to run it would
@@ -26,13 +41,19 @@
  * process also means each interaction can be reported as its own cockpit step,
  * with expected vs actual, rather than as one wall of CLI output.
  *
+ * Results can be PUBLISHED back to a pact broker (`publish` on the pact and
+ * message modes), which is what closes the loop for `can-i-deploy`. That request
+ * carries a vault-held token to an operator-configured URL, so every rule about
+ * where it may go lives in contract-broker.ts and is enforced before the token
+ * is unsealed. Publishing is never the reason a contract test fails.
+ *
  * Honest boundaries, all of them visible in the results rather than hidden:
- *   - A pact file is read; a pact broker is only read from (QAAI never publishes
- *     verification results back — that would write to the customer's broker).
- *   - Message pacts (async/queue) are reported as skipped interactions. This
- *     verifies HTTP interactions.
- *   - OpenAPI documents in YAML need a YAML parser, which is not bundled; that
- *     case is SKIPPED with the install command, never FAILED.
+ *   - The `pact` mode replays HTTP only; a pact's message interactions are
+ *     reported as skipped steps naming the mode that verifies them.
+ *   - OpenAPI/AsyncAPI documents in YAML need a YAML parser, which is not
+ *     bundled; that case is SKIPPED with the install command, never FAILED.
+ *   - An AsyncAPI payload declared in Avro or Protobuf is reported as not
+ *     verified rather than passed.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -50,9 +71,35 @@ import type {
   StepStatus,
   TestExecution,
 } from '@qaai/shared';
-
-/** Response bodies are truncated before they are stored or shown to the model. */
-const BODY_SNIPPET_LIMIT = 2000;
+import {
+  ASYNC_CONTRACT_KINDS,
+  BODY_SNIPPET_LIMIT,
+  ContractConfigError,
+  MissingToolError,
+  asyncApiMessages,
+  asyncContractSpecSchema,
+  brokerPublishSchema,
+  collectMessages,
+  isRecord,
+  messageOf,
+  pactMessages,
+  requestPactMessage,
+  resolveUrl,
+  send,
+  toNetworkEntry,
+} from '../contract-events.js';
+import type {
+  AsyncApiContractSpec,
+  AsyncContractSpec,
+  BrokerPublishConfig,
+  CollectedMessage,
+  Collection,
+  EventsContractSpec,
+  MessageContractSpec,
+  PactMessage,
+} from '../contract-events.js';
+import { publishVerification } from '../contract-broker.js';
+import type { PublishOutcome, VerificationResult } from '../contract-broker.js';
 
 /** Enough to fix the break; not so much that a step becomes a body dump. */
 const MAX_PROBLEMS_PER_STEP = 12;
@@ -62,24 +109,6 @@ const MAX_SCHEMA_DEPTH = 24;
 
 /** Kept out of the literal so a missing YAML parser is a runtime skip, not a build error. */
 const YAML_MODULE = 'yaml';
-
-/**
- * A gap in how the test is configured — an unreachable pact file, a secret that
- * is not set. These become SKIPPED, never FAILED: reporting a setup problem as
- * a failure blames the application under test for the test's own configuration.
- */
-class ContractConfigError extends Error {}
-
-/** A dependency this worker does not have. Also SKIPPED, with the install command. */
-class MissingToolError extends Error {}
-
-function messageOf(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 
 /** Short, safe rendering of a value for an expected/actual field. */
 function preview(value: unknown, limit = 200): string {
@@ -121,107 +150,11 @@ function makeStep(
   };
 }
 
-/**
- * One request budget that also honours run cancellation. Built by hand rather
- * than with `AbortSignal.any` so the cleanup is explicit and no listener is left
- * on the run-wide signal after a request settles.
- */
-function withTimeout(
-  ctx: RunContext,
-  timeoutMs: number,
-): { signal: AbortSignal; done: () => void } {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(new Error(`timed out after ${timeoutMs}ms`)),
-    timeoutMs,
-  );
-  const onAbort = () => controller.abort();
-
-  if (ctx.signal.aborted) controller.abort();
-  else ctx.signal.addEventListener('abort', onAbort, { once: true });
-
-  return {
-    signal: controller.signal,
-    done: () => {
-      clearTimeout(timer);
-      ctx.signal.removeEventListener('abort', onAbort);
-    },
-  };
-}
-
-/** Preserves a base path: `https://api.example.com/v1` + `/orders` → `/v1/orders`. */
-function resolveUrl(baseUrl: string, path: string): string {
-  if (/^https?:\/\//i.test(path)) return path;
-  const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-  return new URL(path.replace(/^\/+/, ''), base).toString();
-}
-
-interface SentRequest {
-  status: number | null;
-  headers: Record<string, string>;
-  text: string;
-  durationMs: number;
-  transportError: string | null;
-}
-
-async function send(
-  ctx: RunContext,
-  url: string,
-  method: string,
-  headers: Record<string, string>,
-  body: string | undefined,
-  timeoutMs: number,
-): Promise<SentRequest> {
-  const started = Date.now();
-  const { signal, done } = withTimeout(ctx, timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method,
-      headers,
-      body,
-      signal,
-      // Never follow redirects: a provider that started 302-ing a documented
-      // endpoint has changed its contract, and following the hop would hide it.
-      redirect: 'manual',
-    });
-    const text = await response.text();
-    const received: Record<string, string> = {};
-    response.headers.forEach((value, key) => {
-      received[key.toLowerCase()] = value;
-    });
-    return {
-      status: response.status,
-      headers: received,
-      text,
-      durationMs: Date.now() - started,
-      transportError: null,
-    };
-  } catch (err) {
-    return {
-      status: null,
-      headers: {},
-      text: '',
-      durationMs: Date.now() - started,
-      transportError: messageOf(err),
-    };
-  } finally {
-    done();
-  }
-}
-
-function toNetworkEntry(method: string, url: string, sent: SentRequest): NetworkEntry {
-  return {
-    method,
-    url,
-    status: sent.status,
-    durationMs: sent.durationMs,
-    responseBodySnippet:
-      sent.status === null || sent.status >= 400 ? sent.text.slice(0, BODY_SNIPPET_LIMIT) : null,
-  };
-}
-
 /** Only the NAME of the secret is in the spec; the value comes from the vault. */
-function authHeaders(spec: ContractTestSpec, ctx: RunContext): Record<string, string> {
+function authHeaders(
+  spec: ContractTestSpec | AsyncContractSpec,
+  ctx: RunContext,
+): Record<string, string> {
   if (!spec.auth) return {};
   const token = ctx.secrets[spec.auth.secretName];
   if (token === undefined) {
@@ -884,10 +817,15 @@ function stringHeaders(raw: Record<string, unknown> | undefined): Record<string,
   return out;
 }
 
-/** Put the provider into the state the interaction was recorded against. */
+/**
+ * Put the provider into the state the interaction was recorded against.
+ *
+ * Structurally typed rather than taking `PactContractSpec`, because the message
+ * mode drives the identical hook with the identical protocol.
+ */
 async function setUpState(
   ctx: RunContext,
-  spec: PactContractSpec,
+  spec: { stateChangeUrl?: string; providerBaseUrl?: string; requestTimeoutSeconds: number },
   consumer: string,
   states: Array<{ name: string; params: Record<string, unknown> }>,
   headers: Record<string, string>,
@@ -920,6 +858,12 @@ interface ModeResult {
   /** Set when nothing could be evaluated — becomes a SKIPPED test, not a failure. */
   notEvaluated: string | null;
   summary: string;
+  /**
+   * What a broker would be told, when the mode verified a pact. Absent for the
+   * modes that have no pact behind them (openapi, events, asyncapi) — there is
+   * no consumer to report a result for, so there is nothing to publish.
+   */
+  pact?: { consumerName: string; providerName: string; results: VerificationResult[] };
 }
 
 /**
@@ -974,7 +918,7 @@ async function verifyPact(
       network: [],
       notEvaluated:
         messageCount > 0
-          ? `This pact holds ${messageCount} message interaction(s) only. QAAI verifies HTTP interactions; message pacts are not replayed.`
+          ? `This pact holds ${messageCount} message interaction(s) and no HTTP interaction. Set the spec's kind to "message" and give it a \`source\` — that mode verifies them against the same matching rules.`
           : 'The pact file declares no HTTP interactions.',
       summary: '',
     };
@@ -998,10 +942,13 @@ async function verifyPact(
   };
   let failures = 0;
   let verified = 0;
+  /** Step index → the pact's own description, which is what a broker records. */
+  const descriptions = new Map<number, string>();
 
   for (const [index, raw] of rawInteractions.entries()) {
     const interaction = (isRecord(raw) ? raw : {}) as PactInteraction;
     const description = interaction.description ?? `interaction ${index + 1}`;
+    descriptions.set(index, description);
     const method = (interaction.request?.method ?? 'GET').toUpperCase();
     const path = interaction.request?.path ?? '/';
     const states = interactionStates(interaction);
@@ -1156,6 +1103,21 @@ async function verifyPact(
     );
   }
 
+  /*
+   * A pact carrying BOTH HTTP interactions and messages gets a step per message
+   * saying which mode verifies it. Dropping them silently would let a half-
+   * verified pact report as fully green, which is the failure mode this whole
+   * plugin exists to prevent.
+   */
+  for (const [offset, message] of pactMessages(document).entries()) {
+    record(
+      makeStep(rawInteractions.length + offset, `message: ${message.description}`, 'SKIPPED', 0, {
+        message:
+          'Not replayed by the "pact" mode, which verifies HTTP interactions. Set the spec\'s kind to "message" and give it a `source` to verify this one.',
+      }),
+    );
+  }
+
   return {
     steps,
     network,
@@ -1164,6 +1126,19 @@ async function verifyPact(
         ? `No interaction in the pact between ${consumerName} and ${providerName} was replayed.`
         : null,
     summary: `${consumerName} → ${providerName}: ${failures} of ${verified} interaction(s) broke`,
+    pact: {
+      consumerName,
+      providerName,
+      results: steps
+        .filter((step) => step.status !== 'SKIPPED')
+        .map((step) => ({
+          interactionDescription: descriptions.get(step.index) ?? step.title,
+          success: step.status === 'PASSED',
+          ...(step.error?.message !== undefined && step.error.message.length > 0
+            ? { exceptionMessage: step.error.message.slice(0, 1000) }
+            : {}),
+        })),
+    },
   };
 }
 
@@ -1726,24 +1701,852 @@ async function checkOpenApi(
   };
 }
 
+// ─── Async: one message against one expectation ──────────────────────────────
+
+/**
+ * What a consumer needs from one message, in the vocabulary a pact already uses.
+ *
+ * A pact message, an inline `events` expectation and (via its payload schema) an
+ * AsyncAPI message all reduce to this, which is the point: the transport decides
+ * how a message is obtained, never how it is judged.
+ */
+interface ShapeExpectation {
+  /** The body the consumer declared. `undefined` asserts only that it arrived. */
+  contents: unknown;
+  /** Pact matching rules, either dialect. */
+  matchingRules: unknown;
+  /** Expected transport/message metadata: a topic, an SSE id, a webhook header. */
+  metadata: Record<string, string>;
+}
+
+interface ShapeVerdict {
+  mismatches: Mismatch[];
+  unsupported: Set<string>;
+}
+
+/**
+ * Compare message metadata to what the consumer declared.
+ *
+ * Uses the same `applyMatchers` engine as the body and the headers so a
+ * `match: "regex"` on `metadata.topic` behaves exactly as it does everywhere
+ * else; only the labels differ, because "header X is missing" is the wrong
+ * sentence for a queue message.
+ */
+function compareMetadata(
+  expected: Record<string, string>,
+  actual: Record<string, string>,
+  rules: HeaderRule[],
+  out: Mismatch[],
+  unsupported: Set<string>,
+): void {
+  for (const [name, want] of Object.entries(expected)) {
+    const got = actual[name] ?? actual[name.toLowerCase()];
+    if (got === undefined) {
+      out.push({
+        where: `metadata ${name}`,
+        detail: 'is missing from the message',
+        expected: want,
+        actual: '(absent)',
+      });
+      continue;
+    }
+    const matchers = rules.find((rule) => rule.name === name.toLowerCase())?.matchers;
+    if (matchers !== undefined && matchers.length > 0) {
+      applyMatchers(matchers, want, got, `metadata ${name}`, out, unsupported);
+      continue;
+    }
+    // Content types carry parameters (`; charset=utf-8`) that are not contract.
+    const same =
+      name.toLowerCase() === 'contenttype' || name.toLowerCase() === 'content-type'
+        ? mediaType(got) === mediaType(want)
+        : got.trim() === want.trim();
+    if (!same) {
+      out.push({
+        where: `metadata ${name}`,
+        detail: `is ${preview(got)}, expected ${preview(want)}`,
+        expected: want,
+        actual: got,
+      });
+    }
+  }
+}
+
+/** Judge one message. The single matcher in this file, reached from every mode. */
+function checkShape(expectation: ShapeExpectation, message: CollectedMessage): ShapeVerdict {
+  const rules = collectRules(expectation.matchingRules);
+  const mismatches: Mismatch[] = [];
+  const unsupported = new Set<string>();
+
+  compareMetadata(expectation.metadata, message.metadata, rules.header, mismatches, unsupported);
+
+  const expected = expectation.contents;
+  if (expected === undefined || expected === null) return { mismatches, unsupported };
+
+  if (typeof expected === 'string') {
+    if (message.text !== expected) {
+      mismatches.push({
+        where: '$',
+        detail: 'payload text differs',
+        expected: preview(expected),
+        actual: preview(message.text),
+      });
+    }
+    return { mismatches, unsupported };
+  }
+
+  let actual: unknown;
+  try {
+    actual = JSON.parse(message.text) as unknown;
+  } catch {
+    mismatches.push({
+      where: '$',
+      detail: 'the payload was not valid JSON',
+      expected: 'a JSON payload',
+      actual: preview(message.text.slice(0, BODY_SNIPPET_LIMIT)),
+    });
+    return { mismatches, unsupported };
+  }
+
+  compareBody(expected, actual, [], rules.body, 'exact', mismatches, unsupported);
+  return { mismatches, unsupported };
+}
+
+/** The candidate that came closest, so a failure shows the real diff. */
+function bestCandidate(
+  expectation: ShapeExpectation,
+  candidates: CollectedMessage[],
+): { message: CollectedMessage; verdict: ShapeVerdict } | null {
+  let best: { message: CollectedMessage; verdict: ShapeVerdict } | null = null;
+  for (const message of candidates) {
+    const verdict = checkShape(expectation, message);
+    if (verdict.mismatches.length === 0) return { message, verdict };
+    if (best === null || verdict.mismatches.length < best.verdict.mismatches.length) {
+      best = { message, verdict };
+    }
+  }
+  return best;
+}
+
+/** The `— matchers not implemented` suffix, identical to the HTTP mode's. */
+function unsupportedNote(unsupported: Set<string>): string {
+  if (unsupported.size === 0) return '';
+  return ` — matcher${unsupported.size > 1 ? 's' : ''} not implemented, compared by type: ${[...unsupported].join(', ')}`;
+}
+
+function mismatchProblem(mismatches: Mismatch[]): {
+  message: string;
+  expected: string | null;
+  actual: string | null;
+} {
+  const first = mismatches[0];
+  return {
+    message: mismatches
+      .slice(0, MAX_PROBLEMS_PER_STEP)
+      .map((m) => `${m.where} ${m.detail}`)
+      .join('; '),
+    expected: first?.expected ?? null,
+    actual: first?.actual ?? null,
+  };
+}
+
+/** Names a stream carries in-band, for matching a pact message to what arrived. */
+function topicOf(metadata: Record<string, string>): string | null {
+  for (const key of ['topic', 'destination', 'channel', 'kafka_topic', 'routingKey', 'subject']) {
+    const value = metadata[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
+}
+
+/** One line describing the window, so a failure says what DID arrive. */
+function describeArrivals(messages: CollectedMessage[]): string {
+  if (messages.length === 0) return 'nothing arrived';
+  const names = [...new Set(messages.map((m) => m.name || '(unnamed)'))].slice(0, 10);
+  return `${messages.length} message(s) arrived: ${names.join(', ')}`;
+}
+
+// ─── Async: message pacts ────────────────────────────────────────────────────
+
+/**
+ * Verify a consumer's message pact against the provider.
+ *
+ * Two ways to get the provider to produce the message, and both are legitimate:
+ *
+ *   `source.transport: "http"` is Pact's own message-provider protocol — QAAI
+ *   asks for one message by description and the provider hands it back. That is
+ *   the faithful implementation, and it needs the provider to have built the
+ *   shim.
+ *
+ *   The streaming transports read the message off the wire instead. Most
+ *   providers never built the shim, and refusing to verify them would mean the
+ *   async half of Pact stays theoretical for exactly the teams that asked for
+ *   it. The judgement is identical either way — same matching rules, same
+ *   matcher — so the transport changes what is observed, never the verdict.
+ */
+async function verifyMessagePact(
+  ctx: RunContext,
+  spec: MessageContractSpec,
+  common: Record<string, string>,
+  emit: EmitStep,
+): Promise<ModeResult> {
+  const timeoutMs = spec.requestTimeoutSeconds * 1000;
+  const text = await loadDocument(spec.pactPath, 'pact file', ctx, common, timeoutMs);
+  const document = await parseDocument(text, 'pact file');
+
+  if (!isRecord(document)) {
+    throw new ContractConfigError('The pact file did not contain a pact object.');
+  }
+
+  const consumerName =
+    isRecord(document.consumer) && typeof document.consumer.name === 'string'
+      ? document.consumer.name
+      : 'consumer';
+  const providerName =
+    isRecord(document.provider) && typeof document.provider.name === 'string'
+      ? document.provider.name
+      : 'provider';
+
+  if (spec.consumer !== undefined && spec.consumer !== consumerName) {
+    return {
+      steps: [],
+      network: [],
+      notEvaluated: `The pact is between ${consumerName} and ${providerName}, but the spec asked for consumer "${spec.consumer}".`,
+      summary: '',
+    };
+  }
+
+  let only: RegExp | null = null;
+  if (spec.only !== undefined) {
+    try {
+      only = new RegExp(spec.only, 'i');
+    } catch {
+      throw new ContractConfigError(`\`only\` is not a valid regular expression: ${spec.only}`);
+    }
+  }
+
+  const all = pactMessages(document);
+  if (all.length === 0) {
+    const httpCount = Array.isArray(document.interactions) ? document.interactions.length : 0;
+    return {
+      steps: [],
+      network: [],
+      notEvaluated:
+        httpCount > 0
+          ? `This pact declares ${httpCount} HTTP interaction(s) and no message. Set the spec's kind to "pact" to replay them.`
+          : 'The pact file declares no message interactions.',
+      summary: '',
+    };
+  }
+
+  const baseUrl = spec.providerBaseUrl ?? ctx.baseUrl;
+  const steps: StepResult[] = [];
+  const network: NetworkEntry[] = [];
+  const results: VerificationResult[] = [];
+  const record = (step: StepResult): void => {
+    steps.push(step);
+    emit(step);
+  };
+  let index = 0;
+  let failures = 0;
+  let verified = 0;
+
+  const selected = all.filter(
+    (message) =>
+      only === null ||
+      only.test(message.description) ||
+      only.test(message.states.map((s) => s.name).join(', ')),
+  );
+  // A message `only` filtered out still gets a step, so "verified 1 of 4" is
+  // visible in the cockpit rather than looking like a pact with one message.
+  const wanted = new Set(selected);
+  for (const message of all) {
+    if (!wanted.has(message)) {
+      record(makeStep(index, `message: ${message.description}`, 'SKIPPED', 0));
+      index += 1;
+    }
+  }
+
+  const titleOf = (message: PactMessage): string => {
+    const given = message.states.map((s) => s.name).join(', ');
+    const topic = topicOf(message.metadata);
+    return `message: ${message.description}${topic !== null ? ` on ${topic}` : ''}${given.length > 0 ? ` (given ${given})` : ''}`;
+  };
+
+  const judge = (message: PactMessage, candidate: CollectedMessage, began: number): void => {
+    verified += 1;
+    const verdict = checkShape(
+      {
+        contents: message.contents,
+        matchingRules: message.matchingRules,
+        metadata: message.metadata,
+      },
+      candidate,
+    );
+    const title = `${titleOf(message)}${unsupportedNote(verdict.unsupported)}`;
+    if (verdict.mismatches.length === 0) {
+      record(makeStep(index, title, 'PASSED', Date.now() - began));
+      results.push({ interactionDescription: message.description, success: true });
+      index += 1;
+      return;
+    }
+    failures += 1;
+    const problem = mismatchProblem(verdict.mismatches);
+    record(makeStep(index, title, 'FAILED', Date.now() - began, problem));
+    results.push({
+      interactionDescription: message.description,
+      success: false,
+      exceptionMessage: problem.message.slice(0, 1000),
+    });
+    index += 1;
+  };
+
+  const fail = (message: PactMessage, detail: string, began: number, actual: string): void => {
+    verified += 1;
+    failures += 1;
+    record(
+      makeStep(index, titleOf(message), 'FAILED', Date.now() - began, {
+        message: detail,
+        expected: `a message matching "${message.description}"`,
+        actual,
+      }),
+    );
+    results.push({
+      interactionDescription: message.description,
+      success: false,
+      exceptionMessage: detail.slice(0, 1000),
+    });
+    index += 1;
+  };
+
+  if (spec.source.transport === 'http') {
+    for (const message of selected) {
+      if (ctx.signal.aborted) {
+        record(makeStep(index, titleOf(message), 'SKIPPED', 0));
+        index += 1;
+        continue;
+      }
+      const began = Date.now();
+      const stateError = await setUpState(ctx, spec, consumerName, message.states, common);
+      if (stateError !== null) {
+        fail(message, stateError, began, 'the state hook did not succeed');
+        continue;
+      }
+      const produced = await requestPactMessage(
+        ctx,
+        spec.source,
+        baseUrl,
+        common,
+        message.description,
+        message.states,
+        timeoutMs,
+      );
+      network.push(produced.network);
+      if (produced.message === null) {
+        fail(message, produced.problem ?? 'no message was produced', began, 'no message');
+        continue;
+      }
+      judge(message, produced.message, began);
+    }
+  } else {
+    /*
+     * A stream cannot be re-driven per message, so every provider state is set
+     * up BEFORE the window opens — the events have to fire after the provider is
+     * in the right state, not after we started asking.
+     */
+    const began = Date.now();
+    const states = selected.flatMap((message) => message.states);
+    const stateError = await setUpState(ctx, spec, consumerName, states, common);
+    if (stateError !== null) {
+      for (const message of selected)
+        fail(message, stateError, began, 'the state hook did not succeed');
+      return {
+        steps,
+        network,
+        notEvaluated: null,
+        summary: `${consumerName} → ${providerName}: ${failures} of ${verified} message(s) broke`,
+        pact: { consumerName, providerName, results },
+      };
+    }
+
+    const collection = await collectMessages(ctx, spec.source, baseUrl, common);
+    network.push(...collection.network);
+    if (collection.transportError !== null) {
+      for (const message of selected) {
+        fail(
+          message,
+          `The provider's ${spec.source.transport} transport failed: ${collection.transportError}`,
+          began,
+          'no message',
+        );
+      }
+    } else {
+      for (const message of selected) {
+        const topic = topicOf(message.metadata);
+        const candidates =
+          topic === null
+            ? collection.messages
+            : collection.messages.filter((candidate) => candidate.name === topic);
+        const best = bestCandidate(
+          {
+            contents: message.contents,
+            matchingRules: message.matchingRules,
+            metadata: message.metadata,
+          },
+          candidates,
+        );
+        if (best === null) {
+          fail(
+            message,
+            `No message${topic !== null ? ` on ${topic}` : ''} arrived on ${collection.target} within ${spec.source.listenSeconds}s. ${describeArrivals(collection.messages)}.`,
+            began,
+            describeArrivals(collection.messages),
+          );
+          continue;
+        }
+        judge(message, best.message, began);
+      }
+    }
+  }
+
+  return {
+    steps,
+    network,
+    notEvaluated:
+      verified === 0
+        ? `No message in the pact between ${consumerName} and ${providerName} was verified.`
+        : null,
+    summary: `${consumerName} → ${providerName}: ${failures} of ${verified} message(s) broke`,
+    pact: { consumerName, providerName, results },
+  };
+}
+
+// ─── Async: event shapes declared inline ─────────────────────────────────────
+
+/** The "what was listened to" step every streaming mode opens with. */
+function listenStep(
+  index: number,
+  spec: { source: { transport: string } },
+  collection: Collection,
+): StepResult {
+  const title = `Listen on ${collection.target} (${spec.source.transport})${collection.notes.length > 0 ? ` — ${collection.notes.join('; ')}` : ''}`;
+  if (collection.transportError !== null) {
+    return makeStep(index, title, 'FAILED', collection.durationMs, {
+      message: `The event transport could not be used: ${collection.transportError}`,
+      expected: 'an open stream',
+      actual: 'no stream',
+    });
+  }
+  return makeStep(
+    index,
+    `${title} — ${describeArrivals(collection.messages)}`,
+    'PASSED',
+    collection.durationMs,
+  );
+}
+
+/**
+ * Check the events a provider emits against shapes declared in the spec.
+ *
+ * The expectations are written the way a pact writes them (a body plus matching
+ * rules) and judged by the same matcher, so a team can start here and move to a
+ * real message pact later without their assertions changing meaning.
+ */
+async function checkEventShapes(
+  ctx: RunContext,
+  spec: EventsContractSpec,
+  common: Record<string, string>,
+  emit: EmitStep,
+): Promise<ModeResult> {
+  const baseUrl = spec.providerBaseUrl ?? ctx.baseUrl;
+  const steps: StepResult[] = [];
+  const record = (step: StepResult): void => {
+    steps.push(step);
+    emit(step);
+  };
+
+  const collection = await collectMessages(ctx, spec.source, baseUrl, common);
+  record(listenStep(0, spec, collection));
+
+  if (collection.transportError !== null) {
+    for (const [offset, expectation] of spec.expect.entries()) {
+      record(
+        makeStep(
+          offset + 1,
+          expectation.name ?? expectation.event ?? `event ${offset + 1}`,
+          'SKIPPED',
+          0,
+        ),
+      );
+    }
+    return {
+      steps,
+      network: collection.network,
+      notEvaluated: null,
+      summary: `the ${spec.source.transport} transport failed before any event could be checked`,
+    };
+  }
+
+  let failures = 0;
+  for (const [offset, expectation] of spec.expect.entries()) {
+    const index = offset + 1;
+    const label = expectation.name ?? expectation.event ?? `event ${index}`;
+    const shape: ShapeExpectation = {
+      contents: expectation.contents,
+      matchingRules: expectation.matchingRules,
+      metadata: expectation.metadata,
+    };
+    const candidates =
+      expectation.event === undefined
+        ? collection.messages
+        : collection.messages.filter((message) => message.name === expectation.event);
+
+    const matched = candidates.filter(
+      (message) => checkShape(shape, message).mismatches.length === 0,
+    );
+    if (matched.length >= expectation.min) {
+      record(
+        makeStep(
+          index,
+          `${label} — ${matched.length} matching message(s)`,
+          'PASSED',
+          collection.durationMs,
+        ),
+      );
+      continue;
+    }
+
+    failures += 1;
+    const best = bestCandidate(shape, candidates);
+    if (best === null) {
+      record(
+        makeStep(index, label, 'FAILED', collection.durationMs, {
+          message: `No event${expectation.event !== undefined ? ` named "${expectation.event}"` : ''} arrived on ${collection.target} within ${spec.source.listenSeconds}s. ${describeArrivals(collection.messages)}.`,
+          expected: expectation.event ?? 'a matching event',
+          actual: describeArrivals(collection.messages),
+        }),
+      );
+      continue;
+    }
+    const problem = mismatchProblem(best.verdict.mismatches);
+    record(
+      makeStep(
+        index,
+        `${label}${unsupportedNote(best.verdict.unsupported)}`,
+        'FAILED',
+        collection.durationMs,
+        matched.length > 0
+          ? {
+              message: `only ${matched.length} of the ${expectation.min} required matching message(s) arrived; the closest other one: ${problem.message}`,
+              expected: `${expectation.min} matching message(s)`,
+              actual: `${matched.length}`,
+            }
+          : problem,
+      ),
+    );
+  }
+
+  return {
+    steps,
+    network: collection.network,
+    notEvaluated: null,
+    summary: `${failures} of ${spec.expect.length} expected event(s) did not arrive as declared`,
+  };
+}
+
+// ─── Async: AsyncAPI ─────────────────────────────────────────────────────────
+
+/**
+ * Validate what a provider emits against the channels its AsyncAPI document
+ * declares — the async equivalent of the openapi mode, down to using the same
+ * schema validator, so `type: integer` means the same thing on a queue as it
+ * does on a REST response.
+ */
+async function checkAsyncApi(
+  ctx: RunContext,
+  spec: AsyncApiContractSpec,
+  common: Record<string, string>,
+  emit: EmitStep,
+): Promise<ModeResult> {
+  const text = await loadDocument(
+    spec.specPath,
+    'AsyncAPI document',
+    ctx,
+    common,
+    spec.requestTimeoutSeconds * 1000,
+  );
+  const document = await parseDocument(text, 'AsyncAPI document');
+  if (!isRecord(document) || !isRecord(document.channels)) {
+    throw new ContractConfigError('The AsyncAPI document has no `channels` object.');
+  }
+
+  const declared = asyncApiMessages(document, (node) => deref(document, node).schema);
+  if (declared.messages.length === 0) {
+    throw new ContractConfigError(
+      'The AsyncAPI document declares no messages on any channel, so there was nothing to verify.',
+    );
+  }
+
+  const wanted = spec.channels.map((channel) => channel.trim().toLowerCase());
+  const baseUrl = spec.providerBaseUrl ?? ctx.baseUrl;
+  const steps: StepResult[] = [];
+  const record = (step: StepResult): void => {
+    steps.push(step);
+    emit(step);
+  };
+
+  const collection = await collectMessages(ctx, spec.source, baseUrl, common);
+  record(listenStep(0, spec, collection));
+
+  if (collection.transportError !== null) {
+    return {
+      steps,
+      network: collection.network,
+      notEvaluated: null,
+      summary: `the ${spec.source.transport} transport failed before any message could be validated`,
+    };
+  }
+
+  if (collection.messages.length === 0) {
+    return {
+      steps,
+      network: collection.network,
+      notEvaluated: spec.requireMessages
+        ? `No message arrived on ${collection.target} within ${spec.source.listenSeconds}s, so no channel could be validated. Raise \`source.listenSeconds\`, or set \`requireMessages: false\` if an empty window is acceptable.`
+        : null,
+      summary: 'no message arrived',
+    };
+  }
+
+  let index = 1;
+  let failures = 0;
+  let checked = 0;
+
+  for (const message of collection.messages) {
+    const label = `${message.name || '(unnamed)'} #${message.index + 1}`;
+    const matches = declared.messages.filter(
+      (candidate) => candidate.channel === message.name || candidate.name === message.name,
+    );
+
+    if (wanted.length > 0) {
+      const inScope = matches.some(
+        (candidate) =>
+          wanted.includes(candidate.channel.toLowerCase()) ||
+          wanted.includes(candidate.name.toLowerCase()),
+      );
+      if (!inScope) {
+        record(makeStep(index, label, 'SKIPPED', 0));
+        index += 1;
+        continue;
+      }
+    }
+
+    if (matches.length === 0) {
+      if (spec.allowUndeclaredChannels) {
+        record(
+          makeStep(
+            index,
+            `${label} — not declared, and undeclared channels are allowed`,
+            'SKIPPED',
+            0,
+          ),
+        );
+        index += 1;
+        continue;
+      }
+      failures += 1;
+      checked += 1;
+      const channels = [...new Set(declared.messages.map((m) => m.channel))]
+        .slice(0, 20)
+        .join(', ');
+      record(
+        makeStep(index, label, 'FAILED', 0, {
+          message: `The provider emitted on "${message.name || '(unnamed)'}", which the document does not declare. Declared channels: ${channels}.`,
+          expected: `one of ${channels}`,
+          actual: message.name || '(unnamed)',
+        }),
+      );
+      index += 1;
+      continue;
+    }
+
+    const unverifiable = matches.find((candidate) => candidate.unverifiableFormat !== null);
+    if (unverifiable !== undefined) {
+      record(
+        makeStep(index, label, 'SKIPPED', 0, {
+          message: `Not validated: ${unverifiable.channel} declares its payload as ${unverifiable.unverifiableFormat}, which is not JSON Schema. QAAI validates JSON Schema payloads.`,
+        }),
+      );
+      index += 1;
+      continue;
+    }
+
+    checked += 1;
+    let payload: unknown;
+    let parsed = true;
+    try {
+      payload = JSON.parse(message.text) as unknown;
+    } catch {
+      parsed = false;
+    }
+
+    if (!parsed) {
+      failures += 1;
+      record(
+        makeStep(index, label, 'FAILED', 0, {
+          message: 'the payload is not valid JSON, but the document declares a JSON Schema payload',
+          expected: 'a JSON payload',
+          actual: preview(message.text.slice(0, BODY_SNIPPET_LIMIT)),
+        }),
+      );
+      index += 1;
+      continue;
+    }
+
+    /*
+     * A channel may declare several messages (`oneOf`, or 3.x's message map).
+     * The payload conforms if ANY of them accepts it — that is what the document
+     * means — so every alternative is tried and only the closest failure is
+     * reported.
+     */
+    let best: SchemaCheck | null = null;
+    let conformed = false;
+    for (const candidate of matches) {
+      if (candidate.payloadSchema === undefined) {
+        conformed = true;
+        break;
+      }
+      const check: SchemaCheck = { document, problems: [], notes: new Set() };
+      validateSchema(check, candidate.payloadSchema, payload, '$', 0);
+      if (check.problems.length === 0) {
+        conformed = true;
+        best = check;
+        break;
+      }
+      if (best === null || check.problems.length < best.problems.length) best = check;
+    }
+
+    const note =
+      best !== null && best.notes.size > 0 ? ` — not verified: ${[...best.notes].join('; ')}` : '';
+    if (conformed) {
+      record(makeStep(index, `${label}${note}`, 'PASSED', 0));
+      index += 1;
+      continue;
+    }
+
+    failures += 1;
+    const problems = best?.problems ?? ['the payload did not conform'];
+    record(
+      makeStep(index, `${label}${note}`, 'FAILED', 0, {
+        message: problems.join('; '),
+        expected: `a payload conforming to the ${matches[0]?.channel ?? message.name} schema`,
+        actual: problems[0] ?? 'the payload did not conform',
+      }),
+    );
+    index += 1;
+  }
+
+  for (const note of declared.notes) {
+    record(makeStep(index, `Not verified: ${note}`, 'SKIPPED', 0));
+    index += 1;
+  }
+
+  return {
+    steps,
+    network: collection.network,
+    notEvaluated:
+      checked === 0
+        ? `None of the ${collection.messages.length} message(s) that arrived matched a requested channel (${spec.channels.join(', ')}).`
+        : null,
+    summary: `${failures} of ${checked} message(s) did not conform to the AsyncAPI document`,
+  };
+}
+
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
-function parseSpec(test: ExecutableTest): ContractTestSpec {
+const KIND_HELP: Record<string, string> = {
+  pact: "replay a consumer pact's HTTP interactions against the provider",
+  openapi: 'check live responses against the OpenAPI document',
+  message: 'verify a consumer message pact against the events the provider produces',
+  events: 'check the events a provider emits against shapes declared in the spec',
+  asyncapi: 'validate emitted messages against the AsyncAPI channel schemas',
+};
+
+function issueSentence(
+  test: ExecutableTest,
+  error: { issues: Array<{ path: PropertyKey[]; message: string }> },
+): Error {
+  const issues = error.issues
+    .map((issue) => `${issue.path.map(String).join('.') || '(root)'}: ${issue.message}`)
+    .join('; ');
+  return new Error(`Contract test "${test.name}" has an invalid spec — ${issues}`);
+}
+
+/**
+ * The synchronous kinds are validated by the schema in @qaai/shared; the async
+ * kinds by the one in contract-events.ts. They are separate because nothing
+ * outside this plugin reads a contract spec, and keeping the async shapes next
+ * to the transports they describe means adding a transport touches one package.
+ */
+function parseSpec(test: ExecutableTest): ContractTestSpec | AsyncContractSpec {
   const kind = isRecord(test.spec) ? test.spec.kind : undefined;
+
+  if (typeof kind === 'string' && (ASYNC_CONTRACT_KINDS as readonly string[]).includes(kind)) {
+    const parsed = asyncContractSpecSchema.safeParse(test.spec);
+    if (!parsed.success) throw issueSentence(test, parsed.error);
+    return parsed.data;
+  }
+
   if (kind !== 'pact' && kind !== 'openapi') {
+    const options = Object.entries(KIND_HELP)
+      .map(([name, help]) => `"${name}" (${help})`)
+      .join(', ');
     throw new Error(
-      `Contract test "${test.name}" has an invalid spec — kind: set it to "pact" (verify a consumer pact against the provider) or "openapi" (check live responses against the OpenAPI document).`,
+      `Contract test "${test.name}" has an invalid spec — kind: set it to one of ${options}.`,
     );
   }
 
   const parsed = contractTestSpecSchema.safeParse(test.spec);
+  if (!parsed.success) throw issueSentence(test, parsed.error);
+  return parsed.data;
+}
+
+/**
+ * The broker configuration for this test, if it has one.
+ *
+ * `publish` is read off the RAW spec for the `pact` kind: its schema lives in
+ * @qaai/shared, does not declare the block, and strips it. Reading it here keeps
+ * every broker field in one definition (`brokerPublishSchema`) and lets both
+ * pact modes publish. A block that does not parse is REPORTED, never dropped —
+ * silently ignoring it would mean a team believes their broker is being updated
+ * when it is not.
+ */
+function publishConfigFor(
+  test: ExecutableTest,
+  spec: ContractTestSpec | AsyncContractSpec,
+): { config: BrokerPublishConfig | null; problem: string | null } {
+  if (spec.kind === 'message') return { config: spec.publish ?? null, problem: null };
+
+  const raw = isRecord(test.spec) ? test.spec.publish : undefined;
+  if (raw === undefined || raw === null) return { config: null, problem: null };
+
+  if (spec.kind !== 'pact') {
+    return {
+      config: null,
+      problem: `Verification results were not published: a broker only records results for a pact, and this spec's kind is "${spec.kind}".`,
+    };
+  }
+
+  const parsed = brokerPublishSchema.safeParse(raw);
   if (!parsed.success) {
     const issues = parsed.error.issues
-      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .map((issue) => `${issue.path.map(String).join('.') || '(root)'}: ${issue.message}`)
       .join('; ');
-    throw new Error(`Contract test "${test.name}" has an invalid spec — ${issues}`);
+    return {
+      config: null,
+      problem: `Verification results were not published — \`publish\` is invalid: ${issues}`,
+    };
   }
-  return parsed.data;
+  return { config: parsed.data, problem: null };
 }
 
 export const contractPlugin: RunnerPlugin = {
@@ -1797,21 +2600,95 @@ export const contractPlugin: RunnerPlugin = {
       const result =
         spec.kind === 'pact'
           ? await verifyPact(ctx, spec, common, emit)
-          : await checkOpenApi(ctx, spec, common, emit);
+          : spec.kind === 'openapi'
+            ? await checkOpenApi(ctx, spec, common, emit)
+            : spec.kind === 'message'
+              ? await verifyMessagePact(ctx, spec, common, emit)
+              : spec.kind === 'events'
+                ? await checkEventShapes(ctx, spec, common, emit)
+                : await checkAsyncApi(ctx, spec, common, emit);
 
       if (result.notEvaluated !== null) {
+        // Nothing was verified, so there is no result to publish: telling a
+        // broker "verification passed" because there was nothing to check is
+        // exactly the lie `can-i-deploy` must never be told.
         return finish('SKIPPED', result.steps, result.network, result.notEvaluated);
       }
 
       const failed = result.steps.filter((step) => step.status === 'FAILED');
+
+      /*
+       * Publish AFTER the verdict is decided and regardless of what it was — a
+       * broker that only ever hears about passes cannot stop a bad deploy. The
+       * step it appends is PASSED or SKIPPED and never FAILED, so a broker
+       * problem cannot turn a conforming provider red.
+       */
+      const steps = [...result.steps];
+      const network = [...result.network];
+      const publish = publishConfigFor(test, spec);
+      const recordPublish = (step: StepResult): void => {
+        steps.push(step);
+        emit(step);
+      };
+      if (publish.problem !== null) {
+        recordPublish(
+          makeStep(steps.length, 'Publish verification results', 'SKIPPED', 0, {
+            message: publish.problem,
+          }),
+        );
+      } else if (publish.config !== null) {
+        /*
+         * The try is the rule, not belt-and-braces: `publishVerification`
+         * returns a skip for every failure it knows about, and if it ever threw
+         * one it did not, the catch below would turn a verified provider into
+         * "the contract test could not complete" — a reporting problem losing a
+         * result, which is the one thing this plugin may never do.
+         */
+        let outcome: PublishOutcome;
+        try {
+          outcome =
+            result.pact === undefined
+              ? {
+                  status: 'SKIPPED',
+                  detail:
+                    'Verification results were not published: this mode has no pact behind it, so there is no consumer to record a result for.',
+                  durationMs: 0,
+                  network: null,
+                }
+              : await publishVerification(ctx, publish.config, {
+                  consumerName: result.pact.consumerName,
+                  providerName: result.pact.providerName,
+                  success: failed.length === 0,
+                  results: result.pact.results,
+                });
+        } catch (err) {
+          outcome = {
+            status: 'SKIPPED',
+            detail: `Verification results were not published: ${messageOf(err)}. The provider's conformance is unaffected.`,
+            durationMs: 0,
+            network: null,
+          };
+        }
+        if (outcome.network !== null) network.push(outcome.network);
+        recordPublish(
+          makeStep(
+            steps.length,
+            `Publish verification results${outcome.status === 'PUBLISHED' ? ` — ${outcome.detail}` : ''}`,
+            outcome.status === 'PUBLISHED' ? 'PASSED' : 'SKIPPED',
+            outcome.durationMs,
+            outcome.status === 'PUBLISHED' ? undefined : { message: outcome.detail },
+          ),
+        );
+      }
+
       if (failed.length === 0) {
-        return finish('PASSED', result.steps, result.network, null);
+        return finish('PASSED', steps, network, null);
       }
 
       return finish(
         'FAILED',
-        result.steps,
-        result.network,
+        steps,
+        network,
         `${result.summary}. First: ${failed[0]?.error?.message ?? ''}`.slice(0, 2000),
       );
     } catch (err) {

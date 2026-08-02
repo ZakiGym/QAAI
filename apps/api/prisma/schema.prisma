@@ -79,6 +79,7 @@ enum TestType {
   CONTRACT
   MUTATION
   MOBILE
+  PERFORMANCE
 }
 
 enum Priority {

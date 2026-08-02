@@ -27,6 +27,7 @@ export const TEST_TYPES = [
   'CONTRACT',
   'MUTATION',
   'MOBILE',
+  'PERFORMANCE',
 ] as const;
 export type TestType = (typeof TEST_TYPES)[number];
 
@@ -50,6 +51,9 @@ export const TEST_TYPE_LABELS: Record<TestType, string> = {
   CONTRACT: 'Contract (Pact / OpenAPI)',
   MUTATION: 'Mutation',
   MOBILE: 'Mobile (native app)',
+  // Distinct from LOAD: that one measures what the server survives, this one
+  // measures what the person holding the laptop waits for.
+  PERFORMANCE: 'Performance budgets (Core Web Vitals)',
 };
 
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────
