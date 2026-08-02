@@ -13,9 +13,9 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { env, isProd } from './env.js';
 import { logger, runWithRequestContext } from './lib/logger.js';
-import { disconnectPrisma, prisma, unscoped } from './lib/prisma.js';
-import { closeQueues, pingRedis, queueDepths } from './lib/queues.js';
-import { startWorkerEventRelay, subscriberCount } from './lib/events.js';
+import { disconnectPrisma } from './lib/prisma.js';
+import { closeQueues } from './lib/queues.js';
+import { startWorkerEventRelay } from './lib/events.js';
 import { attachActor } from './middleware/auth.js';
 import { errorHandler, notFoundHandler } from './middleware/errors.js';
 import { authRouter } from './routes/auth.js';
@@ -47,6 +47,10 @@ import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
 import { traceRouter } from './routes/trace.js';
 import { trafficRouter } from './routes/traffic.js';
+import { healthRouter } from './routes/health.js';
+import { retentionRouter } from './routes/retention.js';
+import { exportOrgRouter } from './routes/export-org.js';
+import { observabilityMiddleware, rateLimitKey } from './lib/metrics.js';
 
 const app = express();
 
@@ -83,42 +87,36 @@ app.use('/webhooks', express.raw({ type: 'application/json', limit: '2mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
+// Request/duration metrics for every route below. Placed ahead of the health
+// router so a scrape can see its own probe traffic.
+app.use(observabilityMiddleware);
+
+// ─── Health & metrics (§11) ──────────────────────────────────────────────────
+//
+// AHEAD OF THE RATE LIMITER, deliberately — see the header of routes/health.ts.
+// A rate-limited liveness probe is a self-inflicted outage: the kubelet reads a
+// 429 as a failed probe and restarts a healthy container, and the Prometheus
+// scraper goes blind exactly when traffic is high enough to be worth watching.
+// Both handlers are cheap and cached, so they belong in front of the limiter.
+//
+// This router also REPLACES the inline /health and /health/ready that used to
+// live here; it serves the same shapes plus /health/live and /metrics.
+app.use(healthRouter);
+
 app.use(
   rateLimit({
     windowMs: 60_000,
     limit: isProd ? 300 : 5000,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    // Rate limit per org where we know it, per IP otherwise — one noisy tenant
-    // must not exhaust the budget for everyone behind the same egress IP.
-    keyGenerator: (req) => req.actor?.orgId ?? req.ip ?? 'anonymous',
+    // Per org where we know it, per client NETWORK otherwise. Not `req.ip`:
+    // an IPv6 caller holds a whole delegated prefix, so keying on the full
+    // address hands it a fresh budget per request. See lib/metrics.ts.
+    keyGenerator: rateLimitKey,
   }),
 );
 
 app.use(attachActor);
-
-// ─── Health (§11) ────────────────────────────────────────────────────────────
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'qaai-api', version: '0.1.0' });
-});
-
-app.get('/health/ready', async (_req, res) => {
-  const [db, redis] = await Promise.all([
-    unscoped(() => prisma.$queryRaw`SELECT 1`)
-      .then(() => true)
-      .catch(() => false),
-    pingRedis(),
-  ]);
-
-  const ok = db && redis;
-  res.status(ok ? 200 : 503).json({
-    ok,
-    checks: { database: db, redis },
-    sseSubscribers: subscriberCount(),
-    queues: ok ? await queueDepths().catch(() => ({})) : {},
-  });
-});
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
@@ -168,6 +166,10 @@ app.use('/dom-diff', domDiffRouter);
 app.use('/repro', reproRouter);
 app.use('/suite-health', suiteHealthRouter);
 app.use('/trace', traceRouter);
+// Retention: /retention/usage (MEMBER), /preview (ADMIN), /sweep (OWNER).
+app.use('/retention', retentionRouter);
+// Org export declares `/org` and `/org/preview`; OWNER-only, enforced inside.
+app.use('/export', exportOrgRouter);
 // Traffic declares its own `/traffic/...` paths (it installs a text body parser
 // on the analyze path), so it mounts at the root like record/import/agent.
 app.use('/', trafficRouter);

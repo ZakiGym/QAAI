@@ -184,6 +184,32 @@ export function IconSearch(props: IconProps) {
   );
 }
 
+/** Production traffic — a request-rate trace. */
+export function IconActivity(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <path d="M2 12h4l3 8 4-16 3 8h6" />
+    </Svg>
+  );
+}
+
+/** Reproduce a bug report — a bug. */
+export function IconBug(props: IconProps) {
+  return (
+    <Svg {...props}>
+      <rect x="8" y="6" width="8" height="14" rx="4" />
+      <path d="m10 4 1 2" />
+      <path d="m14 4-1 2" />
+      <path d="M8 11H4" />
+      <path d="M20 11h-4" />
+      <path d="m8 7-2.5-1.5" />
+      <path d="m16 7 2.5-1.5" />
+      <path d="M8 16l-2.5 1.5" />
+      <path d="m16 16 2.5 1.5" />
+    </Svg>
+  );
+}
+
 export function IconChevronsLeft(props: IconProps) {
   return (
     <Svg {...props}>

@@ -1,0 +1,68 @@
+# Local development overrides.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#
+# Compose loads docker-compose.override.yml automatically when it is present, so
+# nothing else changes. The file is gitignored-by-convention: keep the .example
+# in version control and your edited copy out of it.
+#
+# Everything here loosens something the base file deliberately keeps tight. Do
+# not copy these settings into a production deployment.
+
+services:
+  # ─── Publish the datastores to the host ──────────────────────────────────
+  # The base file keeps these on the compose network only. Publishing them is
+  # convenient for psql/redis-cli/the MinIO console and is exactly what you do
+  # not want on a shared host: with a weak POSTGRES_PASSWORD this is a database
+  # open to the network. Bound to 127.0.0.1 so it stays on this machine.
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console
+
+  # ─── Chattier logs ────────────────────────────────────────────────────────
+  api:
+    environment:
+      LOG_LEVEL: debug
+      NODE_ENV: development
+
+  worker:
+    environment:
+      LOG_LEVEL: debug
+      NODE_ENV: development
+      WORKER_CONCURRENCY: "2"
+
+  # ─── Demo data ────────────────────────────────────────────────────────────
+  #
+  # Seeds one org, one owner, one project and a starter suite. Run it by hand:
+  #
+  #   docker compose run --rm seed
+  #
+  # It is a `profiles:` service so a plain `docker compose up` never triggers
+  # it. That is deliberate: apps/api/prisma/seed.ts calls prisma.*.create(), not
+  # upsert, so running it against a database that already has data either
+  # duplicates the demo org or dies on a unique constraint. It is a
+  # first-boot-only convenience, never a startup step.
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: qaai/app:local
+    profiles: ["tools"]
+    command: ["seed"]
+    # DATABASE_URL only: seed.ts imports the Prisma client directly and never
+    # loads apps/api/src/env.ts, so it has no use for the vault key.
+    environment:
+      DATABASE_URL: 'postgresql://qaai:${POSTGRES_PASSWORD:?}@postgres:5432/qaai?schema=public'
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"

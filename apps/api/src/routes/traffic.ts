@@ -50,6 +50,7 @@ import {
   type TrafficFormat,
 } from '@qaai/agent';
 import { prisma } from '../lib/prisma.js';
+import { env } from '../env.js';
 import { badRequest, notFound, unprocessable } from '../lib/errors.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
@@ -98,7 +99,11 @@ const MAX_JOURNEYS_PROPOSED = 20;
 
 const analyzeOptionsSchema = z.object({
   format: z.enum(['HAR', 'ACCESS_LOG', 'OTLP', 'AUTO']).optional(),
-  sessionGapMinutes: z.coerce.number().min(1).max(24 * 60).optional(),
+  sessionGapMinutes: z.coerce
+    .number()
+    .min(1)
+    .max(24 * 60)
+    .optional(),
   maxJourneys: z.coerce.number().int().min(1).max(40).optional(),
   includeStaticAssets: z.coerce.boolean().optional(),
   includeBots: z.coerce.boolean().optional(),
@@ -279,7 +284,14 @@ const proposeSchema = z.object({
  */
 function resanitise(journey: z.infer<typeof journeySchema>): {
   ok: boolean;
-  steps: Array<{ method: string; route: string; status: number | null; errorRate: number; count: number; repeats: number }>;
+  steps: Array<{
+    method: string;
+    route: string;
+    status: number | null;
+    errorRate: number;
+    count: number;
+    repeats: number;
+  }>;
 } {
   const steps = journey.steps.map((step) => {
     const { segments } = sanitisePath(step.route);
@@ -303,7 +315,9 @@ function resanitise(journey: z.infer<typeof journeySchema>): {
 trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (req, res) => {
   const actor = actorOf(req);
   const projectId = String(req.params.projectId);
-  const project = await loadProject(projectId);
+  // Called for its 404, not its value: a proposal against a project that does
+  // not exist must not fall through to "no journeys matched".
+  await loadProject(projectId);
 
   const parsed = proposeSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -345,7 +359,8 @@ trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (
     if (coverage.status === 'COVERED' && input.includeCovered !== true) {
       skipped.push({
         what: steps.map((s) => `${s.method} ${s.route}`).join(' → '),
-        why: `Already covered by "${coverage.matchedTests[0]?.name ?? 'an existing test'}" — ` +
+        why:
+          `Already covered by "${coverage.matchedTests[0]?.name ?? 'an existing test'}" — ` +
           'pass includeCovered to propose it anyway.',
       });
       continue;
@@ -355,7 +370,12 @@ trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (
       steps,
       journey: {
         id: raw.id,
-        name: raw.name ?? steps.map((s) => s.route).join(' → ').slice(0, 200),
+        name:
+          raw.name ??
+          steps
+            .map((s) => s.route)
+            .join(' → ')
+            .slice(0, 200),
         feature: raw.feature ?? 'Traffic',
         steps,
         sessionCount: raw.sessionCount,
@@ -446,19 +466,34 @@ trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (
     select: { id: true, items: { select: { id: true, title: true, journeyId: true } } },
   });
 
-  const jobId = await enqueue(
-    QUEUE_NAMES.generate,
-    {
-      orgId: actor.orgId,
-      projectId,
-      testPlanId: plan.id,
-      planItemIds: plan.items.map((item) => item.id),
-      requestedBy: actor.userId,
-    },
-    // Not idempotent: the processor inserts Test rows. One attempt only, so a
-    // transient failure reports honestly instead of duplicating the suite.
-    { attempts: 1 },
-  );
+  /*
+   * Generation needs a model. Missing one is a MISSING TOOL, not a failure —
+   * the same call the coverage-gap route makes, and for the same reason: the
+   * ranking, the redaction and the plan items are already done and already
+   * worth having.
+   *
+   * Queueing anyway is worse than not queueing. The job dies in the worker with
+   * "ANTHROPIC_API_KEY is not set", and the only thing the person ever saw was
+   * a green "queued for generation" — a promise the deployment could not keep,
+   * broken somewhere they are not looking. So: keep the plan, skip the queue,
+   * and say so in the response.
+   */
+  const canGenerate = Boolean(env.ANTHROPIC_API_KEY);
+  const jobId = canGenerate
+    ? await enqueue(
+        QUEUE_NAMES.generate,
+        {
+          orgId: actor.orgId,
+          projectId,
+          testPlanId: plan.id,
+          planItemIds: plan.items.map((item) => item.id),
+          requestedBy: actor.userId,
+        },
+        // Not idempotent: the processor inserts Test rows. One attempt only, so a
+        // transient failure reports honestly instead of duplicating the suite.
+        { attempts: 1 },
+      )
+    : null;
 
   await audit({
     actor,
@@ -470,6 +505,8 @@ trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (
       accepted: plan.items.length,
       skippedAsCovered: skipped.length,
       totalSessions: input.totalSessions,
+      queued: canGenerate,
+      ...(canGenerate ? {} : { reason: 'no ANTHROPIC_API_KEY' }),
     },
   });
 
@@ -480,5 +517,14 @@ trafficRouter.post('/traffic/:projectId/propose', requireRole('MEMBER'), async (
     planItemIds: plan.items.map((item) => item.id),
     items: plan.items,
     skipped,
+    generation: canGenerate
+      ? { queued: true }
+      : {
+          queued: false,
+          reason:
+            'ANTHROPIC_API_KEY is not set on this deployment, so the Generator cannot be run. ' +
+            'The plan items above are complete and were written from your traffic, not by a ' +
+            'model — set the key and approve the plan to turn them into code.',
+        },
   });
 });

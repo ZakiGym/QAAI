@@ -1,9 +1,62 @@
+# Build context exclusions.
+#
+# Two rules earn their place here beyond the usual size trimming:
+#   - .env is excluded so a developer's real secrets can never be baked into a
+#     layer. An image is not a secret store; anyone who can pull it can read
+#     every layer. Config arrives at run time through the environment.
+#   - apps/desktop is excluded so the Electron shell (and its ~200MB electron
+#     devDependency) stays out of a server image that never renders a window.
+#
+# Note the previous version used bare `dist` and `.next`, which match only at
+# the context root — the real build output lives at apps/web/.next. Patterns
+# below are rooted with **/ so they match at any depth.
+
+# ─── Dependencies (reinstalled in-image; host binaries are the wrong ABI) ────
 node_modules
 **/node_modules
-.next
-dist
-.git
+
+# ─── Secrets — never, under any circumstances, in an image layer ─────────────
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+
+# ─── Build output (regenerated inside the image) ─────────────────────────────
+**/dist
+**/build
+**/.next
+**/out
+**/*.tsbuildinfo
+
+# Prisma client — regenerated in the build stage against the in-image schema.
+apps/api/src/generated
+
+# ─── The Electron desktop app: not a server-side service ─────────────────────
+apps/desktop
+
+# ─── Runtime + test leftovers ────────────────────────────────────────────────
 .artifacts
 .qaai-runs
-.env
-*.log
+.localdev
+.generated
+test-results
+playwright-report
+coverage
+**/*.log
+
+# ─── VCS, CI and editor noise ────────────────────────────────────────────────
+.git
+.gitignore
+.github
+.claude
+**/.DS_Store
+
+# ─── Deployment descriptors (not needed at run time) ─────────────────────────
+docs
+deploy
+docker-compose.yml
+docker-compose.override.yml
+docker-compose.override.yml.example
+Dockerfile
+.dockerignore

@@ -235,6 +235,8 @@ Usage:
   qaai run --env <id> [options]         Run a suite and wait for the verdict
   qaai deploy-check --env <id> [opts]   Post-deploy smoke run (exit 1 on failure)
   qaai status <runId>                   Print the status of a run
+  qaai backup <create|verify|restore>   Back up or restore the database
+  qaai runner [--api-url <url>]         Run tests inside your own network
 
 Run options:
   --env <id>          Environment to run against (required)
@@ -252,6 +254,16 @@ Global:
 Exit code is nonzero when any test failed or a quality gate blocked, so your
 build goes red without any extra scripting.`;
 
+/*
+ * `backup` and `runner` live in their own modules because each is substantial,
+ * and each self-invokes when run directly. That left them reachable only as
+ * `tsx packages/cli/src/backup.ts` — the CLI's own dispatcher had never heard of
+ * them, so `qaai backup` was an unknown command and the on-prem runner agent, a
+ * thing a customer is meant to install, had no name.
+ *
+ * Imported lazily: both pull in heavy dependencies, and `qaai status` should not
+ * pay for a Postgres client it will never use.
+ */
 async function main(): Promise<number> {
   const { opts, rest } = readGlobals(argv.slice(2));
   const command = rest.shift();
@@ -263,6 +275,17 @@ async function main(): Promise<number> {
       return cmdDeployCheck(opts, rest);
     case 'status':
       return cmdStatus(opts, rest);
+    case 'backup':
+    case 'restore': {
+      const { backupMain } = await import('./backup.js');
+      // The subcommand is part of backup's own argv grammar (`backup create`,
+      // `backup restore`), so it is put back rather than swallowed here.
+      return backupMain(command === 'restore' ? ['restore', ...rest] : rest);
+    }
+    case 'runner': {
+      const { runnerMain } = await import('./runner.js');
+      return runnerMain(rest);
+    }
     case 'help':
     case '--help':
     case undefined:

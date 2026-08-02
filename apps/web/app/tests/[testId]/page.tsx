@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../../lib/api';
 import { StatusDot, duration, relativeTime } from '../../../components/ui';
+import { BisectPanel } from '../../../components/BisectPanel';
+import { DomDiff } from '../../../components/DomDiff';
 import { EmptyState } from '../../../components/ui/EmptyState';
 import {
   Badge,
@@ -14,6 +16,7 @@ import {
   SectionLabel,
   SkeletonRows,
 } from '../../../components/ui/layout';
+import { cn } from '../../../lib/cn';
 
 /**
  * The test detail page — one test's whole story.
@@ -125,6 +128,12 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
   // Without this the empty state renders during the first fetch, telling someone
   // their test has never run before we have any idea whether it has.
   const [loading, setLoading] = useState(true);
+  /**
+   * Which failure has its DOM diff open. One at a time, by result id: two open
+   * diffs of the same page are two ~100-row lists you have to scroll past each
+   * other to compare, and the comparison is against the green run anyway.
+   */
+  const [openDiff, setOpenDiff] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -357,6 +366,21 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
         )}
       </Card>
 
+      {/* ── When did this start failing? ────────────────────────────────────── */}
+      {/*
+        Directly under the strip, because the strip is what makes someone ask.
+        A shape that goes green-green-green-red-red is the question "what
+        happened on Tuesday" in visual form, and the answer used to require
+        opening every run in it by hand.
+      */}
+      {/* `undefined`, not `false`, when there is no streak at all: a test that
+          has never run is not "currently passing", and telling someone a bisect
+          will find nothing is a different claim from having no idea. */}
+      <BisectPanel
+        testId={test.id}
+        currentlyRed={stats.streak ? stats.streak.outcome === 'fail' : undefined}
+      />
+
       {/* ── The failures ────────────────────────────────────────────────────── */}
       <section>
         <SectionLabel>Recent failures</SectionLabel>
@@ -372,38 +396,96 @@ export default function TestDetailPage({ params }: { params: Promise<{ testId: s
             />
           ) : (
             failures.map((result) => (
-              <Link
+              <FailureRow
                 key={result.id}
-                href={`/runs/${result.run.id}`}
-                className="hover:bg-surface-2 block px-4 py-3.5 transition-colors"
-              >
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-                  <StatusDot status={result.status} />
-                  <Badge mono>{result.run.id.slice(-8)}</Badge>
-                  <span className="text-ink-dim text-body-sm">
-                    {result.run.environment.name}
-                    <span className="text-ink-faint"> · {result.run.trigger.toLowerCase()}</span>
-                  </span>
-                  {result.run.branch && <Badge mono>{result.run.branch}</Badge>}
-                  {result.retriedAndPassed && <Badge tone="flake">passed on retry</Badge>}
-                  <span className="text-ink-faint text-micro ml-auto flex items-center gap-3 tabular-nums">
-                    <span>{duration(result.durationMs)}</span>
-                    <span className="w-16 text-right">{relativeTime(result.run.queuedAt)}</span>
-                  </span>
-                </div>
-                {result.errorMessage && (
-                  // Truncated to two lines: a stack trace is the whole reason
-                  // people bounce off failure lists, and the run itself is one
-                  // click away for the full thing.
-                  <p className="text-ink-dim text-micro mt-2 line-clamp-2 font-mono break-words whitespace-pre-wrap">
-                    {result.errorMessage}
-                  </p>
-                )}
-              </Link>
+                result={result}
+                open={openDiff === result.id}
+                onToggle={() => setOpenDiff((current) => (current === result.id ? null : result.id))}
+              />
             ))
           )}
         </Card>
       </section>
     </Page>
+  );
+}
+
+/**
+ * One failure, with "what changed since it last passed" attached to it.
+ *
+ * DomDiff existed and was reachable from nowhere. This is where the question
+ * gets asked — you are looking at the failure, and the next thing you want is
+ * the DOM it failed against versus the DOM from the last green run — so it
+ * opens in place rather than on another screen.
+ *
+ * The row is a disclosure and the run link is its sibling, not its parent. It
+ * was one big `<Link>`; putting a button inside that would have nested an
+ * interactive element in an anchor, which is invalid and breaks keyboard
+ * activation on both.
+ */
+function FailureRow({
+  result,
+  open,
+  onToggle,
+}: {
+  result: HistoryResult;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={cn('px-4 py-3.5 transition-colors', open && 'bg-surface-2/50')}>
+      <div className="flex items-start gap-3">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={open}
+          className="group min-w-0 flex-1 cursor-pointer text-left"
+        >
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            <StatusDot status={result.status} />
+            <Badge mono>{result.run.id.slice(-8)}</Badge>
+            <span className="text-ink-dim text-body-sm">
+              {result.run.environment.name}
+              <span className="text-ink-faint"> · {result.run.trigger.toLowerCase()}</span>
+            </span>
+            {result.run.branch && <Badge mono>{result.run.branch}</Badge>}
+            {result.retriedAndPassed && <Badge tone="flake">passed on retry</Badge>}
+            <span className="text-ink-faint text-micro ml-auto flex items-center gap-3 tabular-nums">
+              <span>{duration(result.durationMs)}</span>
+              <span className="w-16 text-right">{relativeTime(result.run.queuedAt)}</span>
+            </span>
+          </div>
+          {result.errorMessage && (
+            // Truncated to two lines: a stack trace is the whole reason people
+            // bounce off failure lists, and the run itself is one click away
+            // for the full thing.
+            <p className="text-ink-dim text-micro mt-2 line-clamp-2 font-mono break-words whitespace-pre-wrap">
+              {result.errorMessage}
+            </p>
+          )}
+          <span
+            className={cn(
+              'text-micro mt-2 inline-flex items-center gap-1 underline decoration-dotted underline-offset-2',
+              open ? 'text-accent' : 'text-ink-faint group-hover:text-accent',
+            )}
+          >
+            {open ? 'Hide' : 'What changed since it last passed?'}
+          </span>
+        </button>
+        <Link
+          href={`/runs/${result.run.id}`}
+          className="border-line text-ink-dim hover:text-ink hover:border-line-strong text-micro shrink-0 rounded-md border px-2.5 py-1.5"
+        >
+          Run →
+        </Link>
+      </div>
+
+      {/*
+       * Mounted only when open. DomDiff reads two Playwright traces out of
+       * storage on the server; twelve of them fetching on page load would cost
+       * more than the whole rest of the screen.
+       */}
+      {open && <DomDiff resultId={result.id} />}
+    </div>
   );
 }

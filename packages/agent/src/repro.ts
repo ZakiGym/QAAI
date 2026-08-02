@@ -361,6 +361,16 @@ const HEADING_PATTERNS: RegExp[] = [
 /** `Expected: the order confirms` — a heading and its content on one line. */
 const INLINE_HEADING = /^\s*(?:[*_]{0,2})([A-Za-z][\w /&'-]{1,40})(?:[*_]{0,2})\s*:\s+(\S.*)$/;
 
+/**
+ * `Expected` alone on its own line — no marker of any kind.
+ *
+ * Two to four bare words, letters and spaces only. No digits, no punctuation,
+ * no slashes: those are what separate a heading from a sentence that happens to
+ * start a line. The caller additionally requires the words to classify as a
+ * known field, so this pattern alone never starts a section.
+ */
+const BARE_HEADING = /^\s*([A-Za-z]+(?: [A-Za-z]+){0,3})\s*$/;
+
 function headingOf(line: string): string | null {
   for (const pattern of HEADING_PATTERNS) {
     const match = pattern.exec(line);
@@ -448,6 +458,31 @@ function splitSections(body: string): { sections: Section[]; preamble: string } 
       if (key !== 'OTHER') {
         flush();
         current = { key, label: inline[1].trim(), lines: [inline[2].trim()], order: order++ };
+        continue;
+      }
+    }
+
+    /*
+     * A bare heading: `Expected` alone on a line, with no `#`, no bold and no
+     * colon. Plain-text tickets — including the one this product prints in its
+     * own placeholder — are written that way, and none of the patterns above
+     * see them. The whole tail of the report then fell inside the last numbered
+     * step, `expected` and `actual` came back null, and the generated test
+     * asserted nothing but "the flow completes": the exact failure mode this
+     * file exists to prevent, arrived at by a missing heading.
+     *
+     * The bar is deliberately high, because a false heading SPLITS a report and
+     * is worse than a missed one. It must be a short run of bare words, with no
+     * sentence punctuation, no digits and no path separators — so a step like
+     * "Click the first result to open /products/2" (which contains "result",
+     * and would otherwise classify as ACTUAL) can never qualify.
+     */
+    const bare = BARE_HEADING.exec(probe);
+    if (bare?.[1]) {
+      const key = classifySection(bare[1]);
+      if (key !== 'OTHER') {
+        flush();
+        current = { key, label: bare[1].trim(), lines: [], order: order++ };
         continue;
       }
     }

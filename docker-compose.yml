@@ -1,49 +1,91 @@
-# `docker compose up` → full stack + demo store boots (DoD §12.1).
+# QAAI — the whole stack.
 #
-# Everything reads config from .env (copy .env.example → .env first). The
-# service-to-service URLs below intentionally override the localhost defaults
-# in .env.example, because inside the compose network hosts are service names.
+#   cd deploy && cp .env.example ../.env   # then fill in the generated secrets
+#   docker compose up -d
+#
+# See deploy/README.md for the secret-generation one-liner and verification.
+#
+# ── No secret has a default here, on purpose ─────────────────────────────────
+# Every credential is written `${VAR:?...}`, which makes compose refuse to start
+# when the variable is unset *or empty*. A default would be copied out of this
+# file into a real deployment and shared by every install that ever ran it —
+# which for VAULT_MASTER_KEY means every customer sharing one encryption key.
+# The failure mode of a missing value is a clear error before anything boots;
+# the failure mode of a default is a silent, unrecoverable compromise.
 
 name: qaai
 
+# Service-to-service URLs use compose hostnames, which is why they override the
+# localhost values in .env.example rather than inheriting them.
 x-app-env: &app-env
-  NODE_ENV: development
-  DATABASE_URL: postgresql://qaai:qaai@postgres:5432/qaai?schema=public
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  # Quoted: the `:?` error messages contain a colon-and-space, which YAML would
+  # otherwise read as the start of a nested mapping.
+  DATABASE_URL: 'postgresql://qaai:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — see deploy/.env.example}@postgres:5432/qaai?schema=public'
   REDIS_URL: redis://redis:6379
-  S3_ENDPOINT: http://minio:9000
-  S3_BUCKET: qaai-artifacts
-  S3_ACCESS_KEY_ID: qaaiminio
-  S3_SECRET_ACCESS_KEY: qaaiminio
-  S3_FORCE_PATH_STYLE: "true"
+
   API_PUBLIC_URL: http://api:4000
-  WEB_PUBLIC_URL: http://localhost:3000
+  WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
   DEMO_PUBLIC_URL: http://demo:5050
-  SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
-  VAULT_MASTER_KEY: ${VAULT_MASTER_KEY:?set VAULT_MASTER_KEY in .env}
+
+  SESSION_SECRET: '${SESSION_SECRET:?set SESSION_SECRET — generate with: openssl rand -base64 48}'
+  VAULT_MASTER_KEY: '${VAULT_MASTER_KEY:?set VAULT_MASTER_KEY — generate with: openssl rand -base64 32}'
+
+  # Artifacts go to MinIO (S3-compatible) by default.
+  ARTIFACTS_LOCAL: ${ARTIFACTS_LOCAL:-false}
+  S3_ENDPOINT: http://minio:9000
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_BUCKET: ${S3_BUCKET:-qaai-artifacts}
+  S3_ACCESS_KEY_ID: '${MINIO_ROOT_USER:?set MINIO_ROOT_USER — see deploy/.env.example}'
+  S3_SECRET_ACCESS_KEY: '${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD — see deploy/.env.example}'
+  S3_FORCE_PATH_STYLE: "true"
+
+  # Optional. Absent means the LLM features degrade rather than crash.
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   QAAI_MODEL_CHEAP: ${QAAI_MODEL_CHEAP:-claude-haiku-4-5}
   QAAI_MODEL_STRONG: ${QAAI_MODEL_STRONG:-claude-opus-5}
+  QAAI_MONTHLY_TOKEN_BUDGET: ${QAAI_MONTHLY_TOKEN_BUDGET:-0}
+
+  SENTRY_DSN: ${SENTRY_DSN:-}
+
+# api, web, demo and the migration job all run the same image.
+x-app-build: &app-build
+  context: .
+  dockerfile: Dockerfile
+  target: runtime
+  args:
+    # Baked into the cockpit's JS bundle at build time, so it must be the URL a
+    # browser can reach — not the compose hostname.
+    NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
 
 services:
+  # ─── Datastores ────────────────────────────────────────────────────────────
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: qaai
-      POSTGRES_PASSWORD: qaai
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — generate with: openssl rand -hex 24}'
       POSTGRES_DB: qaai
-    ports: ["5432:5432"]
-    volumes: [qaai-pgdata:/var/lib/postgresql/data]
+    volumes:
+      - qaai-pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U qaai -d qaai"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
+    # Not published to the host. Uncomment the mapping in
+    # docker-compose.override.yml.example if you need psql from outside.
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
-    ports: ["6379:6379"]
-    volumes: [qaai-redisdata:/data]
+    volumes:
+      - qaai-redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -51,92 +93,158 @@ services:
       retries: 20
 
   minio:
+    # TODO before production: pin to a dated RELEASE.* tag. `latest` means the
+    # storage layer can change under you on an unrelated `docker compose pull`.
     image: minio/minio:latest
+    restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      MINIO_ROOT_USER: qaaiminio
-      MINIO_ROOT_PASSWORD: qaaiminio
-    ports: ["9000:9000", "9001:9001"]
-    volumes: [qaai-miniodata:/data]
+      MINIO_ROOT_USER: '${MINIO_ROOT_USER:?set MINIO_ROOT_USER — see deploy/.env.example}'
+      MINIO_ROOT_PASSWORD: '${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD — min 8 chars, generate with: openssl rand -hex 24}'
+    volumes:
+      - qaai-miniodata:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/live || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
 
-  # One-shot: creates the artifacts bucket then exits.
+  # One-shot: create the artifacts bucket, then exit.
   minio-init:
     image: minio/mc:latest
     depends_on:
       minio: { condition: service_healthy }
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 qaaiminio qaaiminio &&
-      mc mb --ignore-existing local/qaai-artifacts &&
-      echo 'bucket ready'"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      S3_BUCKET: ${S3_BUCKET:-qaai-artifacts}
+    # Credentials arrive through the environment rather than the command line so
+    # they do not show up in `docker ps`, `docker inspect` or the compose logs.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" > /dev/null &&
+        mc mb --ignore-existing "local/$$S3_BUCKET" &&
+        echo "bucket $$S3_BUCKET ready"
+    restart: on-failure
 
+  # ─── Schema migration ──────────────────────────────────────────────────────
+  #
+  # A dedicated one-shot job rather than a step inside the API's command, for
+  # two reasons: scaling the API to two replicas would otherwise run two
+  # concurrent `migrate deploy`s against the same database, and a migration
+  # failure here stops the rollout instead of leaving a half-migrated API up.
+  #
+  # The entrypoint's `migrate` verb runs from /app/apps/api. That matters:
+  # schema.prisma declares `datasource db` with no url, so the connection string
+  # comes from apps/api/prisma.config.ts, which Prisma resolves relative to the
+  # working directory. Running it from the repo root — as the previous compose
+  # file did — fails with "The datasource.url property is required in your
+  # Prisma config file". Verified against the live database; see deploy/README.md.
+  migrate:
+    build: *app-build
+    image: qaai/app:local
+    command: ["migrate"]
+    # Only the database URL, deliberately. Prisma Migrate reads its connection
+    # string from apps/api/prisma.config.ts and never loads apps/api/src/env.ts,
+    # so handing this job the vault key or the session secret would widen the
+    # blast radius of a compromised migration for no functional gain.
+    environment:
+      DATABASE_URL: 'postgresql://qaai:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — see deploy/.env.example}@postgres:5432/qaai?schema=public'
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  # ─── Application services ──────────────────────────────────────────────────
   api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile
+    build: *app-build
+    image: qaai/app:local
+    restart: unless-stopped
+    command: ["api"]
     environment:
       <<: *app-env
       API_PORT: "4000"
-    ports: ["4000:4000"]
-    volumes: [qaai-artifacts:/app/.artifacts]
+    ports:
+      - "${API_BIND:-127.0.0.1}:4000:4000"
+    volumes:
+      - qaai-artifacts:/app/.artifacts
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    # Migrations + seed run on boot so a fresh `up` lands in a usable state.
-    command:
-      - sh
-      - -c
-      - >-
-        npx prisma migrate deploy --schema apps/api/prisma/schema.prisma &&
-        npm run db:seed -w @qaai/api &&
-        npx tsx apps/api/src/index.ts
+      migrate: { condition: service_completed_successfully }
+    # node:22-slim carries no curl or wget, so the check uses node's own fetch
+    # rather than adding a package to the image just to poll a port.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   worker:
     build:
-      context: .
-      dockerfile: apps/worker/Dockerfile
+      <<: *app-build
+      # The only service that needs browsers. This target is `FROM runtime`, so
+      # it shares every layer with the image above and adds one on top.
+      target: runtime-browsers
+    image: qaai/app-browsers:local
+    restart: unless-stopped
+    command: ["worker"]
     environment:
       <<: *app-env
-      WORKER_CONCURRENCY: "4"
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    # Chromium needs more than Docker's default 64MB of /dev/shm; below roughly
+    # 256MB it crashes on content-heavy pages with no useful error.
+    shm_size: 1gb
+    volumes:
+      - qaai-artifacts:/app/.artifacts
     depends_on:
-      api: { condition: service_started }
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    # Playwright needs more than the default 64MB of shared memory for Chromium.
-    shm_size: 1gb
-    # Artifacts are written here when ARTIFACTS_LOCAL=true; the API reads the
-    # same volume, so both processes must agree on the path.
-    volumes: [qaai-artifacts:/app/.artifacts]
+      migrate: { condition: service_completed_successfully }
 
-  demo:
-    build:
-      context: .
-      dockerfile: apps/demo/Dockerfile
+  web:
+    build: *app-build
+    image: qaai/app:local
+    restart: unless-stopped
+    command: ["web"]
+    # The cockpit is a rendering layer: it talks to the API over HTTP and owns
+    # no credentials. It deliberately does NOT inherit *app-env — a Next server
+    # with the vault key in its environment is one SSR bug away from printing it.
     environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:3000:3000"
+    depends_on:
+      api: { condition: service_healthy }
+
+  # The bundled demo store — the app QAAI tests during onboarding. No database,
+  # no secrets; it is a target, not part of the control plane.
+  demo:
+    build: *app-build
+    image: qaai/app:local
+    restart: unless-stopped
+    command: ["demo"]
+    environment:
+      NODE_ENV: production
       DEMO_PORT: "5050"
       DEMO_SMTP_PORT: "5051"
       DEMO_PLANTED_BUG: ${DEMO_PLANTED_BUG:-true}
-    ports: ["5050:5050", "5051:5051"]
-
-  web:
-    build:
-      context: .
-      dockerfile: apps/web/Dockerfile
-    environment:
-      <<: *app-env
-      # Browser-side calls must reach the API on the host, not the compose network.
-      NEXT_PUBLIC_API_URL: http://localhost:4000
-    ports: ["3000:3000"]
-    depends_on:
-      api: { condition: service_started }
+    ports:
+      - "${DEMO_BIND:-127.0.0.1}:5050:5050"
+      - "${DEMO_BIND:-127.0.0.1}:5051:5051"
 
 volumes:
-  qaai-artifacts:
   qaai-pgdata:
   qaai-redisdata:
   qaai-miniodata:
+  # Only used when ARTIFACTS_LOCAL=true; the API and worker must agree on the
+  # path, so both mount it either way.
+  qaai-artifacts:

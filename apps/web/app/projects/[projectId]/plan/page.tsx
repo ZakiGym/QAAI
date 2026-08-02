@@ -26,6 +26,24 @@ interface PlanItem {
   steps: string[];
   assertions: string[];
   state: string;
+  /** Set once the Generator has written code for this item. */
+  generatedTestId?: string | null;
+}
+
+/**
+ * The items this screen can still act on.
+ *
+ * PROPOSED is the Explorer's cold proposal, waiting for a human to tick it.
+ * APPROVED-without-a-test is a different thing that lands in the same place:
+ * the coverage-gap, traffic and repro flows pre-approve, because selecting the
+ * gap WAS the approval. Those items still need the Generator run on them, and
+ * filtering to PROPOSED alone dropped them off this page entirely — a plan
+ * created from coverage gaps rendered as nothing but its "deliberately skipped"
+ * list, which reads as "we did nothing" when in fact the work is sitting there.
+ */
+function isActionable(item: PlanItem): boolean {
+  if (item.state === 'PROPOSED') return true;
+  return item.state === 'APPROVED' && !item.generatedTestId;
 }
 
 interface Plan {
@@ -61,9 +79,8 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
     try {
       const { plan } = await api<{ plan: Plan }>(`/projects/${projectId}/plan`);
       setPlan(plan);
-      // Everything the Explorer proposed starts ticked; unticking is the edit.
-      const proposable = plan.items.filter((i) => i.state === 'PROPOSED');
-      setSelected(new Set(proposable.map((i) => i.id)));
+      // Everything still actionable starts ticked; unticking is the edit.
+      setSelected(new Set(plan.items.filter(isActionable).map((i) => i.id)));
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.push('/login');
@@ -125,8 +142,11 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
       </Page>
     );
 
-  const proposable = plan.items.filter((i) => i.state === 'PROPOSED');
-  const alreadyGenerated = plan.items.filter((i) => i.state === 'GENERATED').length;
+  const proposable = plan.items.filter(isActionable);
+  const preApproved = proposable.filter((i) => i.state === 'APPROVED').length;
+  const alreadyGenerated = plan.items.filter(
+    (i) => i.state === 'GENERATED' || i.generatedTestId,
+  ).length;
 
   // Group in priority order so the critical-path tests are what the eye lands on.
   const groups = new Map<string, PlanItem[]>();
@@ -141,6 +161,15 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
         subtitle={
           <>
             {plan.summary}
+            {preApproved > 0 && (
+              <span className="text-ink-faint mt-2 block">
+                <span className="tabular-nums">{preApproved}</span> item
+                {preApproved === 1 ? ' was' : 's were'} already approved when{' '}
+                {preApproved === 1 ? 'it was' : 'they were'} selected — choosing the gap was the
+                approval. {preApproved === 1 ? 'It is' : 'They are'} waiting on the Generator, not
+                on you.
+              </span>
+            )}
             {alreadyGenerated > 0 && (
               <span className="text-ink-faint mt-2 block">
                 <span className="tabular-nums">{alreadyGenerated}</span> item
@@ -152,6 +181,14 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
       />
 
       <div className="space-y-6">
+        {/* Never let the page fall through to nothing but the skipped list. */}
+        {proposable.length === 0 && (
+          <p className="border-line text-ink-dim rounded-lg border border-dashed p-4 text-sm">
+            {alreadyGenerated > 0
+              ? 'Every item on this plan has been generated. The tests are in the editor.'
+              : 'Nothing on this plan is waiting on a decision — every item was either generated or declined.'}
+          </p>
+        )}
         {[...groups.entries()].map(([feature, items]) => (
           <section key={feature}>
             <SectionLabel>{feature}</SectionLabel>
