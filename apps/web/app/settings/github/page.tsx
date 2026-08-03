@@ -10,18 +10,11 @@ import {
   type GithubApp,
   type Integration,
 } from '../../../lib/api';
+import { SetupHeader } from '../../../components/setup/SetupHeader';
 import { Button } from '../../../components/ui/Button';
 import { EmptyState } from '../../../components/ui/EmptyState';
 import { useToast } from '../../../components/ui/Toast';
-import {
-  Badge,
-  Card,
-  Page,
-  PageHeader,
-  SectionLabel,
-  Skeleton,
-  Tabs,
-} from '../../../components/ui/layout';
+import { Badge, Card, Page, SectionLabel, Skeleton } from '../../../components/ui/layout';
 
 /**
  * The GitHub App — what QAAI is allowed to do inside your repositories.
@@ -119,22 +112,24 @@ export default function GithubAppPage() {
   const commitRuns = runs.filter((run) => run.commitSha);
 
   return (
-    <Page width="wide">
-      <PageHeader
-        title="Infrastructure"
-        subtitle="Where your tests execute, and what QAAI is allowed to touch."
+    <Page width="setup">
+      {/* A sibling of Runners, not a fifth tab: same section and same question —
+          what QAAI is allowed to touch — but a different subject, so the strip
+          keeps showing Setup's four views and this screen says where it sits. */}
+      <SetupHeader
+        title="GitHub App"
+        eyebrowTail="Setup · GitHub App"
+        subtitle={
+          <>
+            What QAAI may do inside your repositories.{' '}
+            <Link href="/settings/runners" className="text-ink-faint hover:text-ink transition-colors">
+              ← runners
+            </Link>
+          </>
+        }
       />
 
-      <Tabs
-        tabs={[
-          { id: 'runners', label: 'Runners' },
-          { id: 'github', label: 'GitHub App' },
-        ]}
-        active="github"
-        onChange={(id) => {
-          if (id === 'runners') router.push('/settings/runners');
-        }}
-      />
+      <div className="mt-7" />
 
       {forbidden ? (
         <EmptyState

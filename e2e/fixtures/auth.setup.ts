@@ -22,8 +22,15 @@ setup('sign in as the demo owner', async ({ page }) => {
   await page.getByLabel('Password').fill(DEMO_PASSWORD);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
 
-  // The user-visible outcome of signing in: the runs list, not a URL change.
-  await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+  /*
+   * The user-visible outcome of signing in: the runs list, not a URL change.
+   *
+   * This used to look for a "Projects" heading. The redesign merged the old
+   * /dashboard into Runs home, and the project tiles became a FLEET section
+   * under an h1 of "Runs" — so the heading it waited for no longer exists. The
+   * assertion is the same one, pointed at what the screen says now.
+   */
+  await expect(page.getByRole('heading', { name: 'Runs', level: 1 })).toBeVisible();
   await expect(page).toHaveURL(/\/runs$/);
 
   await page.context().storageState({ path: STORAGE_STATE });

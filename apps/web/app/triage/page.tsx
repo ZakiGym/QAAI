@@ -1,94 +1,46 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import Link from 'next/link';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { api, ApiError } from '../../lib/api';
-import { relativeTime } from '../../components/ui';
+import { api, ApiError, type ClusterReport } from '../../lib/api';
 import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { useToast } from '../../components/ui/Toast';
 import { useProject } from '../../components/shell/ProjectContext';
+import { SECTION_TABS_SLOT_ID } from '../../components/shell/AppShell';
+import { Page, PageHeader, SectionLabel, SkeletonRows } from '../../components/ui/layout';
+import { CauseGroup, busyKey, type Action, type OwnerRow } from '../../components/triage/CauseGroup';
 import {
-  Badge,
-  Page,
-  PageHeader,
-  SectionLabel,
-  Skeleton,
-  SkeletonRows,
-} from '../../components/ui/layout';
+  groupByCause,
+  indexCauses,
+  metaFor,
+  type CauseGroup as Cause,
+  type CauseIndex,
+  type TriageVerdict,
+  type VerdictKind,
+} from '../../components/triage/verdicts';
 
 /**
- * Triage review (§3.3) — the screen where a human agrees or disagrees with the
- * machine.
+ * Triage — the screen where a human agrees or disagrees with the machine.
  *
- * The endpoints have existed since early on and nothing rendered them, which
- * meant the AI's verdict on every failure was recorded and never challengeable.
- * That is the wrong default for a product whose value is "it tells you WHY",
- * so this leads with the evidence and makes disagreeing one click.
+ * ── Why this is grouped by cause ────────────────────────────────────────────
  *
- * ── Why this screen also does bulk ──────────────────────────────────────────
+ * It was a flat queue: one row per failure, a detail pane on the right, one
+ * decision at a time. That is the right shape for three failures and the wrong
+ * one for forty. When a shared dependency breaks, forty tests fail for one
+ * reason, and reviewing them individually is exactly the tax this product
+ * exists to remove — the answer to all forty is the same sentence and a person
+ * should get to say it once.
  *
- * One verdict at a time is the right shape for three failures and the wrong one
- * for forty. When a shared dependency breaks, forty tests fail for one reason,
- * and reviewing them individually is the tax this product exists to remove: the
- * answer to all forty is the same sentence, and a person should say it once.
+ * So the queue is now the causes, from the clusterer that already computes
+ * them for the cockpit, with the failures listed under each. Two things keep
+ * that from becoming a rubber stamp, and both are printed on the screen:
  *
- * Two things keep that from becoming a rubber stamp:
- *
- *   • The server records it as N decisions, not one. What a human reviewed is a
- *     matter of fact and the audit log has to be able to state it.
- *   • It is reversible. A bulk action with no undo is one people are right to be
- *     afraid of, and a triage screen people are afraid of is one they stop using.
- *     The undo strip below stays up until it is used or dismissed — a four-second
- *     toast is not an undo.
+ *   • The server records a group decision as N decisions, not one. What a human
+ *     reviewed is a matter of fact and the audit log has to be able to state it.
+ *   • It is reversible, and the undo strip stays up until it is used or
+ *     dismissed. A four-second toast is not an undo.
  */
-
-interface Verdict {
-  id: string;
-  verdict: 'REAL_BUG' | 'INTENDED_CHANGE' | 'FLAKE' | 'ENV_ISSUE';
-  confidence: number;
-  explanation: string;
-  evidence: Array<{ kind: string; ref: string; detail: string }>;
-  reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED';
-  model: string;
-  createdAt: string;
-  testResult: {
-    id: string;
-    runId: string;
-    status: string;
-    test: { id: string; name: string; filePath: string; priority: string };
-  };
-}
-
-type Tone = 'neutral' | 'accent' | 'pass' | 'fail' | 'flake';
-
-const VERDICT_META: Record<string, { label: string; blurb: string; tone: Tone }> = {
-  REAL_BUG: {
-    label: 'Real bug',
-    blurb: 'The application is wrong. This is the only verdict that blocks a merge by default.',
-    tone: 'fail',
-  },
-  INTENDED_CHANGE: {
-    label: 'Intended change',
-    blurb: 'The app changed on purpose and the test is now out of date — the healer proposes a fix.',
-    tone: 'flake',
-  },
-  FLAKE: {
-    label: 'Flake',
-    blurb: 'Nothing is broken; the test is unreliable. Consider quarantining it.',
-    tone: 'flake',
-  },
-  ENV_ISSUE: {
-    label: 'Environment issue',
-    blurb: 'The environment failed, not the app. Alerts, never gates.',
-    tone: 'neutral',
-  },
-};
-
-const OVERRIDES = ['REAL_BUG', 'INTENDED_CHANGE', 'FLAKE', 'ENV_ISSUE'] as const;
-
-const metaFor = (verdict: string) => VERDICT_META[verdict] ?? VERDICT_META.ENV_ISSUE!;
 
 interface BulkResponse {
   batch: { id: string; action: string; overriddenTo: string | null } | null;
@@ -101,22 +53,26 @@ interface AppliedBatch {
   id: string;
   applied: number;
   skipped: number;
-  label: string;
+  /** The whole sentence, built where the decision was made. */
+  sentence: string;
 }
 
-interface OwnerRow {
-  testId: string;
-  owner: { kind: 'USER' | 'TEAM'; id: string; label: string } | null;
-  reason: string | null;
-}
+/**
+ * How many runs' clusters to ask for.
+ *
+ * Pending verdicts almost always come from one or two runs. The cap exists so
+ * that a queue left untouched for a fortnight cannot turn one page load into
+ * forty requests; anything past it simply falls through to the singles list,
+ * which is the honest degradation — an ungrouped failure, not a wrong group.
+ */
+const MAX_CLUSTERED_RUNS = 6;
 
 export default function TriagePage() {
   const router = useRouter();
   const toast = useToast();
   const { project } = useProject();
 
-  const [verdicts, setVerdicts] = useState<Verdict[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [verdicts, setVerdicts] = useState<TriageVerdict[]>([]);
   const [showReviewed, setShowReviewed] = useState(false);
   // `[]` is indistinguishable from "not fetched yet", so without this the empty
   // state — "Nothing to review." — is what rendered during every load.
@@ -124,10 +80,8 @@ export default function TriagePage() {
   /** Which action is in flight, so only that button spins. Null when idle. */
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  /** Ids picked for a bulk decision. Empty means the screen behaves as it always has. */
-  const [picked, setPicked] = useState<Set<string>>(new Set());
   const [batch, setBatch] = useState<AppliedBatch | null>(null);
+
   /** testId → who owns it, when an ownership rule matched. */
   const [owners, setOwners] = useState<Map<string, OwnerRow>>(new Map());
   /**
@@ -137,24 +91,25 @@ export default function TriagePage() {
    * for every such verdict, on the assumption that a verdict of that kind always
    * has a heal waiting. It does not: the healer runs separately and only for
    * failures it can pattern-match, so the common case for a fresh INTENDED_CHANGE
-   * was a link to /heals?test=… that filtered a list down to nothing. Offering a
-   * fix and then showing an empty screen is worse than not offering one.
+   * was a link to /heals?test=… that filtered a list down to nothing.
    */
   const [healedTestIds, setHealedTestIds] = useState<Set<string>>(new Set());
+  /** testResultId → the cause it belongs to. Empty until the clusters land. */
+  const [causes, setCauses] = useState<CauseIndex>(new Map());
+
+  /** The j/k cursor, over causes then singles. */
+  const [focusIndex, setFocusIndex] = useState(0);
+  /** Which failure's evidence is expanded. One at a time, like a disclosure. */
+  const [openId, setOpenId] = useState<string | null>(null);
 
   const load = useCallback(
     async (all: boolean) => {
       try {
-        const { verdicts } = await api<{ verdicts: Verdict[] }>(
+        const { verdicts } = await api<{ verdicts: TriageVerdict[] }>(
           `/verdicts${all ? '' : '?state=PENDING'}`,
         );
         setVerdicts(verdicts);
-        setSelectedId((cur) =>
-          cur && verdicts.some((v) => v.id === cur) ? cur : (verdicts[0]?.id ?? null),
-        );
-        // A selection that survives a reload would apply a decision to rows the
-        // user can no longer see.
-        setPicked((cur) => new Set([...cur].filter((id) => verdicts.some((v) => v.id === id))));
+        setOpenId((cur) => (cur && verdicts.some((v) => v.id === cur) ? cur : null));
         setError(null);
       } catch (err) {
         if (err instanceof ApiError && err.status === 401) {
@@ -176,12 +131,46 @@ export default function TriagePage() {
   }, [load, showReviewed]);
 
   /*
+   * The causes themselves.
+   *
+   * /clusters/run/:id is the same endpoint the cockpit's "what broke" rail uses,
+   * and it is per-run — so this asks once per run represented in the queue and
+   * merges the answers on `signature`, which is stable across runs. Failing
+   * softly on purpose: without it every failure lands in the singles list and
+   * the screen is the flat queue it used to be, which is a worse screen and not
+   * a broken one.
+   */
+  const runKey = useMemo(
+    () =>
+      [...new Set(verdicts.map((v) => v.testResult.runId))].sort().slice(0, MAX_CLUSTERED_RUNS).join(','),
+    [verdicts],
+  );
+
+  useEffect(() => {
+    if (!runKey) {
+      setCauses(new Map());
+      return;
+    }
+    let cancelled = false;
+    void Promise.all(
+      runKey
+        .split(',')
+        .map((runId) => api<ClusterReport>(`/clusters/run/${runId}`).catch(() => null)),
+    ).then((reports) => {
+      if (!cancelled) setCauses(indexCauses(reports));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [runKey]);
+
+  /*
    * Ownership, resolved for what is on screen.
    *
-   * Failing softly and silently on purpose: ownership is an enrichment, and a
-   * team that has not set up any rules — which is every team on day one — must
-   * not see an error on the triage screen because of a feature they are not
-   * using. The chips simply do not appear.
+   * Failing silently on purpose: ownership is an enrichment, and a team that has
+   * not set up any rules — which is every team on day one — must not see an
+   * error on the triage screen because of a feature they are not using. The
+   * chips simply do not appear.
    */
   useEffect(() => {
     const projectId = project?.id;
@@ -211,14 +200,13 @@ export default function TriagePage() {
 
   /*
    * Which failures actually have a fix to review. Same soft-failure contract as
-   * ownership above: if this call fails the link simply does not appear, which
-   * is the safe direction — a missing link costs a click through the sidebar, a
-   * dead one costs a click into an empty screen and the belief that the healer
-   * is broken.
+   * ownership: if this call fails the link simply does not appear, which is the
+   * safe direction — a missing link costs a click through the sidebar, a dead
+   * one costs a click into an empty screen and the belief that the healer is
+   * broken.
    *
    * `state=all` on purpose. A proposal that has already been approved or
-   * rejected is still worth reading from the failure it came from — "what did we
-   * decide about this?" is the question the triage screen leaves people with.
+   * rejected is still worth reading from the failure it came from.
    */
   useEffect(() => {
     if (verdicts.length === 0) {
@@ -240,25 +228,34 @@ export default function TriagePage() {
     };
   }, [verdicts]);
 
-  const selected = verdicts.find((v) => v.id === selectedId) ?? null;
-  const pickable = useMemo(() => verdicts.filter((v) => v.reviewState === 'PENDING'), [verdicts]);
-  const allPicked = pickable.length > 0 && pickable.every((v) => picked.has(v.id));
+  const { groups, singles } = useMemo(
+    () => groupByCause(verdicts, causes),
+    [verdicts, causes],
+  );
+  const rows = useMemo(() => [...groups, ...singles], [groups, singles]);
+  const openCount = verdicts.filter((v) => v.reviewState === 'PENDING').length;
 
-  function togglePicked(id: string) {
-    setPicked((cur) => {
-      const next = new Set(cur);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
+  // A cursor past the end after a decision emptied the queue would leave the
+  // keyboard verbs pointing at nothing.
+  useEffect(() => {
+    setFocusIndex((index) => Math.max(0, Math.min(index, rows.length - 1)));
+  }, [rows.length]);
 
-  async function review(
-    verdict: Verdict,
-    action: 'accept' | 'override' | 'mute',
-    overrideTo?: string,
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  useEffect(() => {
+    const focused = rows[focusIndex];
+    // `nearest` so a cursor that is already on screen does not jerk the page —
+    // it only scrolls when j/k has walked off the edge of the viewport.
+    if (focused) rowRefs.current.get(focused.key)?.scrollIntoView({ block: 'nearest' });
+  }, [focusIndex, rows]);
+
+  async function reviewOne(
+    verdict: TriageVerdict,
+    action: Action,
+    overrideTo?: VerdictKind,
+    scope = verdict.id,
   ) {
-    setBusy(overrideTo ?? action);
+    setBusy(busyKey(scope, action, overrideTo));
     setError(null);
     try {
       await api(`/verdicts/${verdict.id}/review`, {
@@ -280,77 +277,169 @@ export default function TriagePage() {
     }
   }
 
-  /** One verdict, applied to everything picked. */
-  async function reviewPicked(action: 'accept' | 'override' | 'mute', overrideTo?: string) {
-    const verdictIds = [...picked];
-    if (verdictIds.length === 0) return;
+  /** One verdict, applied to every pending failure under a cause. */
+  async function decideGroup(group: Cause, action: Action, overrideTo?: VerdictKind) {
+    const pending = group.members.filter((m) => m.reviewState === 'PENDING');
+    if (pending.length === 0) return;
+    // A group of one is not a batch: the bulk endpoint would write a batch row
+    // with nothing to reconcile, and the undo strip would claim a plural.
+    if (pending.length === 1) {
+      await reviewOne(pending[0]!, action, overrideTo, group.key);
+      return;
+    }
 
-    setBusy(`bulk:${overrideTo ?? action}`);
+    setBusy(busyKey(group.key, action, overrideTo));
     setError(null);
     try {
       const result = await api<BulkResponse>('/team/triage/bulk', {
         method: 'POST',
-        body: JSON.stringify({ action, ...(overrideTo ? { overrideTo } : {}), verdictIds }),
+        body: JSON.stringify({
+          action,
+          ...(overrideTo ? { overrideTo } : {}),
+          verdictIds: pending.map((v) => v.id),
+        }),
       });
 
       if (!result.batch || result.applied === 0) {
-        // Everything picked had already been reviewed by somebody else — a normal
-        // race on a shared queue, and not an error.
+        // Everything in the group had already been reviewed by somebody else — a
+        // normal race on a shared queue, and not an error.
         toast.toast('info', 'Nothing changed — those were all reviewed already.');
       } else {
         setBatch({
           id: result.batch.id,
           applied: result.applied,
           skipped: result.skipped.length,
-          label:
-            action === 'accept'
-              ? 'agreed with'
-              : action === 'mute'
-                ? 'muted'
-                : `called ${metaFor(overrideTo ?? '').label.toLowerCase()}`,
+          sentence: sentenceFor(action, result.applied, overrideTo),
         });
       }
-
-      setPicked(new Set());
       await load(showReviewed);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not apply that to the selection');
+      setError(err instanceof Error ? err.message : 'Could not apply that to the whole cause');
     } finally {
       setBusy(null);
     }
   }
 
-  async function undoBatch(id: string) {
-    setBusy('undo');
-    setError(null);
-    try {
-      const result = await api<{ restored: number; keptIds: string[] }>(
-        `/team/triage/batches/${id}/undo`,
-        { method: 'POST' },
-      );
-      setBatch(null);
-      toast.success(
-        result.keptIds.length > 0
-          ? `Put ${result.restored} back. ${result.keptIds.length} had been reviewed again since and were left alone.`
-          : `Put ${result.restored} back for review.`,
-      );
-      await load(showReviewed);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not undo that batch');
-    } finally {
-      setBusy(null);
-    }
-  }
+  const undoBatch = useCallback(
+    async (id: string) => {
+      setBusy('undo');
+      setError(null);
+      try {
+        const result = await api<{ restored: number; keptIds: string[] }>(
+          `/team/triage/batches/${id}/undo`,
+          { method: 'POST' },
+        );
+        setBatch(null);
+        toast.success(
+          result.keptIds.length > 0
+            ? `Put ${result.restored} back. ${result.keptIds.length} had been reviewed again since and were left alone.`
+            : `Put ${result.restored} back for review.`,
+        );
+        await load(showReviewed);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Could not undo that batch');
+      } finally {
+        setBusy(null);
+      }
+    },
+    [load, showReviewed, toast],
+  );
 
-  const bulkBusy = busy?.startsWith('bulk:') ?? false;
+  /*
+   * The verbs, on the keyboard.
+   *
+   * Printed in the legend at the foot of the page, which is the only reason
+   * they are discoverable — and the reason they have to actually work: a legend
+   * that lists a binding the screen does not implement is worse than no legend.
+   *
+   * `decideGroup` closes over the current queue and is therefore a new function
+   * every render; going through a ref keeps the listener registered once instead
+   * of being torn down and rebuilt on every keystroke's re-render.
+   */
+  const decideRef = useRef(decideGroup);
+  decideRef.current = decideGroup;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const target = e.target as HTMLElement | null;
+      // Never steal a keystroke from something being typed into.
+      if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) {
+        return;
+      }
+
+      const focused = rows[focusIndex] ?? null;
+      const move = (delta: number) => {
+        e.preventDefault();
+        setFocusIndex((index) => Math.max(0, Math.min(rows.length - 1, index + delta)));
+      };
+
+      switch (e.key) {
+        case 'j':
+          move(1);
+          return;
+        case 'k':
+          move(-1);
+          return;
+        case 'u':
+          if (batch && busy === null) {
+            e.preventDefault();
+            void undoBatch(batch.id);
+          }
+          return;
+        case 'Enter': {
+          // Enter belongs to whatever is focused if that is a control; this is
+          // for when nothing in particular is.
+          if (target?.closest('button, a, [role="menuitem"]')) return;
+          const first = focused?.members[0];
+          if (first) {
+            e.preventDefault();
+            setOpenId((cur) => (cur === first.id ? null : first.id));
+          }
+          return;
+        }
+        default:
+          break;
+      }
+
+      if (!focused || busy !== null) return;
+      const action: [Action, VerdictKind?] | null =
+        e.key === 'a'
+          ? ['accept']
+          : e.key === 'f'
+            ? ['override', 'FLAKE']
+            : e.key === 'i'
+              ? ['override', 'INTENDED_CHANGE']
+              : e.key === 'm'
+                ? ['mute']
+                : null;
+      if (!action) return;
+      e.preventDefault();
+      void decideRef.current(focused, action[0], action[1]);
+    };
+
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [rows, focusIndex, batch, busy, undoBatch]);
 
   return (
-    <Page width="full">
+    <Page width="triage">
       <PageHeader
+        eyebrow={project ? `${project.name} · Verdict queue` : 'Verdict queue'}
         title="Triage"
-        subtitle={<>The agent&rsquo;s call on every failure. You get the last word.</>}
+        subtitle={
+          loading ? (
+            <>The agent decided; you get the last word.</>
+          ) : (
+            <>
+              <span className="tabular-nums">{openCount}</span> open
+              {groups.length > 0 ? ', grouped by cause' : ''}. The agent decided; you get the last
+              word.
+            </>
+          )
+        }
         actions={
-          <label className="text-ink-dim flex items-center gap-2 text-xs">
+          <label className="text-ink-dim text-row-sub flex items-center gap-[7px] pb-1">
             <input
               type="checkbox"
               checked={showReviewed}
@@ -360,365 +449,149 @@ export default function TriagePage() {
             Include reviewed
           </label>
         }
-        className="border-line mb-0 shrink-0 items-center border-b px-6 py-4"
       />
 
-      {(error || batch) && (
-        <div className="shrink-0 space-y-3 px-6 pt-4">
-          {error && (
-            <p role="alert" className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm">
-              {error}
-            </p>
-          )}
-          {batch && (
-            /* Deliberately persistent. The value of an undo is that it is still
-               there when you realise you were wrong, which is never within four
-               seconds of pressing the button. */
-            <div
-              role="status"
-              className="border-line bg-surface-1 flex flex-wrap items-center gap-3 rounded-md border p-3"
-            >
-              <p className="text-body-sm flex-1">
-                You {batch.label}{' '}
-                <span className="tabular-nums">{batch.applied}</span>{' '}
-                {batch.applied === 1 ? 'failure' : 'failures'} in one go.
-                {batch.skipped > 0 && (
-                  <span className="text-ink-faint">
-                    {' '}
-                    <span className="tabular-nums">{batch.skipped}</span> had already been reviewed
-                    and were left alone.
-                  </span>
-                )}
-              </p>
-              <Button
-                size="sm"
-                onClick={() => void undoBatch(batch.id)}
-                disabled={busy !== null}
-                loading={busy === 'undo'}
-              >
-                Undo
-              </Button>
-              <Button size="sm" variant="ghost" onClick={() => setBatch(null)} disabled={busy !== null}>
-                Dismiss
-              </Button>
-            </div>
-          )}
+      {/* The section strip — VERDICTS / HEALS / QUALITY — is the shell's, and it
+          belongs under this page's title, so the shell portals it in here. */}
+      <div id={SECTION_TABS_SLOT_ID} />
+
+      {error && (
+        <p
+          role="alert"
+          className="border-fail/40 text-fail text-body-sm mt-5 rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_10%,transparent)] p-3"
+        >
+          {error}
+        </p>
+      )}
+
+      {batch && (
+        /* Deliberately persistent. The value of an undo is that it is still
+           there when you realise you were wrong, which is never within four
+           seconds of pressing the button. */
+        <div
+          role="status"
+          className="border-line bg-surface-1 mt-5 flex flex-wrap items-center gap-3 rounded-lg border px-3.5 py-2.5"
+        >
+          <p className="text-body-sm min-w-0 flex-1">
+            {batch.sentence}
+            <span className="text-ink-faint">
+              {' '}
+              — recorded as <span className="tabular-nums">{batch.applied}</span>{' '}
+              {batch.applied === 1 ? 'decision' : 'decisions'}, reversible
+              {batch.skipped > 0 && (
+                <>
+                  {' · '}
+                  <span className="tabular-nums">{batch.skipped}</span> had already been reviewed and
+                  were left alone
+                </>
+              )}
+            </span>
+          </p>
+          <Button
+            size="sm"
+            onClick={() => void undoBatch(batch.id)}
+            disabled={busy !== null}
+            loading={busy === 'undo'}
+          >
+            Undo
+          </Button>
+          <button
+            type="button"
+            onClick={() => setBatch(null)}
+            aria-label="Dismiss"
+            className="text-ink-faint hover:text-ink px-0.5 text-[13px] transition-colors"
+          >
+            ✕
+          </button>
         </div>
       )}
 
-      {picked.size > 0 && (
-        <div className="border-accent/40 bg-accent/5 mx-6 mt-4 shrink-0 rounded-md border p-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <p className="text-body-sm mr-1 font-medium">
-              <span className="tabular-nums">{picked.size}</span> selected
-            </p>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => void reviewPicked('accept')}
-              disabled={busy !== null}
-              loading={busy === 'bulk:accept'}
-            >
-              Agree with all
-            </Button>
-            <Button
-              size="sm"
-              onClick={() => void reviewPicked('mute')}
-              disabled={busy !== null}
-              loading={busy === 'bulk:mute'}
-            >
-              Mute all
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => setPicked(new Set())}
-              disabled={busy !== null}
-            >
-              Clear
-            </Button>
-          </div>
-          <div className="mt-2.5 flex flex-wrap items-center gap-2">
-            <span className="text-ink-faint text-micro">Or call all of them:</span>
-            {OVERRIDES.map((verdict) => (
-              <Button
-                key={verdict}
-                size="sm"
-                onClick={() => void reviewPicked('override', verdict)}
-                disabled={busy !== null}
-                loading={busy === `bulk:${verdict}`}
+      {loading ? (
+        <div className="mt-8">
+          <SkeletonRows rows={6} />
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="mt-8">
+          <EmptyState
+            title="Nothing to review."
+            body="Verdicts appear when a failing test is triaged. Every failure the agent has already decided on, and you have agreed with, leaves this queue."
+            action={{ label: 'Look at the runs', href: '/runs' }}
+          />
+        </div>
+      ) : (
+        <>
+          <div className="mt-8 space-y-7">
+            {groups.map((group, index) => (
+              <div
+                key={group.key}
+                ref={(node) => {
+                  if (node) rowRefs.current.set(group.key, node);
+                  else rowRefs.current.delete(group.key);
+                }}
               >
-                {metaFor(verdict).label}
-              </Button>
+                <CauseGroup
+                  group={group}
+                  focused={focusIndex === index}
+                  owners={owners}
+                  healedTestIds={healedTestIds}
+                  openId={openId}
+                  onToggleEvidence={(id) => setOpenId((cur) => (cur === id ? null : id))}
+                  onFocus={() => setFocusIndex(index)}
+                  onDecideGroup={(action, to) => void decideGroup(group, action, to)}
+                  onDecideOne={(verdict, action, to) => void reviewOne(verdict, action, to)}
+                  busy={busy}
+                />
+              </div>
             ))}
           </div>
-          <p className="text-ink-faint text-micro mt-2.5">
-            {/* The honest description of what the server does, because a bulk
-                action that quietly logs itself as one decision is one nobody
-                should trust. */}
-            Recorded as {picked.size} separate decisions, and reversible.
-          </p>
-        </div>
-      )}
 
-      <div className="grid min-h-0 flex-1 grid-cols-[340px_1fr]">
-        <aside className="border-line min-h-0 overflow-y-auto border-r">
-          {loading ? (
-            <SkeletonRows rows={7} />
-          ) : verdicts.length === 0 ? (
-            <div className="p-4">
-              <EmptyState
-                title="Nothing to review."
-                body="Verdicts appear when a failing test is triaged."
-              />
-            </div>
-          ) : (
-            <>
-              {pickable.length > 0 && (
-                <div className="border-line/60 flex items-center gap-2 border-b px-4 py-2">
-                  <input
-                    type="checkbox"
-                    className="accent-accent"
-                    checked={allPicked}
-                    onChange={() =>
-                      setPicked(allPicked ? new Set() : new Set(pickable.map((v) => v.id)))
-                    }
-                    aria-label="Select every failure awaiting review"
-                    disabled={bulkBusy}
-                  />
-                  <span className="text-ink-faint text-meta">
-                    <span className="tabular-nums">{pickable.length}</span> awaiting review
-                  </span>
-                  {project && owners.size > 0 && (
-                    <span className="text-ink-faint text-micro ml-auto truncate">
-                      owners for {project.name}
-                    </span>
-                  )}
-                </div>
+          {singles.length > 0 && (
+            <div className="mt-9">
+              {groups.length > 0 && (
+                /* Said out loud, because "one row" and "a group with one member
+                   in it" are different claims and only one of them is true. */
+                <SectionLabel className="mb-3">Causes of one</SectionLabel>
               )}
-
-              {verdicts.map((v) => {
-                const meta = metaFor(v.verdict);
-                const owner = owners.get(v.testResult.test.id)?.owner ?? null;
-                const isPending = v.reviewState === 'PENDING';
-
-                return (
+              <div className="space-y-7">
+                {singles.map((group, index) => (
                   <div
-                    key={v.id}
-                    className={`border-line/60 flex items-start gap-2 border-b pr-2 pl-3 ${
-                      selectedId === v.id ? 'bg-surface-2' : 'hover:bg-surface-1'
-                    }`}
+                    key={group.key}
+                    ref={(node) => {
+                      if (node) rowRefs.current.set(group.key, node);
+                      else rowRefs.current.delete(group.key);
+                    }}
                   >
-                    <input
-                      type="checkbox"
-                      className="accent-accent mt-3.5"
-                      checked={picked.has(v.id)}
-                      onChange={() => togglePicked(v.id)}
-                      // A reviewed verdict cannot be part of a batch: the server
-                      // refuses it, and offering it here would promise something
-                      // that comes back as a skip.
-                      disabled={!isPending || bulkBusy}
-                      aria-label={`Select ${v.testResult.test.name}`}
+                    <CauseGroup
+                      group={group}
+                      focused={focusIndex === groups.length + index}
+                      owners={owners}
+                      healedTestIds={healedTestIds}
+                      openId={openId}
+                      onToggleEvidence={(id) => setOpenId((cur) => (cur === id ? null : id))}
+                      onFocus={() => setFocusIndex(groups.length + index)}
+                      onDecideGroup={(action, to) => void decideGroup(group, action, to)}
+                      onDecideOne={(verdict, action, to) => void reviewOne(verdict, action, to)}
+                      busy={busy}
                     />
-                    <button
-                      type="button"
-                      onClick={() => setSelectedId(v.id)}
-                      className="flex min-w-0 flex-1 flex-col gap-1 py-3 text-left"
-                    >
-                      <span className="truncate text-body-sm font-medium">
-                        {v.testResult.test.name}
-                      </span>
-                      <div className="text-ink-faint flex items-center gap-2 text-meta">
-                        <Badge tone={meta.tone} mono>
-                          {meta.label}
-                        </Badge>
-                        <span className="tabular-nums">{Math.round(v.confidence * 100)}%</span>
-                        {v.reviewState !== 'PENDING' && <span>· {v.reviewState.toLowerCase()}</span>}
-                        <span className="ml-auto shrink-0 tabular-nums">
-                          {relativeTime(v.createdAt)}
-                        </span>
-                      </div>
-                      {owner && (
-                        <span className="text-ink-faint text-micro truncate">{owner.label}</span>
-                      )}
-                    </button>
                   </div>
-                );
-              })}
-            </>
-          )}
-        </aside>
-
-        {loading ? (
-          <section className="min-h-0 overflow-y-auto px-6 py-5">
-            <Skeleton className="h-4 w-64" />
-            <Skeleton className="mt-2.5 h-3 w-44" />
-            <Skeleton className="mt-6 h-3 w-full" />
-            <Skeleton className="mt-2 h-3 w-11/12" />
-            <Skeleton className="mt-2 h-3 w-3/5" />
-            <Skeleton className="mt-8 h-28 w-full" />
-          </section>
-        ) : selected ? (
-          <section className="min-h-0 overflow-y-auto px-6 py-5">
-            <div className="flex items-start gap-3">
-              <div className="min-w-0 flex-1">
-                <h2 className="truncate font-medium">{selected.testResult.test.name}</h2>
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                  <Link
-                    href={`/runs/${selected.testResult.runId}`}
-                    className="text-ink-faint hover:text-accent font-mono text-micro"
-                  >
-                    {selected.testResult.test.filePath} →
-                  </Link>
-                  {/*
-                    The question every triage decision actually rests on, and
-                    this screen could not answer it: is this test always like
-                    this? A verdict of FLAKE on a test that has failed forty
-                    times running is a different call from the same verdict on
-                    one that has never failed before, and the flake rate,
-                    quarantine state and the bisect all live one click away.
-                  */}
-                  <Link
-                    href={`/tests/${selected.testResult.test.id}`}
-                    className="text-ink-faint hover:text-accent text-micro hover:underline"
-                    title="Pass rate, flake rate, quarantine state, and when it started failing"
-                  >
-                    Has it always done this? →
-                  </Link>
-                </div>
-              </div>
-              <Badge tone={metaFor(selected.verdict).tone} mono className="rounded-md px-2">
-                {metaFor(selected.verdict).label}
-              </Badge>
-              <Badge mono className="text-ink-dim rounded-md px-2 tabular-nums">
-                {Math.round(selected.confidence * 100)}% confident
-              </Badge>
-            </div>
-
-            {owners.get(selected.testResult.test.id)?.owner && (
-              <p className="text-ink-faint text-micro mt-2">
-                Owned by {owners.get(selected.testResult.test.id)!.owner!.label}
-                {owners.get(selected.testResult.test.id)!.reason
-                  ? ` — ${owners.get(selected.testResult.test.id)!.reason}`
-                  : ''}
-              </p>
-            )}
-
-            <p className="text-ink-dim mt-4 text-sm leading-relaxed">{selected.explanation}</p>
-            <p className="text-ink-faint mt-2 text-xs">
-              {metaFor(selected.verdict).blurb}
-              {/* The blurb has always said "the healer proposes a fix" and then
-                  left the user to find /heals in the sidebar on their own. The
-                  triage loop was described but never linked together. */}
-              {/* Only when a proposal exists — see healedTestIds. */}
-              {selected.verdict === 'INTENDED_CHANGE' &&
-                (healedTestIds.has(selected.testResult.test.id) ? (
-                  <>
-                    {' '}
-                    {/* Scoped to THIS test. The bare /heals link dropped you into
-                        a queue of every proposal in the project and left you to
-                        find the one for the failure you were just reading. */}
-                    <Link
-                      href={`/heals?test=${selected.testResult.test.id}`}
-                      className="text-accent hover:underline"
-                    >
-                      Review the proposed fix for this test →
-                    </Link>
-                  </>
-                ) : (
-                  <>
-                    {' '}
-                    <span className="text-ink-faint">
-                      The healer has not proposed a fix for this one — update the test in the editor.
-                    </span>{' '}
-                    <Link
-                      href={`/editor?test=${selected.testResult.test.id}`}
-                      className="text-accent hover:underline"
-                    >
-                      Open it →
-                    </Link>
-                  </>
                 ))}
-            </p>
-
-            <div className="mt-6">
-              <SectionLabel>Evidence it used</SectionLabel>
-            </div>
-            <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
-              {selected.evidence.map((e, i) => (
-                <div key={i} className="px-4 py-2.5">
-                  <div className="flex items-baseline gap-2">
-                    <Badge mono>{e.kind}</Badge>
-                    <span className="text-ink-faint font-mono text-meta">{e.ref}</span>
-                  </div>
-                  <p className="text-ink-dim mt-1 text-xs">{e.detail}</p>
-                </div>
-              ))}
-              {selected.evidence.length === 0 && (
-                <p className="text-ink-faint text-micro px-4 py-3">
-                  No screenshot, trace or console output was captured for this failure.
-                </p>
-              )}
-            </div>
-            <p className="text-ink-faint mt-2 text-micro">
-              Decided by {selected.model}.{' '}
-              <span className="tabular-nums">{relativeTime(selected.createdAt)}</span>
-            </p>
-
-            {selected.reviewState === 'PENDING' ? (
-              <div className="border-line mt-6 rounded-lg border p-4">
-                <p className="mb-3 text-sm font-medium">Do you agree?</p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    variant="primary"
-                    onClick={() => void review(selected, 'accept')}
-                    disabled={busy !== null}
-                    loading={busy === 'accept'}
-                  >
-                    Agree
-                  </Button>
-                  <Button
-                    onClick={() => void review(selected, 'mute')}
-                    disabled={busy !== null}
-                    loading={busy === 'mute'}
-                  >
-                    Mute
-                  </Button>
-                </div>
-                <p className="text-ink-faint mt-4 mb-2 text-xs">Or say what it really was:</p>
-                <div className="flex flex-wrap gap-2">
-                  {OVERRIDES.filter((o) => o !== selected.verdict).map((o) => (
-                    <Button
-                      key={o}
-                      size="sm"
-                      onClick={() => void review(selected, 'override', o)}
-                      disabled={busy !== null}
-                      loading={busy === o}
-                    >
-                      {metaFor(o).label}
-                    </Button>
-                  ))}
-                </div>
-                {pickable.length > 1 && picked.size === 0 && (
-                  <p className="text-ink-faint text-micro mt-4">
-                    {/* The discoverability problem this feature actually has:
-                        nobody looks for a checkbox until they know there is one. */}
-                    Same cause as others in the list? Tick them on the left and decide once.
-                  </p>
-                )}
               </div>
-            ) : (
-              <p className="text-ink-faint mt-6 text-xs">
-                Already reviewed — {selected.reviewState.toLowerCase()}.
-              </p>
-            )}
-          </section>
-        ) : (
-          <section className="grid place-items-center">
-            <p className="text-ink-faint text-sm">Select a verdict.</p>
-          </section>
-        )}
-      </div>
+            </div>
+          )}
+
+          <p className="text-ink-faint mt-11 text-center font-mono text-[10.5px]">
+            j/k move · a agree · f flake · i intended · m mute · u undo · ⏎ evidence
+          </p>
+        </>
+      )}
     </Page>
   );
+}
+
+/** What the undo strip says happened, in the words a person would use. */
+function sentenceFor(action: Action, applied: number, overrideTo?: VerdictKind): string {
+  const failures = `${applied} ${applied === 1 ? 'failure' : 'failures'}`;
+  if (action === 'accept') return `Agreed with ${failures} in one go`;
+  if (action === 'mute') return `Muted ${failures} in one go`;
+  return `Called ${failures} ${metaFor(overrideTo ?? '').label.toLowerCase()} in one go`;
 }

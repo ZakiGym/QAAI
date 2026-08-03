@@ -22,11 +22,26 @@ export function DesktopChrome() {
     if (!/electron/i.test(navigator.userAgent)) return;
 
     document.documentElement.dataset.desktop = 'true';
-    // Only macOS draws its window buttons over the page, so the header inset is
-    // platform-specific. `Mac` in the UA is reliable enough for a CSS hook.
-    document.documentElement.dataset.desktopPlatform = /mac/i.test(navigator.userAgent)
+
+    /*
+     * Three platforms, because they need three different things:
+     *
+     *   mac   — the OS draws its traffic lights OVER the page, so the sidebar
+     *           insets to clear them and is itself the drag region.
+     *   win   — the OS draws nothing, so the app supplies a title bar with its
+     *           own caption buttons (see WindowsTitleBar).
+     *   other — Linux, where the WM usually keeps a real frame. Left alone.
+     *
+     * `other` was previously everything-but-mac, which meant Windows users got a
+     * frameless window with no title bar and no caption buttons at all: nowhere
+     * to grab it, and no way to close it except a keyboard shortcut.
+     */
+    const ua = navigator.userAgent;
+    document.documentElement.dataset.desktopPlatform = /mac/i.test(ua)
       ? 'mac'
-      : 'other';
+      : /windows|win32|win64/i.test(ua)
+        ? 'win'
+        : 'other';
   }, []);
 
   return null;

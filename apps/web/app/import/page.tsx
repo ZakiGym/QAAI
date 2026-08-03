@@ -5,16 +5,24 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { API_URL, api, ApiError, type Project } from '../../lib/api';
 import { useProject } from '../../components/shell/ProjectContext';
+import { TestsHeader } from '../../components/TestsHeader';
 import { Button } from '../../components/ui/Button';
 import { Field } from '../../components/ui/Field';
-import { Page, PageHeader, SectionLabel } from '../../components/ui/layout';
+import { Page, SectionLabel } from '../../components/ui/layout';
+import { cn } from '../../lib/cn';
 
 /**
  * Suite import (§7) — the migration wedge, on the landing page as a headline.
  *
- * Upload your Cypress/Selenium/… suite → QAAI detects the framework, converts
- * to Playwright, and reports the coverage gained. Detection is instant and
- * shown before you commit; the guess is never binding — you can override it.
+ * Drop your Cypress/Selenium/… suite → QAAI detects the framework, converts to
+ * Playwright, and reports the coverage gained. Detection is instant and shown
+ * before you commit; the guess is never binding — you can override it.
+ *
+ * The dropzone is a real dropzone. It has always LOOKED like one — dashed
+ * border, "or a whole folder" — and had no drop handler at all, so dropping a
+ * suite on it navigated the browser away to the first file. Folders come in
+ * through `webkitGetAsEntry`, which is the only way a drop can carry a
+ * directory; the file input alone cannot.
  */
 
 interface Detection {
@@ -49,7 +57,57 @@ const OVERRIDES = Object.keys(FRAMEWORK_LABEL).filter((f) => f !== 'UNKNOWN');
 /** What an unfilled base URL becomes. Stated in the UI rather than only here. */
 const DEFAULT_BASE_URL = 'http://localhost:3000';
 
+/**
+ * Folders nobody means to import.
+ *
+ * Someone dropping a repo root drops their dependencies with it, and a
+ * node_modules walk is tens of thousands of files read into memory as text
+ * before anything is sent. The cap below is the same guard from the other end.
+ */
+const SKIP_DIRS = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.turbo']);
+const MAX_FILES = 2000;
+
 type Phase = 'upload' | 'detected' | 'converting' | 'done' | 'error';
+
+/** One dropped or picked file, with the path the API should see it under. */
+interface Picked {
+  path: string;
+  file: File;
+}
+
+/** `readEntries` yields at most 100 at a time and signals the end with an empty batch. */
+function readAll(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  return new Promise((resolve, reject) => {
+    const all: FileSystemEntry[] = [];
+    const pump = () =>
+      reader.readEntries((batch) => {
+        if (batch.length === 0) {
+          resolve(all);
+          return;
+        }
+        all.push(...batch);
+        pump();
+      }, reject);
+    pump();
+  });
+}
+
+async function walk(entry: FileSystemEntry, prefix: string, out: Picked[]): Promise<void> {
+  if (out.length >= MAX_FILES) return;
+
+  if (entry.isFile) {
+    const file = await new Promise<File>((resolve, reject) =>
+      (entry as FileSystemFileEntry).file(resolve, reject),
+    );
+    out.push({ path: `${prefix}${entry.name}`, file });
+    return;
+  }
+
+  if (entry.isDirectory && !SKIP_DIRS.has(entry.name)) {
+    const children = await readAll((entry as FileSystemDirectoryEntry).createReader());
+    for (const child of children) await walk(child, `${prefix}${entry.name}/`, out);
+  }
+}
 
 export default function ImportPage() {
   const router = useRouter();
@@ -61,9 +119,12 @@ export default function ImportPage() {
   const { project, loading: projectsLoading, reload } = useProject();
   const [files, setFiles] = useState<Array<{ path: string; content: string }>>([]);
   const [phase, setPhase] = useState<Phase>('upload');
+  const [dragging, setDragging] = useState(false);
+  const [reading, setReading] = useState(false);
   const [batchId, setBatchId] = useState<string | null>(null);
   const [detection, setDetection] = useState<Detection | null>(null);
   const [framework, setFramework] = useState<string>('');
+  const [overriding, setOverriding] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const [convertedCount, setConvertedCount] = useState(0);
   const [summary, setSummary] = useState<string | null>(null);
@@ -86,31 +147,67 @@ export default function ImportPage() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [log]);
 
-  async function onPick(list: FileList | null) {
-    if (!list) return;
-    const read = await Promise.all(
-      Array.from(list).map(
-        (file) =>
-          new Promise<{ path: string; content: string }>((resolve) => {
-            const reader = new FileReader();
-            reader.onload = () =>
-              resolve({
-                path: file.webkitRelativePath || file.name,
-                content: String(reader.result ?? ''),
-              });
-            reader.readAsText(file);
-          }),
-      ),
-    );
-    setFiles(read);
+  /** Read the picked files as text and name the project after what was dropped. */
+  const ingest = useCallback(
+    async (picked: Picked[]) => {
+      if (picked.length === 0) return;
+      setReading(true);
+      try {
+        const read = await Promise.all(
+          picked.slice(0, MAX_FILES).map(
+            ({ path, file }) =>
+              new Promise<{ path: string; content: string }>((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve({ path, content: String(reader.result ?? '') });
+                reader.onerror = () => resolve({ path, content: '' });
+                reader.readAsText(file);
+              }),
+          ),
+        );
+        setFiles(read);
+        setPhase('upload');
+        setDetection(null);
+        setBatchId(null);
+        setError(null);
 
-    // Name the project after the folder they dropped, when they have none yet.
-    if (!newProjectName) {
-      const top = read
-        .map((f) => f.path.split('/')[0])
-        .find((seg) => seg && !seg.includes('.'));
-      setNewProjectName(top ? top.replace(/[-_]/g, ' ') : 'Imported tests');
+        setNewProjectName((current) => {
+          if (current) return current;
+          const top = read.map((f) => f.path.split('/')[0]).find((seg) => seg && !seg.includes('.'));
+          return top ? top.replace(/[-_]/g, ' ') : 'Imported tests';
+        });
+      } finally {
+        setReading(false);
+      }
+    },
+    [],
+  );
+
+  function onPick(list: FileList | null) {
+    if (!list) return;
+    void ingest(
+      Array.from(list).map((file) => ({ path: file.webkitRelativePath || file.name, file })),
+    );
+  }
+
+  async function onDrop(event: React.DragEvent) {
+    event.preventDefault();
+    setDragging(false);
+
+    // The entries have to be captured synchronously — the DataTransfer is
+    // emptied the moment this handler yields.
+    const entries = Array.from(event.dataTransfer.items)
+      .map((item) => item.webkitGetAsEntry?.() ?? null)
+      .filter((entry): entry is FileSystemEntry => entry !== null);
+
+    if (entries.length > 0) {
+      const picked: Picked[] = [];
+      for (const entry of entries) await walk(entry, '', picked);
+      void ingest(picked);
+      return;
     }
+
+    // A browser with no entry API still gives us the flat file list.
+    void ingest(Array.from(event.dataTransfer.files).map((file) => ({ path: file.name, file })));
   }
 
   async function detect() {
@@ -141,7 +238,7 @@ export default function ImportPage() {
           /* the suite still imports without an environment; runs need one later */
         });
         setCreatedProject(created.project);
-        // So the switcher in the top bar knows about it too.
+        // So the switcher in the sidebar knows about it too.
         void reload();
       }
 
@@ -152,6 +249,7 @@ export default function ImportPage() {
       setBatchId(res.batch.id);
       setDetection(res.detection);
       setFramework(res.detection.framework);
+      setOverriding(false);
       setPhase('detected');
     } catch (err) {
       // The page no longer fetches /projects itself, so this is where a
@@ -220,43 +318,68 @@ export default function ImportPage() {
     }
   }
 
-  return (
-    <Page width="narrow">
-      <PageHeader
-        title="Import an existing suite"
-        subtitle="Cypress, Selenium, WebdriverIO, Puppeteer, TestCafe, Nightwatch, Robot Framework, Postman, Karate, or Cucumber. QAAI detects it, converts to Playwright, and reports what you gained."
-      />
+  const showDropzone = phase !== 'converting' && phase !== 'done';
 
-      {(phase === 'upload' || phase === 'detected' || phase === 'error') && (
-        <div>
-          <label
-            htmlFor="files"
-            className="border-line hover:border-accent block cursor-pointer rounded-lg border border-dashed p-8 text-center"
-          >
-            <span className="text-ink-dim text-sm tabular-nums">
-              {files.length > 0
-                ? `${files.length} file(s) selected`
-                : 'Choose your test files (or a whole folder)'}
-            </span>
-            <input
-              id="files"
-              type="file"
-              multiple
-              // @ts-expect-error — non-standard but widely supported folder upload
-              webkitdirectory=""
-              onChange={(e) => void onPick(e.target.files)}
-              className="hidden"
-            />
-          </label>
-          <p className="text-ink-faint mt-2 text-center text-xs">
-            Nothing leaves your machine except the file contents, sent to your QAAI instance.
+  return (
+    <Page width="full">
+      <TestsHeader />
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto w-full max-w-[720px] px-10 pt-8 pb-16">
+          <p className="text-ink-dim text-[13.5px] leading-relaxed">
+            Drop a suite; QAAI detects the framework, converts to Playwright, and reports the
+            coverage gained. The guess is never binding.
           </p>
+
+          {showDropzone && (
+            <>
+              <label
+                htmlFor="files"
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragging(true);
+                }}
+                onDragLeave={() => setDragging(false)}
+                onDrop={(e) => void onDrop(e)}
+                className={cn(
+                  'mt-4 block cursor-pointer rounded-xl border-[1.5px] border-dashed p-9 text-center transition-colors',
+                  dragging
+                    ? 'border-accent bg-[color-mix(in_srgb,var(--color-accent)_6%,transparent)]'
+                    : 'border-line-strong hover:border-accent',
+                )}
+              >
+                <span className="block text-[14px] font-medium">
+                  {reading
+                    ? 'Reading…'
+                    : files.length > 0
+                      ? `${files.length} file${files.length === 1 ? '' : 's'} selected`
+                      : 'Drop a suite folder'}
+                </span>
+                <span className="text-ink-faint mt-1.5 block text-[12px]">
+                  Cypress, Selenium, WebdriverIO, TestCafe, Postman, Cucumber… or{' '}
+                  <span className="text-accent">browse</span>
+                </span>
+                <input
+                  id="files"
+                  type="file"
+                  multiple
+                  // @ts-expect-error — non-standard but widely supported folder upload
+                  webkitdirectory=""
+                  onChange={(e) => onPick(e.target.files)}
+                  className="hidden"
+                />
+              </label>
+              <p className="text-ink-faint mt-2 text-center text-[11.5px]">
+                Nothing leaves your machine except the file contents, sent to your QAAI instance.
+              </p>
+            </>
+          )}
 
           {/* No project yet — name the one this import will create. */}
           {files.length > 0 && !projectsLoading && !activeProjectId && (
-            <div className="border-line mt-4 space-y-3 rounded-lg border p-4">
+            <div className="border-line mt-5 space-y-3 rounded-lg border p-4">
               <SectionLabel>New project</SectionLabel>
-              <p className="text-ink-dim text-xs">
+              <p className="text-ink-dim text-[12px]">
                 You have no project yet, so this import will create one.
               </p>
               <Field
@@ -278,90 +401,145 @@ export default function ImportPage() {
             </div>
           )}
 
-          {files.length > 0 && phase !== 'detected' && (
+          {files.length > 0 && phase !== 'detected' && phase !== 'converting' && phase !== 'done' && (
             <Button variant="primary" onClick={() => void detect()} className="mt-4 w-full">
-              Detect framework
+              Detect the framework
             </Button>
           )}
-        </div>
-      )}
 
-      {detection && (phase === 'detected' || phase === 'converting' || phase === 'done') && (
-        <div className="border-line bg-surface-1 mt-6 rounded-lg border p-5">
-          <div className="flex items-baseline justify-between">
-            <div>
-              <p className="text-ink-faint text-xs">Detected</p>
-              <p className="text-lg font-semibold">{FRAMEWORK_LABEL[detection.framework]}</p>
-            </div>
-            <span className="text-ink-faint font-mono text-xs tabular-nums">
-              {Math.round(detection.confidence * 100)}% · {detection.fileCount} files
-            </span>
-          </div>
+          {detection && phase !== 'upload' && (
+            <section className="border-line mt-5 rounded-lg border px-[18px] py-4">
+              <div className="flex flex-wrap items-baseline gap-2.5">
+                <span className="text-micro text-accent rounded-sm bg-[color-mix(in_srgb,var(--color-accent)_12%,transparent)] px-2 py-[3px] font-mono font-semibold tracking-[0.05em] tabular-nums">
+                  {detection.framework} · {detection.confidence.toFixed(2)}
+                </span>
+                <span className="text-ink-dim min-w-0 text-[13px]">
+                  <span className="tabular-nums">{detection.fileCount}</span> file
+                  {detection.fileCount === 1 ? '' : 's'}
+                  {detection.evidence.length > 0 && <> · evidence: {detection.evidence.join(', ')}</>}
+                </span>
+                {phase === 'detected' && (
+                  <span className="text-ink-faint ml-auto font-mono text-[10.5px]">
+                    wrong?{' '}
+                    <button
+                      type="button"
+                      onClick={() => setOverriding((open) => !open)}
+                      aria-expanded={overriding}
+                      className="text-accent hover:underline"
+                    >
+                      override
+                    </button>
+                  </span>
+                )}
+              </div>
 
-          {phase === 'detected' && (
-            <>
-              <label htmlFor="override" className="text-ink-faint mt-4 mb-1 block text-xs">
-                Not right? Convert as:
-              </label>
-              <select
-                id="override"
-                value={framework}
-                onChange={(e) => setFramework(e.target.value)}
-                className="border-line bg-surface focus:border-accent w-full rounded-md border px-3 py-2 text-sm outline-none"
-              >
-                {OVERRIDES.map((f) => (
-                  <option key={f} value={f}>
-                    {FRAMEWORK_LABEL[f]}
-                  </option>
-                ))}
-              </select>
+              {phase === 'detected' && overriding && (
+                <div className="mt-3">
+                  <label htmlFor="override" className="text-ink-faint mb-1.5 block text-[11.5px]">
+                    Convert as
+                    {detection.alternatives.length > 0 && (
+                      <>
+                        {' '}
+                        — it also looked like{' '}
+                        {detection.alternatives
+                          .slice(0, 2)
+                          .map((a) => FRAMEWORK_LABEL[a.framework] ?? a.framework)
+                          .join(', ')}
+                      </>
+                    )}
+                  </label>
+                  <select
+                    id="override"
+                    value={framework}
+                    onChange={(e) => setFramework(e.target.value)}
+                    className="border-line bg-surface focus:border-accent text-body-sm w-full rounded-md border px-3 py-2 outline-none"
+                  >
+                    {OVERRIDES.map((f) => (
+                      <option key={f} value={f}>
+                        {FRAMEWORK_LABEL[f]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
-              {framework !== 'POSTMAN' && (
-                <p className="text-flake mt-3 text-xs">
+              {(phase === 'converting' || phase === 'done') && (
+                <div
+                  ref={logRef}
+                  role="log"
+                  aria-live="polite"
+                  className="border-line text-ink-faint mt-3 max-h-[120px] overflow-y-auto rounded-lg border px-3 py-2.5 font-mono text-[10.5px] leading-[1.7]"
+                >
+                  {log.length === 0 ? (
+                    <p>Starting the converter…</p>
+                  ) : (
+                    log.map((line, i) => (
+                      // A skip or a not-a-valid-X is not an error, but it is the
+                      // one line in a hundred someone has to actually read.
+                      <p
+                        key={i}
+                        className={
+                          /skipped|not a valid|no tests found|failed/i.test(line)
+                            ? 'text-flake'
+                            : undefined
+                        }
+                      >
+                        {line}
+                      </p>
+                    ))
+                  )}
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-2.5">
+                {phase === 'detected' && (
+                  <Button variant="primary" onClick={() => void convert()}>
+                    Convert {detection.fileCount} file{detection.fileCount === 1 ? '' : 's'}
+                  </Button>
+                )}
+                {phase === 'converting' && (
+                  <span className="text-ink-dim text-[12px]">
+                    Converting {detection.fileCount} file{detection.fileCount === 1 ? '' : 's'}…
+                  </span>
+                )}
+                {phase === 'done' && (
+                  <span className="text-ink-dim text-[12px]">
+                    <span className="text-pass tabular-nums">{convertedCount}</span> converted ·{' '}
+                    <span className="text-flake">every one flagged for review</span> — the flags open
+                    in the editor
+                  </span>
+                )}
+              </div>
+
+              {phase === 'detected' && framework !== 'POSTMAN' && (
+                <p className="text-flake mt-2.5 text-[11.5px] leading-relaxed">
                   Code conversion uses the model — it needs ANTHROPIC_API_KEY set. Postman
                   collections convert without a key.
                 </p>
               )}
-
-              <Button variant="primary" onClick={() => void convert()} className="mt-4 w-full">
-                Convert to Playwright
-              </Button>
-            </>
+            </section>
           )}
-        </div>
-      )}
-
-      {(phase === 'converting' || phase === 'done') && (
-        <div className="mt-6">
-          <div
-            ref={logRef}
-            className="border-line bg-surface-1 h-56 overflow-y-auto rounded-md border p-3 font-mono text-micro"
-          >
-            {log.map((line, i) => (
-              <div key={i} className="text-ink-dim">
-                {line}
-              </div>
-            ))}
-          </div>
 
           {phase === 'done' && (
-            <div className="border-pass/40 bg-pass/10 mt-4 rounded-lg border p-4">
-              <p className="text-pass font-medium">
+            <div className="mt-5 rounded-lg border border-[color-mix(in_srgb,var(--color-pass)_35%,transparent)] bg-[color-mix(in_srgb,var(--color-pass)_7%,transparent)] px-[18px] py-4">
+              <p className="text-[13.5px] font-semibold">
                 Migrated <span className="tabular-nums">{convertedCount}</span> test
                 {convertedCount === 1 ? '' : 's'} to the Imported suite.
               </p>
               {summary && (
-                <p className="text-ink-dim mt-2 text-xs whitespace-pre-wrap">{summary}</p>
+                <p className="text-ink-dim mt-1.5 text-[12px] leading-relaxed whitespace-pre-wrap">
+                  {summary}
+                </p>
               )}
-              <Link href="/editor" className="text-accent mt-3 inline-block text-sm">
+              <Link href="/editor" className="text-accent mt-3 inline-block text-[12.5px]">
                 Open them in the editor →
               </Link>
             </div>
           )}
-        </div>
-      )}
 
-      {error && <p className="text-fail mt-6 text-sm">{error}</p>}
+          {error && <p className="text-fail mt-5 text-[13px] leading-relaxed">{error}</p>}
+        </div>
+      </div>
     </Page>
   );
 }

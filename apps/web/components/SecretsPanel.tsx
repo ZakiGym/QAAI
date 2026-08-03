@@ -1,10 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type Secret } from '../lib/api';
+import { shortAgo } from './setup/time';
 import { Button } from './ui/Button';
-import { Field } from './ui/Field';
 import { ConfirmDialog } from './ui/Modal';
+import { SectionLabel, SkeletonRows } from './ui/layout';
 
 /**
  * The secrets of one environment.
@@ -13,6 +14,11 @@ import { ConfirmDialog } from './ui/Modal';
  * UI only ever shows its name and a masked hint (••••••••+last4). The plaintext
  * lives in the AES-256-GCM vault and is decrypted solely inside a test run — it
  * is never sent back to the browser, so there is nothing here to leak.
+ *
+ * "Rotate" is not a second endpoint — setting a name that already exists IS the
+ * rotation, and it is the only way to change a value the server will never read
+ * back to you. So the link fills the add row rather than opening anything: the
+ * act and the affordance are the same act.
  */
 export function SecretsPanel({
   projectId,
@@ -22,7 +28,10 @@ export function SecretsPanel({
   environmentId: string;
 }) {
   const base = `/projects/${projectId}/environments/${environmentId}/secrets`;
-  const [secrets, setSecrets] = useState<Secret[]>([]);
+  // `null` until the first fetch settles. Initialising to `[]` meant the empty
+  // state — "No secrets yet" — was what rendered during every load, telling
+  // someone with twelve secrets that they had none.
+  const [secrets, setSecrets] = useState<Secret[] | null>(null);
   const [name, setName] = useState('');
   const [value, setValue] = useState('');
   const [busy, setBusy] = useState(false);
@@ -32,6 +41,7 @@ export function SecretsPanel({
   const [importNote, setImportNote] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<Secret | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const valueRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
     const data = await api<{ secrets: Secret[] }>(base).catch(() => ({ secrets: [] }));
@@ -39,6 +49,7 @@ export function SecretsPanel({
   }, [base]);
 
   useEffect(() => {
+    setSecrets(null);
     void load();
   }, [load]);
 
@@ -104,85 +115,128 @@ export function SecretsPanel({
     }
   }
 
-  return (
-    <div className="space-y-4">
-      <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
-        {secrets.map((secret) => (
-          <div key={secret.id} className="flex items-center gap-4 px-4 py-2.5">
-            <span className="font-mono text-xs font-medium">{secret.name}</span>
-            <span className="text-ink-faint font-mono text-xs">{secret.value}</span>
-            <Button
-              variant="danger"
-              size="sm"
-              className="ml-auto"
-              onClick={() => setPendingDelete(secret)}
-            >
-              Delete
-            </Button>
-          </div>
-        ))}
-        {secrets.length === 0 && (
-          <p className="text-ink-faint px-4 py-4 text-center text-xs">
-            No secrets yet. Tests read these as environment variables.
-          </p>
-        )}
-      </div>
+  function rotate(secret: Secret) {
+    setName(secret.name);
+    setValue('');
+    valueRef.current?.focus();
+  }
 
-      <form onSubmit={add} className="flex items-center gap-2">
+  return (
+    <section className="mt-7">
+      <SectionLabel>Secrets · Vault</SectionLabel>
+
+      {secrets === null ? (
+        <SkeletonRows rows={3} />
+      ) : secrets.length === 0 ? (
+        <p className="border-line text-ink-faint text-row-sub border-b py-2.5">
+          No secrets here yet. Tests read these as environment variables — an admin password, a
+          test-mode API key, an SMTP URL.
+        </p>
+      ) : (
+        <div>
+          {secrets.map((secret) => (
+            <div
+              key={secret.id}
+              className="border-line flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b py-2.5"
+            >
+              {/* `min-w` so the row wraps its metadata rather than eliding the
+                  name — the name is the only part of a secret we can ever show,
+                  and `ADMIN_P…` identifies nothing. */}
+              <span className="min-w-[150px] flex-1 font-mono text-[12px] break-all">
+                {secret.name}
+              </span>
+              <span className="text-ink-faint text-micro font-mono tabular-nums">
+                {secret.value} · set {shortAgo(secret.updatedAt)} ago
+              </span>
+              <button
+                type="button"
+                onClick={() => rotate(secret)}
+                className="text-ink-faint hover:text-ink text-[11.5px] transition-colors"
+              >
+                rotate
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingDelete(secret)}
+                className="text-ink-faint hover:text-fail text-[11.5px] transition-colors"
+              >
+                delete
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <form onSubmit={add} className="mt-3 flex flex-wrap gap-2">
         {/* Neither input had a label of any kind — the placeholder was the only
             thing naming the field, and it disappears the moment you type. */}
-        <div className="w-48 shrink-0">
-          <Field
-            aria-label="Secret name"
-            value={name}
-            onChange={(e) => setName(e.target.value.toUpperCase())}
-            placeholder="SECRET_NAME"
-            className="font-mono text-xs"
-          />
-        </div>
-        <div className="min-w-0 flex-1">
-          <Field
-            aria-label="Secret value"
-            type="password"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder="value"
-            autoComplete="off"
-            className="text-xs"
-          />
-        </div>
-        <Button type="submit" variant="primary" size="sm" loading={busy}>
-          Set
+        <input
+          aria-label="Secret name"
+          value={name}
+          onChange={(e) => setName(e.target.value.toUpperCase())}
+          placeholder="NAME"
+          className="border-line placeholder:text-ink-faint focus:border-accent w-[110px] shrink-0 rounded-md border bg-transparent px-2.5 py-[7px] font-mono text-[11.5px] outline-none transition-colors"
+        />
+        <input
+          ref={valueRef}
+          aria-label="Secret value"
+          type="password"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="value — encrypted on write"
+          autoComplete="off"
+          className="border-line placeholder:text-ink-faint focus:border-accent min-w-[120px] flex-1 rounded-md border bg-transparent px-2.5 py-[7px] font-mono text-[11.5px] outline-none transition-colors"
+        />
+        <Button type="submit" size="sm" loading={busy}>
+          Add
         </Button>
       </form>
 
-      <div>
-        <Button variant="ghost" size="sm" className="-ml-2.5" onClick={() => setShowImport((s) => !s)}>
-          {showImport ? '– Hide .env import' : '+ Import a .env file'}
-        </Button>
+      <p className="text-ink-faint text-micro mt-2.5 font-mono">
+        AES-256-GCM · bound to (org, name) · values are never shown back — rotate to change
+      </p>
+
+      <div className="mt-3">
+        <button
+          type="button"
+          onClick={() => setShowImport((s) => !s)}
+          aria-expanded={showImport}
+          className="text-accent text-[12px] hover:underline"
+        >
+          {showImport ? '– hide .env import' : '+ import a .env file'}
+        </button>
         {showImport && (
           <div className="mt-2 space-y-2">
             <textarea
+              aria-label=".env contents"
               value={envText}
               onChange={(e) => setEnvText(e.target.value)}
               placeholder={'API_TOKEN=sk-…\nADMIN_PASSWORD=…'}
               rows={5}
-              className="border-line bg-surface-1 focus:border-accent w-full rounded-md border px-3 py-2 font-mono text-xs outline-none"
+              className="border-line focus:border-accent text-micro w-full rounded-md border bg-transparent px-3 py-2 font-mono outline-none transition-colors"
             />
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <Button size="sm" onClick={() => void importEnv()} loading={busy}>
                 Import into vault
               </Button>
-              <span className="text-ink-faint text-micro">
-                Parsed on the server; values are sealed and never shown again.
+              <span className="text-ink-faint text-micro font-mono">
+                parsed on the server · values are sealed and never shown again
               </span>
             </div>
           </div>
         )}
       </div>
 
-      {importNote && <p className="text-ink-dim text-xs tabular-nums">{importNote}</p>}
-      {error && <p className="text-fail text-xs">{error}</p>}
+      {importNote && (
+        <p className="text-ink-dim text-micro mt-2 font-mono tabular-nums" role="status">
+          {importNote}
+        </p>
+      )}
+      {error && (
+        <p className="text-fail text-micro mt-2" role="alert">
+          {error}
+        </p>
+      )}
 
       <ConfirmDialog
         open={pendingDelete !== null}
@@ -195,6 +249,6 @@ export function SecretsPanel({
         confirmLabel="Delete secret"
         busy={deleting}
       />
-    </div>
+    </section>
   );
 }

@@ -1,15 +1,18 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { usePathname, useRouter } from 'next/navigation';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import Link from 'next/link';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { Sidebar } from './Sidebar';
-import { NAV, SETTINGS_ITEM, SHELL_EXCLUDED } from './nav';
+import { WindowsTitleBar } from './WindowsTitleBar';
+import { ALL_SECTIONS, SHELL_EXCLUDED, isTabActive, sectionFor } from './nav';
 import { CommandPalette, type PaletteItem, type PaletteMode } from '../CommandPalette';
 import { useProject } from './ProjectContext';
 import { PaletteCommandsProvider, usePaletteRegistry } from './PaletteCommands';
-import { TopBar } from './TopBar';
 import { useToast } from '../ui/Toast';
 import { api } from '../../lib/api';
+import { cn } from '../../lib/cn';
 
 /**
  * The application shell — the persistent frame every signed-in surface lives in.
@@ -31,20 +34,28 @@ interface TestLite {
 }
 
 /**
- * Screens with no sidebar entry of their own.
+ * Screens with no row and no tab of their own.
  *
- * The palette listed exactly the sidebar, so six built screens could only be
- * reached by knowing where their tab lived — and two of them (the trace viewer
- * and, until now, impact analysis) had no tab at all. Anything reachable that
- * does not need an id from the current page belongs here.
+ * Every other destination now comes from `ALL_SECTIONS` and its tab strips, so
+ * this list is what is left over: reachable screens that do not need an id from
+ * the current page and do not appear in any strip. The trace viewer is absent
+ * because it needs a run.
  */
 const EXTRA_DESTINATIONS: ReadonlyArray<{ href: string; label: string; detail: string }> = [
-  { href: '/insights/coverage', label: 'Coverage gaps', detail: 'what nobody tested' },
-  { href: '/insights/health', label: 'Suite health', detail: 'duplicates, weak assertions' },
-  { href: '/insights/impact', label: 'Impact analysis', detail: 'which tests a diff needs' },
   { href: '/settings/github', label: 'GitHub App', detail: 'checks on pull requests' },
-  { href: '/settings/billing', label: 'Billing and usage', detail: 'plan, seats, minutes' },
 ];
+
+/**
+ * Where a page can ask for its section's tab strip.
+ *
+ * The strip is the shell's — it is derived from the route, and a page that
+ * forgets to render it leaves the section with no way out of the view you are
+ * in. But it belongs UNDER the page's own title, which only the page can place,
+ * so a page renders `<div id={SECTION_TABS_SLOT_ID} />` at that spot and the
+ * shell portals into it. Until one does, the shell draws the strip itself at
+ * the top of the column, so no section is ever left without its tabs.
+ */
+export const SECTION_TABS_SLOT_ID = 'qaai-section-tabs';
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   /*
@@ -196,13 +207,34 @@ function ShellFrame({ children }: { children: React.ReactNode }) {
         },
       }));
     }
-    const nav = [...NAV, SETTINGS_ITEM].map((n) => ({
-      id: `go:${n.href}`,
-      label: `Go to ${n.label}`,
-      detail: n.href,
-      group: 'Navigate',
-      run: () => router.push(n.href),
-    }));
+    /*
+     * Every destination, one entry per URL — not one per sidebar row.
+     *
+     * The sidebar went from sixteen rows to six sections with tab strips, and
+     * the palette was built from the rows. Listing only the rows would have
+     * quietly removed ten screens from ⌘K (heals, quality, flow map, import,
+     * repro, traffic, members, keys, billing, account) the moment they stopped
+     * having a row of their own.
+     */
+    const nav = ALL_SECTIONS.flatMap((section) =>
+      section.tabs
+        ? section.tabs.map((tab) => ({
+            id: `go:${tab.href}`,
+            label: `Go to ${section.label} · ${tab.label}`,
+            detail: tab.href,
+            group: 'Navigate',
+            run: () => router.push(tab.href),
+          }))
+        : [
+            {
+              id: `go:${section.href}`,
+              label: `Go to ${section.label}`,
+              detail: section.href,
+              group: 'Navigate',
+              run: () => router.push(section.href),
+            },
+          ],
+    );
 
     const extras = EXTRA_DESTINATIONS.map((n) => ({
       id: `go:${n.href}`,
@@ -313,7 +345,14 @@ function ShellFrame({ children }: { children: React.ReactNode }) {
   if (!inShell) return <>{children}</>;
 
   return (
-    <div className="flex h-screen overflow-hidden">
+    /*
+     * A column, so the Windows title bar can sit ABOVE the sidebar rather than
+     * beside it. It renders nothing on macOS, on Linux, or in a browser — the
+     * component checks the platform itself and returns null.
+     */
+    <div className="flex h-screen flex-col overflow-hidden">
+      <WindowsTitleBar />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         <Sidebar
           collapsed={collapsed}
           mounted={mounted}
@@ -321,9 +360,12 @@ function ShellFrame({ children }: { children: React.ReactNode }) {
           onOpenPalette={openCommands}
         />
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto">
-          {/* The bar owns project, breadcrumb and account for every screen, so
-              no page has to grow its own header to hold them. */}
-          <TopBar />
+          {/* useSearchParams needs a boundary or `next build` fails on every
+              statically rendered route. Settings' tabs are query params, so the
+              strip genuinely has to read them. */}
+          <Suspense fallback={null}>
+            <SectionTabs />
+          </Suspense>
           {children}
         </div>
         <CommandPalette
@@ -334,7 +376,60 @@ function ShellFrame({ children }: { children: React.ReactNode }) {
         />
         {shortcutsOpen && <ShortcutSheet onClose={() => setShortcutsOpen(false)} />}
       </div>
+    </div>
   );
+}
+
+/**
+ * The section's tab strip — Triage's verdicts/heals/quality, Tests' five
+ * screens, Settings' five.
+ *
+ * Every tab is a real `<Link>` to a real URL, which is the whole reason the
+ * sixteen-row sidebar could shrink to six without losing anything: a run link
+ * in Slack, a bookmarked heals queue and every selector in the dogfood suite
+ * all still resolve. It is derived from the path rather than from local state,
+ * so Back works and the strip is never out of step with what is on screen.
+ */
+function SectionTabs() {
+  const pathname = usePathname();
+  const search = useSearchParams().toString();
+  const section = sectionFor(pathname);
+
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    setSlot(document.getElementById(SECTION_TABS_SLOT_ID));
+  }, [pathname, search]);
+
+  if (!section?.tabs) return null;
+
+  const strip = (
+    <nav
+      aria-label={`${section.label} views`}
+      className="border-line flex flex-wrap gap-[22px] border-b"
+    >
+      {section.tabs.map((tab) => {
+        const active = isTabActive(pathname, search, tab.href);
+        return (
+          <Link
+            key={tab.href}
+            href={tab.href}
+            aria-current={active ? 'page' : undefined}
+            className={cn(
+              'text-micro -mb-px border-b-2 px-0.5 pb-[9px] font-mono tracking-[0.08em] uppercase transition-colors',
+              active
+                ? 'border-accent text-ink'
+                : 'text-ink-faint hover:text-ink-dim border-transparent',
+            )}
+          >
+            {tab.label}
+          </Link>
+        );
+      })}
+    </nav>
+  );
+
+  if (slot) return createPortal(strip, slot);
+  return <div className="mx-auto w-full max-w-[1080px] px-10 pt-9">{strip}</div>;
 }
 
 /** Every binding in one place. Reached with ⌘/ or from the command palette. */

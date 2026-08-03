@@ -8,7 +8,6 @@ import type {
   CoverageGap,
   CoverageProposeResult,
   CoverageReport,
-  GapConfidence,
   GapKind,
 } from '../lib/api';
 import { cn } from '../lib/cn';
@@ -16,7 +15,7 @@ import { Button } from './ui/Button';
 import { EmptyState } from './ui/EmptyState';
 import { Modal } from './ui/Modal';
 import { useToast } from './ui/Toast';
-import { Badge, Card, SectionLabel, Skeleton } from './ui/layout';
+import { Badge, SectionLabel, Skeleton } from './ui/layout';
 
 /**
  * Coverage gaps — the tests nobody wrote.
@@ -26,8 +25,8 @@ import { Badge, Card, SectionLabel, Skeleton } from './ui/layout';
  * screen is built around the evidence rather than around the number. A row that
  * says "nothing tests /checkout" and makes you take its word for it is a row
  * that gets argued with once and ignored forever; the API returns `evidence[]`
- * for exactly that reason, so it renders inline on every gap, never behind a
- * disclosure.
+ * for exactly that reason, so the first line of it is ON the row — never behind
+ * a disclosure — and the rest is one click away with the rank and the proposal.
  *
  * The two states people confuse are kept apart on purpose. "No flow map" means
  * the app was never crawled and we know nothing — it is NOT full coverage — and
@@ -54,24 +53,12 @@ const KIND_LABEL: Record<GapKind, string> = {
 const KIND_MEANING: Record<GapKind, string> = {
   UNVISITED_ROUTE: 'The crawler reached this page. No test does.',
   UNREACHED_AUTH_ROUTE: 'Behind a sign-in wall, and no authenticated test gets there.',
-  UNWALKED_JOURNEY: 'Tests touch the steps separately, so the hand-offs between them are unasserted.',
+  UNWALKED_JOURNEY:
+    'Tests touch the steps separately, so the hand-offs between them are unasserted.',
   UNSUBMITTED_FORM: 'A write path. Nothing fills it in or submits it.',
   UNUSED_AFFORDANCE: 'A control the crawl found and no test clicks.',
   NO_NEGATIVE_CASE: 'The feature has tests, and all of them only watch it succeed.',
 };
-
-const CONFIDENCE_TONE: Record<GapConfidence, 'neutral' | 'flake'> = {
-  HIGH: 'neutral',
-  MEDIUM: 'neutral',
-  LOW: 'flake',
-};
-
-/** High score = act on this first, so the ramp runs neutral → flake → fail. */
-function scoreTone(score: number): { text: string; bar: string } {
-  if (score >= 70) return { text: 'text-fail', bar: 'bg-fail' };
-  if (score >= 40) return { text: 'text-flake', bar: 'bg-flake' };
-  return { text: 'text-ink-dim', bar: 'bg-line-strong' };
-}
 
 // ─── Data ────────────────────────────────────────────────────────────────────
 
@@ -129,9 +116,7 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
         setTestNames(names);
       } catch (err) {
         if (cancelled) return;
-        setError(
-          err instanceof Error ? err.message : 'Could not load the coverage report',
-        );
+        setError(err instanceof Error ? err.message : 'Could not load the coverage report');
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -154,97 +139,96 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
 // ─── The answer, before the list ─────────────────────────────────────────────
 
 /**
- * The four ratios the headline is made of.
+ * One dimension of the crawl, as a share of itself.
  *
- * A total of zero is rendered as "none found", not as 0% — a crawl that found
- * no forms is not a suite that fails to test them.
+ * A total of zero renders as "none found" rather than 0%: a crawl that turned
+ * up no forms is not a suite that fails to test them, and a dead-empty bar
+ * saying 0% is the single most misread thing this screen could draw.
  */
-function Ratio({
-  label,
-  covered,
-  total,
-}: {
-  label: string;
-  covered: number;
-  total: number;
-}) {
+function Dimension({ label, covered, total }: { label: string; covered: number; total: number }) {
   const pct = total === 0 ? null : Math.round((covered / total) * 100);
   return (
     <div>
-      <div className="text-ink-faint text-micro mb-1.5 flex items-baseline justify-between gap-2">
-        <span>{label}</span>
-        {pct !== null && <span className="tabular-nums">{pct}%</span>}
-      </div>
-      {pct === null ? (
-        <>
-          <div className="bg-surface-2 h-1 rounded-full" />
-          <p className="text-ink-faint text-meta mt-1.5">none found</p>
-        </>
-      ) : (
-        <>
-          <div className="bg-surface-2 h-1 overflow-hidden rounded-full">
-            <div
-              className={cn('h-full rounded-full', pct >= 60 ? 'bg-pass' : 'bg-flake')}
-              style={{ width: `${Math.max(pct, 2)}%` }}
-            />
-          </div>
-          <p className="text-ink-dim text-meta mt-1.5 tabular-nums">
-            {covered} of {total} exercised
-          </p>
-        </>
-      )}
+      <p className="text-meta text-ink-faint mb-1.5 font-mono tracking-[0.08em] uppercase">
+        {label}{' '}
+        {pct === null ? (
+          <span className="text-ink-faint">none found</span>
+        ) : (
+          <span className="text-ink tabular-nums">{pct}%</span>
+        )}
+      </p>
+      <span className="bg-surface-2 block h-1 overflow-hidden rounded-full">
+        {pct !== null && (
+          <span className="bg-accent block h-full rounded-full" style={{ width: `${pct}%` }} />
+        )}
+      </span>
     </div>
   );
 }
 
-/** The lead: the answer as a sentence, then the arithmetic under it. */
-export function CoverageHeadline({
-  report,
-  compact = false,
-}: {
-  report: CoverageReport;
-  compact?: boolean;
-}) {
+/**
+ * The lead: the answer as a sentence, then the four ratios it is made of.
+ *
+ * The percentage is asserted-over-proven across every dimension the crawl
+ * measured, which is the only honest way to state it — coverage here is against
+ * what the application demonstrably does, not against lines of code, and the
+ * sentence under the number says so because people assume otherwise.
+ */
+function CoverageHeadline({ report }: { report: CoverageReport }) {
   const t = report.totals;
+  const proven = t.routes + t.journeys + t.forms + t.affordances;
+  const asserted = t.routesVisited + t.journeysWalked + t.formsExercised + t.affordancesUsed;
+  const pct = proven === 0 ? null : Math.round((asserted / proven) * 100);
   const unreadable = t.tests - t.testsWithReadableRoutes;
 
   return (
-    <Card className="p-5">
-      <p className="text-lg leading-snug font-medium">
-        You have <span className="tabular-nums">{t.tests}</span>{' '}
-        {t.tests === 1 ? 'test' : 'tests'} and{' '}
-        <span className={cn('tabular-nums', t.gaps > 0 && 'text-fail')}>{t.gaps}</span>{' '}
-        untested {t.gaps === 1 ? 'surface' : 'surfaces'}.
+    <>
+      <p className="font-display text-[28px] leading-[1.25] font-semibold">
+        {pct === null ? (
+          'The crawl proved nothing this report can measure against.'
+        ) : (
+          <>
+            <span className="tabular-nums">{pct}%</span> of proven behaviour is asserted.
+          </>
+        )}
       </p>
-      <p className="text-ink-dim text-body-sm mt-1.5">
-        Measured by putting what the crawler proved this app can do beside what the suite
-        actually asserts
+      <p className="text-ink-dim text-body-sm mt-2">
+        The crawler proved <span className="tabular-nums">{t.routes}</span> states and{' '}
+        <span className="tabular-nums">{t.journeys + t.forms + t.affordances}</span> actions; the
+        suite asserts <span className="tabular-nums">{asserted}</span> of them. Coverage is against
+        what the app can do — not lines of code
         {report.flowMapVersion !== null && (
           <>
             {' '}
-            — crawl v<span className="tabular-nums">{report.flowMapVersion}</span>
+            (crawl v<span className="tabular-nums">{report.flowMapVersion}</span>
+            {report.baseUrl && <> of {report.baseUrl}</>})
           </>
         )}
-        {report.baseUrl && <> of {report.baseUrl}</>}.
+        .
       </p>
 
-      {!compact && (
-        <div className="border-line mt-5 grid grid-cols-2 gap-x-6 gap-y-4 border-t pt-5 sm:grid-cols-4">
-          <Ratio label="Routes" covered={t.routesVisited} total={t.routes} />
-          <Ratio label="Journeys" covered={t.journeysWalked} total={t.journeys} />
-          <Ratio label="Forms" covered={t.formsExercised} total={t.forms} />
-          <Ratio label="Controls" covered={t.affordancesUsed} total={t.affordances} />
-        </div>
-      )}
+      {/*
+       * ROUTES / JOURNEYS / FORMS / CONTROLS, not the reference's ROUTES /
+       * FORMS / ROLES / A11Y: the coverage endpoint measures these four and
+       * says nothing about roles or accessibility, and a bar with no number
+       * behind it is worse than a bar that is missing.
+       */}
+      <div className="mt-6 grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-4">
+        <Dimension label="Routes" covered={t.routesVisited} total={t.routes} />
+        <Dimension label="Journeys" covered={t.journeysWalked} total={t.journeys} />
+        <Dimension label="Forms" covered={t.formsExercised} total={t.forms} />
+        <Dimension label="Controls" covered={t.affordancesUsed} total={t.affordances} />
+      </div>
 
       {unreadable > 0 && (
-        <p className="text-ink-dim text-body-sm border-line mt-4 border-t pt-4">
-          <span className="text-flake">Read this first:</span> {unreadable} of {t.tests} tests
-          declare coverage this report could not read completely, so they are counted neither
-          as coverage nor as a gap.
+        <p className="text-ink-dim text-row-sub mt-4">
+          <span className="text-flake">Read this first:</span>{' '}
+          <span className="tabular-nums">{unreadable}</span> of{' '}
+          <span className="tabular-nums">{t.tests}</span> tests declare coverage this report could
+          not read completely, so they are counted neither as coverage nor as a gap.
         </p>
       )}
-    </Card>
+    </>
   );
 }
 
@@ -253,7 +237,7 @@ export function CoverageHeadline({
 function KeyValue({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <div className="text-ink-faint text-meta mb-1 font-semibold tracking-wider uppercase">
+      <div className="text-meta text-ink-faint mb-1 font-mono font-semibold tracking-[0.1em] uppercase">
         {label}
       </div>
       <div className="text-ink-dim text-body-sm">{children}</div>
@@ -261,13 +245,17 @@ function KeyValue({ label, children }: { label: string; children: React.ReactNod
   );
 }
 
-function FormFields({ fields }: { fields: Array<{ label: string; required: boolean; semantic: string }> }) {
+function FormFields({
+  fields,
+}: {
+  fields: Array<{ label: string; required: boolean; semantic: string }>;
+}) {
   if (fields.length === 0) return <span className="text-ink-faint">no fields</span>;
   return (
     <ul className="space-y-1">
       {fields.map((f, i) => (
         <li key={`${f.label}-${i}`} className="flex items-center gap-2">
-          <code className="text-ink font-mono text-body-sm">{f.label}</code>
+          <code className="text-ink text-body-sm font-mono">{f.label}</code>
           <span className="text-ink-faint text-meta">{f.semantic.replace(/_/g, ' ')}</span>
           {f.required && <Badge tone="flake">required</Badge>}
         </li>
@@ -300,7 +288,7 @@ function FormList({ forms }: { forms: CoverageFormSummary[] }) {
     <div className="space-y-2">
       {unique.map((form, i) => (
         <div key={`${form.name}-${i}`}>
-          <code className="text-ink-dim font-mono text-micro">{form.name}</code>
+          <code className="text-ink-dim text-micro font-mono">{form.name}</code>
           <div className="mt-0.5 pl-3">
             <FormFields fields={form.fields} />
           </div>
@@ -308,8 +296,8 @@ function FormList({ forms }: { forms: CoverageFormSummary[] }) {
       ))}
       {unique.length < forms.length && (
         <p className="text-ink-faint text-meta">
-          {forms.length - unique.length} identical copy(s) on other pages sharing this route are
-          not repeated here.
+          {forms.length - unique.length} identical copy(s) on other pages sharing this route are not
+          repeated here.
         </p>
       )}
     </div>
@@ -330,7 +318,9 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
             <KeyValue label="How the crawler got here">
               <ol className="list-inside list-decimal space-y-0.5">
                 {s.entryActions.map((a, i) => (
-                  <li key={i} className="font-mono text-body-sm">{a}</li>
+                  <li key={i} className="text-body-sm font-mono">
+                    {a}
+                  </li>
                 ))}
               </ol>
             </KeyValue>
@@ -349,13 +339,9 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
             <ol className="space-y-1">
               {s.routes.map((r, i) => (
                 <li key={i} className="flex items-center gap-2">
-                  <span className="text-ink-faint text-meta w-4 shrink-0 tabular-nums">
-                    {i + 1}
-                  </span>
-                  <code className="font-mono text-body-sm">{r}</code>
-                  {s.steps[i] && (
-                    <span className="text-ink-faint text-meta">via {s.steps[i]}</span>
-                  )}
+                  <span className="text-ink-faint text-meta w-4 shrink-0 tabular-nums">{i + 1}</span>
+                  <code className="text-body-sm font-mono">{r}</code>
+                  {s.steps[i] && <span className="text-ink-faint text-meta">via {s.steps[i]}</span>}
                 </li>
               ))}
             </ol>
@@ -367,15 +353,19 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
       return (
         <div className="space-y-3">
           <KeyValue label="Form">
-            <code className="font-mono text-body-sm">{s.form.name}</code>
-            {s.behindAuth && <Badge tone="flake" className="ml-2">behind auth</Badge>}
+            <code className="text-body-sm font-mono">{s.form.name}</code>
+            {s.behindAuth && (
+              <Badge tone="flake" className="ml-2">
+                behind auth
+              </Badge>
+            )}
           </KeyValue>
           <KeyValue label="Fields">
             <FormFields fields={s.form.fields} />
           </KeyValue>
           {s.form.submitLabel && (
             <KeyValue label="Submit control">
-              <code className="font-mono text-body-sm">{s.form.submitLabel}</code>
+              <code className="text-body-sm font-mono">{s.form.submitLabel}</code>
             </KeyValue>
           )}
         </div>
@@ -385,7 +375,7 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
         <div className="space-y-3">
           <KeyValue label={`The ${s.controlKind}`}>{s.label}</KeyValue>
           <KeyValue label="Locator the crawl recorded">
-            <code className="text-ink bg-surface-2 block rounded px-2 py-1.5 font-mono text-body-sm break-all">
+            <code className="text-ink bg-surface-2 text-body-sm block rounded-sm px-2 py-1.5 font-mono break-all">
               {s.expression}
             </code>
           </KeyValue>
@@ -398,7 +388,7 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
           <KeyValue label="Routes it covers">
             <div className="flex flex-wrap gap-1.5">
               {s.routes.map((r) => (
-                <code key={r} className="bg-surface-2 rounded px-1.5 py-0.5 font-mono text-body-sm">
+                <code key={r} className="bg-surface-2 text-body-sm rounded-sm px-1.5 py-0.5 font-mono">
                   {r}
                 </code>
               ))}
@@ -414,100 +404,86 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
   }
 }
 
+/**
+ * The row's second line: why this is a gap, compressed to one line.
+ *
+ * Kind meaning first, then the report's own first piece of evidence. The claim
+ * and at least some of its support travel together — a ranked list of untested
+ * surfaces with the reasons one click away is a list that gets argued with once
+ * and then ignored.
+ */
+function gapWhy(gap: CoverageGap): string {
+  return [gap.route, KIND_MEANING[gap.kind], gap.evidence[0]].filter(Boolean).join(' · ');
+}
+
 function GapRow({
   gap,
   selected,
   onToggle,
+  onPlan,
+  planning,
   testNames,
 }: {
   gap: CoverageGap;
   selected: boolean;
   onToggle: () => void;
+  onPlan: () => void;
+  planning: boolean;
   testNames: Map<string, string>;
 }) {
   const [open, setOpen] = useState(false);
-  const tone = scoreTone(gap.score);
   const detailId = `gap-detail-${gap.id}`;
 
   return (
-    <Card className={cn('overflow-hidden', selected && 'border-accent/60')}>
-      <div className="flex gap-4 p-4">
-        <label className="flex shrink-0 cursor-pointer items-start pt-0.5">
-          <input
-            type="checkbox"
-            checked={selected}
-            onChange={onToggle}
-            className="accent-accent h-4 w-4 cursor-pointer"
-            aria-label={`Select: ${gap.title}`}
-          />
-        </label>
-
-        {/* The rank, and the bar that says how much of the scale it is. */}
-        <div className="w-9 shrink-0 text-center">
-          <div className={cn('text-lg leading-none font-semibold tabular-nums', tone.text)}>
-            {gap.score}
-          </div>
-          <div className="bg-surface-2 mt-1.5 h-1 overflow-hidden rounded-full">
-            <div className={cn('h-full rounded-full', tone.bar)} style={{ width: `${gap.score}%` }} />
-          </div>
-        </div>
-
-        <div className="min-w-0 flex-1">
-          <div className="mb-1.5 flex flex-wrap items-center gap-2">
-            <Badge tone="accent">{KIND_LABEL[gap.kind]}</Badge>
-            {gap.route && (
-              <code className="text-ink-dim font-mono text-micro">{gap.route}</code>
-            )}
-            {gap.feature && <span className="text-ink-faint text-micro">{gap.feature}</span>}
-            <Badge tone={CONFIDENCE_TONE[gap.confidence]} className="ml-auto">
-              {gap.confidence} confidence
-            </Badge>
-          </div>
-
-          <h3 className="text-ink text-sm leading-snug font-medium">{gap.title}</h3>
-          <p className="text-ink-faint text-micro mt-1">{KIND_MEANING[gap.kind]}</p>
-
-          {/*
-           * Evidence is never behind a disclosure. A claim that a thing is
-           * untested is only worth reading if the reason is on the same screen.
-           */}
-          <div className="border-line-strong mt-3 border-l-2 pl-3">
-            <div className="text-ink-faint text-meta mb-1.5 font-semibold tracking-wider uppercase">
-              Why we think so
-            </div>
-            <ul className="space-y-1.5">
-              {gap.evidence.map((line, i) => (
-                <li key={i} className="text-ink-dim text-body-sm leading-relaxed">
-                  {line}
-                </li>
-              ))}
-            </ul>
-          </div>
-
+    <div className="border-line border-b">
+      <div className="flex items-baseline gap-3 py-3">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggle}
+          className="accent-accent mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer self-start"
+          aria-label={`Select: ${gap.title}`}
+        />
+        <span className="min-w-0 flex-1">
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
             aria-controls={detailId}
-            className="text-ink-faint hover:text-ink text-micro mt-3 inline-flex items-center gap-1.5 transition-colors"
+            className="text-row hover:text-accent block text-left font-medium transition-colors"
           >
-            <span className={cn('transition-transform', open && 'rotate-90')} aria-hidden="true">
-              ▸
-            </span>
-            {open ? 'Hide' : 'What the crawl saw, and what a test would do'}
+            {gap.title}
           </button>
-        </div>
+          <span className="text-row-sub text-ink-faint mt-0.5 block">{gapWhy(gap)}</span>
+        </span>
+        <button
+          type="button"
+          onClick={onPlan}
+          disabled={planning}
+          className="text-accent shrink-0 text-[12px] hover:underline disabled:opacity-50"
+        >
+          {planning ? 'planning…' : 'plan a test →'}
+        </button>
       </div>
 
       {open && (
         <div
           id={detailId}
-          className="border-line bg-surface-2/40 grid gap-6 border-t p-4 md:grid-cols-2 md:pl-20"
+          className="border-line bg-surface-1 mb-3 grid gap-6 rounded-lg border p-4 md:grid-cols-2"
         >
           <div className="space-y-4">
             <div>
               <SectionLabel>What the crawl saw</SectionLabel>
               <SubjectDetail gap={gap} />
+            </div>
+
+            <div>
+              <SectionLabel>Why we think so</SectionLabel>
+              <ul className="text-ink-dim text-body-sm space-y-1.5 leading-relaxed">
+                {gap.evidence.map((line, i) => (
+                  <li key={i}>{line}</li>
+                ))}
+              </ul>
             </div>
 
             <div>
@@ -517,9 +493,10 @@ function GapRow({
                   <li key={i}>{why}</li>
                 ))}
               </ul>
-              <div className="text-ink-faint text-meta mt-2 flex gap-4 tabular-nums">
+              <div className="text-ink-faint text-meta mt-2 flex gap-4 font-mono tabular-nums">
                 <span>reachability {Math.round(gap.reachability * 100)}%</span>
                 <span>blast radius {Math.round(gap.blastRadius * 100)}%</span>
+                <span>{gap.confidence} confidence</span>
               </div>
             </div>
 
@@ -529,9 +506,7 @@ function GapRow({
                 <ul className="text-ink-dim text-body-sm space-y-0.5">
                   {gap.relatedTestIds.map((id) => (
                     <li key={id} className="truncate">
-                      {testNames.get(id) ?? (
-                        <code className="font-mono text-micro">{id}</code>
-                      )}
+                      {testNames.get(id) ?? <code className="text-micro font-mono">{id}</code>}
                     </li>
                   ))}
                 </ul>
@@ -549,7 +524,7 @@ function GapRow({
                   <Badge>{gap.proposal.priority}</Badge>
                 </div>
                 <div>
-                  <div className="text-ink-faint text-meta mb-1 font-semibold tracking-wider uppercase">
+                  <div className="text-meta text-ink-faint mb-1 font-mono font-semibold tracking-[0.1em] uppercase">
                     Steps
                   </div>
                   <ol className="text-ink-dim text-body-sm list-inside list-decimal space-y-1">
@@ -559,7 +534,7 @@ function GapRow({
                   </ol>
                 </div>
                 <div>
-                  <div className="text-ink-faint text-meta mb-1 font-semibold tracking-wider uppercase">
+                  <div className="text-meta text-ink-faint mb-1 font-mono font-semibold tracking-[0.1em] uppercase">
                     Assertions
                   </div>
                   <ul className="text-ink-dim text-body-sm space-y-1">
@@ -578,7 +553,7 @@ function GapRow({
           </div>
         </div>
       )}
-    </Card>
+    </div>
   );
 }
 
@@ -618,10 +593,10 @@ function ProposeResult({
        * the footnote.
        */}
       <SectionLabel>The items</SectionLabel>
-      <ul className="divide-line border-line mb-4 divide-y rounded-md border">
+      <ul className="divide-line mb-4 divide-y">
         {result.items.map((item) => (
-          <li key={item.id} className="flex items-center gap-3 px-3 py-2.5">
-            <span className="text-ink text-body-sm min-w-0 flex-1 truncate">{item.title}</span>
+          <li key={item.id} className="flex items-center gap-3 py-2.5">
+            <span className="text-ink text-row min-w-0 flex-1 truncate">{item.title}</span>
             <Badge>{item.testType}</Badge>
             <Badge>{item.priority}</Badge>
           </li>
@@ -639,7 +614,7 @@ function ProposeResult({
           {result.jobId && (
             <>
               {' '}
-              (job <code className="font-mono text-micro">{result.jobId}</code>)
+              (job <code className="text-micro font-mono">{result.jobId}</code>)
             </>
           )}
           . Approving the plan is what turns them into tests.
@@ -653,8 +628,8 @@ function ProposeResult({
       {result.skippedGapIds.length > 0 && (
         <p className="text-ink-faint text-micro mt-3">
           {result.skippedGapIds.length} selected{' '}
-          {result.skippedGapIds.length === 1 ? 'gap was' : 'gaps were'} no longer in the report
-          and {result.skippedGapIds.length === 1 ? 'was' : 'were'} skipped.
+          {result.skippedGapIds.length === 1 ? 'gap was' : 'gaps were'} no longer in the report and{' '}
+          {result.skippedGapIds.length === 1 ? 'was' : 'were'} skipped.
         </p>
       )}
     </Modal>
@@ -662,6 +637,32 @@ function ProposeResult({
 }
 
 // ─── The screen ──────────────────────────────────────────────────────────────
+
+function CoverageSkeleton() {
+  return (
+    <div>
+      <Skeleton className="h-8 w-[26rem] max-w-full" />
+      <Skeleton className="mt-3 h-3 w-full max-w-lg" />
+      <div className="mt-6 grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-4">
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i}>
+            <Skeleton className="mb-1.5 h-2.5 w-20" />
+            <Skeleton className="h-1 w-full" />
+          </div>
+        ))}
+      </div>
+      <Skeleton className="mt-8 h-2.5 w-28" />
+      <div className="divide-line mt-2 divide-y" aria-label="Loading" role="status">
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div key={i} className="py-3">
+            <Skeleton className="h-3.5 w-2/3" />
+            <Skeleton className="mt-2 h-2.5 w-1/2" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function CoverageGaps({
   projectId,
@@ -675,6 +676,8 @@ export function CoverageGaps({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [kinds, setKinds] = useState<Set<GapKind>>(new Set());
   const [proposing, setProposing] = useState(false);
+  /** The single gap a `plan a test →` click is in flight for, so only its row spins. */
+  const [planningId, setPlanningId] = useState<string | null>(null);
   const [result, setResult] = useState<CoverageProposeResult | null>(null);
 
   // A report that reloads underneath a selection would let somebody propose a
@@ -705,14 +708,20 @@ export function CoverageGaps({
     });
   }
 
-  async function propose() {
-    if (!projectId || !report || selected.size === 0) return;
-    setProposing(true);
+  /**
+   * Turn gaps into plan items.
+   *
+   * One code path for the row link and the bulk bar, because they are the same
+   * request with a different number of ids — and because the 409 handling below
+   * (the report moved under you) has to be identical either way.
+   */
+  async function propose(gapIds: string[]) {
+    if (!projectId || !report || gapIds.length === 0) return;
     try {
       const proposal = await api<CoverageProposeResult>(`/coverage/${projectId}/propose`, {
         method: 'POST',
         body: JSON.stringify({
-          gapIds: [...selected],
+          gapIds,
           // Sent so a stale screen is told, rather than quietly handed a test
           // for a gap somebody already closed.
           fingerprint: report.fingerprint,
@@ -733,42 +742,37 @@ export function CoverageGaps({
       } else {
         toast.error(err instanceof Error ? err.message : 'Could not propose tests');
       }
+    }
+  }
+
+  async function proposeSelected() {
+    setProposing(true);
+    try {
+      await propose([...selected]);
     } finally {
       setProposing(false);
     }
   }
 
-  if (loading) {
-    return (
-      <div className="space-y-4">
-        <Card className="p-5">
-          <Skeleton className="h-6 w-80" />
-          <Skeleton className="mt-2 h-3 w-96" />
-          <div className="border-line mt-5 grid grid-cols-2 gap-6 border-t pt-5 sm:grid-cols-4">
-            {[0, 1, 2, 3].map((i) => (
-              <div key={i}>
-                <Skeleton className="mb-2 h-2.5 w-16" />
-                <Skeleton className="h-1 w-full" />
-                <Skeleton className="mt-2 h-2 w-20" />
-              </div>
-            ))}
-          </div>
-        </Card>
-        {[0, 1, 2].map((i) => (
-          <Card key={i} className="space-y-2.5 p-4">
-            <Skeleton className="h-3 w-40" />
-            <Skeleton className="h-4 w-2/3" />
-            <Skeleton className="h-3 w-full" />
-            <Skeleton className="h-3 w-5/6" />
-          </Card>
-        ))}
-      </div>
-    );
+  async function proposeOne(gapId: string) {
+    setPlanningId(gapId);
+    try {
+      await propose([gapId]);
+    } finally {
+      setPlanningId(null);
+    }
   }
+
+  if (loading) return <CoverageSkeleton />;
 
   if (error) {
     return (
-      <p className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm">{error}</p>
+      <p
+        role="alert"
+        className="border-fail/40 text-fail text-body-sm rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] p-3"
+      >
+        {error}
+      </p>
     );
   }
 
@@ -802,8 +806,8 @@ export function CoverageGaps({
       <CoverageHeadline report={report} />
 
       {report.caveats.length > 0 && (
-        <div className="border-flake/40 bg-flake/10 mt-4 rounded-md border p-3">
-          <div className="text-flake text-meta mb-1.5 font-semibold tracking-wider uppercase">
+        <div className="border-flake/40 mt-6 rounded-md border bg-[color-mix(in_srgb,var(--color-flake)_8%,transparent)] p-3">
+          <div className="text-flake text-meta mb-1.5 font-mono font-semibold tracking-[0.1em] uppercase">
             Before you trust these numbers
           </div>
           <ul className="text-ink-dim text-body-sm space-y-1">
@@ -815,40 +819,14 @@ export function CoverageGaps({
       )}
 
       {report.unreadable.length > 0 && (
-        <p className="text-ink-dim text-body-sm mt-4">
+        <p className="text-ink-dim text-row-sub mt-4">
           {report.unreadable.length} part(s) of the flow map could not be read:{' '}
           {report.unreadable.join('; ')}
         </p>
       )}
 
-      {report.unknowns.length > 0 && (
-        <Card className="mt-4 p-4">
-          <SectionLabel>
-            {report.unknowns.length} test(s) whose coverage could not be read
-          </SectionLabel>
-          <p className="text-ink-dim text-body-sm mb-3">
-            Neither a gap nor coverage — the third state. Read the count above knowing these
-            were not counted either way.
-          </p>
-          <ul className="divide-line divide-y">
-            {report.unknowns.map((u) => (
-              <li key={u.testId} className="py-2">
-                <div className="text-ink text-body-sm">{u.name}</div>
-                <div className="text-ink-faint text-micro font-mono">{u.filePath}</div>
-                <div className="text-ink-dim text-body-sm mt-1">{u.reason}</div>
-                {u.sample && (
-                  <code className="bg-surface-2 text-ink-dim mt-1 block rounded px-2 py-1 font-mono text-micro break-all">
-                    {u.sample}
-                  </code>
-                )}
-              </li>
-            ))}
-          </ul>
-        </Card>
-      )}
-
       {report.gaps.length === 0 ? (
-        <div className="mt-6">
+        <div className="mt-8">
           <EmptyState
             title="Every surface the crawl found is exercised"
             body={`Crawl v${report.flowMapVersion ?? '?'} found ${report.totals.routes} route(s), ${report.totals.journeys} journey(s), ${report.totals.forms} form(s) and ${report.totals.affordances} control(s), and a test touches all of them. New gaps appear when the app grows or the Explorer runs again.`}
@@ -856,80 +834,112 @@ export function CoverageGaps({
           />
         </div>
       ) : (
-        <>
-          {/* Filters. Client-side over the report already in hand, so the
-              fingerprint the selection was made against never moves. */}
-          <div className="border-line mt-8 mb-4 flex flex-wrap items-center gap-2 border-b pb-4">
-            <button
-              type="button"
-              onClick={() => setKinds(new Set())}
-              className={cn(
-                'text-micro rounded-full border px-2.5 py-1 transition-colors',
-                kinds.size === 0
-                  ? 'border-accent text-accent'
-                  : 'border-line text-ink-dim hover:text-ink',
-              )}
-            >
-              All <span className="tabular-nums">{report.gaps.length}</span>
-            </button>
-            {[...kindCounts.entries()]
-              .sort((a, b) => b[1] - a[1])
-              .map(([kind, count]) => (
-                <button
-                  key={kind}
-                  type="button"
-                  onClick={() =>
-                    setKinds((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(kind)) next.delete(kind);
-                      else next.add(kind);
-                      return next;
-                    })
-                  }
-                  className={cn(
-                    'text-micro rounded-full border px-2.5 py-1 transition-colors',
-                    kinds.has(kind)
-                      ? 'border-accent text-accent'
-                      : 'border-line text-ink-dim hover:text-ink',
-                  )}
-                >
-                  {KIND_LABEL[kind]} <span className="tabular-nums">{count}</span>
-                </button>
-              ))}
-
-            <div className="ml-auto flex items-center gap-2">
-              <span className="text-ink-faint text-micro tabular-nums">
-                {visible.length} shown
-              </span>
+        <section className="mt-8">
+          <div className="mb-1.5 flex flex-wrap items-baseline gap-x-3 gap-y-2">
+            <SectionLabel className="mb-0">Ranked gaps · {report.totals.gaps}</SectionLabel>
+            {/* Filters. Client-side over the report already in hand, so the
+                fingerprint the selection was made against never moves. */}
+            <div className="ml-auto flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setKinds(new Set())}
+                aria-pressed={kinds.size === 0}
+                className={cn(
+                  'text-meta rounded-full border px-2 py-0.5 font-mono transition-colors',
+                  kinds.size === 0
+                    ? 'border-accent text-accent'
+                    : 'border-line text-ink-faint hover:text-ink',
+                )}
+              >
+                ALL <span className="tabular-nums">{report.gaps.length}</span>
+              </button>
+              {[...kindCounts.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .map(([kind, count]) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    aria-pressed={kinds.has(kind)}
+                    onClick={() =>
+                      setKinds((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(kind)) next.delete(kind);
+                        else next.add(kind);
+                        return next;
+                      })
+                    }
+                    className={cn(
+                      'text-meta rounded-full border px-2 py-0.5 font-mono transition-colors',
+                      kinds.has(kind)
+                        ? 'border-accent text-accent'
+                        : 'border-line text-ink-faint hover:text-ink',
+                    )}
+                  >
+                    {KIND_LABEL[kind]} <span className="tabular-nums">{count}</span>
+                  </button>
+                ))}
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() =>
-                  setSelected(new Set(visible.slice(0, maxPropose).map((g) => g.id)))
-                }
+                onClick={() => setSelected(new Set(visible.slice(0, maxPropose).map((g) => g.id)))}
               >
                 Select top {Math.min(visible.length, maxPropose)}
               </Button>
             </div>
           </div>
 
-          <div className="space-y-3">
-            {visible.map((gap) => (
-              <GapRow
-                key={gap.id}
-                gap={gap}
-                selected={selected.has(gap.id)}
-                onToggle={() => toggle(gap.id)}
-                testNames={testNames}
-              />
-            ))}
-          </div>
+          {visible.length === 0 ? (
+            <p className="text-ink-faint text-body-sm py-6">
+              No gap of that kind. Clear the filter to see the other{' '}
+              <span className="tabular-nums">{report.gaps.length}</span>.
+            </p>
+          ) : (
+            <div>
+              {visible.map((gap) => (
+                <GapRow
+                  key={gap.id}
+                  gap={gap}
+                  selected={selected.has(gap.id)}
+                  onToggle={() => toggle(gap.id)}
+                  onPlan={() => void proposeOne(gap.id)}
+                  planning={planningId === gap.id}
+                  testNames={testNames}
+                />
+              ))}
+            </div>
+          )}
+
+          {report.unknowns.length > 0 && (
+            <div className="mt-8">
+              <SectionLabel>
+                {report.unknowns.length} test(s) whose coverage could not be read
+              </SectionLabel>
+              <p className="text-ink-dim text-row-sub mb-2">
+                Neither a gap nor coverage — the third state. Read the count above knowing these
+                were not counted either way.
+              </p>
+              <div>
+                {report.unknowns.map((u) => (
+                  <div key={u.testId} className="border-line border-b py-3">
+                    <div className="text-ink text-row">{u.name}</div>
+                    <div className="text-ink-faint text-meta font-mono">{u.filePath}</div>
+                    <div className="text-ink-dim text-row-sub mt-1">{u.reason}</div>
+                    {u.sample && (
+                      <code className="bg-surface-2 text-ink-dim text-meta mt-1 block rounded-sm px-2 py-1 font-mono break-all">
+                        {u.sample}
+                      </code>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {selected.size > 0 && (
             <div className="sticky bottom-6 z-20 mt-6">
-              <div className="border-accent/50 bg-surface-1 flex items-center gap-4 rounded-lg border p-3 shadow-lg">
-                <span className="text-body-sm">
-                  <span className="tabular-nums font-medium">{selected.size}</span> gap
+              <div className="border-line-strong bg-surface-1 shadow-overlay flex items-center gap-4 rounded-lg border p-3">
+                <span className="text-row">
+                  <span className="font-medium tabular-nums">{selected.size}</span> gap
                   {selected.size === 1 ? '' : 's'} selected
                 </span>
                 {selected.size > maxPropose && (
@@ -947,7 +957,7 @@ export function CoverageGaps({
                     variant="primary"
                     loading={proposing}
                     disabled={selected.size > maxPropose}
-                    onClick={propose}
+                    onClick={() => void proposeSelected()}
                   >
                     Propose {selected.size} test{selected.size === 1 ? '' : 's'}
                   </Button>
@@ -955,7 +965,7 @@ export function CoverageGaps({
               </div>
             </div>
           )}
-        </>
+        </section>
       )}
 
       {result && projectId && (

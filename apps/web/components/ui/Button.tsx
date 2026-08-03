@@ -20,8 +20,16 @@ type Variant = 'primary' | 'secondary' | 'ghost' | 'danger';
 type Size = 'sm' | 'md';
 
 const VARIANT: Record<Variant, string> = {
-  primary: 'bg-accent text-white hover:opacity-90',
-  secondary: 'border-line text-ink-dim hover:text-ink hover:border-line-strong border bg-transparent',
+  /*
+   * `text-accent-ink`, never `text-white`. The accent is switchable and two of
+   * the three options — mist and sage — are light enough in dark mode that white
+   * on them is unreadable; the token flips to near-black for those and back to
+   * white for iris in light mode. Hard-coding white got it wrong in four of the
+   * six theme × accent combinations.
+   */
+  primary: 'bg-accent text-accent-ink font-semibold hover:opacity-90',
+  secondary:
+    'border-line text-ink-dim hover:text-ink hover:border-line-strong border bg-transparent',
   ghost: 'text-ink-dim hover:text-ink hover:bg-surface-2 bg-transparent',
   // Destructive is deliberately an outline, not a filled red slab. A row of
   // solid red buttons trains people to ignore red; the weight belongs on the
@@ -30,8 +38,8 @@ const VARIANT: Record<Variant, string> = {
 };
 
 const SIZE: Record<Size, string> = {
-  sm: 'text-micro gap-1.5 px-2.5 py-1.5',
-  md: 'text-body-sm gap-2 px-3.5 py-2',
+  sm: 'gap-1.5 px-[11px] py-[5px] text-[12px]',
+  md: 'text-row-sub gap-[7px] px-3.5 py-[7px]',
 };
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
@@ -55,7 +63,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
       // Announce the busy state rather than only showing a spinner.
       aria-busy={loading || undefined}
       className={cn(
-        'inline-flex shrink-0 items-center justify-center rounded-md font-medium transition-[opacity,background-color,border-color] duration-150',
+        'inline-flex shrink-0 items-center justify-center rounded-md font-medium whitespace-nowrap transition-[opacity,background-color,border-color] duration-150',
         'disabled:cursor-not-allowed disabled:opacity-50',
         VARIANT[variant],
         SIZE[size],
@@ -75,12 +83,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button
  */
 function Spinner() {
   return (
-    <svg
-      className="h-3.5 w-3.5 animate-spin"
-      viewBox="0 0 16 16"
-      fill="none"
-      aria-hidden="true"
-    >
+    <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 16 16" fill="none" aria-hidden="true">
       <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="2" opacity="0.25" />
       <path
         d="M14.5 8A6.5 6.5 0 0 0 8 1.5"

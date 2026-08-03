@@ -320,8 +320,18 @@ export function CodeEditor({
       loading={<span className="text-ink-faint text-sm">Loading editor…</span>}
       options={{
         readOnly,
-        fontSize: 13,
-        fontFamily: 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
+        /*
+         * The app's own mono face and measure. Monaco writes `fontFamily`
+         * straight into the style it puts on the view lines, so a custom
+         * property resolves there exactly as it does anywhere else — which is
+         * what stops this pane from being the one place in the product set in a
+         * different typeface. It has to live in these options rather than in a
+         * caller's `updateOptions`, because the library re-applies this object
+         * on every render and would overwrite anything set from outside.
+         */
+        fontSize: 12.5,
+        lineHeight: 22,
+        fontFamily: 'var(--font-mono)',
         minimap: { enabled: false },
         scrollBeyondLastLine: false,
         smoothScrolling: true,

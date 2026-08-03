@@ -152,10 +152,10 @@ export function Modal({
           size === 'lg' && 'max-w-2xl',
         )}
       >
-        <div className="border-line flex items-start gap-3 border-b px-5 py-3.5">
+        <div className="border-line flex items-start gap-3 border-b px-5 py-4">
           <div className="min-w-0 flex-1">
-            <h2 className="text-sm font-medium">{title}</h2>
-            {description && <p className="text-ink-dim text-body-sm mt-1">{description}</p>}
+            <h2 className="font-display text-base leading-snug font-semibold">{title}</h2>
+            {description && <p className="text-ink-dim text-body-sm mt-1.5">{description}</p>}
           </div>
           <button
             type="button"
@@ -168,7 +168,7 @@ export function Modal({
         </div>
         {children && <div className="max-h-[52vh] overflow-y-auto px-5 py-4">{children}</div>}
         {footer && (
-          <div className="border-line bg-surface-1 flex items-center justify-end gap-2 border-t px-5 py-3">
+          <div className="border-line bg-surface-1 flex items-center justify-end gap-2 border-t px-5 py-3.5">
             {footer}
           </div>
         )}

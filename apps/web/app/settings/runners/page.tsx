@@ -12,20 +12,14 @@ import {
   type RunnerJob,
 } from '../../../lib/api';
 import { RunnerList, elapsed, heldJobsFor } from '../../../components/RunnerList';
+import { SetupHeader } from '../../../components/setup/SetupHeader';
 import { Button } from '../../../components/ui/Button';
 import { EmptyState } from '../../../components/ui/EmptyState';
 import { Field } from '../../../components/ui/Field';
 import { ConfirmDialog, Modal } from '../../../components/ui/Modal';
 import { useToast } from '../../../components/ui/Toast';
-import {
-  Badge,
-  Card,
-  Page,
-  PageHeader,
-  SectionLabel,
-  SkeletonRows,
-  Tabs,
-} from '../../../components/ui/layout';
+import { Page, SectionLabel, SkeletonRows } from '../../../components/ui/layout';
+import { cn } from '../../../lib/cn';
 
 /**
  * Runners — the machines inside your network that execute your suite.
@@ -69,6 +63,7 @@ export default function RunnersPage() {
   const [busy, setBusy] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingAction>(null);
+  const [showHelp, setShowHelp] = useState(false);
 
   /** The token, alive only in this tab's memory and only until dismissed. */
   const [minted, setMinted] = useState<{ token: string; name: string; rotated: boolean } | null>(
@@ -116,7 +111,7 @@ export default function RunnersPage() {
 
   async function register() {
     const trimmed = name.trim();
-    if (!trimmed) return;
+    if (!trimmed || busy) return;
     setBusy(true);
     try {
       const result = await api<MintedRunner>('/runners', {
@@ -182,98 +177,104 @@ export default function RunnersPage() {
   const loading = runners === null;
 
   return (
-    <Page width="wide">
-      <PageHeader
-        title="Infrastructure"
-        subtitle="Where your tests execute, and what QAAI is allowed to touch."
-      />
+    <Page width="setup">
+      <SetupHeader />
 
-      <Tabs
-        tabs={[
-          { id: 'runners', label: 'Runners', count: runners?.length },
-          { id: 'github', label: 'GitHub App' },
-        ]}
-        active="runners"
-        onChange={(id) => {
-          if (id === 'github') router.push('/settings/github');
-        }}
-      />
+      <div className="mt-7">
+        {error && (
+          <p
+            role="alert"
+            className="border-fail/40 text-fail text-row-sub mb-5 rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] p-3"
+          >
+            {error}
+          </p>
+        )}
 
-      <div className="mb-6 flex items-start gap-4">
-        <p className="text-ink-dim text-body-sm min-w-0 flex-1 leading-relaxed">
-          A runner executes your suite on a host you control, so QAAI never needs to reach your
-          staging network. The agent only ever dials out — there is nothing to open inbound, and it
-          runs the executor named in its own local config, never a command from us.
-        </p>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button size="sm" variant="ghost" onClick={() => void load()}>
-            Refresh
-          </Button>
-          {canManage && (
-            <Button variant="primary" size="sm" onClick={() => setRegistering(true)}>
-              Register runner
-            </Button>
+        {minted && (
+          <TokenBanner
+            token={minted.token}
+            name={minted.name}
+            rotated={minted.rotated}
+            onDismiss={() => setMinted(null)}
+          />
+        )}
+
+        {/* ── The fleet ────────────────────────────────────────────────────── */}
+        <section className={minted ? 'mt-5' : ''}>
+          <SectionLabel>Fleet{runners && runners.length > 0 ? ` · ${runners.length}` : ''}</SectionLabel>
+
+          {loading ? (
+            <SkeletonRows rows={3} />
+          ) : runners.length === 0 ? (
+            <EmptyState
+              title="No runners registered"
+              body="Your suite runs on QAAI's own workers today. Register a runner to execute it inside your network instead — on a host that can already reach the application under test."
+              action={
+                canManage
+                  ? { label: 'Register runner', onClick: () => setRegistering(true) }
+                  : undefined
+              }
+            />
+          ) : (
+            <RunnerList
+              runners={runners}
+              jobs={jobs}
+              canManage={canManage}
+              busyId={busyId}
+              now={now}
+              onRotate={(runner) => setPending({ kind: 'rotate', runner })}
+              onRevoke={(runner) => setPending({ kind: 'revoke', runner })}
+            />
           )}
-        </div>
+
+          {!canManage && !loading && (
+            <p className="text-ink-faint text-micro mt-2.5 font-mono">
+              registering, rotating and revoking are limited to organization admins
+            </p>
+          )}
+        </section>
+
+        {/* ── The queue ────────────────────────────────────────────────────── */}
+        {!loading && <QueueSection queue={queue} now={now} />}
+
+        {/* ── Getting one running ──────────────────────────────────────────── */}
+        <p className="mt-3.5 flex flex-wrap items-baseline gap-x-2">
+          {canManage ? (
+            <button
+              type="button"
+              onClick={() => setRegistering(true)}
+              className="text-accent text-[12px] hover:underline"
+            >
+              + register a runner
+            </button>
+          ) : (
+            <span className="text-ink-faint text-[12px]">registering needs an admin</span>
+          )}
+          <span className="text-ink-faint text-micro font-mono">
+            · runs inside your network · outbound-only
+          </span>
+        </p>
+
+        <p className="mt-2 flex flex-wrap items-baseline gap-x-3">
+          <button
+            type="button"
+            onClick={() => setShowHelp((s) => !s)}
+            aria-expanded={showHelp}
+            className="text-ink-faint hover:text-ink text-[12px] transition-colors"
+          >
+            {showHelp ? '– hide how to start an agent' : 'how to start an agent →'}
+          </button>
+          {/* The GitHub App is a sibling of this screen, not a tab of it: same
+              section, same question (what may QAAI touch), different subject. */}
+          <Link href="/settings/github" className="text-ink-faint hover:text-ink text-[12px] transition-colors">
+            GitHub App →
+          </Link>
+        </p>
+
+        {(showHelp || (!loading && runners.length === 0)) && <StartAgentHelp />}
       </div>
 
-      {error && (
-        <p
-          role="alert"
-          className="border-fail/40 bg-fail/10 text-fail text-body-sm mb-6 rounded-md border p-3"
-        >
-          {error}
-        </p>
-      )}
-
-      {minted && (
-        <TokenBanner
-          token={minted.token}
-          name={minted.name}
-          rotated={minted.rotated}
-          onDismiss={() => setMinted(null)}
-        />
-      )}
-
-      {loading ? (
-        <Card className="overflow-hidden">
-          <SkeletonRows rows={3} />
-        </Card>
-      ) : runners.length === 0 ? (
-        <EmptyState
-          title="No runners registered"
-          body="Your suite runs on QAAI's own workers today. Register a runner to execute it inside your network instead — on a host that can already reach the application under test."
-          action={
-            canManage
-              ? { label: 'Register runner', onClick: () => setRegistering(true) }
-              : undefined
-          }
-        />
-      ) : (
-        <RunnerList
-          runners={runners}
-          jobs={jobs}
-          canManage={canManage}
-          busyId={busyId}
-          now={now}
-          onRotate={(runner) => setPending({ kind: 'rotate', runner })}
-          onRevoke={(runner) => setPending({ kind: 'revoke', runner })}
-        />
-      )}
-
-      {!canManage && !loading && (
-        <p className="text-ink-faint text-micro mt-3">
-          Registering, rotating and revoking runners is limited to organization admins.
-        </p>
-      )}
-
-      {!loading && (runners.length > 0 || jobs.length > 0) && (
-        <QueueSection queue={queue} now={now} />
-      )}
-
-      {!loading && <StartAgentHelp />}
-
-      {/* ── Register ────────────────────────────────────────────────────── */}
+      {/* ── Register ──────────────────────────────────────────────────────── */}
       <Modal
         open={registering}
         onClose={() => setRegistering(false)}
@@ -319,7 +320,7 @@ export default function RunnersPage() {
         </div>
       </Modal>
 
-      {/* ── Rotate / revoke ─────────────────────────────────────────────── */}
+      {/* ── Rotate / revoke ───────────────────────────────────────────────── */}
       <ConfirmDialog
         open={pending?.kind === 'rotate'}
         onClose={() => setPending(null)}
@@ -387,6 +388,10 @@ function revokeBody(held: RunnerJob[]): string {
  * A banner rather than a dialog on purpose: Escape closes a dialog, and losing
  * the only copy of a credential to a keystroke is not a recoverable mistake —
  * it costs a rotation and a visit to the host.
+ *
+ * The whole token is on screen, not an eliding preview: the clipboard write can
+ * fail silently (permissions, a headless browser, an unfocused document) and
+ * when it does, retyping it is the only way left.
  */
 function TokenBanner({
   token,
@@ -402,39 +407,40 @@ function TokenBanner({
   const [copied, setCopied] = useState(false);
 
   return (
-    <div className="border-accent/50 bg-accent/10 mb-6 rounded-lg border p-4" role="status">
-      <h2 className="text-sm font-medium">
-        {rotated ? `New token for ${name}` : `${name} is registered`}
-      </h2>
-      <p className="text-ink-dim text-body-sm mt-1 leading-relaxed">
-        Copy this now. QAAI stores only a hash of it, so this is the only time it can ever be
-        shown — if it is lost, the way back is to rotate the runner and visit the host again.
-      </p>
-      <code className="border-line bg-surface text-body-sm mt-3 block overflow-x-auto rounded border px-3 py-2 font-mono">
-        {token}
-      </code>
-      <div className="mt-3 flex items-center gap-2">
+    <div
+      role="status"
+      className="rounded-lg border border-[color-mix(in_srgb,var(--color-flake)_35%,transparent)] bg-[color-mix(in_srgb,var(--color-flake)_7%,transparent)] px-3.5 py-2.5"
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <p className="min-w-0 flex-1 text-[12.5px]">
+          <span className="font-mono text-[11.5px] break-all">{token}</span>
+          <span className="text-ink-dim">
+            {' '}
+            — {rotated ? `the new token for ${name}` : `${name} is registered`}; shown once, the
+            server keeps only its hash. Copy it into the runner&apos;s env now.
+          </span>
+        </p>
         <Button
-          variant="primary"
           size="sm"
           onClick={() => {
             void navigator.clipboard?.writeText(token);
             setCopied(true);
           }}
         >
-          Copy token
+          {copied ? 'Copied' : 'Copy'}
         </Button>
-        <Button size="sm" onClick={onDismiss}>
-          {copied ? 'Done — hide it' : 'Dismiss without copying'}
-        </Button>
-        {copied && <span className="text-pass text-micro">Copied to your clipboard.</span>}
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label="Dismiss the token"
+          className="text-ink-faint hover:text-ink p-0.5 text-[13px] transition-colors"
+        >
+          ✕
+        </button>
       </div>
-      <p className="text-ink-faint text-micro mt-3 leading-relaxed">
-        On the host:{' '}
-        <code className="font-mono">export QAAI_RUNNER_TOKEN=&apos;…&apos;</code> then{' '}
-        <code className="font-mono">qaai runner --api-url {API_URL}</code>. Keep it out of the
-        command line — anything on a process&apos;s argv is readable by every other process on that
-        box; <code className="font-mono">--token-file</code> exists for that reason.
+      <p className="text-ink-faint text-micro mt-2 font-mono">
+        export QAAI_RUNNER_TOKEN=&apos;…&apos; · never on the command line — argv is readable by
+        every other process on that box; --token-file exists for that reason
       </p>
     </div>
   );
@@ -470,179 +476,127 @@ function groupQueue(jobs: RunnerJob[]): Queue {
   };
 }
 
-const STATUS_TONE: Record<string, 'neutral' | 'accent' | 'pass' | 'fail' | 'flake'> = {
-  QUEUED: 'neutral',
-  CLAIMED: 'accent',
-  RUNNING: 'accent',
-  COMPLETED: 'pass',
-  FAILED: 'fail',
-  ABANDONED: 'fail',
-  CANCELLED: 'neutral',
-  SKIPPED: 'flake',
+/** Row tint: held work is the only thing here anyone needs to act on. */
+const STATUS_TEXT: Record<string, string> = {
+  QUEUED: 'text-flake',
+  CLAIMED: 'text-ink-dim',
+  RUNNING: 'text-ink-dim',
+  COMPLETED: 'text-pass',
+  FAILED: 'text-fail',
+  ABANDONED: 'text-fail',
+  CANCELLED: 'text-ink-faint',
+  SKIPPED: 'text-flake',
 };
 
 function QueueSection({ queue, now }: { queue: Queue; now: number }) {
-  const nothing =
-    queue.inFlight.length === 0 && queue.waiting.length === 0 && queue.attention.length === 0;
+  const rows = [...queue.attention, ...queue.waiting, ...queue.inFlight];
 
   return (
-    <section className="mt-10">
-      <SectionLabel>On-prem queue</SectionLabel>
-      {nothing ? (
-        <p className="text-ink-faint text-body-sm border-line rounded-lg border border-dashed p-4 leading-relaxed">
+    <section className="mt-6">
+      <SectionLabel>Queue</SectionLabel>
+      {rows.length === 0 ? (
+        <p className="text-ink-faint text-row-sub border-line border-b py-2.5">
           Nothing is queued for an on-prem pool.
-          {queue.completed > 0 && (
-            <> The last {queue.completed} on-prem jobs finished without incident. </>
-          )}{' '}
+          {queue.completed > 0 && ` The last ${queue.completed} finished without incident.`}{' '}
           Work only arrives here when an environment names a runner pool — otherwise runs go to
           QAAI&apos;s own workers.
         </p>
       ) : (
-        <div className="space-y-5">
-          {queue.attention.length > 0 && (
-            <QueueGroup
-              title="Needs attention"
-              note="These jobs will not execute another test. The sentence on each is the one written into the run."
-              jobs={queue.attention}
-              now={now}
-            />
-          )}
-          {queue.inFlight.length > 0 && (
-            <QueueGroup title="In flight" jobs={queue.inFlight} now={now} />
-          )}
-          {queue.waiting.length > 0 && (
-            <QueueGroup
-              title="Waiting for a runner"
-              note="A job that no online runner can serve is skipped fifteen minutes after it was queued, rather than waiting forever — the tests in it report as skipped."
-              jobs={queue.waiting}
-              now={now}
-            />
-          )}
+        <>
+          {rows.slice(0, 25).map((job) => (
+            <QueueRow key={job.id} job={job} now={now} />
+          ))}
           {queue.completed > 0 && (
-            <p className="text-ink-faint text-micro tabular-nums">
-              {queue.completed} completed job{queue.completed === 1 ? '' : 's'} in the last 200.
+            <p className="text-ink-faint text-micro mt-2 font-mono tabular-nums">
+              {queue.completed} completed job{queue.completed === 1 ? '' : 's'} in the last 200
             </p>
           )}
-        </div>
+        </>
       )}
     </section>
   );
 }
 
-function QueueGroup({
-  title,
-  note,
-  jobs,
-  now,
-}: {
-  title: string;
-  note?: string;
-  jobs: RunnerJob[];
-  now: number;
-}) {
-  return (
-    <div>
-      <div className="mb-2 flex items-baseline gap-2">
-        <h3 className="text-body-sm font-medium">{title}</h3>
-        <span className="text-ink-faint text-micro tabular-nums">{jobs.length}</span>
-      </div>
-      {note && <p className="text-ink-faint text-micro mb-2 leading-relaxed">{note}</p>}
-      <Card className="divide-line divide-y overflow-hidden">
-        {jobs.slice(0, 25).map((job) => (
-          <div key={job.id} className="px-4 py-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge tone={STATUS_TONE[job.status] ?? 'neutral'}>{job.status}</Badge>
-              <Link
-                href={`/runs/${job.runId}`}
-                className="text-accent text-body-sm font-mono hover:underline"
-              >
-                {job.runId.slice(-8)}
-              </Link>
-              <span className="text-ink-dim text-body-sm">
-                {job.shardIndex === null ? 'whole run' : `shard ${job.shardIndex}`}
-              </span>
-              {job.pool && <Badge mono>{job.pool}</Badge>}
-              {job.attempt > 1 && (
-                <span className="text-flake text-micro tabular-nums">
-                  attempt {job.attempt} of {job.maxAttempts}
-                </span>
-              )}
-              <span className="text-ink-faint text-micro ml-auto tabular-nums">
-                {job.status === 'QUEUED'
-                  ? `waiting ${elapsed(job.queuedAt, now)}`
-                  : job.finishedAt
-                    ? `${elapsed(job.finishedAt, now)} ago`
-                    : job.claimedAt
-                      ? `picked up ${elapsed(job.claimedAt, now)} ago`
-                      : `queued ${elapsed(job.queuedAt, now)} ago`}
-              </span>
-            </div>
-            {job.errorMessage && (
-              <p className="text-ink-dim text-micro mt-1.5 leading-relaxed">{job.errorMessage}</p>
-            )}
-            <Requirements requirements={job.requirements} />
-          </div>
-        ))}
-      </Card>
-    </div>
-  );
-}
+/**
+ * One held job, carrying its reason.
+ *
+ * The reason is the row. "Waiting 4m" is a fact anyone can read off a clock;
+ * "no live runner in pool 'windows'" is the thing that tells them what to fix,
+ * and it is what the sweep writes into `errorMessage`.
+ */
+function QueueRow({ job, now }: { job: RunnerJob; now: number }) {
+  const waiting = job.status === 'QUEUED';
+  const reason =
+    job.errorMessage ??
+    (waiting
+      ? `waiting for a runner${job.pool ? ` in pool ‘${job.pool}’` : ''}`
+      : `${job.status.toLowerCase()}${job.pool ? ` · pool ${job.pool}` : ''}`);
 
-/** What a runner must have before this job can be offered to it. */
-function Requirements({ requirements }: { requirements: RunnerJob['requirements'] }) {
-  const parts = [
-    ...(requirements.testTypes ?? []),
-    ...(requirements.browsers ?? []),
-    ...(requirements.toolchains ?? []),
-  ];
-  if (parts.length === 0) return null;
   return (
-    <p className="text-ink-faint text-meta mt-1 font-mono">needs {parts.join(' · ')}</p>
+    <div className="border-line flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b py-2.5">
+      <p className={cn('min-w-0 flex-1 text-[13px]', STATUS_TEXT[job.status] ?? 'text-ink-dim')}>
+        {reason}
+        <span className="text-ink-faint">
+          {' · '}
+          <Link href={`/runs/${job.runId}`} className="font-mono hover:underline">
+            {job.runId.slice(-8)}
+          </Link>
+          {job.shardIndex === null ? ' · whole run' : ` · shard ${job.shardIndex}`}
+          {job.attempt > 1 && ` · attempt ${job.attempt} of ${job.maxAttempts}`}
+          {' · '}
+          {waiting
+            ? `waiting ${elapsed(job.queuedAt, now)}`
+            : job.finishedAt
+              ? `${elapsed(job.finishedAt, now)} ago`
+              : job.claimedAt
+                ? `picked up ${elapsed(job.claimedAt, now)} ago`
+                : `queued ${elapsed(job.queuedAt, now)} ago`}
+        </span>
+      </p>
+    </div>
   );
 }
 
 /** How to actually start one — the screen is useless without it. */
 function StartAgentHelp() {
   return (
-    <section className="mt-10">
+    <section className="mt-5">
       <SectionLabel>Starting an agent</SectionLabel>
-      <Card className="p-4">
-        <ol className="text-body-sm text-ink-dim space-y-3 leading-relaxed">
-          <li>
-            <span className="text-ink">1.</span>{' '}Register a runner above and copy its token. It is
-            shown once.
-          </li>
-          <li>
-            <span className="text-ink">2.</span>{' '}On a host that can already reach the application
-            under test, write{' '}
-            <code className="border-line bg-surface rounded border px-1 py-0.5 font-mono text-micro">
-              qaai-runner.json
-            </code>{' '}
-            naming the executor you already use. The agent runs that command and nothing else —
-            QAAI sends test source, never an argv.
-          </li>
-          <li>
-            <span className="text-ink">3.</span>{' '}Start it:
-            <code className="border-line bg-surface mt-2 block overflow-x-auto rounded border px-3 py-2 font-mono text-micro">
-              export QAAI_RUNNER_TOKEN=&apos;qaai_rt_…&apos;
-              <br />
-              qaai runner --api-url {API_URL}
-            </code>
-          </li>
-          <li>
-            <span className="text-ink">4.</span>{' '}Point an environment at the runner&apos;s pool.
-            Until an environment names a pool, its runs go to QAAI&apos;s own workers and this queue
-            stays empty.{' '}
-            <Link href="/environments" className="text-accent hover:underline">
-              Environments
-            </Link>
-          </li>
-        </ol>
-        <p className="text-ink-faint text-micro mt-4 leading-relaxed">
-          Outbound HTTPS to {API_URL} is the only network access the agent needs. It refuses
-          redirects while holding a token, and it will not follow a host named in any response.
-        </p>
-      </Card>
+      <ol className="text-row-sub text-ink-dim space-y-3 leading-relaxed">
+        <li>
+          <span className="text-ink font-mono">1</span> Register a runner above and copy its token.
+          It is shown once.
+        </li>
+        <li>
+          <span className="text-ink font-mono">2</span> On a host that can already reach the
+          application under test, write{' '}
+          <code className="border-line bg-surface-1 text-micro rounded-sm border px-1 py-0.5 font-mono">
+            qaai-runner.json
+          </code>{' '}
+          naming the executor you already use. The agent runs that command and nothing else — QAAI
+          sends test source, never an argv.
+        </li>
+        <li>
+          <span className="text-ink font-mono">3</span> Start it:
+          <code className="border-line bg-surface-1 text-micro mt-2 block overflow-x-auto rounded-md border px-3 py-2 font-mono">
+            export QAAI_RUNNER_TOKEN=&apos;qaai_rt_…&apos;
+            <br />
+            qaai runner --api-url {API_URL}
+          </code>
+        </li>
+        <li>
+          <span className="text-ink font-mono">4</span>{' '}
+          Point an environment at the runner&apos;s pool. Until an environment names a pool, its
+          runs go to QAAI&apos;s own workers and this queue stays empty.{' '}
+          <Link href="/environments" className="text-accent hover:underline">
+            Environments
+          </Link>
+        </li>
+      </ol>
+      <p className="text-ink-faint text-micro mt-3.5 font-mono">
+        outbound HTTPS to {API_URL} is the only network access the agent needs · it refuses
+        redirects while holding a token
+      </p>
     </section>
   );
 }

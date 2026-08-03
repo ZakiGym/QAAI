@@ -4,12 +4,14 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api, ApiError, type Environment } from '../../lib/api';
 import { SecretsPanel } from '../../components/SecretsPanel';
+import { SetupHeader } from '../../components/setup/SetupHeader';
 import { useProject } from '../../components/shell/ProjectContext';
 import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Field } from '../../components/ui/Field';
 import { ConfirmDialog } from '../../components/ui/Modal';
-import { Badge, Page, PageHeader, SectionLabel, SkeletonRows } from '../../components/ui/layout';
+import { Page, SectionLabel, Skeleton } from '../../components/ui/layout';
+import { cn } from '../../lib/cn';
 
 const KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
 
@@ -19,6 +21,10 @@ const KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
  * An environment is a base URL plus a set of credentials the tests run against.
  * The secrets sit in the encrypted vault; this screen manages the shape (which
  * environments exist, where they point) and hands each one to <SecretsPanel>.
+ *
+ * The list is the navigation and the right column is the subject — a two-pane
+ * shape rather than a stack, because the one thing anyone comes here to do is
+ * compare where staging points with where production points.
  */
 export default function EnvironmentsPage() {
   const router = useRouter();
@@ -30,11 +36,16 @@ export default function EnvironmentsPage() {
   const [loadingEnvs, setLoadingEnvs] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // New-environment form.
+  // New-environment form, behind the `+ new environment` link.
+  const [adding, setAdding] = useState(false);
   const [name, setName] = useState('');
   const [kind, setKind] = useState<(typeof KINDS)[number]>('STAGING');
-  const [baseUrl, setBaseUrl] = useState('https://');
+  const [newUrl, setNewUrl] = useState('https://');
   const [creating, setCreating] = useState(false);
+
+  // The base URL of the selected environment, and whether it has been edited.
+  const [baseUrl, setBaseUrl] = useState('');
+  const [savingUrl, setSavingUrl] = useState(false);
 
   // The environment awaiting a delete confirmation.
   const [pendingDelete, setPendingDelete] = useState<Environment | null>(null);
@@ -77,18 +88,27 @@ export default function EnvironmentsPage() {
       .finally(() => setLoadingEnvs(false));
   }, [projectId, loadEnvs, router]);
 
+  const selectedEnv = envs.find((e) => e.id === selected) ?? null;
+
+  // The field follows the selection: switching rows must show that row's URL,
+  // not keep the one you were looking at a moment ago.
+  useEffect(() => {
+    setBaseUrl(selectedEnv?.baseUrl ?? '');
+  }, [selectedEnv?.id, selectedEnv?.baseUrl]);
+
   async function createEnv(e: React.FormEvent) {
     e.preventDefault();
-    if (!projectId || !name.trim()) return;
+    if (!projectId || !name.trim() || creating) return;
     setCreating(true);
     setError(null);
     try {
       const { environment } = await api<{ environment: Environment }>(
         `/projects/${projectId}/environments`,
-        { method: 'POST', body: JSON.stringify({ name: name.trim(), kind, baseUrl }) },
+        { method: 'POST', body: JSON.stringify({ name: name.trim(), kind, baseUrl: newUrl }) },
       );
       setName('');
-      setBaseUrl('https://');
+      setNewUrl('https://');
+      setAdding(false);
       await loadEnvs(projectId);
       setSelected(environment.id);
     } catch (err) {
@@ -98,16 +118,20 @@ export default function EnvironmentsPage() {
     }
   }
 
-  async function saveBaseUrl(env: Environment, next: string) {
-    if (!projectId || next === env.baseUrl) return;
+  async function saveBaseUrl(env: Environment) {
+    if (!projectId || baseUrl === env.baseUrl || savingUrl) return;
+    setSavingUrl(true);
+    setError(null);
     try {
       await api(`/projects/${projectId}/environments/${env.id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ baseUrl: next }),
+        body: JSON.stringify({ baseUrl }),
       });
       await loadEnvs(projectId);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not update the base URL');
+    } finally {
+      setSavingUrl(false);
     }
   }
 
@@ -126,159 +150,189 @@ export default function EnvironmentsPage() {
     }
   }
 
-  const selectedEnv = envs.find((e) => e.id === selected) ?? null;
   // "No project" and "not fetched yet" look identical from the DOM; only the
   // first one may disable the form and say so.
   const noProject = !projectLoading && !projectId;
+  const dirty = selectedEnv !== null && baseUrl !== selectedEnv.baseUrl;
 
   return (
-    <Page width="wide">
-      <PageHeader title="Environments" />
+    <Page width="setup">
+      <SetupHeader />
 
       {error && (
-        <p role="alert" className="border-fail/40 bg-fail/10 text-fail mb-6 rounded-md border p-3 text-sm">
+        <p
+          role="alert"
+          className="border-fail/40 text-fail text-row-sub mt-6 rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] p-3"
+        >
           {error}
         </p>
       )}
 
-      <div className="grid gap-6 sm:grid-cols-[260px_1fr]">
-        {/* Environment list + create */}
-        <div className="space-y-4">
-          <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-lg border">
-            {noProject ? (
-              <p className="text-ink-faint text-micro px-3 py-4 text-center">
-                No app yet — nothing to point at.
+      {noProject ? (
+        <div className="mt-7">
+          <EmptyState
+            title="No app to configure yet"
+            body="Environments hang off an app — they are where a run gets its base URL and its credentials. Add an app, then point one at staging or production."
+            action={{ label: 'Add app', href: '/onboarding' }}
+          />
+        </div>
+      ) : (
+        <div className="mt-7 grid gap-8 md:grid-cols-[minmax(180px,240px)_minmax(300px,1fr)]">
+          {/* ── The environments ───────────────────────────────────────────── */}
+          <div>
+            {loadingEnvs ? (
+              <div className="space-y-1" aria-label="Loading" role="status">
+                <Skeleton className="h-[58px] w-full rounded-lg" />
+                <Skeleton className="h-[58px] w-full rounded-lg" />
+                <Skeleton className="h-[58px] w-full rounded-lg" />
+              </div>
+            ) : envs.length === 0 ? (
+              <p className="text-ink-faint text-row-sub">
+                No environments yet. One points a run at staging or production.
               </p>
-            ) : loadingEnvs ? (
-              <SkeletonRows rows={3} />
             ) : (
-              <>
-                {envs.map((env) => (
-                  <button
-                    key={env.id}
-                    type="button"
-                    onClick={() => setSelected(env.id)}
-                    className={`flex w-full items-center gap-2 px-3 py-2.5 text-left ${
-                      selected === env.id ? 'bg-surface-2' : 'hover:bg-surface-1'
-                    }`}
-                  >
-                    <span className="text-sm font-medium">{env.name}</span>
-                    <Badge mono className="uppercase">
-                      {env.kind.toLowerCase()}
-                    </Badge>
-                    <span className="text-ink-faint ml-auto text-micro tabular-nums">
-                      {env._count?.secrets ?? 0} 🔑
+              envs.map((env) => (
+                <button
+                  key={env.id}
+                  type="button"
+                  onClick={() => setSelected(env.id)}
+                  aria-pressed={selected === env.id}
+                  className={cn(
+                    'mt-1 block w-full rounded-lg border px-3 py-2.5 text-left transition-colors first:mt-0',
+                    selected === env.id
+                      ? 'border-line-strong bg-surface-1'
+                      : 'hover:bg-surface-1 border-transparent',
+                  )}
+                >
+                  <span className="flex items-baseline gap-2">
+                    <span
+                      className={cn(
+                        'min-w-0 flex-1 truncate text-[13px]',
+                        selected === env.id ? 'font-semibold' : 'text-ink-dim',
+                      )}
+                    >
+                      {env.name}
                     </span>
-                  </button>
-                ))}
-                {envs.length === 0 && (
-                  <p className="text-ink-faint text-micro px-3 py-4 text-center">
-                    No environments. Add one to point runs at staging or production.
-                  </p>
-                )}
-              </>
+                    <span className="text-ink-faint shrink-0 font-mono text-[9.5px] tracking-[0.05em]">
+                      {env.kind}
+                    </span>
+                  </span>
+                  <span className="text-ink-faint mt-[3px] block truncate font-mono text-[10.5px]">
+                    {env.baseUrl.replace(/^https?:\/\//, '')}
+                  </span>
+                </button>
+              ))
+            )}
+
+            <p className="mt-3">
+              <button
+                type="button"
+                onClick={() => setAdding((a) => !a)}
+                aria-expanded={adding}
+                className="text-accent text-[12px] hover:underline"
+              >
+                {adding ? '– cancel' : '+ new environment'}
+              </button>
+            </p>
+
+            {adding && (
+              <form
+                onSubmit={createEnv}
+                className="border-line mt-3 space-y-2.5 rounded-lg border p-3"
+              >
+                <Field
+                  label="Name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="staging"
+                />
+                <div>
+                  <label
+                    htmlFor="env-kind"
+                    className="text-meta text-ink-faint mb-2 block font-mono tracking-[0.08em] uppercase"
+                  >
+                    Kind
+                  </label>
+                  <select
+                    id="env-kind"
+                    value={kind}
+                    onChange={(e) => setKind(e.target.value as (typeof KINDS)[number])}
+                    className="border-line text-row-sub focus:border-accent w-full rounded-md border bg-transparent px-2.5 py-2 outline-none transition-colors"
+                  >
+                    {KINDS.map((k) => (
+                      <option key={k} value={k}>
+                        {k.toLowerCase()}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <Field
+                  label="Base URL"
+                  value={newUrl}
+                  onChange={(e) => setNewUrl(e.target.value)}
+                  placeholder="https://staging.example.com"
+                  className="font-mono"
+                />
+                <Button type="submit" variant="primary" size="sm" className="w-full" loading={creating}>
+                  Create
+                </Button>
+              </form>
             )}
           </div>
 
-          <form onSubmit={createEnv} className="border-line space-y-2 rounded-lg border p-3">
-            <p className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
-              New environment
-            </p>
-            <Field
-              aria-label="Environment name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Staging"
-              disabled={noProject}
-              className="disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <select
-              value={kind}
-              onChange={(e) => setKind(e.target.value as (typeof KINDS)[number])}
-              aria-label="Environment kind"
-              disabled={noProject}
-              className="border-line bg-surface-1 w-full rounded-md border px-2.5 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {KINDS.map((k) => (
-                <option key={k} value={k}>
-                  {k.toLowerCase()}
-                </option>
-              ))}
-            </select>
-            <Field
-              aria-label="Base URL"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="https://staging.example.com"
-              disabled={noProject}
-              className="font-mono disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <Button
-              type="submit"
-              variant="primary"
-              className="w-full"
-              loading={creating}
-              disabled={noProject}
-            >
-              Create
-            </Button>
-            {noProject && (
-              <p className="text-ink-faint text-micro">
-                An environment belongs to an app, and there is no app yet. Add one first.
-              </p>
-            )}
-          </form>
-        </div>
-
-        {/* Selected environment */}
-        <div>
-          {selectedEnv ? (
-            <div className="space-y-6">
-              <div className="border-line bg-surface-1 rounded-lg border p-4">
-                <div className="mb-3 flex items-center gap-2">
-                  <h2 className="font-medium">{selectedEnv.name}</h2>
-                  <Badge mono className="uppercase">
-                    {selectedEnv.kind.toLowerCase()}
-                  </Badge>
-                  <Button
-                    variant="danger"
-                    size="sm"
-                    className="ml-auto"
-                    onClick={() => setPendingDelete(selectedEnv)}
-                  >
-                    Delete
-                  </Button>
-                </div>
-                {/* Uncontrolled and keyed by environment, so switching rows
-                    reloads the field instead of keeping the old URL. */}
-                <Field
-                  key={selectedEnv.id}
-                  label="Base URL"
-                  defaultValue={selectedEnv.baseUrl}
-                  onBlur={(e) => void saveBaseUrl(selectedEnv, e.target.value)}
-                  hint="Tests run against this URL. Changes save on blur."
-                  className="bg-surface font-mono"
-                />
+          {/* ── The selected one ───────────────────────────────────────────── */}
+          <div>
+            {loadingEnvs ? (
+              <div aria-hidden="true" className="space-y-3">
+                <Skeleton className="h-3 w-20" />
+                <Skeleton className="h-9 w-full rounded-md" />
               </div>
+            ) : !selectedEnv ? (
+              <p className="text-ink-faint text-row-sub">
+                Select an environment, or add the first one — a run needs a URL to point at.
+              </p>
+            ) : (
+              <>
+                <SectionLabel>Base URL</SectionLabel>
+                <form
+                  className="flex gap-2"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void saveBaseUrl(selectedEnv);
+                  }}
+                >
+                  <input
+                    aria-label="Base URL"
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                    className="border-line bg-surface-1 focus:border-accent min-w-0 flex-1 rounded-md border px-3 py-2 font-mono text-[12px] outline-none transition-colors"
+                  />
+                  <Button type="submit" loading={savingUrl} disabled={!dirty}>
+                    Save
+                  </Button>
+                </form>
+                <p className="text-ink-faint text-micro mt-1.5 font-mono">
+                  every run against {selectedEnv.name} starts here
+                </p>
 
-              <div>
-                <SectionLabel>Secrets</SectionLabel>
                 {projectId && (
                   <SecretsPanel projectId={projectId} environmentId={selectedEnv.id} />
                 )}
-              </div>
-            </div>
-          ) : noProject ? (
-            <EmptyState
-              title="No app to configure yet"
-              body="Environments hang off an app — they are where a run gets its base URL and its credentials. Add an app, then point one at staging or production."
-              action={{ label: 'Add app', href: '/onboarding' }}
-            />
-          ) : (
-            <p className="text-ink-faint text-sm">Select or create an environment.</p>
-          )}
+
+                <p className="mt-7">
+                  <button
+                    type="button"
+                    onClick={() => setPendingDelete(selectedEnv)}
+                    className="text-fail text-[12px] hover:underline"
+                  >
+                    delete this environment…
+                  </button>
+                </p>
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       <ConfirmDialog
         open={pendingDelete !== null}
@@ -289,7 +343,7 @@ export default function EnvironmentsPage() {
         title="Delete environment"
         body={
           pendingDelete
-            ? `Delete the ${pendingDelete.name} environment and all its secrets?`
+            ? `Delete the ${pendingDelete.name} environment and all its secrets? Any run or schedule pointed at it stops having somewhere to go.`
             : ''
         }
         confirmLabel="Delete environment"

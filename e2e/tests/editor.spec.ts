@@ -85,7 +85,9 @@ test.describe('the editor', () => {
     // (A bare /editor restores a file of its own choosing, which would make an
     // assertion about "the file I clicked" pass without the click.)
     await page.goto(`/editor?test=${open!.id}`);
-    await expect(page.getByText(open!.filePath).first()).toBeVisible();
+    // The full path never renders in the redesigned editor (tree and tabs are
+    // basenames); the close button's label is where the full path lives.
+    await expect(page.getByRole('button', { name: `Close ${open!.filePath}` })).toBeVisible();
 
     /*
      * The tree row, addressed by its tooltip — the test's NAME. Its file name
@@ -95,7 +97,6 @@ test.describe('the editor', () => {
     await page.getByTitle(target!.name, { exact: true }).click();
 
     await expect(page.getByRole('button', { name: `Close ${target!.filePath}` })).toBeVisible();
-    await expect(page.getByText(target!.filePath).first()).toBeVisible();
     await expect(page.getByRole('code')).toBeVisible();
   });
 

@@ -91,7 +91,7 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
 
 const STYLE: Record<ToastKind, { border: string; dot: string; label: string }> = {
   success: { border: 'border-pass/40', dot: 'bg-pass', label: 'Success' },
-  error: { border: 'border-fail/50', dot: 'bg-fail', label: 'Error' },
+  error: { border: 'border-fail/40', dot: 'bg-fail', label: 'Error' },
   info: { border: 'border-line-strong', dot: 'bg-accent', label: 'Info' },
 };
 
@@ -112,11 +112,11 @@ function ToastRow({ toast, onDismiss }: { toast: Toast; onDismiss: () => void })
       className={`pointer-events-auto bg-surface-1 flex items-start gap-2.5 rounded-lg border px-3.5 py-3 shadow-[var(--shadow-overlay)] ${style.border}`}
     >
       <span
-        className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${style.dot}`}
+        className={`mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full ${style.dot}`}
         aria-hidden="true"
       />
       <div className="min-w-0 flex-1">
-        <p className="text-body-sm text-ink break-words">{toast.message}</p>
+        <p className="text-row text-ink break-words">{toast.message}</p>
         {toast.action && (
           <button
             type="button"
@@ -124,7 +124,7 @@ function ToastRow({ toast, onDismiss }: { toast: Toast; onDismiss: () => void })
               toast.action?.run();
               onDismiss();
             }}
-            className="text-accent text-micro mt-1.5 font-medium hover:underline"
+            className="text-accent text-row-sub mt-1.5 font-medium hover:underline"
           >
             {toast.action.label}
           </button>

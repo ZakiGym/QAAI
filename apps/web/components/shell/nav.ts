@@ -1,65 +1,108 @@
 import type { ComponentType } from 'react';
-import {
-  IconList,
-  IconGrid,
-  IconCode,
-  IconMap,
-  IconTriage,
-  IconShield,
-  IconHeal,
-  IconBranch,
-  IconKey,
-  IconDownload,
-  IconPlusSquare,
-  IconSliders,
-  IconActivity,
-  IconBug,
-  IconSearch,
-} from './icons';
+import { IconList, IconCode, IconTriage, IconSliders, IconSearch } from './icons';
 import { IconServer } from '../RunnerList';
 
 /**
- * The one source of truth for the sidebar's destinations. The cockpit
- * (`/runs/:id`) and plan approval (`/projects/:id/plan`) have no nav entry of
- * their own, so `isNavActive` folds them under Runs — otherwise nothing in the
- * sidebar lights up while you are looking at a run.
+ * The sidebar's destinations, and the tab strips inside them.
+ *
+ * ─── Why this shrank from sixteen rows to six ────────────────────────────────
+ *
+ * The old sidebar listed every screen the product has. Sixteen equally-weighted
+ * rows is not navigation, it is an index — nothing told you that Triage is
+ * where your day starts and Import is something you do once, and the two most
+ * closely related screens in the app (Runs and Dashboard) sat apart with twelve
+ * rows between them.
+ *
+ * Six sections, each with a tab strip. Every screen the product had is still
+ * reachable and still at its own URL, which matters more than it looks: a run
+ * link pasted in Slack, a bookmark, a link in an email and every selector in
+ * the dogfood suite all keep working. The only genuine merge is /dashboard,
+ * which became the stats band at the top of Runs and now redirects there.
  */
+
+export interface NavTab {
+  href: string;
+  /** Rendered mono/uppercase in the strip; written here in its display case. */
+  label: string;
+}
 
 export interface NavItemDef {
   href: string;
   label: string;
   Icon: ComponentType<{ className?: string }>;
   /**
-   * Extra routes this entry owns — screens with no nav entry of their own that
-   * should still light this one up. `/settings/github` is the GitHub App tab of
-   * the Infrastructure screen: you reach it from a tab, not the sidebar, and
-   * without this the highlight jumped to Settings the moment you switched tabs.
+   * Extra routes this entry owns — screens with no row of their own that should
+   * still light this one up (a cockpit under Runs, the GitHub App tab under
+   * Setup). Without it the sidebar goes dark exactly when you have navigated
+   * somewhere deep and most need to know where you are.
    */
   owns?: string[];
+  /** The strip under the page title. Absent for sections with a single screen. */
+  tabs?: NavTab[];
+  /**
+   * A live signal rendered on the row: a pulse dot for runs in flight, a count
+   * pill for verdicts waiting on a human. Resolved by the Sidebar — this file
+   * stays free of data fetching.
+   */
+  badge?: 'live-runs' | 'open-verdicts';
 }
 
 export const NAV: NavItemDef[] = [
-  { href: '/runs', label: 'Runs', Icon: IconList },
-  { href: '/dashboard', label: 'Dashboard', Icon: IconGrid },
-  { href: '/editor', label: 'Editor', Icon: IconCode },
-  { href: '/flow-map', label: 'Flow map', Icon: IconMap },
-  { href: '/triage', label: 'Triage', Icon: IconTriage },
-  { href: '/quality', label: 'Quality', Icon: IconShield },
-  { href: '/insights', label: 'Insights', Icon: IconSearch },
-  { href: '/heals', label: 'Self-healing', Icon: IconHeal },
-  { href: '/environments', label: 'Environments', Icon: IconKey },
-  { href: '/source-control', label: 'Source control', Icon: IconBranch },
-  { href: '/traffic', label: 'Traffic', Icon: IconActivity },
-  { href: '/repro', label: 'Reproduce a bug', Icon: IconBug },
-  { href: '/import', label: 'Import', Icon: IconDownload },
-  { href: '/onboarding', label: 'Add app', Icon: IconPlusSquare },
-  // Infrastructure (runners + the GitHub App). The icon comes from the feature's
-  // own file rather than ./icons because this change does not own that file.
   {
-    href: '/settings/runners',
-    label: 'Infrastructure',
+    href: '/runs',
+    label: 'Runs',
+    Icon: IconList,
+    // The cockpit and the plan-approval screen fold under Runs. /dashboard is
+    // listed because its redirect is a client hop and the row must not flicker.
+    owns: ['/dashboard', '/projects'],
+    badge: 'live-runs',
+  },
+  {
+    href: '/triage',
+    label: 'Triage',
+    Icon: IconTriage,
+    owns: ['/heals', '/quality'],
+    badge: 'open-verdicts',
+    tabs: [
+      { href: '/triage', label: 'Verdicts' },
+      { href: '/heals', label: 'Heals' },
+      { href: '/quality', label: 'Quality' },
+    ],
+  },
+  {
+    href: '/editor',
+    label: 'Tests',
+    Icon: IconCode,
+    owns: ['/flow-map', '/import', '/repro', '/traffic', '/tests'],
+    tabs: [
+      { href: '/editor', label: 'Editor' },
+      { href: '/flow-map', label: 'Flow map' },
+      { href: '/import', label: 'Import' },
+      { href: '/repro', label: 'From a bug' },
+      { href: '/traffic', label: 'From traffic' },
+    ],
+  },
+  {
+    href: '/insights',
+    label: 'Insights',
+    Icon: IconSearch,
+    tabs: [
+      { href: '/insights/coverage', label: 'Coverage' },
+      { href: '/insights/health', label: 'Suite health' },
+      { href: '/insights/impact', label: 'Impact' },
+    ],
+  },
+  {
+    href: '/environments',
+    label: 'Setup',
     Icon: IconServer,
-    owns: ['/settings/github'],
+    owns: ['/source-control', '/settings/runners', '/settings/github', '/onboarding'],
+    tabs: [
+      { href: '/environments', label: 'Environments' },
+      { href: '/source-control', label: 'Source control' },
+      { href: '/settings/runners', label: 'Runners' },
+      { href: '/onboarding', label: 'Add app' },
+    ],
   },
 ];
 
@@ -67,7 +110,18 @@ export const SETTINGS_ITEM: NavItemDef = {
   href: '/settings',
   label: 'Settings',
   Icon: IconSliders,
+  owns: ['/settings/billing'],
+  tabs: [
+    { href: '/settings?tab=organization', label: 'Organization' },
+    { href: '/settings?tab=members', label: 'Members' },
+    { href: '/settings?tab=apiKeys', label: 'API keys' },
+    { href: '/settings/billing', label: 'Billing' },
+    { href: '/settings?tab=account', label: 'Account' },
+  ],
 };
+
+/** Every section, in sidebar order. Settings sits below a spacer in the UI. */
+export const ALL_SECTIONS: NavItemDef[] = [...NAV, SETTINGS_ITEM];
 
 /**
  * Routes that must NOT get the app shell (marketing + auth stand alone).
@@ -79,28 +133,21 @@ export const SETTINGS_ITEM: NavItemDef = {
 export const SHELL_EXCLUDED = new Set(['/', '/login', '/signup', '/reset-password']);
 
 function matchesPrefix(pathname: string, href: string): boolean {
-  return pathname === href || pathname.startsWith(`${href}/`);
+  const path = href.split('?')[0]!;
+  return pathname === path || pathname.startsWith(`${path}/`);
 }
 
 export function isNavActive(pathname: string, href: string): boolean {
-  if (href === '/runs') {
-    return (
-      pathname === '/runs' || pathname.startsWith('/runs/') || pathname.startsWith('/projects/')
-    );
-  }
-
-  const item = NAV.find((entry) => entry.href === href);
-  if (item?.owns?.some((route) => matchesPrefix(pathname, route))) return true;
+  const item = ALL_SECTIONS.find((entry) => entry.href === href);
 
   /*
-   * Settings yields to anything more specific.
-   *
-   * Infrastructure lives at `/settings/runners`, which the prefix rule also
-   * hands to `/settings` — so on that screen TWO sidebar rows lit up and two
-   * links carried `aria-current="page"`, which is both wrong to look at and
-   * wrong to hear. The general rule: an entry nested under another entry wins
-   * outright, and the parent stays dark.
+   * A nested claim wins outright. Setup owns /settings/runners and
+   * /settings/github, which the prefix rule below would also hand to Settings —
+   * so on those screens TWO rows lit up and two links carried
+   * aria-current="page", which is wrong to look at and wrong to hear.
    */
+  if (item?.owns?.some((route) => matchesPrefix(pathname, route))) return true;
+
   if (href === SETTINGS_ITEM.href) {
     const claimedByNav = NAV.some(
       (entry) =>
@@ -111,4 +158,28 @@ export function isNavActive(pathname: string, href: string): boolean {
   }
 
   return matchesPrefix(pathname, href);
+}
+
+/** Which section owns a path. Null on the routes that stand outside the shell. */
+export function sectionFor(pathname: string): NavItemDef | null {
+  return ALL_SECTIONS.find((item) => isNavActive(pathname, item.href)) ?? null;
+}
+
+/** Whether a tab in a strip is the one currently being shown. */
+export function isTabActive(pathname: string, search: string, tabHref: string): boolean {
+  const [path, query] = tabHref.split('?');
+  if (pathname !== path) {
+    // /insights redirects to /insights/coverage; treat the bare route as its
+    // first tab so the strip is never blank on arrival.
+    return path === '/insights/coverage' && pathname === '/insights';
+  }
+  if (!query) return true;
+
+  const want = new URLSearchParams(query);
+  const have = new URLSearchParams(search);
+  for (const [key, value] of want) {
+    // A URL with no tab param means the screen's own default, which is the first.
+    if ((have.get(key) ?? 'organization') !== value) return false;
+  }
+  return true;
 }

@@ -1,0 +1,25 @@
+/*
+ * The two classes the editor hands to Monaco's decoration API.
+ *
+ * ─── Why these are not Tailwind utilities ────────────────────────────────────
+ *
+ * Monaco sanitises the class string it is given: every bracket, paren, comma
+ * and slash is replaced with a space. A Tailwind arbitrary value such as
+ * `bg-[color-mix(in_srgb,var(--color-fail)_7%,transparent)]` arrives in the DOM
+ * as eight fragments — `bg-`, `color-mix`, `in_srgb`, … — none of which is a
+ * class that exists. The same sanitiser eats the `!` off an important modifier.
+ *
+ * So the two rules the failing-line wash needs live here, as plain CSS, still
+ * bound to the tokens. `!important` on the gutter colour is deliberate: Monaco's
+ * own line-number rule is two classes deep, and beating it from a descendant
+ * selector would mean reaching into its DOM, which is the thing this file exists
+ * to avoid.
+ */
+
+.qaai-fail-line {
+  background: color-mix(in srgb, var(--color-fail) 7%, transparent);
+}
+
+.qaai-fail-line-number {
+  color: var(--color-fail) !important;
+}

@@ -27,7 +27,13 @@ test.describe('the command palette', () => {
     await expect(palette.getByPlaceholder('Run a command…')).toBeFocused();
 
     await palette.getByPlaceholder('Run a command…').fill('triage');
-    await expect(palette.getByRole('button', { name: /Go to Triage/ })).toBeVisible();
+    /*
+     * `.first()`, because "Go to Triage" is now three commands, not one — the
+     * palette gained an entry per section tab (Verdicts / Heals / Quality) when
+     * the nav grew tab strips. More matches is the feature working; the
+     * assertion is that narrowing kept Triage and dropped Settings.
+     */
+    await expect(palette.getByRole('button', { name: /Go to Triage/ }).first()).toBeVisible();
     await expect(palette.getByRole('button', { name: /Go to Settings/ })).toHaveCount(0);
   });
 
@@ -37,7 +43,8 @@ test.describe('the command palette', () => {
 
     await shortcut(page, 'k');
     await page.getByPlaceholder('Run a command…').fill('triage');
-    await page.getByRole('button', { name: /Go to Triage/ }).click();
+    // .first() — see above; the top match is the section's own first tab.
+    await page.getByRole('button', { name: /Go to Triage/ }).first().click();
 
     await expect(page.getByRole('heading', { name: 'Triage', level: 1 })).toBeVisible();
     await expect(page.getByRole('dialog', { name: 'Run a command' })).toHaveCount(0);
@@ -87,7 +94,18 @@ test.describe('quick-open', () => {
   test('picking a file opens it in the editor', async ({ page, api }) => {
     const project = await firstProject(api);
     const tests = await projectTests(api, project.id);
-    const target = tests.find((t) => t.filePath.endsWith('.spec.ts')) ?? tests[0];
+    /*
+     * A target whose name is not a substring of any other test's, so the
+     * fuzzy-narrowed list's FIRST entry is provably the one this test means —
+     * `.first()` on an ambiguous name can click a lookalike and then wait
+     * forever for the wrong file's close button.
+     */
+    const target =
+      tests.find(
+        (t) =>
+          t.filePath.endsWith('.spec.ts') &&
+          tests.every((o) => o === t || !o.name.includes(t.name)),
+      ) ?? tests.find((t) => t.filePath.endsWith('.spec.ts'));
     test.skip(!target, 'This project has no tests to open. Seed the demo data.');
 
     await page.goto('/runs');
@@ -96,10 +114,31 @@ test.describe('quick-open', () => {
     await shortcut(page, 'p');
     const palette = page.getByRole('dialog', { name: 'Go to file' });
     await palette.getByPlaceholder('Go to file…').fill(target!.name);
-    await palette.getByRole('button', { name: new RegExp(escapeRe(target!.name)) }).first().click();
+    /*
+     * Wait for the entry BEFORE clicking. The files list loads lazily on first
+     * open, and under full-suite load that fetch can be slow — a bare .click()
+     * waits for it invisibly and then dies as an opaque test timeout, where the
+     * expect names what was actually missing.
+     */
+    const entry = palette.getByRole('button', { name: new RegExp(escapeRe(target!.name)) }).first();
+    await expect(entry).toBeVisible({ timeout: 15_000 });
+    await entry.click();
 
-    // The user-visible outcome is the file open in the editor, not the URL.
-    await expect(page.getByText(target!.filePath, { exact: false }).first()).toBeVisible();
+    /*
+     * The user-visible outcome is the file open in the editor, not the URL.
+     *
+     * This used to look for the full filePath as text. The redesigned editor
+     * never renders the full path anywhere — the tree is basenames with
+     * ellipsis and the open-file chips are basenames too, both per the design —
+     * so the proof is now the file's own tab chip, which only exists once a
+     * file is actually open.
+     */
+    // The close button is the one control that only exists once the file is
+    // truly open — the tree row's text is ALSO the basename, so any basename
+    // match can pass with nothing open at all.
+    await expect(
+      page.getByRole('button', { name: `Close ${target!.filePath}` }),
+    ).toBeVisible();
   });
 });
 

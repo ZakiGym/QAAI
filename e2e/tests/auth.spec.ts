@@ -26,8 +26,14 @@ test.describe('signing in', () => {
     await page.getByLabel('Password').fill(DEMO_PASSWORD);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
 
-    await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Recent runs' })).toBeVisible();
+    /*
+     * Runs home absorbed /dashboard in the redesign: the "Projects" and "Recent
+     * runs" headings became a FLEET section and a RUN LOG section under one h1.
+     * Still asserting two things — you landed on Runs, and the run log is really
+     * there — against what the screen renders now.
+     */
+    await expect(page.getByRole('heading', { name: 'Runs', level: 1 })).toBeVisible();
+    await expect(page.getByText('RUN LOG')).toBeVisible();
   });
 
   test('a wrong password is reported and does not let anybody through', async ({ page }) => {
@@ -49,9 +55,14 @@ test.describe('signing out', () => {
     await page.getByLabel('Email address').fill(DEMO_EMAIL);
     await page.getByLabel('Password').fill(DEMO_PASSWORD);
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-    await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Runs', level: 1 })).toBeVisible();
 
-    await page.getByRole('button', { name: 'Account' }).click();
+    /*
+     * The account menu moved. It hung off an "Account" button in the top bar;
+     * the redesign deleted the top bar entirely and put the user row at the
+     * foot of the sidebar, which is what opens the same menu now.
+     */
+    await page.getByRole('button', { name: /Demo Owner|Account/ }).click();
     await page.getByRole('menuitem', { name: 'Sign out' }).click();
 
     await expect(page.getByRole('heading', { name: 'Sign in to QAAI' })).toBeVisible();

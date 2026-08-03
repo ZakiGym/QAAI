@@ -13,27 +13,45 @@ import { cn } from '../../lib/cn';
  */
 
 /**
- * One content column, three widths.
+ * One content column, one width per section.
  *
- * `wide` is for lists and dashboards, `narrow` for forms and settings — reading
- * measure, not taste. `full` opts out for the console screens (cockpit, editor)
- * that are genuinely edge-to-edge.
+ * The measures come from the redesign brief and are deliberately not a generic
+ * sm/md/lg scale: each is the width at which that section's own densest row
+ * stops wrapping. Runs needs 1080 for the run-log grid; Settings is a reading
+ * column at 760 and gets narrower, not wider, than everything else.
+ *
+ * `wide` and `narrow` are the names thirty screens already pass. They stay, as
+ * aliases onto the two extremes of the new scale, so no screen breaks while the
+ * sections move over one at a time.
  */
+const WIDTH = {
+  runs: 'max-w-[1080px]',
+  triage: 'max-w-[980px]',
+  insights: 'max-w-[980px]',
+  setup: 'max-w-[940px]',
+  settings: 'max-w-[760px]',
+  wide: 'max-w-[1080px]',
+  narrow: 'max-w-[760px]',
+  /* Cockpit and editor are genuinely edge-to-edge and own their own scrolling. */
+  full: '',
+} as const;
+
 export function Page({
   width = 'wide',
   className,
   children,
 }: {
-  width?: 'narrow' | 'wide' | 'full';
+  width?: keyof typeof WIDTH;
   className?: string;
   children: React.ReactNode;
 }) {
   return (
     <main
       className={cn(
-        width === 'full' ? 'flex h-full flex-col' : 'mx-auto w-full px-6 py-10',
-        width === 'narrow' && 'max-w-3xl',
-        width === 'wide' && 'max-w-5xl',
+        // 44px top / 40px sides. The generous top gutter is what lets a 34px
+        // serif title read as a title rather than as the first row of a list.
+        width === 'full' ? 'flex h-full flex-col' : 'mx-auto w-full px-10 pt-11 pb-16',
+        WIDTH[width],
         className,
       )}
     >
@@ -42,38 +60,98 @@ export function Page({
   );
 }
 
-/** One heading treatment. `actions` sit on the heading's baseline, right-aligned. */
+/**
+ * One heading treatment.
+ *
+ * `eyebrow` is the mono line above the title that says which project and which
+ * environment you are looking at (`STOREFRONT · STAGING`). It exists because the
+ * sidebar's project switcher is easy to miss and every one of these screens is
+ * destructive-adjacent — you should never have to guess which app you are about
+ * to run a suite against.
+ *
+ * `size` is the 34px cockpit-class title against the 26px compact one. Sections
+ * with a tab strip directly under the title use the compact size, otherwise the
+ * title and the strip fight each other for the top of the page.
+ */
 export function PageHeader({
   title,
   subtitle,
   actions,
+  eyebrow,
+  size = 'lg',
   className,
 }: {
   title: string;
   subtitle?: React.ReactNode;
   actions?: React.ReactNode;
+  eyebrow?: React.ReactNode;
+  size?: 'lg' | 'sm';
   className?: string;
 }) {
   return (
-    <div className={cn('mb-6 flex items-start gap-4', className)}>
+    // `items-end`: actions sit on the bottom edge of the title block, so they
+    // stay put whether or not the page has an eyebrow and a subtitle.
+    <div className={cn('mb-6 flex items-end gap-4', className)}>
       <div className="min-w-0 flex-1">
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
-        {subtitle && <p className="text-ink-dim text-body-sm mt-1">{subtitle}</p>}
+        {eyebrow && (
+          <p className="text-meta text-ink-faint font-mono tracking-[0.1em] uppercase">{eyebrow}</p>
+        )}
+        <h1
+          className={cn(
+            'font-display font-semibold tracking-[-0.01em]',
+            size === 'lg' ? 'text-display-lg' : 'text-display',
+            // After the size, not before: a `text-*` utility can carry its own
+            // line-height, so tailwind-merge treats it as beating any `leading-*`
+            // that came earlier and drops it.
+            'leading-[1.1]',
+            eyebrow && 'mt-1.5',
+          )}
+        >
+          {title}
+        </h1>
+        {subtitle && <p className="text-ink-dim text-row mt-2">{subtitle}</p>}
       </div>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      {actions && <div className="flex shrink-0 items-center gap-2 pb-0.5">{actions}</div>}
     </div>
   );
 }
 
-/** Section eyebrow — the uppercase label above a group. Was hand-rolled ~12 times. */
-export function SectionLabel({ children }: { children: React.ReactNode }) {
+/**
+ * Section eyebrow — the mono uppercase label above a group (NEEDS YOU, FLEET,
+ * RUN LOG). Was hand-rolled ~12 times.
+ *
+ * It sits close to what it labels on purpose: the gap below it is smaller than
+ * the gap above it, which is the whole reason it reads as belonging to the list
+ * rather than floating between two of them.
+ */
+export function SectionLabel({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
   return (
-    <h2 className="text-micro text-ink-faint mb-3 font-semibold tracking-wider uppercase">
+    <h2
+      className={cn(
+        'text-micro text-ink-faint mb-2.5 font-mono font-semibold tracking-[0.1em] uppercase',
+        className,
+      )}
+    >
       {children}
     </h2>
   );
 }
 
+/**
+ * A card, for the things that are genuinely cards.
+ *
+ * Lists are NOT cards any more — a run log, a secrets table and a verdict queue
+ * are hairline rows on the page background, because twenty boxes stacked
+ * vertically is nineteen borders nobody reads. What is left here is the real
+ * thing: a fleet tile, a heal proposal, a detection result — an object you can
+ * pick up and act on, one at a time.
+ */
 export function Card({
   className,
   children,
@@ -85,11 +163,7 @@ export function Card({
 }) {
   return (
     <div
-      className={cn(
-        'border-line bg-surface-1 rounded-lg border',
-        interactive && 'lift',
-        className,
-      )}
+      className={cn('border-line bg-surface-1 rounded-lg border', interactive && 'lift', className)}
     >
       {children}
     </div>
@@ -97,37 +171,59 @@ export function Card({
 }
 
 /**
- * The status/meta chip.
+ * The status chip.
  *
- * Seven chips render at `text-[9px]` today — below the design system's own
- * 10px floor and below any reasonable accessibility minimum. This is 10px and
- * that is the floor.
+ * Mono by default: almost every chip in this UI holds a machine word — FAIL,
+ * REAL BUG · 0.92, SELECTOR ONLY, QUARANTINED, CRITICAL — and setting those in
+ * the UI face makes them read as prose the product wrote rather than as a value
+ * it is reporting. Chips that really do hold a sentence pass `mono={false}`.
+ *
+ * Seven chips rendered at `text-[9px]` before this existed — below the design
+ * system's own 10px floor and below any reasonable accessibility minimum. This
+ * is 10px and that is the floor.
  */
+const BADGE_TONE = {
+  neutral: 'border-line text-ink-faint',
+  accent: 'border-accent/40 text-accent',
+  pass: 'border-pass/40 text-pass',
+  fail: 'border-fail/40 text-fail',
+  flake: 'border-flake/40 text-flake',
+} as const;
+
+/*
+ * 12% of the tone against the page, not a pre-mixed colour: `color-mix` resolves
+ * against whatever `--color-fail` currently is, so one class covers both themes
+ * and stays correct when the accent is switched under it.
+ */
+const BADGE_TINT = {
+  neutral: 'bg-surface-2',
+  accent: 'bg-[color-mix(in_srgb,var(--color-accent)_12%,transparent)]',
+  pass: 'bg-[color-mix(in_srgb,var(--color-pass)_12%,transparent)]',
+  fail: 'bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]',
+  flake: 'bg-[color-mix(in_srgb,var(--color-flake)_12%,transparent)]',
+} as const;
+
 export function Badge({
   tone = 'neutral',
-  mono = false,
+  mono = true,
+  tint = false,
   className,
   children,
 }: {
-  tone?: 'neutral' | 'accent' | 'pass' | 'fail' | 'flake';
+  tone?: keyof typeof BADGE_TONE;
   mono?: boolean;
+  /** Fills the chip with 12% of its tone. For the one chip that must be seen. */
+  tint?: boolean;
   className?: string;
   children: React.ReactNode;
 }) {
-  const TONE = {
-    neutral: 'border-line text-ink-faint',
-    accent: 'border-accent/50 text-accent',
-    pass: 'border-pass/40 text-pass',
-    fail: 'border-fail/50 text-fail',
-    flake: 'border-flake/40 text-flake',
-  } as const;
-
   return (
     <span
       className={cn(
-        'text-meta inline-flex shrink-0 items-center rounded border px-1.5 py-0.5',
+        'text-meta inline-flex shrink-0 items-center rounded-sm border px-[7px] py-[2px] font-medium tracking-[0.05em]',
         mono && 'font-mono',
-        TONE[tone],
+        BADGE_TONE[tone],
+        tint && BADGE_TINT[tone],
         className,
       )}
     >
@@ -137,8 +233,13 @@ export function Badge({
 }
 
 /**
- * Tab strip. Was implemented three times — two of them byte-identical
- * copy-paste between /settings and /quality.
+ * Tabs INSIDE a page — Settings, Quality.
+ *
+ * Section-level navigation (Runs / Triage / Tests / …) is the shell's job and
+ * lives in the strip under the page title; this is the level below that, for a
+ * screen that genuinely has two views of the same thing. Both are drawn the
+ * same way on purpose: mono, uppercase, accent underline. A user should not
+ * have to learn that one row of tabs changes the URL and the other does not.
  */
 export function Tabs<T extends string>({
   tabs,
@@ -150,7 +251,7 @@ export function Tabs<T extends string>({
   onChange: (id: T) => void;
 }) {
   return (
-    <div className="border-line mb-6 flex gap-1 border-b" role="tablist">
+    <div className="border-line mb-6 flex flex-wrap gap-[22px] border-b" role="tablist">
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -159,15 +260,15 @@ export function Tabs<T extends string>({
           aria-selected={active === tab.id}
           onClick={() => onChange(tab.id)}
           className={cn(
-            '-mb-px border-b-2 px-3 py-2 text-sm transition-colors',
+            'text-micro -mb-px border-b-2 px-0.5 pb-[9px] font-mono tracking-[0.08em] uppercase transition-colors',
             active === tab.id
               ? 'border-accent text-ink'
-              : 'text-ink-dim hover:text-ink border-transparent',
+              : 'text-ink-faint hover:text-ink-dim border-transparent',
           )}
         >
           {tab.label}
           {tab.count !== undefined && (
-            <span className="text-ink-faint text-micro ml-1.5 tabular-nums">{tab.count}</span>
+            <span className="ml-1.5 tabular-nums opacity-70">{tab.count}</span>
           )}
         </button>
       ))}
@@ -185,20 +286,24 @@ export function Tabs<T extends string>({
  */
 export function Skeleton({ className }: { className?: string }) {
   return (
-    <div
-      aria-hidden="true"
-      className={cn('bg-surface-2 animate-pulse rounded', className)}
-    />
+    <div aria-hidden="true" className={cn('bg-surface-2 animate-pulse rounded-sm', className)} />
   );
 }
 
-/** N skeleton rows shaped like the list they stand in for. */
+/**
+ * N skeleton rows shaped like the list they stand in for.
+ *
+ * Hairline rows with no outer box and no horizontal padding, because that is
+ * what the real list is now — a skeleton that is a different shape from its
+ * content produces a visible jump on every load, which is the one thing a
+ * skeleton exists to prevent.
+ */
 export function SkeletonRows({ rows = 5, className }: { rows?: number; className?: string }) {
   return (
     <div className={cn('divide-line divide-y', className)} aria-label="Loading" role="status">
       {Array.from({ length: rows }, (_, i) => (
-        <div key={i} className="flex items-center gap-4 px-4 py-3.5">
-          <Skeleton className="h-2 w-2 rounded-full" />
+        <div key={i} className="flex items-center gap-4 py-3">
+          <Skeleton className="h-1.5 w-1.5 rounded-full" />
           <Skeleton className="h-3 w-20" />
           <Skeleton className="h-3 w-32" />
           <Skeleton className="ml-auto h-3 w-16" />

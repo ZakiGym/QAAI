@@ -12,33 +12,36 @@ const STATUS_COLOUR: Record<string, string> = {
   CANCELLED: 'bg-skip',
 };
 
+/** 6px. Big enough to carry a colour, small enough not to be a bullet point. */
 export function StatusDot({ status }: { status: string }) {
   return (
     <span
       aria-label={status.toLowerCase()}
       title={status}
-      className={`inline-block h-2 w-2 shrink-0 rounded-full ${STATUS_COLOUR[status] ?? 'bg-skip'}`}
+      className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${STATUS_COLOUR[status] ?? 'bg-skip'}`}
     />
   );
 }
 
 const VERDICT_STYLE: Record<string, string> = {
-  REAL_BUG: 'border-fail/50 bg-fail/10 text-fail',
-  INTENDED_CHANGE: 'border-accent/50 bg-accent/10 text-accent',
-  FLAKE: 'border-flake/50 bg-flake/10 text-flake',
+  REAL_BUG: 'border-fail/40 bg-fail/12 text-fail',
+  INTENDED_CHANGE: 'border-accent/40 bg-accent/12 text-accent',
+  FLAKE: 'border-flake/40 bg-flake/12 text-flake',
   ENV_ISSUE: 'border-line bg-surface-2 text-ink-dim',
 };
 
 export function VerdictChip({ verdict, confidence }: { verdict: string; confidence?: number }) {
   return (
     <span
-      className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono text-xs ${
+      className={`text-meta inline-flex items-center gap-1.5 rounded-sm border px-[7px] py-[2px] font-mono font-medium tracking-[0.05em] ${
         VERDICT_STYLE[verdict] ?? VERDICT_STYLE.ENV_ISSUE
       }`}
     >
       {verdict}
+      {/* The model's own number, shown as the model states it. A verdict with no
+          confidence attached asks the reader to trust it more than it earned. */}
       {confidence !== undefined && (
-        <span className="opacity-70">{Math.round(confidence * 100)}%</span>
+        <span className="tabular-nums opacity-70">{confidence.toFixed(2)}</span>
       )}
     </span>
   );
@@ -53,7 +56,9 @@ const SEVERITY_STYLE: Record<string, string> = {
 
 export function SeverityLabel({ severity }: { severity: string }) {
   return (
-    <span className={`font-mono text-micro ${SEVERITY_STYLE[severity] ?? 'text-ink-faint'}`}>
+    <span
+      className={`text-meta font-mono font-semibold tracking-[0.06em] ${SEVERITY_STYLE[severity] ?? 'text-ink-faint'}`}
+    >
       {severity}
     </span>
   );

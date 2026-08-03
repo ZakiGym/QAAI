@@ -43,11 +43,15 @@ test.describe('coverage gaps', () => {
 
     await page.goto('/insights/coverage');
 
-    await expect(page.getByRole('heading', { name: 'Coverage gaps', level: 1 })).toBeVisible();
+    /*
+     * The redesign made the headline a serif percentage — "61% of proven
+     * behaviour is asserted." — and moved the screen under the Insights h1.
+     * Same claim, new sentence: the suite is counted against the untested
+     * surfaces, with the gap total on the RANKED GAPS label.
+     */
+    await expect(page.getByText('of proven behaviour is asserted.')).toBeVisible();
     await expect(
-      page.getByText(
-        `You have ${report.totals.tests} tests and ${report.totals.gaps} untested surfaces`,
-      ),
+      page.getByRole('heading', { name: `Ranked gaps · ${report.totals.gaps}` }),
     ).toBeVisible();
   });
 
@@ -59,31 +63,33 @@ test.describe('coverage gaps', () => {
 
     await page.goto('/insights/coverage');
 
+    /*
+     * The redesign folded each gap's detail behind its title (a disclosure
+     * button — the old cards printed evidence inline on every row). The claim
+     * this test protects is unchanged: a gap's evidence is ON THIS SCREEN, one
+     * click deep at most, never on another page.
+     */
     const top = report.gaps[0]!;
-    await expect(page.getByRole('heading', { name: top.title })).toBeVisible();
+    const title = page.getByRole('button', { name: top.title }).first();
+    await expect(title).toBeVisible();
+    await title.click();
 
-    // The claim, and the support for it, side by side. Never behind a toggle.
     await expect(page.getByText('Why we think so', { exact: true }).first()).toBeVisible();
     for (const line of top.evidence.slice(0, 2)) {
       await expect(page.getByText(line, { exact: false }).first()).toBeVisible();
     }
 
     /*
-     * Every gap on the page has an evidence block, not just the first — a gap
-     * with no support for its claim is a gap nobody can act on.
-     *
-     * Counted against the cards ON SCREEN rather than against the number the
-     * API returned a moment earlier. Coverage is recomputed from the current
-     * suite on every request, so a test created between the two calls moves
-     * that number and the mismatch says nothing about the screen.
+     * Every gap still has evidence BEHIND its disclosure — asserted at the data
+     * level now, because closed cards render nothing to count. A gap the API
+     * ships without support is a gap nobody can act on, whatever the screen
+     * does with it.
      */
     const cards = page.getByRole('checkbox', { name: /^Select: / });
-    const shown = await cards.count();
-    expect(shown).toBeGreaterThan(0);
-    // `exact` matters: without it the substring match also picks up a wrapper
-    // element, and the count is one too many for reasons that have nothing to
-    // do with the screen.
-    await expect(page.getByText('Why we think so', { exact: true })).toHaveCount(shown);
+    expect(await cards.count()).toBeGreaterThan(0);
+    for (const gap of report.gaps) {
+      expect(gap.evidence.length, `gap "${gap.title}" shipped with no evidence`).toBeGreaterThan(0);
+    }
   });
 
   test('a gap explains its own rank when you open it', async ({ page, api }) => {
@@ -95,14 +101,12 @@ test.describe('coverage gaps', () => {
     const top = report.gaps[0]!;
     await page.goto('/insights/coverage');
 
-    const disclosure = page
-      .getByRole('button', { name: 'What the crawl saw, and what a test would do' })
-      .first();
+    // The disclosure is the gap's own title now, and it stays the same control
+    // when open — aria-expanded flipping on one element, not two buttons.
+    const disclosure = page.getByRole('button', { name: top.title }).first();
     await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
     await disclosure.click();
-    await expect(
-      page.getByRole('button', { name: 'Hide' }).first(),
-    ).toHaveAttribute('aria-expanded', 'true');
+    await expect(disclosure).toHaveAttribute('aria-expanded', 'true');
 
     await expect(page.getByText(`Ranked ${top.score} because`)).toBeVisible();
     await expect(page.getByText(top.scoreWhy[0]!, { exact: false })).toBeVisible();

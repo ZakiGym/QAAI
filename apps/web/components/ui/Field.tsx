@@ -32,7 +32,14 @@ export const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
   return (
     <div className="w-full">
       {label && (
-        <label htmlFor={inputId} className="text-ink-dim text-body-sm mb-1.5 block">
+        // Mono uppercase, matching the label idiom everywhere else in the app
+        // (BASE URL, SECRETS · VAULT, the org label/value grid). A field label
+        // names a slot; it is not prose, and setting it in the UI face made it
+        // compete with the value it labels.
+        <label
+          htmlFor={inputId}
+          className="text-meta text-ink-faint mb-2 block font-mono tracking-[0.08em] uppercase"
+        >
           {label}
         </label>
       )}
@@ -42,7 +49,9 @@ export const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
         aria-describedby={describedBy}
         aria-invalid={error ? true : undefined}
         className={cn(
-          'border-line bg-surface-1 text-body-sm placeholder:text-ink-faint w-full rounded-md border px-3 py-2 outline-none',
+          // Transparent, not surface-1: an input on this background is defined
+          // by its hairline, and a filled box reads as a value already set.
+          'border-line text-row-sub placeholder:text-ink-faint w-full rounded-md border bg-transparent px-2.5 py-2 outline-none',
           'focus:border-accent transition-colors',
           error && 'border-fail/60',
           className,
@@ -52,7 +61,7 @@ export const Field = forwardRef<HTMLInputElement, FieldProps>(function Field(
       {(hint || error) && (
         <p
           id={describedBy}
-          className={cn('text-micro mt-1.5', error ? 'text-fail' : 'text-ink-faint')}
+          className={cn('text-micro mt-1.5 font-mono', error ? 'text-fail' : 'text-ink-faint')}
         >
           {error ?? hint}
         </p>

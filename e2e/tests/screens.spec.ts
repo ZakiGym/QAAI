@@ -17,30 +17,60 @@ import { test, expect, firstProject, projectTests, recentRuns, runWithAFailure }
 interface Screen {
   path: string;
   /** What the user should be able to see once this screen has rendered. */
-  ready: (page: Page) => ReturnType<Page['getByRole']>;
+  ready: (page: Page) => ReturnType<Page['locator']>;
 }
 
+/**
+ * The active tab in a section's strip.
+ *
+ * Every one of these screens used to have an h1 of its own, and this list
+ * asserted on it. The redesign grouped sixteen routes into six sections, so the
+ * h1 is now the SECTION — /traffic, /repro and /import all say "Tests" — and a
+ * heading no longer identifies a screen.
+ *
+ * The active tab does, and it is a better assertion than the heading ever was:
+ * it proves the route rendered, that the shell put it in the right section, AND
+ * that the right tab is marked current. A screen that loads under the wrong tab
+ * is a real bug this now catches and the old heading check could not.
+ */
+const activeTab = (page: Page, section: string, tab: string) =>
+  page.locator(`nav[aria-label="${section} views"] a[aria-current="page"]`, { hasText: tab });
+
 const SHELL_SCREENS: Screen[] = [
-  { path: '/runs', ready: (p) => p.getByRole('heading', { name: 'Projects', level: 1 }) },
-  { path: '/dashboard', ready: (p) => p.getByRole('heading', { name: 'Dashboard', level: 1 }) },
-  { path: '/flow-map', ready: (p) => p.getByRole('heading', { level: 1 }) },
-  { path: '/triage', ready: (p) => p.getByRole('heading', { name: 'Triage', level: 1 }) },
-  { path: '/quality', ready: (p) => p.getByRole('heading', { name: 'Quality', level: 1 }) },
-  { path: '/insights', ready: (p) => p.getByRole('heading', { name: 'Insights', level: 1 }) },
-  { path: '/insights/coverage', ready: (p) => p.getByRole('heading', { name: 'Coverage gaps', level: 1 }) },
-  { path: '/insights/health', ready: (p) => p.getByRole('heading', { name: 'Suite health', level: 1 }) },
-  { path: '/insights/impact', ready: (p) => p.getByRole('heading', { name: 'Impact analysis', level: 1 }) },
-  { path: '/heals', ready: (p) => p.getByRole('heading', { name: 'Self-healing', level: 1 }) },
-  { path: '/environments', ready: (p) => p.getByRole('heading', { name: 'Environments', level: 1 }) },
-  { path: '/source-control', ready: (p) => p.getByRole('heading', { name: 'Source control', level: 1 }) },
-  { path: '/traffic', ready: (p) => p.getByRole('heading', { name: 'Traffic', level: 1 }) },
-  { path: '/repro', ready: (p) => p.getByRole('heading', { name: 'Reproduce a bug', level: 1 }) },
-  { path: '/import', ready: (p) => p.getByRole('heading', { name: 'Import an existing suite', level: 1 }) },
-  { path: '/onboarding', ready: (p) => p.getByRole('heading', { name: 'Add your app', level: 1 }) },
-  { path: '/settings', ready: (p) => p.getByRole('heading', { name: 'Settings', level: 1 }) },
-  { path: '/settings/runners', ready: (p) => p.getByRole('heading', { name: 'Infrastructure', level: 1 }) },
-  { path: '/settings/github', ready: (p) => p.getByRole('heading', { name: 'Infrastructure', level: 1 }) },
-  { path: '/settings/billing', ready: (p) => p.getByRole('heading', { name: 'Billing', level: 1 }) },
+  // Runs has no tab strip — one screen, and the h1 identifies it outright.
+  { path: '/runs', ready: (p) => p.getByRole('heading', { name: 'Runs', level: 1 }) },
+  // /dashboard was merged into Runs home and redirects; landing on that h1 is
+  // exactly what proves the redirect still works.
+  { path: '/dashboard', ready: (p) => p.getByRole('heading', { name: 'Runs', level: 1 }) },
+
+  { path: '/triage', ready: (p) => activeTab(p, 'Triage', 'Verdicts') },
+  { path: '/heals', ready: (p) => activeTab(p, 'Triage', 'Heals') },
+  { path: '/quality', ready: (p) => activeTab(p, 'Triage', 'Quality') },
+
+  { path: '/editor', ready: (p) => activeTab(p, 'Tests', 'Editor') },
+  { path: '/flow-map', ready: (p) => activeTab(p, 'Tests', 'Flow map') },
+  { path: '/import', ready: (p) => activeTab(p, 'Tests', 'Import') },
+  { path: '/repro', ready: (p) => activeTab(p, 'Tests', 'From a bug') },
+  { path: '/traffic', ready: (p) => activeTab(p, 'Tests', 'From traffic') },
+
+  { path: '/insights', ready: (p) => activeTab(p, 'Insights', 'Coverage') },
+  { path: '/insights/coverage', ready: (p) => activeTab(p, 'Insights', 'Coverage') },
+  { path: '/insights/health', ready: (p) => activeTab(p, 'Insights', 'Suite health') },
+  { path: '/insights/impact', ready: (p) => activeTab(p, 'Insights', 'Impact') },
+
+  { path: '/environments', ready: (p) => activeTab(p, 'Setup', 'Environments') },
+  { path: '/source-control', ready: (p) => activeTab(p, 'Setup', 'Source control') },
+  { path: '/settings/runners', ready: (p) => activeTab(p, 'Setup', 'Runners') },
+  { path: '/onboarding', ready: (p) => activeTab(p, 'Setup', 'Add app') },
+
+  { path: '/settings', ready: (p) => activeTab(p, 'Settings', 'Organization') },
+  { path: '/settings/billing', ready: (p) => activeTab(p, 'Settings', 'Billing') },
+
+  /*
+   * The GitHub App screen is reached FROM the Runners tab rather than being a
+   * tab itself, so it keeps a heading of its own and is asserted on that.
+   */
+  { path: '/settings/github', ready: (p) => p.getByRole('heading', { name: 'GitHub App', level: 1 }) },
 ];
 
 /*

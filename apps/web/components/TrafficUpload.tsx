@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { api, type TrafficAnalysis, type TrafficFormat } from '../lib/api';
 import { Button } from './ui/Button';
-import { SectionLabel } from './ui/layout';
+import { cn } from '../lib/cn';
 
 /**
  * The upload half of /traffic.
@@ -54,7 +54,8 @@ export function TrafficUpload({
   busy: boolean;
   /** Fired before the request, so the page can clear the previous analysis. */
   onStart: () => void;
-  onAnalysed: (analysis: TrafficAnalysis) => void;
+  /** The filename rides along: the analysis itself has no idea what it came from. */
+  onAnalysed: (analysis: TrafficAnalysis, fileName: string) => void;
   /** The raw failure, so the page can tell a signed-out session from a bad file. */
   onError: (err: unknown) => void;
 }) {
@@ -106,7 +107,7 @@ export function TrafficUpload({
           body: text,
         },
       );
-      onAnalysed(analysis);
+      onAnalysed(analysis, file.name);
     } catch (err) {
       onError(err);
     }
@@ -126,14 +127,17 @@ export function TrafficUpload({
           setDragging(false);
           accept(e.dataTransfer.files?.[0]);
         }}
-        className={`block cursor-pointer rounded-lg border border-dashed p-8 text-center transition-colors ${
-          dragging ? 'border-accent bg-accent/5' : 'border-line hover:border-line-strong'
-        }`}
+        className={cn(
+          'block cursor-pointer rounded-xl border-[1.5px] border-dashed p-9 text-center transition-colors',
+          dragging
+            ? 'border-accent bg-[color-mix(in_srgb,var(--color-accent)_6%,transparent)]'
+            : 'border-line-strong hover:border-accent',
+        )}
       >
-        <span className="text-ink text-body-sm block font-medium">
-          {file ? file.name : 'Drop a HAR, an access log or an OTLP export here'}
+        <span className="block text-[14px] font-medium">
+          {file ? file.name : 'Drop a HAR, an access log or an OTLP export'}
         </span>
-        <span className="text-ink-faint text-micro mt-1 block tabular-nums">
+        <span className="text-ink-faint mt-1.5 block text-[12px] tabular-nums">
           {file
             ? `${bytes(file.size)} · click to choose a different file`
             : `or click to choose a file — up to ${bytes(MAX_UPLOAD_BYTES)}`}
@@ -147,13 +151,15 @@ export function TrafficUpload({
         />
       </label>
 
-      {tooBig && <p className="text-fail text-micro mt-2">{tooBig}</p>}
+      {tooBig && <p className="text-fail mt-2 text-[11.5px] leading-relaxed">{tooBig}</p>}
 
-      <div className="border-line mt-4 rounded-lg border p-4">
-        <SectionLabel>How to read it</SectionLabel>
+      <div className="border-line mt-4 rounded-lg border px-[18px] py-4">
+        <h3 className="text-meta text-ink-faint mb-3 font-mono font-semibold tracking-[0.1em] uppercase">
+          How to read it
+        </h3>
         <div className="grid gap-4 sm:grid-cols-2">
           <div>
-            <label htmlFor="traffic-format" className="text-ink-dim text-body-sm mb-1.5 block">
+            <label htmlFor="traffic-format" className="text-ink-dim mb-1.5 block text-[12px]">
               Format
             </label>
             <select
@@ -168,13 +174,13 @@ export function TrafficUpload({
                 </option>
               ))}
             </select>
-            <p className="text-ink-faint text-micro mt-1.5">
+            <p className="text-ink-faint mt-1.5 text-[11px]">
               Detection reads the shape, not the file extension.
             </p>
           </div>
 
           <div>
-            <label htmlFor="traffic-gap" className="text-ink-dim text-body-sm mb-1.5 block">
+            <label htmlFor="traffic-gap" className="text-ink-dim mb-1.5 block text-[12px]">
               A session ends after
             </label>
             <div className="flex items-center gap-2">
@@ -189,17 +195,17 @@ export function TrafficUpload({
                 placeholder="30"
                 className="border-line bg-surface-1 focus:border-accent text-body-sm w-24 rounded-md border px-3 py-2 tabular-nums outline-none"
               />
-              <span className="text-ink-dim text-body-sm">minutes of silence</span>
+              <span className="text-ink-dim text-[12px]">minutes of silence</span>
             </div>
-            <p className="text-ink-faint text-micro mt-1.5">
-              Blank uses 30 minutes, the analytics convention. This decides where one
-              user&rsquo;s journey stops and the next begins.
+            <p className="text-ink-faint mt-1.5 text-[11px] leading-relaxed">
+              Blank uses 30 minutes, the analytics convention. This decides where one user&rsquo;s
+              journey stops and the next begins.
             </p>
           </div>
         </div>
 
         <div className="border-line mt-4 space-y-2 border-t pt-4">
-          <label className="text-body-sm flex items-start gap-2.5">
+          <label className="flex items-start gap-2.5 text-[12px]">
             <input
               type="checkbox"
               className="accent-accent mt-0.5"
@@ -208,13 +214,13 @@ export function TrafficUpload({
             />
             <span>
               <span className="text-ink">Include static assets</span>
-              <span className="text-ink-faint block text-micro">
-                CSS, images and fonts are excluded by default — nobody writes a test for a
-                sprite sheet.
+              <span className="text-ink-faint block text-[11px] leading-relaxed">
+                CSS, images and fonts are excluded by default — nobody writes a test for a sprite
+                sheet.
               </span>
             </span>
           </label>
-          <label className="text-body-sm flex items-start gap-2.5">
+          <label className="flex items-start gap-2.5 text-[12px]">
             <input
               type="checkbox"
               className="accent-accent mt-0.5"
@@ -223,9 +229,9 @@ export function TrafficUpload({
             />
             <span>
               <span className="text-ink">Include bots and uptime monitors</span>
-              <span className="text-ink-faint block text-micro">
-                Excluded by default: a monitor hitting one path every minute would outrank
-                every real journey.
+              <span className="text-ink-faint block text-[11px] leading-relaxed">
+                Excluded by default: a monitor hitting one path every minute would outrank every
+                real journey.
               </span>
             </span>
           </label>
@@ -241,9 +247,9 @@ export function TrafficUpload({
       >
         {busy ? 'Analysing…' : 'Analyse this traffic'}
       </Button>
-      <p className="text-ink-faint text-micro mt-2 text-center">
-        The upload is redacted as it is read and is never written down — not to a row, not to
-        the audit log, not to a log line.
+      <p className="text-ink-faint mt-2 text-center text-[11.5px] leading-relaxed">
+        The upload is redacted as it is read and is never written down — not to a row, not to the
+        audit log, not to a log line.
       </p>
     </div>
   );

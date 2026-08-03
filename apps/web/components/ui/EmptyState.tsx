@@ -31,10 +31,16 @@ export function EmptyState({
   icon?: React.ReactNode;
 }) {
   return (
-    <div className="border-line/60 flex flex-col items-center rounded-lg border border-dashed px-6 py-14 text-center">
-      {icon && <div className="text-ink-faint mb-3.5" aria-hidden="true">{icon}</div>}
-      <h3 className="text-ink text-sm font-medium">{title}</h3>
-      <p className="text-ink-dim text-body-sm mt-1.5 max-w-sm leading-relaxed">{body}</p>
+    // Dashed hairline at the dropzone radius — this is the same gesture as the
+    // import dropzone: an outline around space that is waiting to be filled.
+    <div className="border-line flex flex-col items-center rounded-xl border border-dashed px-6 py-14 text-center">
+      {icon && (
+        <div className="text-ink-faint mb-3.5" aria-hidden="true">
+          {icon}
+        </div>
+      )}
+      <h3 className="text-ink font-display text-base font-semibold">{title}</h3>
+      <p className="text-ink-dim text-body-sm mt-2 max-w-sm leading-relaxed">{body}</p>
       {(action || secondary) && (
         <div className="mt-5 flex items-center gap-2">
           {action && <Action {...action} primary />}
@@ -56,9 +62,11 @@ function Action({
   href?: string;
   primary?: boolean;
 }) {
+  // Same geometry as Button, because it is a button — the only reason this is
+  // not one is that half of these are links, and `<Button>` is a `<button>`.
   const className = primary
-    ? 'bg-accent text-body-sm rounded-md px-3.5 py-2 font-medium text-white hover:opacity-90'
-    : 'border-line text-ink-dim hover:text-ink hover:border-line-strong text-body-sm rounded-md border px-3.5 py-2';
+    ? 'bg-accent text-accent-ink text-row-sub rounded-md px-3.5 py-[7px] font-semibold hover:opacity-90'
+    : 'border-line text-ink-dim hover:text-ink hover:border-line-strong text-row-sub rounded-md border px-3.5 py-[7px]';
 
   if (href) {
     return (

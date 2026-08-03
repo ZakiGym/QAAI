@@ -33,14 +33,16 @@ test.describe('reading a real failure', () => {
     // The middle column heads with the selected test...
     await expect(page.getByRole('heading', { name: testName })).toBeVisible();
     /*
-     * ...and the step scrubber names the step that failed. Anchored on the step
-     * INDEX as well as the title: real suites contain steps whose titles are
-     * prefixes of each other ("Headers and cookies: /" and ".../products"), and
-     * a title-only locator quietly matches both.
+     * ...and the step timeline names the step that failed. The redesign dropped
+     * the numeric index from the step rows — the accessible name is now
+     * `title duration` — so the anchor against prefix-ambiguous titles
+     * ("Headers and cookies: /" vs ".../products") is the whitespace that must
+     * follow the full title before the duration starts.
      */
+    void stepIndex;
     await expect(
       page.getByRole('button', {
-        name: new RegExp(`\\b${stepIndex}\\s+${escapeRe(stepTitle)}(\\s|$)`),
+        name: new RegExp(`^${escapeRe(stepTitle)}\\s`),
       }),
     ).toBeVisible();
 
@@ -61,8 +63,10 @@ test.describe('reading a real failure', () => {
     await page.goto(`/runs/${failure!.runId}`);
     await page.getByRole('button', { name: new RegExp(escapeRe(failure!.testName)) }).first().click();
 
+    // The redesign dropped the parentheses: the heading is `Findings 12`, with
+    // the count in tabular figures. Same claim — the count is ON the heading.
     await expect(
-      page.getByRole('heading', { name: `Findings (${failure!.findingCount})` }),
+      page.getByRole('heading', { name: `Findings ${failure!.findingCount}` }),
     ).toBeVisible();
   });
 
@@ -79,21 +83,37 @@ test.describe('reading a real failure', () => {
     await expect(page.getByRole('link', { name: 'Compare' })).toBeVisible();
   });
 
-  test('the evidence rail can be collapsed and brought back', async ({ page, api }) => {
-    const [run] = await recentRuns(api, 1);
-    test.skip(!run, 'No runs in this org yet.');
+  /*
+   * This used to assert the evidence rail could be collapsed and brought back.
+   * The redesign replaced that rail with the always-visible TRIAGE rail — the
+   * three-column cockpit sizes it with minmax() instead of hiding it — so the
+   * collapse affordance no longer exists ON PURPOSE. What must now be true is
+   * that both rails are really there and the right one carries the evidence.
+   */
+  test('the causes rail and the triage rail are both on screen with the evidence', async ({
+    page,
+    api,
+  }) => {
+    // A run WITH a failure — on a green run there is no failure story and the
+    // rail rightly shows no evidence, which would vacuously fail this.
+    const failure = await runWithAFailingStep(api);
+    test.skip(!failure, NO_FAILURE);
 
-    await page.goto(`/runs/${run!.id}`);
+    await page.goto(`/runs/${failure!.runId}`);
 
-    const rail = page.getByRole('complementary', { name: 'Evidence' });
-    await expect(rail).toBeVisible();
-
-    await page.getByRole('button', { name: 'Collapse evidence rail' }).click();
-    // Collapsed to a strip, never to nothing — the run's live feed lives here.
-    await expect(page.getByRole('button', { name: 'Show evidence' })).toBeVisible();
-
-    await page.getByRole('button', { name: 'Show evidence' }).click();
-    await expect(page.getByRole('button', { name: 'Collapse evidence rail' })).toBeVisible();
+    await expect(page.getByRole('complementary', { name: 'What broke' })).toBeVisible();
+    const triage = page.getByRole('complementary', { name: 'Triage' });
+    await expect(triage).toBeVisible();
+    /*
+     * Console and network sections render only when the result actually carries
+     * that evidence, so they cannot anchor this test. What the rail must ALWAYS
+     * do for a selected failure is speak about triage: either the verdict chip,
+     * or the honest sentence about why there is no verdict yet. Silence — a
+     * rail that renders and says nothing — is the failure being pinned.
+     */
+    await expect(
+      triage.getByText(/REAL BUG|INTENDED CHANGE|FLAKE|ENVIRONMENT|has not produced a verdict/),
+    ).toBeVisible();
   });
 });
 

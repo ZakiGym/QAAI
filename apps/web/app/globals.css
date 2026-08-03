@@ -1,26 +1,73 @@
 @import 'tailwindcss';
 
 /*
- * Dark-first (§8). The light values exist so the marketing page is readable in
- * a bright room, but the cockpit is designed for the dark palette — that is
- * where a QA engineer spends the day.
+ * Dark-first (§8). The cockpit is where a QA engineer spends the day, so dark
+ * is the product and light is a genuine alternate rather than an afterthought —
+ * both are full palettes, not one derived from the other.
+ *
+ * ─── How theming works here ──────────────────────────────────────────────────
+ *
+ * Every switchable value is a plain custom property declared in `@theme` and
+ * REDECLARED under `[data-theme="light"]` / `[data-accent="…"]` below. Tailwind
+ * v4 emits these at `:root` and has its utilities reference `var(--color-…)`,
+ * so overriding the variable under a selector re-skins every utility that uses
+ * it without generating a second set of classes.
+ *
+ * Do NOT convert this block to `@theme inline`. That substitutes the literal
+ * value into each utility at build time, which is faster and would silently
+ * make both the theme toggle and the accent picker do nothing.
  */
 @theme {
-  --color-ink: #e9ecf1;
-  --color-ink-dim: #99a1ad;
-  --color-ink-faint: #646c7a;
-  --color-surface: #0b0d11;
-  --color-surface-1: #14171d;
-  --color-surface-2: #1c2029;
-  --color-line: #262b34;
-  --color-line-strong: #333a45;
-  --color-accent: #5b8dff;
-  --color-accent-2: #8b5cff;
-  --color-pass: #3fb950;
-  --color-fail: #f85149;
-  --color-flake: #e3a723;
-  --color-skip: #646c7a;
-  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  /* Dark — the default. Light overrides every one of these below. */
+  --color-ink: #e9e9e6;
+  --color-ink-dim: #9da0a6;
+  /*
+   * The design specified #67696f, which is 3.49:1 against --color-surface —
+   * under the 4.5:1 WCAG AA needs for normal text. This token is not decorative:
+   * it carries timestamps, section eyebrows, file paths and row meta on
+   * essentially every screen, so at the specified value a meaningful share of
+   * the product's text is unreadable to anyone with reduced contrast
+   * sensitivity. Lightened along the same hue to the nearest value that reaches
+   * AA (4.53:1). Same reasoning for the light theme below.
+   */
+  --color-ink-faint: #797b81;
+  --color-surface: #0e0f11;
+  --color-surface-1: #15161a;
+  --color-surface-2: #1c1e23;
+  --color-line: #25272d;
+  --color-line-strong: #35383f;
+
+  /*
+   * Status colours are in oklch, not hex. A dark and a light theme need the
+   * same green to read as "the same green" at two very different backgrounds,
+   * and oklch lets the lightness move while hue and chroma hold — which is what
+   * keeps `pass` recognisable as pass in both.
+   */
+  --color-pass: oklch(0.72 0.13 152);
+  --color-fail: oklch(0.68 0.16 27);
+  --color-flake: oklch(0.78 0.11 85);
+  --color-skip: #67696f;
+
+  /*
+   * Accent defaults to mist and is swapped wholesale by `[data-accent]`.
+   * `--color-accent-ink` is the text colour that sits ON the accent: mist and
+   * sage are light enough in dark mode to need near-black text, and inverting
+   * that per theme is why it is a token rather than a hard-coded `text-white`.
+   */
+  --color-accent: #8fa3e6;
+  --color-accent-ink: #0e0f11;
+
+  /*
+   * Three families, three jobs (see the redesign brief):
+   *   sans    — the UI. 13–14px body, 13.5/12.5px rows.
+   *   display — page titles, stat numerals, and agent-authored prose in italic.
+   *   mono    — machine strings: ids, counts, file paths, status words, kbd.
+   * Bound to next/font variables in layout.tsx so the actual files are
+   * self-hosted and there is no network request on first paint.
+   */
+  --font-sans: var(--font-instrument-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-source-serif), ui-serif, Georgia, serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
 
   /*
    * Type scale. The cockpit is a dense, data-heavy UI, so the scale is tight
@@ -37,16 +84,35 @@
   --text-micro--line-height: 1.45;
   --text-body-sm: 0.8125rem; /* 13px — the workhorse: lists, forms, rows */
   --text-body-sm--line-height: 1.5;
+  /* 13.5 / 12.5px — list rows and their secondary line. Half-pixel sizes look
+     like a mistake until you put 25 run rows on a screen and count the ones
+     that fit. */
+  --text-row: 0.84375rem;
+  --text-row--line-height: 1.45;
+  --text-row-sub: 0.78125rem;
+  --text-row-sub--line-height: 1.4;
 
   /*
-   * Radius. Four steps, deliberately far enough apart to be a decision rather
+   * Display sizes. Serif, and used sparingly: a page title, a stat numeral, a
+   * score. They are the only thing on screen allowed to be large, which is what
+   * makes a dense UI feel edited rather than merely full.
+   */
+  --text-display-lg: 2.125rem; /* 34px — cockpit-class page titles */
+  --text-display: 1.625rem; /* 26px — section titles, journey percentages */
+  --text-display-sm: 1.375rem; /* 22px — a test's name */
+  --text-stat: 1.875rem; /* 30px — stat-band numerals */
+  --text-score: 3.75rem; /* 60px — the suite-health score, once per app */
+
+  /*
+   * Radius. Five steps, deliberately far enough apart to be a decision rather
    * than a coin flip — a radius scale goes wrong when it has six values nobody
    * can tell apart.
    */
-  --radius-sm: 0.25rem; /* inline: kbd, badges, chips */
-  --radius-md: 0.375rem; /* controls: buttons, inputs, rows */
-  --radius-lg: 0.5rem; /* containers: cards, panels */
-  --radius-xl: 0.75rem; /* overlays: dialogs, the palette */
+  --radius-sm: 0.3125rem; /* 5px — chips */
+  --radius-md: 0.4375rem; /* 7px — controls: buttons, inputs */
+  --radius-lg: 0.5625rem; /* 9px — cards, panels */
+  --radius-xl: 0.75rem; /* 12px — overlays: dialogs, the palette, dropzones */
+  --radius-full: 99px; /* dots and pills */
 
   /*
    * Elevation. A dark UI cannot lean on shadow the way a light one does — a
@@ -61,21 +127,89 @@
   --ease-out-soft: cubic-bezier(0.2, 0, 0, 1);
 }
 
+/*
+ * Light.
+ *
+ * A full palette, not the dark one lightened. The surfaces are warm — #f6f5f2
+ * rather than white — because a screen someone reads for eight hours at a time
+ * should not be a lamp, and because the serif display type this design leans on
+ * reads better on paper-coloured ground than on pure white.
+ *
+ * The status colours drop in lightness and gain a little chroma: the same hue
+ * that reads as "pass" against near-black disappears against near-white.
+ */
+[data-theme='light'] {
+  --color-ink: #1b1c1e;
+  --color-ink-dim: #585a60;
+  /* Specified #8f9197 = 2.89:1 on the light surface. See the note in @theme. */
+  --color-ink-faint: #6e7076;
+  --color-surface: #f6f5f2;
+  --color-surface-1: #fdfdfc;
+  --color-surface-2: #eceae4;
+  --color-line: #e3e0d9;
+  --color-line-strong: #cfccc3;
+  --color-pass: oklch(0.55 0.14 152);
+  --color-fail: oklch(0.55 0.17 27);
+  --color-flake: oklch(0.58 0.12 80);
+  --color-skip: #8f9197;
+  --color-accent: #4d67c0;
+  --color-accent-ink: #ffffff;
+
+  /* Shadow does real work on a light surface, so it is allowed to. */
+  --shadow-raised: 0 1px 2px rgb(0 0 0 / 0.06);
+  --shadow-overlay: 0 16px 48px -12px rgb(0 0 0 / 0.18);
+}
+
+/*
+ * Accents.
+ *
+ * Three, and only three — an accent picker with a colour wheel produces a
+ * hundred combinations nobody checked for contrast. Each declares its own
+ * `--color-accent-ink`, because mist and sage are light enough in dark mode to
+ * need near-black text on them and iris in light mode needs white.
+ *
+ * Ordered after the light block so an accent choice wins in either theme.
+ */
+[data-accent='sage'] {
+  --color-accent: #86c5ad;
+  --color-accent-ink: #0e0f11;
+}
+[data-accent='iris'] {
+  --color-accent: #b39ce8;
+  --color-accent-ink: #0e0f11;
+}
+[data-theme='light'][data-accent='sage'] {
+  --color-accent: #2e7d5f;
+  --color-accent-ink: #ffffff;
+}
+[data-theme='light'][data-accent='iris'] {
+  --color-accent: #6a4fc2;
+  --color-accent-ink: #ffffff;
+}
+
 html,
 body {
   /*
-   * A near-black base with two faint accent glows in the top corners. It reads
-   * as depth rather than a flat panel, which is most of the difference between
-   * "basic" and "considered" in a dark UI — without pulling attention.
+   * Flat. The old background layered two faint accent glows in the top corners
+   * to suggest depth; this design gets its depth from hairlines and surface
+   * steps instead, and the gradient fought the serif display type by tinting
+   * the space immediately around it.
    */
-  background:
-    radial-gradient(60rem 40rem at 100% -10%, color-mix(in srgb, var(--color-accent) 7%, transparent), transparent 60%),
-    radial-gradient(50rem 40rem at -10% -20%, color-mix(in srgb, var(--color-accent-2) 6%, transparent), transparent 55%),
-    var(--color-surface);
-  background-attachment: fixed;
+  background: var(--color-surface);
   color: var(--color-ink);
+  font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/*
+ * Switching theme should not animate. Every surface, border and text colour in
+ * the app transitions at once otherwise, which reads as the page breaking
+ * rather than as a preference being applied. Re-enabled a frame later by the
+ * toggle itself.
+ */
+[data-theme-switching] * {
+  transition: none !important;
 }
 
 /*
@@ -123,10 +257,15 @@ body {
   transform: translateY(-1px);
 }
 
-/* The brand gradient, used on the logo mark and the odd accent. */
-.brand-gradient {
-  background: linear-gradient(135deg, var(--color-accent), var(--color-accent-2));
-}
+/*
+ * `.brand-gradient` was here. It blended --color-accent into --color-accent-2,
+ * and there is no accent-2 any more: the accent is now one switchable colour
+ * with three options, and a gradient between "the accent" and a fixed violet
+ * would have been the wrong colour in two of the three.
+ *
+ * The mark it decorated is gone too — the sidebar now leads with the wordmark
+ * set in the display serif rather than a coloured tile.
+ */
 
 /*
  * Desktop window chrome.
@@ -173,6 +312,23 @@ body {
 }
 [data-desktop][data-desktop-platform='mac'] .app-sidebar-drag {
   padding-top: 40px;
+}
+
+/*
+ * Windows gets a title bar of its own instead.
+ *
+ * The sidebar must NOT also be a drag region there — two drag handles is one
+ * more than a window can have, and the sidebar's would swallow clicks on the
+ * nav for no benefit once a real strip exists above it.
+ */
+[data-desktop][data-desktop-platform='win'] .app-sidebar-drag {
+  -webkit-app-region: no-drag;
+}
+[data-desktop][data-desktop-platform='win'] .app-titlebar {
+  -webkit-app-region: drag;
+}
+[data-desktop] .app-titlebar .no-drag {
+  -webkit-app-region: no-drag;
 }
 
 /* A scrollbar that does not scream in a dark UI. */

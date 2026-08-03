@@ -1,9 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { FIXTURE_PREFIX, buildTree, type TreeNode, type TreeTest } from '../lib/tree';
+import { buildTree, type TreeNode, type TreeTest } from '../lib/tree';
 import { FileMenu, type MenuItem } from './FileMenu';
-import { Button } from './ui/Button';
 import { cn } from '../lib/cn';
 
 /**
@@ -12,6 +11,14 @@ import { cn } from '../lib/cn';
  * in localStorage) and default to open, so a fresh project reads at a glance.
  * Fixtures (paths under `fixtures/`) are test DATA, not tests, and are tinted to
  * say so. Hovering a folder reveals a `+` to add a file right there.
+ *
+ * It sets no type of its own: the column it lives in is mono 11.5px and every
+ * row inherits that. A file tree is a list of paths, and paths are machine
+ * strings — the size and the face belong to the pane, not to each row.
+ *
+ * The stroke icons are gone. At 150px the glyph, the chevron and the indent
+ * between them took most of the width a filename needed, and the extension
+ * already says which of these is a fixture.
  */
 
 const IND = 12; // px of indent per depth level
@@ -19,7 +26,7 @@ const IND = 12; // px of indent per depth level
 function Chevron({ open }: { open: boolean }) {
   return (
     <svg
-      className={cn('h-3 w-3 shrink-0 transition-transform', open && 'rotate-90')}
+      className={cn('h-2.5 w-2.5 shrink-0 transition-transform', open && 'rotate-90')}
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -29,36 +36,6 @@ function Chevron({ open }: { open: boolean }) {
       aria-hidden
     >
       <polyline points="9 6 15 12 9 18" />
-    </svg>
-  );
-}
-
-function FolderIcon({ open }: { open: boolean }) {
-  return (
-    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      {open ? (
-        <path d="M4 20h13.2a2 2 0 0 0 1.94-1.5L21 11H8a2 2 0 0 0-1.94 1.5L4 20V6a2 2 0 0 1 2-2h3l2 2.5h6a2 2 0 0 1 2 2v1" />
-      ) : (
-        <path d="M4 6a2 2 0 0 1 2-2h3l2 2.5h6a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" />
-      )}
-    </svg>
-  );
-}
-
-function FileIcon({ fixture }: { fixture: boolean }) {
-  if (fixture) {
-    // A "braces" glyph — this holds data, not a test.
-    return (
-      <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-        <path d="M8 4a3 3 0 0 0-3 3v2a2 2 0 0 1-2 2 2 2 0 0 1 2 2v2a3 3 0 0 0 3 3" />
-        <path d="M16 4a3 3 0 0 1 3 3v2a2 2 0 0 0 2 2 2 2 0 0 0-2 2v2a3 3 0 0 1-3 3" />
-      </svg>
-    );
-  }
-  return (
-    <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-      <path d="M14 3v4a1 1 0 0 0 1 1h4" />
-      <path d="M17 21H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7l5 5v11a2 2 0 0 1-2 2Z" />
     </svg>
   );
 }
@@ -158,38 +135,34 @@ export function FileTree({
         <div key={`dir:${node.path}`}>
           <div
             onContextMenu={(e) => folderMenu(e, node.path)}
-            className="group text-ink-dim hover:bg-surface-1 flex items-center gap-1.5 rounded px-1.5 py-1 text-body-sm"
-            style={{ paddingLeft: depth * IND + 6 }}
+            className="group text-ink-faint hover:bg-surface-1 flex items-center gap-1 rounded-sm py-[1px] pr-1.5 leading-[1.9]"
+            style={{ paddingLeft: depth * IND + 4 }}
           >
             <button
               type="button"
               onClick={() => toggle(node.path)}
-              className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+              className="flex min-w-0 flex-1 items-center gap-1 text-left"
             >
               <Chevron open={open} />
-              <span className="text-ink-faint">
-                <FolderIcon open={open} />
-              </span>
-              <span className="truncate font-medium">{node.name}</span>
+              <span className="truncate">{node.name}/</span>
               {node.flagCount > 0 && (
                 <span
-                  className="text-flake text-meta tabular-nums"
+                  className="text-flake shrink-0 tabular-nums"
                   title={`${node.flagCount} flagged`}
                 >
                   ⚑{node.flagCount}
                 </span>
               )}
             </button>
-            <Button
-              variant="ghost"
-              size="sm"
+            <button
+              type="button"
               onClick={() => onAdd(node.path)}
               title={`New file in ${node.name}/`}
               aria-label={`New file in ${node.name}/`}
-              className="text-ink-faint text-body-sm px-1 py-0 opacity-0 group-hover:opacity-100"
+              className="hover:text-ink shrink-0 px-1 leading-none opacity-0 group-hover:opacity-100"
             >
               +
-            </Button>
+            </button>
           </div>
           {open && node.children.map((child) => renderNode(child, depth + 1))}
         </div>
@@ -198,7 +171,6 @@ export function FileTree({
 
     const active = openTestId === node.test.id;
     const dirty = dirtyTestId === node.test.id;
-    const isFixture = node.path.startsWith(FIXTURE_PREFIX);
     return (
       <button
         key={`file:${node.test.id}`}
@@ -206,38 +178,40 @@ export function FileTree({
         onClick={() => onOpen(node.test.id)}
         onContextMenu={(e) => fileMenu(e, node.test)}
         title={node.test.name}
-        style={{ paddingLeft: depth * IND + 6 }}
+        style={{ paddingLeft: depth * IND + 16 }}
         className={cn(
-          'text-body-sm flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left',
+          'flex w-full items-center gap-1.5 rounded-sm py-[1px] pr-1.5 text-left leading-[1.9]',
           active ? 'bg-surface-2 text-ink' : 'hover:bg-surface-1 text-ink-dim',
         )}
       >
-        <span className="w-3 shrink-0" />
-        <span className={isFixture ? 'text-accent-2' : 'text-ink-faint'}>
-          <FileIcon fixture={isFixture} />
-        </span>
         <span className="min-w-0 flex-1 truncate">{node.name}</span>
         {node.test.reviewFlags.length > 0 && (
-          <span className="text-flake shrink-0 text-meta" title="Generator flagged this for review">
+          <span className="text-flake shrink-0" title="Generator flagged this for review">
             ⚑
           </span>
         )}
-        {dirty && <span className="text-flake shrink-0 text-micro" title="Unsaved changes">●</span>}
+        {/* The accent dot, not the flake one: unsaved is a state of the buffer,
+            not a warning about the test. */}
+        {dirty && (
+          <span className="text-accent shrink-0 leading-none" title="Unsaved changes">
+            ●
+          </span>
+        )}
       </button>
     );
   };
 
   if (nodes.length === 0) {
     return (
-      <p className="text-ink-faint px-3 py-4 text-xs">
-        No files yet. Press + to write one.
+      <p className="text-ink-faint leading-relaxed whitespace-normal">
+        No files yet. Press + new test to write one.
       </p>
     );
   }
 
   return (
     <>
-      <div className="py-1">{nodes.map((node) => renderNode(node, 0))}</div>
+      <div>{nodes.map((node) => renderNode(node, 0))}</div>
       {menu && <FileMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
     </>
   );

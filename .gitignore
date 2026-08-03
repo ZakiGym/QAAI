@@ -23,6 +23,12 @@ test-results/
 *.log
 npm-debug.log*
 coverage/
+# …but /insights/coverage is a ROUTE, not a coverage report. The unanchored
+# pattern above swallowed the whole directory, so the screen behind the first
+# Insights tab was never committed — it existed only in working trees where
+# somebody had written it. `/insights` now redirects there, so on a fresh clone
+# the section's landing page would 404.
+!apps/web/app/insights/coverage/
 
 # Ephemeral Playwright workspaces created by the runner
 .qaai-runs/

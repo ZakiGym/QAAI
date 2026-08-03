@@ -3,7 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { api, ApiError, type Run } from '../../lib/api';
+import { useMonaco } from '@monaco-editor/react';
+import type { Monaco } from '@monaco-editor/react';
+import { api, ApiError, type Run, type TestResult } from '../../lib/api';
 import { CodeEditor } from '../../components/CodeEditor';
 import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
@@ -12,22 +14,29 @@ import { InlineEdit } from '../../components/InlineEdit';
 import { VersionHistory } from '../../components/VersionHistory';
 import type { LocatorSuggestion } from '../../components/CodeEditor';
 import { FIXTURE_PREFIX } from '../../lib/tree';
-import { StatusDot, duration } from '../../components/ui';
+import { duration, relativeTime } from '../../components/ui';
 import { useProject } from '../../components/shell/ProjectContext';
+import { TestsHeader } from '../../components/TestsHeader';
 import { Button } from '../../components/ui/Button';
 import { ConfirmDialog } from '../../components/ui/Modal';
 import { PromptDialog } from '../../components/ui/Field';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Page } from '../../components/ui/layout';
 import { cn } from '../../lib/cn';
+import './monaco-decorations.css';
 
 /**
  * The editor (§8) — write and run tests by hand.
  *
- * Three panes, like the cockpit: file tree, Monaco, results. The point is that
- * a QA engineer who already knows what to write should not have to negotiate
- * with an agent to get it written. Save with Cmd-S, run with Cmd-Enter, and the
- * result lands in the right pane without leaving the page.
+ * Three panes: the tree, the file, and the run rail. The point is that a QA
+ * engineer who already knows what to write should not have to negotiate with an
+ * agent to get it written. Save with Cmd-S, run with Cmd-Enter, and the result
+ * lands in the rail without leaving the page.
+ *
+ * The rail answers the question the screen actually raises — "why is this test
+ * red?" — before you have run anything: it loads the file's last real result on
+ * open, and the lines that failed are washed in the failure colour inside the
+ * code itself.
  */
 
 interface TestSummary {
@@ -44,6 +53,25 @@ interface TestSummary {
 interface FullTest extends TestSummary {
   code: string;
   spec: unknown;
+}
+
+/** One row of the VERSIONS rail. Same payload the history sheet reads. */
+interface TestVersion {
+  id: string;
+  version: number;
+  source: string;
+  message: string | null;
+  createdAt: string;
+}
+
+/** The file's last real result, plus where to go to see the whole run. */
+interface LastRun {
+  runId: string;
+  environment: string;
+  at: string;
+  result: TestResult | null;
+  /** Set when only the history row could be read — status without the steps. */
+  fallback: { status: string; durationMs: number; errorMessage: string | null } | null;
 }
 
 /**
@@ -65,6 +93,15 @@ type Dialog =
 
 /** Non-Playwright plugins are configured with JSON, not source. */
 const SPEC_DRIVEN = new Set(['API', 'ACCESSIBILITY', 'SECURITY_SMOKE', 'VISUAL', 'LOAD']);
+
+/** Who wrote a version, in the rail's voice. `HUMAN` is the only one with a face. */
+const VERSION_SOURCE: Record<string, string> = {
+  HUMAN: 'hand edit',
+  GENERATOR: 'generator',
+  HEALER: 'healer',
+  AGENT: 'agent',
+  IMPORT: 'import',
+};
 
 const NEW_TEST_TEMPLATE = `import { test, expect } from '@playwright/test';
 
@@ -117,11 +154,152 @@ function editorLanguage(test: { type: string; filePath: string }): string {
   return 'typescript';
 }
 
+/**
+ * A design token as the `#rrggbb` Monaco understands, or null.
+ *
+ * Nothing here can be a literal: the status colours are oklch, the accent is one
+ * of three and switchable at runtime, and both palettes flip with the theme.
+ * Canvas is the only normaliser the platform hands us that parses every colour
+ * syntax CSS does, so a token written in oklch still reaches Monaco as hex.
+ *
+ * Null rather than a hard-coded fallback: a value that cannot be read is a value
+ * this file has no honest answer for, and Monaco's `inherit` already has one.
+ */
+function tokenColour(variable: string): string | null {
+  if (typeof document === 'undefined') return null;
+  const raw = getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
+  if (!raw) return null;
+  const ctx = document.createElement('canvas').getContext('2d');
+  if (!ctx) return null;
+
+  // An unparseable colour leaves fillStyle where it was, so a sentinel is the
+  // only way to tell "resolved to black" from "was rejected".
+  const sentinel = '#010203';
+  ctx.fillStyle = sentinel;
+  ctx.fillStyle = raw;
+  const resolved = ctx.fillStyle;
+  if (typeof resolved !== 'string' || !/^#[0-9a-f]{6}$/i.test(resolved)) return null;
+  return resolved === sentinel ? null : resolved;
+}
+
+/** Drops the pairs whose token could not be read, so `inherit` covers them. */
+function known(entries: Record<string, string | null>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(entries).filter((pair): pair is [string, string] => pair[1] !== null),
+  );
+}
+
+/**
+ * The editor, dressed in the app's own tokens.
+ *
+ * CodeEditor defines `qaai-dark` from constants when it mounts, which was right
+ * when there was one palette and is wrong now that there are two themes and
+ * three accents. Redefining the SAME name rather than adding another means
+ * whichever of us calls `setTheme` last, the definition in force is this one.
+ * Monaco is themed through its own API here on purpose — reaching into its DOM
+ * with CSS is how an embedded editor stops surviving its next version.
+ */
+function applyTokenTheme(monaco: Monaco): void {
+  const light = document.documentElement.getAttribute('data-theme') === 'light';
+
+  const ink = tokenColour('--color-ink');
+  const dim = tokenColour('--color-ink-dim');
+  const faint = tokenColour('--color-ink-faint');
+  const surface = tokenColour('--color-surface');
+  const surface1 = tokenColour('--color-surface-1');
+  const surface2 = tokenColour('--color-surface-2');
+  const line = tokenColour('--color-line');
+  const accent = tokenColour('--color-accent');
+  const pass = tokenColour('--color-pass');
+  const flake = tokenColour('--color-flake');
+  const fail = tokenColour('--color-fail');
+
+  /* Monaco's token rules want the six digits without the hash; its colours want it. */
+  const rule = (token: string, hex: string | null, fontStyle?: string) =>
+    hex ? [{ token, foreground: hex.slice(1), ...(fontStyle ? { fontStyle } : {}) }] : [];
+
+  monaco.editor.defineTheme('qaai-dark', {
+    base: light ? 'vs' : 'vs-dark',
+    inherit: true,
+    rules: [
+      ...rule('', ink),
+      ...rule('comment', faint, 'italic'),
+      ...rule('string', pass),
+      ...rule('string.value.json', pass),
+      ...rule('string.key.json', dim),
+      ...rule('keyword', accent),
+      ...rule('keyword.json', accent),
+      ...rule('type', accent),
+      ...rule('type.identifier', accent),
+      ...rule('number', flake),
+      ...rule('delimiter', dim),
+    ],
+    colors: known({
+      'editor.background': surface,
+      'editor.foreground': ink,
+      'editorLineNumber.foreground': faint,
+      'editorLineNumber.activeForeground': dim,
+      // 40% of the accent: legible as a selection against both surfaces without
+      // swamping the text it is selecting.
+      'editor.selectionBackground': accent && `${accent}66`,
+      'editor.lineHighlightBackground': surface1,
+      'editorGutter.background': surface,
+      'editorIndentGuide.background1': line,
+      'editorWidget.background': surface1,
+      'editorWidget.border': line,
+      'editorSuggestWidget.background': surface1,
+      'editorSuggestWidget.border': line,
+      'editorSuggestWidget.selectedBackground': surface2,
+      'editorHoverWidget.background': surface1,
+      'editorHoverWidget.border': line,
+      /*
+       * Bracket-pair colouring is on, and its stock palette is gold/magenta/blue
+       * — three colours this design does not contain, on the most frequent glyph
+       * in a test file. Bound to the palette it becomes depth rather than decoration.
+       */
+      'editorBracketHighlight.foreground1': dim,
+      'editorBracketHighlight.foreground2': accent,
+      'editorBracketHighlight.foreground3': faint,
+      'editorBracketHighlight.foreground4': dim,
+      'editorBracketHighlight.foreground5': accent,
+      'editorBracketHighlight.foreground6': faint,
+      'editorBracketHighlight.unexpectedBracket.foreground': fail,
+      'scrollbarSlider.background': line && `${line}cc`,
+      'scrollbarSlider.hoverBackground': surface2,
+    }),
+  });
+  monaco.editor.setTheme('qaai-dark');
+}
+
+/**
+ * Which lines of THIS file the last run died on.
+ *
+ * Playwright puts the failing frame in the message it hands back, so the line
+ * numbers are already in the payload — they only had to be read out of it. A
+ * message that names no line simply washes nothing, which is the right failure
+ * mode for a hint.
+ */
+function failingLines(result: TestResult | null, filePath: string): number[] {
+  const base = filePath.split('/').pop();
+  if (!result || !base) return [];
+
+  const pattern = new RegExp(`${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:(\\d+)`, 'g');
+  const lines = new Set<number>();
+  for (const text of [result.errorMessage, ...result.steps.map((s) => s.errorMessage)]) {
+    if (!text) continue;
+    for (const match of text.matchAll(pattern)) {
+      const line = Number(match[1]);
+      if (Number.isFinite(line) && line > 0) lines.add(line);
+    }
+  }
+  return [...lines];
+}
+
 export default function EditorPage() {
   const router = useRouter();
 
-  // Which app am I editing? The top bar owns that answer now — this screen used
-  // to silently take projects[0] and never say which project that was.
+  // Which app am I editing? The sidebar's switcher owns that answer now — this
+  // screen used to silently take projects[0] and never say which project it was.
   const { project, projectId, loading: projectLoading } = useProject();
 
   const [tests, setTests] = useState<TestSummary[]>([]);
@@ -185,7 +363,9 @@ export default function EditorPage() {
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [lastRun, setLastRun] = useState<Run | null>(null);
+  const [lastRun, setLastRun] = useState<LastRun | null>(null);
+  const [lastRunLoading, setLastRunLoading] = useState(false);
+  const [versions, setVersions] = useState<TestVersion[]>([]);
   const [locators, setLocators] = useState<LocatorSuggestion[]>([]);
   const [inlineSelection, setInlineSelection] = useState<{
     text: string;
@@ -194,7 +374,16 @@ export default function EditorPage() {
   } | null>(null);
   const [running, setRunning] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(false);
   const editorRef = useRef<import('monaco-editor').editor.IStandaloneCodeEditor | null>(null);
+  /** Flipped in `onReady`, so the theme and decoration effects run after mount. */
+  const [editorReady, setEditorReady] = useState(0);
+  const failWashRef = useRef<import('monaco-editor').editor.IEditorDecorationsCollection | null>(
+    null,
+  );
+
+  const openTestId = openTest?.id ?? null;
+  const openFilePath = openTest?.filePath ?? null;
 
   const loadTests = useCallback(async (projectId: string) => {
     const { tests } = await api<{ tests: TestSummary[] }>(`/projects/${projectId}/tests`);
@@ -202,7 +391,7 @@ export default function EditorPage() {
     return tests;
   }, []);
 
-  // Follows the top bar. Switching apps reloads the tree and closes the open
+  // Follows the sidebar. Switching apps reloads the tree and closes the open
   // tabs, because they belong to the project that was selected when they opened.
   useEffect(() => {
     if (!projectId) return;
@@ -274,6 +463,90 @@ export default function EditorPage() {
     });
   }, [projectLoading, projectId, router]);
 
+  /**
+   * The rail's LAST RUN, for the file you just opened.
+   *
+   * Two hops, both on endpoints that already existed: the history row says
+   * which run last touched this test, and the run itself carries the steps and
+   * the expected/actual the rail is made of. If the second hop fails the first
+   * one still answers "did it pass, and when" — a rail that says less is better
+   * than a rail that says nothing.
+   */
+  useEffect(() => {
+    if (!openTestId) {
+      setLastRun(null);
+      return;
+    }
+    let cancelled = false;
+    setLastRunLoading(true);
+    setLastRun(null);
+    void (async () => {
+      try {
+        const history = await api<{
+          results: Array<{
+            status: string;
+            durationMs: number;
+            errorMessage: string | null;
+            createdAt: string;
+            run: { id: string; environment: { name: string } };
+          }>;
+        }>(`/tests/${openTestId}/history?limit=1`);
+        if (cancelled) return;
+
+        const latest = history.results[0];
+        if (!latest) {
+          setLastRun(null);
+          return;
+        }
+
+        const base: LastRun = {
+          runId: latest.run.id,
+          environment: latest.run.environment.name,
+          at: latest.createdAt,
+          result: null,
+          fallback: {
+            status: latest.status,
+            durationMs: latest.durationMs,
+            errorMessage: latest.errorMessage,
+          },
+        };
+        setLastRun(base);
+
+        const { run } = await api<{ run: Run }>(`/runs/${latest.run.id}`);
+        if (cancelled) return;
+        const result = run.results?.find((r) => r.test.id === openTestId) ?? null;
+        if (result) setLastRun({ ...base, result, fallback: null });
+      } catch {
+        /* no history, or signed out — the rail says so in its own words */
+      } finally {
+        if (!cancelled) setLastRunLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [openTestId]);
+
+  /** The rail's VERSIONS. Re-read after a save, which writes one. */
+  const [versionsTick, setVersionsTick] = useState(0);
+  useEffect(() => {
+    if (!projectId || !openTestId) {
+      setVersions([]);
+      return;
+    }
+    let cancelled = false;
+    void api<{ versions: TestVersion[] }>(`/projects/${projectId}/tests/${openTestId}/versions`)
+      .then((d) => {
+        if (!cancelled) setVersions(d.versions);
+      })
+      .catch(() => {
+        if (!cancelled) setVersions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, openTestId, versionsTick]);
+
   async function openFile(projectId: string, testId: string) {
     // Already open? Just focus it — no fetch, and no unsaved work at risk.
     if (tabs.some((t) => t.test.id === testId)) {
@@ -319,13 +592,14 @@ export default function EditorPage() {
 
       setDirty(false);
       setStatus('Saved');
+      setVersionsTick((n) => n + 1);
       await loadTests(project.id);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : 'Save failed');
     } finally {
       setSaving(false);
     }
-  }, [project, openTest, draft, saving, loadTests]);
+  }, [project, openTest, draft, saving, loadTests, setDirty]);
 
   const runThis = useCallback(async () => {
     if (!project || !openTest || running) return;
@@ -352,7 +626,13 @@ export default function EditorPage() {
       for (let i = 0; i < 90; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         const { run: latest } = await api<{ run: Run }>(`/runs/${run.id}`);
-        setLastRun(latest);
+        setLastRun({
+          runId: latest.id,
+          environment: latest.environment.name,
+          at: latest.finishedAt ?? latest.startedAt ?? latest.queuedAt,
+          result: latest.results?.[0] ?? null,
+          fallback: null,
+        });
         if (['PASSED', 'FAILED', 'ERRORED', 'CANCELLED'].includes(latest.status)) break;
       }
       setStatus(null);
@@ -409,6 +689,57 @@ export default function EditorPage() {
     return () => window.removeEventListener('qaai:open-test', onOpen);
   }, []);
 
+  /*
+   * Monaco, in the app's palette.
+   *
+   * Runs after `onReady` on purpose: CodeEditor installs its own definition of
+   * `qaai-dark` as it mounts, and this has to be the later word.
+   *
+   * It follows the theme by WATCHING `<html>` rather than by subscribing to
+   * `useTheme`. That hook holds per-component state, so the copy of it in this
+   * page never hears about a switch made from the sidebar's own copy — the
+   * attribute on the document is the one fact both of them agree on, and it is
+   * also what the accent picker writes.
+   */
+  const monaco = useMonaco();
+  useEffect(() => {
+    if (!monaco || editorReady === 0) return;
+    applyTokenTheme(monaco);
+
+    const observer = new MutationObserver(() => applyTokenTheme(monaco));
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-theme', 'data-accent'],
+    });
+    return () => observer.disconnect();
+  }, [monaco, editorReady]);
+
+  /* The lines the last run died on, washed in the failure colour. */
+  const result = lastRun?.result ?? null;
+  useEffect(() => {
+    const ed = editorRef.current;
+    if (!monaco || !ed || editorReady === 0) return;
+
+    const model = ed.getModel();
+    const total = model?.getLineCount() ?? 0;
+    const decorations = failingLines(result, openFilePath ?? '')
+      .filter((line) => line <= total)
+      .map((line) => ({
+        range: new monaco.Range(line, 1, line, 1),
+        options: {
+          isWholeLine: true,
+          // Plain class names, defined in ./monaco-decorations.css — Monaco
+          // rewrites every bracket and paren in a class string it is handed, so
+          // a Tailwind arbitrary value arrives as rubble. See that file.
+          className: 'qaai-fail-line',
+          lineNumberClassName: 'qaai-fail-line-number',
+        },
+      }));
+
+    if (failWashRef.current) failWashRef.current.set(decorations);
+    else failWashRef.current = ed.createDecorationsCollection(decorations);
+  }, [monaco, editorReady, result, openFilePath]);
+
   /**
    * Create a new file inside a folder. A folder under `fixtures/` makes test
    * DATA (a .json fixture); anywhere else makes a test spec. The folder defaults
@@ -455,7 +786,7 @@ export default function EditorPage() {
     }
   }
 
-  /** Shared by the ⌘K binding and the toolbar button. */
+  /** Shared by the ⌘K binding and the footer bar. */
   function openInlineEdit() {
     const ed = editorRef.current;
     if (!ed) return;
@@ -523,14 +854,13 @@ export default function EditorPage() {
     );
   }
 
-  const result = lastRun?.results?.[0] ?? null;
   const openIsFixture = openTest?.filePath.startsWith(FIXTURE_PREFIX) ?? false;
 
   if (error) {
     return (
       <Page width="narrow">
-        <p className="text-fail">{error}</p>
-        <Link href="/runs" className="text-accent mt-4 inline-block text-sm">
+        <p className="text-fail text-body-sm">{error}</p>
+        <Link href="/runs" className="text-accent text-body-sm mt-4 inline-block">
           Back to runs
         </Link>
       </Page>
@@ -541,12 +871,15 @@ export default function EditorPage() {
   // projects yet — run the seed." — a developer's note shipped as product copy.
   if (!projectLoading && !project) {
     return (
-      <Page width="narrow">
-        <EmptyState
-          title="No app connected yet"
-          body="The editor writes tests against an app. Connect one and its files land here — the ones QAAI writes, and the ones you write yourself."
-          action={{ label: 'Add your app', href: '/onboarding' }}
-        />
+      <Page width="full">
+        <TestsHeader />
+        <div className="mx-auto w-full max-w-[760px] px-10 pt-10">
+          <EmptyState
+            title="No app connected yet"
+            body="The editor writes tests against an app. Connect one and its files land here — the ones QAAI writes, and the ones you write yourself."
+            action={{ label: 'Add your app', href: '/onboarding' }}
+          />
+        </div>
       </Page>
     );
   }
@@ -562,77 +895,12 @@ export default function EditorPage() {
           onClose={() => setHistoryOpen(false)}
         />
       )}
-      <header className="border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
-        <span className="text-ink-dim text-sm font-medium">Editor</span>
-        {openTest && (
-          <span className="text-ink-faint font-mono text-xs">
-            {openTest.filePath}
-            {dirty && <span className="text-flake"> ●</span>}
-          </span>
-        )}
 
-        <div className="ml-auto flex items-center gap-2">
-          {status && <span className="text-ink-faint text-xs">{status}</span>}
-          <RecordButton
-            projectId={project?.id ?? ''}
-            environmentId={project?.environments[0]?.id ?? null}
-            onRecorded={(testId) => {
-              if (project) {
-                void loadTests(project.id).then(() => void openFile(project.id, testId));
-              }
-            }}
-          />
-          <Button
-            size="sm"
-            onClick={() => setHistoryOpen(true)}
-            disabled={!openTest}
-            title="Who changed this file, and what did they change"
-          >
-            History
-          </Button>
-          <Button
-            size="sm"
-            onClick={openInlineEdit}
-            disabled={!openTest}
-            title="Describe a change in plain English"
-          >
-            Edit <span className="text-ink-faint">⌘K</span>
-          </Button>
-          <Button size="sm" onClick={() => void save()} loading={saving} disabled={!dirty}>
-            Save <span className="text-ink-faint">⌘S</span>
-          </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => void runThis()}
-            loading={running}
-            disabled={!openTest || openIsFixture}
-            title={openIsFixture ? 'Fixtures hold test data — there is nothing to run' : undefined}
-          >
-            {running ? 'Running…' : 'Run'} <span className="opacity-70">⌘↵</span>
-          </Button>
-        </div>
-      </header>
+      <TestsHeader detail={tests.length > 0 ? `${tests.length} tests` : undefined} />
 
-      <div className="grid min-h-0 flex-1 grid-cols-[240px_1fr_400px]">
-        {/* ── File tree ───────────────────────────────────────────────────── */}
-        <aside className="border-line min-h-0 overflow-y-auto border-r">
-          <div className="border-line flex items-center justify-between border-b px-3 py-2">
-            <span className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
-              {project?.name ?? 'Files'}
-            </span>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => createInFolder('')}
-              title="New test"
-              aria-label="New test"
-              className="text-ink-faint px-1 py-0 text-sm"
-            >
-              +
-            </Button>
-          </div>
-
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(150px,220px)_minmax(320px,1fr)_minmax(180px,290px)] overflow-x-auto">
+        {/* ── The tree ────────────────────────────────────────────────────── */}
+        <aside className="border-line min-h-0 overflow-auto border-r px-2.5 py-3.5 font-mono text-[11.5px] whitespace-nowrap">
           {/*
             An app is connected but has no tests — the state every new user is in
             right after onboarding, and the one the sidebar rendered as a blank
@@ -641,20 +909,20 @@ export default function EditorPage() {
             forward were writing a test by hand or guessing the URL.
           */}
           {project && tests.length === 0 && (
-            <div className="border-line/60 mx-2 mt-2 rounded-lg border border-dashed p-3">
+            <div className="border-line/60 mb-3 rounded-md border border-dashed p-2.5 whitespace-normal">
               {/*
                 Deliberately does not assert a plan exists — a project created
                 outside onboarding has none, and the plan page says so with a
                 working "Run the Explorer" button. Promising a plan that isn't
                 there is the same mistake as the triage fix-review link.
               */}
-              <p className="text-ink-dim text-xs leading-relaxed">
+              <p className="text-ink-dim font-sans text-[11.5px] leading-relaxed">
                 No tests yet for {project.name}. Approve a test plan and the Generator writes them
                 here.
               </p>
               <Link
                 href={`/projects/${project.id}/plan`}
-                className="text-accent mt-2 inline-block text-xs hover:underline"
+                className="text-accent mt-2 inline-block font-sans text-[11.5px] hover:underline"
               >
                 Review the test plan →
               </Link>
@@ -682,166 +950,242 @@ export default function EditorPage() {
               onDeleteFolder={(path) => setDialog({ kind: 'delete-folder', folderPath: path })}
             />
           )}
+
+          <button
+            type="button"
+            onClick={() => createInFolder('')}
+            className="text-accent mt-3.5 block text-[11px] hover:underline"
+          >
+            + new test
+          </button>
         </aside>
 
-        {/* ── Monaco ──────────────────────────────────────────────────────── */}
-        <section className="relative grid min-h-0 grid-rows-[auto_1fr]">
-          {/* Open files. Dirty tabs show a dot instead of the close ✕ until hovered,
-              the way VS Code does — so unsaved work is visible without being noisy. */}
-          {tabs.length > 0 && (
-            <div className="border-line flex min-w-0 shrink-0 overflow-x-auto border-b">
-              {tabs.map((tab) => {
-                const active = tab.test.id === activeId;
-                return (
-                  <div
-                    key={tab.test.id}
-                    className={cn(
-                      'group border-line text-micro flex shrink-0 items-center gap-2 border-r px-3 py-1.5',
-                      active ? 'bg-surface text-ink' : 'text-ink-faint hover:bg-surface-1',
-                    )}
+        {/* ── The file ────────────────────────────────────────────────────── */}
+        <section className="flex min-h-0 min-w-0 flex-col">
+          {/*
+            Open files, then the verbs. The row wraps rather than scrolls: at a
+            narrow width the Run button dropping to a second line is readable,
+            and a horizontally scrolled toolbar hides the only control on the
+            screen that starts anything.
+          */}
+          <div className="border-line flex shrink-0 flex-wrap items-center gap-2 gap-y-1.5 border-b px-4 py-2">
+            {tabs.map((tab) => {
+              const active = tab.test.id === activeId;
+              return (
+                <span
+                  key={tab.test.id}
+                  className={cn(
+                    'text-micro inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 font-mono whitespace-nowrap',
+                    active ? 'border-line bg-surface-1 text-ink border' : 'text-ink-faint',
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setActiveId(tab.test.id)}
+                    title={tab.test.filePath}
+                    className="max-w-44 truncate"
                   >
-                    <button
-                      type="button"
-                      onClick={() => setActiveId(tab.test.id)}
-                      title={tab.test.filePath}
-                      className="max-w-44 truncate"
-                    >
-                      {tab.test.filePath.split('/').pop()}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => closeTab(tab.test.id)}
-                      aria-label={`Close ${tab.test.filePath}`}
-                      className="text-ink-faint hover:text-ink shrink-0 leading-none"
-                    >
-                      {tab.dirty ? (
-                        <span className="text-flake group-hover:hidden">●</span>
-                      ) : null}
-                      <span className={tab.dirty ? 'hidden group-hover:inline' : ''}>✕</span>
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-          <div className="relative min-h-0">
-          {openTest && inlineSelection && project && (
-            <InlineEdit
-              projectId={project.id}
-              testId={openTest.id}
-              selection={inlineSelection}
-              language={editorLanguage(openTest)}
-              onClose={() => setInlineSelection(null)}
-              onAccept={(code) => {
-                // Staged into the draft, not saved — the user still owns ⌘S.
-                setDraft(code);
-                setDirty(true);
-                setInlineSelection(null);
-                setStatus('Edit applied — ⌘S to save');
-              }}
-            />
-          )}
-          {openTest ? (
-            <CodeEditor
-              value={draft}
-              language={editorLanguage(openTest)}
-              onChange={(next) => {
-                setDraft(next);
-                setDirty(true);
-              }}
-              onSave={() => void save()}
-              locators={locators}
-              onInlineEdit={(selection) => setInlineSelection(selection)}
-              onReady={(ed) => {
-                editorRef.current = ed;
-              }}
-            />
-          ) : (
-            <p className="text-ink-faint p-6 text-sm">
-              Select a test, or press + to write a new one.
-            </p>
-          )}
-          </div>
-        </section>
+                    {tab.test.filePath.split('/').pop()}
+                  </button>
+                  {/* The dirty dot is the tab's state; ✕ is what you do about it. */}
+                  {tab.dirty && <span className="text-accent leading-none">●</span>}
+                  <button
+                    type="button"
+                    onClick={() => closeTab(tab.test.id)}
+                    aria-label={`Close ${tab.test.filePath}`}
+                    className="hover:text-ink shrink-0 leading-none"
+                  >
+                    ✕
+                  </button>
+                </span>
+              );
+            })}
 
-        {/* ── Agent + result ─────────────────────────────────────────────── */}
-        <aside className="border-line grid min-h-0 grid-rows-[1fr_auto] border-l">
-          <div className="min-h-0">
-            <AgentPanel
-              projectId={project?.id ?? ''}
-              onApplied={() => {
-                if (project) {
-                  void loadTests(project.id);
-                  if (openTest) void openFile(project.id, openTest.id);
+            {status && (
+              <span aria-live="polite" className="text-ink-faint text-micro min-w-0">
+                {status}
+              </span>
+            )}
+
+            <div className="ml-auto flex flex-wrap items-center gap-2 gap-y-1.5">
+              <RecordButton
+                projectId={project?.id ?? ''}
+                environmentId={project?.environments[0]?.id ?? null}
+                onRecorded={(testId) => {
+                  if (project) {
+                    void loadTests(project.id).then(() => void openFile(project.id, testId));
+                  }
+                }}
+              />
+              <Button size="sm" onClick={() => void save()} loading={saving} disabled={!dirty}>
+                Save <span className="text-ink-faint font-mono text-[9.5px]">⌘S</span>
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => void runThis()}
+                loading={running}
+                disabled={!openTest || openIsFixture}
+                title={
+                  openIsFixture ? 'Fixtures hold test data — there is nothing to run' : undefined
                 }
-              }}
-            />
+              >
+                {running ? 'Running…' : 'Run'}{' '}
+                <span className="font-mono text-[9.5px] opacity-70">⌘⏎</span>
+              </Button>
+            </div>
           </div>
 
-          <div className="border-line max-h-[45%] overflow-y-auto border-t px-3 py-3">
-            {openTest?.reviewFlags.length ? (
-              <div className="border-flake/40 bg-flake/10 mb-4 rounded-md border p-3">
-                <p className="text-flake mb-1.5 text-micro font-semibold tracking-wider uppercase">
-                  Generator flagged
-                </p>
-                <ul className="text-ink-dim space-y-1 text-xs">
-                  {openTest.reviewFlags.map((flag, i) => (
-                    <li key={i}>{flag}</li>
-                  ))}
-                </ul>
-                <p className="text-ink-faint mt-2 text-micro">Saving clears these.</p>
-              </div>
-            ) : null}
-
-            {result ? (
-              <>
-                <div className="mb-3 flex items-center gap-2">
-                  <StatusDot status={result.status} />
-                  <span className="text-sm">{result.status}</span>
-                  <span className="text-ink-faint ml-auto font-mono text-xs tabular-nums">
-                    {duration(result.durationMs)}
-                  </span>
-                </div>
-
-                <ol className="space-y-1">
-                  {result.steps.map((s) => (
-                    <li
-                      key={s.id}
-                      className={cn(
-                        'flex items-center gap-2 rounded border px-2 py-1.5 text-xs',
-                        s.status === 'FAILED' ? 'border-fail/40 bg-fail/5' : 'border-line',
-                      )}
-                    >
-                      <StatusDot status={s.status} />
-                      <span className="flex-1 truncate">{s.title}</span>
-                      <span className="text-ink-faint text-meta font-mono tabular-nums">
-                        {duration(s.durationMs)}
-                      </span>
-                    </li>
-                  ))}
-                </ol>
-
-                {(result.errorMessage || result.steps.some((s) => s.errorMessage)) && (
-                  <pre className="border-fail/40 bg-fail/5 text-fail text-micro mt-3 overflow-x-auto rounded-md border p-2.5 font-mono whitespace-pre-wrap">
-                    {result.errorMessage ?? result.steps.find((s) => s.errorMessage)?.errorMessage}
-                  </pre>
-                )}
-
-                {lastRun && (
-                  <Link
-                    href={`/runs/${lastRun.id}`}
-                    className="text-accent mt-3 inline-block text-xs"
-                  >
-                    Open in cockpit →
-                  </Link>
-                )}
-              </>
+          <div className="relative min-h-0 flex-1">
+            {openTest && inlineSelection && project && (
+              <InlineEdit
+                projectId={project.id}
+                testId={openTest.id}
+                selection={inlineSelection}
+                language={editorLanguage(openTest)}
+                onClose={() => setInlineSelection(null)}
+                onAccept={(code) => {
+                  // Staged into the draft, not saved — the user still owns ⌘S.
+                  setDraft(code);
+                  setDirty(true);
+                  setInlineSelection(null);
+                  setStatus('Edit applied — ⌘S to save');
+                }}
+              />
+            )}
+            {openTest ? (
+              <CodeEditor
+                value={draft}
+                language={editorLanguage(openTest)}
+                onChange={(next) => {
+                  setDraft(next);
+                  setDirty(true);
+                }}
+                onSave={() => void save()}
+                locators={locators}
+                onInlineEdit={(selection) => setInlineSelection(selection)}
+                onReady={(ed) => {
+                  editorRef.current = ed;
+                  failWashRef.current = null;
+                  setEditorReady((n) => n + 1);
+                }}
+              />
             ) : (
-              <p className="text-ink-faint text-xs">
-                Press <span className="font-mono">⌘↵</span> to run this test. The result lands here.
+              <p className="text-ink-faint text-body-sm p-6">
+                Select a test, or press <span className="font-mono">+ new test</span> to write one.
               </p>
             )}
           </div>
+
+          {/* The footer is the affordance, not a caption — ⌘K is the binding and
+              this is the same command for anyone reaching for a mouse. */}
+          <button
+            type="button"
+            onClick={openInlineEdit}
+            disabled={!openTest}
+            className="border-line text-ink-faint hover:text-ink-dim flex shrink-0 items-center gap-2.5 border-t px-4 py-2 text-left transition-colors disabled:hover:text-current"
+          >
+            <span className="font-mono text-[10px]">⌘K</span>
+            <span className="text-[12px]">
+              Edit the selection in plain English — &ldquo;also assert the tax line&rdquo;
+            </span>
+          </button>
+        </section>
+
+        {/* ── The rail ────────────────────────────────────────────────────── */}
+        <aside className="border-line flex min-h-0 flex-col overflow-y-auto border-l px-[18px] py-4">
+          <LastRunPanel
+            lastRun={lastRun}
+            loading={lastRunLoading}
+            hasFile={Boolean(openTest)}
+            isFixture={openIsFixture}
+          />
+
+          {openTest?.reviewFlags.length ? (
+            <section className="border-line mt-5 border-t pt-4">
+              <h3 className="text-meta text-flake font-mono font-semibold tracking-[0.1em] uppercase">
+                Generator flagged
+              </h3>
+              <ul className="text-ink-dim mt-2 space-y-1 text-[12px]">
+                {openTest.reviewFlags.map((flag, i) => (
+                  <li key={i}>{flag}</li>
+                ))}
+              </ul>
+              <p className="text-ink-faint text-meta mt-2">Saving clears these.</p>
+            </section>
+          ) : null}
+
+          <section className="border-line mt-5 border-t pt-4">
+            <div className="flex items-baseline gap-2">
+              <h3 className="text-meta text-ink-faint font-mono font-semibold tracking-[0.1em] uppercase">
+                Versions
+              </h3>
+              <button
+                type="button"
+                onClick={() => setHistoryOpen(true)}
+                disabled={!openTest}
+                className="text-accent ml-auto text-[11.5px] hover:underline disabled:opacity-50 disabled:hover:no-underline"
+                title="Who changed this file, and what did they change"
+              >
+                compare →
+              </button>
+            </div>
+            {versions.length === 0 ? (
+              <p className="text-ink-faint mt-2 text-[11.5px] leading-relaxed">
+                Every save writes one — by you, by the generator, by a heal. This file has none yet.
+              </p>
+            ) : (
+              <div className="mt-2 flex flex-col gap-2 text-[12px]">
+                {versions.slice(0, 6).map((version) => (
+                  <div key={version.id} className="flex gap-2">
+                    <span className="text-ink-faint font-mono text-[10.5px] tabular-nums">
+                      v{version.version}
+                    </span>
+                    <span className="text-ink-dim min-w-0 flex-1 truncate">
+                      {VERSION_SOURCE[version.source] ?? version.source.toLowerCase()}
+                      {version.message ? ` — ${version.message}` : ''}
+                    </span>
+                    <span className="text-ink-faint font-mono text-[10px] whitespace-nowrap">
+                      {relativeTime(version.createdAt).replace(' ago', '')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/*
+            The copilot. Closed by default — the rail's job on arrival is to say
+            why the file is red — but kept here because this is its only door in
+            the whole product, and a feature you cannot reach is a feature you
+            deleted.
+          */}
+          <section className="border-line mt-5 flex min-h-0 flex-col border-t pt-4">
+            <button
+              type="button"
+              onClick={() => setAgentOpen((open) => !open)}
+              aria-expanded={agentOpen}
+              className="text-meta text-ink-faint hover:text-ink-dim flex items-center gap-1.5 font-mono font-semibold tracking-[0.1em] uppercase transition-colors"
+            >
+              Agent
+              <span aria-hidden className={cn('transition-transform', agentOpen && 'rotate-90')}>
+                ▸
+              </span>
+            </button>
+            {agentOpen && (
+              <div className="mt-3 min-h-[320px] flex-1">
+                <AgentPanel
+                  projectId={project?.id ?? ''}
+                  onApplied={() => {
+                    if (project) {
+                      void loadTests(project.id);
+                      if (openTest) void openFile(project.id, openTest.id);
+                    }
+                  }}
+                />
+              </div>
+            )}
+          </section>
         </aside>
       </div>
 
@@ -923,5 +1267,137 @@ export default function EditorPage() {
         />
       )}
     </Page>
+  );
+}
+
+// ─── LAST RUN ────────────────────────────────────────────────────────────────
+
+const RESULT_TONE: Record<string, { chip: string; word: string }> = {
+  PASSED: { chip: 'text-pass bg-[color-mix(in_srgb,var(--color-pass)_12%,transparent)]', word: 'PASS' },
+  FAILED: { chip: 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]', word: 'FAIL' },
+  ERRORED: { chip: 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]', word: 'ERROR' },
+  TIMED_OUT: { chip: 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]', word: 'TIMEOUT' },
+  FLAKY: { chip: 'text-flake bg-[color-mix(in_srgb,var(--color-flake)_12%,transparent)]', word: 'FLAKE' },
+  SKIPPED: { chip: 'text-ink-faint bg-surface-2', word: 'SKIP' },
+};
+
+function LastRunPanel({
+  lastRun,
+  loading,
+  hasFile,
+  isFixture,
+}: {
+  lastRun: LastRun | null;
+  loading: boolean;
+  hasFile: boolean;
+  isFixture: boolean;
+}) {
+  const result = lastRun?.result ?? null;
+  const status = result?.status ?? lastRun?.fallback?.status ?? null;
+  const tone = (status && RESULT_TONE[status]) || RESULT_TONE.SKIPPED!;
+  const ms = result?.durationMs ?? lastRun?.fallback?.durationMs ?? null;
+  const failedStep = result?.steps.find((s) => s.status === 'FAILED') ?? null;
+  const errorMessage = result?.errorMessage ?? lastRun?.fallback?.errorMessage ?? null;
+
+  return (
+    <section>
+      <div className="flex items-baseline gap-2">
+        <h3 className="text-meta text-ink-faint font-mono font-semibold tracking-[0.1em] uppercase">
+          Last run
+        </h3>
+        {lastRun && (
+          <span className="text-ink-faint ml-auto font-mono text-[10px]">
+            {relativeTime(lastRun.at)} · {lastRun.environment}
+          </span>
+        )}
+      </div>
+
+      {!lastRun && (
+        <p className="text-ink-faint mt-2.5 text-[11.5px] leading-relaxed">
+          {!hasFile
+            ? 'Open a file and its last result lands here.'
+            : isFixture
+              ? 'Fixtures hold test data — there is nothing to run, so there is nothing to report.'
+              : loading
+                ? 'Reading this file’s last result…'
+                : 'This file has never run. Press ⌘⏎ and the result lands here.'}
+        </p>
+      )}
+
+      {lastRun && (
+        <>
+          <div className="mt-2.5 flex items-center gap-2">
+            <span
+              className={cn(
+                'text-micro rounded-sm px-2 py-[3px] font-mono font-semibold tracking-[0.05em]',
+                tone.chip,
+              )}
+            >
+              {tone.word}
+            </span>
+            {ms !== null && (
+              <span className="text-ink-faint font-mono text-[11px] tabular-nums">
+                {duration(ms)}
+              </span>
+            )}
+            <Link
+              href={`/runs/${lastRun.runId}`}
+              className="text-accent ml-auto text-[11.5px] hover:underline"
+            >
+              open in cockpit →
+            </Link>
+          </div>
+
+          {result && result.steps.length > 0 && (
+            <div className="mt-3 flex flex-col gap-[7px] text-[12px]">
+              {result.steps.map((step) => (
+                <div key={step.id} className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      'h-1.5 w-1.5 shrink-0 rounded-full',
+                      step.status === 'FAILED'
+                        ? 'bg-fail'
+                        : step.status === 'PASSED'
+                          ? 'bg-pass'
+                          : 'bg-skip',
+                    )}
+                  />
+                  <span
+                    className={cn(
+                      'min-w-0 flex-1 truncate',
+                      step.status === 'FAILED' ? 'font-semibold' : 'text-ink-dim',
+                    )}
+                    title={step.title}
+                  >
+                    {step.title}
+                  </span>
+                  <span className="text-ink-faint font-mono text-[10px] tabular-nums">
+                    {duration(step.durationMs)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Expected against actual, in that order — the assertion is the claim
+              and the app's answer is the evidence against it. */}
+          {failedStep?.expected && failedStep.actual && (
+            <div className="mt-2.5 rounded-lg border border-[color-mix(in_srgb,var(--color-fail)_30%,transparent)] bg-[color-mix(in_srgb,var(--color-fail)_6%,transparent)] px-3 py-2.5 font-mono text-[11px] leading-relaxed">
+              <span className="text-ink-faint">expected</span>{' '}
+              <span className="text-pass break-all">{failedStep.expected}</span>{' '}
+              <span className="text-ink-faint">·</span>{' '}
+              <span className="text-ink-faint">actual</span>{' '}
+              <span className="text-fail break-all">{failedStep.actual}</span>
+            </div>
+          )}
+
+          {!failedStep?.expected && errorMessage && (
+            <pre className="mt-2.5 max-h-40 overflow-auto rounded-lg border border-[color-mix(in_srgb,var(--color-fail)_30%,transparent)] bg-[color-mix(in_srgb,var(--color-fail)_6%,transparent)] px-3 py-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
+              {errorMessage}
+            </pre>
+          )}
+        </>
+      )}
+    </section>
   );
 }

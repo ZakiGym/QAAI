@@ -1,23 +1,35 @@
 'use client';
 
-import { use, useCallback, useEffect, useRef, useState } from 'react';
+import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { API_URL, api, type Run } from '../../../lib/api';
-import { SeverityLabel, StatusDot, duration } from '../../../components/ui';
+import { cn } from '../../../lib/cn';
+import { StatusDot } from '../../../components/ui';
 import { Button } from '../../../components/ui/Button';
+import { Skeleton } from '../../../components/ui/layout';
 import { useToast } from '../../../components/ui/Toast';
-import { EvidenceRail, type EvidenceResult } from '../../../components/EvidenceRail';
-import { RunCauses } from '../../../components/RunCauses';
+import type { EvidenceResult } from '../../../components/EvidenceRail';
+import { CauseRail } from '../../../components/runs/CauseRail';
+import { FailureStory } from '../../../components/runs/FailureStory';
+import { TriageRail } from '../../../components/runs/TriageRail';
+import { wallClock } from '../../../components/runs/format';
 import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
 
 /**
- * The cockpit (§8).
+ * The cockpit.
  *
- * Left: the suite, grouped by status. Middle: the selected test as a step
- * timeline — the scrubber. Right: the evidence for the selected step, and the
- * Triage verdict card with its review actions.
+ * Three columns, and the left one changed what it is. It used to be the suite —
+ * one row per test — which is the right shape for a run with three results and
+ * the wrong one for a red build with 128. It is now the CAUSES: six failures,
+ * three causes, and a representative of each, from GET /clusters/run/:id.
+ *
+ * Middle is the failure story for the selected test; right is the triage rail,
+ * scoped to the selected step. Selecting a cause selects its first member and
+ * that member's failing step, so one click lands on the evidence rather than on
+ * a name.
  */
+
 /**
  * Turning a stream event into a line a person can read.
  *
@@ -41,7 +53,7 @@ interface LiveLine {
  * `GET /runs/:id` has returned `shards` since sharding shipped; the shared `Run`
  * interface in lib/api.ts — which this page does not own — never described
  * them, which is most of the reason a split run has looked exactly like an
- * unsplit one. Declared here so the panel below is typed; they belong in
+ * unsplit one. Declared here so the strip below is typed; they belong in
  * lib/api.ts next time that file is opened.
  */
 type RunShardStatus = 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'ABANDONED';
@@ -67,7 +79,7 @@ interface RunShard {
  * `results` is re-typed to `EvidenceResult`, which is the same row plus the
  * three columns the API has always returned and lib/api.ts never described:
  * `network`, `consoleLog` and each step's `startedAt` / `errorStack`. Those are
- * what the rail correlates against; see components/EvidenceRail.tsx.
+ * what the triage rail correlates against; see components/EvidenceRail.tsx.
  */
 type ShardedRun = Omit<Run, 'results'> & {
   shardCount?: number;
@@ -115,22 +127,6 @@ function shardDotStatus(shard: RunShard): string {
     default:
       return shard.status;
   }
-}
-
-/**
- * How long a shard has been going, or took.
- *
- * `duration()` renders everything above a second in seconds, which is right for
- * a step and wrong for a slice of a nightly: an eight-minute shard reading
- * "480.0s" is a number nobody can compare at a glance, and comparing shards is
- * the entire point of the panel. Under a minute it defers to the primitive so
- * the two never disagree.
- */
-function wallClock(ms: number): string {
-  if (ms < 60_000) return duration(ms);
-  const minutes = Math.floor(ms / 60_000);
-  const seconds = Math.round((ms % 60_000) / 1000);
-  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
 }
 
 /** Elapsed for a shard. A finished one is fixed; a running one is still counting. */
@@ -215,27 +211,12 @@ function describeEvent(label: string, data: Record<string, unknown>): LiveLine |
 /** A run in one of these states will never emit another event. */
 const TERMINAL = new Set(['PASSED', 'FAILED', 'ERRORED', 'CANCELLED']);
 
-// ─── The evidence rail's width ───────────────────────────────────────────────
-//
-// It was a hard-coded 380px at every viewport, which is where "read this stack
-// trace" turned into "read this stack trace four words at a time". Draggable,
-// collapsible, and persisted with the same key convention and the same
-// try/catch-around-localStorage as the sidebar in components/shell/AppShell.
-
-const RAIL_WIDTH_KEY = 'qaai.cockpit.rail.width';
-const RAIL_COLLAPSED_KEY = 'qaai.cockpit.rail.collapsed';
-const RAIL_DEFAULT = 380;
-const RAIL_MIN = 300;
-const RAIL_MAX = 960;
-/** The strip left behind when collapsed — never zero, because a rail with no
- *  handle is a rail you cannot get back. */
-const RAIL_RAIL = 34;
-
-/** Keep the middle pane usable no matter how far the rail is dragged. */
-function clampRail(width: number): number {
-  const viewportMax =
-    typeof window === 'undefined' ? RAIL_MAX : Math.max(RAIL_MIN, window.innerWidth - 620);
-  return Math.round(Math.min(Math.min(RAIL_MAX, viewportMax), Math.max(RAIL_MIN, width)));
+/** `21:38 UTC` — the one absolute time on the screen, so shifts can be compared. */
+function startedAtLabel(iso: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')} UTC`;
 }
 
 export default function CockpitPage({ params }: { params: Promise<{ runId: string }> }) {
@@ -262,130 +243,12 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const [doneByShard, setDoneByShard] = useState<Record<number, number>>({});
   const [suiteTotal, setSuiteTotal] = useState<number | null>(null);
   /**
-   * A clock, so a running shard's elapsed time counts up between events rather
-   * than freezing on whatever the last refetch happened to catch. Only ticks
-   * while there is something to tick for.
+   * A clock, so elapsed time counts up between events rather than freezing on
+   * whatever the last refetch happened to catch. Only ticks while there is
+   * something to tick for.
    */
   const [now, setNow] = useState(() => Date.now());
   const toast = useToast();
-
-  /*
-   * Rail geometry. The initial state must match what the server rendered, so
-   * the persisted value is applied in an effect and `railReady` gates the width
-   * transition — restoring a collapsed rail should snap, not animate open then
-   * shut, which is the same reason AppShell has its `mounted` flag.
-   */
-  const [railWidth, setRailWidth] = useState(RAIL_DEFAULT);
-  const [railCollapsed, setRailCollapsed] = useState(false);
-  const [railReady, setRailReady] = useState(false);
-  const [railDragging, setRailDragging] = useState(false);
-  const railDrag = useRef<{ x: number; from: number } | null>(null);
-
-  useEffect(() => {
-    try {
-      const stored = Number(localStorage.getItem(RAIL_WIDTH_KEY));
-      if (Number.isFinite(stored) && stored > 0) setRailWidth(clampRail(stored));
-      setRailCollapsed(localStorage.getItem(RAIL_COLLAPSED_KEY) === '1');
-    } catch {
-      /* private mode / no storage — the defaults are fine */
-    }
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(() => setRailReady(true));
-    });
-    return () => {
-      cancelAnimationFrame(outer);
-      if (inner) cancelAnimationFrame(inner);
-    };
-  }, []);
-
-  // A width that was legal on a wide monitor is not legal in a narrow window.
-  useEffect(() => {
-    const onResize = () => setRailWidth((w) => clampRail(w));
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, []);
-
-  const persistRailWidth = useCallback((width: number) => {
-    try {
-      localStorage.setItem(RAIL_WIDTH_KEY, String(width));
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  /** Set and persist in one go — the keyboard path, where every press commits. */
-  const commitRailWidth = useCallback(
-    (width: number) => {
-      const next = clampRail(width);
-      setRailWidth(next);
-      persistRailWidth(next);
-    },
-    [persistRailWidth],
-  );
-
-  /*
-   * The drag itself lives on the WINDOW, not on the handle.
-   *
-   * The handle is 8px wide; a pointer moving at any speed leaves it on the
-   * first frame, so listening on the element only works if pointer capture
-   * holds for the whole gesture — and if capture is ever refused or dropped
-   * (a synthetic pointer, a pen that goes out of range, a release outside the
-   * window) the rail sticks at whatever width it had reached and never commits.
-   * Window listeners have no such failure mode: the gesture ends when the
-   * pointer goes up anywhere, or when the window loses focus mid-drag.
-   */
-  const railWidthRef = useRef(railWidth);
-  railWidthRef.current = railWidth;
-
-  useEffect(() => {
-    if (!railDragging) return;
-
-    const onMove = (e: PointerEvent) => {
-      const drag = railDrag.current;
-      if (!drag) return;
-      // Dragging left widens the rail, so the delta is inverted.
-      setRailWidth(clampRail(drag.from - (e.clientX - drag.x)));
-    };
-    const onEnd = () => {
-      railDrag.current = null;
-      setRailDragging(false);
-      persistRailWidth(railWidthRef.current);
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onEnd);
-    window.addEventListener('pointercancel', onEnd);
-    window.addEventListener('blur', onEnd);
-
-    // Own the cursor and kill text selection for the whole gesture — without
-    // this, dragging across the step list selects every step title on the way.
-    const previousCursor = document.body.style.cursor;
-    const previousSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'col-resize';
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onEnd);
-      window.removeEventListener('pointercancel', onEnd);
-      window.removeEventListener('blur', onEnd);
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousSelect;
-    };
-  }, [railDragging, persistRailWidth]);
-
-  const toggleRail = useCallback(() => {
-    setRailCollapsed((c) => {
-      const next = !c;
-      try {
-        localStorage.setItem(RAIL_COLLAPSED_KEY, next ? '1' : '0');
-      } catch {
-        /* ignore */
-      }
-      return next;
-    });
-  }, []);
 
   /**
    * Re-run the exact same tests against the same environment. Passing the
@@ -524,11 +387,11 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   }, [run?.status, runId, load, run]);
 
   /*
-   * The elapsed clock for a running shard. Bound to the run's status so it
-   * stops the moment there is nothing moving — a finished run must not hold a
-   * timer open for as long as the tab is.
+   * The elapsed clock. Bound to the run's status so it stops the moment there is
+   * nothing moving — a finished run must not hold a timer open for as long as
+   * the tab is.
    */
-  const ticking = run !== null && !TERMINAL.has(run.status) && (run.shards?.length ?? 0) > 0;
+  const ticking = run !== null && !TERMINAL.has(run.status);
   useEffect(() => {
     if (!ticking) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -600,14 +463,16 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   if (error) {
     return (
       <main className="p-10">
-        <p className="text-fail">{error}</p>
-        <Link href="/runs" className="text-accent mt-4 inline-block text-sm">
+        <p className="text-fail text-body-sm" role="alert">
+          {error}
+        </p>
+        <Link href="/runs" className="text-accent mt-4 inline-block text-body-sm hover:underline">
           Back to runs
         </Link>
       </main>
     );
   }
-  if (!run) return <main className="text-ink-faint p-10 text-sm">Loading…</main>;
+  if (!run) return <CockpitSkeleton />;
 
   const inFlight = run.status === 'RUNNING' || run.status === 'QUEUED';
   const results = run.results ?? [];
@@ -639,79 +504,90 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const doneShards = shards.length - pendingShards.length;
   const testsDone = Object.values(doneByShard).reduce((a, b) => a + b, 0);
 
-  const failingResults = results.filter(
-    (r) => r.status === 'FAILED' || r.status === 'TIMED_OUT' || r.status === 'FLAKY',
-  ).length;
+  const startedLabel = startedAtLabel(run.startedAt);
+  const elapsed = run.startedAt
+    ? Math.max(
+        0,
+        (run.finishedAt ? new Date(run.finishedAt).getTime() : now) -
+          new Date(run.startedAt).getTime(),
+      )
+    : null;
 
   /*
    * The trace viewer at /runs/:id/trace has existed since the trace feature
    * shipped and NOTHING linked to it — the only route in was typing the URL.
-   * The evidence rail offered a .zip download instead, which is the trace for
-   * somebody who already has Playwright installed.
-   *
-   * The header link opens on the failure worth looking at; the per-test link
-   * below opens on the selected one. Both are conditional on a result that
-   * actually kept a trace, because the viewer's honest empty state ("this test
-   * kept no trace") is not somewhere to send a person on purpose.
+   * The header link opens on the failure worth looking at; the per-test link in
+   * the middle column opens on the selected one. Both are conditional on a
+   * result that actually kept a trace, because the viewer's honest empty state
+   * ("this test kept no trace") is not somewhere to send a person on purpose.
    */
   const traceTarget =
     results.find((r) => r.traceKey && r.status !== 'PASSED' && r.status !== 'SKIPPED') ??
     results.find((r) => r.traceKey) ??
     null;
 
+  /** Selecting a test always lands on the step that explains it. */
+  const selectTest = (testId: string) => {
+    setSelectedTestId(testId);
+    const target = results.find((r) => r.test.id === testId);
+    setSelectedStep(target?.steps.find((s) => s.status === 'FAILED')?.index ?? null);
+  };
+
   return (
     <div className="flex h-full flex-col">
-      <header className="border-line flex shrink-0 items-center gap-3 border-b px-5 py-3">
+      {/* Wraps rather than scrolls: at 900px this header has a back chip, an id,
+          four facts, a gate verdict, three counts, a button and three links, and
+          a single line of that is a horizontal scrollbar over the one strip
+          nobody should have to scroll. */}
+      <header className="border-line flex shrink-0 flex-wrap items-center gap-x-3.5 gap-y-2 border-b px-6 py-3.5">
         <Link
           href="/runs"
-          className="text-ink-dim hover:text-ink hover:border-accent border-line flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors"
+          className="border-line text-ink-dim hover:text-ink hover:border-line-strong inline-flex items-center gap-1.5 rounded-md border px-2.5 py-[5px] text-[12px] whitespace-nowrap transition-colors"
           title="Back to all runs"
         >
-          <span aria-hidden>←</span> Runs
+          <span aria-hidden>←</span> runs
         </Link>
-        <span className="border-line rounded-md border px-2 py-0.5 font-mono text-micro">
-          {run.id.slice(-8)}
+        <span className="font-mono text-[12.5px]">{run.id.slice(-8)}</span>
+        <span className="text-ink-dim text-body-sm">
+          {run.environment.name} · {run.trigger.toLowerCase()}
+          {startedLabel && ` · started ${startedLabel}`}
+          {elapsed !== null && (
+            <>
+              {' · '}
+              <span className="tabular-nums">{wallClock(elapsed)}</span>
+            </>
+          )}
         </span>
-        <span className="text-ink-dim text-sm">{run.environment.name}</span>
 
-        <div className="ml-auto flex items-center gap-3 text-xs">
-          <span className="text-pass">{run.passedCount} passed</span>
-          {run.failedCount > 0 && <span className="text-fail">{run.failedCount} failed</span>}
-          {run.flakyCount > 0 && <span className="text-flake">{run.flakyCount} flaky</span>}
-          {run.gateResult &&
-            (() => {
-              const provisional = run.gateResult.passed && awaitingTriage;
-              const detail = run.gateResult.evaluations.map((e) => e.detail).join('\n');
-              return (
-                <span
-                  className={`rounded-md border px-2 py-0.5 font-mono ${
-                    provisional
-                      ? 'border-flake/40 text-flake'
-                      : run.gateResult.passed
-                        ? 'border-pass/40 text-pass'
-                        : 'border-fail/40 text-fail'
-                  }`}
-                  title={
-                    provisional
-                      ? `${detail}\n\nProvisional: the gate is scored on triage verdicts and at least one failure has not been triaged yet, so nothing has been cleared. It is not a pass.`
-                      : detail
-                  }
-                >
-                  gate {provisional ? 'provisional' : run.gateResult.passed ? 'pass' : 'block'}
-                </span>
-              );
-            })()}
-          {/*
-            While a run is in flight the only useful action is stopping it, so
-            the button becomes Cancel rather than a greyed-out Re-run with no
-            explanation of why it is disabled.
-          */}
+        {run.gateResult && <GateChip gate={run.gateResult} provisional={awaitingTriage} />}
+
+        <div className="ml-auto flex flex-wrap items-center gap-x-3.5 gap-y-2">
+          <span className="font-mono text-[11.5px] tabular-nums whitespace-nowrap">
+            <span className="text-pass">{run.passedCount}</span>
+            <span className="text-ink-faint"> pass</span>
+            {run.failedCount > 0 && (
+              <>
+                <span className="text-ink-faint"> · </span>
+                <span className="text-fail">{run.failedCount}</span>
+                <span className="text-ink-faint"> fail</span>
+              </>
+            )}
+            {run.flakyCount > 0 && (
+              <>
+                <span className="text-ink-faint"> · </span>
+                <span className="text-flake">{run.flakyCount}</span>
+                <span className="text-ink-faint"> flaky</span>
+              </>
+            )}
+          </span>
+
+          {/* While a run is in flight the only useful action is stopping it, so
+              the button becomes Cancel rather than a greyed-out Re-run with no
+              explanation of why it is disabled. */}
           {inFlight ? (
             <>
-              <span className="text-ink-dim tabular-nums" aria-live="polite">
-                {suiteTotal !== null
-                  ? `${testsDone} of ${suiteTotal}`
-                  : run.status.toLowerCase()}
+              <span className="text-ink-dim text-[11.5px] tabular-nums" aria-live="polite">
+                {suiteTotal !== null ? `${testsDone} of ${suiteTotal}` : run.status.toLowerCase()}
                 {/* The one number that must never be missing from a sharded run
                     in flight: a suite where four of five workers are done still
                     has a fifth of its tests unrun. */}
@@ -734,52 +610,39 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
               onClick={() => void rerun()}
               title="Run the same tests again"
             >
-              ↻ Re-run
+              Re-run
             </Button>
           )}
-          {/* "Is this failure new?" is the first question of any triage, and
-              until now there was no way to ask it — re-running pushed you to a
-              new run id with no link back to the one you were comparing. */}
-          <Link
-            href={`/runs/${run.id}/compare`}
-            className="text-ink-faint hover:text-ink transition-colors"
-            title="Compare with the previous run on this environment"
-          >
-            Compare
-          </Link>
-          {traceTarget && (
+
+          <span className="inline-flex items-center gap-3.5 text-[12.5px] whitespace-nowrap">
+            {/* "Is this failure new?" is the first question of any triage, and
+                until this existed there was no way to ask it — re-running pushed
+                you to a new run id with no link back. */}
             <Link
-              href={`/runs/${run.id}/trace?result=${traceTarget.id}`}
+              href={`/runs/${run.id}/compare`}
               className="text-ink-faint hover:text-ink transition-colors"
-              title="Step through the recorded browser session — DOM, network and console at every action"
+              title="Compare with the previous run on this environment"
             >
-              Trace
+              compare
             </Link>
-          )}
-          <a
-            href={`${API_URL}/runs/${run.id}/junit.xml`}
-            className="text-ink-faint hover:text-ink transition-colors"
-          >
-            JUnit XML
-          </a>
+            {traceTarget && (
+              <Link
+                href={`/runs/${run.id}/trace?result=${traceTarget.id}`}
+                className="text-ink-faint hover:text-ink transition-colors"
+                title="Step through the recorded browser session — DOM, network and console at every action"
+              >
+                trace
+              </Link>
+            )}
+            <a
+              href={`${API_URL}/runs/${run.id}/junit.xml`}
+              className="text-ink-faint hover:text-ink transition-colors"
+            >
+              junit
+            </a>
+          </span>
         </div>
       </header>
-
-      {/*
-        ── What broke ──────────────────────────────────────────────────────
-        Above the shards because it is about the failures, and the failures are
-        why anyone opened this screen. Renders nothing at all on a green run.
-      */}
-      <RunCauses
-        runId={run.id}
-        failingResults={failingResults}
-        selectedTestId={selected?.test.id ?? null}
-        onSelectTest={(testId) => {
-          setSelectedTestId(testId);
-          const target = results.find((r) => r.test.id === testId);
-          setSelectedStep(target?.steps.find((s) => s.status === 'FAILED')?.index ?? null);
-        }}
-      />
 
       {/*
         ── The shards ──────────────────────────────────────────────────────
@@ -790,9 +653,9 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
       {shards.length > 0 && (
         <section
           aria-label="Shards"
-          className="border-line flex shrink-0 items-center gap-2 overflow-x-auto border-b px-5 py-2"
+          className="border-line flex shrink-0 items-center gap-2 overflow-x-auto border-b px-6 py-2"
         >
-          <p className="text-ink-dim shrink-0 text-xs">
+          <p className="text-ink-dim shrink-0 text-[11.5px]">
             <span className="tabular-nums">{doneShards}</span> of{' '}
             <span className="tabular-nums">{shards.length}</span> shards done
             {pendingShards.length > 0 && (
@@ -806,7 +669,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           </p>
 
           {shards.map((shard) => {
-            const elapsed = shardElapsedMs(shard, now);
+            const shardElapsed = shardElapsedMs(shard, now);
             const failedItsTests = shard.status === 'FAILED' || shard.status === 'ABANDONED';
             return (
               <div
@@ -814,22 +677,25 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
                 title={`Shard ${shard.index} of ${shard.total} · ${shard.testCount} tests · predicted ${wallClock(
                   shard.estimatedMs,
                 )}${shard.errorMessage ? ` · ${shard.errorMessage}` : ''}`}
-                className={`flex shrink-0 items-center gap-2.5 rounded-md border px-2.5 py-1 ${
-                  failedItsTests ? 'border-fail/40 bg-fail/5' : 'border-line bg-surface-1'
-                }`}
+                className={cn(
+                  'flex shrink-0 items-center gap-2.5 rounded-md border px-2.5 py-1',
+                  failedItsTests
+                    ? 'border-fail/40 bg-[color-mix(in_srgb,var(--color-fail)_5%,transparent)]'
+                    : 'border-line bg-surface-1',
+                )}
               >
                 <StatusDot status={shardDotStatus(shard)} />
-                <span className="text-ink-faint font-mono text-micro tabular-nums">
+                <span className="text-ink-faint font-mono text-meta tabular-nums">
                   #{shard.index}
                 </span>
-                <span className="text-xs">{SHARD_STATUS_LABEL[shard.status]}</span>
-                <span className="text-ink-faint text-micro tabular-nums">
+                <span className="text-[12px]">{SHARD_STATUS_LABEL[shard.status]}</span>
+                <span className="text-ink-faint font-mono text-meta tabular-nums">
                   {shard.testCount} tests
                 </span>
                 {/* A shard that has not started has no elapsed time to show, and
                     a dash is more honest than a zero. */}
-                <span className="text-ink-dim text-micro tabular-nums">
-                  {elapsed === null ? '—' : wallClock(elapsed)}
+                <span className="text-ink-dim font-mono text-meta tabular-nums">
+                  {shardElapsed === null ? '—' : wallClock(shardElapsed)}
                 </span>
               </div>
             );
@@ -837,248 +703,112 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
         </section>
       )}
 
-      <div
-        className={`grid min-h-0 flex-1 ${
-          railReady && !railDragging ? 'transition-[grid-template-columns] duration-150 ease-out' : ''
-        }`}
-        style={{
-          gridTemplateColumns: `280px minmax(0,1fr) ${railCollapsed ? RAIL_RAIL : railWidth}px`,
-        }}
-      >
-        {/* ── Left: the suite ─────────────────────────────────────────────── */}
-        <aside className="border-line min-h-0 overflow-y-auto border-r">
-          {results.map((result) => (
-            <button
-              key={result.id}
-              type="button"
-              onClick={() => {
-                setSelectedTestId(result.test.id);
-                setSelectedStep(result.steps.find((s) => s.status === 'FAILED')?.index ?? null);
-              }}
-              className={`border-line/60 flex w-full items-start gap-2.5 border-b px-4 py-3 text-left ${
-                selected?.id === result.id ? 'bg-surface-2' : 'hover:bg-surface-1'
-              }`}
-            >
-              <span className="mt-1.5">
-                <StatusDot status={result.status} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-sm">{result.test.name}</span>
-                <span className="text-ink-faint mt-0.5 flex items-center gap-2 font-mono text-micro">
-                  {result.test.type}
-                  {result.test.quarantined && <span className="text-flake">quarantined</span>}
-                  {result.verdict && <span>{result.verdict.verdict}</span>}
-                </span>
-              </span>
-            </button>
-          ))}
-        </aside>
+      {/*
+        Three columns, minmax on all of them, and the container scrolls
+        horizontally rather than any one of them collapsing: the left rail stops
+        being useful below ~170px and the middle stops being readable below
+        ~280px, so past that point the honest answer is a scrollbar.
+      */}
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(170px,240px)_minmax(280px,1fr)_minmax(200px,320px)] overflow-x-auto">
+        <CauseRail
+          runId={run.id}
+          results={results}
+          selectedTestId={selected?.test.id ?? null}
+          onSelectTest={selectTest}
+        />
 
-        {/* ── Middle: the step scrubber ───────────────────────────────────── */}
-        <section className="min-h-0 overflow-y-auto px-5 py-4">
-          {selected ? (
-            <>
-              <h2 className="text-lg font-medium">{selected.test.name}</h2>
-              <p className="text-ink-faint mt-1 font-mono text-xs">
-                {/* This was dead text on the highest-traffic triage screen,
-                    while /heals and /triage both made the same string a link.
-                    It goes to the test's own history, which answers the
-                    question you ask next: has this always been unreliable? */}
-                <Link
-                  href={`/tests/${selected.test.id}`}
-                  className="hover:text-ink transition-colors hover:underline"
-                  title="This test's history"
-                >
-                  {selected.test.filePath}
-                </Link>{' '}
-                · <span className="tabular-nums">{duration(selected.durationMs)}</span> ·{' '}
-                {selected.test.priority.toLowerCase().replace('_', ' ')}
-                {/* The trace viewer, on the test you are actually looking at.
-                    Only when this result kept one — sending someone to a viewer
-                    that has to explain there is nothing to view is worse than
-                    not offering the link. */}
-                {selected.traceKey && (
-                  <>
-                    {' · '}
-                    <Link
-                      href={`/runs/${run.id}/trace?result=${selected.id}`}
-                      className="hover:text-ink transition-colors hover:underline"
-                      title="Step through this test's recorded browser session"
-                    >
-                      trace
-                    </Link>
-                  </>
-                )}
-              </p>
+        <FailureStory
+          runId={run.id}
+          result={selected}
+          selectedStep={selectedStep}
+          onSelectStep={setSelectedStep}
+        />
 
-              {selected.retriedAndPassed && (
-                <p className="border-flake/40 bg-flake/10 text-flake mt-4 rounded-md border p-3 text-xs">
-                  This test failed and then passed on retry. A retry that passes is not a pass — it
-                  is a flake candidate, and the gate treats it as one.
-                </p>
-              )}
-
-              <ol className="mt-5 space-y-1.5">
-                {selected.steps.map((s) => (
-                  <li key={s.id}>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedStep(s.index)}
-                      className={`flex w-full items-center gap-3 rounded-md border px-3 py-2 text-left ${
-                        selectedStep === s.index
-                          ? 'border-accent bg-surface-2'
-                          : s.status === 'FAILED'
-                            ? 'border-fail/40 bg-fail/5 hover:bg-fail/10'
-                            : 'border-line hover:bg-surface-1'
-                      }`}
-                    >
-                      <StatusDot status={s.status} />
-                      <span className="text-ink-faint font-mono text-micro">{s.index}</span>
-                      <span className="flex-1 text-sm">{s.title}</span>
-                      <span className="text-ink-faint font-mono text-micro">
-                        {duration(s.durationMs)}
-                      </span>
-                    </button>
-                  </li>
-                ))}
-              </ol>
-
-              {selected.steps.length === 0 && selected.errorMessage && (
-                <pre className="border-fail/40 bg-fail/5 text-fail mt-5 overflow-x-auto rounded-md border p-3 font-mono text-xs whitespace-pre-wrap">
-                  {selected.errorMessage}
-                </pre>
-              )}
-
-              {selected.findings.length > 0 && (
-                <section className="mt-8">
-                  <h3 className="text-ink-dim mb-2 text-xs font-semibold tracking-wider uppercase">
-                    Findings ({selected.findings.length})
-                  </h3>
-                  <ul className="border-line divide-line divide-y rounded-md border">
-                    {selected.findings.map((f) => (
-                      <li key={f.id} className="px-3 py-2">
-                        <div className="flex items-center gap-2">
-                          <SeverityLabel severity={f.severity} />
-                          <code className="font-mono text-micro">{f.code}</code>
-                        </div>
-                        <p className="text-ink-dim mt-1 text-xs">{f.message}</p>
-                        <p className="text-ink-faint mt-0.5 font-mono text-micro">{f.location}</p>
-                      </li>
-                    ))}
-                  </ul>
-                </section>
-              )}
-            </>
-          ) : (
-            <p className="text-ink-faint text-sm">This run has no results.</p>
-          )}
-        </section>
-
-        {/* ── Right: evidence and verdict ─────────────────────────────────── */}
-        <aside className="border-line relative min-h-0 border-l" aria-label="Evidence">
-          {railCollapsed ? (
-            /* Collapsed to a strip, never to nothing: the live feed lives in
-               this rail, so a run in flight keeps a pulsing dot on the handle
-               rather than silently losing its only progress surface. */
-            <button
-              type="button"
-              onClick={toggleRail}
-              title="Show evidence"
-              aria-label="Show evidence"
-              aria-expanded={false}
-              className="text-ink-faint hover:text-ink hover:bg-surface-1 flex h-full w-full flex-col items-center gap-3 py-3"
-            >
-              <span aria-hidden>‹</span>
-              {live.length > 0 && (
-                <span className="bg-accent inline-block h-1.5 w-1.5 animate-pulse rounded-full" />
-              )}
-              <span className="text-micro [writing-mode:vertical-rl]">Evidence</span>
-            </button>
-          ) : (
-            <>
-              {/*
-                The drag handle. It sits on the border rather than beside it, so
-                the rail does not jump the first time you grab it, and it is a
-                real focusable separator — arrow keys resize it, which is the
-                only way this is usable without a mouse.
-              */}
-              <div
-                role="separator"
-                aria-orientation="vertical"
-                aria-label="Resize evidence rail"
-                aria-valuenow={railWidth}
-                aria-valuemin={RAIL_MIN}
-                aria-valuemax={RAIL_MAX}
-                tabIndex={0}
-                onPointerDown={(e) => {
-                  railDrag.current = { x: e.clientX, from: railWidth };
-                  setRailDragging(true);
-                  // preventDefault stops the browser starting a text selection,
-                  // and also suppresses the focus it would otherwise give — so
-                  // focus is taken explicitly, keeping the keyboard path alive
-                  // for anyone who grabs the handle with a mouse first.
-                  e.preventDefault();
-                  e.currentTarget.focus();
-                }}
-                onDoubleClick={() => commitRailWidth(RAIL_DEFAULT)}
-                onKeyDown={(e) => {
-                  const step = e.shiftKey ? 80 : 16;
-                  if (e.key === 'ArrowLeft') {
-                    e.preventDefault();
-                    commitRailWidth(railWidth + step);
-                  } else if (e.key === 'ArrowRight') {
-                    e.preventDefault();
-                    commitRailWidth(railWidth - step);
-                  } else if (e.key === 'Home') {
-                    e.preventDefault();
-                    commitRailWidth(RAIL_MAX);
-                  } else if (e.key === 'End') {
-                    e.preventDefault();
-                    commitRailWidth(RAIL_MIN);
-                  }
-                }}
-                title="Drag to resize · double-click to reset"
-                className={`hover:bg-accent/60 focus-visible:bg-accent absolute top-0 -left-1 z-10 h-full w-2 cursor-col-resize ${
-                  railDragging ? 'bg-accent/60' : 'bg-transparent'
-                }`}
-              />
-
-              <div className="flex h-full min-h-0 flex-col">
-                <div className="border-line flex shrink-0 items-center gap-2 border-b px-4 py-2">
-                  <h2 className="text-ink-faint text-micro font-semibold tracking-wider uppercase">
-                    Evidence
-                  </h2>
-                  <span className="text-ink-faint ml-auto font-mono text-meta tabular-nums">
-                    {railWidth}px
-                  </span>
-                  <button
-                    type="button"
-                    onClick={toggleRail}
-                    title="Collapse evidence rail"
-                    aria-label="Collapse evidence rail"
-                    aria-expanded
-                    className="text-ink-faint hover:text-ink text-sm leading-none"
-                  >
-                    ›
-                  </button>
-                </div>
-
-                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-                  <EvidenceRail
-                    runId={run.id}
-                    result={selected}
-                    step={step}
-                    onSelectStep={setSelectedStep}
-                    onReviewed={() => void load()}
-                    live={live}
-                  />
-                </div>
-              </div>
-            </>
-          )}
-        </aside>
+        <TriageRail
+          runId={run.id}
+          result={selected}
+          step={step}
+          onSelectStep={setSelectedStep}
+          onReviewed={() => void load()}
+          live={live}
+        />
       </div>
     </div>
   );
 }
 
+/**
+ * The gate, as a word rather than a colour.
+ *
+ * `provisional` is the third state and the reason this is not a boolean: a gate
+ * scored against verdicts finds nothing to block on when nothing has been
+ * triaged yet, and reports a pass. It is not a pass. It has not been decided.
+ */
+function GateChip({
+  gate,
+  provisional,
+}: {
+  gate: NonNullable<Run['gateResult']>;
+  provisional: boolean;
+}) {
+  const undecided = gate.passed && provisional;
+  const detail = gate.evaluations.map((e) => e.detail).join('\n');
+  const word = undecided ? 'PROVISIONAL' : gate.passed ? 'PASS' : 'BLOCK';
+  const tone = undecided
+    ? 'text-flake bg-[color-mix(in_srgb,var(--color-flake)_12%,transparent)]'
+    : gate.passed
+      ? 'text-pass bg-[color-mix(in_srgb,var(--color-pass)_12%,transparent)]'
+      : 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]';
+
+  return (
+    <span
+      title={
+        undecided
+          ? `${detail}\n\nProvisional: the gate is scored on triage verdicts and at least one failure has not been triaged yet, so nothing has been cleared. It is not a pass.`
+          : detail
+      }
+      className={cn(
+        'shrink-0 rounded-sm px-2 py-[3px] font-mono text-[10.5px] font-semibold tracking-[0.06em] whitespace-nowrap',
+        tone,
+      )}
+    >
+      GATE — {word}
+    </span>
+  );
+}
+
+/**
+ * The cockpit while the run is still being fetched.
+ *
+ * Shaped like the screen it stands in for, three columns and all — a spinner
+ * centred in an empty page tells you to wait, and this tells you what for.
+ */
+function CockpitSkeleton() {
+  return (
+    <div className="flex h-full flex-col" role="status" aria-label="Loading the run">
+      <div className="border-line flex shrink-0 items-center gap-3.5 border-b px-6 py-3.5">
+        <Skeleton className="h-6 w-16" />
+        <Skeleton className="h-3.5 w-20" />
+        <Skeleton className="h-3.5 w-60" />
+        <Skeleton className="ml-auto h-6 w-24" />
+      </div>
+      <div className="grid min-h-0 flex-1 grid-cols-[minmax(170px,240px)_minmax(280px,1fr)_minmax(200px,320px)]">
+        <div className="border-line border-r px-3.5 py-4">
+          <Skeleton className="h-2.5 w-20" />
+          <Skeleton className="mt-4 h-20 w-full" />
+          <Skeleton className="mt-2 h-12 w-full" />
+        </div>
+        <div className="px-8 py-6">
+          <Skeleton className="h-2.5 w-48" />
+          <Skeleton className="mt-3 h-6 w-80" />
+          <Skeleton className="mt-6 h-40 w-full" />
+        </div>
+        <div className="border-line border-l px-5 py-[18px]">
+          <Skeleton className="h-2.5 w-16" />
+          <Skeleton className="mt-3 h-5 w-32" />
+          <Skeleton className="mt-4 h-24 w-full" />
+        </div>
+      </div>
+    </div>
+  );
+}

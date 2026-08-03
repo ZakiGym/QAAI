@@ -3,9 +3,10 @@
 import { Suspense, useCallback, useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { api, ApiError } from '../../../lib/api';
+import { cn } from '../../../lib/cn';
 import { useToast } from '../../../components/ui/Toast';
-import { Button } from '../../../components/ui/Button';
-import { Card, Page, PageHeader, SectionLabel } from '../../../components/ui/layout';
+import { Page, PageHeader, Skeleton, SkeletonRows } from '../../../components/ui/layout';
+import { SECTION_TABS_SLOT_ID } from '../../../components/shell/AppShell';
 
 /**
  * Billing.
@@ -19,6 +20,11 @@ import { Card, Page, PageHeader, SectionLabel } from '../../../components/ui/lay
  * the Stripe webhook can move an org between plans; landing on the success URL
  * proves a redirect happened, not that money moved. So the page polls until the
  * server confirms, and says exactly that while it waits.
+ *
+ * It is a route rather than a `?tab=` on /settings because it comes back from
+ * Stripe with `?pending=1` and has to survive a whole page load. It wears the
+ * Settings header and the Settings tab strip so that it still reads as the tab
+ * it is.
  */
 
 interface PlanRow {
@@ -44,6 +50,64 @@ interface Billing {
   usage: { runsThisMonth: number; projects: number };
   configured: boolean;
   catalogue: PlanRow[];
+}
+
+interface Me {
+  activeOrgId: string;
+  orgs: Array<{ id: string; name: string }>;
+}
+
+/** The catalogue says "unlimited" with a number nobody can read. Translate it. */
+const uncapped = (n: number | null): boolean => n === null || n > 1000;
+
+const count = (n: number) => n.toLocaleString();
+
+function priceLabel(usd: number | null): string {
+  if (usd === null) return 'talk to us';
+  if (usd === 0) return 'free';
+  return `$${usd}/mo`;
+}
+
+/**
+ * The frame: the Settings title, the Settings tab slot, and the org name.
+ *
+ * Only `BillingInner` reads `?pending=1`, and it is the only thing inside the
+ * Suspense boundary. `next build` refuses to prerender a page that calls
+ * `useSearchParams()` without one, and the shell resolves its tab slot with a
+ * single `getElementById` — a slot rendered inside a fallback is a different DOM
+ * node from the one rendered after it resolves, so it has to live out here where
+ * it is mounted once and never replaced.
+ */
+export default function BillingPage() {
+  const [orgName, setOrgName] = useState<string | null>(null);
+
+  // Only for the eyebrow: this page is a Settings tab and has to say which
+  // organisation's money it is about, which /billing does not carry.
+  useEffect(() => {
+    void api<Me>('/auth/me')
+      .then((me) => setOrgName(me.orgs.find((org) => org.id === me.activeOrgId)?.name ?? null))
+      .catch(() => setOrgName(null));
+  }, []);
+
+  return (
+    <Page width="settings">
+      <PageHeader
+        // A non-breaking space while the org name is in flight, so the title
+        // does not jump down a line when it lands.
+        eyebrow={orgName ? `${orgName} · Settings` : ' '}
+        title="Settings"
+      />
+
+      {/* The shell portals the section strip in here, under the title. */}
+      <div id={SECTION_TABS_SLOT_ID} />
+
+      <div className="mt-[26px]">
+        <Suspense fallback={<SkeletonRows rows={4} />}>
+          <BillingInner />
+        </Suspense>
+      </div>
+    </Page>
+  );
 }
 
 function BillingInner() {
@@ -129,219 +193,308 @@ function BillingInner() {
 
   if (error) {
     return (
-      <Page width="narrow">
-        <p
-          role="alert"
-          className="border-fail/40 bg-fail/10 text-fail rounded-md border p-3 text-sm"
-        >
-          {error}
-        </p>
-      </Page>
+      <p
+        role="alert"
+        className="border-fail/40 bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] text-fail text-body-sm rounded-md border px-3 py-2"
+      >
+        {error}
+      </p>
     );
   }
 
   if (!billing) {
     return (
-      <Page width="narrow">
-        <p className="text-ink-faint text-body-sm">Loading…</p>
-      </Page>
+      <>
+        <Skeleton className="h-7 w-56" />
+        <Skeleton className="mt-3 h-4 w-full max-w-[520px]" />
+        <div className="mt-[22px]">
+          <SkeletonRows rows={4} />
+        </div>
+      </>
     );
   }
 
+  return (
+    <BillingBody
+      billing={billing}
+      activating={activating}
+      pending={pending}
+      busy={busy}
+      onCheckout={checkout}
+      onPortal={portal}
+    />
+  );
+}
+
+function BillingBody({
+  billing,
+  activating,
+  pending,
+  busy,
+  onCheckout,
+  onPortal,
+}: {
+  billing: Billing;
+  activating: boolean;
+  pending: boolean;
+  busy: string | null;
+  onCheckout: (plan: string) => void;
+  onPortal: () => void;
+}) {
   const { limits, usage } = billing;
-  const runCap = limits.maxRunsPerMonth;
+
+  const runs = uncapped(limits.maxRunsPerMonth)
+    ? `${count(usage.runsThisMonth)} runs`
+    : `${count(usage.runsThisMonth)} of ${count(limits.maxRunsPerMonth as number)} runs`;
+  const projects = uncapped(limits.maxProjects)
+    ? `${count(usage.projects)} projects`
+    : `${count(usage.projects)} of ${count(limits.maxProjects)} projects`;
+
+  const renewal =
+    billing.currentPeriodEnd && billing.paying
+      ? `${billing.cancelAtPeriodEnd ? 'Ends' : 'Renews'} ${new Date(
+          billing.currentPeriodEnd,
+        ).toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}.`
+      : null;
 
   return (
-    <Page width="narrow">
-      <PageHeader
-        title="Billing"
-        subtitle={
-          <>
-            You are on <span className="text-ink font-medium">{limits.label}</span>
-            {billing.currentPeriodEnd && billing.paying && (
-              <>
-                {' · '}
-                {billing.cancelAtPeriodEnd ? 'ends' : 'renews'}{' '}
-                {new Date(billing.currentPeriodEnd).toLocaleDateString()}
-              </>
-            )}
-          </>
-        }
-      />
-
+    <div>
       {activating && (
-        <p className="border-accent/50 bg-accent/10 text-body-sm mb-6 rounded-md border p-3">
-          Activating your plan… this usually takes a couple of seconds.
-        </p>
+        <Note tone="accent">Activating your plan… this usually takes a couple of seconds.</Note>
       )}
 
       {!activating && pending && !billing.paying && (
-        <p className="border-flake/40 bg-flake/10 text-body-sm mb-6 rounded-md border p-3">
+        <Note tone="flake">
           Payment went through, but we have not had the confirmation from Stripe yet. It usually
           arrives within a minute — refresh, and if it is still not here, contact us and we will
           sort it out. You have not been charged twice.
-        </p>
+        </Note>
       )}
 
       {/* Past due gets said plainly, because the consequence is real. */}
       {billing.status === 'past_due' && (
-        <p className="border-fail/50 bg-fail/10 text-body-sm mb-6 rounded-md border p-3">
+        <Note tone="fail">
           Your last payment failed, so you are temporarily on Free limits. Updating your card
           restores everything — nothing has been deleted.
+        </Note>
+      )}
+
+      <h2 className="font-display text-display-sm font-semibold">
+        {limits.label} — {priceLabel(limits.monthlyPriceUsd)}
+      </h2>
+
+      <p className="text-ink-dim text-row-sub mt-1.5 leading-relaxed">
+        {runs} · {projects} · {limits.maxParallelWorkers} parallel workers ·{' '}
+        {limits.artifactRetentionDays}-day artifacts.
+        {renewal && ` ${renewal}`} Usage first, upsell second — usage is the honest argument
+        anyway.
+      </p>
+
+      {!billing.configured && (
+        <p className="text-ink-faint text-micro border-line mt-4 rounded-md border border-dashed px-3 py-2">
+          This instance has no Stripe keys configured, so plans cannot be bought here. The limits
+          below are still enforced.
         </p>
       )}
 
-      <section className="mb-10">
-        <SectionLabel>This month</SectionLabel>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Meter
-            label="Runs"
-            used={usage.runsThisMonth}
-            cap={runCap}
-            note={runCap === null ? 'Unlimited on your plan' : 'Resets on the 1st'}
-          />
-          <Meter label="Projects" used={usage.projects} cap={limits.maxProjects} />
-        </div>
-      </section>
+      <PlanTable billing={billing} busy={busy} onCheckout={onCheckout} />
 
-      <section>
-        <div className="mb-3 flex items-baseline justify-between">
-          <SectionLabel>Plans</SectionLabel>
-          {billing.paying && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void portal()}
+      <p className="text-ink-faint text-meta mt-3 font-mono">
+        stripe hosts the card form — we never see a number
+        {billing.paying && (
+          <>
+            {' · '}
+            <button
+              type="button"
+              onClick={onPortal}
               disabled={busy !== null}
-              className="text-accent"
+              className="text-accent hover:underline disabled:opacity-50"
             >
-              Manage payment &amp; invoices →
-            </Button>
-          )}
-        </div>
-
-        {!billing.configured && (
-          <p className="text-ink-faint text-body-sm border-line mb-3 rounded-md border border-dashed p-3">
-            This instance has no Stripe keys configured, so plans cannot be bought here. Limits
-            below are still enforced.
-          </p>
+              {busy === 'portal' ? 'opening…' : 'manage in the portal →'}
+            </button>
+          </>
         )}
-
-        <div className="border-line divide-line bg-surface-1 divide-y overflow-hidden rounded-lg border">
-          {billing.catalogue.map((row) => {
-            const current = row.plan === billing.plan;
-            return (
-              <div key={row.plan} className="flex items-center gap-4 px-4 py-3.5">
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium">
-                    {row.label}
-                    {current && (
-                      <span className="border-accent/50 text-accent text-meta ml-2 rounded border px-1.5 py-0.5 align-middle">
-                        CURRENT
-                      </span>
-                    )}
-                  </p>
-                  <p className="text-ink-faint text-micro mt-1">
-                    {row.maxProjects > 1000 ? 'Unlimited' : row.maxProjects} project
-                    {row.maxProjects === 1 ? '' : 's'} ·{' '}
-                    {row.maxRunsPerMonth === null
-                      ? 'unlimited runs'
-                      : `${row.maxRunsPerMonth} runs`}{' '}
-                    · {row.maxParallelWorkers} parallel · {row.artifactRetentionDays}d artifacts
-                    {row.sso && ' · SSO'}
-                    {row.auditLog && ' · audit log'}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <p className="text-body-sm">
-                    {row.monthlyPriceUsd === null ? (
-                      <span className="text-ink-dim">Talk to us</span>
-                    ) : row.monthlyPriceUsd === 0 ? (
-                      <span className="text-ink-dim">Free</span>
-                    ) : (
-                      <>
-                        ${row.monthlyPriceUsd}
-                        <span className="text-ink-faint text-micro">/mo</span>
-                      </>
-                    )}
-                  </p>
-                </div>
-                <div className="w-24 text-right">
-                  {!current && row.purchasable && (
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      onClick={() => void checkout(row.plan)}
-                      disabled={busy !== null && busy !== row.plan}
-                      loading={busy === row.plan}
-                    >
-                      Upgrade
-                    </Button>
-                  )}
-                  {!current && !row.purchasable && row.monthlyPriceUsd === null && (
-                    <a
-                      href="mailto:sales@qaai.dev"
-                      className="text-accent text-body-sm hover:underline"
-                    >
-                      Contact
-                    </a>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-    </Page>
-  );
-}
-
-/** A usage bar that only alarms when there is something to be alarmed about. */
-function Meter({
-  label,
-  used,
-  cap,
-  note,
-}: {
-  label: string;
-  used: number;
-  cap: number | null;
-  note?: string;
-}) {
-  const unlimited = cap === null || cap > 1000;
-  const pct = unlimited ? 0 : Math.min(100, Math.round((used / cap) * 100));
-  const tone = pct >= 100 ? 'bg-fail' : pct >= 80 ? 'bg-flake' : 'bg-accent';
-
-  return (
-    <div className="border-line bg-surface-1 rounded-lg border p-4">
-      <div className="flex items-baseline justify-between">
-        <p className="text-body-sm text-ink-dim">{label}</p>
-        <p className="text-sm">
-          <span className="font-medium">{used}</span>
-          <span className="text-ink-faint">{unlimited ? '' : ` / ${cap}`}</span>
-        </p>
-      </div>
-      {!unlimited && (
-        <div className="bg-surface-2 mt-2.5 h-1.5 overflow-hidden rounded-full">
-          <div className={`h-full ${tone}`} style={{ width: `${pct}%` }} />
-        </div>
-      )}
-      {note && <p className="text-ink-faint text-micro mt-2">{note}</p>}
+      </p>
     </div>
   );
 }
 
-/**
- * `useSearchParams()` forces a client-side bailout, and Next refuses to
- * statically prerender a page that does so without a Suspense boundary — it
- * failed the production build outright ("useSearchParams() should be wrapped in
- * a suspense boundary"). The boundary lets the shell prerender and the
- * param-dependent part hydrate on the client.
- */
-export default function BillingPage() {
+const NOTE_TONE = {
+  accent: 'border-accent/40 bg-[color-mix(in_srgb,var(--color-accent)_8%,transparent)]',
+  flake: 'border-flake/40 bg-[color-mix(in_srgb,var(--color-flake)_8%,transparent)]',
+  fail: 'border-fail/40 bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)]',
+} as const;
+
+function Note({ tone, children }: { tone: keyof typeof NOTE_TONE; children: React.ReactNode }) {
   return (
-    <Suspense fallback={<main className="text-ink-faint p-10 text-body-sm">Loading…</main>}>
-      <BillingInner />
-    </Suspense>
+    <p
+      className={cn(
+        'text-body-sm mb-5 rounded-md border px-3 py-2 leading-relaxed',
+        NOTE_TONE[tone],
+      )}
+    >
+      {children}
+    </p>
+  );
+}
+
+/**
+ * The comparison, one column per plan, the one you are on in ink.
+ *
+ * A real `<table>` rather than the reference's CSS grid: five columns of plan
+ * limits IS tabular data, and the grid version gives a screen reader five
+ * unrelated runs of text with no idea which number belongs to which plan.
+ *
+ * The `Monthly` row is the one addition to the design. The reference had three
+ * columns and put the price only in the serif headline, which works when the
+ * reader already knows what the other two cost — nobody does, and a comparison
+ * table you cannot decide from is decoration.
+ */
+function PlanTable({
+  billing,
+  busy,
+  onCheckout,
+}: {
+  billing: Billing;
+  busy: string | null;
+  onCheckout: (plan: string) => void;
+}) {
+  const cell = 'px-3.5 py-2.5 text-left align-baseline';
+
+  return (
+    <div className="border-line mt-[22px] overflow-x-auto rounded-lg border">
+      <table className="text-row-sub w-full min-w-[560px] table-fixed border-collapse">
+        <colgroup>
+          <col className="w-[24%]" />
+          {billing.catalogue.map((row) => (
+            <col key={row.plan} />
+          ))}
+        </colgroup>
+        <thead>
+          <tr className="border-line border-b">
+            <th className={cell}>
+              <span className="sr-only">Limit</span>
+            </th>
+            {billing.catalogue.map((row) => {
+              const current = row.plan === billing.plan;
+              return (
+                <th
+                  key={row.plan}
+                  scope="col"
+                  aria-current={current ? 'true' : undefined}
+                  className={cn(
+                    cell,
+                    'text-meta font-mono font-normal tracking-[0.08em] uppercase',
+                    current ? 'text-ink' : 'text-ink-faint',
+                  )}
+                >
+                  {current ? `${row.label} · now` : row.label}
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          <Row label="Monthly" cell={cell}>
+            {billing.catalogue.map((row) => (
+              <td key={row.plan} className={cn(cell, 'tabular-nums')}>
+                {priceLabel(row.monthlyPriceUsd)}
+              </td>
+            ))}
+          </Row>
+          <Row label="Runs / month" cell={cell}>
+            {billing.catalogue.map((row) => (
+              <td key={row.plan} className={cn(cell, 'tabular-nums')}>
+                {uncapped(row.maxRunsPerMonth) ? 'unlimited' : count(row.maxRunsPerMonth as number)}
+              </td>
+            ))}
+          </Row>
+          <Row label="Parallel workers" cell={cell}>
+            {billing.catalogue.map((row) => (
+              <td key={row.plan} className={cn(cell, 'tabular-nums')}>
+                {row.maxParallelWorkers}
+              </td>
+            ))}
+          </Row>
+          <Row label="Artifact retention" cell={cell}>
+            {billing.catalogue.map((row) => (
+              <td key={row.plan} className={cn(cell, 'tabular-nums')}>
+                {row.artifactRetentionDays} days
+              </td>
+            ))}
+          </Row>
+          <Row label="SSO · audit export" cell={cell}>
+            {billing.catalogue.map((row) => (
+              <td
+                key={row.plan}
+                className={cn(
+                  cell,
+                  row.sso && row.auditLog
+                    ? 'text-pass'
+                    : row.sso || row.auditLog
+                      ? undefined
+                      : 'text-ink-faint',
+                )}
+              >
+                {row.sso && row.auditLog
+                  ? 'both'
+                  : row.auditLog
+                    ? 'audit only'
+                    : row.sso
+                      ? 'SSO only'
+                      : '—'}
+              </td>
+            ))}
+          </Row>
+          <tr>
+            <td className={cell} />
+            {billing.catalogue.map((row) => {
+              const current = row.plan === billing.plan;
+              return (
+                <td key={row.plan} className={cn(cell, 'text-ink-faint text-[12px]')}>
+                  {current ? (
+                    'current'
+                  ) : row.purchasable ? (
+                    <button
+                      type="button"
+                      onClick={() => onCheckout(row.plan)}
+                      disabled={busy !== null}
+                      className="text-accent hover:underline disabled:opacity-50"
+                    >
+                      {busy === row.plan ? 'starting…' : 'upgrade →'}
+                    </button>
+                  ) : row.monthlyPriceUsd === null ? (
+                    <a href="mailto:sales@qaai.dev" className="text-accent hover:underline">
+                      contact →
+                    </a>
+                  ) : (
+                    '—'
+                  )}
+                </td>
+              );
+            })}
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Row({
+  label,
+  cell,
+  children,
+}: {
+  label: string;
+  cell: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <tr className="border-line border-b">
+      <th scope="row" className={cn(cell, 'text-ink-dim font-normal')}>
+        {label}
+      </th>
+      {children}
+    </tr>
   );
 }

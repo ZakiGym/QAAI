@@ -60,15 +60,30 @@ test.describe('the runs list', () => {
 
     await page.goto('/runs');
 
-    await expect(page.getByRole('heading', { name: project.name })).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Recent runs' })).toBeVisible();
+    /*
+     * The project's tile lives in the FLEET band now (a selectable button, not
+     * a heading), and "Recent runs" became RUN LOG. Same three claims as ever:
+     * the app is on screen, the log is on screen, and every run is a link to
+     * its own cockpit.
+     */
+    /*
+     * Scoped to the FLEET section: the sidebar's project switcher also carries
+     * the project's name, and an unscoped role query matches both.
+     */
+    const fleet = page.locator('section', { has: page.getByRole('heading', { name: 'Fleet' }) });
+    await expect(
+      fleet.getByRole('button', { name: new RegExp(escapeRe(project.name)) }),
+    ).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Run log' })).toBeVisible();
 
-    // Runs are links to their own cockpit — that is what makes the list usable.
-    await expect(page.getByRole('link', { name: /passed|failed|flaky/ }).first()).toBeVisible();
+    // Row text is now FAIL/PASS status words, so the cockpit links are matched
+    // by where they go rather than by prose that no longer exists.
+    await expect(page.locator('a[href^="/runs/"]').first()).toBeVisible();
   });
 
   test('the Failed filter narrows the list to the runs that failed', async ({ page, api }) => {
-    const runs = await recentRuns(api, 25);
+    // 100, matching the page's own fetch — the log grew from 25 with the merge.
+    const runs = await recentRuns(api, 100);
     const failed = runs.filter((run) => run.status === 'FAILED' || run.status === 'ERRORED');
     test.skip(
       failed.length === 0 || failed.length === runs.length,
@@ -76,14 +91,15 @@ test.describe('the runs list', () => {
     );
 
     await page.goto('/runs');
-    const rows = page.getByRole('link', { name: /passed|failed|flaky/ });
+    const rows = page.locator('a[href^="/runs/"]');
     await expect(rows).toHaveCount(runs.length);
 
-    await page.getByRole('button', { name: `Failed ${failed.length}` }).click();
+    // Filter chips are lowercase mono now — `fail 64` — with the count inside.
+    await page.getByRole('button', { name: `fail ${failed.length}` }).click();
 
     // The user-visible outcome: fewer rows, and the button reads as pressed.
     await expect(rows).toHaveCount(failed.length);
-    await expect(page.getByRole('button', { name: `Failed ${failed.length}` })).toHaveAttribute(
+    await expect(page.getByRole('button', { name: `fail ${failed.length}` })).toHaveAttribute(
       'aria-pressed',
       'true',
     );
@@ -100,11 +116,12 @@ test.describe('the runs list', () => {
    * reaches it, so the test finds one instead of assuming which.
    */
   test('a filter that matches nothing offers the way back', async ({ page, api }) => {
-    const runs = await recentRuns(api, 25);
+    const runs = await recentRuns(api, 100);
+    // The chips renamed with the redesign: fail / pass / live, lowercase mono.
     const counts = {
-      Failed: runs.filter((r) => r.status === 'FAILED' || r.status === 'ERRORED').length,
-      Passed: runs.filter((r) => r.status === 'PASSED').length,
-      Running: runs.filter((r) => r.status === 'RUNNING' || r.status === 'QUEUED').length,
+      fail: runs.filter((r) => r.status === 'FAILED' || r.status === 'ERRORED').length,
+      pass: runs.filter((r) => r.status === 'PASSED').length,
+      live: runs.filter((r) => r.status === 'RUNNING' || r.status === 'QUEUED').length,
     };
     const empty = Object.entries(counts).find(([, n]) => n === 0)?.[0];
     test.skip(
@@ -113,14 +130,14 @@ test.describe('the runs list', () => {
     );
 
     await page.goto('/runs');
-    await page.getByRole('button', { name: new RegExp(`^${empty}`) }).click();
+    await page.getByRole('button', { name: new RegExp(`^${empty} `) }).click();
 
     await expect(page.getByRole('heading', { name: 'Nothing with that status' })).toBeVisible();
     await page.getByRole('button', { name: 'Show all runs' }).click();
     await expect(page.getByRole('heading', { name: 'Nothing with that status' })).toHaveCount(0);
 
     // The way back actually went back — every run is on screen again.
-    await expect(page.getByRole('link', { name: /passed|failed|flaky/ })).toHaveCount(runs.length);
+    await expect(page.locator('a[href^="/runs/"]')).toHaveCount(runs.length);
   });
 });
 
@@ -140,32 +157,29 @@ test.describe('a project with no tests yet', () => {
     await page.goto('/runs');
 
     /*
-     * The deepest div holding BOTH this project's heading and a run trigger is
-     * its card. Filtering on the name alone lands on the heading row, which has
-     * the name and none of the controls — and the run triggers have to be scoped
-     * to this card, because the seeded project's are legitimately enabled.
+     * The redesign turned per-project run buttons into ONE `Run suite` button
+     * that acts on the SELECTED project, and projects into FLEET tiles. So the
+     * journey under test is now: find the empty project's tile, select it, and
+     * the page must close the trap — Run suite disabled, the plan offered.
      */
-    const card = page
-      .locator('div')
-      .filter({ has: page.getByRole('heading', { name: emptyProject.name, exact: true }) })
-      .filter({ has: page.getByRole('button', { name: /^▶ Run / }) })
-      .last();
-    await expect(card.getByRole('heading', { name: emptyProject.name })).toBeVisible();
+    const fleet = page.locator('section', { has: page.getByRole('heading', { name: 'Fleet' }) });
+    const tile = fleet.getByRole('button', { name: new RegExp(escapeRe(emptyProject.name)) });
+    await expect(tile).toBeVisible();
+    // The tile says out loud why there is no pass rate to show.
+    await expect(tile.getByText('no tests yet · plan not approved')).toBeVisible();
 
-    // The way forward, addressed to THIS project.
-    await expect(card.getByRole('link', { name: /Review the test plan/ })).toHaveAttribute(
-      'href',
-      `/projects/${emptyProject.id}/plan`,
-    );
+    await tile.click();
+    await expect(tile).toHaveAttribute('aria-pressed', 'true');
 
-    // And the trap is closed: every run trigger on this card is disabled, with
-    // the reason on the control rather than in a toast after the click.
-    const triggers = card.getByRole('button', { name: /^▶ Run / });
-    const count = await triggers.count();
-    expect(count, 'a new project should still show its environments').toBeGreaterThan(0);
-    for (let i = 0; i < count; i++) await expect(triggers.nth(i)).toBeDisabled();
+    // The trap is closed: the one run trigger on the page is disabled while
+    // this project is selected, not enabled-then-explained-in-a-toast.
+    await expect(page.getByRole('button', { name: 'Run suite' })).toBeDisabled();
 
-    await expect(card.getByText(/No tests yet, so there is nothing to run/)).toBeVisible();
+    // And the way forward is addressed to THIS project — on the tile and again
+    // beside the disabled button.
+    await expect(
+      page.getByRole('link', { name: /Review the test plan/ }).first(),
+    ).toHaveAttribute('href', `/projects/${emptyProject.id}/plan`);
   });
 
   test('the plan link lands somewhere that tells you what to do', async ({
@@ -209,7 +223,12 @@ test.describe('starting a run', () => {
 
     await page.goto('/runs');
 
-    const runButton = page.getByRole('button', { name: `▶ Run ${environment!.name}` });
+    /*
+     * Per-environment "▶ Run staging" buttons became one `Run suite` primary
+     * acting on the selected project. The claim is unchanged: press the
+     * trigger, land in the cockpit of the run you just queued.
+     */
+    const runButton = page.getByRole('button', { name: 'Run suite' });
     await expect(runButton).toBeEnabled();
     await runButton.click();
 
@@ -222,3 +241,8 @@ test.describe('starting a run', () => {
     await expect(page.getByRole('status').filter({ hasText: /Run queued/ })).toBeVisible();
   });
 });
+
+/** Test and project names are data — they can contain regex metacharacters. */
+function escapeRe(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

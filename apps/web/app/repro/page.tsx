@@ -15,70 +15,109 @@ import {
 import { duration } from '../../components/ui';
 import { useProject } from '../../components/shell/ProjectContext';
 import { ReproForm, type ReproRequest } from '../../components/ReproForm';
+import { TestsHeader } from '../../components/TestsHeader';
 import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { useToast } from '../../components/ui/Toast';
-import {
-  Badge,
-  Card,
-  Page,
-  PageHeader,
-  SectionLabel,
-  Skeleton,
-} from '../../components/ui/layout';
+import { Page, Skeleton } from '../../components/ui/layout';
+import { cn } from '../../lib/cn';
 
 /**
  * Test-from-bug-report (§10).
  *
- * The screen is the endpoint's pipeline in order, and the order is the argument:
+ * The right column is the endpoint's pipeline in order, and the order is the
+ * argument:
  *
- *   what was understood → what it matched → is it already covered →
- *   the proposed test → THE RUN RESULT
+ *   1 what was understood → 2 what it matched → 3 is it already covered →
+ *   4 THE RUN RESULT
  *
- * The first section exists because an agent that quietly misreads a ticket and
- * writes the wrong test is worse than one that asks. Everything in it is
- * deterministic — no model touched it — so it is worth showing on its own even
- * when generation cannot run at all.
+ * Step 1 exists because an agent that quietly misreads a ticket and writes the
+ * wrong test is worse than one that asks. Everything in it is deterministic —
+ * no model touched it — which is why the heading says so, and why it is worth
+ * showing even on a deployment where generation cannot run at all.
  *
- * The last section is the one the feature lives or dies by. A reproduction that
- * PASSES has reproduced nothing, and that case is rendered as loudly as a
- * failure, never as a success. The API also leaves such a test disabled; the
- * screen says so in the same breath, because "we wrote you a test" and "that
- * test proves your bug exists" are different claims and only one of them is
- * true here.
+ * Step 4 is the one the feature lives or dies by. A reproduction that PASSES
+ * has reproduced nothing, and that case is rendered as loudly as a failure,
+ * never as a success. The API also leaves such a test disabled; the screen says
+ * so in the same breath, because "we wrote you a test" and "that test proves
+ * your bug exists" are different claims and only one of them is true here.
  */
 
 const HOW_LABEL: Record<string, string> = {
-  EXACT: 'exact match',
-  PARAMETERISED: 'matched a parameterised route',
-  NORMALISED: 'matched after normalising ids',
+  EXACT: 'exact',
+  PARAMETERISED: 'parameterised',
+  NORMALISED: 'normalised',
   FUZZY: 'closest guess',
-  NONE: 'nothing in the crawl serves this',
+  NONE: 'no match',
 };
 
 const SECTION_LABEL: Record<string, string> = {
-  TITLE: 'Title',
-  STEPS: 'Steps',
-  EXPECTED: 'Expected',
-  ACTUAL: 'Actual',
-  ENVIRONMENT: 'Environment',
-  ERRORS: 'Errors',
-  DESCRIPTION: 'Description',
-  OTHER: 'Other',
+  TITLE: 'title',
+  STEPS: 'steps',
+  EXPECTED: 'expected',
+  ACTUAL: 'actual',
+  ENVIRONMENT: 'environment',
+  ERRORS: 'errors',
+  DESCRIPTION: 'description',
+  OTHER: 'other',
 };
 
+/** The shape the steps arrived in — worth naming, because it is what was parsed. */
 const STEPS_FORMAT: Record<string, string> = {
-  ORDERED: 'written as a numbered list',
-  STEP_N: 'written as "Step 1, Step 2…"',
-  GHERKIN: 'written as Given/When/Then',
-  BULLET: 'written as bullets',
-  INLINE: 'pulled out of a prose sentence',
-  LINES: 'taken one per line',
-  NONE: 'no steps were found at all',
+  ORDERED: 'ordered',
+  STEP_N: 'step n',
+  GHERKIN: 'gherkin',
+  BULLET: 'bullets',
+  INLINE: 'inline prose',
+  LINES: 'one per line',
+  NONE: 'none found',
 };
 
 /** The four sections a report needs to be transcribed rather than inferred. */
 const WANTED = ['STEPS', 'EXPECTED', 'ACTUAL', 'ENVIRONMENT'] as const;
+
+function Step({
+  n,
+  label,
+  aside,
+  children,
+}: {
+  n: number;
+  label: string;
+  aside?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className={n === 1 ? undefined : 'mt-[18px]'}>
+      <h3 className="text-meta text-ink-faint font-mono font-semibold tracking-[0.1em] uppercase">
+        {n} · {label}
+        {aside && <span className="text-ink-dim font-normal normal-case"> — {aside}</span>}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+function Chip({
+  tone = 'faint',
+  children,
+}: {
+  tone?: 'pass' | 'flake' | 'faint';
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      className={cn(
+        'border-line rounded-sm border px-2 py-[3px] font-mono text-[10.5px]',
+        tone === 'pass' && 'text-pass',
+        tone === 'flake' && 'text-flake',
+        tone === 'faint' && 'text-ink-faint',
+      )}
+    >
+      {children}
+    </span>
+  );
+}
 
 export default function ReproPage() {
   const router = useRouter();
@@ -134,136 +173,118 @@ export default function ReproPage() {
 
   if (projectsLoading) {
     return (
-      <Page width="wide">
-        <PageHeader title="Reproduce a bug" />
-        <Skeleton className="h-40 w-full" />
+      <Page width="full">
+        <TestsHeader />
+        <div className="mx-auto w-full max-w-[980px] px-10 pt-8">
+          <Skeleton className="h-56 w-full" />
+        </div>
       </Page>
     );
   }
 
   if (!project) {
     return (
-      <Page width="wide">
-        <PageHeader title="Reproduce a bug" />
-        <EmptyState
-          title="A test written from a bug report, then run"
-          body={
-            projects.length === 0
-              ? 'Paste a ticket or drop in an issue URL and QAAI extracts the steps, writes a test against the crawl, runs it, and tells you whether it actually reproduced anything. It needs an app to run against first.'
-              : 'Choose an app in the switcher above — the report is matched against that app’s crawl and its existing tests.'
-          }
-          {...(projects.length === 0
-            ? { action: { label: 'Add an app', href: '/onboarding' } }
-            : {})}
-        />
+      <Page width="full">
+        <TestsHeader />
+        <div className="mx-auto w-full max-w-[760px] px-10 pt-10">
+          <EmptyState
+            title="A test written from a bug report, then run"
+            body={
+              projects.length === 0
+                ? 'Paste a ticket or drop in an issue URL and QAAI extracts the steps, writes a test against the crawl, runs it, and tells you whether it actually reproduced anything. It needs an app to run against first.'
+                : 'Choose an app in the sidebar — the report is matched against that app’s crawl and its existing tests.'
+            }
+            {...(projects.length === 0
+              ? { action: { label: 'Add an app', href: '/onboarding' } }
+              : {})}
+          />
+        </div>
       </Page>
     );
   }
 
+  const ran = result?.run?.result;
+
   return (
-    <Page width="wide">
-      <PageHeader
-        title="Reproduce a bug"
-        subtitle={`Paste a ticket, or point at a Jira, Linear or GitHub issue. QAAI shows what it understood, writes a test against ${project.name}, runs it, and says plainly whether the bug reproduced.`}
-      />
+    <Page width="full">
+      <TestsHeader />
 
-      <ReproForm project={project} busy={busy} onSubmit={(request) => void submit(request)} />
-
-      {busy && (
-        <div className="mt-10 space-y-3" role="status" aria-label="Reading the report">
-          <Skeleton className="h-40 w-full" />
-          <Skeleton className="h-24 w-full" />
-          <p className="text-ink-faint text-micro text-center tabular-nums">
-            Extracting, matching the crawl, checking for a test that already covers this — then
-            generating and running. {elapsed}s elapsed; a run is held for up to 90.
-          </p>
-        </div>
-      )}
-
-      {error && !busy && (
-        <div className="border-fail/50 bg-fail/10 mt-8 rounded-lg border p-4">
-          <p className="text-fail text-body-sm leading-relaxed">{error}</p>
-        </div>
-      )}
-
-      {result && !busy && (
-        <div className="mt-10 space-y-10">
-          <Understood extracted={result.extracted} source={result.source} />
-          <FlowMatch match={result.flowMatch} />
-
-          {result.duplicate && (
-            <Duplicate
-              duplicate={result.duplicate}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto grid w-full max-w-[980px] grid-cols-1 gap-8 px-10 pt-8 pb-16 lg:grid-cols-[minmax(260px,380px)_minmax(300px,1fr)]">
+          <div>
+            <ReproForm
+              project={project}
               busy={busy}
-              onForce={() =>
-                lastRequest && void submit({ ...lastRequest, force: true })
+              note={
+                ran ? (
+                  <span className="text-ink-faint font-mono text-[10.5px] tabular-nums">
+                    ran in {duration(ran.durationMs)}
+                  </span>
+                ) : busy ? (
+                  <span className="text-ink-faint font-mono text-[10.5px] tabular-nums">
+                    {elapsed}s · a run is held for up to 90
+                  </span>
+                ) : null
               }
+              onSubmit={(request) => void submit(request)}
             />
-          )}
+          </div>
 
-          <Proposed result={result} />
-          <RunResult result={result} />
-
-          {result.notes.length > 0 && (
-            <section>
-              <SectionLabel>Read before trusting this</SectionLabel>
-              <Card className="p-5">
-                <ul className="space-y-2">
-                  {result.notes.map((note) => (
-                    <li key={note} className="text-ink-dim text-body-sm leading-relaxed">
-                      {note}
-                    </li>
-                  ))}
-                </ul>
-              </Card>
-            </section>
-          )}
-
-          {result.duplicateCandidates.length > 0 && !result.duplicate && (
-            <section>
-              <SectionLabel>Tests that touch the same ground</SectionLabel>
-              <Card className="p-5">
-                <p className="text-ink-dim text-body-sm mb-3 leading-relaxed">
-                  None scored high enough to stop generation — the check fails open, because a
-                  redundant test is cheaper than a bug nobody reproduced.
+          <div>
+            {busy && (
+              <div className="space-y-3" role="status" aria-label="Reading the report">
+                <Skeleton className="h-24 w-full" />
+                <Skeleton className="h-16 w-full" />
+                <Skeleton className="h-28 w-full" />
+                <p className="text-ink-faint text-[11px] leading-relaxed">
+                  Extracting, matching the crawl, checking for a test that already covers this —
+                  then generating and running. Nothing above the run needed a model.
                 </p>
-                <ul className="space-y-2">
-                  {result.duplicateCandidates.map((candidate) => (
-                    <li key={candidate.testId} className="flex flex-wrap items-baseline gap-2">
-                      <Link
-                        href={`/tests/${candidate.testId}`}
-                        className="text-accent text-body-sm hover:underline"
-                      >
-                        {candidate.name}
-                      </Link>
-                      <span className="text-ink-faint text-micro tabular-nums">
-                        {Math.round(candidate.score * 100)}%
-                      </span>
-                      <span className="text-ink-dim text-micro">
-                        {candidate.reasons.join('; ')}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </Card>
-            </section>
-          )}
+              </div>
+            )}
+
+            {error && !busy && (
+              <div className="rounded-lg border border-[color-mix(in_srgb,var(--color-fail)_50%,transparent)] bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] p-4">
+                <p className="text-fail text-[13px] leading-relaxed">{error}</p>
+              </div>
+            )}
+
+            {!busy && !error && !result && (
+              <p className="text-ink-faint text-[12.5px] leading-relaxed">
+                The pipeline appears here: what was understood, what it matched in the crawl,
+                whether your suite already covers it, and — last, because it is the only claim that
+                counts — whether the test actually failed.
+              </p>
+            )}
+
+            {result && !busy && (
+              <>
+                <Understood extracted={result.extracted} source={result.source} />
+                <FlowMatch match={result.flowMatch} />
+                <AlreadyCovered
+                  duplicate={result.duplicate}
+                  candidates={result.duplicateCandidates}
+                  busy={busy}
+                  onForce={() => lastRequest && void submit({ ...lastRequest, force: true })}
+                />
+                {/* Keyed on the test: RunResult holds "have I enabled it yet",
+                    and a second report must not inherit the first one's answer. */}
+                <RunResult
+                  key={result.test?.id ?? 'no-test'}
+                  result={result}
+                  projectId={project.id}
+                />
+                <TheTest result={result} />
+              </>
+            )}
+          </div>
         </div>
-      )}
+      </div>
     </Page>
   );
 }
 
-// ─── 1. What was understood ──────────────────────────────────────────────────
-
-function KeyValue({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <p className="text-ink-faint text-micro">{label}</p>
-      <p className="text-ink text-body-sm">{value}</p>
-    </div>
-  );
-}
+// ─── 1 · UNDERSTOOD ──────────────────────────────────────────────────────────
 
 function Understood({
   extracted,
@@ -280,452 +301,428 @@ function Understood({
   );
 
   return (
-    <section>
-      <SectionLabel>What QAAI understood, before anything was generated</SectionLabel>
-      <Card className="p-5">
-        <div className="flex flex-wrap items-center gap-2">
-          {source.kind === 'ISSUE' ? (
-            <>
-              <Badge tone="accent">
-                {source.provider} {source.key}
-              </Badge>
-              <a
-                href={source.url}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="text-ink-faint text-micro hover:underline"
-              >
-                the original ticket
-              </a>
-              <span className="text-flake text-micro">
-                Third-party text QAAI did not author — read the steps below before running this
-                against anything that matters.
-              </span>
-            </>
-          ) : (
-            <Badge>Pasted report</Badge>
-          )}
-        </div>
+    <Step n={1} label="Understood" aside="deterministic, no model">
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {extracted.found.includes('STEPS') && (
+          <Chip tone="pass">
+            steps ✓ {STEPS_FORMAT[extracted.stepsFormat] ?? 'read'} ×{extracted.steps.length}
+          </Chip>
+        )}
+        {extracted.found
+          .filter((section) => section !== 'STEPS')
+          .map((section) => (
+            <Chip key={section} tone="pass">
+              {SECTION_LABEL[section] ?? section.toLowerCase()} ✓
+            </Chip>
+          ))}
+        {missing.map((section) => (
+          <Chip key={section}>{SECTION_LABEL[section]} — missing</Chip>
+        ))}
+        <Chip>structure {Math.round(extracted.structureScore * 100)}%</Chip>
+      </div>
 
-        <h3 className="mt-3 text-lg font-semibold tracking-tight">
-          {extracted.title ?? 'The report had no title line.'}
-        </h3>
+      {source.kind === 'ISSUE' && (
+        <p className="text-flake mt-2 text-[11.5px] leading-relaxed">
+          <a
+            href={source.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-accent hover:underline"
+          >
+            {source.provider} {source.key}
+          </a>{' '}
+          — third-party text QAAI did not author. Read the steps before running this against
+          anything that matters.
+        </p>
+      )}
 
-        <div className="mt-4">
-          <p className="text-ink-faint text-micro">
-            Steps — {STEPS_FORMAT[extracted.stepsFormat] ?? 'read from the report'}
+      <p className="mt-2.5 text-[13px] font-medium">
+        {extracted.title ?? 'The report had no title line.'}
+      </p>
+
+      {extracted.steps.length > 0 ? (
+        <ol className="mt-1.5 space-y-0.5">
+          {extracted.steps.map((step, i) => (
+            <li key={`${i}-${step}`} className="text-ink-dim flex gap-2 text-[12.5px]">
+              <span className="text-ink-faint font-mono text-[11px] tabular-nums">{i + 1}</span>
+              <span className="min-w-0 flex-1">{step}</span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="text-flake mt-1.5 text-[12.5px] leading-relaxed">
+          No steps were found, so the test below is inference rather than transcription.
+        </p>
+      )}
+
+      <div className="border-line mt-3 border-t pt-2.5 text-[12.5px] leading-relaxed">
+        <p className="text-ink-dim">
+          <span className="text-ink-faint font-mono text-[10.5px]">expected</span>{' '}
+          {extracted.expected ??
+            'not stated — it has to be derived from the actual by negation, which is a weaker test'}
+        </p>
+        <p className="text-ink-dim mt-1">
+          <span className="text-ink-faint font-mono text-[10.5px]">actual</span>{' '}
+          {extracted.actual ?? 'not stated'}
+        </p>
+        {envParts.length > 0 && (
+          <p className="text-ink-dim mt-1">
+            <span className="text-ink-faint font-mono text-[10.5px]">environment</span>{' '}
+            {envParts.join(' · ')}
           </p>
-          {extracted.steps.length > 0 ? (
-            <ol className="mt-1.5 space-y-1">
-              {extracted.steps.map((step, i) => (
-                <li key={`${i}-${step}`} className="text-ink text-body-sm flex gap-2.5">
-                  <span className="text-ink-faint tabular-nums">{i + 1}</span>
-                  <span className="min-w-0 flex-1">{step}</span>
-                </li>
-              ))}
-            </ol>
-          ) : (
-            <p className="text-flake text-body-sm mt-1.5">
-              No steps were found, so the test below is inference rather than transcription.
-            </p>
-          )}
-        </div>
-
-        <div className="mt-5 grid gap-4 sm:grid-cols-2">
-          <div className="border-line rounded-md border p-3.5">
-            <p className="text-ink-faint text-micro">Expected — this becomes the assertion</p>
-            <p className="text-ink text-body-sm mt-1 leading-relaxed">
-              {extracted.expected ?? 'Not stated. It has to be derived from the actual by negation, which is a weaker test.'}
-            </p>
-          </div>
-          <div className="border-line rounded-md border p-3.5">
-            <p className="text-ink-faint text-micro">Actual — context only, never asserted</p>
-            <p className="text-ink text-body-sm mt-1 leading-relaxed">
-              {extracted.actual ?? 'Not stated.'}
-            </p>
-          </div>
-        </div>
-        <p className="text-ink-faint text-micro mt-2 leading-relaxed">
+        )}
+        <p className="text-ink-faint mt-1.5 text-[11px] leading-relaxed">
           A test that asserts what the reporter SAW would pass against the broken app and prove
           nothing, so the assertion is always the expected behaviour.
         </p>
+      </div>
 
-        <div className="border-line mt-5 grid grid-cols-2 gap-4 border-t pt-4 sm:grid-cols-4">
-          <KeyValue
-            label="Structure"
-            value={`${Math.round(extracted.structureScore * 100)}%`}
-          />
-          <KeyValue
-            label="Environment"
-            value={envParts.length > 0 ? envParts.join(' · ') : 'not stated'}
-          />
-          <KeyValue
-            label="Routes named"
-            value={
-              extracted.paths.length + extracted.urls.length > 0
-                ? [...extracted.paths, ...extracted.urls].join(' ')
-                : 'none'
-            }
-          />
-          <KeyValue
-            label="Selectors named"
-            value={extracted.selectors.length > 0 ? extracted.selectors.join(' ') : 'none'}
-          />
-        </div>
+      {thin && (
+        <p className="text-flake mt-2 text-[11px] leading-relaxed">
+          This report gave up very little structure, so most of the test is inference rather than
+          transcription. Check the steps before you trust a failure.
+        </p>
+      )}
 
-        <div className="mt-4 flex flex-wrap gap-1.5">
-          {extracted.found.map((section) => (
-            <Badge key={section} tone="pass">
-              {SECTION_LABEL[section] ?? section}
-            </Badge>
-          ))}
-          {missing.map((section) => (
-            <Badge key={section}>{SECTION_LABEL[section]} missing</Badge>
-          ))}
-        </div>
-
-        {thin && (
-          <p className="text-flake text-micro mt-3 leading-relaxed">
-            This report gave up very little structure, so most of the test below is inference
-            rather than transcription. Check the steps before you trust a failure.
+      {extracted.errorStrings.length > 0 && (
+        <div className="mt-2.5">
+          <p className="text-ink-faint font-mono text-[10.5px]">
+            errors the report named — the run&rsquo;s own failure is held against these
           </p>
-        )}
-
-        {extracted.errorStrings.length > 0 && (
-          <div className="border-line mt-4 border-t pt-4">
-            <p className="text-ink text-body-sm font-medium">
-              Errors the report named — the run&rsquo;s own failure is held against these
-            </p>
-            <ul className="mt-1.5 space-y-1">
-              {extracted.errorStrings.map((message) => (
-                <li key={message} className="text-ink-dim font-mono text-micro break-words">
-                  {message}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-
-        {extracted.codeBlocks.length > 0 && (
-          <div className="border-line mt-4 border-t pt-4">
-            <p className="text-ink text-body-sm font-medium">Pasted blocks</p>
-            {extracted.codeBlocks.map((block, i) => (
-              <pre
-                key={i}
-                className="border-line bg-surface-2 text-ink-dim text-micro mt-2 max-h-48 overflow-auto rounded-md border p-3 font-mono whitespace-pre-wrap"
-              >
-                {block}
-              </pre>
+          <ul className="mt-1 space-y-0.5">
+            {extracted.errorStrings.map((message) => (
+              <li key={message} className="text-ink-dim font-mono text-[11px] break-words">
+                {message}
+              </li>
             ))}
-          </div>
-        )}
-      </Card>
-    </section>
+          </ul>
+        </div>
+      )}
+
+      {extracted.codeBlocks.length > 0 && (
+        <div className="mt-2.5">
+          <p className="text-ink-faint font-mono text-[10.5px]">pasted blocks</p>
+          {extracted.codeBlocks.map((block, i) => (
+            <pre
+              key={i}
+              className="border-line bg-surface-2 text-ink-dim mt-1 max-h-40 overflow-auto rounded-md border p-2.5 font-mono text-[11px] whitespace-pre-wrap"
+            >
+              {block}
+            </pre>
+          ))}
+        </div>
+      )}
+    </Step>
   );
 }
 
-// ─── 2. What it matched in the crawl ─────────────────────────────────────────
+// ─── 2 · MATCHED THE CRAWL ───────────────────────────────────────────────────
 
 function FlowMatch({ match }: { match: ReproFlowMatch }) {
   return (
-    <section>
-      <SectionLabel>Where the test starts</SectionLabel>
-      <Card className="p-5">
-        <p className="text-ink text-body-sm">
-          {match.startRoute ? (
-            <>
-              The reproduction opens at{' '}
-              <code className="text-accent font-mono">{match.startRoute}</code>
-              {match.feature ? ` in ${match.feature}.` : '.'}
-            </>
-          ) : (
-            'No route in the report matched the crawl, so the test starts at the environment’s base URL.'
-          )}
+    <Step n={2} label="Matched the crawl">
+      {match.matches.length > 0 ? (
+        <p className="text-ink-dim mt-2 text-[12.5px] leading-relaxed">
+          {match.matches.map((route, i) => (
+            <span key={route.reported}>
+              {i > 0 && ' · '}
+              <span className={cn('font-mono text-[11px]', route.route ? 'text-ink' : 'text-fail')}>
+                {route.route ?? route.reported}
+              </span>{' '}
+              {HOW_LABEL[route.how] ?? route.how.toLowerCase()}
+              {route.offEnvironment && <span className="text-flake"> · another origin</span>}
+            </span>
+          ))}
         </p>
+      ) : (
+        <p className="text-ink-dim mt-2 text-[12.5px] leading-relaxed">
+          No route in the report matched the crawl, so the test starts at the environment&rsquo;s
+          base URL.
+        </p>
+      )}
 
-        {match.matches.length > 0 && (
-          <ul className="mt-3 space-y-1.5">
-            {match.matches.map((route) => (
-              <li key={route.reported} className="flex flex-wrap items-baseline gap-2">
-                <code className="text-ink font-mono text-micro">{route.reported}</code>
-                <span className="text-ink-faint text-micro">→</span>
-                <code
-                  className={`font-mono text-micro ${route.route ? 'text-accent' : 'text-fail'}`}
-                >
-                  {route.route ?? 'no match'}
-                </code>
-                <span className="text-ink-faint text-micro">
-                  {HOW_LABEL[route.how] ?? route.how.toLowerCase()}
-                </span>
-                {route.offEnvironment && (
-                  <Badge tone="flake">points at another origin</Badge>
-                )}
-              </li>
-            ))}
-          </ul>
-        )}
+      {match.startRoute && (
+        <p className="text-ink-faint mt-1 text-[11.5px]">
+          the reproduction opens at <span className="text-accent font-mono">{match.startRoute}</span>
+          {match.feature ? ` in ${match.feature}` : ''}
+        </p>
+      )}
 
-        {match.warnings.length > 0 && (
-          <ul className="border-line mt-4 space-y-1.5 border-t pt-4">
-            {match.warnings.map((warning) => (
-              <li key={warning} className="text-flake text-micro leading-relaxed">
-                {warning}
-              </li>
-            ))}
-          </ul>
-        )}
-      </Card>
-    </section>
+      {match.warnings.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5">
+          {match.warnings.map((warning) => (
+            <li key={warning} className="text-flake text-[11px] leading-relaxed">
+              {warning}
+            </li>
+          ))}
+        </ul>
+      )}
+    </Step>
   );
 }
 
-// ─── 3. Already covered ──────────────────────────────────────────────────────
+// ─── 3 · ALREADY COVERED? ────────────────────────────────────────────────────
 
-function Duplicate({
+function AlreadyCovered({
   duplicate,
+  candidates,
   busy,
   onForce,
 }: {
-  duplicate: ReproDuplicate;
+  duplicate: ReproDuplicate | null;
+  candidates: ReproDuplicate[];
   busy: boolean;
   onForce: () => void;
 }) {
+  const closest = duplicate ?? candidates[0] ?? null;
+
   return (
-    <section>
-      <SectionLabel>This bug already has a test</SectionLabel>
-      <Card className="border-accent/50 p-5">
-        <p className="text-ink text-body-sm">
-          <Link href={`/tests/${duplicate.testId}`} className="text-accent hover:underline">
-            {duplicate.name}
-          </Link>{' '}
-          <span className="text-ink-faint font-mono text-micro">{duplicate.filePath}</span>
+    <Step n={3} label="Already covered?">
+      {!closest ? (
+        <p className="text-ink-dim mt-2 text-[12.5px] leading-relaxed">
+          Nothing in your suite touches the same ground.
         </p>
-        <p className="text-ink-dim text-body-sm mt-2 leading-relaxed">
-          {duplicate.reasons.join('; ')}. No second test was written — a duplicate needs both a
-          score over the threshold and two independent reasons, and this cleared both.
+      ) : (
+        <p className="text-ink-dim mt-2 text-[12.5px] leading-relaxed">
+          Closest: <span className="text-ink">&ldquo;{closest.name}&rdquo;</span> —{' '}
+          <span className="tabular-nums">{Math.round(closest.score * 100)}%</span> similar.{' '}
+          <span className="text-ink-faint">
+            {duplicate
+              ? `${duplicate.reasons.join('; ')}. No second test was written — a duplicate needs both a score over the threshold and two independent reasons, and this cleared both.`
+              : 'Not a duplicate; the check fails open, because a redundant test is cheaper than a bug nobody reproduced.'}
+          </span>
         </p>
-        <div className="mt-4 flex items-center gap-3">
-          <Button loading={busy} onClick={onForce}>
+      )}
+
+      {duplicate && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2.5">
+          <Button size="sm" loading={busy} onClick={onForce}>
             Write one anyway
           </Button>
-          <span className="text-ink-faint text-micro">
+          <span className="text-ink-faint text-[11px]">
             Sends the same report again with the duplicate check overridden.
           </span>
         </div>
-      </Card>
-    </section>
+      )}
+
+      {candidates.length > 1 && !duplicate && (
+        <ul className="mt-1.5 space-y-0.5">
+          {candidates.slice(1, 4).map((candidate) => (
+            <li key={candidate.testId} className="text-ink-faint text-[11px]">
+              <Link href={`/tests/${candidate.testId}`} className="text-accent hover:underline">
+                {candidate.name}
+              </Link>{' '}
+              <span className="tabular-nums">{Math.round(candidate.score * 100)}%</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Step>
   );
 }
 
-// ─── 4. The proposed test ────────────────────────────────────────────────────
+// ─── 4 · THE RUN RESULT, which is the whole point ────────────────────────────
 
-function Proposed({ result }: { result: ReproResponse }) {
-  const { planItem, test, generation } = result;
-
-  return (
-    <section>
-      <SectionLabel>The proposed test</SectionLabel>
-      <Card className="p-5">
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge tone="accent">{planItem.testType}</Badge>
-          <Badge>{planItem.priority.toLowerCase().replace(/_/g, ' ')}</Badge>
-          {planItem.feature && <Badge>{planItem.feature}</Badge>}
-        </div>
-        <h3 className="mt-2.5 text-base font-medium">{planItem.title}</h3>
-        <p className="text-ink-dim text-body-sm mt-1.5 leading-relaxed">{planItem.rationale}</p>
-
-        <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          <div>
-            <p className="text-ink-faint text-micro">Steps it will drive</p>
-            <ol className="mt-1.5 space-y-1">
-              {planItem.steps.map((step, i) => (
-                <li key={`${i}-${step}`} className="text-ink text-body-sm flex gap-2.5">
-                  <span className="text-ink-faint tabular-nums">{i + 1}</span>
-                  <span className="min-w-0 flex-1">{step}</span>
-                </li>
-              ))}
-            </ol>
-          </div>
-          <div>
-            <p className="text-ink-faint text-micro">What it asserts</p>
-            <ul className="mt-1.5 space-y-1.5">
-              {planItem.assertions.map((assertion) => (
-                <li key={assertion} className="text-ink text-body-sm leading-relaxed">
-                  {assertion}
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-
-        {/* A missing model is information, not a failure: everything above this
-            line was derived from the report and the crawl without one. */}
-        {generation?.skipped && (
-          <div className="border-line bg-surface-2 mt-5 rounded-md border p-3.5">
-            <p className="text-ink text-body-sm font-medium">No code was written</p>
-            <p className="text-ink-dim text-body-sm mt-1 leading-relaxed">
-              {generation.reason === 'ANTHROPIC_API_KEY is not set' ? (
-                <>
-                  This deployment has no model configured
-                  (<code className="font-mono">ANTHROPIC_API_KEY</code> is unset), so the plan
-                  above is as far as it goes. Everything in it — the steps, the assertions, the
-                  start route, the duplicate check — was derived from your report and your
-                  crawl, not generated, and stays true once a key is set.
-                </>
-              ) : (
-                <>
-                  {generation.reason}. The plan above is deterministic and stands on its own.
-                </>
-              )}
-            </p>
-          </div>
-        )}
-
-        {test && (
-          <div className="border-line mt-5 border-t pt-4">
-            <div className="flex flex-wrap items-baseline justify-between gap-2">
-              <p className="text-ink text-body-sm font-medium">{test.name}</p>
-              <code className="text-ink-faint font-mono text-micro">{test.filePath}</code>
-            </div>
-            {test.reviewFlags.length > 0 && (
-              <ul className="mt-2.5 space-y-1.5">
-                {test.reviewFlags.map((flag) => (
-                  <li key={flag} className="text-flake text-micro leading-relaxed">
-                    {flag}
-                  </li>
-                ))}
-              </ul>
-            )}
-            <pre className="border-line bg-surface-2 text-ink-dim text-micro mt-3 max-h-80 overflow-auto rounded-md border p-3 font-mono">
-              {test.code}
-            </pre>
-            <Link
-              href={`/tests/${test.id}`}
-              className="text-accent text-micro mt-2.5 inline-block font-medium hover:underline"
-            >
-              Open the test →
-            </Link>
-          </div>
-        )}
-      </Card>
-    </section>
-  );
-}
-
-// ─── 5. The run result, which is the whole point ─────────────────────────────
-
-const VERDICT_STYLE: Record<
-  ReproVerdict['outcome'],
-  { wrap: string; text: string; label: string }
-> = {
-  REPRODUCED: {
-    wrap: 'border-pass/50 bg-pass/10',
-    text: 'text-pass',
-    label: 'Reproduced',
-  },
+const VERDICT_STYLE: Record<ReproVerdict['outcome'], string> = {
+  REPRODUCED:
+    'border-[color-mix(in_srgb,var(--color-pass)_35%,transparent)] bg-[color-mix(in_srgb,var(--color-pass)_7%,transparent)]',
   // Loud. A green reproduction is the failure mode this whole screen exists to
-  // prevent someone from misreading as a success.
-  NOT_REPRODUCED: {
-    wrap: 'border-fail/60 bg-fail/10',
-    text: 'text-fail',
-    label: 'Not reproduced',
-  },
-  INCONCLUSIVE: {
-    wrap: 'border-flake/50 bg-flake/10',
-    text: 'text-flake',
-    label: 'Inconclusive',
-  },
+  // stop someone misreading as a success.
+  NOT_REPRODUCED:
+    'border-[color-mix(in_srgb,var(--color-fail)_45%,transparent)] bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)]',
+  INCONCLUSIVE:
+    'border-[color-mix(in_srgb,var(--color-flake)_40%,transparent)] bg-[color-mix(in_srgb,var(--color-flake)_8%,transparent)]',
 };
 
-function RunResult({ result }: { result: ReproResponse }) {
+function RunResult({ result, projectId }: { result: ReproResponse; projectId: string }) {
   const { reproduction, run, test } = result;
+  const router = useRouter();
+  const [enabling, setEnabling] = useState(false);
+  const [enabled, setEnabled] = useState(test?.enabled ?? false);
+  const [enableError, setEnableError] = useState<string | null>(null);
+
+  /** The soft-delete restore endpoint IS "enable" — a disabled test is one with `disabledAt` set. */
+  async function enable() {
+    if (!test || enabling) return;
+    setEnabling(true);
+    setEnableError(null);
+    try {
+      await api(`/projects/${projectId}/tests/${test.id}/restore`, { method: 'POST' });
+      setEnabled(true);
+    } catch (err) {
+      setEnableError(err instanceof Error ? err.message : 'Could not enable that test');
+    } finally {
+      setEnabling(false);
+    }
+  }
 
   if (!reproduction) {
     return (
-      <section>
-        <SectionLabel>Did it reproduce?</SectionLabel>
-        <Card className="border-flake/40 p-5">
-          <p className="text-flake text-body-sm font-medium">Nothing has been reproduced.</p>
-          <p className="text-ink-dim text-body-sm mt-1.5 leading-relaxed">
-            No test was written, so none was run. A bug report is only reproduced once a test
-            built from it has been watched to fail against the app.
+      <Step n={4} label="The run result">
+        <div className="mt-2 rounded-lg border border-[color-mix(in_srgb,var(--color-flake)_40%,transparent)] bg-[color-mix(in_srgb,var(--color-flake)_8%,transparent)] px-3.5 py-3">
+          <p className="text-[13.5px] font-semibold">Nothing has been reproduced.</p>
+          <p className="text-ink-dim mt-1.5 text-[12px] leading-relaxed">
+            No test was written, so none was run. A bug report is only reproduced once a test built
+            from it has been watched to fail against the app.
           </p>
-        </Card>
-      </section>
+        </div>
+      </Step>
     );
   }
 
-  const style = VERDICT_STYLE[reproduction.outcome];
-
   return (
-    <section>
-      <SectionLabel>Did it reproduce?</SectionLabel>
-      <div className={`rounded-lg border p-5 ${style.wrap}`}>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className={`text-body-sm font-semibold tracking-wide uppercase ${style.text}`}>
-            {style.label}
-          </span>
-          {reproduction.confirmed && <Badge tone="pass">failed for the reported reason</Badge>}
-          {run?.result && (
-            <span className="text-ink-dim text-micro tabular-nums">
-              run status {run.result.status.toLowerCase()} · {duration(run.result.durationMs)}
-            </span>
-          )}
-        </div>
-
-        <p className={`mt-2 text-lg leading-snug font-semibold ${style.text}`}>
-          {reproduction.headline}
-        </p>
-        <p className="text-ink-dim text-body-sm mt-2 max-w-3xl leading-relaxed">
+    <Step n={4} label="The run result">
+      <div className={cn('mt-2 rounded-lg border px-3.5 py-3', VERDICT_STYLE[reproduction.outcome])}>
+        <p className="text-[13.5px] leading-snug font-semibold">{reproduction.headline}</p>
+        <p className="text-ink-dim mt-1.5 text-[12px] leading-relaxed">
           {reproduction.detail}
+          {test && !enabled && (
+            <>
+              {' '}
+              It stays <span className="text-flake">disabled</span> until you enable it — a repro
+              that PASSES has reproduced nothing, and would gate on nothing.
+            </>
+          )}
+          {test && enabled && (
+            <>
+              {' '}
+              It is <span className="text-pass">enabled</span> and part of the suite — it was
+              allowed in because it was seen to fail.
+            </>
+          )}
         </p>
 
         {reproduction.matchedReportedError && (
-          <p className="text-ink-dim text-micro mt-3 font-mono break-words">
+          <p className="text-ink-dim mt-2 font-mono text-[11px] break-words">
             matched: {reproduction.matchedReportedError}
           </p>
         )}
 
         {run?.result?.errorMessage && (
-          <pre className="border-line bg-surface-2 text-ink-dim text-micro mt-3 max-h-48 overflow-auto rounded-md border p-3 font-mono whitespace-pre-wrap">
+          <pre className="border-line bg-surface-2 text-ink-dim mt-2 max-h-40 overflow-auto rounded-md border p-2.5 font-mono text-[11px] whitespace-pre-wrap">
             {run.result.errorMessage}
           </pre>
         )}
 
-        {test && (
-          <p className="text-ink-dim text-body-sm mt-4">
-            {test.enabled ? (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          {test && !enabled && (
+            <Button variant="primary" size="sm" loading={enabling} onClick={() => void enable()}>
+              Save &amp; enable
+            </Button>
+          )}
+          {test && (
+            <Button size="sm" onClick={() => router.push(`/editor?test=${test.id}`)}>
+              Open in editor
+            </Button>
+          )}
+          {run && (
+            <Link href={`/runs/${run.id}`} className="text-accent text-[11.5px] hover:underline">
+              open the run →
+            </Link>
+          )}
+          {run && !run.finished && (
+            <span className="text-flake text-[11px] tabular-nums">
+              Still running after {Math.round(run.waitedMs / 1000)}s — until it finishes, nothing is
+              known either way.
+            </span>
+          )}
+        </div>
+
+        {enableError && <p className="text-fail mt-2 text-[11px]">{enableError}</p>}
+      </div>
+    </Step>
+  );
+}
+
+// ─── The test it wrote ───────────────────────────────────────────────────────
+
+function TheTest({ result }: { result: ReproResponse }) {
+  const { planItem, test, generation, notes } = result;
+
+  return (
+    <section className="border-line mt-6 border-t pt-4">
+      <h3 className="text-meta text-ink-faint font-mono font-semibold tracking-[0.1em] uppercase">
+        The test it wrote
+      </h3>
+
+      <p className="mt-2 text-[13px] font-medium">{planItem.title}</p>
+      <p className="text-ink-dim mt-1 text-[12px] leading-relaxed">{planItem.rationale}</p>
+
+      <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+        <div>
+          <p className="text-ink-faint font-mono text-[10.5px]">steps it will drive</p>
+          <ol className="mt-1 space-y-0.5">
+            {planItem.steps.map((step, i) => (
+              <li key={`${i}-${step}`} className="text-ink-dim flex gap-2 text-[12px]">
+                <span className="text-ink-faint font-mono text-[10.5px] tabular-nums">{i + 1}</span>
+                <span className="min-w-0 flex-1">{step}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
+        <div>
+          <p className="text-ink-faint font-mono text-[10.5px]">what it asserts</p>
+          <ul className="mt-1 space-y-1">
+            {planItem.assertions.map((assertion) => (
+              <li key={assertion} className="text-ink-dim text-[12px] leading-relaxed">
+                {assertion}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+
+      {/* A missing model is information, not a failure: everything above this
+          line was derived from the report and the crawl without one. */}
+      {generation?.skipped && (
+        <div className="border-line bg-surface-2 mt-3 rounded-md border p-3">
+          <p className="text-[12.5px] font-medium">No code was written</p>
+          <p className="text-ink-dim mt-1 text-[12px] leading-relaxed">
+            {generation.reason === 'ANTHROPIC_API_KEY is not set' ? (
               <>
-                The test is <span className="text-pass font-medium">enabled</span> and now part
-                of the suite — it was allowed in because it was seen to fail.
+                This deployment has no model configured (
+                <code className="font-mono">ANTHROPIC_API_KEY</code> is unset), so the plan above is
+                as far as it goes. Everything in it — the steps, the assertions, the start route, the
+                duplicate check — was derived from your report and your crawl, not generated, and
+                stays true once a key is set.
               </>
             ) : (
-              <>
-                The test was left <span className="text-fail font-medium">disabled</span>. A
-                reproduction nobody has seen fail is not allowed to join the suite that gates a
-                merge, where it would sit green and tell every reader the bug is covered.
-              </>
+              <>{generation.reason}. The plan above is deterministic and stands on its own.</>
             )}
           </p>
-        )}
+        </div>
+      )}
 
-        {run && (
-          <div className="mt-4 flex flex-wrap items-center gap-3">
-            <Link
-              href={`/runs/${run.id}`}
-              className="text-accent text-micro font-medium hover:underline"
-            >
-              Open the run →
-            </Link>
-            {!run.finished && (
-              <span className="text-flake text-micro tabular-nums">
-                Still running after {Math.round(run.waitedMs / 1000)}s — until it finishes,
-                nothing is known either way.
-              </span>
-            )}
-          </div>
-        )}
-      </div>
+      {test && (
+        <div className="mt-3">
+          <p className="text-ink-faint font-mono text-[10.5px]">{test.filePath}</p>
+          {test.reviewFlags.length > 0 && (
+            <ul className="mt-1.5 space-y-1">
+              {test.reviewFlags.map((flag) => (
+                <li key={flag} className="text-flake text-[11px] leading-relaxed">
+                  {flag}
+                </li>
+              ))}
+            </ul>
+          )}
+          <pre className="border-line bg-surface-2 text-ink-dim mt-2 max-h-72 overflow-auto rounded-md border p-3 font-mono text-[11px]">
+            {test.code}
+          </pre>
+        </div>
+      )}
+
+      {notes.length > 0 && (
+        <div className="mt-3">
+          <p className="text-ink-faint font-mono text-[10.5px]">read before trusting this</p>
+          <ul className="mt-1 space-y-1">
+            {notes.map((note) => (
+              <li key={note} className="text-ink-dim text-[12px] leading-relaxed">
+                {note}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </section>
   );
 }
