@@ -97,16 +97,19 @@ const KNOWN_GAPS: KnownGap[] = [
     check: 'prisma-models',
     what: 'OAuthAccount',
     why: 'No OAuth sign-in exists. Nothing reads or writes this table; the GOOGLE_/GITHUB_OAUTH_* env vars that would have fed it are gone (this pass removed them from .env.example).',
-    remediation:
-      'Either implement OAuth sign-in on authRouter, or drop the model in a migration together with VerificationToken.',
+    remediation: 'Either implement OAuth sign-in on authRouter, or drop the model in a migration.',
   },
-  {
-    check: 'prisma-models',
-    what: 'VerificationToken',
-    why: 'Email verification and password reset were never built. auth.ts issues sessions from a password only; nothing writes a token row.',
-    remediation:
-      'Either build the verify/reset flows on authRouter, or drop the model in a migration.',
-  },
+  /*
+   * VerificationToken was here. It said "Email verification and password reset
+   * were never built … nothing writes a token row", and that is no longer true:
+   * POST /auth/password/forgot writes one and POST /auth/password/reset burns
+   * it. The ratchet caught its own entry going stale and failed the build until
+   * it was removed, which is the behaviour it exists for.
+   *
+   * Email VERIFICATION is still unbuilt — but that is a missing feature, not a
+   * disconnected table, and this file is about the second thing. A gap entry
+   * kept alive for a reason it no longer describes is how an allowlist starts.
+   */
   {
     check: 'prisma-models',
     what: 'FeatureFlag',

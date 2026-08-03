@@ -5,6 +5,14 @@ import Link from 'next/link';
 import { api, ApiError } from '../../lib/api';
 
 /**
+ * The seeded demo account was prefilled into the email box and its password
+ * printed under the form on every build, so every production deployment of QAAI
+ * handed working credentials to anyone who opened the sign-in page. `NODE_ENV`
+ * is substituted at build time, so a production bundle never renders either.
+ */
+const SHOW_DEMO_ACCOUNT = process.env.NODE_ENV !== 'production';
+
+/**
  * Sign in.
  *
  * The password form is untouched — same fields, same handler, same behaviour on
@@ -18,7 +26,7 @@ import { api, ApiError } from '../../lib/api';
  * page never learns an org name from an address it was handed.
  */
 export default function LoginPage() {
-  const [email, setEmail] = useState('owner@qaai.local');
+  const [email, setEmail] = useState(SHOW_DEMO_ACCOUNT ? 'owner@qaai.local' : '');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -114,9 +122,20 @@ export default function LoginPage() {
           </div>
 
           <div>
-            <label htmlFor="password" className="mb-1.5 block text-sm font-medium">
-              Password
-            </label>
+            {/*
+              On the password field's own label row, because that is where a
+              person looks the moment the password fails — and until now there
+              was no link to a reset anywhere in the product, so the only exit
+              from a forgotten password was asking someone with database access.
+            */}
+            <div className="mb-1.5 flex items-baseline justify-between gap-3">
+              <label htmlFor="password" className="text-sm font-medium">
+                Password
+              </label>
+              <Link href="/reset-password" className="text-accent text-xs hover:underline">
+                Forgot password?
+              </Link>
+            </div>
             <input
               id="password"
               type="password"
@@ -172,10 +191,12 @@ export default function LoginPage() {
           </Link>
         </p>
 
-        <p className="text-ink-faint mt-4 text-xs">
-          Seeded demo account: <code className="font-mono">owner@qaai.local</code> /{' '}
-          <code className="font-mono">qaai-demo-password-1</code>
-        </p>
+        {SHOW_DEMO_ACCOUNT && (
+          <p className="text-ink-faint mt-4 text-xs">
+            Seeded demo account: <code className="font-mono">owner@qaai.local</code> /{' '}
+            <code className="font-mono">qaai-demo-password-1</code>
+          </p>
+        )}
       </main>
     </>
   );

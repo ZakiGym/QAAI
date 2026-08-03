@@ -29,3 +29,9 @@ coverage/
 
 # Prisma client output — regenerate with: npm run db:generate -w @qaai/api
 apps/api/src/generated/
+
+# Next.js regenerates this on every build AND on every dev start, and writes a
+# DIFFERENT import each time (.next/types vs .next/dev/types). Tracked, it shows
+# up as a spurious modification in every diff depending on which ran last — and
+# the file itself says "This file should not be edited".
+apps/web/next-env.d.ts

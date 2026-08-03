@@ -34,13 +34,45 @@ const httpUrl = z
 
 // ─── Auth (§1) ───────────────────────────────────────────────────────────────
 
-export const signupSchema = z.object({
+/**
+ * Signup, in two shapes that share one route.
+ *
+ * Without an invite the caller names an organisation and becomes its OWNER.
+ * With one, the organisation already exists and `orgName` is meaningless — so it
+ * is not merely optional, it is REFUSED, because accepting and ignoring it is
+ * how a field ends up looking like it does something.
+ *
+ * This union is the fix for a real bug: `POST /settings/invites` has always
+ * minted `…/signup?invite=<token>`, and signup unconditionally created a brand
+ * new organisation. Every invited teammate landed in their own private org
+ * rather than the one that invited them, and `Invite.acceptedAt` was never
+ * written by any code path. A non-strict `z.object` was part of why it went
+ * unnoticed: a request carrying `invite` had the field silently stripped.
+ */
+const signupBase = {
   email: z.string().email().max(254),
   password: z.string().min(12, 'use at least 12 characters').max(200),
   name: z.string().min(1).max(120),
-  /** Creating the first org inline keeps signup to one screen. */
-  orgName: z.string().min(1).max(120),
-});
+};
+
+export const signupSchema = z.union([
+  z
+    .object({
+      ...signupBase,
+      /** Creating the first org inline keeps signup to one screen. */
+      orgName: z.string().min(1).max(120),
+      invite: z.undefined().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...signupBase,
+      /** The raw token from the invite link. The org comes from the invite. */
+      invite: z.string().min(1),
+      orgName: z.undefined().optional(),
+    })
+    .strict(),
+]);
 export type SignupInput = z.infer<typeof signupSchema>;
 
 export const loginSchema = z.object({
@@ -56,6 +88,39 @@ export type LoginInput = z.infer<typeof loginSchema>;
 
 export const inviteSchema = z.object({
   email: z.string().email(),
+  role: z.enum(ORG_ROLES),
+});
+
+// ─── Passwords ───────────────────────────────────────────────────────────────
+//
+// Until now a password could be set at signup and never again. There was no
+// reset, no change, and no admin path either — a customer who forgot theirs was
+// locked out of their organisation permanently, and for an org whose only OWNER
+// forgot it, the account was simply dead.
+
+export const requestPasswordResetSchema = z.object({
+  email: z.string().email().max(254),
+});
+
+export const resetPasswordSchema = z.object({
+  /** The raw token from the emailed link; the stored copy is a hash. */
+  token: z.string().min(1),
+  password: z.string().min(12, 'use at least 12 characters').max(200),
+});
+
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1),
+  newPassword: z.string().min(12, 'use at least 12 characters').max(200),
+});
+
+/**
+ * Changing a member's role.
+ *
+ * Deliberately its own schema rather than a partial of inviteSchema: the email
+ * identifies an invite, and a userId identifies a member. Sharing one shape
+ * across both invited them to be confused at the call site.
+ */
+export const updateMemberSchema = z.object({
   role: z.enum(ORG_ROLES),
 });
 

@@ -6,7 +6,8 @@ import { api, ApiError } from '../../lib/api';
 import { Button } from '../../components/ui/Button';
 import { Field } from '../../components/ui/Field';
 import { ConfirmDialog } from '../../components/ui/Modal';
-import { Page, PageHeader, SectionLabel, Tabs } from '../../components/ui/layout';
+import { useToast } from '../../components/ui/Toast';
+import { Badge, Page, PageHeader, SectionLabel, SkeletonRows, Tabs } from '../../components/ui/layout';
 
 /** The shape of GET /auth/me — declared here since it is settings-specific. */
 interface Org {
@@ -23,7 +24,16 @@ interface Me {
   orgs: Org[];
 }
 
-type Tab = 'organization' | 'members' | 'apiKeys' | 'usage' | 'audit';
+/*
+ * 'account' is the personal tab; every other tab on this screen is about the
+ * ORGANISATION. It exists because POST /auth/password/change shipped with no
+ * caller: the endpoint worked, and a signed-in person had nowhere in the entire
+ * product to change their password — the only route to a new one was to sign
+ * out and use the forgot-password email. That is this codebase's recurring
+ * defect (correct code connected to nothing), committed in the same wave that
+ * was fixing three other instances of it.
+ */
+type Tab = 'organization' | 'members' | 'apiKeys' | 'usage' | 'audit' | 'account';
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'organization', label: 'Organization' },
@@ -31,6 +41,7 @@ const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'apiKeys', label: 'API keys' },
   { id: 'usage', label: 'Usage' },
   { id: 'audit', label: 'Audit log' },
+  { id: 'account', label: 'Your account' },
 ];
 
 export default function SettingsPage() {
@@ -84,10 +95,113 @@ export default function SettingsPage() {
         <ApiKeysTab />
       ) : tab === 'usage' ? (
         <UsageTab />
-      ) : (
+      ) : tab === 'audit' ? (
         <AuditTab />
+      ) : (
+        <AccountTab me={me} />
       )}
     </Page>
+  );
+}
+
+/**
+ * Your own account, as opposed to the organisation's.
+ *
+ * Changing a password requires the current one even though the caller already
+ * holds a session — that is what stops a borrowed laptop from becoming
+ * permanent ownership of the account, and the API enforces it regardless of
+ * what this form does.
+ */
+function AccountTab({ me }: { me: Me }) {
+  const toast = useToast();
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Matches the API's own rule (packages/shared changePasswordSchema) so the
+  // failure is shown before a round trip rather than after one.
+  const tooShort = next.length > 0 && next.length < 12;
+  const mismatch = confirm.length > 0 && confirm !== next;
+  const ready = current.length > 0 && next.length >= 12 && confirm === next;
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    if (!ready || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/auth/password/change', {
+        method: 'POST',
+        body: JSON.stringify({ currentPassword: current, newPassword: next }),
+      });
+      setCurrent('');
+      setNext('');
+      setConfirm('');
+      // Said out loud because it is a real consequence the user should know
+      // about before they walk to another machine and find it signed out.
+      toast.success('Password changed. Every other session has been signed out.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not change the password');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <section className="border-line bg-surface-1 rounded-lg border p-5">
+        <SectionLabel>Signed in as</SectionLabel>
+        <p className="text-body-sm mt-1">{me.user?.name ?? me.user?.email ?? '—'}</p>
+        {me.user?.name && <p className="text-ink-faint text-micro mt-0.5">{me.user.email}</p>}
+      </section>
+
+      <form onSubmit={submit} className="border-line bg-surface-1 rounded-lg border p-5">
+        <SectionLabel>Change password</SectionLabel>
+
+        <div className="mt-3 space-y-3">
+          <Field
+            label="Current password"
+            type="password"
+            autoComplete="current-password"
+            value={current}
+            onChange={(e) => setCurrent(e.target.value)}
+          />
+          <Field
+            label="New password"
+            type="password"
+            autoComplete="new-password"
+            value={next}
+            onChange={(e) => setNext(e.target.value)}
+            hint="At least 12 characters."
+            error={tooShort ? 'Use at least 12 characters.' : undefined}
+          />
+          <Field
+            label="Confirm new password"
+            type="password"
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            error={mismatch ? 'These do not match.' : undefined}
+          />
+        </div>
+
+        {error && (
+          <p role="alert" className="text-fail mt-3 text-body-sm">
+            {error}
+          </p>
+        )}
+
+        <p className="text-ink-faint text-micro mt-3">
+          Changing it signs you out everywhere else. This tab stays signed in.
+        </p>
+
+        <Button type="submit" variant="primary" className="mt-3" disabled={!ready} loading={busy}>
+          Change password
+        </Button>
+      </form>
+    </div>
   );
 }
 
@@ -127,44 +241,460 @@ interface Member {
   joinedAt: string;
 }
 
+interface Invite {
+  id: string;
+  email: string;
+  role: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+/**
+ * What actually happened to the email, straight from POST /settings/invites.
+ *
+ * Only `smtp` means a message left the building. `console` means this
+ * deployment has no mail server and the link went to the API log; `failed`
+ * means the send threw. Both leave a working invite that somebody has to
+ * deliver by hand, and saying "invite sent" for either is the lie this screen
+ * used to tell in the other direction.
+ */
+type Delivery = 'smtp' | 'console' | 'failed';
+
+/**
+ * Kept in sync with ORG_ROLES in @qaai/shared. Duplicated as a plain tuple
+ * rather than imported because nothing else in the web app pulls from the
+ * shared package, and one constant is not worth the dependency.
+ */
+const ORG_ROLES = ['OWNER', 'ADMIN', 'MEMBER', 'VIEWER'] as const;
+type OrgRole = (typeof ORG_ROLES)[number];
+
+const SELECT_CLASS =
+  'border-line bg-surface-1 text-body-sm focus:border-accent rounded-md border px-2.5 py-1.5 outline-none disabled:cursor-not-allowed disabled:opacity-50';
+
+const nameOf = (member: Member) => member.name || member.email;
+
+/** ApiError carries the server's own sentence — the readable one is the point. */
+const reasonFor = (err: unknown, fallback: string) =>
+  err instanceof Error && err.message ? err.message : fallback;
+
+/**
+ * Invites expire, and GET /settings/invites returns the expired ones too — they
+ * are unaccepted, which is all that query asks. An expired row that reads like a
+ * live one sends an admin off to chase a link that cannot work.
+ */
+function expiryPhrase(iso: string): { text: string; expired: boolean } {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (Number.isNaN(ms)) return { text: 'expiry unknown', expired: false };
+  if (ms <= 0) return { text: 'expired', expired: true };
+  // A date beyond a day out, a countdown inside one. Rounding a 7-day link to
+  // "6 days" reads as a bug, and rounding it up would promise time it does not
+  // have; the date is the only phrasing that is never off by one.
+  if (ms >= 86_400_000) {
+    const on = new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return { text: `expires ${on}`, expired: false };
+  }
+  const hours = Math.max(1, Math.round(ms / 3_600_000));
+  return { text: `expires in ${hours} hour${hours === 1 ? '' : 's'}`, expired: false };
+}
+
 function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
-  const [members, setMembers] = useState<Member[]>([]);
+  const router = useRouter();
+  const toast = useToast();
+
+  /*
+   * Every mutation on this tab — invite, revoke, role change, remove — is
+   * requireRole('ADMIN') on the server. The current role is already on screen,
+   * so rendering controls that are certain to 403 only teaches people that the
+   * product argues with them. The *rules* stay server-side: the last-OWNER
+   * guard is not reimplemented here, because a control this page disabled that
+   * the server would have allowed is its own bug.
+   */
+  const canManage = activeOrg?.role === 'OWNER' || activeOrg?.role === 'ADMIN';
+
+  const [members, setMembers] = useState<Member[] | null>(null);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const [busyMember, setBusyMember] = useState<string | null>(null);
+  const [pendingRemove, setPendingRemove] = useState<Member | null>(null);
+  const [removing, setRemoving] = useState(false);
+
+  const [invites, setInvites] = useState<Invite[] | null>(null);
+  const [invitesError, setInvitesError] = useState<string | null>(null);
+  const [pendingRevoke, setPendingRevoke] = useState<Invite | null>(null);
+  const [revoking, setRevoking] = useState(false);
+
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteRole, setInviteRole] = useState<OrgRole>('MEMBER');
+  const [inviting, setInviting] = useState(false);
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  // The link is returned exactly once. It stays on screen until dismissed so an
+  // admin who wants to send it themselves is never racing a toast.
+  const [minted, setMinted] = useState<{
+    email: string;
+    role: string;
+    acceptUrl: string;
+    delivery: Delivery;
+    expiresAt: string;
+  } | null>(null);
+
+  const loadMembers = useCallback(async () => {
+    try {
+      const data = await api<{ members: Member[] }>('/settings/members');
+      setMembers(data.members);
+      setMembersError(null);
+    } catch (err) {
+      // This used to fall back to a fabricated row for the current user, which
+      // answers "who is in this org" with "only you" — a wrong answer, not a
+      // missing one.
+      setMembersError(reasonFor(err, 'Could not load the members list'));
+    }
+  }, []);
+
+  const loadInvites = useCallback(async () => {
+    if (!canManage) return;
+    try {
+      const data = await api<{ invites: Invite[] }>('/settings/invites');
+      setInvites(data.invites);
+      setInvitesError(null);
+    } catch (err) {
+      setInvitesError(reasonFor(err, 'Could not load pending invitations'));
+    }
+  }, [canManage]);
 
   useEffect(() => {
-    void api<{ members: Member[] }>('/settings/members')
-      .then((d) => setMembers(d.members))
-      .catch(() => setMembers([]));
-  }, []);
+    void loadMembers();
+  }, [loadMembers]);
+
+  useEffect(() => {
+    void loadInvites();
+  }, [loadInvites]);
+
+  async function copyLink(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.success('Invite link copied');
+    } catch {
+      // The clipboard is unavailable outside a secure context. The link is on
+      // screen and selectable, so say that rather than fail silently.
+      toast.error('Could not reach the clipboard — select the link and copy it by hand.');
+    }
+  }
+
+  async function sendInvite(e: React.FormEvent) {
+    e.preventDefault();
+    const email = inviteEmail.trim();
+    if (!email || inviting) return;
+    setInviting(true);
+    setInviteError(null);
+    try {
+      const result = await api<{
+        invite: Invite;
+        acceptUrl: string;
+        delivery: Delivery;
+      }>('/settings/invites', {
+        method: 'POST',
+        body: JSON.stringify({ email, role: inviteRole }),
+      });
+      setMinted({
+        email: result.invite.email,
+        role: result.invite.role,
+        acceptUrl: result.acceptUrl,
+        delivery: result.delivery,
+        expiresAt: result.invite.expiresAt,
+      });
+      setInviteEmail('');
+      await loadInvites();
+    } catch (err) {
+      setInviteError(reasonFor(err, 'Could not create the invitation'));
+    } finally {
+      setInviting(false);
+    }
+  }
+
+  /*
+   * Optimistic, because a select that snaps back to its old value while a
+   * request is in flight reads as a rejected choice. The rollback below is the
+   * price: on failure the row returns to the role the server still holds, and
+   * the server's sentence — "This is the only owner…" — is what gets shown.
+   */
+  async function changeRole(member: Member, role: OrgRole) {
+    const previous = member.role;
+    if (previous === role) return;
+    setBusyMember(member.userId);
+    setMembersError(null);
+    setMembers((current) =>
+      current?.map((m) => (m.userId === member.userId ? { ...m, role } : m)) ?? current,
+    );
+    try {
+      await api(`/settings/members/${member.userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role }),
+      });
+    } catch (err) {
+      setMembers((current) =>
+        current?.map((m) => (m.userId === member.userId ? { ...m, role: previous } : m)) ?? current,
+      );
+      setMembersError(reasonFor(err, `Could not change ${nameOf(member)}'s role`));
+    } finally {
+      setBusyMember(null);
+    }
+  }
+
+  /*
+   * Not optimistic: a row that disappears and then reappears with an error is a
+   * worse account of a destructive action than a spinner in the dialog, and the
+   * dialog's busy state already makes the button unpressable twice.
+   */
+  async function removeMember(member: Member) {
+    setRemoving(true);
+    setMembersError(null);
+    try {
+      await api(`/settings/members/${member.userId}`, { method: 'DELETE' });
+      setPendingRemove(null);
+      if (member.userId === me.user?.id) {
+        // The server revokes this user's sessions for this org, so every
+        // request from here is a 401. Leaving them on a dead page is worse than
+        // sending them somewhere that works.
+        router.push('/login');
+        return;
+      }
+      setMembers((current) => current?.filter((m) => m.userId !== member.userId) ?? current);
+    } catch (err) {
+      setPendingRemove(null);
+      setMembersError(reasonFor(err, `Could not remove ${nameOf(member)}`));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  async function revokeInvite(invite: Invite) {
+    setRevoking(true);
+    setInvitesError(null);
+    try {
+      await api(`/settings/invites/${invite.id}`, { method: 'DELETE' });
+      setInvites((current) => current?.filter((i) => i.id !== invite.id) ?? current);
+      setPendingRevoke(null);
+      // The link on screen is this invite's; leaving it up would hand out a
+      // token that no longer opens anything.
+      setMinted((current) => (current?.email === invite.email ? null : current));
+    } catch (err) {
+      setPendingRevoke(null);
+      setInvitesError(reasonFor(err, `Could not revoke the invitation for ${invite.email}`));
+    } finally {
+      setRevoking(false);
+    }
+  }
 
   return (
     <div className="space-y-8">
-      <section>
-        <SectionLabel>{activeOrg ? `Members of ${activeOrg.name}` : 'Members'}</SectionLabel>
-        <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
-          {members.map((member) => (
-            <div key={member.userId} className="flex items-center gap-4 px-4 py-3">
-              <span className="text-sm font-medium">{member.name || member.email}</span>
-              {member.name && <span className="text-ink-faint text-xs">{member.email}</span>}
-              <span className="text-ink-faint ml-auto font-mono text-xs">
-                {member.role.toLowerCase()}
-              </span>
+      {canManage && (
+        <section>
+          <SectionLabel>Invite a teammate</SectionLabel>
+
+          <form onSubmit={sendInvite} className="flex items-start gap-2">
+            <div className="flex-1">
+              <Field
+                type="email"
+                aria-label="Email address to invite"
+                value={inviteEmail}
+                onChange={(e) => setInviteEmail(e.target.value)}
+                placeholder="teammate@example.com"
+                autoComplete="off"
+              />
             </div>
-          ))}
-          {members.length === 0 && (
-            <div className="flex items-center gap-4 px-4 py-3">
-              <span className="text-sm font-medium">
-                {me.user?.name ?? me.user?.email ?? 'You'}
-              </span>
-              <span className="text-ink-faint ml-auto font-mono text-xs">
-                {activeOrg?.role.toLowerCase() ?? ''}
-              </span>
+            <select
+              aria-label="Role for the invited person"
+              value={inviteRole}
+              onChange={(e) => setInviteRole(e.target.value as OrgRole)}
+              disabled={inviting}
+              className={SELECT_CLASS}
+            >
+              {ORG_ROLES.map((role) => (
+                <option key={role} value={role}>
+                  {role.toLowerCase()}
+                </option>
+              ))}
+            </select>
+            <Button
+              type="submit"
+              variant="primary"
+              loading={inviting}
+              disabled={!inviteEmail.trim()}
+            >
+              Send invite
+            </Button>
+          </form>
+
+          {inviteError && (
+            <p role="alert" className="text-fail mt-2 text-xs">
+              {inviteError}
+            </p>
+          )}
+
+          {minted && (
+            <div
+              className={`mt-4 rounded-lg border p-4 ${
+                minted.delivery === 'smtp'
+                  ? 'border-accent/50 bg-accent/10'
+                  : 'border-flake/40 bg-flake/10'
+              }`}
+            >
+              <p className="text-sm font-medium">
+                {minted.delivery === 'smtp'
+                  ? `Invitation emailed to ${minted.email}`
+                  : `Invitation created for ${minted.email} — nothing was emailed`}
+              </p>
+              <p className="text-ink-dim text-body-sm mt-1 leading-relaxed">
+                {minted.delivery === 'smtp'
+                  ? `They can join as ${minted.role.toLowerCase()} with the link below — the same one in their inbox.`
+                  : minted.delivery === 'console'
+                    ? 'This deployment has no mail server, so the link went to the API log instead. Send it to them yourself.'
+                    : 'The email did not send. The invitation is saved either way — send the link to them yourself.'}{' '}
+                This link {expiryPhrase(minted.expiresAt).text}.
+              </p>
+              <code className="border-line bg-surface mt-3 block overflow-x-auto rounded border px-3 py-2 font-mono text-xs">
+                {minted.acceptUrl}
+              </code>
+              <div className="mt-3 flex items-center gap-2">
+                <Button variant="primary" size="sm" onClick={() => void copyLink(minted.acceptUrl)}>
+                  Copy link
+                </Button>
+                <Button size="sm" onClick={() => setMinted(null)}>
+                  Dismiss
+                </Button>
+              </div>
             </div>
           )}
-        </div>
-        <p className="text-ink-faint mt-2 text-xs">
-          Email invites are not built yet — new members join by signing up and being added to the
-          org.
-        </p>
+        </section>
+      )}
+
+      {canManage && (
+        <section>
+          <SectionLabel>Pending invitations</SectionLabel>
+
+          {invitesError && (
+            <p
+              role="alert"
+              className="border-fail/40 bg-fail/10 text-fail mb-3 rounded-md border p-3 text-sm"
+            >
+              {invitesError}
+            </p>
+          )}
+
+          {invites === null ? (
+            // A failed load already said so above; an empty box under the
+            // message would read as "no invitations", which is not what we know.
+            !invitesError && (
+              <div className="border-line overflow-hidden rounded-lg border">
+                <SkeletonRows rows={2} />
+              </div>
+            )
+          ) : (
+            <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
+              {invites.map((invite) => {
+                const expiry = expiryPhrase(invite.expiresAt);
+                return (
+                  <div key={invite.id} className="flex items-center gap-3 px-4 py-3">
+                    <span className="truncate text-sm font-medium">{invite.email}</span>
+                    <Badge mono>{invite.role.toLowerCase()}</Badge>
+                    <span
+                      className={`ml-auto text-xs ${expiry.expired ? 'text-fail' : 'text-ink-faint'}`}
+                    >
+                      {expiry.text}
+                    </span>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => setPendingRevoke(invite)}
+                      disabled={revoking}
+                    >
+                      Revoke
+                    </Button>
+                  </div>
+                );
+              })}
+              {invites.length === 0 && (
+                <p className="text-ink-faint px-4 py-6 text-center text-sm">
+                  No invitations waiting. Invited people appear here until they sign up.
+                </p>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      <section>
+        <SectionLabel>{activeOrg ? `Members of ${activeOrg.name}` : 'Members'}</SectionLabel>
+
+        {membersError && (
+          <p
+            role="alert"
+            className="border-fail/40 bg-fail/10 text-fail mb-3 rounded-md border p-3 text-sm"
+          >
+            {membersError}
+          </p>
+        )}
+
+        {members === null ? (
+          !membersError && (
+            <div className="border-line overflow-hidden rounded-lg border">
+              <SkeletonRows rows={3} />
+            </div>
+          )
+        ) : (
+          <div className="border-line divide-line divide-y overflow-hidden rounded-lg border">
+            {members.map((member) => (
+              <div key={member.userId} className="flex items-center gap-3 px-4 py-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">{nameOf(member)}</p>
+                  {member.name && (
+                    <p className="text-ink-faint truncate text-xs">{member.email}</p>
+                  )}
+                </div>
+                {member.userId === me.user?.id && <Badge tone="accent">you</Badge>}
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  {canManage ? (
+                    <select
+                      aria-label={`Role for ${nameOf(member)}`}
+                      value={member.role}
+                      onChange={(e) => void changeRole(member, e.target.value as OrgRole)}
+                      disabled={busyMember === member.userId}
+                      className={SELECT_CLASS}
+                    >
+                      {ORG_ROLES.map((role) => (
+                        <option key={role} value={role}>
+                          {role.toLowerCase()}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <Badge mono>{member.role.toLowerCase()}</Badge>
+                  )}
+                  {canManage && (
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => setPendingRemove(member)}
+                      disabled={busyMember === member.userId}
+                    >
+                      Remove
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {members.length === 0 && (
+              <p className="text-ink-faint px-4 py-6 text-center text-sm">
+                Nobody is in this organisation yet.
+              </p>
+            )}
+          </div>
+        )}
+
+        {!canManage && (
+          <p className="text-ink-faint mt-2 text-xs">
+            Inviting people and changing roles needs the admin or owner role.
+          </p>
+        )}
       </section>
 
       <section>
@@ -181,6 +711,36 @@ function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
           ))}
         </div>
       </section>
+
+      <ConfirmDialog
+        open={pendingRemove !== null}
+        onClose={() => setPendingRemove(null)}
+        onConfirm={() => {
+          if (pendingRemove) void removeMember(pendingRemove);
+        }}
+        title={pendingRemove ? `Remove ${nameOf(pendingRemove)}?` : 'Remove this member?'}
+        body={
+          pendingRemove?.userId === me.user?.id
+            ? `You lose access to ${activeOrg?.name ?? 'this organisation'} immediately and are signed out of it. Your account and everything you created stay.`
+            : `${pendingRemove ? nameOf(pendingRemove) : 'They'} loses access to ${
+                activeOrg?.name ?? 'this organisation'
+              } immediately and any session they have here is ended. Their account and everything they created stay.`
+        }
+        confirmLabel="Remove member"
+        busy={removing}
+      />
+
+      <ConfirmDialog
+        open={pendingRevoke !== null}
+        onClose={() => setPendingRevoke(null)}
+        onConfirm={() => {
+          if (pendingRevoke) void revokeInvite(pendingRevoke);
+        }}
+        title="Revoke this invitation?"
+        body={`The link sent to ${pendingRevoke?.email ?? 'this address'} stops working. You can invite them again at any time.`}
+        confirmLabel="Revoke invite"
+        busy={revoking}
+      />
     </div>
   );
 }

@@ -70,6 +70,20 @@ const schema = z.object({
 
   GITHUB_WEBHOOK_SECRET: z.string().default(''),
 
+  /**
+   * Outbound email. SMTP_HOST is the switch: set it and lib/mail.ts sends for
+   * real, leave it and the same module writes the message to the log instead.
+   *
+   * There is deliberately no "enabled" flag. A boolean that can disagree with
+   * the host it guards is one more way for mail to be silently off, and the
+   * host is the thing an operator actually has or does not have.
+   */
+  SMTP_HOST: z.string().default(''),
+  SMTP_PORT: z.coerce.number().int().positive().default(587),
+  SMTP_USER: z.string().default(''),
+  SMTP_PASSWORD: z.string().default(''),
+  SMTP_FROM: z.string().default('QAAI <no-reply@qaai.local>'),
+
   /*
    * SLACK_WEBHOOK_URL, LINEAR_API_KEY and SENTRY_DSN used to be declared here.
    * All three were parsed at boot and then referenced by nothing — no `env.`

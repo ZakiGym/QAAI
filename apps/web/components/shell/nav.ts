@@ -69,8 +69,14 @@ export const SETTINGS_ITEM: NavItemDef = {
   Icon: IconSliders,
 };
 
-/** Routes that must NOT get the app shell (marketing + auth stand alone). */
-export const SHELL_EXCLUDED = new Set(['/', '/login', '/signup']);
+/**
+ * Routes that must NOT get the app shell (marketing + auth stand alone).
+ *
+ * `/reset-password` is reached from a link in an email by someone who is, by
+ * definition, signed out — a sidebar of destinations they cannot open is noise
+ * at best, and its project fetches 401 on every one of them.
+ */
+export const SHELL_EXCLUDED = new Set(['/', '/login', '/signup', '/reset-password']);
 
 function matchesPrefix(pathname: string, href: string): boolean {
   return pathname === href || pathname.startsWith(`${href}/`);
