@@ -11,9 +11,15 @@
  */
 
 import { open, seal } from './vault.js';
+import type { ChatCredentials } from './chat-integrations.js';
+import { decodeChatCredentials, encodeChatCredentials, integrationAad } from './chat-integrations.js';
 
-/** Namespaced so a token can never be opened as if it were an environment secret. */
-const aadName = (integrationId: string) => `integration:${integrationId}`;
+/**
+ * Namespaced so a token can never be opened as if it were an environment
+ * secret. The name lives in chat-integrations.ts (the pure module the worker
+ * also imports) so both sides bind the same AAD; `aadName` here is that helper.
+ */
+const aadName = integrationAad;
 
 export function sealToken(token: string, orgId: string, integrationId: string) {
   return seal(token, orgId, aadName(integrationId));
@@ -26,6 +32,29 @@ export function openToken(
   integrationId: string,
 ): string {
   return open(ciphertext, keyVersion, orgId, aadName(integrationId));
+}
+
+/**
+ * Chat-webhook credentials — the URL, plus the WEBHOOK signing secret when one
+ * exists — sealed as one JSON envelope under the same AAD as a git token. The
+ * plaintext is produced only inside a send and is never returned by any
+ * endpoint, logged, or written to audit metadata.
+ */
+export function sealChatCredentials(
+  credentials: ChatCredentials,
+  orgId: string,
+  integrationId: string,
+) {
+  return seal(encodeChatCredentials(credentials), orgId, aadName(integrationId));
+}
+
+export function openChatCredentials(
+  ciphertext: string,
+  keyVersion: number,
+  orgId: string,
+  integrationId: string,
+): ChatCredentials {
+  return decodeChatCredentials(open(ciphertext, keyVersion, orgId, aadName(integrationId)));
 }
 
 /**

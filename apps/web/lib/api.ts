@@ -157,6 +157,61 @@ export interface Integration {
   updatedAt: string;
 }
 
+// ─── Chat & webhook integrations + the delivery log (/integrations/chat) ─────
+
+export type ChatIntegrationKind = 'SLACK' | 'MSTEAMS' | 'DISCORD' | 'WEBHOOK';
+
+/** off — nothing about runs · failures — failing runs only · all — every run. */
+export type RunFinishedPref = 'off' | 'failures' | 'all';
+
+export interface NotifyPrefs {
+  runFinished: RunFinishedPref;
+  digest: boolean;
+}
+
+/**
+ * The webhook URL is the credential and is never returned by any endpoint:
+ * `host` and `urlHint` (host + last four characters of the path) are all a
+ * screen gets, and all it needs to tell two hooks apart.
+ */
+export interface ChatIntegration {
+  id: string;
+  kind: ChatIntegrationKind;
+  name: string;
+  host: string;
+  urlHint: string;
+  enabled: boolean;
+  hasUrl: boolean;
+  /** WEBHOOK only: whether the sealed envelope carries an HMAC signing secret. */
+  hasSecret: boolean;
+  notify: NotifyPrefs;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** PENDING — queued, a send is coming · SENT — the provider took it · FAILED — retries exhausted. */
+export type DeliveryStatus = 'PENDING' | 'SENT' | 'FAILED';
+
+/** One row of GET /integrations/:id/deliveries — newest first. */
+export interface WebhookDelivery {
+  id: string;
+  event: string;
+  status: DeliveryStatus;
+  responseStatus: number | null;
+  attempts: number;
+  deliveredAt: string | null;
+  lastError: string | null;
+  createdAt: string;
+}
+
+/** The honest outcome of POST /integrations/chat/:id/test. */
+export interface ChatTestResult {
+  ok: boolean;
+  responseStatus: number | null;
+  error: string | null;
+  deliveryId: string;
+}
+
 export interface GitPreviewFile {
   path: string;
   bytes: number;
@@ -672,6 +727,37 @@ export interface RunnerJob {
 export interface MintedRunner {
   runner: { id: string; name: string; tokenPrefix: string; pools?: string[] };
   token: string;
+}
+
+// ─── GET /health/queues — the install's own BullMQ queues (ADMIN+) ───────────
+//
+// Mirrors apps/api/src/lib/queue-health.ts, which is the source of truth. This
+// is the report that tells a dead queue from an idle one: both sit at zero
+// active, but only the dead one accumulates failed jobs — and the newest
+// failure's error text is what says why. Org-agnostic install infrastructure,
+// so the endpoint answers 403 below ADMIN and the runners screen hides the
+// block rather than erroring.
+
+export interface WorkerQueueFailure {
+  jobId: string | null;
+  /** The BullMQ job name (a QAAI constant like 'qaai.run' or 'tick'). */
+  name: string;
+  /** First line of the failure reason, capped server-side. */
+  error: string;
+  failedAt: string | null;
+  attemptsMade: number;
+}
+
+export interface WorkerQueueHealth {
+  queue: string;
+  /** Null when the queue could not be read — unknown, never zeros standing in. */
+  counts: { waiting: number; delayed: number; active: number; failed: number } | null;
+  newestFailure: WorkerQueueFailure | null;
+}
+
+export interface WorkerQueueHealthReport {
+  generatedAt: string;
+  queues: WorkerQueueHealth[];
 }
 
 /** GET /github/app — is the app set up, and where may it act? */

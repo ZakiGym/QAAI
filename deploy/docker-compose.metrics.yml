@@ -1,0 +1,42 @@
+# Metrics override: Prometheus scraping the API's /metrics over the compose
+# network. See deploy/README.md ("Metrics").
+#
+# Usage, from the REPO ROOT (combine freely with the TLS override — later -f
+# files merge over earlier ones, and relative paths in all of them resolve
+# against the repo root, the directory of the first -f file):
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.metrics.yml up -d
+#
+# STATUS: statically validated YAML, never booted (no docker on the authoring
+# machine). deploy/README.md keeps the honest ledger.
+
+services:
+  prometheus:
+    # v2.53 is the Prometheus 2.x LTS line — the newest tag the author could
+    # name with CERTAINTY without a registry to ask (no docker here; an
+    # invented newer tag would fail the first pull). Newer lines exist: bump
+    # when you can verify one, and re-run promtool afterwards.
+    image: prom/prometheus:v2.53.1
+    restart: unless-stopped
+    command:
+      # The image's default config path, stated explicitly so this flag and
+      # the volume mount below cannot drift apart silently.
+      - --config.file=/etc/prometheus/prometheus.yml
+      # A small install does not need a year of samples; 15 days bounds the
+      # volume while covering "was it like this last week".
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - qaai-promdata:/prometheus
+    ports:
+      # Loopback ONLY. The Prometheus UI has no authentication and will run
+      # any query for whoever reaches it. Use an SSH tunnel
+      # (ssh -L 9090:localhost:9090 <host>) — or put it behind Caddy WITH
+      # basic_auth on a hostname of its own. Never publish it bare.
+      - "127.0.0.1:9090:9090"
+    # Sized for one small target at 15s intervals with 15d retention. Memory
+    # limited, CPU not — see the datastores header in docker-compose.yml.
+    mem_limit: 512m
+
+volumes:
+  qaai-promdata:

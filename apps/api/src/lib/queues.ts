@@ -12,6 +12,7 @@ import { QUEUE_NAMES } from '@qaai/shared';
 import type { JobPayloads } from '@qaai/shared';
 import { env } from '../env.js';
 import { logger } from './logger.js';
+import { OPERATOR_QUEUE_NAMES } from './queue-health.js';
 
 const connection = new IORedis(env.REDIS_URL, {
   // BullMQ requires this; without it a job can be silently dropped when Redis
@@ -64,6 +65,20 @@ export async function queueDepths(): Promise<Record<string, number>> {
     out[name] = await queueFor(name).getWaitingCount();
   }
   return out;
+}
+
+/**
+ * One Queue handle per queue the worker drains, for the queue-health report.
+ *
+ * Reuses `queueFor`'s cached instances and the single shared connection, so the
+ * health endpoint costs no sockets beyond what enqueuing already pays. Wider
+ * than `queueDepths()` above deliberately: that one predates the bisect, checks
+ * and retention queues and only sees QUEUE_NAMES, and those three are exactly
+ * the queues most likely to die unnoticed — nobody is watching a spinner when
+ * a retention sweep stops being consumed.
+ */
+export function operatorQueues(): Queue[] {
+  return OPERATOR_QUEUE_NAMES.map((name) => queueFor(name));
 }
 
 export async function pingRedis(): Promise<boolean> {

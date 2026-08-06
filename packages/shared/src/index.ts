@@ -18,5 +18,6 @@ export * from './locators';
 export * from './types';
 export * from './schemas';
 export * from './mask';
+export * from './webhook-failure';
 export * from './job-enums';
 export * from './jobs';

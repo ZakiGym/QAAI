@@ -47,7 +47,7 @@ import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
 import { traceRouter } from './routes/trace.js';
 import { trafficRouter } from './routes/traffic.js';
-import { healthRouter } from './routes/health.js';
+import { healthRouter, queueHealthRouter } from './routes/health.js';
 import { retentionRouter } from './routes/retention.js';
 import { exportOrgRouter } from './routes/export-org.js';
 import { observabilityMiddleware, rateLimitKey } from './lib/metrics.js';
@@ -119,6 +119,13 @@ app.use(
 app.use(attachActor);
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
+
+// Queue health lives in routes/health.ts beside /metrics but is mounted HERE,
+// behind the limiter, not with its siblings in front of it: it requires a
+// session (its payload carries failed-job error text, which the unauthenticated
+// surface may never serve) and nothing in a cluster probes it. See the router's
+// comment for the full reasoning.
+app.use(queueHealthRouter);
 
 app.use('/auth', authRouter);
 // SSO sits beside /auth rather than inside it: most of its endpoints are

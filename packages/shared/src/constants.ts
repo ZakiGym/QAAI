@@ -136,6 +136,31 @@ export const VISUAL_INTEGRATION_KINDS = ['APPLITOOLS', 'PERCY', 'CHROMATIC'] as 
 export type VisualIntegrationKind = (typeof VISUAL_INTEGRATION_KINDS)[number];
 
 /**
+ * Chat and webhook destinations — where run notifications and the digest go
+ * (§7). All four are a single HTTPS POST to an incoming-webhook URL; the URL is
+ * the credential and lives sealed in the vault, never in `Integration.config`.
+ *
+ * PAGERDUTY is in the Prisma enum but deliberately NOT here: it is not an
+ * incoming-webhook POST (it is the Events API v2 — routing keys, severities,
+ * dedup keys — plus an on-call expectation this notification pipeline does not
+ * meet), and nothing in the worker can deliver to it. Making it creatable would
+ * mint an integration that silently never fires. It joins this list when a
+ * delivery path exists.
+ */
+export const CHAT_INTEGRATION_KINDS = ['SLACK', 'MSTEAMS', 'DISCORD', 'WEBHOOK'] as const;
+export type ChatIntegrationKind = (typeof CHAT_INTEGRATION_KINDS)[number];
+
+/**
+ * Per-integration notification preference for `run.finished` (§7).
+ *
+ *   off       — this channel hears nothing about runs
+ *   failures  — failing runs only (the default; a green run is not news)
+ *   all       — every finished run, green included
+ */
+export const RUN_FINISHED_PREFS = ['off', 'failures', 'all'] as const;
+export type RunFinishedPref = (typeof RUN_FINISHED_PREFS)[number];
+
+/**
  * A test whose `filePath` starts with this is treated as test data, not a test:
  * excluded from run selection and the flake radar, materialised into the run
  * workspace so specs can read it. Reuses the Test row so no new model is needed.

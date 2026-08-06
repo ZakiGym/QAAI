@@ -1,0 +1,56 @@
+# TLS front door: Caddy terminating HTTPS for the cockpit and the API on one
+# domain. This is the recommended way to put QAAI on the internet — see
+# deploy/README.md ("The front door").
+#
+# Usage, from the REPO ROOT:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.tls.yml up -d
+#
+# Relative paths in every compose file resolve against the project directory —
+# the directory of the FIRST -f file, i.e. the repo root — which is why the
+# volume below says ./deploy/caddy/… even though this file already lives in
+# deploy/.
+#
+# The base file's 127.0.0.1 port bindings for web/api are correct and stay:
+# Caddy reaches web:3000 and api:4000 over the compose network, and nothing
+# else needs to. Do NOT set API_BIND/WEB_BIND to 0.0.0.0 — that would publish
+# the plaintext ports beside the TLS ones.
+#
+# STATUS: statically validated YAML, never booted (no docker on the authoring
+# machine). deploy/README.md keeps the honest ledger.
+
+services:
+  caddy:
+    # Major-pinned, deliberately looser than the datastores' minor pins: this
+    # is the internet-facing TLS terminator, the one container whose security
+    # patches you want on every pull, and this Caddyfile's four directives are
+    # stable across 2.x. Pin a digest instead once a registry can be asked:
+    #   docker image inspect --format '{{index .RepoDigests 0}}' caddy:2-alpine
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80" # ACME HTTP-01 challenges + redirect to HTTPS
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      QAAI_DOMAIN: ${QAAI_DOMAIN:?set QAAI_DOMAIN in .env to the DNS name this host serves}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and the ACME account key. Losing this volume is
+      # survivable — Caddy re-issues — but it burns Let's Encrypt rate limits,
+      # so keep it across re-deploys.
+      - qaai-caddydata:/data
+      - qaai-caddyconfig:/config
+    depends_on:
+      # Plain (started, not healthy) dependencies: a proxy that comes up first
+      # answers 502 until its upstream does, which is the correct behaviour —
+      # and it must be running early anyway to answer ACME challenges.
+      - api
+      - web
+    # A reverse proxy is a header-rewriter with a socket. Memory limited, CPU
+    # not — see the datastores header in docker-compose.yml for the rationale.
+    mem_limit: 256m
+
+volumes:
+  qaai-caddydata:
+  qaai-caddyconfig:

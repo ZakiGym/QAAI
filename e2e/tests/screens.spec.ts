@@ -60,6 +60,7 @@ const SHELL_SCREENS: Screen[] = [
 
   { path: '/environments', ready: (p) => activeTab(p, 'Setup', 'Environments') },
   { path: '/source-control', ready: (p) => activeTab(p, 'Setup', 'Source control') },
+  { path: '/integrations', ready: (p) => activeTab(p, 'Setup', 'Integrations') },
   { path: '/settings/runners', ready: (p) => activeTab(p, 'Setup', 'Runners') },
   { path: '/onboarding', ready: (p) => activeTab(p, 'Setup', 'Add app') },
 

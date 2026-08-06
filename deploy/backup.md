@@ -73,7 +73,33 @@ world-readable in `ps` on a shared host, and a database host is a shared host by
 definition. Nothing in `manifest.json` contains a password — the `source` field is
 `user@host:port/database` and is built by a function that is never given one.
 
-### A cron that behaves
+### The worker schedules this for you
+
+A backup command nobody runs is not a backup, so the worker runs it. Set
+
+```bash
+QAAI_BACKUP_DIR=/backups     # writable by the worker; different disk from Postgres
+QAAI_BACKUP_KEEP=7           # how many nightly copies survive the prune
+```
+
+and `apps/worker/src/processors/backup.ts` calls the **same** `backupMain`
+this document describes — imported in-process, not a reimplementation and not a
+shell-out — once a day, into `qaai-backup-<UTC stamp>/` under that directory.
+It is a BullMQ repeatable job de-duplicated by a fixed jobId, so worker
+restarts cannot double-schedule it, and it survives as long as any worker does
+(a plain `setInterval` would do neither). Daily cadence means the
+recovery-point objective is **up to 24 hours of loss**; if that is too much for
+your install, run the cron below on top — the two coexist, since `create`
+refuses to collide with an existing directory.
+
+With `QAAI_BACKUP_DIR` unset, **no backup runs and the worker says so** — one
+warn-level log line per day naming the variable to set. An unconfigured backup
+is loud on purpose; the silent version of that state is how installs discover
+their backup posture during the incident.
+
+A failed nightly backup marks the BullMQ job FAILED and prunes nothing.
+
+### A cron that behaves (if you schedule it yourself)
 
 ```bash
 #!/usr/bin/env bash
@@ -96,10 +122,21 @@ Alerting on it as a broken backup means alerting on a broken *package list*.
 
 ### Rotation and pruning
 
-This tool **never deletes a backup.** Deleting the wrong one is unrecoverable and
-the tool cannot know which one you are mid-incident on. Use your object store's
-lifecycle policy, or `find /backups -mtime +30`, and keep at least one copy whose
-deletion requires a second pair of hands.
+The CLI **never deletes a backup.** Deleting the wrong one is unrecoverable and
+the tool cannot know which one you are mid-incident on.
+
+The worker's scheduled sweep **does** prune — that division is deliberate. A
+human runs the CLI mid-incident, when deleting anything is the wrong reflex; a
+scheduler that never deletes fills the disk at day N, and a disk that fills is
+a backup system that killed the database it protected. So after — and only
+after — a night's backup succeeds, the sweep keeps the newest
+`QAAI_BACKUP_KEEP` directories matching `qaai-backup-*` and removes the rest,
+oldest first. Anything else in the directory (your own dumps, notes, a
+prefix-matching *file*) is structurally invisible to it. A night the backup
+fails deletes nothing: the old copies matter most on exactly that night.
+
+Still keep at least one copy elsewhere whose deletion requires a second pair of
+hands — the prune protects the disk, not against the disk.
 
 ---
 
@@ -340,27 +377,18 @@ a partial response rather than a clean 200 over half a file.
 
 ---
 
-## Wiring (not yet done)
+## Wiring
 
-Neither entry point is mounted — both live in files owned by this change, and the
-two call sites do not:
+All three entry points are mounted (this section used to be a to-do list; each
+item below was verified against the source, not remembered):
 
-1. **`packages/cli/src/index.ts`** — add the subcommand:
-
-   ```ts
-   import { backupMain } from './backup.js';
-   // in main()'s switch:
-   case 'backup': return backupMain(rest);
-   ```
-
-   Until then, run it directly: `npx tsx packages/cli/src/backup.ts create --out …`
-
-2. **`apps/api/src/index.ts`** — mount the export router:
-
-   ```ts
-   import { exportOrgRouter } from './routes/export-org.js';
-   app.use('/export', exportOrgRouter);
-   ```
+1. **`qaai backup`** — `packages/cli/src/index.ts` dispatches `backup` (and the
+   `restore` alias) to `backupMain`.
+2. **`GET /export/org`** — `apps/api/src/index.ts` mounts `exportOrgRouter` at
+   `/export`.
+3. **The nightly schedule** — `apps/worker/src/index.ts` registers a consumer
+   for the `qaai.backup` queue and arms the daily repeatable job on boot. See
+   [The worker schedules this for you](#the-worker-schedules-this-for-you).
 
 ## Docker
 

@@ -7,6 +7,7 @@
 import { z } from 'zod';
 import {
   AUTH_PROFILE_KINDS,
+  CHAT_INTEGRATION_KINDS,
   ENVIRONMENT_KINDS,
   FRAMEWORKS_BY_LANGUAGE,
   GIT_INTEGRATION_KINDS,
@@ -14,6 +15,7 @@ import {
   LANGUAGES,
   ORG_ROLES,
   PRIORITIES,
+  RUN_FINISHED_PREFS,
   TEST_TYPES,
   UI_FRAMEWORKS,
   VERDICTS,
@@ -1771,6 +1773,52 @@ export const updateIntegrationSchema = z
     enabled: z.boolean().optional(),
     /** Rotate the token. Omit to keep the existing one. */
     token: z.string().min(1).max(4096).optional(),
+  })
+  .refine((v) => Object.keys(v).length > 0, 'nothing to update');
+
+// ─── Chat & webhook integrations (§7) ────────────────────────────────────────
+
+/**
+ * Which events reach one integration. Both fields have defaults, so an absent
+ * preference parses to today's behaviour: failing runs and the digest.
+ */
+export const notifyPrefsSchema = z.object({
+  runFinished: z.enum(RUN_FINISHED_PREFS).default('failures'),
+  digest: z.boolean().default(true),
+});
+
+/** The same two fields, all optional — a PATCH names only what it changes. */
+export const notifyPrefsPatchSchema = z.object({
+  runFinished: z.enum(RUN_FINISHED_PREFS).optional(),
+  digest: z.boolean().optional(),
+});
+
+/**
+ * The URL is only length-checked here. The real validation — https, pinned
+ * provider host, no internal names — lives in
+ * apps/api/src/lib/chat-integrations.ts, because its error messages must be
+ * written to never echo the URL back (the URL is the credential), and zod's
+ * refine messages would be tempted to.
+ */
+export const createChatIntegrationSchema = z.object({
+  kind: z.enum(CHAT_INTEGRATION_KINDS),
+  name: z.string().min(1).max(80),
+  /** The incoming-webhook URL. Write-only: sealed into the vault, never returned. */
+  url: z.string().min(1).max(2048),
+  /** WEBHOOK only: HMAC-SHA256 signing secret. Write-only, like the URL. */
+  secret: z.string().min(8).max(256).optional(),
+  notify: notifyPrefsSchema.optional(),
+});
+
+export const updateChatIntegrationSchema = z
+  .object({
+    name: z.string().min(1).max(80).optional(),
+    enabled: z.boolean().optional(),
+    /** Rotate the webhook URL. Omit to keep the existing one. */
+    url: z.string().min(1).max(2048).optional(),
+    /** WEBHOOK only: rotate the signing secret. Omit to keep the existing one. */
+    secret: z.string().min(8).max(256).optional(),
+    notify: notifyPrefsPatchSchema.optional(),
   })
   .refine((v) => Object.keys(v).length > 0, 'nothing to update');
 

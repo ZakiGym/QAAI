@@ -195,6 +195,21 @@ const INTERNAL_HOST =
   /^(localhost|.+\.localhost|.+\.local|.+\.internal|.+\.intranet|.+\.lan|.+\.corp|.+\.private|.+\.svc|.+\.cluster\.local|.+\.home\.arpa)$/i;
 
 /**
+ * Exported for lib/chat-integrations.ts, which validates generic-webhook URLs
+ * under the same rule. One list: a name added here (the `.svc` lesson above) is
+ * automatically refused a webhook payload too, rather than waiting for someone
+ * to remember the second copy. Callers must strip trailing dots first.
+ */
+export function isInternalHostname(host: string): boolean {
+  return INTERNAL_HOST.test(host);
+}
+
+/** IPv4 literal or anything with a colon (IPv6, or a port smuggled into a host). */
+export function isIpLiteralHost(host: string): boolean {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
+}
+
+/**
  * Validate a Jira site and return it normalised.
  *
  * Jira is the one provider we cannot host-pin — Data Center customers run it on
@@ -241,8 +256,7 @@ export function jiraSite(baseUrl: string): string {
    * correctly refused, and the vault-unsealed Jira credential went with it.
    */
   const host = url.hostname.replace(/\.+$/, '');
-  const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
-  if (isIpLiteral || INTERNAL_HOST.test(host) || !host.includes('.')) {
+  if (isIpLiteralHost(host) || isInternalHostname(host) || !host.includes('.')) {
     throw new IssueFilingError(
       `Refusing to send a Jira token to ${host}: use the public hostname of your Jira site.`,
     );

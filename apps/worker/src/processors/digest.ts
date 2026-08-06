@@ -50,6 +50,7 @@
 
 import { CronExpressionParser } from 'cron-parser';
 import { logger, prisma } from '../context.js';
+import { open as openSecret } from '../vault.js';
 // Pure modules from the API workspace — types and functions, no Prisma and no
 // Express — imported rather than copied for the same reason bisect.ts is. The
 // alternative is a second implementation of "is this a real failure", and two
@@ -57,6 +58,15 @@ import { logger, prisma } from '../context.js';
 import { isRealFailure } from '../../../api/src/lib/run-selection.js';
 import { resolveOwnershipFor } from '../../../api/src/lib/ownership.js';
 import type { OwnershipRuleInput } from '../../../api/src/lib/ownership.js';
+// Same rule for the chat credential envelope and the notification preference:
+// the API seals and writes them, notify.ts and this file read them, and all
+// three must agree on the shape.
+import {
+  decodeChatCredentials,
+  integrationAad,
+  parseChatConfig,
+  webhookHostAllowed,
+} from '../../../api/src/lib/chat-integrations.js';
 
 /** How far back a first-ever digest looks, and the ceiling on catching up. */
 const DEFAULT_WINDOW_MS = 24 * 60 * 60_000;
@@ -566,25 +576,12 @@ const VERDICT_PHRASE: Record<string, string> = {
  * customer's test suite — what broke, in which files. A config row must be able
  * to choose the PATH (that is the webhook token) and never the host.
  */
-function isPinnedHost(kind: string, hostname: string): boolean {
-  // A fully-qualified name may end in a dot and DNS resolves it identically, so
-  // strip it BEFORE comparing. One character defeating a hostname guard is not
-  // hypothetical here — see the trailing-dot note in apps/api/src/lib/issues.ts.
-  const host = hostname.toLowerCase().replace(/\.+$/, '');
-
-  if (kind === 'SLACK') return host === 'hooks.slack.com';
-  if (kind === 'DISCORD') return host === 'discord.com' || host === 'discordapp.com';
-  if (kind === 'MSTEAMS') {
-    return (
-      host === 'outlook.office.com' ||
-      host === 'outlook.office365.com' ||
-      host.endsWith('.webhook.office.com') ||
-      // Power Automate, which is what "Workflows" in Teams creates now that the
-      // Office connectors are being retired.
-      host.endsWith('.logic.azure.com')
-    );
-  }
-  return false;
+export function isPinnedHost(kind: string, hostname: string): boolean {
+  // The list itself lives in @qaai/shared (notifications.ts) — ONE list for
+  // the API's write-time validation, notify's send-time check and this one.
+  // The name is kept exported here because this file is where the pinning
+  // decision is explained.
+  return webhookHostAllowed(kind, hostname);
 }
 
 interface Destination {
@@ -600,17 +597,49 @@ interface SkippedDestination {
   reason: string;
 }
 
-export function partitionDestinations(
-  integrations: Array<{ id: string; kind: string; config: unknown }>,
-): { deliverable: Destination[]; skipped: SkippedDestination[] } {
+/**
+ * One candidate destination, as `destinationsFor` prepares it: the URL already
+ * unsealed from the vault (or the sentence saying why it could not be), and
+ * the integration's own digest preference already read. This function stays
+ * pure — decryption happens in the caller — so the decision table it encodes
+ * is testable without key material.
+ */
+export interface DigestCandidate {
+  id: string;
+  kind: string;
+  /** The unsealed webhook URL, or null when there is none to send to. */
+  url: string | null;
+  /** Why `url` is null, when the reason is worth a sentence of its own. */
+  urlProblem?: string | null;
+  /** The integration's `notify.digest` preference (§7). */
+  digest: boolean;
+}
+
+export function partitionDestinations(candidates: DigestCandidate[]): {
+  deliverable: Destination[];
+  skipped: SkippedDestination[];
+} {
   const deliverable: Destination[] = [];
   const skipped: SkippedDestination[] = [];
 
-  for (const integration of integrations) {
-    const config = (integration.config ?? {}) as { url?: unknown };
-    const raw = typeof config.url === 'string' ? config.url.trim() : '';
+  for (const candidate of candidates) {
+    /*
+     * The org-scoped preference first: an integration whose `notify.digest` is
+     * false asked not to hear this, and that outranks every question about
+     * whether it COULD. Skipped loudly like everything else here — a
+     * preference someone forgot they set looks exactly like a broken feature.
+     */
+    if (!candidate.digest) {
+      skipped.push({
+        id: candidate.id,
+        kind: candidate.kind,
+        reason:
+          'This integration has opted out of the digest in its notification preference.',
+      });
+      continue;
+    }
 
-    if (integration.kind === 'WEBHOOK') {
+    if (candidate.kind === 'WEBHOOK') {
       /*
        * Deliberately not supported yet, and skipped loudly rather than silently.
        *
@@ -620,32 +649,32 @@ export function partitionDestinations(
        * rather than one this feature inherits by reusing a code path.
        */
       skipped.push({
-        id: integration.id,
-        kind: integration.kind,
+        id: candidate.id,
+        kind: candidate.kind,
         reason:
           'Generic webhooks do not receive the digest. Point the digest at a Slack, Teams or Discord integration.',
       });
       continue;
     }
 
-    if (!raw) {
+    if (!candidate.url) {
       skipped.push({
-        id: integration.id,
-        kind: integration.kind,
-        reason: 'This integration has no webhook URL configured.',
+        id: candidate.id,
+        kind: candidate.kind,
+        reason: candidate.urlProblem || 'This integration has no webhook URL configured.',
       });
       continue;
     }
 
     let url: URL;
     try {
-      url = new URL(raw);
+      url = new URL(candidate.url);
     } catch {
       // Never echoes the URL: a webhook URL IS the credential, and this is
       // exactly where a malformed one carrying a token would be logged.
       skipped.push({
-        id: integration.id,
-        kind: integration.kind,
+        id: candidate.id,
+        kind: candidate.kind,
         reason: 'The webhook URL on this integration could not be parsed.',
       });
       continue;
@@ -653,25 +682,62 @@ export function partitionDestinations(
 
     if (url.protocol !== 'https:') {
       skipped.push({
-        id: integration.id,
-        kind: integration.kind,
+        id: candidate.id,
+        kind: candidate.kind,
         reason: 'The webhook URL must be https — the digest describes your test suite.',
       });
       continue;
     }
-    if (!isPinnedHost(integration.kind, url.hostname)) {
+    if (!isPinnedHost(candidate.kind, url.hostname)) {
       skipped.push({
-        id: integration.id,
-        kind: integration.kind,
-        reason: `${url.hostname.replace(/\.+$/, '')} is not a ${integration.kind} webhook host, so nothing was sent to it. Re-copy the incoming-webhook URL from ${integration.kind}.`,
+        id: candidate.id,
+        kind: candidate.kind,
+        reason: `${url.hostname.replace(/\.+$/, '')} is not a ${candidate.kind} webhook host, so nothing was sent to it. Re-copy the incoming-webhook URL from ${candidate.kind}.`,
       });
       continue;
     }
 
-    deliverable.push({ id: integration.id, kind: integration.kind, url: raw });
+    deliverable.push({ id: candidate.id, kind: candidate.kind, url: candidate.url });
   }
 
   return { deliverable, skipped };
+}
+
+/**
+ * Read the org's chat integrations into DigestCandidates: preference read,
+ * URL unsealed. The unseal happens only for kinds the digest can actually use
+ * — decrypting a WEBHOOK row's credentials just to skip it would be unsealing
+ * a secret on a path that never sends, the exact move this file refuses.
+ */
+export function candidateFor(
+  orgId: string,
+  integration: { id: string; kind: string; config: unknown; configEnc: string | null },
+): DigestCandidate {
+  const config = parseChatConfig(integration.config);
+  const base = {
+    id: integration.id,
+    kind: integration.kind,
+    digest: config.notify.digest,
+  };
+
+  if (!config.notify.digest || integration.kind === 'WEBHOOK') return { ...base, url: null };
+  if (!integration.configEnc) return { ...base, url: null };
+
+  try {
+    return {
+      ...base,
+      url: decodeChatCredentials(
+        openSecret(integration.configEnc, config.keyVersion, orgId, integrationAad(integration.id)),
+      ).url,
+    };
+  } catch {
+    return {
+      ...base,
+      url: null,
+      urlProblem:
+        'The stored webhook URL could not be decrypted — re-enter it on the integration.',
+    };
+  }
 }
 
 /**
@@ -730,6 +796,12 @@ async function deliver(
           event: 'digest.daily',
           payload: { text },
           signature: '',
+          // Decided in one attempt, never PENDING: the digest deliberately does
+          // not retry per destination — its retry is the window staying open,
+          // so tomorrow's digest carries today's news (see runDigest). A row
+          // left on the column's PENDING default would read as "still in
+          // flight" forever on the deliveries screen.
+          status: error ? 'FAILED' : 'SENT',
           responseStatus: status,
           attempts: 1,
           deliveredAt: error ? null : new Date(),
@@ -820,10 +892,12 @@ export async function runDigest(subscription: Subscription, now: Date): Promise<
       // An empty notifyVia means "wherever the failures already go".
       ...(subscription.notifyVia.length > 0 ? { id: { in: subscription.notifyVia } } : {}),
     },
-    select: { id: true, kind: true, config: true },
+    select: { id: true, kind: true, config: true, configEnc: true },
   });
 
-  const { deliverable, skipped } = partitionDestinations(integrations);
+  const { deliverable, skipped } = partitionDestinations(
+    integrations.map((integration) => candidateFor(subscription.orgId, integration)),
+  );
   for (const destination of skipped) {
     // Every skip is actionable and says what to change. A destination that is
     // quietly dropped is how a team concludes the digest does not work.

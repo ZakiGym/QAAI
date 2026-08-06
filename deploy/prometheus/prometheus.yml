@@ -1,0 +1,43 @@
+# Prometheus scrape config for QAAI. Wired in by the metrics override:
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.metrics.yml up -d
+#
+# ── Authentication: there is none, and that is the design ────────────────────
+# /metrics carries no token — no bearer_token, no basic_auth to wire here. The
+# header of apps/api/src/routes/health.ts is explicit about why: a scrape
+# config has no session, and giving Prometheus a credential means writing a
+# credential into a scrape config. In exchange, the endpoint publishes ONLY
+# non-tenant aggregates (every label is a closed vocabulary; no org, project,
+# test, branch or URL ever appears), and privacy comes from the NETWORK
+# boundary instead: this file targets api:4000 on the compose-internal
+# network, and the Caddy front door (deploy/caddy/Caddyfile) answers 404 for
+# /api/metrics from the internet. If you scrape from outside the compose
+# network, you are the one moving that boundary — put your own auth in front
+# (e.g. Caddy basic_auth on a hostname of its own).
+#
+# ── One target covers the workers too ────────────────────────────────────────
+# The worker has no HTTP listener. It publishes snapshots to short-TTL Redis
+# keys and the API renders them into the same /metrics body (the qaai_worker_*
+# series), so there is no worker target to add here. A worker that dies simply
+# drops out of the scrape — alert on qaai_workers_online, which is emitted
+# even at zero, not on the per-instance series that vanish.
+#
+# STATUS: parses as YAML (checked with a real parser). promtool is NOT
+# installed on the authoring machine, so `promtool check config` has never run
+# against this file — run it once wherever it exists:
+#
+#   docker compose exec prometheus promtool check config /etc/prometheus/prometheus.yml
+
+global:
+  # The API caches a rendered scrape for 2 seconds (METRICS_CACHE_MS in
+  # routes/health.ts) as flood protection; any interval of 5s or more always
+  # sees fresh numbers. 15s is plenty for queue depths that move in seconds
+  # and LLM spend that moves in hours.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: qaai-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:4000"]

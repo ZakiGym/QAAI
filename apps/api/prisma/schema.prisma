@@ -1137,6 +1137,17 @@ model Integration {
   @@index([orgId, kind])
 }
 
+/// Lifecycle of one outbound notification (§7). Mirrored as a union type in
+/// packages/shared/src/types.ts — `check:enums` diffs them. PENDING while
+/// retries remain, SENT on the 2xx that landed, FAILED once the last attempt is
+/// spent. There is no separate dead-letter store: a FAILED row, holding its
+/// final error, IS the dead letter.
+enum WebhookDeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
 model WebhookDelivery {
   id            String   @id @default(cuid())
   orgId         String
@@ -1145,6 +1156,7 @@ model WebhookDelivery {
   payload       Json
   /// HMAC-SHA256 signature sent with the request (§7 "signed").
   signature     String
+  status        WebhookDeliveryStatus @default(PENDING)
   responseStatus Int?
   attempts      Int      @default(0)
   deliveredAt   DateTime?

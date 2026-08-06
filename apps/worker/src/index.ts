@@ -20,14 +20,20 @@ import type {
   TriageJob,
 } from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
-import { armFlakeTick, armScheduleTick, closeProducers } from './queues.js';
+import {
+  DELIVERY_JOB,
+  armFlakeTick,
+  armScheduleTick,
+  closeProducers,
+  type DeliveryJob,
+} from './queues.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
 import { processRun, sweepStalledShardedRuns } from './processors/run.js';
 import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
-import { processNotify } from './processors/notify.js';
+import { processDelivery, processNotify } from './processors/notify.js';
 import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
 import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
@@ -41,6 +47,13 @@ import {
   processRetentionTick,
   type RetentionJob,
 } from './processors/retention.js';
+import {
+  BACKUP_QUEUE,
+  armBackupSweep,
+  closeBackupQueue,
+  processBackupTick,
+  type BackupTickJob,
+} from './processors/backup.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
@@ -49,7 +62,11 @@ const workers: Worker[] = [];
 function register<T>(
   name: string,
   concurrency: number,
-  handler: (payload: T) => Promise<void>,
+  // The job rides along for the handlers that need its metadata — the notify
+  // queue dispatches on job.name, and a delivery needs to know which attempt
+  // it IS (attemptsMade counts finished attempts, so this one is +1). Handlers
+  // that only want the payload just don't declare the parameter.
+  handler: (payload: T, job: Job<T>) => Promise<void>,
 ): void {
   const worker = new Worker(
     name,
@@ -57,7 +74,7 @@ function register<T>(
       const started = Date.now();
       logger.info({ queue: name, jobId: job.id }, 'job started');
       try {
-        await handler(job.data);
+        await handler(job.data, job);
         logger.info({ queue: name, jobId: job.id, ms: Date.now() - started }, 'job finished');
       } catch (err) {
         logger.error({ err, queue: name, jobId: job.id }, 'job failed');
@@ -68,8 +85,34 @@ function register<T>(
   );
 
   worker.on('failed', (job, err) => {
+    /*
+     * BullMQ fires 'failed' on every attempt, but only the FINAL one leaves the
+     * job dead in the failed set with nothing coming back for it — that is the
+     * line an operator writes an alert on, so it gets a message of its own with
+     * the queue, the job name and the error all in it. The retryable case keeps
+     * the old message (and its `attempts` field name) so a transient blip does
+     * not page anyone and existing log consumers see what they always saw.
+     *
+     * `attemptsMade` already counts the attempt that just failed, hence `>=`.
+     * A job BullMQ could not even hand back (`job` undefined) is treated as
+     * final — there is nothing left that could retry it.
+     */
+    const allowed = job?.opts.attempts ?? 1;
+    if (!job || job.attemptsMade >= allowed) {
+      logger.error(
+        {
+          queue: name,
+          jobId: job?.id,
+          jobName: job?.name,
+          attemptsMade: job?.attemptsMade,
+          err: err.message,
+        },
+        'job failed permanently',
+      );
+      return;
+    }
     logger.error(
-      { queue: name, jobId: job?.id, attempts: job?.attemptsMade, err: err.message },
+      { queue: name, jobId: job.id, attempts: job.attemptsMade, err: err.message },
       'job attempt failed',
     );
   });
@@ -93,7 +136,21 @@ register<CopilotJob>(QUEUE_NAMES.copilot, config.concurrency, processCopilot);
 // Inline edits are interactive — a user is staring at a spinner — so they get
 // their own lane rather than queueing behind a long copilot turn.
 register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
-register<NotifyJob>(QUEUE_NAMES.notify, config.concurrency, processNotify);
+// The notify queue carries two job shapes, told apart by NAME: the fan-out
+// (build the message, write one WebhookDelivery row per destination) and the
+// per-row delivery jobs it enqueues. Same queue on purpose — a second queue is
+// a second thing that can end up produced-but-undrained. The delivery handler
+// is given which attempt this is, because the attempt that exhausts the
+// retries is the one that must flip the row to FAILED (the dead-letter the
+// deliveries endpoint reads).
+register<NotifyJob | DeliveryJob>(QUEUE_NAMES.notify, config.concurrency, (payload, job) =>
+  job.name === DELIVERY_JOB
+    ? processDelivery(payload as DeliveryJob, {
+        attempt: job.attemptsMade + 1,
+        maxAttempts: job.opts.attempts ?? 1,
+      })
+    : processNotify(payload as NotifyJob, String(job.id ?? '')),
+);
 // One repeating sweep rather than a timer per schedule: timers drift, do not
 // survive a restart, and a scheduler that quietly stops is worse than none.
 //
@@ -158,6 +215,22 @@ void armRetentionSweep().catch((err) =>
   logger.error({ err }, 'could not arm the retention sweep'),
 );
 
+// The nightly database backup ("a backup command nobody runs is not a backup").
+// Concurrency 1: two dumps at once would double the load on Postgres for a copy
+// of the same data, and the CLI would refuse the second --out anyway. The same
+// tick also prunes StripeEventSeen replay-guard rows past Stripe's redelivery
+// horizon — the one cleanup that table has.
+//
+// Wrapped in an arrow so register()'s second argument (the BullMQ Job, which
+// the notify queue needs) is never mistaken for processBackupTick's own options
+// parameter — that slot is for tests to inject a fake backup runner, and a Job
+// object landing in it would be a silent no-op today and a confusing bug the
+// day either type grows a matching field.
+register<BackupTickJob>(BACKUP_QUEUE, 1, (payload) => processBackupTick(payload));
+// Repeatable daily job, de-duplicated by jobId, so arming on every boot is safe
+// and a restart cannot double-schedule.
+void armBackupSweep().catch((err) => logger.error({ err }, 'could not arm the backup tick'));
+
 logger.info(
   {
     concurrency: config.concurrency,
@@ -183,10 +256,11 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
     await Promise.all(workers.map((w) => w.close()));
     await closeProducers().catch(() => {});
-    // retention.ts builds its producer lazily and outside queues.ts, so
-    // closeProducers() does not know about it. Left open, it holds the process
-    // past the shutdown that is supposed to end it.
+    // retention.ts and backup.ts build their producers lazily and outside
+    // queues.ts, so closeProducers() does not know about them. Left open, they
+    // hold the process past the shutdown that is supposed to end it.
     await closeRetentionQueue().catch(() => {});
+    await closeBackupQueue().catch(() => {});
     await prisma.$disconnect().catch(() => {});
     connection.disconnect();
     process.exit(0);

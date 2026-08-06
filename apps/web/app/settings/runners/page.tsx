@@ -10,6 +10,8 @@ import {
   type MintedRunner,
   type Runner,
   type RunnerJob,
+  type WorkerQueueHealth,
+  type WorkerQueueHealthReport,
 } from '../../../lib/api';
 import { RunnerList, elapsed, heldJobsFor } from '../../../components/RunnerList';
 import { SetupHeader } from '../../../components/setup/SetupHeader';
@@ -53,6 +55,8 @@ export default function RunnersPage() {
 
   const [runners, setRunners] = useState<Runner[] | null>(null);
   const [jobs, setJobs] = useState<RunnerJob[]>([]);
+  /** Null means unavailable (a viewer below ADMIN, or the endpoint down) — hidden, never an error. */
+  const [workerQueues, setWorkerQueues] = useState<WorkerQueueHealth[] | null>(null);
   const [canManage, setCanManage] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -72,14 +76,19 @@ export default function RunnersPage() {
 
   const load = useCallback(async () => {
     try {
-      const [fleet, queue] = await Promise.all([
+      const [fleet, queue, health] = await Promise.all([
         api<{ runners: Runner[] }>('/runners'),
         // The queue sweep runs when this is fetched, which is how an org with
         // no runner left ever learns its jobs are unservable.
         api<{ jobs: RunnerJob[] }>('/runners/queue').catch(() => ({ jobs: [] as RunnerJob[] })),
+        // Soft on every failure — 403 for a non-admin, 503 while Redis is down,
+        // any 500. Queue telemetry is a bonus on this screen, and it must never
+        // be the reason the runner fleet stops rendering.
+        api<WorkerQueueHealthReport>('/health/queues').catch(() => null),
       ]);
       setRunners(fleet.runners);
       setJobs(queue.jobs);
+      setWorkerQueues(health ? health.queues : null);
       setNow(Date.now());
       setError(null);
     } catch (err) {
@@ -235,7 +244,7 @@ export default function RunnersPage() {
         </section>
 
         {/* ── The queue ────────────────────────────────────────────────────── */}
-        {!loading && <QueueSection queue={queue} now={now} />}
+        {!loading && <QueueSection queue={queue} workerQueues={workerQueues} now={now} />}
 
         {/* ── Getting one running ──────────────────────────────────────────── */}
         <p className="mt-3.5 flex flex-wrap items-baseline gap-x-2">
@@ -488,7 +497,15 @@ const STATUS_TEXT: Record<string, string> = {
   SKIPPED: 'text-flake',
 };
 
-function QueueSection({ queue, now }: { queue: Queue; now: number }) {
+function QueueSection({
+  queue,
+  workerQueues,
+  now,
+}: {
+  queue: Queue;
+  workerQueues: WorkerQueueHealth[] | null;
+  now: number;
+}) {
   const rows = [...queue.attention, ...queue.waiting, ...queue.inFlight];
 
   return (
@@ -513,7 +530,63 @@ function QueueSection({ queue, now }: { queue: Queue; now: number }) {
           )}
         </>
       )}
+      <WorkerQueues queues={workerQueues} now={now} />
     </section>
+  );
+}
+
+/**
+ * QAAI's own worker queues, under the runner queue they feed.
+ *
+ * A dead queue looks exactly like an idle one from the outside — both sit at
+ * zero active — so the block's whole job is to make permanent failures loud
+ * (one red row per queue holding them, led by the newest error, the same way
+ * QueueRow leads with the reason) while a healthy install gets one quiet mono
+ * line of totals and no rows at all.
+ *
+ * Renders nothing when `queues` is null: the health endpoint answers 403 below
+ * ADMIN and 503 while Redis is down, and queue telemetry must never be the
+ * reason the runner fleet stops rendering.
+ */
+function WorkerQueues({ queues, now }: { queues: WorkerQueueHealth[] | null; now: number }) {
+  if (!queues) return null;
+
+  const failing = queues.filter((q) => (q.counts?.failed ?? 0) > 0);
+  const unreadable = queues.filter((q) => q.counts === null).length;
+  const totals = queues.reduce(
+    (acc, q) => ({
+      waiting: acc.waiting + (q.counts?.waiting ?? 0),
+      active: acc.active + (q.counts?.active ?? 0),
+      failed: acc.failed + (q.counts?.failed ?? 0),
+    }),
+    { waiting: 0, active: 0, failed: 0 },
+  );
+
+  return (
+    <div className="mt-3">
+      {failing.map((q) => (
+        <div
+          key={q.queue}
+          className="border-line flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b py-2.5"
+        >
+          <p className="text-fail min-w-0 flex-1 text-[13px]">
+            {q.newestFailure?.error ?? 'jobs failed with no retrievable detail'}
+            <span className="text-ink-faint">
+              {' · '}
+              <span className="font-mono">{q.queue}</span>
+              {` · ${q.counts!.failed} failed job${q.counts!.failed === 1 ? '' : 's'}`}
+              {q.newestFailure?.failedAt && ` · newest ${elapsed(q.newestFailure.failedAt, now)} ago`}
+            </span>
+          </p>
+        </div>
+      ))}
+      <p className="text-ink-faint text-micro mt-2 font-mono tabular-nums">
+        worker queues · {totals.waiting} waiting · {totals.active} active ·{' '}
+        {totals.failed === 0 ? 'no failed jobs' : `${totals.failed} failed`}
+        {unreadable > 0 &&
+          ` · ${unreadable} queue${unreadable === 1 ? '' : 's'} unreadable`}
+      </p>
+    </div>
   );
 }
 

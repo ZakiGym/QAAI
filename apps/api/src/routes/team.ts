@@ -40,6 +40,7 @@ import { logger } from '../lib/logger.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
 import { clusterFailures } from '../lib/cluster.js';
 import type { FailureInput, FailureNetworkInput } from '../lib/cluster.js';
+import { notifyPrefsOf } from '../lib/chat-integrations.js';
 import {
   MAX_OWNERSHIP_RULES_PER_PROJECT,
   OwnershipRuleError,
@@ -998,7 +999,7 @@ teamRouter.get('/digest', async (req, res) => {
   const digest = await prisma.digestSubscription.findUnique({ where: { projectId } });
   const destinations = await prisma.integration.findMany({
     where: { enabled: true, kind: { in: ['SLACK', 'MSTEAMS', 'DISCORD', 'WEBHOOK'] } },
-    select: { id: true, kind: true, name: true },
+    select: { id: true, kind: true, name: true, config: true },
   });
 
   res.json({
@@ -1007,10 +1008,15 @@ teamRouter.get('/digest', async (req, res) => {
     // than asking someone to paste an integration id — and each one says whether
     // the digest can actually use it, because a picker that offers a
     // destination the worker will skip is how a team concludes the feature is
-    // broken.
+    // broken. `optedOut` is the integration's own notify.digest preference —
+    // the second reason the worker skips a destination, surfaced for the same
+    // reason `supported` is.
     destinations: destinations.map((destination) => ({
-      ...destination,
+      id: destination.id,
+      kind: destination.kind,
+      name: destination.name,
       supported: DIGEST_CAPABLE.has(destination.kind),
+      optedOut: !notifyPrefsOf(destination.config).digest,
       ...(DIGEST_CAPABLE.has(destination.kind)
         ? {}
         : { unsupportedReason: GENERIC_WEBHOOK_REASON }),
@@ -1040,18 +1046,27 @@ teamRouter.put('/digest', async (req, res) => {
   if (input.notifyVia?.length) {
     const known = await prisma.integration.findMany({
       where: { id: { in: input.notifyVia } },
-      select: { id: true, kind: true },
+      select: { id: true, kind: true, config: true },
     });
     const missing = input.notifyVia.filter((id) => !known.some((k) => k.id === id));
     if (missing.length > 0) {
       throw badRequest(`No integration in this org with the id ${missing.join(', ')}.`);
     }
     // Refused here rather than skipped at 8am. A digest pointed exclusively at
-    // destinations the worker cannot use is a digest that will never arrive, and
-    // finding that out from an empty channel is the worst possible way to learn
-    // it. A mix is allowed — the usable ones still get it.
-    if (!known.some((integration) => DIGEST_CAPABLE.has(integration.kind))) {
-      throw badRequest(GENERIC_WEBHOOK_REASON);
+    // destinations the worker cannot use — or that have opted out of the digest
+    // in their own notification preference — is a digest that will never
+    // arrive, and finding that out from an empty channel is the worst possible
+    // way to learn it. A mix is allowed — the usable ones still get it.
+    const usable = known.filter(
+      (integration) =>
+        DIGEST_CAPABLE.has(integration.kind) && notifyPrefsOf(integration.config).digest,
+    );
+    if (usable.length === 0) {
+      throw badRequest(
+        known.some((integration) => DIGEST_CAPABLE.has(integration.kind))
+          ? 'Every selected integration has opted out of the digest in its notification preference. Turn the digest back on for one of them, or pick another destination.'
+          : GENERIC_WEBHOOK_REASON,
+      );
     }
   }
 

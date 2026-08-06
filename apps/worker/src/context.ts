@@ -35,6 +35,14 @@ export const config = {
   logLevel: process.env.LOG_LEVEL ?? 'info',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? '',
   vaultMasterKey: required('VAULT_MASTER_KEY'),
+  // Nightly database backups (processors/backup.ts). Empty means "not
+  // configured", which the backup tick reports at warn once a day rather than
+  // silently skipping — an unconfigured backup must be loud.
+  backupDir: process.env.QAAI_BACKUP_DIR ?? '',
+  // How many timestamped backup directories survive the nightly prune. `|| 7`
+  // catches NaN and 0 alike; the processor additionally clamps to >= 1 so no
+  // value of this can ever mean "delete the backup we just wrote".
+  backupKeep: Number(process.env.QAAI_BACKUP_KEEP ?? 7) || 7,
 };
 
 export const logger = pino({

@@ -50,9 +50,12 @@ import { Router } from 'express';
 import IORedis from 'ioredis';
 import { QUEUE_NAMES, RUN_STATUSES } from '@qaai/shared';
 import { env } from '../env.js';
+import { ApiError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { prisma, unscoped } from '../lib/prisma.js';
-import { pingRedis, queueDepths } from '../lib/queues.js';
+import { collectQueueHealth } from '../lib/queue-health.js';
+import { operatorQueues, pingRedis, queueDepths } from '../lib/queues.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { subscriberCount } from '../lib/events.js';
 import { RUNNER_ONLINE_MS } from '../lib/runners.js';
 import {
@@ -536,3 +539,53 @@ healthRouter.get('/metrics', async (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.send(metricsCache.body);
 });
+
+// ─── GET /health/queues — queue health, with the failures attached ───────────
+//
+// The report /metrics cannot serve: per queue, what is waiting, executing and
+// permanently failed, plus the newest failed job's name, error and timestamp.
+// Without the error text a dead queue is indistinguishable from an idle one,
+// and the error text is exactly why this endpoint CANNOT follow its siblings
+// above into being unauthenticated — a failed job's reason can carry whatever
+// the processor threw, including a customer URL, and the standing rule on this
+// file is that the unauthenticated surface publishes aggregates only.
+//
+// So: org-agnostic like /metrics (queues are install infrastructure, not tenant
+// data), but session-authenticated at ADMIN or better, on its OWN router. It is
+// mounted in index.ts BEHIND the rate limiter and attachActor, not beside the
+// probes in front of them — an endpoint that resolves sessions and reads Redis
+// has no business being exempt from the limiter, and the kubelet never calls it.
+
+export const queueHealthRouter: Router = Router();
+
+/**
+ * The producer connection retries forever (`maxRetriesPerRequest: null`), so
+ * with Redis down the reads below never reject — they wait. This bound is what
+ * turns "Redis is down" into a fast 503 instead of a hung poll from every open
+ * runners screen.
+ */
+const QUEUE_HEALTH_TIMEOUT_MS = 3_000;
+
+queueHealthRouter.get(
+  '/health/queues',
+  requireAuth,
+  requireRole('ADMIN'),
+  async (_req, res, next) => {
+    try {
+      const report = await withTimeout(
+        collectQueueHealth(operatorQueues()),
+        QUEUE_HEALTH_TIMEOUT_MS,
+        'queue health',
+      );
+      // A reading, not a resource; a cached one says "healthy" about the past.
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(report);
+    } catch (err) {
+      logger.warn({ err }, 'queue health collection failed');
+      // 503 rather than the opaque 500 the terminal handler would mint: the
+      // caller (the runners screen, a curl in a runbook) should read this as
+      // "Redis did not answer", not as a bug in the API.
+      next(new ApiError(503, 'QUEUE_HEALTH_UNAVAILABLE', 'Queue health is unavailable'));
+    }
+  },
+);

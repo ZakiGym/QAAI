@@ -127,6 +127,50 @@ export async function enqueueNotify(job: NotifyJob): Promise<void> {
 }
 
 /**
+ * One webhook/chat POST, addressed by its WebhookDelivery row (§7).
+ *
+ * The notify processor no longer sends inline: it writes a PENDING row per
+ * destination and enqueues one of these per row, so a failed send is retried by
+ * the QUEUE — with backoff, without holding a worker slot through the wait, and
+ * surviving a worker restart — rather than by sleeping in-process. The job
+ * carries ids only (see the header of packages/shared/src/jobs.ts); the
+ * processor re-reads the row and the integration, so an admin who fixes a bad
+ * webhook URL mid-retry gets the retry delivered to the fixed URL.
+ *
+ * These ride the notify queue under their own job NAME rather than a queue of
+ * their own: the queue already has a consumer, and a second queue is a second
+ * thing that can end up produced-but-undrained (the bisect lesson check:wiring
+ * exists for).
+ *
+ * The job id pins idempotency to the row: a redelivered or retried notify job
+ * that re-enqueues the same delivery collapses onto the one job instead of
+ * double-posting.
+ */
+export const DELIVERY_JOB = 'notify.deliver';
+
+/**
+ * Attempts per delivery. With the exponential backoff below (1m base) the five
+ * attempts spread over ~15 minutes — long enough to ride out a Slack blip,
+ * short enough that a page about a red build is not an hour late. After the
+ * last one the row is marked FAILED and nothing retries it again.
+ */
+export const DELIVERY_ATTEMPTS = 5;
+
+export interface DeliveryJob {
+  orgId: string;
+  /** The WebhookDelivery row this job exists to fulfil and record into. */
+  deliveryId: string;
+}
+
+export async function enqueueDelivery(job: DeliveryJob): Promise<void> {
+  await notifyQueue.add(DELIVERY_JOB, job, {
+    jobId: `deliver-${job.deliveryId}`,
+    attempts: DELIVERY_ATTEMPTS,
+    backoff: { type: 'exponential', delay: 60_000 },
+  });
+}
+
+/**
  * Arm the scheduler sweep. A BullMQ repeatable job survives restarts and
  * de-duplicates by key, so calling this on every boot is safe and means the
  * sweep exists as long as a worker does.

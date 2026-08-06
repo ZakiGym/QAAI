@@ -59,6 +59,15 @@ const PAIRS: Array<{
   // a database value TypeScript does not know about would be an org whose
   // billing screen cannot say what state it is in.
   { prismaEnum: 'BillingState', tsConst: 'BillingState', source: 'types', kind: 'union' },
+  // Outbound deliveries (§7). The worker writes it on every attempt and the
+  // deliveries read path renders it; a database value TypeScript does not know
+  // about would be a delivery whose state the screen cannot name.
+  {
+    prismaEnum: 'WebhookDeliveryStatus',
+    tsConst: 'WebhookDeliveryStatus',
+    source: 'types',
+    kind: 'union',
+  },
   // SSO (§1). The admin API validates `protocol` against SSO_PROTOCOLS, so a
   // value in the database enum that TypeScript does not know about is a
   // connection nobody can log in through.

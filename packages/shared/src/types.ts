@@ -276,6 +276,19 @@ export interface RunSummary {
  */
 export type BillingState = 'OK' | 'PAST_DUE';
 
+// ─── Outbound notifications (§7) ─────────────────────────────────────────────
+
+/**
+ * Lifecycle of one outbound webhook/chat delivery. Mirrors the
+ * `WebhookDeliveryStatus` enum in `apps/api/prisma/schema.prisma`
+ * (`check:enums` diffs them).
+ *
+ * PENDING while retry attempts remain, SENT on the 2xx that landed, FAILED
+ * once the last attempt is spent. A FAILED row holds its final error and IS
+ * the dead letter — there is no separate dead-letter store to consult.
+ */
+export type WebhookDeliveryStatus = 'PENDING' | 'SENT' | 'FAILED';
+
 // ─── Build sharding (§5) ─────────────────────────────────────────────────────
 
 /**

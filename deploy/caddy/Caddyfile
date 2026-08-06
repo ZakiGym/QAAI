@@ -1,0 +1,70 @@
+# The QAAI front door — automatic HTTPS for the cockpit and the API on one
+# domain. Enabled by deploy/docker-compose.tls.yml; see deploy/README.md
+# ("The front door") for the full setup, including the NEXT_PUBLIC_API_URL
+# rebuild this requires.
+#
+# Caddy obtains and renews certificates on its own (Let's Encrypt / ZeroSSL).
+# The only input it needs is QAAI_DOMAIN — a DNS name that resolves to this
+# host — supplied through the compose override.
+#
+# STATUS: written and reviewed, never executed. No caddy binary and no docker
+# exist on the machine this was written on, so even `caddy validate` has not
+# run. Validate it on first deploy before trusting it:
+#
+#   docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+
+{
+	# Certificate-expiry warnings from the CA reach a human. Optional, but an
+	# expired certificate is an outage with a two-week warning nobody received.
+	# email ops@example.com
+}
+
+{$QAAI_DOMAIN} {
+	encode zstd gzip
+
+	# HSTS scoped to exactly this host — no includeSubDomains, no preload — so
+	# putting QAAI on a subdomain can never break an unrelated site that still
+	# serves plain HTTP somewhere under the same registered domain.
+	header Strict-Transport-Security "max-age=31536000"
+
+	# /metrics is served WITHOUT authentication by design: a Prometheus scrape
+	# config has no session, and giving it a credential means writing a
+	# credential into a scrape config — see the header of
+	# apps/api/src/routes/health.ts. In exchange the endpoint publishes only
+	# non-tenant aggregates and relies on the NETWORK boundary for privacy. The
+	# compose-internal network is that boundary; the public internet is not.
+	# Blocked here so "one domain in front of everything" does not quietly
+	# publish operational metrics. Prometheus never needs this hostname — it
+	# scrapes api:4000 directly over the compose network.
+	#
+	# The trailing * is load-bearing: Express matches /metrics/ (trailing
+	# slash) with strict routing off, so an exact-path matcher here would leave
+	# /api/metrics/ as a bypass.
+	handle /api/metrics* {
+		respond 404
+	}
+
+	# The API, under /api — matching NEXT_PUBLIC_API_URL=https://<domain>/api
+	# in deploy/.env.example. handle_path strips the prefix, so the API keeps
+	# serving /auth, /runs, /webhooks… at its root exactly as it does locally,
+	# and external webhook URLs become https://<domain>/api/webhooks/….
+	#
+	# Caddy is exactly one proxy hop, which is what the API already trusts
+	# (`app.set('trust proxy', 1)` in apps/api/src/index.ts): req.ip is the
+	# real client, so the rate limiter buckets callers, not this proxy.
+	handle_path /api/* {
+		reverse_proxy api:4000 {
+			# Disable response buffering. The cockpit holds server-sent-event
+			# streams open against the API; a buffered SSE stream is an event
+			# feed that arrives all at once when the connection finally dies.
+			flush_interval -1
+		}
+	}
+
+	# Everything else is the cockpit. The bundled demo store is deliberately
+	# not proxied: it is a local practice target for QAAI itself, not part of
+	# the product surface, and it stays on 127.0.0.1:5050.
+	handle {
+		reverse_proxy web:3000
+	}
+}

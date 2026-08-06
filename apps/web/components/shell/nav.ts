@@ -96,10 +96,11 @@ export const NAV: NavItemDef[] = [
     href: '/environments',
     label: 'Setup',
     Icon: IconServer,
-    owns: ['/source-control', '/settings/runners', '/settings/github', '/onboarding'],
+    owns: ['/source-control', '/integrations', '/settings/runners', '/settings/github', '/onboarding'],
     tabs: [
       { href: '/environments', label: 'Environments' },
       { href: '/source-control', label: 'Source control' },
+      { href: '/integrations', label: 'Integrations' },
       { href: '/settings/runners', label: 'Runners' },
       { href: '/onboarding', label: 'Add app' },
     ],

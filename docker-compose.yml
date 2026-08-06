@@ -87,9 +87,37 @@ x-app-build: &app-build
 
 services:
   # ─── Datastores ────────────────────────────────────────────────────────────
+  #
+  # Every long-running service below carries a MEMORY limit, sized for a small
+  # single-node install (a handful of orgs, one worker). Two deliberate choices:
+  #
+  #   - Memory is limited because it fails badly without a bound: one leaking
+  #     process invites the kernel OOM killer, which picks its own victim —
+  #     historically the process whose death hurts most, i.e. Postgres. A
+  #     per-service limit turns "the box died" into "one container restarted",
+  #     which `restart: unless-stopped` then handles.
+  #   - CPU is deliberately NOT limited. CPU contention degrades gracefully
+  #     through the scheduler, while a throttled worker turns real browser
+  #     timeouts into flaky test verdicts — the product failing at its one job —
+  #     and a throttled healthcheck reads as an outage that isn't one.
+  #
+  # The one-shot jobs (migrate, minio-init, seed) carry no limit on purpose: an
+  # OOM-killed migration is a half-applied migration, strictly worse than a
+  # briefly greedy one.
+  #
+  # None of these limits has been exercised under load (no docker on the
+  # authoring machine — see deploy/README.md's ledger); the numbers are budgets,
+  # not measurements. If a service is OOM-killed in practice, raise its limit
+  # and treat the old number as the measurement this machine could not take.
   postgres:
-    image: postgres:17-alpine
+    # Pinned to a specific minor, not `17-alpine`: a datastore that can jump
+    # minors on an unrelated `docker compose pull` is a behaviour change nobody
+    # scheduled. Bump deliberately, with a fresh backup taken first.
+    image: postgres:17.2-alpine
     restart: unless-stopped
+    # Postgres at compose scale runs comfortably here — default shared_buffers
+    # is 128MB and the API's connection count is small.
+    mem_limit: 512m
     environment:
       POSTGRES_USER: qaai
       POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — generate with: openssl rand -hex 24}'
@@ -106,8 +134,15 @@ services:
     # docker-compose.override.yml.example if you need psql from outside.
 
   redis:
-    image: redis:7-alpine
+    # Same reasoning as postgres: pin the minor, bump deliberately.
+    image: redis:7.4-alpine
     restart: unless-stopped
+    # Redis holds BullMQ queues and worker heartbeats — small data, but it must
+    # never evict: an evicted key is a silently lost job. So the bound is a
+    # container-level backstop and there is deliberately NO redis-side
+    # maxmemory/eviction policy. If this limit is ever hit, the fix is finding
+    # what grew, not letting Redis pick keys to drop.
+    mem_limit: 256m
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - qaai-redisdata:/data
@@ -118,10 +153,24 @@ services:
       retries: 20
 
   minio:
-    # TODO before production: pin to a dated RELEASE.* tag. `latest` means the
-    # storage layer can change under you on an unrelated `docker compose pull`.
+    # Still `latest`, and here is the honest reason: MinIO publishes only dated
+    # RELEASE.* tags (plus `latest`) — there is no stable minor line to pin the
+    # way postgres/redis above are pinned — and the machine this was written on
+    # has no docker with which to ask the registry which dated tag is current.
+    # Naming one from memory risks pinning to a tag that does not exist, which
+    # fails later and more confusingly than `latest` does. Before production,
+    # pin by DIGEST instead, which is stronger than any tag:
+    #
+    #   docker pull minio/minio:latest
+    #   docker image inspect --format '{{index .RepoDigests 0}}' minio/minio:latest
+    #   # replace the line below with the printed value:
+    #   # image: minio/minio@sha256:<digest>
+    #
+    # Give minio/mc in minio-init the same treatment.
     image: minio/minio:latest
     restart: unless-stopped
+    # Artifact PUT/GET at one-worker scale; MinIO idles far below this.
+    mem_limit: 512m
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: '${MINIO_ROOT_USER:?set MINIO_ROOT_USER — see deploy/.env.example}'
@@ -137,6 +186,8 @@ services:
 
   # One-shot: create the artifacts bucket, then exit.
   minio-init:
+    # `latest` for the same reason as minio above; pin by digest when you can
+    # ask a registry. No mem_limit: one-shot (see the datastores header).
     image: minio/mc:latest
     depends_on:
       minio: { condition: service_healthy }
@@ -190,6 +241,9 @@ services:
     environment:
       <<: *app-env
       API_PORT: "4000"
+    # Node RSS for the API sits well under half of this; the headroom is for
+    # artifact streaming and the scrape-time metric aggregates.
+    mem_limit: 512m
     ports:
       - "${API_BIND:-127.0.0.1}:4000:4000"
     volumes:
@@ -223,6 +277,22 @@ services:
     environment:
       <<: *app-env
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      # Nightly database backups (worker-only — the API never reads these).
+      # Blank means no backup runs and the worker's log says so at warn once a
+      # day. NOTE the honest caveat, kept in deploy/README.md's unproven list:
+      # this image does not currently ship pg_dump, so an in-container backup
+      # fails loudly with an install hint until the postgres-17 client tools
+      # are added to the runtime layer. Point QAAI_BACKUP_DIR at a bind mount
+      # on storage that does not share a disk with the postgres volume.
+      QAAI_BACKUP_DIR: ${QAAI_BACKUP_DIR:-}
+      QAAI_BACKUP_KEEP: ${QAAI_BACKUP_KEEP:-7}
+    # Budget ~500MB per WORKER_CONCURRENCY slot (each slot drives a Chromium),
+    # PLUS /dev/shm below — tmpfs pages count against this same cgroup. At the
+    # default 4 slots: 4 × 500MB + 1GB shm ≈ 3GB, so 4g leaves headroom.
+    # mem_limit cannot do arithmetic, so this is an env knob rather than a
+    # constant: raise it in step with WORKER_CONCURRENCY, or shrink both on a
+    # small box (WORKER_CONCURRENCY=2 fits in 2g).
+    mem_limit: ${WORKER_MEM_LIMIT:-4g}
     # Chromium needs more than Docker's default 64MB of /dev/shm; below roughly
     # 256MB it crashes on content-heavy pages with no useful error.
     shm_size: 1gb
@@ -245,6 +315,8 @@ services:
       NODE_ENV: production
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
       WEB_PUBLIC_URL: ${WEB_PUBLIC_URL:-http://localhost:3000}
+    # A Next server rendering a cockpit for a handful of concurrent humans.
+    mem_limit: 512m
     ports:
       - "${WEB_BIND:-127.0.0.1}:3000:3000"
     depends_on:
@@ -262,6 +334,8 @@ services:
       DEMO_PORT: "5050"
       DEMO_SMTP_PORT: "5051"
       DEMO_PLANTED_BUG: ${DEMO_PLANTED_BUG:-true}
+    # A toy store with in-memory state; the smallest budget here.
+    mem_limit: 256m
     ports:
       - "${DEMO_BIND:-127.0.0.1}:5050:5050"
       - "${DEMO_BIND:-127.0.0.1}:5051:5051"

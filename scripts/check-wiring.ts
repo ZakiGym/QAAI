@@ -137,13 +137,15 @@ const KNOWN_GAPS: KnownGap[] = [
     remediation:
       'Either key the session token hash with it — a session-only HMAC, NOT hashToken(), which also hashes API keys and would invalidate every issued key — or drop it from env.ts and correct the claim in deploy/.env.example. Do not just delete it quietly: installs already set it, and its removal silently changes what boots.',
   },
-  {
-    check: 'prisma-models',
-    what: 'WebhookDelivery',
-    why: 'Write-only. notify.ts and digest.ts record every outbound delivery with its status, attempts and last error, and no endpoint or screen ever reads a row back — so the one table that could answer "did my Slack notification go out?" cannot be asked.',
-    remediation:
-      'Add GET /integrations/:id/deliveries (owner of routes/integrations.ts), or stop writing the rows.',
-  },
+  /*
+   * WebhookDelivery was here. It said "notify.ts and digest.ts record every
+   * outbound delivery … and no endpoint or screen ever reads a row back", and
+   * that is no longer true: the worker's retry path (processDelivery in
+   * apps/worker/src/processors/notify.ts) reads each row back on every
+   * attempt and dead-letters the ones that never land. The customer-facing
+   * read — GET /integrations/:id/deliveries — is the remaining half, owned by
+   * routes/integrations.ts.
+   */
 ];
 
 /** Params filled with this cannot resolve to a row, so a probed handler 404s. */
