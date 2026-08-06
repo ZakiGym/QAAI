@@ -17,8 +17,8 @@ import {
   TEST_TYPES,
   UI_FRAMEWORKS,
   VERDICTS,
-} from './constants.js';
-import { SELECTOR_STRATEGIES } from './flow-map.js';
+} from './constants';
+import { SELECTOR_STRATEGIES } from './flow-map';
 
 const slug = z
   .string()
@@ -442,6 +442,51 @@ export const apiTestSpecSchema = z.object({
   steps: z.array(apiRequestStepSchema).min(1),
 });
 export type ApiTestSpec = z.infer<typeof apiTestSpecSchema>;
+
+// ─── Accessibility & security smoke — authoring schemas (§4) ─────────────────
+
+/**
+ * The two plugins these describe (accessibility.ts, security-smoke.ts) parse
+ * `test.spec` by hand and are slightly MORE permissive than this — the a11y
+ * plugin silently drops non-string routes, for example. These schemas are the
+ * strict authoring subset the Generator is held to: anything valid here is
+ * valid there, so a generated spec can never be one the plugin rejects.
+ * apps/worker/src/processors/generate.test.ts pins that subset relationship
+ * against each plugin's own validate().
+ */
+export const accessibilityTestSpecSchema = z.object({
+  /** Routes the axe scan visits. The plugin refuses an empty list. */
+  routes: z.array(z.string().min(1)).min(1).max(50),
+  /** axe rule tags. Omitted means the plugin's WCAG 2.1 AA default. */
+  tags: z.array(z.string().min(1)).max(20).optional(),
+});
+export type AccessibilityTestSpec = z.infer<typeof accessibilityTestSpecSchema>;
+
+const idorProbeSchema = z.object({
+  /** Path template containing `{id}`, e.g. `/orders/{id}`. */
+  template: z
+    .string()
+    .min(1)
+    .refine((t) => t.includes('{id}'), 'must contain the {id} placeholder'),
+  /** Object ids fetched anonymously through the template. */
+  ids: z.array(z.string().min(1)).min(1).max(50),
+  /** A 2xx whose body contains this marks the probe as an exposure. */
+  mustNotContain: z.string().min(1).optional(),
+});
+
+export const securitySmokeSpecSchema = z
+  .object({
+    /** Paths that must NOT be reachable without a session. */
+    authRequiredPaths: z.array(z.string().min(1)).max(100).default([]),
+    idorProbes: z.array(idorProbeSchema).max(50).default([]),
+    /** Paths whose response headers and cookies are inspected. */
+    headerPaths: z.array(z.string().min(1)).max(100).default([]),
+  })
+  .refine(
+    (s) => s.authRequiredPaths.length + s.idorProbes.length + s.headerPaths.length > 0,
+    'must define at least one check — authRequiredPaths, idorProbes, or headerPaths',
+  );
+export type SecuritySmokeSpec = z.infer<typeof securitySmokeSpecSchema>;
 
 // ─── Email / OTP (§4) ────────────────────────────────────────────────────────
 

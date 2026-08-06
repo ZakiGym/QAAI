@@ -266,6 +266,9 @@ interface AgentSpend {
   days: number;
   totalCalls: number;
   totalCostCents: number;
+  /** QAAI_MONTHLY_TOKEN_BUDGET on the API; 0 means no ceiling is set. */
+  monthlyTokenBudget: number;
+  tokensThisMonth: number;
   byAgent: Array<{
     agent: string;
     calls: number;
@@ -412,6 +415,14 @@ function AgentSpendSection() {
   return (
     <section className="mt-[30px]">
       <SectionLabel>{spend ? `Model spend · last ${spend.days} days` : 'Model spend'}</SectionLabel>
+      {/* The ceiling, only when one is set — the same numbers the API's budget gate compares. */}
+      {spend && spend.monthlyTokenBudget > 0 && (
+        <p className="text-ink-faint text-micro mb-1.5 font-mono tabular-nums">
+          budget: {spend.tokensThisMonth.toLocaleString()} of{' '}
+          {spend.monthlyTokenBudget.toLocaleString()} tokens used this month
+          (QAAI_MONTHLY_TOKEN_BUDGET)
+        </p>
+      )}
       {!spend ? (
         <SkeletonRows rows={2} />
       ) : spend.byAgent.length === 0 ? (

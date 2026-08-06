@@ -469,6 +469,22 @@ async function recordAgentCall(record: AgentCallRecord & { error?: string }): Pr
   }
 }
 
+/**
+ * Month-to-date tokens for the budget gate — the same row recordAgentCall
+ * increments, read `unscoped` for the same reason that write is: the orgId
+ * comes from the call context the service was handed, not from whichever
+ * tenant scope happens to be live when the gate runs.
+ */
+async function monthTokens(orgId: string): Promise<number> {
+  const row = await unscoped(() =>
+    prisma.usageRecord.findUnique({
+      where: { orgId_metric_period: { orgId, metric: 'agent_tokens', period: currentPeriod() } },
+      select: { quantity: true },
+    }),
+  );
+  return Number(row?.quantity ?? 0n);
+}
+
 let llmSingleton: ReturnType<typeof createLlmService> | null = null;
 function llmService(): ReturnType<typeof createLlmService> {
   llmSingleton ??= createLlmService(
@@ -480,6 +496,7 @@ function llmService(): ReturnType<typeof createLlmService> {
       QAAI_MONTHLY_TOKEN_BUDGET: env.QAAI_MONTHLY_TOKEN_BUDGET,
     },
     recordAgentCall,
+    monthTokens,
   );
   return llmSingleton;
 }

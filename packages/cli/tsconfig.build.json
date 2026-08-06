@@ -1,0 +1,16 @@
+{
+  // The publishable build. The sibling tsconfig.json stays noEmit for the
+  // repo-wide typecheck sweep; this one exists so `npm run build` can produce
+  // the dist/ the bin actually points at — `bin: src/index.ts` shipped TypeScript
+  // to customers, and `npx qaai` died on the first import for anyone without tsx.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    // The CLI's only @qaai/shared imports are `import type`, erased here — which
+    // is what lets dist/ run with zero runtime dependencies.
+    "verbatimModuleSyntax": true
+  },
+  "exclude": ["src/**/*.test.ts"]
+}

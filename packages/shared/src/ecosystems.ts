@@ -47,8 +47,8 @@
  * executable is `python`, and inside an activated venv either name works.
  */
 
-import type { Language, TestType } from './constants.js';
-import type { ExternalReportFormat } from './schemas.js';
+import type { Language, TestType } from './constants';
+import type { ExternalReportFormat } from './schemas';
 
 // ─── Report formats ──────────────────────────────────────────────────────────
 

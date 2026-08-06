@@ -30,6 +30,9 @@ const GLOBAL_MODELS = new Set([
   'VerificationToken',
   'Organization', // scoped by `id`, not `orgId` — handled separately
   'FeatureFlag',
+  // Webhook replay guard. A Stripe event id arrives before we know which org
+  // it is for, so the table has no orgId to scope by.
+  'StripeEventSeen',
 ]);
 
 /**

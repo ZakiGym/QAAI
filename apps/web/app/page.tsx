@@ -1,33 +1,61 @@
 import Link from 'next/link';
+import { PLAN_LIMITS } from '@qaai/shared/constants';
 
 /**
  * Landing page (§10). The three things a QA lead needs to believe in the first
  * ten seconds: it finds real bugs, it tells you why, and you keep the code.
+ *
+ * Every price and limit below comes from PLAN_LIMITS — the same table the
+ * billing screen renders and checkout charges from. This page used to carry
+ * its own copies of the numbers, which is how a marketing page ends up
+ * advertising a price the card is not billed.
+ *
+ * Imported via the `@qaai/shared/constants` subpath, not the package barrel:
+ * the barrel re-exports with NodeNext-style `./x.js` specifiers that neither
+ * Turbopack nor webpack resolve to `.ts` here, while constants.ts itself
+ * imports nothing — so the subpath resolves cleanly under transpilePackages.
  */
+
+const price = (usd: number | null): string => (usd === null ? 'Contact' : `$${usd}`);
 
 const PLANS = [
   {
-    name: 'Free',
-    price: '$0',
+    name: PLAN_LIMITS.FREE.label,
+    price: price(PLAN_LIMITS.FREE.monthlyPriceUsd),
     tagline: 'The hook',
-    features: ['1 project', '100 E2E runs/mo', 'Community support'],
+    features: [
+      `${PLAN_LIMITS.FREE.maxProjects} project`,
+      `${PLAN_LIMITS.FREE.maxRunsPerMonth} E2E runs/mo`,
+      'Community support',
+    ],
   },
   {
-    name: 'Team',
-    price: '$349',
+    name: PLAN_LIMITS.TEAM.label,
+    price: price(PLAN_LIMITS.TEAM.monthlyPriceUsd),
     tagline: 'Unlimited CI runs — no credit model',
-    features: ['3 projects', 'Unlimited CI runs', 'All test types', '5 parallel workers'],
+    features: [
+      `${PLAN_LIMITS.TEAM.maxProjects} projects`,
+      'Unlimited CI runs',
+      'All test types',
+      `${PLAN_LIMITS.TEAM.maxParallelWorkers} parallel workers`,
+    ],
     highlight: true,
   },
   {
-    name: 'Business',
-    price: '$999',
+    name: PLAN_LIMITS.BUSINESS.label,
+    price: price(PLAN_LIMITS.BUSINESS.monthlyPriceUsd),
     tagline: 'For orgs with compliance needs',
-    features: ['10 projects', '15 workers', 'SSO', 'Audit log', 'Priority support'],
+    features: [
+      `${PLAN_LIMITS.BUSINESS.maxProjects} projects`,
+      `${PLAN_LIMITS.BUSINESS.maxParallelWorkers} workers`,
+      'SSO',
+      'Audit log',
+      'Priority support',
+    ],
   },
   {
-    name: 'Enterprise',
-    price: 'Contact',
+    name: PLAN_LIMITS.ENTERPRISE.label,
+    price: price(PLAN_LIMITS.ENTERPRISE.monthlyPriceUsd),
     tagline: 'On-prem runners, custom retention',
     features: ['SSO / SAML', 'On-prem runner agents', 'Custom retention', 'DPA'],
   },

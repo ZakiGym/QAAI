@@ -4,12 +4,20 @@
   "description": "Run QAAI test suites from any CI",
   "type": "module",
   "bin": {
-    "qaai": "src/index.ts"
+    "qaai": "dist/index.js"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-  "dependencies": {
+  "files": [
+    "dist"
+  ],
+  "devDependencies": {
     "@qaai/shared": "^0.1.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

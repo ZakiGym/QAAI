@@ -119,6 +119,31 @@ export function passwordResetMail(to: string, url: string, ttlMinutes: number): 
   };
 }
 
+/**
+ * Sent to every OWNER when Stripe reports a failed invoice payment (§9 dunning).
+ *
+ * One message per failed charge attempt, not one per incident: Stripe's retries
+ * are days apart, and a card that is still broken a week later deserves a
+ * second nudge. The wording promises only what the code does — nothing is
+ * switched off on failure (see the webhook in routes/billing.ts).
+ */
+export function paymentFailedMail(to: string, orgName: string, billingUrl: string): Mail {
+  return {
+    to,
+    subject: `Payment failed for ${orgName} on QAAI`,
+    text: [
+      `The latest subscription payment for ${orgName} on QAAI did not go through.`,
+      '',
+      'Stripe will retry automatically. To sort it out sooner, update the card on file:',
+      '',
+      billingUrl,
+      '',
+      'Nothing has been switched off. If payment keeps failing, the subscription',
+      'will eventually lapse and the organisation drops to the free plan.',
+    ].join('\n'),
+  };
+}
+
 export function inviteMail(to: string, orgName: string, inviterName: string, url: string): Mail {
   return {
     to,

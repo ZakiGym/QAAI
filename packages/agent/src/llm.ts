@@ -58,9 +58,47 @@ export interface LlmConfig {
   cheapModel: string;
   strongModel: string;
   maxRetries: number;
-  /** 0 disables the ceiling. Enforced by the caller-supplied budget check. */
+  /** 0 disables the ceiling. Checked against the caller-supplied SpendLookup before every call. */
   monthlyTokenBudget: number;
 }
+
+/**
+ * Month-to-date agent tokens for an org, read from wherever the host process
+ * keeps its usage metering — the same row the UsageSink increments, so the
+ * ceiling and the meter cannot disagree. Wired by the host (worker or API)
+ * because this package has no database of its own, and must not grow one for
+ * a counter the sink already maintains.
+ */
+export type SpendLookup = (orgId: string) => Promise<number>;
+
+/**
+ * The cost ceiling (§9), as a comparison anyone can test without a database.
+ *
+ * `budget <= 0` means no ceiling — that is the env default, and turning the
+ * default into a lockout would brick every install that never set the var. At
+ * or past the line the call is refused BEFORE it reaches the API: a ceiling
+ * that lets "one more" call through is not a ceiling. The overshoot from a
+ * call already in flight when the line was crossed is accepted as the price
+ * of not holding a lock around every request.
+ */
+export function assertWithinTokenBudget(budget: number, spentTokens: number): void {
+  if (budget <= 0) return;
+  if (spentTokens < budget) return;
+  throw new LlmError(
+    `Monthly token budget reached: ${spentTokens.toLocaleString('en-US')} of ` +
+      `${budget.toLocaleString('en-US')} tokens used this month. Raise ` +
+      `QAAI_MONTHLY_TOKEN_BUDGET in .env (0 removes the ceiling), or wait for the month to roll over.`,
+    'BUDGET',
+  );
+}
+
+/**
+ * THE no-key sentence, exported so every refusal names the same fix in the
+ * same words. The Generator appends a per-type clause after it; the sentence
+ * itself must not drift, because the API routes and the worker both grep their
+ * own copies of it into user-facing messages.
+ */
+export const NO_KEY_SENTENCE = 'ANTHROPIC_API_KEY is not set — add it to .env to enable the agent';
 
 export interface CallContext {
   orgId: string;
@@ -220,6 +258,14 @@ export class LlmService {
   constructor(
     private readonly config: LlmConfig,
     private readonly sink: UsageSink = () => {},
+    /**
+     * Month-to-date token spend, consulted only when a budget is set. The
+     * default answers "nothing spent", which keeps a service constructed
+     * without a lookup behaving exactly as before — but it also means a host
+     * that sets a budget and forgets the lookup has no ceiling, so both hosts
+     * wire this in the same place they wire the sink.
+     */
+    private readonly spend: SpendLookup = async () => 0,
   ) {
     if (!config.apiKey) {
       // Deliberately not thrown at construction: the API boots fine without a
@@ -235,13 +281,31 @@ export class LlmService {
     return tier === 'cheap' ? this.config.cheapModel : this.config.strongModel;
   }
 
+  /**
+   * Whether a key exists at all. The Generator branches on this to its
+   * deterministic scaffolds instead of paying for a guaranteed AUTH throw —
+   * a missing credential is a missing tool, not an exception to catch.
+   */
+  get configured(): boolean {
+    return Boolean(this.config.apiKey);
+  }
+
   private assertConfigured(): void {
     if (!this.config.apiKey) {
-      throw new LlmError(
-        'ANTHROPIC_API_KEY is not set — add it to .env to enable the agent',
-        'AUTH',
-      );
+      throw new LlmError(NO_KEY_SENTENCE, 'AUTH');
     }
+  }
+
+  /**
+   * Refuse before spending. Skipped without a DB round trip when no ceiling
+   * is configured, which is every install that leaves the env var at 0.
+   * Thrown from the same position as the missing-key error above, so every
+   * caller that already turns that into an honest outcome handles this one
+   * for free.
+   */
+  private async assertWithinBudget(ctx: CallContext): Promise<void> {
+    if (this.config.monthlyTokenBudget <= 0) return;
+    assertWithinTokenBudget(this.config.monthlyTokenBudget, await this.spend(ctx.orgId));
   }
 
   /** Free-text completion. Used by the chat copilot and by explanation prose. */
@@ -332,6 +396,12 @@ export class LlmService {
     let finalText = '';
 
     for (let round = 0; round < maxRounds; round++) {
+      // Per round, not once at the top: every round is its own model call, and
+      // a twelve-round loop that only checked on entry could sail well past
+      // the ceiling on the strong model. The sink updated the meter last
+      // round, so this read sees that spend.
+      await this.assertWithinBudget(ctx);
+
       const startedAt = Date.now();
 
       const response = await this.client.beta.messages.create({
@@ -467,6 +537,7 @@ export class LlmService {
     jsonSchema: Record<string, unknown> | null,
   ): Promise<{ text: string }> {
     this.assertConfigured();
+    await this.assertWithinBudget(ctx);
 
     const model = this.modelFor(opts.tier);
     const secrets = ctx.secrets ?? [];
@@ -587,6 +658,7 @@ export function createLlmService(
     QAAI_MONTHLY_TOKEN_BUDGET: number;
   },
   sink?: UsageSink,
+  spend?: SpendLookup,
 ): LlmService {
   return new LlmService(
     {
@@ -597,5 +669,6 @@ export function createLlmService(
       monthlyTokenBudget: env.QAAI_MONTHLY_TOKEN_BUDGET,
     },
     sink,
+    spend,
   );
 }

@@ -15,8 +15,8 @@ import type {
   TestType,
   UiFramework,
   Verdict,
-} from './constants.js';
-import type { RunJob } from './jobs.js';
+} from './constants';
+import type { RunJob } from './jobs';
 
 // ─── Identity & tenancy ──────────────────────────────────────────────────────
 
@@ -262,6 +262,19 @@ export interface RunSummary {
   commitSha: string | null;
   prNumber: number | null;
 }
+
+// ─── Billing (§9) ────────────────────────────────────────────────────────────
+
+/**
+ * Dunning state of an organisation. Mirrors the `BillingState` enum in
+ * `apps/api/prisma/schema.prisma` (`check:enums` diffs them).
+ *
+ * PAST_DUE means Stripe reported a failed invoice payment and the org's owners
+ * were told; OK means the last invoice paid. It is a record, not a gate —
+ * nothing may deny a feature off this field without an explicit policy
+ * decision first.
+ */
+export type BillingState = 'OK' | 'PAST_DUE';
 
 // ─── Build sharding (§5) ─────────────────────────────────────────────────────
 

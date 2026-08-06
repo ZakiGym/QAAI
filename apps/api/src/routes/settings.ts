@@ -299,6 +299,7 @@ settingsRouter.get('/audit', requireRole('ADMIN'), async (req, res) => {
  * model usage.
  */
 settingsRouter.get('/usage', async (req, res) => {
+  const actor = actorOf(req);
   const days = Math.min(90, Number(req.query.days ?? 30));
   const since = new Date(Date.now() - days * 86_400_000);
 
@@ -340,10 +341,27 @@ settingsRouter.get('/usage', async (req, res) => {
     byAgent.set(call.agent, row);
   }
 
+  /*
+   * The ceiling next to the meter. The budget is deploy-wide env
+   * (QAAI_MONTHLY_TOKEN_BUDGET, 0 = none); the spend is this org's
+   * month-to-date row — the exact row the LLM gate reads before refusing a
+   * call, so what this endpoint shows and what the gate enforces cannot drift.
+   */
+  const now = new Date();
+  const period = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const monthRow = await prisma.usageRecord.findUnique({
+    where: {
+      orgId_metric_period: { orgId: actor.orgId, metric: 'agent_tokens', period },
+    },
+    select: { quantity: true },
+  });
+
   res.json({
     days,
     totalCalls: calls.length,
     totalCostCents: calls.reduce((sum, c) => sum + c.costCents, 0),
+    monthlyTokenBudget: env.QAAI_MONTHLY_TOKEN_BUDGET,
+    tokensThisMonth: Number(monthRow?.quantity ?? 0n),
     byAgent: [...byAgent.values()].sort((a, b) => b.costCents - a.costCents),
   });
 });

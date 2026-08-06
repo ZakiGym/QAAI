@@ -7,7 +7,7 @@
  * plausible is worse than none when the whole point is that the locator exists.
  */
 
-import type { Selector } from './flow-map.js';
+import type { Selector } from './flow-map';
 
 /** JS single-quoted string literal, escaped. */
 function q(value: string): string {

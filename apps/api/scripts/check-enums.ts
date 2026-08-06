@@ -55,6 +55,10 @@ const PAIRS: Array<{
   { prismaEnum: 'Verdict', tsConst: 'VERDICTS' },
   { prismaEnum: 'Language', tsConst: 'LANGUAGES' },
   { prismaEnum: 'RunShardStatus', tsConst: 'RunShardStatus', source: 'types', kind: 'union' },
+  // Dunning (§9). The webhook writes it and the UI will eventually render it;
+  // a database value TypeScript does not know about would be an org whose
+  // billing screen cannot say what state it is in.
+  { prismaEnum: 'BillingState', tsConst: 'BillingState', source: 'types', kind: 'union' },
   // SSO (§1). The admin API validates `protocol` against SSO_PROTOCOLS, so a
   // value in the database enum that TypeScript does not know about is a
   // connection nobody can log in through.

@@ -9,7 +9,8 @@
 
 import { Router } from 'express';
 import { QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
-import { applyHealDiff } from '@qaai/agent';
+import type { TestType } from '@qaai/shared';
+import { applyHealDiff, canScaffoldWithoutModel } from '@qaai/agent';
 import { prisma } from '../lib/prisma.js';
 import { env } from '../env.js';
 import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
@@ -97,7 +98,7 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
 
   const plan = await prisma.testPlan.findUnique({
     where: { id: String(req.params.planId) },
-    include: { items: { select: { id: true, state: true } } },
+    include: { items: { select: { id: true, state: true, testType: true } } },
   });
   if (!plan) throw notFound('Test plan');
 
@@ -133,29 +134,33 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
   }
 
   /*
-   * Generation needs a model. Missing one is a MISSING TOOL, not a failure —
-   * the identical guard routes/coverage.ts and routes/traffic.ts already make,
-   * for the identical reason, and this is the one approval path every new
-   * customer walks.
+   * Test CODE needs a model, but the spec-driven types do not — the Generator
+   * scaffolds those deterministically from the crawl (@qaai/agent's
+   * spec-strategies), each carrying review flags naming its TODO fields. So a
+   * missing key narrows the queue to the scaffoldable subset instead of
+   * refusing outright; only when NOTHING in the batch can be scaffolded does
+   * this fall back to the old "approved, not queued, here is what to set".
    *
-   * Without it this endpoint answered 202 `{ jobId, approved: 8 }`, the cockpit
-   * read that as success and sent the person to /editor, and the job died in
-   * the worker on "ANTHROPIC_API_KEY is not set". The only thing they ever saw
-   * was a green count and then an editor that stayed empty forever, with
-   * nothing anywhere to say why. The approval itself is real and is kept — the
-   * items are APPROVED and generate as soon as a key is set — so the honest
-   * answer is "approved, not queued, here is what to set".
+   * The history that shaped this: the endpoint used to answer 202 with no key,
+   * the cockpit read that as success, and the job died in the worker with
+   * nothing anywhere to say why. `generation.reason` is always present when a
+   * key is missing so the person is told exactly which half happened.
    */
   const canGenerate = Boolean(env.ANTHROPIC_API_KEY);
-  const jobId = canGenerate
-    ? await enqueue(QUEUE_NAMES.generate, {
-        orgId: actor.orgId,
-        projectId: plan.projectId,
-        testPlanId: plan.id,
-        planItemIds: input.approvedItemIds,
-        requestedBy: actor.userId,
-      })
-    : null;
+  const typeOf = new Map(plan.items.map((i) => [i.id, i.testType]));
+  const queueableIds = canGenerate
+    ? input.approvedItemIds
+    : input.approvedItemIds.filter((id) => canScaffoldWithoutModel(typeOf.get(id) as TestType));
+  const jobId =
+    queueableIds.length > 0
+      ? await enqueue(QUEUE_NAMES.generate, {
+          orgId: actor.orgId,
+          projectId: plan.projectId,
+          testPlanId: plan.id,
+          planItemIds: queueableIds,
+          requestedBy: actor.userId,
+        })
+      : null;
 
   await audit({
     actor,
@@ -165,22 +170,29 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
     metadata: {
       approved: input.approvedItemIds.length,
       rejected: known.size - input.approvedItemIds.length,
-      queued: canGenerate,
-      ...(canGenerate ? {} : { reason: 'no ANTHROPIC_API_KEY' }),
+      queued: jobId !== null,
+      ...(canGenerate ? {} : { scaffolded: queueableIds.length, reason: 'no ANTHROPIC_API_KEY' }),
     },
   });
 
+  const needModel = input.approvedItemIds.length - queueableIds.length;
   res.status(202).json({
     jobId,
     approved: input.approvedItemIds.length,
     generation: canGenerate
       ? { queued: true }
       : {
-          queued: false,
+          queued: jobId !== null,
+          scaffolded: queueableIds.length,
           reason:
-            'ANTHROPIC_API_KEY is not set on this deployment, so the Generator cannot be run and no ' +
-            'test code was written. Your approval was saved — these items are APPROVED and will ' +
-            'generate as soon as the key is set and you approve the plan again.',
+            queueableIds.length > 0
+              ? `${queueableIds.length} of ${input.approvedItemIds.length} approved item(s) are spec-driven and were scaffolded from the crawl without a model — each carries review flags naming what to fill in. ` +
+                (needModel > 0
+                  ? `The other ${needModel} need a model: ANTHROPIC_API_KEY is not set on this deployment — set it and approve the plan again.`
+                  : `Set ANTHROPIC_API_KEY to have a model write them outright.`)
+              : 'ANTHROPIC_API_KEY is not set on this deployment, so the Generator cannot be run and no ' +
+                'test code was written. Your approval was saved — these items are APPROVED and will ' +
+                'generate as soon as the key is set and you approve the plan again.',
         },
   });
 });

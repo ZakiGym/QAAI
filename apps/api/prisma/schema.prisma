@@ -37,6 +37,16 @@ enum Plan {
   ENTERPRISE
 }
 
+/// Dunning (§9). Mirrored as a union type in packages/shared/src/types.ts —
+/// `check:enums` diffs them. PAST_DUE is set by `invoice.payment_failed` and
+/// cleared by `invoice.paid`; deliberately, NOTHING gates on it yet. Whether a
+/// past-due org keeps its paid limits is a policy decision (lib/plan.ts already
+/// meters a `past_due` Stripe status at FREE limits), not a schema one.
+enum BillingState {
+  OK
+  PAST_DUE
+}
+
 enum EnvironmentKind {
   LOCAL
   PREVIEW
@@ -362,6 +372,13 @@ model Organization {
   plan      Plan     @default(FREE)
   /// Per-org overrides on top of PLAN_LIMITS; used for trials and enterprise deals.
   limitOverrides Json?
+  /// Record-and-notify only (§9 dunning) — see the BillingState doc comment.
+  billingState BillingState @default(OK)
+  /// Stripe's clock (`event.created`) for the LAST invoice event applied. The
+  /// ordering guard for dunning: an invoice.payment_failed that is older than
+  /// the invoice.paid already applied must not mark a healthy org PAST_DUE.
+  /// Same single-clock rule as Subscription.planSyncedAt, for the same reason.
+  billingStateAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1268,10 +1285,29 @@ model Subscription {
   status               String   @default("active")
   currentPeriodEnd     DateTime?
   cancelAtPeriodEnd    Boolean  @default(false)
+  /// Stripe's `event.created` for the last subscription state applied here.
+  /// Stripe does not promise delivery order, so the webhook refuses to write a
+  /// subscription event older than this — a redelivered `updated` from before a
+  /// cancellation must not resurrect the plan. Null on rows that predate the
+  /// column; the first event to arrive claims it.
+  planSyncedAt         DateTime?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+/// Stripe webhook events already processed. Stripe redelivers on timeouts, on
+/// any non-2xx, and occasionally even after a 2xx, and this endpoint moves orgs
+/// between paid plans — so every event id is checked here before handling and
+/// recorded after. Global on purpose (no orgId): the event arrives before we
+/// know which org it is for. Same shape as SsoAssertionSeen, the other
+/// replay-guard table.
+model StripeEventSeen {
+  /// The Stripe event id (`evt_…`) — stable across every redelivery.
+  id        String   @id
+  type      String
+  createdAt DateTime @default(now())
 }
 
 /// Metered regardless of plan (§9), so pricing can change without a data migration.

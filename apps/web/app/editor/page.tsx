@@ -5,8 +5,15 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useMonaco } from '@monaco-editor/react';
 import type { Monaco } from '@monaco-editor/react';
+import {
+  NEW_TEST_TEMPLATES,
+  SPEC_DRIVEN_TEST_TYPES,
+  testFileSlug,
+  type TestType,
+} from '@qaai/shared';
 import { api, ApiError, type Run, type TestResult } from '../../lib/api';
 import { CodeEditor } from '../../components/CodeEditor';
+import { NewTestDialog } from '../../components/NewTestDialog';
 import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
 import { FileTree } from '../../components/FileTree';
@@ -91,8 +98,17 @@ type Dialog =
   | { kind: 'delete-folder'; folderPath: string }
   | { kind: 'close-dirty'; testId: string; filePath: string };
 
-/** Non-Playwright plugins are configured with JSON, not source. */
-const SPEC_DRIVEN = new Set(['API', 'ACCESSIBILITY', 'SECURITY_SMOKE', 'VISUAL', 'LOAD']);
+/**
+ * Non-Playwright plugins are configured with JSON, not source.
+ *
+ * Imported rather than listed here, because the local copy of this set held
+ * five types while fifteen plugins were spec-driven — open an EMAIL_OTP or
+ * DATABASE test and the editor showed its placeholder `code` as TypeScript,
+ * and save could never touch the `spec` that actually runs. The shared module
+ * derives the set from the same templates the create dialog offers, and the
+ * runner's template test pins both to what each plugin really parses.
+ */
+const SPEC_DRIVEN = SPEC_DRIVEN_TEST_TYPES;
 
 /** Who wrote a version, in the rail's voice. `HUMAN` is the only one with a face. */
 const VERSION_SOURCE: Record<string, string> = {
@@ -103,25 +119,10 @@ const VERSION_SOURCE: Record<string, string> = {
   IMPORT: 'import',
 };
 
-const NEW_TEST_TEMPLATE = `import { test, expect } from '@playwright/test';
-
-test('describe what must be true', async ({ page }) => {
-  await test.step('Set up the state under test', async () => {
-    await page.goto('/');
-  });
-
-  await test.step('Assert something that could actually be wrong', async () => {
-    await expect(page.getByRole('heading')).toBeVisible();
-  });
-});
-`;
-
 const NEW_FIXTURE_TEMPLATE = `{
   "example": "replace with your test data"
 }
 `;
-
-const slugify = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
 /**
  * Catch the paths the server will reject anyway, before the round-trip.
@@ -757,24 +758,33 @@ export default function EditorPage() {
     });
   }
 
-  async function createFile(folderPath: string, name: string) {
+  async function createFile(folderPath: string, name: string, type: TestType = 'E2E') {
     if (!project) return;
     const isFixture =
       folderPath === FIXTURE_PREFIX.slice(0, -1) || folderPath.startsWith(FIXTURE_PREFIX);
 
+    // The template is the honesty contract: the picker only offers types with
+    // one, and packages/runner's template test proves each type's own plugin
+    // accepts exactly this code and spec — so the file is runnable the moment
+    // it exists, never a scaffold whose first run is FAILED "invalid spec".
+    const template = NEW_TEST_TEMPLATES[type];
+    if (!isFixture && !template) return;
+
     const dir = folderPath || (isFixture ? 'fixtures' : 'hand-written');
-    const slug = slugify(name) || (isFixture ? 'data' : 'test');
-    const filePath = isFixture ? `${dir}/${slug}.json` : `${dir}/${slug}.spec.ts`;
+    const slug = testFileSlug(name, isFixture ? 'data' : 'test');
+    const filePath = isFixture ? `${dir}/${slug}.json` : `${dir}/${slug}${template!.fileSuffix}`;
 
     try {
       const { test } = await api<{ test: FullTest }>(`/projects/${project.id}/tests`, {
         method: 'POST',
         body: JSON.stringify({
           name,
-          type: 'E2E',
+          // Fixtures are data, not tests — their row keeps the default type.
+          type: isFixture ? 'E2E' : type,
           feature: isFixture ? 'Fixtures' : 'Hand-written',
           priority: 'IMPORTANT',
-          code: isFixture ? NEW_FIXTURE_TEMPLATE : NEW_TEST_TEMPLATE,
+          code: isFixture ? NEW_FIXTURE_TEMPLATE : template!.code,
+          ...(!isFixture && template!.spec !== undefined ? { spec: template!.spec } : {}),
           filePath,
           tags: [],
         }),
@@ -1190,16 +1200,27 @@ export default function EditorPage() {
       </div>
 
       {/* ── Dialogs ───────────────────────────────────────────────────────── */}
-      {dialog?.kind === 'create' && (
+      {/* A fixture is one string of a name; a test is a name AND a type, so the
+          two get different dialogs rather than one dialog with a hidden mode. */}
+      {dialog?.kind === 'create' && dialog.isFixture && (
         <PromptDialog
           open
           onClose={closeDialog}
           onSubmit={(name) => void createFile(dialog.folderPath, name)}
-          title={dialog.isFixture ? 'New fixture' : 'New test'}
-          label={dialog.isFixture ? 'Fixture name' : 'Test name'}
+          title="New fixture"
+          label="Fixture name"
           hint={`It lands in ${dialog.dir}/`}
-          initialValue={dialog.isFixture ? 'data' : 'New test'}
+          initialValue="data"
           confirmLabel="Create"
+        />
+      )}
+
+      {dialog?.kind === 'create' && !dialog.isFixture && (
+        <NewTestDialog
+          open
+          dir={dialog.dir}
+          onClose={closeDialog}
+          onCreate={(name, type) => void createFile(dialog.folderPath, name, type)}
         />
       )}
 

@@ -7,7 +7,7 @@
  * this function, not merely forgetting to call a logger helper.
  */
 
-import { SECRET_MASK } from './constants.js';
+import { SECRET_MASK } from './constants';
 
 /** Values shorter than this are too likely to be substrings of ordinary text. */
 const MIN_MASKABLE_LENGTH = 6;

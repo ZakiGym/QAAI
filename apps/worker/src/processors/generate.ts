@@ -89,6 +89,12 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
           feature: item.feature,
           priority: item.priority,
           code: generated.code,
+          // Spec-driven and hybrid types live or die on this column — their
+          // plugin executes `spec` and never reads `code`. The generator has
+          // already validated it against the plugin's own schema.
+          ...(generated.spec !== null && generated.spec !== undefined
+            ? { spec: generated.spec as object }
+            : {}),
           filePath: generated.filePath,
           tags: item.priority === 'CRITICAL_PATH' ? ['smoke'] : [],
           reviewFlags: generated.reviewFlags,

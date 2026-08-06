@@ -8,8 +8,8 @@
  * re-running the model.
  */
 
-import { analyzeCoverage, planItemForGap, proposePlan, crawl } from '@qaai/agent';
-import type { TestPlan } from '@qaai/shared';
+import { analyzeCoverage, canScaffoldWithoutModel, planItemForGap, proposePlan, crawl } from '@qaai/agent';
+import type { TestPlan, TestType } from '@qaai/shared';
 import type { ExploreJob, FlowMap } from '@qaai/shared';
 import { config, llm, logger, prisma, publishEvent } from '../context.js';
 import { secretsFor } from '../vault.js';
@@ -216,7 +216,7 @@ export async function processExplore(job: ExploreJob): Promise<void> {
         })),
       },
     },
-    include: { items: { select: { id: true } } },
+    include: { items: { select: { id: true, testType: true } } },
   });
 
   logger.info(
@@ -248,11 +248,12 @@ export async function processExplore(job: ExploreJob): Promise<void> {
       where: { testPlanId: testPlan.id },
       data: { state: 'APPROVED', decidedBy: job.requestedBy, decidedAt: new Date() },
     });
-    // The Generator genuinely needs a model — there is no deterministic way to
-    // write test code. Queueing without a key only moves the failure somewhere
-    // nobody is watching, so it is skipped with the reason instead, matching
-    // routes/coverage.ts and routes/traffic.ts. The items stay APPROVED and
-    // generate the moment a key is present and the plan is approved again.
+    // Test CODE genuinely needs a model, but the spec-driven types do not:
+    // the Generator scaffolds them deterministically from this very crawl
+    // (see @qaai/agent's spec-strategies). So without a key the scaffoldable
+    // subset is queued and the rest is skipped with the reason — the same
+    // fail-open shape the plan itself took above. Code items stay APPROVED
+    // and generate the moment a key is present and the plan is approved again.
     if (config.anthropicApiKey) {
       await enqueueGenerate({
         orgId,
@@ -262,16 +263,34 @@ export async function processExplore(job: ExploreJob): Promise<void> {
         requestedBy: job.requestedBy,
       });
     } else {
+      const scaffoldable = testPlan.items.filter((i) =>
+        canScaffoldWithoutModel(i.testType as TestType),
+      );
+      if (scaffoldable.length > 0) {
+        await enqueueGenerate({
+          orgId,
+          projectId,
+          testPlanId: testPlan.id,
+          planItemIds: scaffoldable.map((i) => i.id),
+          requestedBy: job.requestedBy,
+        });
+      }
+      const needModel = testPlan.items.length - scaffoldable.length;
+      const message =
+        scaffoldable.length > 0
+          ? `${testPlan.items.length} item(s) approved. ${scaffoldable.length} spec-driven item(s) were queued to scaffold from the crawl — each carries review flags naming what to fill in. ` +
+            (needModel > 0
+              ? `The other ${needModel} need a model: ANTHROPIC_API_KEY is not set on this deployment — set it and approve the plan again.`
+              : `Set ANTHROPIC_API_KEY to have a model write them outright.`)
+          : `${testPlan.items.length} item(s) approved, but no test code was written: ANTHROPIC_API_KEY is not set on this deployment. Set it and approve the plan again.`;
       logger.warn(
-        { planId: testPlan.id, items: testPlan.items.length },
-        'auto-approve is on but ANTHROPIC_API_KEY is not set — the plan is approved and waiting, no generate job was queued',
+        { planId: testPlan.id, items: testPlan.items.length, scaffolded: scaffoldable.length },
+        'auto-approve without ANTHROPIC_API_KEY — queued only the deterministic scaffolds',
       );
       publishEvent(orgId, {
         runId: `explore:${projectId}`,
         type: 'log',
-        data: {
-          message: `${testPlan.items.length} item(s) approved, but no test code was written: ANTHROPIC_API_KEY is not set on this deployment. Set it and approve the plan again.`,
-        },
+        data: { message },
         at: new Date().toISOString(),
       });
     }

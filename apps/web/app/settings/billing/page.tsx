@@ -57,6 +57,22 @@ interface Me {
   orgs: Array<{ id: string; name: string }>;
 }
 
+/**
+ * What POST /billing/checkout answers. `url` means a first purchase and a
+ * redirect to Stripe's card form; everything else means the live subscription
+ * was modified in place and there is nothing to pay interactively.
+ */
+interface CheckoutResult {
+  url?: string;
+  changed?: boolean;
+  plan?: string | null;
+  to?: string;
+  resumed?: boolean;
+  cancelAtPeriodEnd?: boolean;
+  currentPeriodEnd?: string | null;
+  overLimit?: Array<{ limit: 'projects' | 'runs'; used: number; max: number }>;
+}
+
 /** The catalogue says "unlimited" with a number nobody can read. Translate it. */
 const uncapped = (n: number | null): boolean => n === null || n > 1000;
 
@@ -168,12 +184,55 @@ function BillingInner() {
   async function checkout(plan: string) {
     setBusy(plan);
     try {
-      const { url } = await api<{ url: string }>('/billing/checkout', {
+      const result = await api<CheckoutResult>('/billing/checkout', {
         method: 'POST',
         body: JSON.stringify({ plan }),
       });
-      // Stripe hosts the card form. We never see a card number.
-      window.location.href = url;
+
+      if (result.url) {
+        // A first purchase: Stripe hosts the card form. We never see a number.
+        window.location.href = result.url;
+        return;
+      }
+
+      /*
+       * An existing subscription was modified in place — no card form, no
+       * redirect. The server changed it at Stripe; the plan shown here moves
+       * when the webhook lands, same contract as the post-checkout poll.
+       */
+      if (result.cancelAtPeriodEnd) {
+        toast.success(
+          'Downgrade scheduled. Your plan runs to the end of the period you paid for, then drops to Free.',
+        );
+      } else if (result.resumed) {
+        toast.success('Cancellation withdrawn — your plan continues.');
+      } else {
+        toast.success(`Plan change requested — Stripe is confirming ${result.plan ?? 'it'} now.`);
+      }
+
+      // A downgrade never deletes anything; it only stops MORE being created.
+      // Say which ceilings are already exceeded, so the next refused create is
+      // not a surprise.
+      for (const flag of result.overLimit ?? []) {
+        toast.toast(
+          'info',
+          flag.limit === 'projects'
+            ? `You have ${flag.used} projects and the lower plan includes ${flag.max}. Nothing is deleted — you just cannot create more until you are under the limit.`
+            : `You have used ${flag.used} runs this month and the lower plan includes ${flag.max}. Existing results stay; new runs wait for the 1st.`,
+        );
+      }
+
+      // Give the webhook a few seconds to land, then stop — the page tells the
+      // truth either way, and an indefinite spinner would not.
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const data = await load();
+        if (!data) break;
+        if (result.cancelAtPeriodEnd && data.cancelAtPeriodEnd) break;
+        if (result.resumed && !data.cancelAtPeriodEnd) break;
+        if (!result.cancelAtPeriodEnd && !result.resumed && data.plan === result.plan) break;
+      }
+      setBusy(null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : 'Could not start checkout');
       setBusy(null);
@@ -448,8 +507,12 @@ function PlanTable({
           </Row>
           <tr>
             <td className={cell} />
-            {billing.catalogue.map((row) => {
+            {billing.catalogue.map((row, idx) => {
               const current = row.plan === billing.plan;
+              const currentIdx = billing.catalogue.findIndex((r) => r.plan === billing.plan);
+              // The catalogue is ordered cheapest-first, so position IS rank.
+              // Calling a cheaper plan "upgrade" would misdescribe the money.
+              const label = idx < currentIdx ? 'downgrade →' : 'upgrade →';
               return (
                 <td key={row.plan} className={cn(cell, 'text-ink-faint text-[12px]')}>
                   {current ? (
@@ -461,8 +524,24 @@ function PlanTable({
                       disabled={busy !== null}
                       className="text-accent hover:underline disabled:opacity-50"
                     >
-                      {busy === row.plan ? 'starting…' : 'upgrade →'}
+                      {busy === row.plan ? 'starting…' : label}
                     </button>
+                  ) : row.plan === 'FREE' && billing.paying && billing.configured ? (
+                    // The way DOWN AND OUT. Cancels at the period end — the
+                    // month is paid for — which is why it shows as scheduled
+                    // rather than done.
+                    billing.cancelAtPeriodEnd ? (
+                      'scheduled'
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onCheckout('FREE')}
+                        disabled={busy !== null}
+                        className="text-accent hover:underline disabled:opacity-50"
+                      >
+                        {busy === 'FREE' ? 'scheduling…' : 'downgrade →'}
+                      </button>
+                    )
                   ) : row.monthlyPriceUsd === null ? (
                     <a href="mailto:sales@qaai.dev" className="text-accent hover:underline">
                       contact →

@@ -203,6 +203,48 @@ test.describe('the editor', () => {
     await expect(page.getByText(/That test is not in this app/)).toHaveCount(0);
   });
 
+  /*
+   * The regression this exists for: the "New test" dialog asked for a name and
+   * hardcoded `type: 'E2E'` with a Playwright template — the API accepted every
+   * test type and the UI could mint exactly one. The picker now offers the
+   * types with a plugin behind them, and a spec-driven choice must open as its
+   * golden JSON spec, not as a TypeScript stub the plugin would never read.
+   */
+  test('the new-test dialog creates the type it was asked for, spec-first', async ({
+    page,
+    api,
+  }) => {
+    const project = await firstProject(api);
+    const stamp = Date.now();
+    const name = `Dogfood a11y ${stamp}`;
+
+    await page.goto('/editor');
+    await page.getByRole('button', { name: '+ new test' }).click();
+
+    const dialog = page.getByRole('dialog', { name: 'New test' });
+    await expect(dialog).toBeVisible();
+    await dialog.getByLabel('Test name').fill(name);
+    await dialog.getByLabel('Type').selectOption('ACCESSIBILITY');
+    await dialog.getByRole('button', { name: 'Create' }).click();
+
+    // The file lands with the type's own extension, not .spec.ts…
+    const filePath = `hand-written/dogfood-a11y-${stamp}.a11y.json`;
+    await expect(page.getByRole('button', { name: `Close ${filePath}` })).toBeVisible();
+    // …and the buffer holds the runnable JSON spec — the routes axe will scan —
+    // rather than a Playwright stub the accessibility plugin would never read.
+    await expect(page.getByRole('code')).toContainText('routes');
+
+    // Clean up through the API, same soft contract as the scratch fixture.
+    const created = (await projectTests(api, project.id)).find((t) => t.filePath === filePath);
+    expect(created, 'the created test should be in the project tree').toBeDefined();
+    if (created) {
+      const removed = await api.delete(`${API_URL}/projects/${project.id}/tests/${created.id}`);
+      expect
+        .soft(removed.ok(), `Could not clean up ${filePath} (${removed.status()}).`)
+        .toBeTruthy();
+    }
+  });
+
   test('closing a file with unsaved changes asks first', async ({ page, scratch }) => {
     await page.goto(`/editor?test=${scratch.id}`);
 

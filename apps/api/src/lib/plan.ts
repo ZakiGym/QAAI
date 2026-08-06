@@ -178,6 +178,38 @@ export async function canCreateProject(orgId: string): Promise<LimitVerdict> {
   };
 }
 
+export interface OverLimitFlag {
+  limit: 'projects' | 'runs';
+  used: number;
+  max: number;
+}
+
+/**
+ * The reverse of `canCreateProject` / `canStartRun`: given a plan the org is
+ * about to DROP to, name everything already over that plan's ceilings.
+ *
+ * Deliberately observational. A downgrade never deletes anything — the excess
+ * projects stay readable, the run history stays visible — because the customer
+ * paid for the tier that produced them. What the lower plan takes away is the
+ * ability to create MORE, and the forward checks above already enforce that on
+ * every create. This function exists so the downgrade can say out loud what
+ * those checks are about to start refusing, in the response and in the audit
+ * row, instead of the customer discovering it at the next "New project" click.
+ */
+export async function overLimitFor(orgId: string, plan: Plan): Promise<OverLimitFlag[]> {
+  const limits = PLAN_LIMITS[plan];
+  const usage = await usageFor(orgId);
+
+  const flags: OverLimitFlag[] = [];
+  if (usage.projects > limits.maxProjects) {
+    flags.push({ limit: 'projects', used: usage.projects, max: limits.maxProjects });
+  }
+  if (limits.maxRunsPerMonth !== null && usage.runsThisMonth > limits.maxRunsPerMonth) {
+    flags.push({ limit: 'runs', used: usage.runsThisMonth, max: limits.maxRunsPerMonth });
+  }
+  return flags;
+}
+
 /**
  * Feature gates.
  *

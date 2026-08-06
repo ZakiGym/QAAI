@@ -3,6 +3,7 @@ export * from './crawler.js';
 export * from './explorer.js';
 export * from './ecosystem-prompts.js';
 export * from './generator.js';
+export * from './spec-strategies.js';
 export * from './triage.js';
 export * from './healer.js';
 export * from './heal-apply.js';

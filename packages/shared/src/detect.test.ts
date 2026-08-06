@@ -24,7 +24,7 @@ import {
   detectProject,
   type RepoFile,
   type RunnerCandidate,
-} from './detect.js';
+} from './detect';
 import {
   ECOSYSTEMS,
   PACKAGE_MANAGER_LANGUAGES,
@@ -32,7 +32,7 @@ import {
   ecosystemRunArgs,
   junitPlanFor,
   type Ecosystem,
-} from './ecosystems.js';
+} from './ecosystems';
 
 const f = (path: string, content?: string): RepoFile =>
   content === undefined ? { path } : { path, content };

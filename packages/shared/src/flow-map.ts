@@ -6,7 +6,7 @@
  * the interesting test material lives in the transitions between them.
  */
 
-import type { Priority, TestType } from './constants.js';
+import type { Priority, TestType } from './constants';
 
 /** How a locator was derived. Ranked most→least resilient (§3.2). */
 export const SELECTOR_STRATEGIES = [

@@ -7,7 +7,7 @@
  * the worker always re-reads from the database.
  */
 
-import type { RunTrigger } from './job-enums.js';
+import type { RunTrigger } from './job-enums';
 
 export interface ExploreJob {
   orgId: string;

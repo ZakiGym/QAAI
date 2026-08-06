@@ -120,6 +120,22 @@ async function recordAgentCall(record: AgentCallRecord & { error?: string }): Pr
   }
 }
 
+/**
+ * Month-to-date tokens for the budget gate — read from the same row
+ * recordAgentCall increments, so the ceiling can never disagree with the
+ * meter. BigInt → Number is safe here: a month that overflows 2^53 tokens is
+ * nine quadrillion of them, which is not a month anyone is having.
+ */
+async function monthTokens(orgId: string): Promise<number> {
+  const now = new Date();
+  const period = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const row = await prisma.usageRecord.findUnique({
+    where: { orgId_metric_period: { orgId, metric: 'agent_tokens', period } },
+    select: { quantity: true },
+  });
+  return Number(row?.quantity ?? 0n);
+}
+
 export const llm = createLlmService(
   {
     ANTHROPIC_API_KEY: config.anthropicApiKey,
@@ -129,4 +145,5 @@ export const llm = createLlmService(
     QAAI_MONTHLY_TOKEN_BUDGET: Number(process.env.QAAI_MONTHLY_TOKEN_BUDGET ?? 0),
   },
   recordAgentCall,
+  monthTokens,
 );

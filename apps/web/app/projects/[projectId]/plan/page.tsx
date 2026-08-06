@@ -80,7 +80,9 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
    * /editor in that case sends someone to watch an empty screen for code that
    * is never coming, so the sentence the API returned is shown here instead.
    */
-  const [notGenerated, setNotGenerated] = useState<string | null>(null);
+  const [notGenerated, setNotGenerated] = useState<{ headline: string; detail: string } | null>(
+    null,
+  );
 
   const load = useCallback(async () => {
     try {
@@ -124,18 +126,31 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
     try {
       const result = await api<{
         approved: number;
-        generation?: { queued: boolean; reason?: string };
+        generation?: { queued: boolean; scaffolded?: number; reason?: string };
       }>(`/plans/${plan.id}/approve`, {
         method: 'POST',
         body: JSON.stringify({ approvedItemIds: [...selected] }),
       });
 
-      // Only claim the Generator is running when the API says it was queued.
-      if (result.generation && result.generation.queued === false) {
-        setNotGenerated(
-          result.generation.reason ??
+      /*
+       * A `reason` means something on this deployment could not run the full
+       * Generator — no key. That now comes in two honest flavours: nothing was
+       * written, or the spec-driven subset was scaffolded deterministically
+       * while the code items wait for a key. Either way the person stays here
+       * to read which one happened, instead of being sent to an editor that
+       * may or may not have anything in it.
+       */
+      if (result.generation && (result.generation.queued === false || result.generation.reason)) {
+        const scaffolded = result.generation.scaffolded ?? 0;
+        setNotGenerated({
+          headline:
+            scaffolded > 0
+              ? 'Approved — scaffolded without a model.'
+              : 'Approved — but no test code was written.',
+          detail:
+            result.generation.reason ??
             'The approval was saved, but no test code was written on this deployment.',
-        );
+        });
         await load();
         return;
       }
@@ -324,7 +339,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
           role="status"
           className="border-flake/40 bg-flake/10 mt-6 rounded-lg border p-4 text-sm"
         >
-          <p className="font-medium">Approved — but no test code was written.</p>
+          <p className="font-medium">{notGenerated.headline}</p>
           {/*
             Every reason the API returns here already states that the approval
             was saved — that is the one fact this banner must not omit. A second
@@ -332,7 +347,7 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
             about the same thing, and the retry affordance is the button below,
             which relabels itself rather than needing its own control.
           */}
-          <p className="text-ink-dim mt-1.5">{notGenerated}</p>
+          <p className="text-ink-dim mt-1.5">{notGenerated.detail}</p>
         </div>
       )}
 

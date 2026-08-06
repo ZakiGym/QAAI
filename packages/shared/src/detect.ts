@@ -45,7 +45,7 @@
  * are exempt from the enum-drift check.
  */
 
-import { LANGUAGES, type Language, type TestType } from './constants.js';
+import { LANGUAGES, type Language, type TestType } from './constants';
 import {
   ECOSYSTEM_LANGUAGES,
   PACKAGE_MANAGERS,
@@ -58,7 +58,7 @@ import {
   type EcosystemLanguage,
   type JUnitPlan,
   type PackageManager,
-} from './ecosystems.js';
+} from './ecosystems';
 
 // ─── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ export interface RepoFile {
  * one — `DETECTABLE_RUNNERS` below is derived from the rule table, and the rule
  * table cannot name a runner ecosystems.ts does not define.
  */
-export type { EcosystemId } from './ecosystems.js';
+export type { EcosystemId } from './ecosystems';
 
 /**
  * Languages we can *observe*, in the SHOUTING spelling the DB-backed `Language`
