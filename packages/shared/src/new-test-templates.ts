@@ -274,6 +274,34 @@ export const CREATABLE_TEST_TYPES: readonly TestType[] = TEST_TYPES.filter(
 );
 
 /**
+ * The types QAAI can WRITE from a crawl with no model.
+ *
+ * Not the same question as `SPEC_DRIVEN_TEST_TYPES` below, and the difference
+ * is the whole point: a spec-driven type has a JSON buffer, but only these six
+ * have required fields a crawl can actually fill. DATABASE is spec-driven and
+ * is not here, because the SQL worth asserting on is a fact about someone's
+ * schema and no amount of crawling supplies it.
+ *
+ * This is a mirror of `canScaffoldWithoutModel` in
+ * `packages/agent/src/spec-strategies.ts`, which is the implementation — the
+ * scaffold function's existence IS the fact. It is restated here because the
+ * web app must tell someone choosing test types which of them this deployment
+ * can produce without ANTHROPIC_API_KEY, and pulling @qaai/agent into the
+ * browser bundle would drag Playwright and the Anthropic SDK with it. The two
+ * are held equal by a test in `apps/worker/src/processors/generate.test.ts`,
+ * so a new scaffold that is not listed here fails the build rather than
+ * quietly making the funnel lie about what a key buys you.
+ */
+export const MODEL_FREE_TEST_TYPES: readonly TestType[] = [
+  'API',
+  'VISUAL',
+  'ACCESSIBILITY',
+  'LOAD',
+  'SECURITY_SMOKE',
+  'PERFORMANCE',
+];
+
+/**
  * Types whose editor buffer is the JSON spec rather than source. Typed as a
  * set of strings because the UI holds `test.type` as a string off the wire.
  */

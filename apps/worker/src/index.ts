@@ -21,12 +21,15 @@ import type {
 } from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
 import {
+  ANALYZE_SOURCE_QUEUE,
   DELIVERY_JOB,
   armFlakeTick,
   armScheduleTick,
   closeProducers,
+  type AnalyzeSourceJob,
   type DeliveryJob,
 } from './queues.js';
+import { processAnalyzeSource } from './processors/analyze-source.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
 import { processRun, sweepStalledShardedRuns } from './processors/run.js';
@@ -173,6 +176,20 @@ register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
 });
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
+
+// "Learn my codebase". Cheap and model-free — it reads a stored analysis and
+// writes a plan, never a browser and never a token — so it rides the wider
+// pool. Without this registration POST /projects/:id/analyze-source answers
+// "queued" and the job sits in Redis forever, which is the bisect-queue defect
+// exactly; `npm run check:wiring` fails if the line is removed.
+register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, (payload) =>
+  // Wrapped in an arrow so register()'s second argument (the BullMQ Job) is
+  // never mistaken for processAnalyzeSource's own deps parameter — that slot is
+  // the test seam for injecting a fake project row, and a Job landing in it
+  // would be a silent no-op today and a confusing bug the day the two types
+  // grow a matching field. Same reasoning as the backup tick below.
+  processAnalyzeSource(payload),
+);
 
 // The flake sweep: one tick, concurrency 1, its own queue. It shares nothing
 // with the scheduler tick deliberately — confirming a flake has nothing to do

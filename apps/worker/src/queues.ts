@@ -12,7 +12,40 @@ import type { CopilotJob, GenerateJob, NotifyJob, ShardedRunJob, TriageJob } fro
 import { BISECT_QUEUE, MAX_BISECT_TICKS, type BisectJob } from '../../api/src/lib/bisect.js';
 import { connection } from './context.js';
 
+/**
+ * "Learn my codebase": read the stored source analysis and propose a plan.
+ *
+ * NOT in `QUEUE_NAMES` (packages/shared) only because this wave does not own
+ * that file — the same reason and the same shape as RETENTION_QUEUE in
+ * processors/retention.ts and BISECT_QUEUE in the API's lib/bisect.ts. The
+ * literal is exported so the API's producer and the worker's consumer can share
+ * one constant instead of two strings that drift.
+ *
+ * It lives HERE rather than in the processor so that processors/analyze-source.ts
+ * can import `enqueueGenerate` from this module without the two files forming an
+ * import cycle around a module-level `new Queue(...)`.
+ */
+export const ANALYZE_SOURCE_QUEUE = 'qaai.analyze-source';
+
+/**
+ * One "learn this project's codebase" job.
+ *
+ * Ids only, like every other payload (see the header of
+ * packages/shared/src/jobs.ts): the analysis itself is a large blob written by
+ * the ingest pass, and a job that carried a copy would be generating a plan
+ * against a snapshot that may already be stale by the time it runs.
+ */
+export interface AnalyzeSourceJob {
+  orgId: string;
+  projectId: string;
+  /** Who asked, for the audit row and the plan's provenance. */
+  requestedBy: string;
+  /** Skip the approval screen and generate straight away (onboarding only). */
+  autoApprove?: boolean;
+}
+
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
+const analyzeSourceQueue = new Queue(ANALYZE_SOURCE_QUEUE, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
 const triageQueue = new Queue(QUEUE_NAMES.triage, { connection });
 const copilotQueue = new Queue(QUEUE_NAMES.copilot, { connection });
@@ -39,6 +72,23 @@ const BACKGROUND_RUN_PRIORITY = 100;
 
 export async function enqueueGenerate(job: GenerateJob): Promise<void> {
   await generateQueue.add(QUEUE_NAMES.generate, job, { attempts: 2 });
+}
+
+/**
+ * Queue a source analysis.
+ *
+ * `attempts: 1`, and the job id pins one analysis per project in flight. Both
+ * for the same reason the Explorer runs at one attempt: the job WRITES — a
+ * FlowMap version and a TestPlan — so a retry does not re-do the work, it
+ * duplicates it, and the user ends up approving one of two identical plans.
+ * Everything the processor needs is read fresh from the database, so the next
+ * deliberate run is always a better answer than a retry of this one.
+ */
+export async function enqueueAnalyzeSource(job: AnalyzeSourceJob): Promise<void> {
+  await analyzeSourceQueue.add(ANALYZE_SOURCE_QUEUE, job, {
+    jobId: `analyze-source-${job.projectId}`,
+    attempts: 1,
+  });
 }
 
 /**
@@ -214,5 +264,6 @@ export async function closeProducers(): Promise<void> {
     copilotQueue.close(),
     flakeQueue.close(),
     bisectQueue.close(),
+    analyzeSourceQueue.close(),
   ]);
 }

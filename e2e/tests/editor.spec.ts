@@ -262,4 +262,136 @@ test.describe('the editor', () => {
     await dialog.getByRole('button', { name: 'Close anyway' }).click();
     await expect(page.getByRole('button', { name: `Close ${scratch.filePath}` })).toHaveCount(0);
   });
+
+  /*
+   * The editor chrome: breadcrumbs, the status bar, and project-wide search.
+   *
+   * The search case below is here for a specific reason. Clicking a match in a
+   * file that was NOT already open used to move the caret one animation frame
+   * after the click, while Monaco still held the previous file's model — the
+   * jump landed at the end of the wrong buffer, and only for the cross-file
+   * case, which is the case a person hits every time they actually use search.
+   * It reads as "search is broken" and typechecks perfectly.
+   */
+  test('the breadcrumb names the block the caret is in, and jumps back to it', async ({
+    page,
+    scratch,
+  }) => {
+    await page.goto(`/editor?test=${scratch.id}`);
+
+    const code = page.getByRole('code');
+    await expect(code).toBeVisible();
+
+    const status = page.getByText(/^Ln \d+, Col \d+$/);
+    await expect(status).toBeVisible();
+
+    // Into the body of the scratch file's `test(...)`, which the outline names.
+    /*
+     * Click the LINE, rather than clicking the region and stepping down from
+     * wherever that left the caret. Two earlier versions of this test navigated
+     * by keyboard and both landed on line 6 — one past the end of a five-line
+     * file, where there is correctly no block to name. Monaco's go-to-top
+     * binding also differs by platform, and this suite runs a Windows user
+     * agent on a Mac, so a keyboard route here is a coin flip.
+     *
+     * Line 4 is the `page.goto` inside the scratch file's `test(...)`, so the
+     * trail is exactly one symbol deep and the crumb is unambiguous.
+     */
+    await code.getByText("await page.goto('/');").first().click();
+
+    /*
+     * Addressed by title. A breadcrumb button's accessible name is its CONTENT
+     * — the symbol's own name, `scratch` here — and "Go to line N" is the title
+     * that says where it goes. Asking for it by role+name looks for a button
+     * labelled with the destination, which is not what the control says.
+     */
+    const crumb = page.getByTitle(/^Go to line \d+$/).first();
+    await expect(crumb).toBeVisible();
+    // The symbol the caret is inside, named by the crumb.
+    await expect(crumb).toHaveText('scratch');
+    await crumb.click();
+
+    // The crumb's own label says where it goes, so the assertion can be exact
+    // rather than "some line changed".
+    const label = (await crumb.getAttribute('title')) ?? '';
+    const line = Number(/Go to line (\d+)/.exec(label)?.[1]);
+    expect(Number.isFinite(line)).toBeTruthy();
+    await expect(page.getByText(`Ln ${line}, Col 1`)).toBeVisible();
+  });
+
+  test('a search match opens its file and lands on the matching line', async ({
+    page,
+    api,
+    scratch,
+  }) => {
+    const project = await firstProject(api);
+    /*
+     * A second file of this test's own, holding a marker no other file can
+     * contain. Searching the demo data for something generic would find matches
+     * in whichever files happen to exist, and the assertion below has to know
+     * exactly which file and which line the click should reach.
+     */
+    const marker = `qaaiSearchProbe${Date.now()}`;
+    const filePath = `e2e-scratch/search-target-${Date.now()}.spec.ts`;
+    const created = await api.post(`${API_URL}/projects/${project.id}/tests`, {
+      data: {
+        name: `Search target ${marker}`,
+        type: 'E2E',
+        feature: 'Hand-written',
+        priority: 'NICE_TO_HAVE',
+        filePath,
+        tags: ['e2e-dogfood'],
+        code: `import { test, expect } from '@playwright/test';\n\ntest('a', async ({ page }) => {\n  await page.goto('/');\n  // ${marker}\n});\n`,
+      },
+    });
+    expect(created.ok(), `Could not create the search target (${created.status()}).`).toBeTruthy();
+    const { test: target } = (await created.json()) as { test: { id: string } };
+
+    try {
+      // The SCRATCH file is what is open, so the match below is in a file the
+      // editor has not loaded — the cross-file case that was broken.
+      await page.goto(`/editor?test=${scratch.id}`);
+      await expect(page.getByRole('code')).toBeVisible();
+
+      await shortcut(page, 'Shift+F');
+      const box = page.getByRole('textbox', { name: 'Search all files' });
+      await expect(box).toBeFocused();
+      await box.fill(marker);
+
+      // Addressed by title: the button's accessible name comes from its
+      // contents (the line number and the matching text), while `file:line` —
+      // the thing this test needs to assert against — is the title.
+      const match = page.getByTitle(`${filePath}:5`);
+      await expect(match).toBeVisible();
+      await match.click();
+
+      // Both halves. Asserting only that the file opened is what let the bug
+      // through: the file DID open, and the caret went to the wrong line.
+      await expect(page.getByRole('button', { name: `Close ${filePath}` })).toBeVisible();
+      await expect(page.getByText('Ln 5, Col 1')).toBeVisible();
+    } finally {
+      const removed = await api.delete(`${API_URL}/projects/${project.id}/tests/${target.id}`);
+      expect
+        .soft(removed.ok(), `Could not clean up ${filePath} (${removed.status()}).`)
+        .toBeTruthy();
+    }
+  });
+
+  test('the status bar remembers word wrap across a reload', async ({ page, scratch }) => {
+    await page.goto(`/editor?test=${scratch.id}`);
+    await expect(page.getByRole('code')).toBeVisible();
+
+    const wrap = page.getByRole('button', { name: 'Wrap' });
+    await expect(wrap).toHaveAttribute('aria-pressed', 'false');
+    await wrap.click();
+    await expect(wrap).toHaveAttribute('aria-pressed', 'true');
+
+    await page.reload();
+    await expect(page.getByRole('code')).toBeVisible();
+    // A preference that does not survive a reload is one people stop setting.
+    await expect(page.getByRole('button', { name: 'Wrap' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+  });
 });

@@ -9,7 +9,6 @@ import {
   AUTH_PROFILE_KINDS,
   CHAT_INTEGRATION_KINDS,
   ENVIRONMENT_KINDS,
-  FRAMEWORKS_BY_LANGUAGE,
   GIT_INTEGRATION_KINDS,
   GRID_INTEGRATION_KINDS,
   LANGUAGES,
@@ -19,6 +18,8 @@ import {
   TEST_TYPES,
   UI_FRAMEWORKS,
   VERDICTS,
+  isSupportedPair,
+  pairMessage,
 } from './constants';
 import { SELECTOR_STRATEGIES } from './flow-map';
 
@@ -143,15 +144,41 @@ export const createProjectSchema = z
    * approval and a generation.
    */
   .superRefine((value, ctx) => {
-    const allowed = FRAMEWORKS_BY_LANGUAGE[value.primaryLanguage];
-    if (!allowed.includes(value.primaryFramework)) {
+    if (!isSupportedPair(value.primaryLanguage, value.primaryFramework)) {
       ctx.addIssue({
         code: 'custom',
         path: ['primaryFramework'],
-        message: `${value.primaryFramework} is not available for ${value.primaryLanguage}. Choose one of: ${allowed.join(', ')}`,
+        message: pairMessage(value.primaryLanguage, value.primaryFramework),
       });
     }
   });
+
+/**
+ * Change an app's name, language or framework after it exists.
+ *
+ * The first-run funnel promises, on every step, that none of its choices are
+ * binding — "you can change any of this in Setup later". Until this existed
+ * that sentence was false for the two choices the funnel makes most loudly:
+ * `Project.primaryLanguage` and `primaryFramework` were writable exactly once,
+ * at create time, and the only escape was to archive the app and start again.
+ *
+ * Every field is optional and the pair rule is deliberately NOT enforced here:
+ * a request may legitimately send only a language, and whether the RESULT is a
+ * supported pair depends on the row this merges into. The route re-checks the
+ * merged pair — validating the fragment would either reject a valid partial
+ * update or wave through an invalid combination, and it is the stored row that
+ * the generator reads.
+ */
+export const updateProjectSchema = z
+  .object({
+    name: z.string().min(1).max(120).optional(),
+    primaryLanguage: z.enum(LANGUAGES).optional(),
+    primaryFramework: z.enum(UI_FRAMEWORKS).optional(),
+  })
+  .refine(
+    (value) => Object.values(value).some((field) => field !== undefined),
+    'nothing to update',
+  );
 
 export const createEnvironmentSchema = z.object({
   name: z.string().min(1).max(60),

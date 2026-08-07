@@ -1,585 +1,422 @@
 'use client';
 
-import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import Link from 'next/link';
+import { Suspense, useCallback, useMemo, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { API_URL, api, ApiError, type Project } from '../../lib/api';
+import type { Language, TestType, UiFramework } from '@qaai/shared';
+import { NEW_TEST_TEMPLATES } from '@qaai/shared';
+import { api, ApiError, type Project } from '../../lib/api';
 import { SetupHeader } from '../../components/setup/SetupHeader';
-import { clock } from '../../components/setup/time';
 import { Button } from '../../components/ui/Button';
-import { Field } from '../../components/ui/Field';
-import { Page, SectionLabel, Skeleton } from '../../components/ui/layout';
-import { cn } from '../../lib/cn';
+import { Page, Skeleton } from '../../components/ui/layout';
+import { CodebaseDrop, type CodebaseResult } from '../../components/onboarding/CodebaseDrop';
+import { ChangeableLater, FunnelStepper } from '../../components/onboarding/FunnelStepper';
+import { PathPicker } from '../../components/onboarding/PathPicker';
+import { ResultStep, type CreatedTest } from '../../components/onboarding/ResultStep';
+import { StackStep } from '../../components/onboarding/StackStep';
+import { TestTypesStep } from '../../components/onboarding/TestTypesStep';
+import {
+  DEFAULT_TEST_TYPES,
+  nameFromPaths,
+  reconcileFramework,
+  suggestStack,
+  uploadPayload,
+  type FunnelPath,
+} from '../../components/onboarding/funnel';
 
 /**
- * Add app (§10) — the first-run path the spec targets at "under 15 minutes".
+ * Add app — the first-run funnel.
  *
- * Four steps, and the stepper says which one you are in: name the app, point it
- * at a URL, watch the Explorer crawl live, then land on the plan to approve.
- * This is the flow that makes the product usable on your own app instead of only
- * the seeded demo — it was the single biggest gap.
+ * The old screen asked one question ("what URL?") and assumed the answer. That
+ * suits exactly one kind of user: somebody with a running staging environment
+ * who has already decided QAAI should crawl it. Everyone else — a team with a
+ * repo and no deployed URL, a team with an existing suite, a team who wants to
+ * write the first test by hand — had to pretend to be that person or leave.
  *
- * The crawl needs no API key; the plan step it hands off to does. That split is
- * shown honestly rather than hidden behind a spinner that never resolves.
+ * So the first question is now WHERE TESTS COME FROM, and the three steps after
+ * it narrow rather than interrogate: the stack (pre-filled from the repo when
+ * there was one, with the reason shown), the types of test wanted, and then the
+ * result. Every step says the choices are changeable in Setup afterwards,
+ * because a funnel that reads as a commitment is a funnel people abandon.
+ *
+ * The four paths are deliberately not four screens: they share a project, a
+ * stack and a set of test types, and differ only in what QAAI is given to work
+ * from. Keeping them in one stepper is what stops the shared parts drifting.
  */
 
-type Phase = 'form' | 'starting' | 'crawling' | 'stopped' | 'done' | 'error';
+const STEP_INDEX = { source: 0, stack: 1, types: 2, result: 3 } as const;
+type StepName = keyof typeof STEP_INDEX;
 
-const FRAMEWORKS = [
-  { value: 'PLAYWRIGHT', label: 'Playwright (TypeScript)' },
-  { value: 'CYPRESS', label: 'Cypress' },
-  { value: 'SELENIUM', label: 'Selenium' },
-];
-
-/** How long without a new log line before the screen says so, in ms. */
-const QUIET_MS = 20_000;
+/** The order steps unlock in, so the stepper can offer a jump back. */
+const ORDER: StepName[] = ['source', 'stack', 'types', 'result'];
 
 function OnboardingInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  const [name, setName] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
-  const [framework, setFramework] = useState('PLAYWRIGHT');
-  const [envKind, setEnvKind] = useState('STAGING');
-
-  const [phase, setPhase] = useState<Phase>('form');
-  /** What the submit is doing right now — three round-trips, named one by one. */
-  const [step, setStep] = useState<string | null>(null);
-  const [project, setProject] = useState<Project | null>(null);
-  const [log, setLog] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const logRef = useRef<HTMLDivElement>(null);
-
   /*
-   * The crawl's own clock. It exists because the Explorer can genuinely sit for
-   * minutes on a slow app, and a log that has not moved for ninety seconds is
-   * indistinguishable from a worker that died — the screen said nothing either
-   * way, so people reloaded and started a second crawl.
+   * `?mode=import` has linked here from the runs list since before this screen
+   * had paths at all. It preselects the import card rather than being a
+   * separate route: the link's promise was "start an import", and landing on
+   * the picker with that choice already made keeps it.
    */
-  const [startedAt, setStartedAt] = useState<number | null>(null);
-  const [lastLogAt, setLastLogAt] = useState<number>(() => Date.now());
-  const [now, setNow] = useState(() => Date.now());
+  const [path, setPath] = useState<FunnelPath | null>(
+    searchParams.get('mode') === 'import' ? 'import' : null,
+  );
+
+  const [step, setStep] = useState<StepName>('source');
+  const [furthest, setFurthest] = useState<StepName>('source');
+
+  const [codebase, setCodebase] = useState<CodebaseResult | null>(null);
+  const [name, setName] = useState('');
+  const [language, setLanguage] = useState<Language>('TYPESCRIPT');
+  const [framework, setFramework] = useState<UiFramework>('PLAYWRIGHT');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [envKind, setEnvKind] = useState('STAGING');
+  const [types, setTypes] = useState<ReadonlySet<TestType>>(new Set(DEFAULT_TEST_TYPES));
+
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  /**
+   * Something worth saying that is not a failure — currently only the upload
+   * trim. Kept apart from `error` because a repo that was too big to send whole
+   * still produced a working project, and colouring that red would read as
+   * "this did not work" when it did.
+   */
+  const [notice, setNotice] = useState<string | null>(null);
+  const [project, setProject] = useState<Project | null>(null);
+  const [createdTests, setCreatedTests] = useState<CreatedTest[]>([]);
+
+  const suggestion = useMemo(
+    () => (codebase ? suggestStack(codebase.detection) : null),
+    [codebase],
+  );
 
   /**
-   * Teardown for the in-flight crawl watcher. followCrawl returns one, and it
-   * used to be dropped on the floor — so the five-minute give-up timer fired
-   * even after a successful crawl, flipping a user reading their plan back to
-   * an empty form with a false "the crawl did not finish" error.
+   * Accept a repo pick: adopt what it implies, without overwriting what the
+   * person has already typed.
+   *
+   * A pre-filled field is a suggestion; a field that overwrites an edit is a
+   * bug. Hence the `||` guards — the name and stack move only while they are
+   * still at their defaults.
    */
-  const stopWatchingRef = useRef<(() => void) | null>(null);
-  useEffect(() => () => stopWatchingRef.current?.(), []);
+  const onCodebase = useCallback((result: CodebaseResult | null) => {
+    setCodebase(result);
+    setError(null);
+    if (!result) return;
 
-  /**
-   * "Import existing tests" on /runs links here with ?mode=import, and this
-   * screen ignored the parameter entirely — so someone who said they already
-   * have a suite landed on the crawl form and was asked to point us at a URL
-   * instead. The parameter has one meaning: you are here to import.
-   */
-  const mode = searchParams.get('mode');
-  useEffect(() => {
-    if (mode === 'import') router.replace('/import');
-  }, [mode, router]);
-
-  useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-    setLastLogAt(Date.now());
-  }, [log]);
-
-  // Ticks only while something is actually in flight.
-  useEffect(() => {
-    if (phase !== 'crawling') return;
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, [phase]);
-
-  const followCrawl = useCallback((projectId: string) => {
-    const source = new EventSource(`${API_URL}/projects/${projectId}/explore/events`, {
-      withCredentials: true,
-    });
-
-    source.addEventListener('log', (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as {
-          data: { message?: string };
-        };
-        if (parsed.data.message) setLog((prev) => [...prev, parsed.data.message!].slice(-200));
-      } catch {
-        /* ignore a malformed frame */
-      }
-    });
-
-    // The crawl ends by writing a plan; the run.finished event carries the
-    // item count. Poll for the plan too, in case the event is missed.
-    source.addEventListener('run.finished', () => {
-      stop();
-      setPhase('done');
-    });
-
-    const poll = setInterval(() => {
-      void (async () => {
-        const plan = await api<{ plan: { items: unknown[] } }>(`/projects/${projectId}/plan`).catch(
-          () => null,
-        );
-        if (plan) {
-          stop();
-          setPhase('done');
-        }
-      })();
-    }, 3000);
-
-    /*
-     * Give up after five minutes rather than spin forever if the worker is
-     * down — but do not guess at why. This used to assert "The crawl did not
-     * finish" flatly, and the most common way to reach it was a crawl that had
-     * finished perfectly and was already in the database. Ask the flow map
-     * whether that happened before saying anything.
-     */
-    const giveUp = setTimeout(() => {
-      stop();
-      void api<{ flowMap: { version: number; nodeCount: number } }>(
-        `/projects/${projectId}/flow-map`,
-      )
-        .then((result) => {
-          setError(
-            `The crawl finished — flow map v${result.flowMap.version}, ${result.flowMap.nodeCount} states — but no test plan was written from it. That step runs in the worker: check that it is running and read its log for the reason.`,
-          );
-        })
-        .catch(() => {
-          setError(
-            'The crawl did not finish and no flow map was written. Is the worker running? Its log will say what stopped.',
-          );
-        })
-        .finally(() => setPhase('error'));
-    }, 5 * 60_000);
-
-    function stop() {
-      clearInterval(poll);
-      clearTimeout(giveUp);
-      source.close();
+    setName((current) => current || nameFromPaths(result.paths) || '');
+    const stack = suggestStack(result.detection);
+    if (stack) {
+      setLanguage(stack.language);
+      setFramework(stack.framework);
     }
-
-    return stop;
   }, []);
 
-  async function start(event: React.FormEvent) {
-    event.preventDefault();
-    // Three round-trips used to happen with no feedback and nothing stopping a
-    // second press — which created a second project on the retry path, or hit
-    // the Free plan's one-project cap and reported it as a failure to crawl.
-    if (phase === 'starting') return;
+  const onLanguage = useCallback((next: Language) => {
+    setLanguage(next);
+    // The API refuses a pair its generator cannot emit, so the framework
+    // follows the language here rather than letting the person build an
+    // invalid pair and meet the refusal after they press the button.
+    setFramework((current) => reconcileFramework(next, current));
+  }, []);
+
+  const toggleType = useCallback((type: TestType) => {
+    setTypes((current) => {
+      const next = new Set(current);
+      if (next.has(type)) next.delete(type);
+      else next.add(type);
+      return next;
+    });
+  }, []);
+
+  function advance(to: StepName) {
+    setStep(to);
+    if (ORDER.indexOf(to) > ORDER.indexOf(furthest)) setFurthest(to);
+  }
+
+  const canLeaveSource =
+    path !== null && (path !== 'codebase' || codebase !== null);
+  const canLeaveStack =
+    name.trim().length > 0 && (path !== 'url' || baseUrl.trim().length > 0);
+
+  /**
+   * Everything the chosen path needs, in order, each round trip named.
+   *
+   * The old screen ran up to three requests behind a single unlabelled press:
+   * no busy state, nothing to stop a second click, and a failure halfway
+   * through left a project with no environment and no way to tell. Each step
+   * below sets `busy` to what it is doing, and the button is disabled while it
+   * is set.
+   */
+  async function finish() {
+    if (busy) return;
     setError(null);
-    setPhase('starting');
+    setNotice(null);
 
     try {
-      /**
-       * One project, one environment, one crawl — the whole first-run in a
-       * single submit so nobody has to assemble it by hand.
-       *
-       * Each step reuses what already exists rather than re-creating it. This
-       * matters on the retry path: creating the project and then failing at the
-       * environment used to leave a project behind, and resubmitting hit "slug
-       * already exists" (and, on the Free plan, "1 project allowed") forever.
-       */
-      const existing = project;
-      setStep(existing ? 'Reusing the app you already created…' : 'Creating the app…');
-      const created =
-        existing ??
-        (
-          await api<{ project: Project }>('/projects', {
-            method: 'POST',
-            body: JSON.stringify({ name, primaryFramework: framework }),
-          })
-        ).project;
+      setBusy('Creating the app…');
+      const { project: created } = await api<{ project: Project }>('/projects', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name.trim(),
+          primaryLanguage: language,
+          primaryFramework: framework,
+        }),
+      });
       setProject(created);
 
-      setStep('Setting up the environment…');
-      const environments = await api<{ environments: Array<{ id: string; baseUrl: string }> }>(
-        `/projects/${created.id}/environments`,
-      ).catch(() => ({ environments: [] as Array<{ id: string; baseUrl: string }> }));
+      // An environment is what a run needs; the URL is optional on every path
+      // except the crawl, so this is conditional rather than assumed.
+      if (baseUrl.trim()) {
+        setBusy('Adding the environment…');
+        await api(`/projects/${created.id}/environments`, {
+          method: 'POST',
+          body: JSON.stringify({
+            name: envKind.toLowerCase(),
+            kind: envKind,
+            baseUrl: baseUrl.trim(),
+          }),
+        });
+      }
 
-      const environment =
-        environments.environments[0] ??
-        (
-          await api<{ environment: { id: string } }>(`/projects/${created.id}/environments`, {
-            method: 'POST',
-            body: JSON.stringify({ name: envKind.toLowerCase(), kind: envKind, baseUrl }),
-          })
-        ).environment;
+      if (path === 'codebase' && codebase) {
+        /*
+         * The repo goes up as paths plus the contents of the files detection
+         * actually reads — readRepo already made that split in the browser, so
+         * a monorepo does not become a 200MB POST.
+         */
+        setBusy('Reading your codebase…');
+        /*
+         * Trimmed to what the API accepts before it is sent. The read is
+         * generous because it happens in this tab; the upload is not, because
+         * `express.json` rejects a 2MB body outright and the person would meet
+         * that as an unexplained failure at the last step of the funnel.
+         */
+        const payload = uploadPayload(codebase.files);
+        await api(`/projects/${created.id}/source`, {
+          method: 'POST',
+          body: JSON.stringify({ files: payload.files }),
+        });
+        if (payload.droppedFiles > 0) {
+          setNotice(
+            `Sent ${payload.files.length.toLocaleString()} of ${codebase.files.length.toLocaleString()} files — the rest were over the upload limit.`,
+          );
+        }
 
-      setStep('Starting the crawl…');
-      await api(`/projects/${created.id}/explore`, {
-        method: 'POST',
-        body: JSON.stringify({ environmentId: environment.id, maxPages: 25, maxDepth: 3 }),
-      });
+        setBusy('Proposing scenarios…');
+        await api(`/projects/${created.id}/analyze-source`, {
+          method: 'POST',
+          body: JSON.stringify({ autoApprove: false }),
+        });
+      }
 
-      setStep(null);
-      setPhase('crawling');
-      setLog([`Crawling ${baseUrl}…`]);
-      setStartedAt(Date.now());
-      setNow(Date.now());
-      stopWatchingRef.current = followCrawl(created.id);
+      if (path === 'scratch') {
+        /*
+         * A starter file per chosen type, from the same templates the editor's
+         * new-test dialog uses — so "start from scratch" opens on something
+         * that runs, not an empty tree. The templates are validated against
+         * their runner plugins by a test in packages/shared.
+         */
+        setBusy('Writing the starter tests…');
+        const made: CreatedTest[] = [];
+        for (const type of types) {
+          const template = NEW_TEST_TEMPLATES[type];
+          if (!template) continue;
+          const slug = `starter-${type.toLowerCase().replace(/_/g, '-')}`;
+          const { test } = await api<{ test: CreatedTest }>(
+            `/projects/${created.id}/tests`,
+            {
+              method: 'POST',
+              body: JSON.stringify({
+                name: `Starter ${type.toLowerCase().replace(/_/g, ' ')} test`,
+                type,
+                feature: 'Hand-written',
+                priority: 'NICE_TO_HAVE',
+                filePath: `hand-written/${slug}${template.fileSuffix}`,
+                code: template.code,
+                // Spec-driven types carry a spec their plugin validates; the
+                // editor's create dialog sends it the same conditional way.
+                ...(template.spec !== undefined ? { spec: template.spec } : {}),
+              }),
+            },
+          );
+          made.push(test);
+        }
+        setCreatedTests(made);
+      }
+
+      if (path === 'import') {
+        // The import screen owns its own upload and conversion; this funnel's
+        // job was the project and the stack it converts into.
+        router.push(`/import?project=${created.id}`);
+        return;
+      }
+
+      advance('result');
     } catch (err) {
-      setStep(null);
       if (err instanceof ApiError && err.status === 401) {
         router.push('/login');
         return;
       }
-      setError(err instanceof Error ? err.message : 'Could not start');
-      setPhase('error');
+      setError(err instanceof Error ? err.message : 'Could not finish setting up');
+    } finally {
+      setBusy(null);
     }
   }
 
-  function watchAgain() {
-    if (!project) return;
-    setPhase('crawling');
-    setStartedAt((at) => at ?? Date.now());
-    setNow(Date.now());
-    stopWatchingRef.current = followCrawl(project.id);
-  }
-
-  // Mid-redirect to /import — rendering the crawl form here would flash the
-  // exact screen the parameter says the user did not want.
-  if (mode === 'import') return null;
-
-  const editing = phase === 'form' || phase === 'starting' || phase === 'error';
-  const quietFor = phase === 'crawling' ? Math.floor((now - lastLogAt) / 1000) : 0;
-
-  return (
-    <div className="mt-7">
-      <Stepper phase={phase} />
-
-        <div className="mt-6 grid gap-7 md:grid-cols-[minmax(240px,340px)_minmax(280px,1fr)]">
-          {/* ── The app ──────────────────────────────────────────────────── */}
-          <div>
-            <SectionLabel>The app</SectionLabel>
-
-            {editing ? (
-              <form onSubmit={start} className="space-y-4">
-                <Field
-                  id="name"
-                  label="Name"
-                  required
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="Acme Storefront"
-                  disabled={phase === 'starting'}
-                />
-
-                <div>
-                  <Field
-                    id="url"
-                    label="URL to test"
-                    type="url"
-                    required
-                    value={baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder="https://staging.acme.com"
-                    aria-describedby="url-hint"
-                    className="font-mono"
-                    disabled={phase === 'starting'}
-                  />
-                  {/* Not the Field's own `hint`, because this one has a control in it. */}
-                  <p id="url-hint" className="text-ink-faint text-micro mt-1.5">
-                    A staging or preview URL is best. To test the bundled demo, use{' '}
-                    <button
-                      type="button"
-                      onClick={() => setBaseUrl('http://localhost:5050')}
-                      className="text-accent font-mono underline"
-                    >
-                      http://localhost:5050
-                    </button>
-                    .
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label
-                      htmlFor="framework"
-                      className="text-meta text-ink-faint mb-2 block font-mono tracking-[0.08em] uppercase"
-                    >
-                      Framework
-                    </label>
-                    <select
-                      id="framework"
-                      value={framework}
-                      onChange={(e) => setFramework(e.target.value)}
-                      disabled={phase === 'starting'}
-                      className="border-line text-row-sub focus:border-accent w-full rounded-md border bg-transparent px-2.5 py-2 outline-none transition-colors"
-                    >
-                      {FRAMEWORKS.map((f) => (
-                        <option key={f.value} value={f.value}>
-                          {f.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="env"
-                      className="text-meta text-ink-faint mb-2 block font-mono tracking-[0.08em] uppercase"
-                    >
-                      Environment
-                    </label>
-                    <select
-                      id="env"
-                      value={envKind}
-                      onChange={(e) => setEnvKind(e.target.value)}
-                      disabled={phase === 'starting'}
-                      className="border-line text-row-sub focus:border-accent w-full rounded-md border bg-transparent px-2.5 py-2 outline-none transition-colors"
-                    >
-                      <option value="LOCAL">Local</option>
-                      <option value="PREVIEW">Preview</option>
-                      <option value="STAGING">Staging</option>
-                      <option value="PRODUCTION">Production</option>
-                    </select>
-                  </div>
-                </div>
-
-                {error && (
-                  <p
-                    role="alert"
-                    className="border-fail/40 text-fail text-row-sub rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] p-3"
-                  >
-                    {error}
-                  </p>
-                )}
-
-                <Button
-                  type="submit"
-                  variant="primary"
-                  className="w-full"
-                  loading={phase === 'starting'}
-                >
-                  {phase === 'error' ? 'Try again' : 'Crawl and propose tests'}
-                </Button>
-
-                {step && (
-                  <p className="text-ink-dim text-micro font-mono" aria-live="polite">
-                    {step}
-                  </p>
-                )}
-              </form>
-            ) : (
-              <div className="flex flex-col gap-2">
-                <span className="border-line bg-surface-1 rounded-md border px-3 py-2 text-[13px]">
-                  {project?.name ?? name}
-                </span>
-                <span className="border-line bg-surface-1 rounded-md border px-3 py-2 font-mono text-[11.5px] break-all">
-                  {baseUrl}
-                </span>
-                <span className="border-line bg-surface-1 text-ink-dim rounded-md border px-3 py-2 text-[12.5px]">
-                  {FRAMEWORKS.find((f) => f.value === framework)?.label ?? framework} ·{' '}
-                  {envKind.toLowerCase()}
-                </span>
-              </div>
-            )}
-
-            <p className="text-ink-faint mt-2.5 text-[11.5px]">
-              The crawl needs no API key; writing the plan does. That split is shown, not hidden
-              behind a spinner.
-            </p>
-          </div>
-
-          {/* ── The Explorer ─────────────────────────────────────────────── */}
-          <div>
-            <SectionLabel>
-              Explorer{' '}
-              <span className={phase === 'done' ? 'text-pass' : undefined}>
-                · {phase === 'crawling' ? 'live' : phase === 'done' ? 'finished' : 'idle'}
-              </span>
-              {phase === 'crawling' && (
-                <span className="bg-accent ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full align-middle" />
-              )}
-            </SectionLabel>
-
-            {log.length === 0 ? (
-              <div className="border-line text-ink-faint text-micro rounded-lg border border-dashed px-3.5 py-6 leading-relaxed">
-                The Explorer&apos;s log appears here — every page it visits, every form it finds, and
-                every auth wall it records rather than crosses.
-              </div>
-            ) : (
-              <div
-                ref={logRef}
-                className="border-line bg-surface-1 max-h-[220px] overflow-y-auto rounded-lg border px-3.5 py-3 font-mono text-[10.5px] leading-[1.8]"
-              >
-                {log.map((line, i) => (
-                  <p
-                    key={i}
-                    className={i === log.length - 1 ? 'text-ink-dim' : 'text-ink-faint'}
-                  >
-                    {line}
-                  </p>
-                ))}
-              </div>
-            )}
-
-            {/* The progress signal. Elapsed alone answers "is it stuck?"; the
-                quiet counter answers "has it stopped?" — different questions. */}
-            {phase === 'crawling' && (
-              <p
-                className="text-ink-faint text-micro mt-2.5 font-mono tabular-nums"
-                aria-live="polite"
-              >
-                {log.length} line{log.length === 1 ? '' : 's'} ·{' '}
-                {clock(now - (startedAt ?? now))} · stops at 5m or when the frontier is empty
-                {quietFor >= QUIET_MS / 1000 && (
-                  <span className="text-flake"> · still going — nothing new for {quietFor}s</span>
-                )}
-              </p>
-            )}
-
-            {phase === 'crawling' && (
-              <p className="mt-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    stopWatchingRef.current?.();
-                    stopWatchingRef.current = null;
-                    setPhase('stopped');
-                  }}
-                  className="text-ink-faint hover:text-ink text-[12px] transition-colors"
-                >
-                  stop watching
-                </button>
-              </p>
-            )}
-
-            {phase === 'stopped' && (
-              <div className="mt-2.5">
-                <p className="text-ink-dim text-row-sub leading-relaxed">
-                  Stopped watching. The crawl itself keeps running in the worker — nothing was
-                  cancelled, and the flow map fills in when it finishes.
-                </p>
-                <div className="mt-2.5 flex flex-wrap gap-2">
-                  <Button size="sm" onClick={watchAgain}>
-                    Watch again
-                  </Button>
-                  <Link
-                    href="/flow-map"
-                    className="border-line text-ink-dim hover:text-ink hover:border-line-strong inline-flex items-center rounded-md border px-[11px] py-[5px] text-[12px] transition-colors"
-                  >
-                    Open the flow map
-                  </Link>
-                </div>
-              </div>
-            )}
-
-            {phase === 'done' && project && (
-              <div className="mt-3">
-                <Link
-                  href={`/projects/${project.id}/plan`}
-                  className="bg-accent text-accent-ink text-row-sub inline-block rounded-md px-3.5 py-[7px] font-semibold hover:opacity-90"
-                >
-                  Review the proposed plan →
-                </Link>
-                <p className="text-ink-faint text-micro mt-2 font-mono">
-                  writing the plan is the step that needs an API key
-                </p>
-              </div>
-            )}
-
-            {/*
-              The error phase re-renders the form, which used to throw away the
-              crawl log with it — leaving someone who just watched twelve pages
-              get visited with a bare error and no evidence of what happened. It
-              is the only record of the crawl the screen has; keep it.
-            */}
-            {phase === 'error' && log.length > 0 && (
-              <p className="text-ink-faint text-micro mt-2.5 font-mono">
-                the log above is what the crawl reported before it stopped
-              </p>
-            )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/**
- * Where you are in the four steps.
- *
- * Derived from the phase rather than tracked separately — a stepper that can
- * disagree with the screen it labels is worse than no stepper.
- */
-function Stepper({ phase }: { phase: Phase }) {
-  // The URL is only "pointed at" once the crawl has actually been accepted, so
-  // `starting` still counts as being on step one.
-  const pointed = phase === 'crawling' || phase === 'stopped' || phase === 'done';
-  const crawled = phase === 'done';
-  const states: ReadonlyArray<'done' | 'active' | 'pending'> = [
-    pointed ? 'done' : 'active',
-    crawled ? 'done' : pointed ? 'active' : 'pending',
-    crawled ? 'active' : 'pending',
-    'pending',
-  ];
-  const steps = ['POINT', 'CRAWL', 'PLAN', 'FIRST RUN'].map((label, i) => ({
-    label,
-    state: states[i]!,
-  }));
-
-  return (
-    <ol className="flex flex-wrap font-mono text-[10.5px] tracking-[0.06em]">
-      {steps.map((s, i) => (
-        <li
-          key={s.label}
-          className={cn(
-            'flex items-center gap-[7px] px-[18px] first:pr-[18px] first:pl-0',
-            i > 0 && 'border-line border-l',
-            s.state === 'done' && 'text-pass',
-            s.state === 'active' && 'text-ink',
-            s.state === 'pending' && 'text-ink-faint',
-          )}
-          aria-current={s.state === 'active' ? 'step' : undefined}
-        >
-          <span
-            aria-hidden="true"
-            className={cn(
-              'inline-flex h-[18px] w-[18px] items-center justify-center rounded-full text-[10px]',
-              s.state === 'done' && 'bg-[color-mix(in_srgb,var(--color-pass)_15%,transparent)]',
-              s.state === 'active' && 'bg-accent text-accent-ink',
-              s.state === 'pending' && 'border-line border',
-            )}
-          >
-            {s.state === 'done' ? '✓' : i + 1}
-          </span>
-          {s.label}
-        </li>
-      ))}
-    </ol>
-  );
-}
-
-/**
- * `useSearchParams()` forces a client-side bailout, and Next refuses to
- * statically prerender a page that does so without a Suspense boundary — it
- * failed the production build outright ("useSearchParams() should be wrapped in
- * a suspense boundary"). The boundary lets the shell prerender and the
- * param-dependent part hydrate on the client.
- *
- * The header stays OUTSIDE it, and that placement is load-bearing rather than
- * cosmetic: it carries the shell's tab-strip slot, which the shell fills from an
- * effect. Inside the boundary, that effect fires while this subtree is still
- * queued for hydration, React finds a `<nav>` in a node it rendered empty, and
- * throws the whole page away and re-renders it. Outside, the slot hydrates in
- * the first pass, before any effect runs.
- */
-export default function OnboardingPage() {
   return (
     <Page width="setup">
       <SetupHeader />
-      <Suspense
-        fallback={
-          <div className="mt-7 space-y-3" role="status" aria-label="Loading">
-            <Skeleton className="h-4 w-64" />
-            <Skeleton className="h-40 w-full rounded-lg" />
+
+      <div className="mt-7">
+        <FunnelStepper
+          current={STEP_INDEX[step]}
+          furthest={STEP_INDEX[furthest]}
+          onJump={(index) => {
+            // Backwards only, and never once the project exists — the earlier
+            // steps describe decisions that have already been acted on.
+            if (project) return;
+            const target = ORDER[index];
+            if (target && index <= STEP_INDEX[furthest]) setStep(target);
+          }}
+        />
+      </div>
+
+      {notice && !error && (
+        <p className="border-line bg-surface-1 text-ink-dim text-body-sm mt-5 rounded-md border px-3 py-2">
+          {notice}
+        </p>
+      )}
+
+      {error && (
+        <p
+          role="alert"
+          className="border-fail/40 bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] text-fail text-body-sm mt-5 rounded-md border px-3 py-2"
+        >
+          {error}
+        </p>
+      )}
+
+      {step === 'source' && (
+        <div className="mt-6">
+          <PathPicker value={path} onChange={setPath}>
+            {(choice) =>
+              choice === 'codebase' ? (
+                <CodebaseDrop result={codebase} onResult={onCodebase} />
+              ) : null
+            }
+          </PathPicker>
+
+          <div className="mt-7 flex items-center gap-3">
+            <Button
+              variant="primary"
+              disabled={!canLeaveSource}
+              onClick={() => advance('stack')}
+            >
+              Continue
+            </Button>
+            {path === 'codebase' && !codebase && (
+              <span className="text-ink-faint text-row-sub">
+                Pick the folder your application lives in.
+              </span>
+            )}
           </div>
-        }
-      >
-        <OnboardingInner />
-      </Suspense>
+          <ChangeableLater />
+        </div>
+      )}
+
+      {step === 'stack' && (
+        <div className="mt-6">
+          <StackStep
+            name={name}
+            onName={setName}
+            language={language}
+            framework={framework}
+            onLanguage={onLanguage}
+            onFramework={setFramework}
+            suggestion={suggestion}
+            baseUrl={baseUrl}
+            onBaseUrl={setBaseUrl}
+            urlRequired={path === 'url'}
+            envKind={envKind}
+            onEnvKind={setEnvKind}
+            disabled={busy !== null}
+          />
+
+          <div className="mt-7 flex items-center gap-3">
+            <Button variant="secondary" onClick={() => setStep('source')}>
+              Back
+            </Button>
+            <Button variant="primary" disabled={!canLeaveStack} onClick={() => advance('types')}>
+              Continue
+            </Button>
+          </div>
+          <ChangeableLater />
+        </div>
+      )}
+
+      {step === 'types' && (
+        <div className="mt-6">
+          <TestTypesStep
+            selected={types}
+            onToggle={toggleType}
+            onClear={() => setTypes(new Set())}
+            disabled={busy !== null}
+          />
+
+          <div className="mt-7 flex items-center gap-3">
+            <Button variant="secondary" disabled={busy !== null} onClick={() => setStep('stack')}>
+              Back
+            </Button>
+            <Button
+              variant="primary"
+              loading={busy !== null}
+              disabled={types.size === 0}
+              onClick={() => void finish()}
+            >
+              {busy ?? 'Set up my app'}
+            </Button>
+            {types.size === 0 && (
+              <span className="text-ink-faint text-row-sub">Pick at least one kind of test.</span>
+            )}
+          </div>
+          <ChangeableLater />
+        </div>
+      )}
+
+      {step === 'result' && project && (
+        <ResultStep
+          path={path ?? 'scratch'}
+          projectId={project.id}
+          projectName={project.name}
+          language={language}
+          framework={framework}
+          codebase={codebase}
+          baseUrl={path === 'url' ? baseUrl.trim() : ''}
+          createdTests={createdTests}
+          selectedTypes={[...types]}
+          onCrawlError={setError}
+        />
+      )}
     </Page>
+  );
+}
+
+export default function OnboardingPage() {
+  return (
+    /*
+     * `?mode=import` is read with useSearchParams, which `next build` refuses to
+     * prerender without a boundary above it. This has broken the build twice.
+     */
+    <Suspense
+      fallback={
+        <Page width="setup">
+          <SetupHeader />
+          <Skeleton className="mt-8 h-64 w-full" />
+        </Page>
+      }
+    >
+      <OnboardingInner />
+    </Suspense>
   );
 }

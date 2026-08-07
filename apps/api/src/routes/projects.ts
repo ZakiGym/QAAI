@@ -11,6 +11,7 @@ import {
   QUEUE_NAMES,
   PLAN_LIMITS,
   SECRET_MASK,
+  SPEC_DRIVEN_TEST_TYPES,
   authProfileConfigSchema,
   authProfileSchema,
   createEnvironmentSchema,
@@ -25,12 +26,15 @@ import {
   moveFolderSchema,
   moveTestSchema,
   locatorsFromFlowMap,
+  isSupportedPair,
+  pairMessage,
   updateEnvironmentSchema,
   updateGateRulesSchema,
+  updateProjectSchema,
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
-import type { FlowMap, GitIntegrationKind } from '@qaai/shared';
+import type { FlowMap, GitIntegrationKind, Language, UiFramework } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
@@ -135,6 +139,81 @@ projectsRouter.get('/:projectId', async (req, res) => {
   });
   if (!project) throw notFound('Project');
   res.json({ project });
+});
+
+/**
+ * Rename an app, or change the language and framework its tests are written in.
+ *
+ * The first-run funnel says on every step that nothing it asks is binding.
+ * That was false: language and framework were set once at create time and
+ * there was no route to change them, so a person who picked TypeScript on
+ * their way in and then wanted Python had to archive the app — losing its runs,
+ * its plan and its history — to get a different answer.
+ *
+ * The pair is validated against the MERGED row rather than against the request.
+ * A body carrying only `primaryLanguage: 'RUBY'` is a perfectly well-formed
+ * fragment that would leave a TypeScript project's Playwright pointing at a
+ * language the generator cannot emit it for; the schema cannot see that,
+ * because the schema never sees the row.
+ */
+projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = updateProjectSchema.parse(req.body);
+
+  const project = await prisma.project.findUnique({
+    where: { id: String(req.params.projectId) },
+    select: {
+      id: true,
+      name: true,
+      primaryLanguage: true,
+      primaryFramework: true,
+      archivedAt: true,
+    },
+  });
+  if (!project || project.archivedAt) throw notFound('Project');
+
+  const language = (input.primaryLanguage ?? project.primaryLanguage) as Language;
+  const framework = (input.primaryFramework ?? project.primaryFramework) as UiFramework;
+  if (!isSupportedPair(language, framework)) {
+    throw unprocessable(pairMessage(language, framework));
+  }
+
+  const updated = await prisma.project.update({
+    where: { id: project.id },
+    data: {
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      primaryLanguage: language,
+      primaryFramework: framework,
+    },
+    include: { environments: true, _count: { select: { tests: true, runs: true } } },
+  });
+
+  /*
+   * The BEFORE values are in the metadata as well as the after. Changing the
+   * framework silently re-points every future generation at a different runner,
+   * and "it used to write Playwright" is the question someone asks a week later
+   * when a generated suite stops matching the one they already had.
+   */
+  await audit({
+    actor,
+    action: 'project.update',
+    targetType: 'Project',
+    targetId: project.id,
+    metadata: {
+      from: {
+        name: project.name,
+        primaryLanguage: project.primaryLanguage,
+        primaryFramework: project.primaryFramework,
+      },
+      to: {
+        name: updated.name,
+        primaryLanguage: updated.primaryLanguage,
+        primaryFramework: updated.primaryFramework,
+      },
+    },
+  });
+
+  res.json({ project: updated });
 });
 
 /**
@@ -523,6 +602,191 @@ projectsRouter.get('/:projectId/tests', async (req, res) => {
     },
   });
   res.json({ tests });
+});
+
+/**
+ * Search across every test file in the project (⌘⇧F in the editor).
+ *
+ * This is server-side because the list above deliberately omits `code`, and it
+ * should stay that way: fetching every file so the browser can grep them is one
+ * request per test, and the payload is the whole suite for a query that matches
+ * three lines. The endpoint sends back only what is shown — the matching lines.
+ *
+ * Two rules keep it honest:
+ *
+ *  · It searches THE BUFFER THE EDITOR WOULD SHOW YOU. A spec-driven test's
+ *    `code` column holds a pointer comment, not a program, and the editor opens
+ *    its `spec` as pretty-printed JSON instead. Searching `code` for those would
+ *    report matches in text nobody can see and, worse, report line numbers that
+ *    jump to the wrong place in the file that does open.
+ *
+ *  · No caller-supplied regular expression, and none COMPILED FROM one either.
+ *    Node cannot interrupt a running match, so one pathological pattern from one
+ *    user stops the API for everyone. Case-sensitivity and whole-word are
+ *    offered instead because both can be answered by `indexOf` plus a look at
+ *    the two characters either side of the hit — a scan that is linear no matter
+ *    what is typed, with no pattern-shaped input reaching a regex engine at all.
+ */
+
+/** Longer than any query a person types; a longer one is a paste or a probe. */
+const SEARCH_MAX_QUERY = 200;
+/** Files reported. Past this the panel is a scroll, not an answer. */
+const SEARCH_MAX_FILES = 100;
+/** Rows per file. The panel says "+N more in this file" for the rest. */
+const SEARCH_MAX_PER_FILE = 50;
+/** Matches counted across the project before the scan stops. */
+const SEARCH_MAX_TOTAL = 1000;
+/** Long enough to read a matching line, short enough that a minified file cannot flood the panel. */
+const SEARCH_MAX_LINE = 400;
+
+/**
+ * The whole-word boundary, checked by hand.
+ *
+ * `\w` in a regex, written out — because writing it out is the point: this is
+ * the check a `\b` would do, done on two characters we already have, so the
+ * query never becomes a pattern. `undefined` (either end of the line) is not a
+ * word character, which is what makes a match at column 0 a whole word.
+ */
+function isSearchWordChar(ch: string | undefined): boolean {
+  if (ch === undefined) return false;
+  return (
+    (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '_'
+  );
+}
+
+/** Every index in `haystack` where `needle` starts, left to right. */
+function searchHits(haystack: string, needle: string, wholeWord: boolean): number[] {
+  const columns: number[] = [];
+  for (let at = haystack.indexOf(needle); at !== -1; at = haystack.indexOf(needle, at + 1)) {
+    if (
+      wholeWord &&
+      (isSearchWordChar(haystack[at - 1]) || isSearchWordChar(haystack[at + needle.length]))
+    ) {
+      continue;
+    }
+    columns.push(at);
+  }
+  return columns;
+}
+
+projectsRouter.get('/:projectId/search', async (req, res) => {
+  const query = (typeof req.query.q === 'string' ? req.query.q : '').trim();
+  if (query.length > SEARCH_MAX_QUERY) {
+    throw badRequest(`q must be ${SEARCH_MAX_QUERY} characters or fewer`);
+  }
+
+  const matchCase = req.query.case === '1';
+  const wholeWord = req.query.word === '1';
+
+  /*
+   * An empty box is not an error. The panel clears its own results before it
+   * would send one, so a blank `q` here is a direct caller or a race — and the
+   * honest answer to "find nothing" is nothing found, not a 400 the UI would
+   * have to special-case, and not a scan of every file in the project.
+   */
+  if (!query) {
+    res.json({ query, files: [], totalMatches: 0, truncated: false });
+    return;
+  }
+
+  /*
+   * `prisma` is the tenant-scoped client: the extension in lib/prisma.ts merges
+   * the request's orgId into this findMany, so a projectId belonging to another
+   * organisation matches no rows rather than returning its code. That is the
+   * whole tenant boundary for this route — reaching for `unscoped` here, or
+   * building the client yourself, removes it silently.
+   */
+  const tests = await prisma.test.findMany({
+    where: { projectId: String(req.params.projectId), disabledAt: null },
+    orderBy: [{ filePath: 'asc' }],
+    select: { id: true, name: true, type: true, filePath: true, code: true, spec: true },
+  });
+
+  const needle = matchCase ? query : query.toLowerCase();
+
+  const files: Array<{
+    testId: string;
+    name: string;
+    filePath: string;
+    type: string;
+    matchCount: number;
+    matches: Array<{ line: number; column: number; length: number; text: string }>;
+  }> = [];
+  let totalMatches = 0;
+  let truncated = false;
+
+  for (const test of tests) {
+    if (files.length >= SEARCH_MAX_FILES || totalMatches >= SEARCH_MAX_TOTAL) {
+      truncated = true;
+      break;
+    }
+
+    const buffer = SPEC_DRIVEN_TEST_TYPES.has(test.type)
+      ? JSON.stringify(test.spec ?? {}, null, 2)
+      : test.code;
+    if (!buffer) continue;
+
+    const matches: Array<{ line: number; column: number; length: number; text: string }> = [];
+    let matchCount = 0;
+    const lines = buffer.split('\n');
+
+    for (let index = 0; index < lines.length; index++) {
+      const raw = lines[index] ?? '';
+      const columns = searchHits(matchCase ? raw : raw.toLowerCase(), needle, wholeWord);
+      if (columns.length === 0) continue;
+      matchCount += columns.length;
+
+      /*
+       * The line as the panel will draw it: indentation dropped (a result row
+       * is 40px wide and a nested step starts at column 8) and capped. The
+       * column is re-based onto that string so the highlight lands on the same
+       * characters the reader sees, and is -1 when the match sits past the cap
+       * — a row that says "this line matches" without pretending to know where.
+       */
+      const lead = raw.length - raw.trimStart().length;
+      const text = raw.trimStart().slice(0, SEARCH_MAX_LINE);
+
+      // A row per hit, not per line: two hits on one line are two things to
+      // click. The panel keys its rows by line and column, so the unplaceable
+      // ones — every hit past the text cap collapses to the same -1 — are
+      // reported once and counted as dropped, rather than repeated.
+      let unplaceableShown = false;
+      for (const at of columns) {
+        if (matches.length >= SEARCH_MAX_PER_FILE) {
+          truncated = true;
+          break;
+        }
+        const column = at - lead;
+        const placed = column >= 0 && column < text.length;
+        if (!placed) {
+          if (unplaceableShown) {
+            truncated = true;
+            continue;
+          }
+          unplaceableShown = true;
+        }
+        matches.push({
+          line: index + 1,
+          column: placed ? column : -1,
+          length: needle.length,
+          text,
+        });
+      }
+    }
+
+    if (matchCount === 0) continue;
+    totalMatches += matchCount;
+    files.push({
+      testId: test.id,
+      name: test.name,
+      filePath: test.filePath,
+      type: test.type,
+      matchCount,
+      matches,
+    });
+  }
+
+  res.json({ query, files, totalMatches, truncated });
 });
 
 projectsRouter.get('/:projectId/tests/:testId', async (req, res) => {

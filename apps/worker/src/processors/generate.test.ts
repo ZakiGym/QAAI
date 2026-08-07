@@ -35,7 +35,7 @@ import {
   specFilePathFor,
   specPointerCode,
 } from '@qaai/agent';
-import { NEW_TEST_TEMPLATES, TEST_TYPES } from '@qaai/shared';
+import { MODEL_FREE_TEST_TYPES, NEW_TEST_TEMPLATES, TEST_TYPES } from '@qaai/shared';
 import type { ExecutableTest, FlowMap, PlanItem, TestType } from '@qaai/shared';
 import { pluginFor } from '@qaai/runner';
 
@@ -132,6 +132,18 @@ describe('deterministic scaffolds', () => {
     expect(SCAFFOLDABLE.sort()).toEqual(
       ['ACCESSIBILITY', 'API', 'LOAD', 'PERFORMANCE', 'SECURITY_SMOKE', 'VISUAL'].sort(),
     );
+  });
+
+  /*
+   * The first-run funnel tells someone choosing test types which ones this
+   * deployment can produce with no ANTHROPIC_API_KEY, and it reads that from
+   * @qaai/shared because the browser bundle cannot import @qaai/agent. This is
+   * what stops the two drifting: add a scaffold without listing it and the
+   * funnel understates what a key-less deployment can do; list one that does
+   * not exist and it promises a test nothing will ever write.
+   */
+  it('are exactly what MODEL_FREE_TEST_TYPES tells the web app they are', () => {
+    expect([...MODEL_FREE_TEST_TYPES].sort()).toEqual(SCAFFOLDABLE.sort());
   });
 
   for (const type of SCAFFOLDABLE) {

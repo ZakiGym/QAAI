@@ -10,6 +10,7 @@
  * this package's source under plain Node.
  */
 export * from './constants';
+export * from './codebase';
 export * from './detect';
 export * from './new-test-templates';
 export * from './ecosystems';

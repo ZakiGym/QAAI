@@ -1251,6 +1251,48 @@ model ImportBatch {
   @@index([orgId, projectId])
 }
 
+/// What QAAI learned from an application's SOURCE (§7).
+///
+/// The sibling of ImportBatch, and deliberately not the same table. An
+/// ImportBatch's subject is an existing TEST SUITE and its verb is "convert";
+/// this row's subject is the APPLICATION and its verb is "understand". Nothing
+/// here is converted into anything — it is read, and what was read becomes the
+/// material a plan is written from when no crawlable environment exists yet.
+///
+/// THE FILE BODIES ARE NOT STORED, and that is a decision rather than an
+/// omission. ImportBatch keeps its uploads because the worker has to read them
+/// again to convert them; nothing re-reads an application's source, so keeping
+/// a copy of a customer's entire codebase in our database would be a liability
+/// with no consumer — the kind of data you can only lose. Paths are kept
+/// because they are small, they are what the file-convention detectors ran on,
+/// and they let a user see exactly which files we looked at. Re-ingesting is one
+/// request away.
+model CodebaseSnapshot {
+  id           String   @id @default(cuid())
+  orgId        String
+  projectId    String
+  /// string[] — the repo-relative paths that were analysed. No file contents.
+  paths        Json
+  /// How many files the upload carried, before ignores and caps.
+  fileCount    Int      @default(0)
+  /// How many arrived with a body. The rest contributed only their path, which
+  /// bounds what the analysis below could possibly have seen.
+  withContent  Int      @default(0)
+  /// Bytes of source received, for the audit trail and the rate story.
+  totalBytes   Int      @default(0)
+  /// ProjectDetection — packages/shared/src/detect.ts. Runners, languages,
+  /// package managers: how you would RUN this repo's tests.
+  detection    Json
+  /// CodebaseAnalysis — packages/shared/src/codebase.ts. Routes, endpoints,
+  /// forms, auth surfaces: what the application EXPOSES.
+  analysis     Json
+  requestedBy  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([orgId, projectId])
+}
+
 /// A file change the copilot wants to make, held for human approval (§3).
 ///
 /// The copilot never writes a test directly. It proposes, the person reads the

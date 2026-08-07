@@ -34,6 +34,7 @@ import { teamRouter } from './routes/team.js';
 import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
+import { sourceRouter } from './routes/source.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { clustersRouter } from './routes/clusters.js';
 import { compareRouter } from './routes/compare.js';
@@ -182,6 +183,11 @@ app.use('/export', exportOrgRouter);
 app.use('/', trafficRouter);
 app.use('/', recordRouter);
 app.use('/', importRouter);
+// Declares '/projects/:projectId/source', so it mounts at the root beside
+// importRouter rather than inside projectsRouter — same reason: the path is
+// owned by the file that serves it. projectsRouter has no ':projectId/source'
+// route, so nothing shadows this one on the way past.
+app.use('/', sourceRouter);
 app.use('/', agentRouter);
 
 app.use(notFoundHandler);

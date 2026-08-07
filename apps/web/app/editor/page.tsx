@@ -1,10 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useMonaco } from '@monaco-editor/react';
-import type { Monaco } from '@monaco-editor/react';
 import {
   NEW_TEST_TEMPLATES,
   SPEC_DRIVEN_TEST_TYPES,
@@ -29,6 +28,12 @@ import { ConfirmDialog } from '../../components/ui/Modal';
 import { PromptDialog } from '../../components/ui/Field';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Page } from '../../components/ui/layout';
+import { Breadcrumbs } from '../../components/editor/Breadcrumbs';
+import { SearchPanel } from '../../components/editor/SearchPanel';
+import { StatusBar } from '../../components/editor/StatusBar';
+import { fileOutline, symbolTrailAt } from '../../components/editor/outline';
+import { useEditorPrefs } from '../../components/editor/prefs';
+import { defineTokenTheme } from '../../components/editor/theme';
 import { cn } from '../../lib/cn';
 import './monaco-decorations.css';
 
@@ -156,123 +161,6 @@ function editorLanguage(test: { type: string; filePath: string }): string {
 }
 
 /**
- * A design token as the `#rrggbb` Monaco understands, or null.
- *
- * Nothing here can be a literal: the status colours are oklch, the accent is one
- * of three and switchable at runtime, and both palettes flip with the theme.
- * Canvas is the only normaliser the platform hands us that parses every colour
- * syntax CSS does, so a token written in oklch still reaches Monaco as hex.
- *
- * Null rather than a hard-coded fallback: a value that cannot be read is a value
- * this file has no honest answer for, and Monaco's `inherit` already has one.
- */
-function tokenColour(variable: string): string | null {
-  if (typeof document === 'undefined') return null;
-  const raw = getComputedStyle(document.documentElement).getPropertyValue(variable).trim();
-  if (!raw) return null;
-  const ctx = document.createElement('canvas').getContext('2d');
-  if (!ctx) return null;
-
-  // An unparseable colour leaves fillStyle where it was, so a sentinel is the
-  // only way to tell "resolved to black" from "was rejected".
-  const sentinel = '#010203';
-  ctx.fillStyle = sentinel;
-  ctx.fillStyle = raw;
-  const resolved = ctx.fillStyle;
-  if (typeof resolved !== 'string' || !/^#[0-9a-f]{6}$/i.test(resolved)) return null;
-  return resolved === sentinel ? null : resolved;
-}
-
-/** Drops the pairs whose token could not be read, so `inherit` covers them. */
-function known(entries: Record<string, string | null>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(entries).filter((pair): pair is [string, string] => pair[1] !== null),
-  );
-}
-
-/**
- * The editor, dressed in the app's own tokens.
- *
- * CodeEditor defines `qaai-dark` from constants when it mounts, which was right
- * when there was one palette and is wrong now that there are two themes and
- * three accents. Redefining the SAME name rather than adding another means
- * whichever of us calls `setTheme` last, the definition in force is this one.
- * Monaco is themed through its own API here on purpose — reaching into its DOM
- * with CSS is how an embedded editor stops surviving its next version.
- */
-function applyTokenTheme(monaco: Monaco): void {
-  const light = document.documentElement.getAttribute('data-theme') === 'light';
-
-  const ink = tokenColour('--color-ink');
-  const dim = tokenColour('--color-ink-dim');
-  const faint = tokenColour('--color-ink-faint');
-  const surface = tokenColour('--color-surface');
-  const surface1 = tokenColour('--color-surface-1');
-  const surface2 = tokenColour('--color-surface-2');
-  const line = tokenColour('--color-line');
-  const accent = tokenColour('--color-accent');
-  const pass = tokenColour('--color-pass');
-  const flake = tokenColour('--color-flake');
-  const fail = tokenColour('--color-fail');
-
-  /* Monaco's token rules want the six digits without the hash; its colours want it. */
-  const rule = (token: string, hex: string | null, fontStyle?: string) =>
-    hex ? [{ token, foreground: hex.slice(1), ...(fontStyle ? { fontStyle } : {}) }] : [];
-
-  monaco.editor.defineTheme('qaai-dark', {
-    base: light ? 'vs' : 'vs-dark',
-    inherit: true,
-    rules: [
-      ...rule('', ink),
-      ...rule('comment', faint, 'italic'),
-      ...rule('string', pass),
-      ...rule('string.value.json', pass),
-      ...rule('string.key.json', dim),
-      ...rule('keyword', accent),
-      ...rule('keyword.json', accent),
-      ...rule('type', accent),
-      ...rule('type.identifier', accent),
-      ...rule('number', flake),
-      ...rule('delimiter', dim),
-    ],
-    colors: known({
-      'editor.background': surface,
-      'editor.foreground': ink,
-      'editorLineNumber.foreground': faint,
-      'editorLineNumber.activeForeground': dim,
-      // 40% of the accent: legible as a selection against both surfaces without
-      // swamping the text it is selecting.
-      'editor.selectionBackground': accent && `${accent}66`,
-      'editor.lineHighlightBackground': surface1,
-      'editorGutter.background': surface,
-      'editorIndentGuide.background1': line,
-      'editorWidget.background': surface1,
-      'editorWidget.border': line,
-      'editorSuggestWidget.background': surface1,
-      'editorSuggestWidget.border': line,
-      'editorSuggestWidget.selectedBackground': surface2,
-      'editorHoverWidget.background': surface1,
-      'editorHoverWidget.border': line,
-      /*
-       * Bracket-pair colouring is on, and its stock palette is gold/magenta/blue
-       * — three colours this design does not contain, on the most frequent glyph
-       * in a test file. Bound to the palette it becomes depth rather than decoration.
-       */
-      'editorBracketHighlight.foreground1': dim,
-      'editorBracketHighlight.foreground2': accent,
-      'editorBracketHighlight.foreground3': faint,
-      'editorBracketHighlight.foreground4': dim,
-      'editorBracketHighlight.foreground5': accent,
-      'editorBracketHighlight.foreground6': faint,
-      'editorBracketHighlight.unexpectedBracket.foreground': fail,
-      'scrollbarSlider.background': line && `${line}cc`,
-      'scrollbarSlider.hoverBackground': surface2,
-    }),
-  });
-  monaco.editor.setTheme('qaai-dark');
-}
-
-/**
  * Which lines of THIS file the last run died on.
  *
  * Playwright puts the failing frame in the message it hands back, so the line
@@ -376,6 +264,38 @@ export default function EditorPage() {
   const [running, setRunning] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [agentOpen, setAgentOpen] = useState(false);
+  const [prefs, togglePref] = useEditorPrefs();
+  const [caret, setCaret] = useState<{
+    position: { line: number; column: number };
+    selection: { chars: number; lines: number } | null;
+  } | null>(null);
+  const [problems, setProblems] = useState<{ errors: number; warnings: number } | null>(null);
+  /*
+   * The left column is one column showing one of two things. VS Code makes the
+   * activity bar a permanent rail; there is no room for a fourth column here,
+   * and the tree and the search results answer the same question — "which file"
+   * — so they take turns. ⌘⇧F switches to search; Escape in the box goes back.
+   */
+  const [leftPanel, setLeftPanel] = useState<'files' | 'search'>('files');
+  /** Bumped per ⌘⇧F so a second press re-focuses and selects the query. */
+  const [searchTick, setSearchTick] = useState(0);
+  /**
+   * A line to jump to once the file it belongs to is the one on screen.
+   *
+   * Opening a file and revealing a line in it are two steps with a render
+   * between them, and the first version of this deferred the reveal by one
+   * `requestAnimationFrame` and hoped. It was wrong in the case that matters:
+   * clicking a match in a file that was not already open moved the caret while
+   * Monaco still held the PREVIOUS model, and the swap that followed dropped it
+   * at the end of the new file instead of on the match.
+   *
+   * So the reveal is stored and performed by an effect that runs after the
+   * render where the tab actually became active — a fact, rather than a guess
+   * about how many frames the swap takes.
+   */
+  const [pendingReveal, setPendingReveal] = useState<{ testId: string; line: number } | null>(
+    null,
+  );
   const editorRef = useRef<import('monaco-editor').editor.IStandaloneCodeEditor | null>(null);
   /** Flipped in `onReady`, so the theme and decoration effects run after mount. */
   const [editorReady, setEditorReady] = useState(0);
@@ -644,6 +564,58 @@ export default function EditorPage() {
     }
   }, [project, openTest, dirty, running, save]);
 
+  /*
+   * The outline is parsed from the DRAFT, not the saved file: the breadcrumb
+   * has to name the test you are typing inside, including one you have not
+   * saved yet. Memoised on the text because the parse walks the whole buffer
+   * and the caret moves far more often than the text does — recomputing it per
+   * keystroke is fine, per cursor move is not.
+   */
+  const outline = useMemo(
+    () => (openTest ? fileOutline(draft, editorLanguage(openTest)) : []),
+    [draft, openTest],
+  );
+  const symbolTrail = useMemo(
+    () => (caret ? symbolTrailAt(outline, caret.position.line) : []),
+    [outline, caret],
+  );
+
+  /**
+   * Put the caret on a line and scroll it into view.
+   *
+   * `revealLineInCenter` rather than `revealLine`: a match that lands one row
+   * above the fold is a match you scroll to find, which defeats clicking it.
+   * Focus follows, because the point of jumping there is to type.
+   */
+  const revealLine = useCallback((line: number) => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    ed.revealLineInCenter(line);
+    ed.setPosition({ lineNumber: line, column: 1 });
+    ed.focus();
+  }, []);
+
+  /** ⇧⌥F, and the status bar's Format. Monaco owns the formatter. */
+  const formatDocument = useCallback(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    void ed.getAction('editor.action.formatDocument')?.run();
+    ed.focus();
+  }, []);
+
+  /**
+   * Jump to the first diagnostic.
+   *
+   * The count in the bar is only worth drawing if it goes somewhere — a number
+   * that says "3 errors" and cannot show you one is decoration.
+   */
+  const goToProblem = useCallback(() => {
+    const ed = editorRef.current;
+    if (!ed) return;
+    void ed.getAction('editor.action.marker.next')?.run();
+    ed.focus();
+  }, []);
+
   // Cmd-Enter runs. Cmd-S is bound inside Monaco so it only fires with the
   // editor focused; run is useful from anywhere on the page.
   const runRef = useRef(runThis);
@@ -658,6 +630,14 @@ export default function EditorPage() {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
         void runRef.current();
+      }
+      // ⌘⇧F. Compared case-insensitively: with shift held the browser reports
+      // `F`, and matching only 'f' is why this shortcut silently did nothing
+      // the first time it was tried.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setLeftPanel('search');
+        setSearchTick((n) => n + 1);
       }
     };
     window.addEventListener('keydown', onKey);
@@ -693,8 +673,9 @@ export default function EditorPage() {
   /*
    * Monaco, in the app's palette.
    *
-   * Runs after `onReady` on purpose: CodeEditor installs its own definition of
-   * `qaai-dark` as it mounts, and this has to be the later word.
+   * CodeEditor installs the SAME definition in `beforeMount`, so the first
+   * paint is already right; this effect exists to REDEFINE it when the theme or
+   * accent changes underneath a mounted editor.
    *
    * It follows the theme by WATCHING `<html>` rather than by subscribing to
    * `useTheme`. That hook holds per-component state, so the copy of it in this
@@ -705,15 +686,31 @@ export default function EditorPage() {
   const monaco = useMonaco();
   useEffect(() => {
     if (!monaco || editorReady === 0) return;
-    applyTokenTheme(monaco);
+    defineTokenTheme(monaco);
 
-    const observer = new MutationObserver(() => applyTokenTheme(monaco));
+    const observer = new MutationObserver(() => defineTokenTheme(monaco));
     observer.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ['data-theme', 'data-accent'],
     });
     return () => observer.disconnect();
   }, [monaco, editorReady]);
+
+  /*
+   * Perform a queued reveal once its file is the open one.
+   *
+   * `draft` is in the deps because the model's CONTENT arrives with it: the tab
+   * can be active for one render while Monaco still holds the previous text,
+   * and revealing line 40 of a file that currently has 9 lines is how the caret
+   * ends up somewhere no one asked for.
+   */
+  useEffect(() => {
+    if (!pendingReveal) return;
+    if (activeId !== pendingReveal.testId) return;
+    if (!editorRef.current || editorReady === 0) return;
+    revealLine(pendingReveal.line);
+    setPendingReveal(null);
+  }, [pendingReveal, activeId, draft, editorReady, revealLine]);
 
   /* The lines the last run died on, washed in the failure colour. */
   const result = lastRun?.result ?? null;
@@ -909,7 +906,31 @@ export default function EditorPage() {
       <TestsHeader detail={tests.length > 0 ? `${tests.length} tests` : undefined} />
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(150px,220px)_minmax(320px,1fr)_minmax(180px,290px)] overflow-x-auto">
-        {/* ── The tree ────────────────────────────────────────────────────── */}
+        {/* ── The tree, or search ─────────────────────────────────────────── */}
+        {leftPanel === 'search' && project ? (
+          <aside className="border-line flex min-h-0 flex-col overflow-hidden border-r">
+            <div className="border-line flex shrink-0 items-center justify-between border-b px-2.5 py-2">
+              <span className="text-ink-faint text-micro tracking-wide uppercase">Search</span>
+              <button
+                type="button"
+                onClick={() => setLeftPanel('files')}
+                className="text-ink-faint hover:text-ink text-micro"
+              >
+                Files
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              <SearchPanel
+                projectId={project.id}
+                focusTick={searchTick}
+                onOpenMatch={(testId, line) => {
+                  setPendingReveal({ testId, line });
+                  void openFile(project.id, testId);
+                }}
+              />
+            </div>
+          </aside>
+        ) : (
         <aside className="border-line min-h-0 overflow-auto border-r px-2.5 py-3.5 font-mono text-[11.5px] whitespace-nowrap">
           {/*
             An app is connected but has no tests — the state every new user is in
@@ -968,7 +989,19 @@ export default function EditorPage() {
           >
             + new test
           </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setLeftPanel('search');
+              setSearchTick((n) => n + 1);
+            }}
+            className="text-ink-faint hover:text-ink-dim mt-2 block text-[11px]"
+          >
+            Search files <span className="font-mono text-[9.5px]">⌘⇧F</span>
+          </button>
         </aside>
+        )}
 
         {/* ── The file ────────────────────────────────────────────────────── */}
         <section className="flex min-h-0 min-w-0 flex-col">
@@ -1046,6 +1079,14 @@ export default function EditorPage() {
             </div>
           </div>
 
+          {openTest && (
+            <Breadcrumbs
+              filePath={openTest.filePath}
+              trail={symbolTrail}
+              onReveal={revealLine}
+            />
+          )}
+
           <div className="relative min-h-0 flex-1">
             {openTest && inlineSelection && project && (
               <InlineEdit
@@ -1072,6 +1113,9 @@ export default function EditorPage() {
                   setDirty(true);
                 }}
                 onSave={() => void save()}
+                prefs={prefs}
+                onCursor={setCaret}
+                onProblems={setProblems}
                 locators={locators}
                 onInlineEdit={(selection) => setInlineSelection(selection)}
                 onReady={(ed) => {
@@ -1086,6 +1130,20 @@ export default function EditorPage() {
               </p>
             )}
           </div>
+
+          {openTest && (
+            <StatusBar
+              position={caret?.position ?? null}
+              selection={caret?.selection ?? null}
+              language={editorLanguage(openTest)}
+              tabSize={2}
+              problems={problems}
+              prefs={prefs}
+              onTogglePref={togglePref}
+              onFormat={formatDocument}
+              onGoToProblem={goToProblem}
+            />
+          )}
 
           {/* The footer is the affordance, not a caption — ⌘K is the binding and
               this is the same command for anyone reaching for a mouse. */}

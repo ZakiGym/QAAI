@@ -305,6 +305,72 @@ export const FRAMEWORKS_BY_LANGUAGE: Record<Language, readonly UiFramework[]> = 
   PHP: ['PANTHER', 'CODECEPTION'],
 };
 
+/**
+ * Human labels for the language dropdown. The enum spelling is a database
+ * value, not a word anyone writes — "CSHARP" and "TYPESCRIPT" belong in a
+ * payload, never on a form.
+ */
+export const LANGUAGE_LABELS: Record<Language, string> = {
+  TYPESCRIPT: 'TypeScript',
+  JAVASCRIPT: 'JavaScript',
+  JAVA: 'Java',
+  PYTHON: 'Python',
+  CSHARP: 'C#',
+  RUBY: 'Ruby',
+  KOTLIN: 'Kotlin',
+  GO: 'Go',
+  PHP: 'PHP',
+};
+
+/** Ditto for the framework dropdown, which the pair rule filters per language. */
+export const UI_FRAMEWORK_LABELS: Record<UiFramework, string> = {
+  PLAYWRIGHT: 'Playwright',
+  CYPRESS: 'Cypress',
+  WEBDRIVERIO: 'WebdriverIO',
+  PUPPETEER: 'Puppeteer',
+  NIGHTWATCH: 'Nightwatch',
+  TESTCAFE: 'TestCafe',
+  SELENIUM: 'Selenium',
+  CAPYBARA: 'Capybara',
+  PANTHER: 'Panther',
+  CODECEPTION: 'Codeception',
+  CHROMEDP: 'chromedp',
+  APPIUM: 'Appium',
+  MAESTRO: 'Maestro',
+  DETOX: 'Detox',
+  ESPRESSO: 'Espresso',
+  XCUITEST: 'XCUITest',
+};
+
+/**
+ * Whether the generator can emit this framework for this language.
+ *
+ * One implementation, because there are now four callers who must agree:
+ * `createProjectSchema` and `updateProjectSchema` reject the pair, the PATCH
+ * route re-checks the MERGED pair (a request that changes only the language
+ * can invalidate a framework the request never mentions), and the first-run
+ * funnel filters its own dropdown so it cannot offer what the API will refuse.
+ * The bug this closes was live: the funnel's own list offered Selenium, the
+ * schema defaulted the language to TypeScript, and the pair rule rejected it —
+ * so one of three options on the product's first screen could not be submitted.
+ */
+export function isSupportedPair(language: Language, framework: UiFramework): boolean {
+  return FRAMEWORKS_BY_LANGUAGE[language].includes(framework);
+}
+
+/** The pair rule's own answer to "then what should I pick?" — never undefined. */
+export function defaultFrameworkFor(language: Language): UiFramework {
+  return FRAMEWORKS_BY_LANGUAGE[language][0]!;
+}
+
+/** The refusal, worded once, so create and update do not explain it differently. */
+export function pairMessage(language: Language, framework: UiFramework): string {
+  return (
+    `${framework} is not available for ${language}. ` +
+    `Choose one of: ${FRAMEWORKS_BY_LANGUAGE[language].join(', ')}`
+  );
+}
+
 // ─── Flake automation (§5) ───────────────────────────────────────────────────
 
 /**

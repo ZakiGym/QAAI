@@ -1,8 +1,10 @@
 'use client';
 
 import { useRef } from 'react';
-import Editor, { type Monaco, type OnMount } from '@monaco-editor/react';
-import type { editor, Position } from 'monaco-editor';
+import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react';
+import type { editor, MarkerSeverity, Position } from 'monaco-editor';
+import { EDITOR_THEME, defineTokenTheme } from './editor/theme';
+import type { EditorPrefs } from './editor/prefs';
 
 /**
  * The Monaco wrapper — the same editor VS Code is built on.
@@ -128,38 +130,6 @@ declare module '@playwright/test' {
 }
 `;
 
-/**
- * A dark theme matched to the cockpit. Monaco's stock `vs-dark` is a different
- * shade of near-black and reads as a foreign panel dropped into the app.
- */
-function defineTheme(monaco: Monaco): void {
-  monaco.editor.defineTheme('qaai-dark', {
-    base: 'vs-dark',
-    inherit: true,
-    rules: [
-      { token: 'comment', foreground: '6b7480', fontStyle: 'italic' },
-      { token: 'string', foreground: '9ecbff' },
-      { token: 'keyword', foreground: 'ff7b72' },
-      { token: 'number', foreground: 'd29922' },
-      { token: 'type', foreground: '4c8dff' },
-    ],
-    colors: {
-      'editor.background': '#0b0d11',
-      'editor.foreground': '#e9ecf1',
-      'editorLineNumber.foreground': '#3a4149',
-      'editorLineNumber.activeForeground': '#9aa3ad',
-      'editor.selectionBackground': '#264f78',
-      'editor.lineHighlightBackground': '#14171c',
-      'editorGutter.background': '#0b0d11',
-      'editorWidget.background': '#14171c',
-      'editorWidget.border': '#262b33',
-      'editorSuggestWidget.background': '#14171c',
-      'editorSuggestWidget.border': '#262b33',
-      'editorSuggestWidget.selectedBackground': '#1b1f26',
-    },
-  });
-}
-
 /** A locator the last crawl found — offered as a completion. */
 export interface LocatorSuggestion {
   label: string;
@@ -191,6 +161,27 @@ export interface CodeEditorProps {
   }) => void;
   /** The mounted editor, so a toolbar button can read the current selection. */
   onReady?: (editor: editor.IStandaloneCodeEditor) => void;
+  /**
+   * Word wrap and the minimap, owned by the status bar.
+   *
+   * They arrive as a prop rather than being read from localStorage here because
+   * the toggles that change them live outside this component — one source of
+   * truth, passed down, is what stops the bar and the editor disagreeing.
+   */
+  prefs?: EditorPrefs;
+  /** Every caret move: what the status bar's `Ln 12, Col 4` is made of. */
+  onCursor?: (state: {
+    position: { line: number; column: number };
+    selection: { chars: number; lines: number } | null;
+  }) => void;
+  /**
+   * Markers from the TypeScript service, debounced by Monaco itself.
+   *
+   * Reported as counts rather than the markers: the bar shows how many and
+   * jumps to the first, and handing the page the full list would invite it to
+   * render diagnostics it has no room for.
+   */
+  onProblems?: (problems: { errors: number; warnings: number }) => void;
 }
 
 export function CodeEditor({
@@ -202,6 +193,9 @@ export function CodeEditor({
   locators,
   onInlineEdit,
   onReady,
+  prefs,
+  onCursor,
+  onProblems,
 }: CodeEditorProps) {
   // Kept in a ref so the Monaco keybinding always calls the latest handler
   // rather than the one captured when the editor mounted.
@@ -215,10 +209,21 @@ export function CodeEditor({
   locatorsRef.current = locators;
   const onReadyRef = useRef(onReady);
   onReadyRef.current = onReady;
+  const onCursorRef = useRef(onCursor);
+  onCursorRef.current = onCursor;
+  const onProblemsRef = useRef(onProblems);
+  onProblemsRef.current = onProblems;
+
+  /*
+   * The theme is defined BEFORE the editor exists, so its first frame is
+   * already in the app's palette. Defining it in `onMount` meant one paint in
+   * Monaco's stock colours — a dark panel flashing inside the light theme.
+   */
+  const handleBeforeMount: BeforeMount = (monaco) => {
+    defineTokenTheme(monaco);
+  };
 
   const handleMount: OnMount = (editor, monaco) => {
-    defineTheme(monaco);
-    monaco.editor.setTheme('qaai-dark');
 
     monaco.languages.typescript.typescriptDefaults.setCompilerOptions({
       target: monaco.languages.typescript.ScriptTarget.ES2022,
@@ -305,7 +310,55 @@ export function CodeEditor({
       },
     });
 
-    editor.onDidDispose(() => provider.dispose());
+    /*
+     * Caret and selection, reported on change rather than polled.
+     *
+     * Both handlers are registered here and read through refs for the same
+     * reason the save binding does: they outlive the render that mounted them.
+     */
+    const report = () => {
+      const position = editor.getPosition();
+      const selection = editor.getSelection();
+      const model = editor.getModel();
+      if (!position || !model) return;
+      const selected =
+        selection && !selection.isEmpty()
+          ? {
+              chars: model.getValueLengthInRange(selection),
+              lines: selection.endLineNumber - selection.startLineNumber + 1,
+            }
+          : null;
+      onCursorRef.current?.({
+        position: { line: position.lineNumber, column: position.column },
+        selection: selected,
+      });
+    };
+    report();
+    const cursorSub = editor.onDidChangeCursorPosition(report);
+    const selectionSub = editor.onDidChangeCursorSelection(report);
+
+    /*
+     * Markers are owned by the language service and arrive well after mount,
+     * so this listens rather than reads once. Filtered to THIS model: Monaco
+     * reports every model it holds, including the ones behind other tabs.
+     */
+    const markerSub = monaco.editor.onDidChangeMarkers(() => {
+      const model = editor.getModel();
+      if (!model) return;
+      const markers: editor.IMarker[] = monaco.editor.getModelMarkers({ resource: model.uri });
+      const severity = monaco.MarkerSeverity as unknown as typeof MarkerSeverity;
+      onProblemsRef.current?.({
+        errors: markers.filter((m) => m.severity === severity.Error).length,
+        warnings: markers.filter((m) => m.severity === severity.Warning).length,
+      });
+    });
+
+    editor.onDidDispose(() => {
+      provider.dispose();
+      cursorSub.dispose();
+      selectionSub.dispose();
+      markerSub.dispose();
+    });
 
     onReadyRef.current?.(editor);
   };
@@ -316,7 +369,9 @@ export function CodeEditor({
       language={language}
       value={value}
       onChange={(next) => onChange?.(next ?? '')}
+      beforeMount={handleBeforeMount}
       onMount={handleMount}
+      theme={EDITOR_THEME}
       loading={<span className="text-ink-faint text-sm">Loading editor…</span>}
       options={{
         readOnly,
@@ -332,7 +387,8 @@ export function CodeEditor({
         fontSize: 12.5,
         lineHeight: 22,
         fontFamily: 'var(--font-mono)',
-        minimap: { enabled: false },
+        minimap: { enabled: prefs?.minimap ?? false },
+        wordWrap: prefs?.wordWrap ? 'on' : 'off',
         scrollBeyondLastLine: false,
         smoothScrolling: true,
         renderLineHighlight: 'line',

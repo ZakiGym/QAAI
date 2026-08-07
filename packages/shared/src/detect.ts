@@ -973,6 +973,29 @@ function extractDeps(path: string, content: string, into: Map<string, DepEntry>)
 const MANIFEST_RE =
   /^(package\.json|composer\.json|pyproject\.toml|Pipfile|Cargo\.toml|Gemfile|.*\.gemspec|pom\.xml|build\.gradle(\.kts)?|go\.mod|requirements.*\.txt|constraints\.txt|setup\.cfg|tox\.ini|.*\.(csproj|fsproj|vbproj))$/;
 
+/** The two ini files that are not manifests but are still read for their text. */
+const READ_AS_TEXT_RE = /^(pytest\.ini|setup\.cfg|tox\.ini)$/;
+
+/**
+ * Whether detection needs this file's CONTENT, or only its path.
+ *
+ * `RepoFile.content` is optional because a listing is cheap and contents are
+ * not — but which files are worth reading was, until now, knowable only by
+ * reading this module. That made the caller guess, and a guess here is not
+ * cosmetic: a manifest supplied WITHOUT its content is recorded as unreadable
+ * (see `detectRoots`), so under-reading does not merely lose signal, it makes
+ * detection warn about files the caller was holding all along.
+ *
+ * The first-run funnel walks a whole repo in the browser. It reads the ~dozen
+ * files this returns true for and passes the other twenty thousand as bare
+ * paths, which is the difference between a folder pick that is instant and one
+ * that loads a monorepo into a tab as text.
+ */
+export function needsContent(path: string): boolean {
+  const base = basename(normalisePath(path));
+  return MANIFEST_RE.test(base) || base.endsWith('.sln') || READ_AS_TEXT_RE.test(base);
+}
+
 // ─── Roots ───────────────────────────────────────────────────────────────────
 
 /** A manifest we were told about but could not use, and why. */
@@ -1186,7 +1209,7 @@ function detectRoots(files: RepoFile[]): {
         }
       }
     }
-    if (isManifest || /^(pytest\.ini|setup\.cfg|tox\.ini)$/.test(base)) {
+    if (isManifest || READ_AS_TEXT_RE.test(base)) {
       root.texts.set(base, content);
       extractDeps(path, content, root.deps);
     }
