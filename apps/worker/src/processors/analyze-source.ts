@@ -103,8 +103,22 @@ export interface SourceFormField {
 
 export interface SourceForm {
   name: string;
-  /** Route the form is declared on, when the extractor could tie it to one. */
+  /**
+   * Route the form is declared on, when it could be tied to one.
+   *
+   * Null is a real answer and not a defect: the producer finds a form by
+   * scanning markup, so the FILE is the only location fact it has. A form in
+   * `components/ContactForm.tsx` sits on whichever page imports it, and there
+   * is no import graph here to say which. `attachForms` resolves the ones that
+   * can be resolved and leaves the rest null rather than parking them on `/`.
+   */
   route: string | null;
+  /**
+   * The literal `action` attribute, when the markup states one. Kept because it
+   * is the only thing on a form that names a URL outright, and it is the first
+   * rule `attachForms` tries.
+   */
+  action: string | null;
   /** Repo-relative file. This is the evidence, and it is never optional. */
   file: string;
   fields: SourceFormField[];
@@ -115,7 +129,19 @@ export interface SourceRoute {
   /** Normalised, dynamic segments as `:name` — the FlowNode vocabulary. */
   path: string;
   file: string;
-  /** True when a guard was found in the source: middleware, decorator, layout. */
+  /**
+   * True when a guard was found in the source: middleware, decorator, layout.
+   *
+   * Always false for anything @qaai/shared produces today. `PageRoute` and
+   * `HttpEndpoint` (packages/shared/src/codebase.ts) carry no guard field, no
+   * detector there reads one, and the single file that would hold a Next.js
+   * matcher — `middleware.ts` — is on that module's skip list. The ingest
+   * response says as much in its own words: "what this cannot tell you …
+   * which pages need a login". So this is read but never set from a real
+   * analysis, and a plan built from one proposes no authenticated scenario.
+   * It stays read because a snapshot written by hand, or by a later producer
+   * that DOES express a guard, must not lose it silently.
+   */
   behindAuth: boolean;
   /** What the guard was, concretely enough for a human to disagree with it. */
   authEvidence: string | null;
@@ -167,6 +193,15 @@ export interface CodebaseAnalysis {
   /** Human labels for the plan's prose: 'Next.js', 'Express', 'Django'. */
   frameworks: string[];
   routes: SourceRoute[];
+  /**
+   * Every form the analysis declares, flat — the shape the producer publishes
+   * them in (`CodebaseAnalysis.forms`, packages/shared/src/codebase.ts). Forms
+   * that could be tied to a route also hang off that route, so the FlowMap
+   * keeps its per-node form models; this list is what the plan counts and what
+   * it derives E2E items from, so a form on no known route is still proposed
+   * rather than lost.
+   */
+  forms: SourceForm[];
   endpoints: SourceEndpoint[];
   authSurfaces: SourceAuthSurface[];
   /**
@@ -219,6 +254,8 @@ const MAX_NAMED_SKIPS = 60;
 /** Ceilings on a JSON blob written by another process. Bounded work, always. */
 const MAX_ROUTES = 2000;
 const MAX_ENDPOINTS = 4000;
+/** The producer's own cap on the top-level list (MAX_FORMS in codebase.ts). */
+const MAX_FORMS = 500;
 const MAX_FORMS_PER_ROUTE = 20;
 const MAX_FIELDS_PER_FORM = 60;
 const MAX_AUTH_SURFACES = 40;
@@ -270,6 +307,31 @@ function normalisePath(raw: string): string | null {
   return collapsed;
 }
 
+/**
+ * The URL an entry sits at, whichever of the two names the producer used.
+ *
+ * @qaai/shared spells one idea two ways: a page route's URL is `route`
+ * (`PageRoute`), an endpoint's is `path` (`HttpEndpoint`), and an auth
+ * surface's is `path` again. `parseRoute` read only `path`, so `str(undefined)`
+ * was '', `normalisePath('')` was null, and the guard below rejected EVERY page
+ * route a real analysis produced: no SMOKE items, no ACCESSIBILITY item, and a
+ * FlowMap with no nodes — a pure-frontend app yielded an entirely empty plan.
+ *
+ * `parseAuthSurface` had already been patched with its own local fallback for
+ * exactly this reason. One helper, used by all three call sites, is what stops
+ * the two sides drifting apart a fourth time.
+ */
+function pathOf(raw: Record<string, unknown>): string | null {
+  return normalisePath(str(raw.path) || str(raw.route));
+}
+
+/** `app/account/page.tsx` → `app/account`; '' for a file at the repo root. */
+function dirOf(file: string): string {
+  const normalised = file.replace(/\\/g, '/');
+  const cut = normalised.lastIndexOf('/');
+  return cut === -1 ? '' : normalised.slice(0, cut);
+}
+
 const SEMANTICS: ReadonlySet<string> = new Set<FormField['semantic']>([
   'email',
   'password',
@@ -317,6 +379,7 @@ function parseForm(raw: unknown, routePath: string | null): SourceForm | null {
   return {
     name: str(raw.name).trim() || 'form',
     route: declaredRoute ?? routePath,
+    action: typeof raw.action === 'string' ? normalisePath(raw.action) : null,
     file,
     fields,
     submitLabel:
@@ -328,7 +391,7 @@ function parseForm(raw: unknown, routePath: string | null): SourceForm | null {
 
 function parseRoute(raw: unknown): SourceRoute | null {
   if (!isRecord(raw)) return null;
-  const path = normalisePath(str(raw.path));
+  const path = pathOf(raw);
   const file = str(raw.file).trim();
   if (path === null || file === '') return null;
   return {
@@ -354,7 +417,7 @@ const HTTP_METHODS: ReadonlySet<string> = new Set([
 
 function parseEndpoint(raw: unknown): SourceEndpoint | null {
   if (!isRecord(raw)) return null;
-  const path = normalisePath(str(raw.path));
+  const path = pathOf(raw);
   const file = str(raw.file).trim();
   const method = str(raw.method).trim().toUpperCase();
   if (path === null || file === '' || !HTTP_METHODS.has(method)) return null;
@@ -370,9 +433,9 @@ function parseEndpoint(raw: unknown): SourceEndpoint | null {
 function parseAuthSurface(raw: unknown): SourceAuthSurface | null {
   if (!isRecord(raw)) return null;
   const kind = str(raw.kind).trim().toUpperCase();
-  // `path` is what the producer writes; `route` is read as a fallback so a
-  // snapshot stored by the older shape still yields its auth tests.
-  const path = normalisePath(str(raw.path) || str(raw.route));
+  // `path` is what the producer writes; `pathOf` reads `route` as a fallback so
+  // a snapshot stored by the older shape still yields its auth tests.
+  const path = pathOf(raw);
   const file = str(raw.file).trim();
   if (path === null || file === '') return null;
   if (!(AUTH_SURFACE_KINDS as readonly string[]).includes(kind)) return null;
@@ -398,23 +461,49 @@ function parseAuthSurface(raw: unknown): SourceAuthSurface | null {
 export function parseCodebaseAnalysis(raw: unknown): CodebaseAnalysis | null {
   if (!isRecord(raw)) return null;
 
-  const routes = arr(raw.routes, MAX_ROUTES)
-    .map(parseRoute)
-    .filter((r): r is SourceRoute => r !== null);
+  const routes = dedupeRoutes(
+    arr(raw.routes, MAX_ROUTES)
+      .map(parseRoute)
+      .filter((r): r is SourceRoute => r !== null),
+  );
   const endpoints = arr(raw.endpoints, MAX_ENDPOINTS)
     .map(parseEndpoint)
     .filter((e): e is SourceEndpoint => e !== null);
+  // The top-level list is the producer's, and it names no route: `attachForms`
+  // ties what it can to the routes above and hands back the whole set, nested
+  // forms included.
+  const forms = attachForms(
+    routes,
+    arr(raw.forms, MAX_FORMS)
+      .map((f) => parseForm(f, null))
+      .filter((f): f is SourceForm => f !== null),
+  );
   const authSurfaces = arr(raw.authSurfaces, MAX_AUTH_SURFACES)
     .map(parseAuthSurface)
-    .filter((a): a is SourceAuthSurface => a !== null);
+    .filter((a): a is SourceAuthSurface => a !== null)
+    // The producer's `AuthSurface` carries no form, so the credential fields
+    // are matched in from the list above — see `formForSurface`.
+    .map((surface) => (surface.form ? surface : { ...surface, form: formForSurface(surface, forms) }));
 
   return {
     schema: typeof raw.schema === 'number' ? raw.schema : 1,
     analyzedAt: str(raw.analyzedAt) || new Date(0).toISOString(),
+    /*
+     * The fourth field-name disagreement on this boundary, and the same shape
+     * as the other three: the producer emits `AppFrameworkSignal` OBJECTS
+     * (`{ framework, evidence, file }`), while this read them as plain strings.
+     * `str()` on an object is '', every entry was filtered out, and the plan
+     * summary a person reads — "N tests proposed from your codebase (Next.js,
+     * Express)" — silently lost its parenthetical for every repo ever analysed.
+     *
+     * The string branch is kept because snapshots written before this fix are
+     * still in the table and still get read back.
+     */
     frameworks: arr(raw.frameworks, 20)
-      .map((f) => str(f).trim())
+      .map((f) => (isRecord(f) ? str(f.framework) : str(f)).trim())
       .filter((f) => f !== ''),
-    routes: dedupeRoutes(routes),
+    routes,
+    forms,
     endpoints: dedupeEndpoints(endpoints),
     authSurfaces,
     warnings: arr(raw.warnings, MAX_WARNINGS)
@@ -442,6 +531,91 @@ function dedupeRoutes(routes: SourceRoute[]): SourceRoute[] {
     });
   }
   return [...byPath.values()];
+}
+
+/**
+ * Tie each declared form to the route it sits on, and return every form there is.
+ *
+ * The producer publishes forms at the TOP LEVEL of the analysis
+ * (`CodebaseAnalysis.forms`, packages/shared/src/codebase.ts) with a file and no
+ * route, because a `<form>` is found by scanning markup and the file is the only
+ * location fact that scan has. This parser looked for forms NESTED inside each
+ * route and nowhere else, so every form a real analysis produced was dropped:
+ * no E2E item for any of them, no fields on the login item, and
+ * `summaryFromSource` said "0 form(s)" one click after the ingest response had
+ * listed several — two screens of one feature contradicting each other.
+ *
+ * Matching is by evidence, most specific first, and a route file claimed by
+ * more than one route is not used at all: `src/App.tsx` declaring ten
+ * `<Route path>` elements says nothing about which of the ten a form in that
+ * file belongs to, and picking one would be a guess wearing a citation.
+ */
+function attachForms(routes: SourceRoute[], topLevel: SourceForm[]): SourceForm[] {
+  const byPath = new Map(routes.map((route) => [route.path, route]));
+  const byFile = new Map<string, SourceRoute | null>();
+  const byDir = new Map<string, SourceRoute | null>();
+  for (const route of routes) {
+    byFile.set(route.file, byFile.has(route.file) ? null : route);
+    const dir = dirOf(route.file);
+    byDir.set(dir, byDir.has(dir) ? null : route);
+  }
+
+  // Two entries for one form — a nested copy and a top-level one — are one
+  // form. Keyed on file plus name, which is what the producer makes unique
+  // (`form 1 in <file>` when the markup names none).
+  const seen = new Set<string>();
+  const out: SourceForm[] = [];
+  const keep = (form: SourceForm): void => {
+    const key = `${form.file}|${form.name}`;
+    if (seen.has(key) || out.length >= MAX_FORMS) return;
+    seen.add(key);
+    out.push(form);
+  };
+
+  for (const route of routes) for (const form of route.forms) keep(form);
+
+  for (const form of topLevel) {
+    const host =
+      (form.route !== null ? byPath.get(form.route) : undefined) ??
+      (form.action !== null ? byPath.get(form.action) : undefined) ??
+      byFile.get(form.file) ??
+      byDir.get(dirOf(form.file)) ??
+      null;
+    const resolved = host ? { ...form, route: host.path } : form;
+    if (host && host.forms.length < MAX_FORMS_PER_ROUTE) {
+      // Onto the route as well as into the flat list: `flowMapFromSource` reads
+      // per-node forms, and that is how a generated E2E test gets its fields.
+      if (!host.forms.some((f) => f.file === resolved.file && f.name === resolved.name)) {
+        host.forms.push(resolved);
+      }
+    }
+    keep(resolved);
+  }
+
+  return out;
+}
+
+/**
+ * The credential form for an auth surface.
+ *
+ * The producer's `AuthSurface` (codebase.ts) is kind/path/from/file/evidence and
+ * nothing else — the fields live on the form. Without this every login item read
+ * "the source names no fields on it" for repositories whose sign-in form had
+ * just been parsed field by field, and the generated test had nothing to fill in.
+ *
+ * Matched on the surface's own evidence — the file it was read from, or the
+ * route it sits at — and a form with a password field wins, because that is what
+ * makes a form a credential form rather than the newsletter box below it.
+ */
+function formForSurface(surface: SourceAuthSurface, forms: SourceForm[]): SourceForm | null {
+  const candidates = forms.filter(
+    (form) => form.file === surface.file || (form.route !== null && form.route === surface.path),
+  );
+  return (
+    candidates.find((form) => form.fields.some((field) => field.semantic === 'password')) ??
+    candidates[0] ??
+    null
+  );
 }
 
 /** METHOD + path is the identity of an endpoint; the same pair twice is one. */
@@ -708,27 +882,44 @@ function apiItem(endpoint: SourceEndpoint): PlanItem {
 }
 
 function formItem(form: SourceForm, behindAuth: boolean): PlanItem {
-  const route = form.route ?? '/';
+  /*
+   * A form the analysis could not tie to a route used to be proposed on `/`,
+   * which is a claim about where it renders and not one the source makes. The
+   * item is still worth proposing — the fields are read, the file is the
+   * evidence — so the unknown is stated instead, and the tester is told to find
+   * the page rather than sent to the wrong one.
+   */
+  const route = form.route;
   const required = form.fields.filter((f) => f.required);
 
   return {
-    id: itemId('form', `${route}-${form.name}`),
-    title: clamp(`Submit the "${form.name}" form on ${route}`, 160),
+    id: itemId('form', `${route ?? form.file}-${form.name}`),
+    title: clamp(
+      route
+        ? `Submit the "${form.name}" form on ${route}`
+        : `Submit the "${form.name}" form declared in ${form.file}`,
+      160,
+    ),
     rationale: clamp(
       `\`${form.file}\` declares a form named "${form.name}" with ${form.fields.length} field(s)` +
         (required.length > 0
           ? `, ${required.length} of them marked required in the source`
           : ', none of them marked required in the source') +
         `.${behindAuth ? ' The route it sits on is guarded, so reaching it needs a session.' : ''}` +
+        (route
+          ? ''
+          : ' The source names no route for it — a form is found by reading markup, and which page renders this file needs an import graph this pass does not have.') +
         ` ${STATIC_ONLY}`,
       1000,
     ),
-    feature: clamp(featureFor(route), 80),
+    feature: clamp(route ? featureFor(route) : 'Forms', 80),
     priority: 'IMPORTANT',
     testType: 'E2E',
     steps: [
       ...(behindAuth ? ['Sign in — the source guards the route this form sits on'] : []),
-      `Navigate to ${route}`,
+      route
+        ? `Navigate to ${route}`
+        : `Open the page that renders ${form.file} — the source ties this form to no route`,
       ...form.fields
         .slice(0, 25)
         .map(
@@ -876,9 +1067,14 @@ export function scenariosFromSource(
   const items: PlanItem[] = [];
   const skipped: Array<{ what: string; why: string }> = [...choice.refused];
 
-  const forms = analysis.routes.flatMap((route) =>
-    route.forms.map((form) => ({ form, behindAuth: route.behindAuth })),
-  );
+  // The analysis's own flat list, not a walk over the routes: a form the source
+  // ties to no route is still a form a user fills in, and counting only the
+  // attached ones is how the plan came to disagree with the ingest screen.
+  const guardByPath = new Map(analysis.routes.map((route) => [route.path, route.behindAuth]));
+  const forms = analysis.forms.map((form) => ({
+    form,
+    behindAuth: form.route !== null && (guardByPath.get(form.route) ?? false),
+  }));
   const totals = {
     routes: analysis.routes.length,
     endpoints: analysis.endpoints.length,

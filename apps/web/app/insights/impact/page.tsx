@@ -103,7 +103,7 @@ function parsePaths(raw: string): string[] {
 export default function ImpactPage() {
   const router = useRouter();
   const toast = useToast();
-  const { project, projectId, loading: projectLoading } = useProject();
+  const { project, projectId, projects, loading: projectLoading } = useProject();
 
   const [raw, setRaw] = useState('');
   const [analysis, setAnalysis] = useState<ImpactAnalysis | null>(null);
@@ -190,11 +190,23 @@ export default function ImpactPage() {
     }
   }
 
+  /*
+   * A zero-project org cannot pick anything in the sidebar, so saying so left
+   * it with an instruction and no way to carry it out. `projects` is only read
+   * once the provider has settled, which is what `!projectLoading` above
+   * guarantees — before that, "no apps" and "not fetched yet" look identical.
+   */
   if (!projectLoading && !projectId) {
+    const noApps = projects.length === 0;
     return (
       <EmptyState
-        title="No project selected"
-        body="The analysis reads this app's tests and its flow map. Pick an app in the sidebar and this fills in."
+        title={noApps ? 'No app to analyse yet' : 'No project selected'}
+        body={
+          noApps
+            ? "The analysis decides which of an app's tests a diff actually needs, by reading those tests and its flow map. Connect an app and this fills in."
+            : "The analysis reads this app's tests and its flow map. Pick an app in the sidebar and this fills in."
+        }
+        {...(noApps ? { action: { label: 'Add your app', href: '/onboarding' } } : {})}
       />
     );
   }
@@ -318,9 +330,7 @@ export default function ImpactPage() {
                       >
                         {attribution.confidence}
                       </span>
-                      {attribution.blastRadius && (
-                        <Badge tone="fail">forces the whole suite</Badge>
-                      )}
+                      {attribution.blastRadius && <Badge tone="fail">forces the whole suite</Badge>}
                       {attribution.ignored && <Badge>cannot affect the app</Badge>}
                     </div>
                     <p className="text-ink-faint text-row-sub mt-1">{attribution.why}</p>
@@ -511,10 +521,7 @@ function DecisionRow({ decision }: { decision: ImpactDecision }) {
       <span className="min-w-0 flex-1">
         <Link
           href={`/tests/${decision.testId}`}
-          className={cn(
-            'text-body-sm hover:text-accent block',
-            run ? 'text-ink' : 'text-ink-dim',
-          )}
+          className={cn('text-body-sm hover:text-accent block', run ? 'text-ink' : 'text-ink-dim')}
           title="This test's history"
         >
           {decision.name}

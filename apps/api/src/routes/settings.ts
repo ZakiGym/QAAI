@@ -382,6 +382,19 @@ settingsRouter.get('/usage', async (req, res) => {
 settingsRouter.post('/invites', requireRole('ADMIN'), async (req, res) => {
   const actor = actorOf(req);
   const input = inviteSchema.parse(req.body);
+
+  /*
+   * The same rule PATCH /members/:userId applies, in the same words, because an
+   * invite is a role grant with a delay and the two must read as one policy.
+   * Without it the sibling route's check was decorative: an ADMIN who could not
+   * promote themselves directly could invite an address they control at OWNER,
+   * accept it, and come back holding the role that moves money on the org's
+   * card, exports every row it owns, and demotes the real owners.
+   */
+  if (input.role === 'OWNER' && actor.role !== 'OWNER') {
+    throw badRequest('Only an owner can make someone else an owner.');
+  }
+
   const email = input.email.toLowerCase();
 
   const existingUser = await unscoped(() =>

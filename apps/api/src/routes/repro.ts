@@ -76,10 +76,10 @@ import type {
   ReproSource,
 } from '../../../../packages/agent/src/repro.js';
 import { prisma, unscoped } from '../lib/prisma.js';
-import { badRequest, notFound, planLimit, unprocessable } from '../lib/errors.js';
+import { badRequest, notFound, unprocessable } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
 import { enqueue } from '../lib/queues.js';
-import { canStartRun, planFor } from '../lib/plan.js';
+import { startRun } from '../lib/start-run.js';
 import { openToken } from '../lib/integrations.js';
 import { logger, registerRequestSecrets } from '../lib/logger.js';
 import {
@@ -891,17 +891,19 @@ reproRouter.post('/:projectId', requireRole('MEMBER'), async (req, res) => {
     return;
   }
 
-  const verdict = await canStartRun(actor.orgId);
-  if (!verdict.allowed) {
-    const { plan } = await planFor(actor.orgId);
-    // The test exists and is recorded; only the execution is blocked. Say which.
-    throw planLimit(
-      `${verdict.reason ?? 'Plan limit reached'} The reproduction was written (test ${test.id}) but not run.`,
-      { limit: 'maxRunsPerMonth', plan },
-    );
-  }
-
-  const run = await prisma.run.create({
+  /*
+   * Gate, create, count — lib/start-run.ts, the one place a Run is allowed to
+   * come into existence. `enforce` throws 402 PLAN_LIMIT over cap, and `note`
+   * is what this endpoint has always added to that message: the test exists and
+   * is recorded, only the execution is blocked, and the caller needs to be told
+   * which half it got.
+   */
+  const { run } = await startRun({
+    db: prisma,
+    orgId: actor.orgId,
+    mode: 'enforce',
+    unscope: unscoped,
+    note: `The reproduction was written (test ${test.id}) but not run.`,
     data: {
       orgId: actor.orgId,
       projectId: project.id,
@@ -911,13 +913,6 @@ reproRouter.post('/:projectId', requireRole('MEMBER'), async (req, res) => {
       totalCount: 1,
       results: { create: [{ orgId: actor.orgId, testId: test.id, status: 'SKIPPED' as const }] },
     },
-    select: { id: true },
-  });
-
-  await prisma.usageRecord.upsert({
-    where: { orgId_metric_period: { orgId: actor.orgId, metric: 'runs', period: currentPeriod() } },
-    create: { orgId: actor.orgId, metric: 'runs', period: currentPeriod(), quantity: 1n },
-    update: { quantity: { increment: 1n } },
   });
 
   await enqueue(

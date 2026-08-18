@@ -5,6 +5,11 @@ fails or a quality gate blocks, and writes JUnit XML for your CI's own
 reporting. Nothing about this is GitHub-specific — the same command works in
 GitLab, Jenkins, CircleCI, or a bare shell.
 
+The package is **`@qaai/cli`**; the command it installs is `qaai`. Always install
+it by the scoped name. The unscoped `qaai` on npm is an unrelated project by
+another author, so `npx qaai` fetches and runs somebody else's binary — in a
+step where you have just put your API key in the environment.
+
 ## 1. Create an API key
 
 Settings → API keys → **New key**. Copy it once — it is never shown again.
@@ -21,7 +26,7 @@ project's environment list.
 export QAAI_API_KEY=qaai_...
 export QAAI_API_URL=https://your-qaai-host
 
-npx qaai run --env <environmentId> --junit results.xml
+npx @qaai/cli@0.1.0 run --env <environmentId> --junit results.xml
 echo "exit code: $?"   # 0 = green, 1 = a test failed or a gate blocked
 ```
 
@@ -58,11 +63,19 @@ step keyed off `||` fires automatically.
 
 ## Command reference
 
+Installed globally (`npm i -g @qaai/cli`) the command is `qaai`. Run without
+installing with `npx @qaai/cli@<version> …`.
+
 ```
 qaai run --env <id> [--suite <id>] [--commit <sha>] [--junit <path>]
                      [--no-wait] [--timeout <sec>]
 qaai deploy-check --env <id> [--junit <path>]
 qaai status <runId>
+
+qaai backup create --out <dir>            Self-hosted operators; see deploy/backup.md
+qaai backup verify --from <dir>
+qaai backup restore --from <dir> --to <postgres-url>
+qaai runner                               Run an on-prem runner agent
 
 --json             Machine-readable output on stdout
 --api-url <url>    Overrides $QAAI_API_URL

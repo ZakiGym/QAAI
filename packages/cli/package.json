@@ -1,7 +1,7 @@
 {
-  "name": "qaai",
+  "name": "@qaai/cli",
   "version": "0.1.0",
-  "description": "Run QAAI test suites from any CI",
+  "description": "The QAAI command-line client: run suites in your own CI, and back up a self-hosted install.",
   "type": "module",
   "bin": {
     "qaai": "dist/index.js"

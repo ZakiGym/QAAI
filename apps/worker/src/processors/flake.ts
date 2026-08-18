@@ -50,6 +50,10 @@ import {
   resolveFlakePolicy,
 } from '@qaai/shared';
 import type { FlakePolicy, Priority, RunStatus, TestResultStatus } from '@qaai/shared';
+// One toll for every path that creates a Run: the plan gate and the usage
+// counter. It lives in the API workspace and takes its Prisma client as an
+// argument so this file can call the same implementation POST /runs does.
+import { startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
 import { enqueueRun } from '../queues.js';
 
@@ -576,7 +580,20 @@ async function advanceOne(
   // Bounded: `samples` attempts, ever. Errored attempts are not retried — they
   // shrink the denominator instead, which pushes towards "not enough evidence".
   if (group.runs.length < policy.samples) {
-    await queueSample(group, policy, group.runs.length + 1);
+    const sample = await queueSample(group, policy, group.runs.length + 1);
+    if (sample && 'refused' in sample) {
+      /*
+       * The cap will not clear before this investigation's deadline, so waiting
+       * on it would end in an abandonment whose stated reason was the timeout
+       * rather than the truth. Say the truth now, in the audit row that is the
+       * only record this investigation ever leaves.
+       */
+      await concludeAbandoned(
+        group,
+        `${sample.refused} The remaining confirmation runs were not started, so nothing was measured.`,
+      );
+      return false;
+    }
     return true;
   }
 
@@ -666,12 +683,23 @@ async function findRecentRealBugVerdict(
   return verdict?.createdAt ?? null;
 }
 
-/** Create the next confirmation run and queue it behind everything else. */
+/**
+ * Create the next confirmation run and queue it behind everything else.
+ *
+ * Three outcomes. A run id; `null` for the ordinary "not now" — the project is
+ * busy and the next tick is five minutes away; and `refused`, which is the org
+ * being at its monthly run cap. The last one is worth distinguishing because it
+ * will not clear on its own: an investigation waiting for it would sit open
+ * until its deadline and then report itself abandoned for no stated reason, so
+ * the caller ends it now and says why.
+ */
+type SampleOutcome = { runId: string } | { refused: string } | null;
+
 async function queueSample(
   group: InvestigationGroup,
   policy: FlakePolicy,
   index: number,
-): Promise<string | null> {
+): Promise<SampleOutcome> {
   const { orgId, projectId, environmentId, testId, investigationId } = group;
 
   /*
@@ -699,7 +727,16 @@ async function queueSample(
     return null;
   }
 
-  const run = await prisma.run.create({
+  /*
+   * Gate, create, count — `advisory`, because this is a sweep: throwing here
+   * would fail the whole flake tick for every other org sharing it, and it is
+   * the caller's job to decide what a refused sample means for the measurement
+   * in front of it.
+   */
+  const started = await startRun({
+    db: prisma,
+    orgId,
+    mode: 'advisory',
     data: {
       orgId,
       projectId,
@@ -709,8 +746,16 @@ async function queueSample(
       totalCount: 1,
       results: { create: [{ orgId, testId, status: 'SKIPPED' as const }] },
     },
-    select: { id: true },
   });
+
+  if (!started.created) {
+    logger.warn(
+      { testId, investigationId, orgId, sample: index, of: policy.samples },
+      'flake confirmation run refused: the org is at its monthly run limit',
+    );
+    return { refused: started.quota.reason ?? 'This org is at its monthly run limit.' };
+  }
+  const run = started.run;
 
   try {
     await enqueueRun({ orgId, runId: run.id }, { background: true });
@@ -735,7 +780,7 @@ async function queueSample(
     { testId, investigationId, runId: run.id, sample: index, of: policy.samples },
     'queued a flake confirmation run',
   );
-  return run.id;
+  return { runId: run.id };
 }
 
 /** Write the decision and its evidence, atomically. */
@@ -962,8 +1007,11 @@ async function openOne(
     runs: [],
   };
 
-  const runId = await queueSample(group, policy, 1);
-  if (!runId) return false;
+  // Refused and busy both mean "not started"; queueSample has already said
+  // which at warn, and an investigation that never opened leaves nothing behind
+  // to correct.
+  const sample = await queueSample(group, policy, 1);
+  if (!sample || 'refused' in sample) return false;
 
   logger.info(
     {

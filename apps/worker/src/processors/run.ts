@@ -106,6 +106,28 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
   const { orgId, runId } = job;
   const shard: RunShardRef | null = job.shard ?? null;
 
+  /*
+   * Refuse a job that does not say WHICH run, before touching the database.
+   *
+   * `failRunFromDeadJob` below carries the same guard and the same reasoning,
+   * but this is the call site where it matters more. Prisma reads an undefined
+   * `where` value as an ABSENT FILTER, not an impossible one — so
+   * `findFirst({ where: { id: undefined, orgId: undefined } })` does not return
+   * null, it returns the first Run in the table, belonging to whichever tenant
+   * happens to sort first. This function would then mark that run RUNNING,
+   * open a browser, and execute somebody else's suite against somebody else's
+   * environment — production included — while publishing events on an
+   * undefined org channel.
+   *
+   * The payload reaches here through `as unknown as RunJob` on a BullMQ job, so
+   * the type system is not checking it and cannot: the only thing standing
+   * between a malformed producer and a cross-tenant run is this line.
+   */
+  if (!orgId || !runId) {
+    logger.error({ orgId, runId }, 'run job carried no org or run id; refusing to execute');
+    throw new Error('Run job is missing orgId or runId; refusing to execute an unscoped run');
+  }
+
   const run = await prisma.run.findFirst({
     where: { id: runId, orgId },
     include: {
@@ -117,6 +139,24 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     },
   });
   if (!run) throw new Error(`Run ${runId} not found for org ${orgId}`);
+
+  /*
+   * Cancelled before this job was ever picked up, which is the NORMAL case: the
+   * pool is busy, the run sits QUEUED, and a busy pool is exactly when people
+   * reach for Cancel. The API wrote CANCELLED and the cockpit already said "Run
+   * cancelled before it started"; executing the suite now would make a liar of
+   * both — and would drive a browser at whatever environment the run was
+   * pointed at, production included. Bailing here (rather than only at the
+   * conditional start below) also means the job costs nothing: no vault reads,
+   * no fixture load, no grid session.
+   */
+  if (run.status === 'CANCELLED') {
+    logger.info(
+      { runId: run.id, shard: shard?.index },
+      'run was cancelled before this job started; not executing',
+    );
+    return;
+  }
 
   /*
    * A shard that arrives after the run has already been declared finished — a
@@ -134,165 +174,204 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
 
   if (shard && !(await claimShard(orgId, run.id, shard))) return;
 
-  const org = await prisma.organization.findUniqueOrThrow({
-    where: { id: orgId },
-    select: { plan: true },
-  });
-  const retentionDays = RETENTION_DAYS[org.plan] ?? 30;
-  const expiresAt = new Date(Date.now() + retentionDays * 86_400_000);
-
-  const baseUrl = run.baseUrlOverride ?? run.environment.baseUrl;
-  const secrets = await secretsFor(orgId, run.environment.id);
-
-  // Test data lives as Test rows under `fixtures/`; every workspace gets a copy
-  // so a spec can read its data off disk. Loaded once per run, not per test.
-  const fixtureRows = await prisma.test.findMany({
-    where: {
-      orgId,
-      projectId: run.projectId,
-      // Matches the export's filter, so the workspace and a pushed repo can never
-      // disagree about which fixtures exist.
-      disabledAt: null,
-      filePath: { startsWith: FIXTURE_PREFIX },
-    },
-    select: { filePath: true, code: true, spec: true },
-  });
-  const fixtures = Object.fromEntries(
-    fixtureRows.map((row) => [
-      row.filePath,
-      // A fixture edited as JSON is stored in `spec`; anything else keeps its raw
-      // text in `code`. Prefer whichever actually holds content.
-      row.spec !== null && row.spec !== undefined ? JSON.stringify(row.spec, null, 2) : row.code,
-    ]),
-  );
-
-  /**
-   * A configured cloud grid moves the browser off this machine (§6). The
-   * endpoint carries the provider's access key, so it is built here from the
-   * vault and kept in memory — never logged, never written to an exported repo.
-   */
-  let grid: { provider: string; wsEndpoint: string } | null = null;
-  const gridIntegration = await prisma.integration.findFirst({
-    where: { orgId, enabled: true, kind: { in: [...GRID_INTEGRATION_KINDS] } },
-    orderBy: { createdAt: 'asc' },
-    select: { id: true, kind: true, config: true, configEnc: true },
-  });
-  if (gridIntegration?.configEnc) {
-    try {
-      const cfg = (gridIntegration.config ?? {}) as {
-        username?: string;
-        keyVersion?: number;
-        os?: string;
-        browser?: string;
-        browserVersion?: string;
-      };
-      const accessKey = openSecret(
-        gridIntegration.configEnc,
-        cfg.keyVersion ?? 1,
-        orgId,
-        `integration:${gridIntegration.id}`,
-      );
-      grid = {
-        provider: gridIntegration.kind,
-        wsEndpoint: gridWsEndpoint(
-          gridIntegration.kind as GridIntegrationKind,
-          { username: cfg.username ?? '', accessKey },
-          {
-            os: cfg.os,
-            browser: cfg.browser,
-            browserVersion: cfg.browserVersion,
-            buildName: `QAAI ${run.id.slice(-8)}`,
-            sessionName: `QAAI run ${run.id.slice(-8)}`,
-          },
-        ),
-      };
-      logger.info({ provider: gridIntegration.kind }, 'running on a cloud grid');
-    } catch (err) {
-      // A broken grid config must not silently fall back to a local browser —
-      // the customer asked for Safari on Windows and would get Chromium here.
-      throw new Error(
-        `Cloud grid ${gridIntegration.kind} is configured but its credentials could not be used: ${
-          err instanceof Error ? err.message : 'unknown error'
-        }`,
-        // The message says what broke; the cause says which of the vault open,
-        // the key version lookup or the endpoint build actually threw. That
-        // stack is the whole diagnosis, and this error ends up in a run's
-        // errorMessage being read by someone who was not here when it happened.
-        { cause: err },
-      );
-    }
-  }
-
-  const authProfile = await prisma.authProfile.findFirst({
-    where: { orgId, environmentId: run.environment.id },
-    orderBy: { createdAt: 'asc' },
-    select: { storageState: true, storageStateExpiresAt: true },
-  });
-  const storageState =
-    authProfile?.storageState &&
-    (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
-      ? authProfile.storageState
-      : null;
-
-  if (shard) {
-    /*
-     * Five shards start at once, and the run starts once. The conditional
-     * update is the arbiter: `startedAt: null` matches for exactly one of them,
-     * so exactly one publishes `run.started` and the cockpit does not show the
-     * run beginning five times.
-     */
-    const first = await prisma.run.updateMany({
-      where: { id: run.id, startedAt: null },
-      data: { status: 'RUNNING', startedAt: new Date() },
-    });
-    if (first.count === 1) {
-      publishEvent(orgId, {
-        runId: run.id,
-        type: 'run.started',
-        data: { total: run.totalCount, baseUrl, shards: shard.count },
-        at: new Date().toISOString(),
-      });
-    }
-    publishEvent(orgId, {
-      runId: run.id,
-      type: 'shard.started',
-      data: { shard: shard.index, shards: shard.count, tests: run.results.length },
-      at: new Date().toISOString(),
-    });
-  } else {
-    await prisma.run.update({
-      where: { id: run.id },
-      data: { status: 'RUNNING', startedAt: new Date() },
-    });
-    publishEvent(orgId, {
-      runId: run.id,
-      type: 'run.started',
-      data: { total: run.results.length, baseUrl },
-      at: new Date().toISOString(),
-    });
-  }
-
-  // Proof of life for this shard, on a timer. It dies with the process, which
-  // is exactly the signal the siblings' reaper is looking for.
-  const heartbeat = shard
-    ? setInterval(() => {
-        void prisma.runShard
-          .updateMany({
-            where: { orgId, runId: run.id, index: shard.index, status: 'RUNNING' },
-            data: { heartbeatAt: new Date() },
-          })
-          .catch((err) => logger.debug({ err, runId: run.id }, 'shard heartbeat failed'));
-      }, SHARD_HEARTBEAT_MS)
-    : null;
-  // Never hold the process open for a heartbeat.
-  heartbeat?.unref?.();
-
   const controller = new AbortController();
   const counts: RunCounts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
   let runErrored: string | null = null;
   let cancelled = false;
+  /*
+   * Assigned inside the try, declared out here so the finally can always stop
+   * it. Everything below — the grid endpoint, the vault, the fixtures, the auth
+   * profile — used to run OUTSIDE the try. Anything it threw escaped the
+   * processor entirely: the run sat at QUEUED/RUNNING for good, its elapsed
+   * clock never started, its gate never resolved, and no `run.finished`
+   * notification was enqueued, so the Slack message and the PR comment simply
+   * never arrived. One rotated vault key stranded every run in an org that way.
+   * Setup lives inside the try now, so a failure in it takes the same path a
+   * broken test does and the run finalises ERRORED with the reason on it.
+   */
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
 
   try {
+    const org = await prisma.organization.findUniqueOrThrow({
+      where: { id: orgId },
+      select: { plan: true },
+    });
+    const retentionDays = RETENTION_DAYS[org.plan] ?? 30;
+    const expiresAt = new Date(Date.now() + retentionDays * 86_400_000);
+
+    const baseUrl = run.baseUrlOverride ?? run.environment.baseUrl;
+    const secrets = await secretsFor(orgId, run.environment.id);
+
+    // Test data lives as Test rows under `fixtures/`; every workspace gets a copy
+    // so a spec can read its data off disk. Loaded once per run, not per test.
+    const fixtureRows = await prisma.test.findMany({
+      where: {
+        orgId,
+        projectId: run.projectId,
+        // Matches the export's filter, so the workspace and a pushed repo can never
+        // disagree about which fixtures exist.
+        disabledAt: null,
+        filePath: { startsWith: FIXTURE_PREFIX },
+      },
+      select: { filePath: true, code: true, spec: true },
+    });
+    const fixtures = Object.fromEntries(
+      fixtureRows.map((row) => [
+        row.filePath,
+        // A fixture edited as JSON is stored in `spec`; anything else keeps its raw
+        // text in `code`. Prefer whichever actually holds content.
+        row.spec !== null && row.spec !== undefined ? JSON.stringify(row.spec, null, 2) : row.code,
+      ]),
+    );
+
+    /**
+     * A configured cloud grid moves the browser off this machine (§6). The
+     * endpoint carries the provider's access key, so it is built here from the
+     * vault and kept in memory — never logged, never written to an exported repo.
+     */
+    let grid: { provider: string; wsEndpoint: string } | null = null;
+    const gridIntegration = await prisma.integration.findFirst({
+      where: { orgId, enabled: true, kind: { in: [...GRID_INTEGRATION_KINDS] } },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, kind: true, config: true, configEnc: true },
+    });
+    if (gridIntegration?.configEnc) {
+      try {
+        const cfg = (gridIntegration.config ?? {}) as {
+          username?: string;
+          keyVersion?: number;
+          os?: string;
+          browser?: string;
+          browserVersion?: string;
+        };
+        const accessKey = openSecret(
+          gridIntegration.configEnc,
+          cfg.keyVersion ?? 1,
+          orgId,
+          `integration:${gridIntegration.id}`,
+        );
+        grid = {
+          provider: gridIntegration.kind,
+          wsEndpoint: gridWsEndpoint(
+            gridIntegration.kind as GridIntegrationKind,
+            { username: cfg.username ?? '', accessKey },
+            {
+              os: cfg.os,
+              browser: cfg.browser,
+              browserVersion: cfg.browserVersion,
+              buildName: `QAAI ${run.id.slice(-8)}`,
+              sessionName: `QAAI run ${run.id.slice(-8)}`,
+            },
+          ),
+        };
+        logger.info({ provider: gridIntegration.kind }, 'running on a cloud grid');
+      } catch (err) {
+        // A broken grid config must not silently fall back to a local browser —
+        // the customer asked for Safari on Windows and would get Chromium here.
+        throw new Error(
+          `Cloud grid ${gridIntegration.kind} is configured but its credentials could not be used: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+          // The message says what broke; the cause says which of the vault open,
+          // the key version lookup or the endpoint build actually threw. That
+          // stack is the whole diagnosis, and this error ends up in a run's
+          // errorMessage being read by someone who was not here when it happened.
+          { cause: err },
+        );
+      }
+    }
+
+    const authProfile = await prisma.authProfile.findFirst({
+      where: { orgId, environmentId: run.environment.id },
+      orderBy: { createdAt: 'asc' },
+      select: { storageState: true, storageStateExpiresAt: true },
+    });
+    const storageState =
+      authProfile?.storageState &&
+      (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
+        ? authProfile.storageState
+        : null;
+
+    if (shard) {
+      /*
+       * Five shards start at once, and the run starts once. The conditional
+       * update is the arbiter: `startedAt: null` matches for exactly one of them,
+       * so exactly one publishes `run.started` and the cockpit does not show the
+       * run beginning five times.
+       */
+      const first = await prisma.run.updateMany({
+        where: { id: run.id, startedAt: null },
+        data: { status: 'RUNNING', startedAt: new Date() },
+      });
+      if (first.count === 1) {
+        publishEvent(orgId, {
+          runId: run.id,
+          type: 'run.started',
+          data: { total: run.totalCount, baseUrl, shards: shard.count },
+          at: new Date().toISOString(),
+        });
+      }
+      publishEvent(orgId, {
+        runId: run.id,
+        type: 'shard.started',
+        data: { shard: shard.index, shards: shard.count, tests: run.results.length },
+        at: new Date().toISOString(),
+      });
+    } else {
+      /*
+       * The unsharded start is conditional too, for the reason the sharded one
+       * above already was: the status this writes must never be allowed to
+       * overwrite a decision somebody else made about this run.
+       *
+       * It used to be an unconditional `update`. A run cancelled while QUEUED —
+       * again, the normal case on a busy pool — had CANCELLED written by the
+       * API, and this line put it straight back to RUNNING and executed the
+       * whole suite anyway, against the environment it was pointed at.
+       *
+       * RUNNING is accepted alongside QUEUED so a job BullMQ redelivers after
+       * its worker stalled still re-executes: matching only QUEUED would have
+       * that job return quietly and leave the run at RUNNING with no verdict
+       * for good, since the sharded sweep does not look at unsharded runs.
+       * CANCELLED and every terminal status match neither, which is the point.
+       */
+      const started = await prisma.run.updateMany({
+        where: { id: run.id, status: { in: ['QUEUED', 'RUNNING'] } },
+        data: { status: 'RUNNING', startedAt: new Date() },
+      });
+      if (started.count === 0) {
+        const current = await prisma.run.findUnique({
+          where: { id: run.id },
+          select: { status: true },
+        });
+        logger.info(
+          { runId: run.id, status: current?.status },
+          'run is no longer startable; not executing the suite',
+        );
+        return;
+      }
+      publishEvent(orgId, {
+        runId: run.id,
+        type: 'run.started',
+        data: { total: run.results.length, baseUrl },
+        at: new Date().toISOString(),
+      });
+    }
+
+    // Proof of life for this shard, on a timer. It dies with the process, which
+    // is exactly the signal the siblings' reaper is looking for.
+    heartbeat = shard
+      ? setInterval(() => {
+          void prisma.runShard
+            .updateMany({
+              where: { orgId, runId: run.id, index: shard.index, status: 'RUNNING' },
+              data: { heartbeatAt: new Date() },
+            })
+            .catch((err) => logger.debug({ err, runId: run.id }, 'shard heartbeat failed'));
+        }, SHARD_HEARTBEAT_MS)
+      : null;
+    // Never hold the process open for a heartbeat.
+    heartbeat?.unref?.();
+
     for (const [index, result] of run.results.entries()) {
       const test = result.test;
 
@@ -325,15 +404,15 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           { runId: run.id, completed: index, shard: shard?.index },
           cancelled ? 'run cancelled; stopping' : 'run already finalised; stopping',
         );
-        if (!shard) {
-          publishEvent(orgId, {
-            runId: run.id,
-            type: 'run.finished',
-            data: { status: 'CANCELLED', completed: index, total: run.results.length },
-            at: new Date().toISOString(),
-          });
-          return;
-        }
+        /*
+         * Break rather than return, on both paths. An unsharded cancel used to
+         * publish a bare `run.finished` here and return: the counts, the gate
+         * result and the `run.finished` NOTIFICATION were all skipped, so the
+         * cockpit rendered a cancelled run with a blank summary forever and
+         * nobody who subscribes to a finished run ever heard about it. Falling
+         * out of the loop hands both paths to the finalisation below, which
+         * already knows how to write a forced status.
+         */
         break;
       }
 
@@ -620,10 +699,106 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       prNumber: run.prNumber,
       gateRules: run.project.gateRules,
     },
-    counts,
+    /*
+     * A cancelled run stopped part-way, so the in-memory counters describe the
+     * tests this process happened to reach and nothing else — the rest are
+     * still sitting at their placeholder SKIPPED. The result rows are what the
+     * cockpit renders, so they are what the summary is counted from, exactly as
+     * `completeShardedRun` does it. A run that ran to the end keeps its own
+     * counters: they are already the same numbers, without the extra query.
+     */
+    counts: cancelled ? await aggregateCounts(orgId, run.id) : counts,
     errorMessage: runErrored,
-    forcedStatus: runErrored ? 'ERRORED' : null,
+    forcedStatus: cancelled ? 'CANCELLED' : runErrored ? 'ERRORED' : null,
   });
+}
+
+/**
+ * Write the terminal state for a run whose JOB died.
+ *
+ * The processor's own failure path (above) covers everything that throws while
+ * it is executing. This covers what is left: a job that never reached the
+ * processor's try at all, or one whose failure handling itself blew up. BullMQ
+ * hands those to `worker.on('failed')` and, before this existed, nothing else
+ * ever looked at them — the run stayed at QUEUED or RUNNING permanently, the
+ * cockpit's elapsed clock ran forever against a run nobody was executing, and
+ * the `run.finished` notification that carries the Slack message and the PR
+ * comment was never enqueued.
+ *
+ * The conditional update is the claim, the same one `completeShardedRun` uses:
+ * `finalizedAt: null` matches once, so a run this rescues cannot also be
+ * finalised by a shard. The status filter is what keeps it honest — a run that
+ * already reported PASSED, FAILED or CANCELLED keeps that verdict, because a
+ * job failing AFTER the run reported is not a reason to rewrite what it said.
+ *
+ * Returns whether it actually wrote anything, so the caller can log the
+ * difference between a rescue and a no-op.
+ */
+export async function failRunFromDeadJob(args: {
+  orgId: string;
+  runId: string;
+  errorMessage: string;
+}): Promise<boolean> {
+  const { orgId, runId, errorMessage } = args;
+
+  /*
+   * The caller reads these two straight off `job.data`, and a job BullMQ could
+   * deserialise but that carries the wrong shape — one enqueued by an older
+   * build, or by hand — leaves them undefined. Prisma reads an undefined
+   * `where` value as "no filter", not as "matches nothing", so the claim below
+   * would stop being scoped to one run and one org: `updateMany` would stamp
+   * `finalizedAt` on every QUEUED or RUNNING run in the database across every
+   * tenant, and `finalizeRun` would then write a terminal status and fire a
+   * notification for whichever row `findFirst` happened to return first. One
+   * malformed job would end every live run on the platform, in other people's
+   * organisations, with a PR comment each.
+   *
+   * There is nothing to rescue without a run id, so this refuses rather than
+   * guesses — and says so loudly, because a run job with no run in it is a
+   * producer bug somebody needs to see.
+   */
+  if (!orgId || !runId) {
+    logger.error(
+      { orgId, runId, errorMessage },
+      'a dead run job carried no org or run id; refusing to finalise an unscoped set of runs',
+    );
+    return false;
+  }
+
+  const run = await prisma.run.findFirst({
+    where: { id: runId, orgId },
+    select: {
+      id: true,
+      trigger: true,
+      prNumber: true,
+      project: { select: { gateRules: true } },
+    },
+  });
+  if (!run) return false;
+
+  // Counted before the claim rather than after: nothing is writing results to a
+  // run whose job is dead, and reading first keeps this to a single write.
+  const counts = await aggregateCounts(orgId, runId);
+
+  const claim = await prisma.run.updateMany({
+    where: { id: runId, orgId, finalizedAt: null, status: { in: ['QUEUED', 'RUNNING'] } },
+    data: { finalizedAt: new Date() },
+  });
+  if (claim.count === 0) return false;
+
+  await finalizeRun({
+    orgId,
+    run: {
+      id: run.id,
+      trigger: run.trigger,
+      prNumber: run.prNumber,
+      gateRules: run.project.gateRules,
+    },
+    counts,
+    errorMessage,
+    forcedStatus: 'ERRORED',
+  });
+  return true;
 }
 
 /**
@@ -646,8 +821,26 @@ async function finalizeRun(args: {
   const status =
     forcedStatus ?? (counts.failed > 0 || !gateResult.passed ? 'FAILED' : ('PASSED' as const));
 
-  await prisma.run.update({
-    where: { id: run.id },
+  /*
+   * A cancel that lands while setup is in flight must still win.
+   *
+   * This write used to be unconditional, which reopened the defect the
+   * conditional start was added to close, one layer down: a run cancelled
+   * after `secretsFor` was awaited and before the catch ran would be stamped
+   * ERRORED here, and the cockpit — which already said "cancelled" — would
+   * flip to a failure the user did not cause. `updateMany` with the status
+   * filter makes the cancel authoritative: CANCELLED is terminal, and nothing
+   * that arrives afterwards may relabel it.
+   *
+   * A cancel is still allowed to be WRITTEN by this function (forcedStatus
+   * 'CANCELLED' is how a mid-flight stop finalises), so CANCELLED is excluded
+   * from the filter only when it is not the status being written.
+   */
+  const wrote = await prisma.run.updateMany({
+    where:
+      status === 'CANCELLED'
+        ? { id: run.id }
+        : { id: run.id, status: { notIn: ['CANCELLED'] } },
     data: {
       status,
       finishedAt: new Date(),
@@ -659,6 +852,17 @@ async function finalizeRun(args: {
       errorMessage,
     },
   });
+
+  /*
+   * Nothing was written, so the run is already CANCELLED. Everything below —
+   * the monitor streak, the notification, the SSE frame — describes a terminal
+   * state this call did not produce; sending it would announce a status the row
+   * does not have, which is the reassuring-lie failure this file exists to avoid.
+   */
+  if (wrote.count === 0) {
+    logger.info({ runId: run.id, status }, 'run was cancelled first; not relabelling it');
+    return;
+  }
 
   // A monitor-triggered run updates its streak, and pages once the threshold
   // is crossed rather than on every blip.

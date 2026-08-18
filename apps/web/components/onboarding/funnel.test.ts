@@ -17,6 +17,7 @@ import {
   DEFAULT_TEST_TYPES,
   frameworksFor,
   nameFromPaths,
+  provision,
   readRepo,
   reconcileFramework,
   shouldList,
@@ -343,5 +344,155 @@ describe('uploadPayload', () => {
   it('reports the trim so the funnel can say so', () => {
     const result = uploadPayload(paths(6_000));
     expect(result.droppedFiles).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Finishing the funnel — what it ASKS THE SERVER FOR, not what it renders.
+ *
+ * This block exists because of a specific shipped regression: the "I have a
+ * running URL" path created the project, created the environment, discarded the
+ * environment's id, and advanced to a result step whose CrawlPanel only ever
+ * WATCHES a crawl. Nothing ever enqueued one. Every screen assertion anybody
+ * could have written still passed — the panel rendered, its first log line said
+ * "Crawling https://…", the spinner spun — and five minutes later the app told
+ * the user the worker must be broken.
+ *
+ * So these assert on the requests. A recording client is the only witness that
+ * can tell a crawl that was started from a crawl that was merely displayed.
+ */
+describe('provision — the requests each path actually makes', () => {
+  interface Call {
+    path: string;
+    method: string;
+    body: Record<string, unknown> | null;
+  }
+
+  /**
+   * A stand-in for `lib/api`'s client that records every call and answers with
+   * whatever the funnel destructures out of it.
+   */
+  function recorder(overrides: Record<string, unknown> = {}) {
+    const calls: Call[] = [];
+    const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+      calls.push({
+        path,
+        method: init?.method ?? 'GET',
+        body: init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : null,
+      });
+      if (path in overrides) return overrides[path] as T;
+      if (path === '/projects') return { project: { id: 'prj_1', name: 'Shop' } } as T;
+      if (path.endsWith('/environments')) return { environment: { id: 'env_1' } } as T;
+      if (path.endsWith('/tests')) {
+        return {
+          test: { id: `tst_${calls.length}`, name: 'Starter', filePath: 'hand-written/x', type: 'SMOKE' },
+        } as T;
+      }
+      return {} as T;
+    };
+    return { api, calls };
+  }
+
+  const hooks = (api: ReturnType<typeof recorder>['api']) => ({
+    api,
+    onBusy: () => {},
+    onProject: () => {},
+  });
+
+  const urlInput = {
+    path: 'url' as const,
+    name: 'Shop',
+    language: 'TYPESCRIPT' as const,
+    framework: 'PLAYWRIGHT' as const,
+    baseUrl: ' https://staging.shop.test ',
+    envKind: 'STAGING',
+    types: ['SMOKE'] as const,
+    files: null,
+  };
+
+  it('starts the crawl on the url path, against the environment it just created', async () => {
+    const { api, calls } = recorder();
+    const result = await provision(hooks(api), urlInput);
+
+    const explore = calls.find((c) => c.path === '/projects/prj_1/explore');
+    expect(
+      explore,
+      'the url path must POST /explore — CrawlPanel only watches, it never enqueues',
+    ).toBeDefined();
+    expect(explore!.method).toBe('POST');
+    // The id from the environment response, not a guess and not undefined —
+    // the API 404s an explore whose environmentId is not this project's.
+    expect(explore!.body).toEqual({ environmentId: 'env_1', maxPages: 25, maxDepth: 3 });
+    expect(result.environmentId).toBe('env_1');
+  });
+
+  it('creates the environment before it asks for the crawl', async () => {
+    const { api, calls } = recorder();
+    await provision(hooks(api), urlInput);
+
+    const order = calls.map((c) => c.path);
+    expect(order.indexOf('/projects/prj_1/environments')).toBeGreaterThan(-1);
+    expect(order.indexOf('/projects/prj_1/environments')).toBeLessThan(
+      order.indexOf('/projects/prj_1/explore'),
+    );
+    // The URL reaches the environment trimmed; a stray space makes every
+    // crawled link absolute against a host with a space in it.
+    const env = calls.find((c) => c.path === '/projects/prj_1/environments');
+    expect(env!.body).toMatchObject({ baseUrl: 'https://staging.shop.test' });
+  });
+
+  it('surfaces a refused crawl as the funnel’s own failure, not the result step’s', async () => {
+    const { api } = recorder({
+      '/projects/prj_1/explore': Promise.reject(new Error('nope')),
+    });
+    // The override above answers with a rejected promise, which `provision`
+    // awaits — so the throw has to come out of provision itself. Reaching the
+    // result step with a crawl that was refused is the bug being prevented:
+    // CrawlPanel would sit on it for five minutes and blame the worker.
+    await expect(provision(hooks(api), urlInput)).rejects.toThrow('nope');
+  });
+
+  it('does not crawl on the paths that have nothing to crawl', async () => {
+    for (const path of ['scratch', 'import'] as const) {
+      const { api, calls } = recorder();
+      await provision(hooks(api), { ...urlInput, path, baseUrl: '' });
+      expect(calls.some((c) => c.path.endsWith('/explore'))).toBe(false);
+      expect(calls.some((c) => c.path.endsWith('/environments'))).toBe(false);
+    }
+  });
+
+  it('still reads the codebase and asks for scenarios on the codebase path', async () => {
+    const { api, calls } = recorder();
+    await provision(hooks(api), {
+      ...urlInput,
+      path: 'codebase',
+      baseUrl: '',
+      files: [{ path: 'package.json', content: '{"name":"shop"}' }],
+    });
+
+    expect(calls.map((c) => c.path)).toEqual([
+      '/projects',
+      '/projects/prj_1/source',
+      '/projects/prj_1/analyze-source',
+    ]);
+  });
+
+  it('sends the import path onward instead of to the result step', async () => {
+    const { api } = recorder();
+    const result = await provision(hooks(api), { ...urlInput, path: 'import', baseUrl: '' });
+    expect(result.next).toBe('import');
+  });
+
+  it('writes one starter test per chosen type on the scratch path', async () => {
+    const { api, calls } = recorder();
+    const result = await provision(hooks(api), {
+      ...urlInput,
+      path: 'scratch',
+      baseUrl: '',
+      types: ['SMOKE', 'E2E'],
+    });
+    expect(calls.filter((c) => c.path === '/projects/prj_1/tests')).toHaveLength(2);
+    expect(result.createdTests).toHaveLength(2);
+    expect(result.next).toBe('result');
   });
 });

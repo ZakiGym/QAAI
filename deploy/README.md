@@ -219,7 +219,7 @@ The database and the vault key are two separate backups, and a restore needs
 both.
 
 The worker now schedules the real backup path itself: set `QAAI_BACKUP_DIR`
-(and optionally `QAAI_BACKUP_KEEP`, default 7) and it runs `qaai backup create`
+(and optionally `QAAI_BACKUP_KEEP`, default 7) and it runs `qaai backup create` (the CLI is `@qaai/cli` — `npm i -g @qaai/cli`; the unscoped `qaai` on npm is a different project)
 daily into timestamped subdirectories, pruning all but the newest N after each
 success — see `deploy/backup.md`. **In-container caveat, stated honestly:** the
 image does not install the PostgreSQL client tools, so inside the worker

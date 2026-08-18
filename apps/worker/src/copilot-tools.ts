@@ -22,6 +22,10 @@ import { defineTool } from '@qaai/agent';
 import type { AgentTool } from '@qaai/agent';
 import { FIXTURE_PREFIX } from '@qaai/shared';
 import type { FlowMap } from '@qaai/shared';
+// One toll for every path that creates a Run: the plan gate and the usage
+// counter. It lives in the API workspace and takes its Prisma client as an
+// argument so this file can call the same implementation POST /runs does.
+import { startRun } from '../../api/src/lib/start-run.js';
 import { logger, prisma } from './context.js';
 import { enqueueRun } from './queues.js';
 
@@ -228,7 +232,22 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
       if (ids.length === 0) return { error: 'There are no tests to run' };
 
-      const run = await prisma.run.create({
+      /*
+       * Gate, create, count. Mirrors the guard in POST /runs for the same
+       * reason the fixture filter above does: the copilot creates the Run
+       * directly and would otherwise bypass it — "ask the assistant to run the
+       * suite" was an unmetered way around the free tier's only real ceiling.
+       *
+       * `advisory`, not `enforce`: this executes inside a tool call, and a
+       * thrown ApiError would reach the model as a tool failure it would very
+       * likely retry. A refusal returned as `error` is what every other tool
+       * here does with a condition the user has to resolve, and the model
+       * relays it as a sentence the person can act on.
+       */
+      const started = await startRun({
+        db: prisma,
+        orgId: ctx.orgId,
+        mode: 'advisory',
         data: {
           orgId: ctx.orgId,
           projectId: ctx.projectId,
@@ -240,6 +259,15 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
           },
         },
       });
+
+      if (!started.created) {
+        logger.warn(
+          { orgId: ctx.orgId, projectId: ctx.projectId },
+          'copilot run_tests refused: the org is at its monthly run limit',
+        );
+        return { error: started.quota.reason ?? 'This org is at its monthly run limit.' };
+      }
+      const run = started.run;
 
       await enqueueRun({ orgId: ctx.orgId, runId: run.id });
 

@@ -3,6 +3,22 @@
 # Runs a QAAI suite in the repo's own CI and fails the job when a test fails or
 # a quality gate blocks — the CLI's exit code does the work, this is just the
 # thin wrapper that surfaces JUnit to the Checks tab.
+#
+# WHY THE PACKAGE NAME IS SCOPED AND PINNED
+#
+# This step used to run `npx --yes qaai run …`. The unscoped name `qaai` on the
+# public npm registry belongs to somebody else — an unrelated OpenAPI-to-Jest
+# generator, published at 1.0.0, which ships its own `qaai` binary. So the line
+# above resolved to a stranger's package, `--yes` installed it without asking,
+# and it was handed control of a step that had just exported the customer's
+# QAAI_API_KEY into its environment. The job then failed confusingly, because
+# that package has never heard of `run --env`.
+#
+# A scope cannot be squatted the same way: `@qaai/*` can only be published by
+# the owner of the `qaai` scope. Pinning the version on top means a compromised
+# later release cannot be pulled in silently by a workflow that has not changed.
+# If the pinned version is not published, this fails with a plain 404 naming the
+# package — loud and correct, which is what the old line was not.
 
 name: QAAI
 description: Run a QAAI test suite and block the build on failures
@@ -24,6 +40,12 @@ inputs:
     description: Where to write JUnit XML
     required: false
     default: qaai-results.xml
+  cli-version:
+    description: >-
+      Version of @qaai/cli to run. Pinned by default so a workflow that has not
+      changed cannot start executing different code; override to upgrade.
+    required: false
+    default: 0.1.0
 runs:
   using: composite
   steps:
@@ -33,7 +55,7 @@ runs:
         QAAI_API_KEY: ${{ inputs.api-key }}
         QAAI_API_URL: ${{ inputs.api-url }}
       run: |
-        npx --yes qaai run \
+        npx --yes "@qaai/cli@${{ inputs.cli-version }}" run \
           --env "${{ inputs.environment-id }}" \
           ${{ inputs.suite && format('--suite {0}', inputs.suite) || '' }} \
           --commit "${{ github.sha }}" \

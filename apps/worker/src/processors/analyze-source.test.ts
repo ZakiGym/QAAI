@@ -223,6 +223,226 @@ describe('the analysis this parser reads is the analysis @qaai/shared writes', (
     const items = scenariosFromSource(parsed, allTypes(['E2E'])).items;
     expect(items.some((i) => i.feature === 'Authentication')).toBe(true);
   });
+
+  /**
+   * The Express fixture above is exactly why a round-trip test was not enough.
+   *
+   * `analyseCodebase` writes an endpoint's URL under `path` and a PAGE's URL
+   * under `route`, and an Express app declares no pages — so the only field
+   * those tests ever exercised was the one field the two sides agreed on. Three
+   * disagreements lived through it:
+   *
+   *   • `parseRoute` read `raw.path`, which a `PageRoute` does not have. Every
+   *     page route was dropped: no SMOKE item, no ACCESSIBILITY item, and a
+   *     FlowMap with no nodes at all. A pure-frontend app — the commonest thing
+   *     an ingest is handed — produced a completely empty plan.
+   *   • the producer publishes forms at the TOP LEVEL of the analysis; the
+   *     parser looked for them nested inside each route and nowhere else, so
+   *     every form-driven E2E item was lost and the plan summary said
+   *     "0 form(s)" one screen after the ingest response had listed them.
+   *   • an `AuthSurface` carries no fields, so a sign-in item had nothing to
+   *     fill in until the credential form was matched back onto it.
+   *
+   * So this fixture is a Next.js App Router app with pages and a real form, and
+   * every assertion below is written against `produced`'s own counts and fields.
+   * A literal here would be a second copy of the contract, and a copy is what
+   * drifted in the first place.
+   */
+  const nextApp: RepoFile[] = [
+    { path: 'package.json', content: '{"dependencies":{"next":"^15.0.0","react":"^19.0.0"}}' },
+    {
+      path: 'app/page.tsx',
+      content: 'export default function Home() {\n  return <main>Storefront</main>;\n}\n',
+    },
+    {
+      path: 'app/products/page.tsx',
+      content: 'export default function Products() {\n  return <ul />;\n}\n',
+    },
+    {
+      path: 'app/products/[id]/page.tsx',
+      content: 'export default function Product() {\n  return <article />;\n}\n',
+    },
+    {
+      path: 'app/login/page.tsx',
+      content: [
+        'export default function LoginPage() {',
+        '  return (',
+        '    <form name="Sign in" method="post">',
+        '      <label htmlFor="email">Email</label>',
+        '      <input id="email" name="email" type="email" required />',
+        '      <label htmlFor="password">Password</label>',
+        '      <input id="password" name="password" type="password" required />',
+        '      <button type="submit">Sign in</button>',
+        '    </form>',
+        '  );',
+        '}',
+      ].join('\n'),
+    },
+  ];
+
+  /** The producer's output and the parser's reading of it, once, for one repo. */
+  const roundTrip = () => {
+    const produced = analyseCodebase(nextApp);
+    const parsed = parseCodebaseAnalysis(JSON.parse(JSON.stringify(produced)))!;
+    return { produced, parsed };
+  };
+
+  it('keeps every page route a file-convention router declares', () => {
+    const { produced, parsed } = roundTrip();
+    // The fixture has to be worth running: a producer that found no pages would
+    // let a parser that drops all of them pass silently.
+    expect(produced.routes.length).toBeGreaterThan(0);
+    expect(parsed.routes).toHaveLength(produced.routes.length);
+    // The field, not just the count — `route` on one side, `path` on the other.
+    expect(parsed.routes.map((r) => r.path)).toEqual(produced.routes.map((r) => r.route));
+    expect(parsed.routes.map((r) => r.file)).toEqual(produced.routes.map((r) => r.file));
+  });
+
+  it('keeps every form the producer publishes, with its fields', () => {
+    const { produced, parsed } = roundTrip();
+    expect(produced.forms.length).toBeGreaterThan(0);
+    expect(parsed.forms).toHaveLength(produced.forms.length);
+    expect(parsed.forms.map((f) => f.file)).toEqual(produced.forms.map((f) => f.file));
+    expect(parsed.forms.map((f) => f.name)).toEqual(produced.forms.map((f) => f.name));
+    for (const [index, form] of produced.forms.entries()) {
+      expect(parsed.forms[index]!.fields.map((f) => f.name)).toEqual(
+        form.fields.map((f) => f.name),
+      );
+      expect(parsed.forms[index]!.fields.map((f) => f.semantic)).toEqual(
+        form.fields.map((f) => f.semantic),
+      );
+    }
+  });
+
+  it('ties a top-level form to the route whose file declares it', () => {
+    const { produced, parsed } = roundTrip();
+    // The producer states a form's FILE and no route, because a `<form>` is
+    // found by reading markup. A page file is a route, so this one resolves —
+    // and resolving it is what puts the fields on the FlowMap node the E2E
+    // scaffold reads.
+    for (const form of produced.forms) {
+      const owner = produced.routes.find((r) => r.file === form.file);
+      if (!owner) continue;
+      const attached = parsed.forms.find((f) => f.file === form.file);
+      expect(attached?.route ?? null, `${form.file} reached no route`).toBe(owner.route);
+    }
+  });
+
+  it('proposes one SMOKE item per declared route, and an axe scan over them', () => {
+    const { produced, parsed } = roundTrip();
+    const derived = scenariosFromSource(parsed, allTypes(['SMOKE', 'ACCESSIBILITY']));
+    expect(derived.totals.routes).toBe(produced.routes.length);
+    expect(derived.items.filter((i) => i.testType === 'SMOKE')).toHaveLength(
+      produced.routes.length,
+    );
+    expect(derived.items.filter((i) => i.testType === 'ACCESSIBILITY')).toHaveLength(1);
+  });
+
+  it('counts the forms the ingest screen showed, on the plan and in its summary', () => {
+    const { produced, parsed } = roundTrip();
+    const derived = scenariosFromSource(parsed, allTypes(['E2E']));
+    expect(derived.totals.forms).toBe(produced.forms.length);
+    // The sentence the user reads. It said "0 form(s)" while the ingest
+    // response listed them, which is one feature contradicting itself.
+    expect(summaryFromSource(derived, parsed)).toContain(`${produced.forms.length} form(s)`);
+    for (const form of produced.forms) {
+      expect(derived.items.some((i) => i.rationale.includes(form.file))).toBe(true);
+    }
+  });
+
+  it('reaches an authenticated scenario, with the credentials the source names', () => {
+    const { produced, parsed } = roundTrip();
+    const credentials = produced.forms.find((f) =>
+      f.fields.some((field) => field.semantic === 'password'),
+    )!;
+    expect(credentials).toBeDefined();
+
+    // An `AuthSurface` is kind/path/from/file/evidence and nothing else, so the
+    // fields have to be matched back on. Without them the sign-in item read
+    // "the source names no fields on it" for a repo whose login form had just
+    // been parsed field by field, and the generated test had nothing to type.
+    const surfaces = parsed.authSurfaces.filter((s) => s.file === credentials.file);
+    expect(surfaces.length).toBeGreaterThan(0);
+    for (const surface of surfaces) {
+      expect(
+        surface.form?.fields.map((f) => f.name) ?? null,
+        `${surface.kind} at ${surface.path} carries no credential form`,
+      ).toEqual(credentials.fields.map((f) => f.name));
+    }
+
+    const derived = scenariosFromSource(parsed, allTypes(['E2E']));
+    const signIn = derived.items.filter((i) => i.feature === 'Authentication');
+    expect(signIn).toHaveLength(parsed.authSurfaces.length);
+    for (const item of signIn) {
+      expect(item.priority).toBe('CRITICAL_PATH');
+      for (const field of credentials.fields) {
+        expect(
+          item.steps.some(
+            (step) => step.includes(field.name) || (field.label !== null && step.includes(field.label)),
+          ),
+          `no step fills "${field.name}"`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('gives the Generator a FlowMap with the app in it', () => {
+    const { produced, parsed } = roundTrip();
+    const map = flowMapFromSource(parsed, ctx);
+    expect(map.nodes.map((n) => n.route)).toEqual(produced.routes.map((r) => r.route));
+    /*
+     * Per-node forms are how a generated E2E test gets its fields, so a form
+     * that resolved to a route has to arrive on that route's node too.
+     *
+     * Anchored to the PRODUCER, not to `parsed`. The first version of this
+     * compared `map.nodes.flatMap(n => n.forms)` against
+     * `parsed.forms.filter(f => f.route !== null)` — both sides downstream of
+     * the parser, so dropping every form on the floor made both sides zero and
+     * the assertion passed. That is the precise failure this whole describe
+     * block exists to prevent, reproduced inside it.
+     */
+    const producedLoginForms = produced.forms.filter((f) =>
+      produced.routes.some((r) => r.file === f.file),
+    );
+    expect(
+      producedLoginForms.length,
+      'the fixture must declare at least one form on a page route, or this asserts nothing',
+    ).toBeGreaterThan(0);
+    expect(map.nodes.flatMap((n) => n.forms)).toHaveLength(producedLoginForms.length);
+    expect(map.nodes.flatMap((n) => n.forms.flatMap((f) => f.fields)).length).toBe(
+      producedLoginForms.reduce((total, form) => total + form.fields.length, 0),
+    );
+  });
+
+  it('carries the frameworks the producer named into the summary a person reads', () => {
+    /*
+     * The fourth disagreement on this boundary. `analyseCodebase` emits
+     * `AppFrameworkSignal` objects; the parser read them as plain strings, so
+     * `str(object)` was '' and every one was filtered away. Nothing failed —
+     * the plan summary just quietly lost its "(Next.js, Express)" for every
+     * repository ever analysed.
+     */
+    const { produced, parsed } = roundTrip();
+    expect(produced.frameworks.length).toBeGreaterThan(0);
+    expect(parsed.frameworks).toEqual(produced.frameworks.map((f) => f.framework));
+
+    const summary = summaryFromSource(scenariosFromSource(parsed, allTypes(['E2E'])), parsed);
+    for (const signal of produced.frameworks) {
+      expect(summary).toContain(signal.framework);
+    }
+  });
+
+  it('claims no guard the producer never expressed', () => {
+    const { parsed } = roundTrip();
+    // `PageRoute` and `HttpEndpoint` carry no guard field and no detector reads
+    // one, so `behindAuth` is false for everything a real analysis produces.
+    // The honest consequence is a SECURITY_SMOKE that is skipped WITH A REASON,
+    // not an auth wall invented to fill the slot.
+    expect(parsed.routes.some((r) => r.behindAuth)).toBe(false);
+    const derived = scenariosFromSource(parsed, allTypes(['SECURITY_SMOKE']));
+    expect(derived.items).toHaveLength(0);
+    expect(derived.skipped.some((s) => s.why.includes('no auth wall to probe'))).toBe(true);
+  });
 });
 
 describe('parseCodebaseAnalysis', () => {

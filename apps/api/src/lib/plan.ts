@@ -15,23 +15,19 @@
 
 import { PLAN_LIMITS, type Plan, type PlanLimits } from '@qaai/shared';
 import { prisma, unscoped } from './prisma.js';
+import { RUNS_METRIC, currentPeriod, effectivePlan, runQuota } from './start-run.js';
 
-/** The first instant of the current UTC billing month. */
-export function currentPeriod(): Date {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-}
-
-/**
- * A subscription in a non-paying state falls back to FREE limits rather than
- * to nothing.
+/*
+ * The billing period key, the paying-status rule and the run ceiling itself now
+ * live in start-run.ts. `currentPeriod` is re-exported rather than restated.
  *
- * Stripe reports `past_due` for a card that failed to charge, which is very
- * often a bank blip and not a decision to stop paying. Locking a team out of
- * their CI over that is a way to lose the customer; dropping them to free
- * limits is a way to get them to update the card.
+ * They moved because apps/worker creates Runs too and cannot import this module
+ * — it reaches for the tenancy-extended Prisma client, which reaches for the
+ * API's env. A second copy of "which plan is this org metered at" is exactly
+ * what let the free-tier run cap be enforced on two of the seven paths that
+ * create a run and ignored on the other five.
  */
-const PAYING_STATUSES = new Set(['active', 'trialing']);
+export { currentPeriod };
 
 export interface PlanState {
   plan: Plan;
@@ -65,7 +61,6 @@ export async function planFor(orgId: string): Promise<PlanState> {
   );
 
   const status = subscription?.status ?? 'active';
-  const paying = subscription ? PAYING_STATUSES.has(status) : false;
 
   /*
    * With no Subscription row, fall back to Organization.plan.
@@ -84,14 +79,16 @@ export async function planFor(orgId: string): Promise<PlanState> {
    *
    * A Subscription still wins when one exists: that is the paid path, and its
    * status is what decides whether the plan is currently honoured.
+   *
+   * An org that has stopped paying keeps its plan *label* — so the UI can say
+   * "your Team plan is past due" rather than silently pretending they were
+   * always free — but is metered at free limits. An org with no Subscription is
+   * not "not paying"; it never had one, so its plan is honoured as set.
+   *
+   * The rule itself is `effectivePlan` in start-run.ts, so the worker's
+   * scheduler answers "which plan is this org on" exactly the way this does.
    */
-  const plan = subscription?.plan ?? org?.plan ?? 'FREE';
-
-  // An org that has stopped paying keeps its plan *label* — so the UI can say
-  // "your Team plan is past due" rather than silently pretending they were
-  // always free — but is metered at free limits. An org with no Subscription is
-  // not "not paying"; it never had one, so its plan is honoured as set.
-  const effective: Plan = !subscription || paying || plan === 'FREE' ? plan : 'FREE';
+  const { plan, effective, paying } = effectivePlan(subscription, org?.plan ?? null);
 
   return {
     plan,
@@ -112,7 +109,7 @@ export async function usageFor(orgId: string): Promise<UsageSnapshot> {
   const [runs, projects] = await Promise.all([
     unscoped(() =>
       prisma.usageRecord.findUnique({
-        where: { orgId_metric_period: { orgId, metric: 'runs', period: currentPeriod() } },
+        where: { orgId_metric_period: { orgId, metric: RUNS_METRIC, period: currentPeriod() } },
         select: { quantity: true },
       }),
     ),
@@ -149,19 +146,17 @@ export interface LimitVerdict {
  *
  * `maxRunsPerMonth: null` means unlimited — every paid tier. Only FREE has a
  * ceiling, which is the point of the ceiling.
+ *
+ * Advisory, and kept for callers that want to refuse before doing expensive
+ * work. It is no longer where the ceiling is ENFORCED: `startRun` asks the same
+ * question again at the instant the row would be written, because a check
+ * standing apart from the write is a check every new caller can forget to make
+ * — and five of the seven forgot.
  */
 export async function canStartRun(orgId: string): Promise<LimitVerdict> {
-  const [{ limits, plan }, usage] = await Promise.all([planFor(orgId), usageFor(orgId)]);
-  const cap = limits.maxRunsPerMonth;
-  if (cap === null || usage.runsThisMonth < cap) return { allowed: true };
-
-  return {
-    allowed: false,
-    limit: 'runs',
-    reason:
-      `You have used all ${cap} runs included with ${PLAN_LIMITS[plan].label} this month. ` +
-      `They reset on the 1st — or upgrade for unlimited runs.`,
-  };
+  const quota = await runQuota(prisma, orgId, unscoped);
+  if (quota.allowed) return { allowed: true };
+  return { allowed: false, limit: 'runs', reason: quota.reason };
 }
 
 export async function canCreateProject(orgId: string): Promise<LimitVerdict> {

@@ -23,7 +23,12 @@
 
 import { CronExpressionParser } from 'cron-parser';
 import { PLAN_LIMITS } from '@qaai/shared';
-import type { Plan, ScheduleTickJob, ShardAssignment } from '@qaai/shared';
+import type { ScheduleTickJob, ShardAssignment } from '@qaai/shared';
+// The run toll — the plan gate and the usage counter — lives in the API
+// workspace because six other places create Runs too and there must be exactly
+// one of it. It takes its Prisma client as an argument precisely so this file
+// can call it; nothing in it touches the API's env or its tenancy layer.
+import { effectivePlan, startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
 import { enqueueRun, enqueueNotify } from '../queues.js';
 
@@ -60,14 +65,6 @@ const RECENT_RESULTS_PER_TEST = 5;
  * forty-minute nightly still fans out far enough to hit any plan's ceiling.
  */
 const TARGET_SHARD_MS = 4 * 60_000;
-
-/**
- * A subscription in a non-paying state falls back to FREE limits.
- *
- * The same rule as apps/api/src/lib/plan.ts, restated because that module
- * imports the API's tenancy-scoped Prisma client and cannot be loaded here.
- */
-const PAYING_STATUSES = new Set(['active', 'trialing']);
 
 /**
  * Recent per-test duration, in ms, for the tests about to run.
@@ -155,22 +152,22 @@ function packShards(
   return shards;
 }
 
-/** The org's parallel-worker ceiling — PLAN_LIMITS, resolved the way billing does. */
+/**
+ * The org's parallel-worker ceiling — PLAN_LIMITS, resolved the way billing does.
+ *
+ * `effectivePlan` is now imported rather than restated: a seeded org's
+ * Organization.plan, a past-due subscription dropping to free limits, and an
+ * org that never had a subscription at all are all the same three-line rule,
+ * and two copies of it is how the run cap ended up enforced in two places out
+ * of seven.
+ */
 async function maxParallelWorkersFor(orgId: string): Promise<number> {
   const [subscription, org] = await Promise.all([
     prisma.subscription.findUnique({ where: { orgId }, select: { plan: true, status: true } }),
     prisma.organization.findUnique({ where: { id: orgId }, select: { plan: true } }),
   ]);
 
-  // With no Subscription row, Organization.plan is the answer: a seeded org, a
-  // self-hosted install and an enterprise contract signed offline all have it
-  // set and never went through Stripe checkout.
-  const plan: Plan = subscription?.plan ?? org?.plan ?? 'FREE';
-  const paying = subscription ? PAYING_STATUSES.has(subscription.status) : false;
-
-  // An org that stopped paying keeps its plan label but is metered at free
-  // limits. An org that never had a subscription is not "not paying".
-  const effective: Plan = !subscription || paying || plan === 'FREE' ? plan : 'FREE';
+  const { effective } = effectivePlan(subscription, org?.plan ?? null);
   return PLAN_LIMITS[effective].maxParallelWorkers;
 }
 
@@ -227,14 +224,24 @@ async function planScheduledShards(
 /**
  * Queue a run of a suite, returning its id and how many shards it was split
  * across. Shared by both paths.
+ *
+ * Three outcomes rather than two. `null` still means "this suite has nothing to
+ * run". `refused` is new: the org is at its monthly run cap, and this path — a
+ * cron tick — must not throw about it. A schedule that throws into the queue
+ * disappears into BullMQ's failed set and the customer's nightly silently stops
+ * firing, which is a worse bug than the unlimited free runs this closes. So the
+ * refusal comes back as a value and the tick reports it at warn, alongside the
+ * line it already writes when a schedule fires.
  */
+type QueuedRun = { id: string; shards: number };
+
 async function queueRun(args: {
   orgId: string;
   projectId: string;
   environmentId: string;
   suiteId: string;
   trigger: 'SCHEDULE' | 'MONITOR';
-}): Promise<{ id: string; shards: number } | null> {
+}): Promise<QueuedRun | { refused: string } | null> {
   const tests = await prisma.test.findMany({
     where: {
       orgId: args.orgId,
@@ -273,7 +280,17 @@ async function queueRun(args: {
     for (const testId of assignment.testIds) shardOfTest.set(testId, assignment.index);
   }
 
-  const run = await prisma.run.create({
+  /*
+   * Gate, create, count. Until this call existed, a schedule created its Run
+   * directly: a nightly on a FREE account ran an unlimited number of browsers a
+   * month, and because the counter never moved, POST /runs never refused that
+   * org either. This is the path that made the free tier's only real ceiling
+   * decorative.
+   */
+  const started = await startRun({
+    db: prisma,
+    orgId: args.orgId,
+    mode: 'advisory',
     data: {
       orgId: args.orgId,
       projectId: args.projectId,
@@ -310,8 +327,12 @@ async function queueRun(args: {
           }
         : {}),
     },
-    select: { id: true },
   });
+
+  if (!started.created) {
+    return { refused: started.quota.reason ?? 'This org is at its monthly run limit.' };
+  }
+  const run = started.run;
 
   if (!sharded) {
     await enqueueRun({ orgId: args.orgId, runId: run.id });
@@ -422,6 +443,15 @@ export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> 
     }
 
     const queued = await queueRun({ ...schedule, trigger: 'SCHEDULE' });
+    if (queued && 'refused' in queued) {
+      // Loud, and at warn: a nightly that stopped running is exactly the thing
+      // a green dashboard would otherwise lie about.
+      logger.warn(
+        { scheduleId: schedule.id, orgId: schedule.orgId, reason: queued.refused, next },
+        'schedule skipped: the org is at its monthly run limit',
+      );
+      continue;
+    }
     logger.info(
       { scheduleId: schedule.id, runId: queued?.id, shards: queued?.shards, next },
       'schedule fired',
@@ -455,7 +485,12 @@ export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> 
     await prisma.monitor.update({ where: { id: monitor.id }, data: { lastCheckedAt: now } });
 
     const queued = await queueRun({ ...monitor, trigger: 'MONITOR' });
-    if (queued) {
+    if (queued && 'refused' in queued) {
+      logger.warn(
+        { monitorId: monitor.id, orgId: monitor.orgId, reason: queued.refused },
+        'monitor check skipped: the org is at its monthly run limit',
+      );
+    } else if (queued) {
       logger.info(
         { monitorId: monitor.id, runId: queued.id, shards: queued.shards },
         'monitor check queued',

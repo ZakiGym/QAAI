@@ -17,6 +17,7 @@ import {
   AUTO_QUARANTINE_REASON_PREFIX,
   FLAKE_AUDIT_ACTIONS,
   FLAKE_POLICY_DEFAULTS,
+  PLAN_LIMITS,
   resolveFlakePolicy,
 } from '@qaai/shared';
 import type { FlakePolicy, TestResultStatus } from '@qaai/shared';
@@ -435,10 +436,20 @@ function fakePrisma(scenario: {
   /** Queued runs to filter for real, so the yield check is tested semantically. */
   queuedRunTriggers?: Array<string | null>;
   realBugAt?: Date | null;
+  /**
+   * The org's plan and its month-to-date run count, which a confirmation run
+   * now costs one of. A flake sweep creates real Runs, and until it went
+   * through the shared toll (apps/api/src/lib/start-run.ts) it created them
+   * without asking the plan or moving the counter.
+   */
+  plan?: string;
+  runsThisMonth?: number;
 }) {
   const audits = scenario.audits ?? [];
   const calls = {
     audits,
+    /** Every `runs` UsageRecord increment, so metering can be asserted. */
+    metered: [] as Array<{ orgId: string; metric: string }>,
     created: [] as Array<{ testId: string; triggeredBy: string }>,
     updated: [] as Array<{ testId: string; data: Record<string, unknown> }>,
     transactions: [] as number[],
@@ -529,6 +540,24 @@ function fakePrisma(scenario: {
         const row = { ...data, createdAt: new Date() };
         audits.push(row);
         return row;
+      },
+    },
+    /*
+     * Billing, as the run toll reads it: which plan the org is on, and how many
+     * runs it has already spent this month. Modelled rather than left off the
+     * stand-in, because a confirmation run is a run — it costs a browser and it
+     * belongs on the bill.
+     */
+    subscription: { findUnique: async () => null },
+    organization: { findUnique: async () => ({ plan: scenario.plan ?? 'ENTERPRISE' }) },
+    usageRecord: {
+      findUnique: async () => ({ quantity: BigInt(scenario.runsThisMonth ?? 0) }),
+      upsert: async ({ where }: { where: Record<string, any> }) => {
+        calls.metered.push({
+          orgId: where.orgId_metric_period.orgId,
+          metric: where.orgId_metric_period.metric,
+        });
+        return {};
       },
     },
     $transaction: async (ops: Promise<unknown>[]) => {
@@ -622,9 +651,43 @@ describe('the sweep', () => {
     expect(calls.created).toHaveLength(1);
     expect(calls.created[0]).toMatchObject({ testId: 'test-1' });
     expect(h.enqueued).toEqual([{ runId: 'run-1', background: true }]);
+    // And it is billed for. A confirmation run is a real browser against the
+    // customer's app; five of the seven paths that create Runs — this one
+    // included — used to make them without the counter ever moving, which is
+    // what made `usage.runsThisMonth` on the billing screen wrong.
+    expect(calls.metered).toEqual([{ orgId: 'org-1', metric: 'runs' }]);
     // Nothing decided while the measurement is still being taken.
     expect(calls.updated).toEqual([]);
     expect(calls.audits).toEqual([]);
+  });
+
+  it('ends an investigation it cannot finish rather than creating runs over the cap', async () => {
+    /*
+     * The org has spent its month. The sweep must not throw — one org's plan
+     * limit cannot be allowed to fail the tick for every other org sharing it —
+     * and it must not leave the investigation open either: waiting would end in
+     * an abandonment whose stated reason was the deadline rather than the truth.
+     */
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: [confirmationRun(0, 'PASSED', 'PASSED'), confirmationRun(1, 'FAILED', 'FAILED')],
+      tests: { 'test-1': testRow() },
+      plan: 'FREE',
+      runsThisMonth: PLAN_LIMITS.FREE.maxRunsPerMonth!,
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    expect(calls.created).toEqual([]);
+    expect(h.enqueued).toEqual([]);
+    // Refusing costs nothing: no row written, so nothing to count.
+    expect(calls.metered).toEqual([]);
+
+    const audit = calls.audits.at(-1)!;
+    expect(audit.action).toBe(FLAKE_AUDIT_ACTIONS.abandoned);
+    expect(String(audit.metadata.reason)).toContain('runs included with Free');
+    // Nothing was suppressed on the strength of a measurement never taken.
+    expect(calls.updated).toEqual([]);
   });
 
   it('yields the queue to real runs', async () => {

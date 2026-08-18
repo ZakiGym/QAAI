@@ -642,6 +642,18 @@ function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
    */
   const canManage = activeOrg?.role === 'OWNER' || activeOrg?.role === 'ADMIN';
 
+  /*
+   * OWNER is the one exception to "the rules stay server-side". It is not a
+   * guard whose answer the page would have to guess — it is a flat refusal that
+   * depends only on the viewer's own role, which is already on screen, and both
+   * POST /settings/invites and PATCH /settings/members/:userId now reject it the
+   * same way. Offering an ADMIN a choice that always comes back "Only an owner
+   * can make someone else an owner" reads as a broken product, and offering it
+   * at all was how the escalation looked legitimate.
+   */
+  const canGrantOwner = activeOrg?.role === 'OWNER';
+  const inviteRoleOptions = canGrantOwner ? ORG_ROLES : ORG_ROLES.filter((r) => r !== 'OWNER');
+
   const [members, setMembers] = useState<Member[] | null>(null);
   const [membersError, setMembersError] = useState<string | null>(null);
   const [busyMember, setBusyMember] = useState<string | null>(null);
@@ -905,7 +917,7 @@ function MembersTab({ me, activeOrg }: { me: Me; activeOrg: Org | null }) {
                 disabled={inviting}
                 className={FORM_SELECT}
               >
-                {ORG_ROLES.map((role) => (
+                {inviteRoleOptions.map((role) => (
                   <option key={role} value={role}>
                     {role.charAt(0) + role.slice(1).toLowerCase()}
                   </option>

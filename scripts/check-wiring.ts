@@ -1012,6 +1012,91 @@ function checkWorkspaceSweeps(): void {
  * is a claim that the demo store serves that route; if it stops doing so, boot
  * hangs for 90 seconds and blames the wrong service.
  */
+/**
+ * Does anything tell a customer to install the CLI by a name we do not own?
+ *
+ * The shipped GitHub Action ran `npx --yes qaai run …` in a step that had just
+ * exported the customer's QAAI_API_KEY into the environment. The unscoped name
+ * `qaai` on the public registry belongs to an unrelated project — a different
+ * author's OpenAPI-to-Jest generator, published at 1.0.0, which ships its own
+ * `qaai` binary. So the action fetched a stranger's package, `--yes` installed
+ * it without a prompt, and handed it the key. It then failed confusingly,
+ * because that package has never heard of `run --env`.
+ *
+ * The package is `@qaai/cli`. A scope cannot be squatted: only the owner of the
+ * `qaai` scope can publish under it. This check exists because the dangerous
+ * form and the correct form differ by eight characters, and the dangerous one
+ * is the one that reads naturally.
+ *
+ * It deliberately looks at MARKDOWN AND YAML, not TypeScript: nothing in this
+ * repo imports the CLI, and the damage is done by instructions people copy and
+ * by the action they add to their pipeline. Prose ABOUT the hazard is fine —
+ * only an actual install/exec invocation counts.
+ */
+function checkCliInstallName(): void {
+  const CLI_MANIFEST = join(ROOT, 'packages/cli/package.json');
+  if (!existsSync(CLI_MANIFEST)) return; // No CLI, nothing to get wrong.
+
+  const pkg = JSON.parse(read(CLI_MANIFEST)) as { name?: string; bin?: Record<string, string> };
+  const name = pkg.name ?? '';
+
+  if (!name.startsWith('@')) {
+    add({
+      check: 'cli-install-name',
+      severity: 'fail',
+      what: `packages/cli is published as "${name}"`,
+      detail:
+        `An unscoped package name is first-come on the public registry, and "${name}" is ` +
+        'already taken by another author. Anyone following our own docs installs their code.',
+      fix: 'Scope it — "@qaai/cli" — and keep the bin as `qaai`, which is what a person types.',
+    });
+    return;
+  }
+
+  /*
+   * An invocation, not a mention. `npx qaai`, `npm i -g qaai`, `npm install
+   * --global qaai` — each followed by a word boundary that is not `/`, so
+   * `@qaai/cli` and `qaai-something` do not match.
+   */
+  const INVOCATION =
+    /(?:npx(?:\s+--?\w+)*\s+|npm\s+(?:i|install|add)\s+(?:-g|--global)\s+)(?:"|')?qaai(?![\w/-])/g;
+
+  const docs = [...walk(join(ROOT, 'docs')), ...walk(join(ROOT, 'deploy')), ...walk(join(ROOT, '.github'))]
+    .concat(existsSync(join(ROOT, 'README.md')) ? [join(ROOT, 'README.md')] : [])
+    .filter((f) => /\.(md|ya?ml)$/.test(f));
+
+  const offenders: string[] = [];
+  for (const file of docs) {
+    const text = read(file);
+    for (const line of text.split('\n')) {
+      // Prose explaining the hazard names the bad form on purpose. A line that
+      // is a comment or narrative, not a command, is not an invocation.
+      const isProse = /^\s*(#|>|\*|-\s|\/\/)/.test(line) || /\b(unscoped|belongs to|used to run|different project|somebody else)\b/i.test(line);
+      if (isProse) continue;
+      INVOCATION.lastIndex = 0;
+      if (INVOCATION.test(line)) offenders.push(`${rel(file)}: ${line.trim().slice(0, 100)}`);
+    }
+  }
+
+  if (offenders.length > 0) {
+    add({
+      check: 'cli-install-name',
+      severity: 'fail',
+      what: `${offenders.length} instruction(s) install the CLI by the unscoped name`,
+      detail:
+        `The package is "${name}", but these fetch the unscoped "qaai", which is a different ` +
+        `author's project on npm:\n      ${offenders.join('\n      ')}`,
+      fix: `Use "${name}" — and pin the version wherever an API key is in scope.`,
+    });
+  }
+
+  okIfClean(
+    'cli-install-name',
+    'the CLI is installed by a name we own',
+    `${name}, bin \`${Object.keys(pkg.bin ?? {}).join(', ') || 'none'}\` — no unscoped invocations in docs, deploy or .github.`,
+  );
+}
+
 function checkDesktopServices(): void {
   const file = SOURCES.find((s) => rel(s.path) === 'apps/desktop/src/main.cjs');
   if (!file) return; // The app is optional; its absence is not a defect.
@@ -1674,6 +1759,7 @@ async function main(): Promise<void> {
   checkNpmScripts();
   checkWorkspaceSweeps();
   checkDesktopServices();
+  checkCliInstallName();
   await checkTestTypes();
   checkEnvVars();
   checkPrismaModels();

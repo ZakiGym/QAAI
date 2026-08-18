@@ -32,7 +32,7 @@ import {
 import { processAnalyzeSource } from './processors/analyze-source.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
-import { processRun, sweepStalledShardedRuns } from './processors/run.js';
+import { failRunFromDeadJob, processRun, sweepStalledShardedRuns } from './processors/run.js';
 import { processTriage } from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
@@ -112,6 +112,47 @@ function register<T>(
         },
         'job failed permanently',
       );
+      /*
+       * A dead run job leaves a run behind, and somebody has to say so.
+       *
+       * This is the only place that hears about a job which failed before the
+       * processor could finalise anything — a throw in its pre-loop setup, a
+       * job BullMQ could not even deserialise. Without this the run stayed at
+       * QUEUED or RUNNING forever: the cockpit's elapsed clock never stopped,
+       * the gate never resolved, and no `run.finished` notification was
+       * enqueued, so the Slack message and the PR comment never arrived. One
+       * rotated vault key did that to every run in an org.
+       *
+       * Only the run queue, and only when BullMQ handed the job back — without
+       * `job.data` there is no run id to write to. The write itself is
+       * conditional inside `failRunFromDeadJob`, so it can never overwrite a
+       * run that already reported. Fire-and-forget with its own catch: this is
+       * an event handler, and a rescue that throws must not take the worker's
+       * error reporting down with it.
+       */
+      if (job && name === QUEUE_NAMES.run) {
+        // `?? {}` because the destructure is the first thing to touch a payload
+        // BullMQ handed back, inside a listener where a throw would take the
+        // worker's own error reporting down with it. The guard in
+        // `failRunFromDeadJob` handles the missing FIELDS; this handles the
+        // missing OBJECT, which would throw one frame earlier than that guard.
+        const { orgId, runId } = (job.data ?? {}) as unknown as RunJob;
+        void failRunFromDeadJob({ orgId, runId, errorMessage: err.message })
+          .then((rescued) => {
+            if (rescued) {
+              logger.error(
+                { queue: name, jobId: job.id, runId },
+                'marked the run ERRORED because its job died before it could finalise',
+              );
+            }
+          })
+          .catch((rescueErr) =>
+            logger.error(
+              { err: rescueErr, queue: name, jobId: job.id, runId },
+              'could not mark the run terminal after its job died',
+            ),
+          );
+      }
       return;
     }
     logger.error(

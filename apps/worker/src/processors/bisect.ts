@@ -57,6 +57,10 @@ import {
   type HistoryAnalysis,
   type ProbePlan,
 } from '../../../api/src/lib/bisect.js';
+// One toll for every path that creates a Run: the plan gate and the usage
+// counter. It lives in the API workspace and takes its Prisma client as an
+// argument so this file can call the same implementation POST /runs does.
+import { startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
 import { enqueueBisect, enqueueRun } from '../queues.js';
 
@@ -192,17 +196,22 @@ export async function processBisect(job: BisectJob): Promise<void> {
   }
 
   const target = candidates[step.index]!;
-  const queued = await queueProbe(job, target, plan);
-  if (queued === 0) {
+  const probe = await queueProbe(job, target, plan);
+  if (probe.queued === 0) {
     await conclude(
       job,
       report(job, analysis, {
         source,
         status: 'INCONCLUSIVE',
-        summary:
-          `The probe at ${shortSha(target.commitSha)} could not be queued, so the search stopped ` +
-          `where it was. ` +
-          rangeSentence(analysis),
+        summary: probe.refused
+          ? // Named rather than folded into "could not be queued": one of these
+            // is an outage and the other is a bill, and telling them apart is
+            // the difference between filing a ticket and clicking Upgrade.
+            `${probe.refused} The search stopped at ${shortSha(target.commitSha)} without probing it. ` +
+            rangeSentence(analysis)
+          : `The probe at ${shortSha(target.commitSha)} could not be queued, so the search stopped ` +
+            `where it was. ` +
+            rangeSentence(analysis),
         probeRunIds: probes.runIds,
         plan,
       }),
@@ -215,7 +224,7 @@ export async function processBisect(job: BisectJob): Promise<void> {
       bisectId,
       testId,
       commit: target.commitSha,
-      runs: queued,
+      runs: probe.queued,
       probe: probes.probedCommits.size + 1,
       budget: plan.budget,
     },
@@ -345,16 +354,32 @@ function canProbe(node: CommitNode, probedCommits: ReadonlySet<string>): boolean
  * the caller, because the failure mode is a run labelled with a commit sha it
  * never actually tested.
  *
- * @returns how many runs were queued. 0 means the probe did not happen.
+ * A probe is `plan.repeats` real runs, and a bisect can be dozens of probes, so
+ * this was the single largest way an org could spend browsers it had not paid
+ * for — it created Runs directly and neither asked the plan nor counted them.
+ * It asks now, in `advisory` mode: a bisect tick that threw would take the whole
+ * investigation down into the queue's failed set with nothing written, whereas a
+ * refusal is something the report can say out loud.
+ *
+ * @returns how many runs were queued, and — if the plan cut the probe short —
+ * why, so the caller can put the reason in the conclusion rather than reporting
+ * a mysterious "could not be queued". 0 queued means the probe did not happen.
  */
-async function queueProbe(job: BisectJob, node: CommitNode, plan: ProbePlan): Promise<number> {
-  if (!node.pinnedBaseUrl || !node.environmentId) return 0;
+async function queueProbe(
+  job: BisectJob,
+  node: CommitNode,
+  plan: ProbePlan,
+): Promise<{ queued: number; refused?: string }> {
+  if (!node.pinnedBaseUrl || !node.environmentId) return { queued: 0 };
 
   const { orgId, projectId, testId, bisectId } = job;
   let queued = 0;
 
   for (let i = 0; i < plan.repeats; i++) {
-    const run = await prisma.run.create({
+    const started = await startRun({
+      db: prisma,
+      orgId,
+      mode: 'advisory',
       data: {
         orgId,
         projectId,
@@ -368,8 +393,20 @@ async function queueProbe(job: BisectJob, node: CommitNode, plan: ProbePlan): Pr
         // execute, and it is what keeps the counts honest if the run dies first.
         results: { create: [{ orgId, testId, status: 'SKIPPED' as const }] },
       },
-      select: { id: true },
     });
+
+    if (!started.created) {
+      // Stop here rather than hammering the same refusal `repeats` times. What
+      // was queued already stands: a short probe is a probe with fewer samples,
+      // which the next tick's analysis handles the same way it handles a run
+      // that errored.
+      logger.warn(
+        { bisectId, orgId, commit: node.commitSha, queued, of: plan.repeats },
+        'bisect probe cut short: the org is at its monthly run limit',
+      );
+      return { queued, refused: started.quota.reason ?? 'This org is at its monthly run limit.' };
+    }
+    const run = started.run;
 
     try {
       await enqueueRun({ orgId, runId: run.id }, { background: true });
@@ -391,7 +428,7 @@ async function queueProbe(job: BisectJob, node: CommitNode, plan: ProbePlan): Pr
     }
   }
 
-  return queued;
+  return { queued };
 }
 
 async function cancelInFlight(job: BisectJob, runIds: readonly string[]): Promise<void> {

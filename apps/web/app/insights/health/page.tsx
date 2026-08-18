@@ -22,7 +22,7 @@ import { EmptyState } from '../../../components/ui/EmptyState';
  * belong in the same viewport, and three tab bodies could not all be there.
  */
 export default function HealthPage() {
-  const { projectId, loading: projectLoading } = useProject();
+  const { projectId, projects, loading: projectLoading } = useProject();
   const { report, loading, error } = useSuiteHealth(projectId, projectLoading);
 
   if (loading) return <SuiteHealthSkeleton />;
@@ -38,11 +38,24 @@ export default function HealthPage() {
     );
   }
 
+  /*
+   * Two different reasons there is no report, and telling them apart is the
+   * whole of this branch. An org with no apps at all was being told to "pick one
+   * in the sidebar" — an instruction it is not possible to follow, because the
+   * switcher it names is empty. /repro already makes this distinction; this is
+   * the same branch.
+   */
   if (!projectId || !report) {
+    const noApps = projects.length === 0;
     return (
       <EmptyState
-        title="No project selected"
-        body="Suite health is computed per app. Pick one in the sidebar and this fills in."
+        title={noApps ? 'No app to score yet' : 'No project selected'}
+        body={
+          noApps
+            ? 'Suite health scores the tests QAAI has for an app — how much they assert, how much they duplicate, how much of the critical path they touch. Connect an app and this fills in.'
+            : 'Suite health is computed per app. Pick one in the sidebar and this fills in.'
+        }
+        {...(noApps ? { action: { label: 'Add your app', href: '/onboarding' } } : {})}
       />
     );
   }

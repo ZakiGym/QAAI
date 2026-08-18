@@ -18,9 +18,10 @@
 import { Router } from 'express';
 import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 import type { ShardAssignment, ShardPlan, ShardedRunJob } from '@qaai/shared';
-import { prisma } from '../lib/prisma.js';
+import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, notFound, planLimit } from '../lib/errors.js';
 import { canStartRun, planFor } from '../lib/plan.js';
+import { startRun } from '../lib/start-run.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
 import { subscribe } from '../lib/events.js';
@@ -49,12 +50,6 @@ import type {
 export const runsRouter: Router = Router();
 
 runsRouter.use(requireAuth);
-
-/** First day of the current UTC month — the usage-metering period key (§9). */
-function currentPeriod(): Date {
-  const now = new Date();
-  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-}
 
 // ─── Build sharding (§5) ─────────────────────────────────────────────────────
 
@@ -453,6 +448,11 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
    * whose card has failed keeps its label — so the UI can say "your Team plan
    * is past due" — but is metered at free limits until it clears. Reading the
    * raw field would hand a cancelled org unlimited runs indefinitely.
+   *
+   * This early read is a courtesy, not the gate: it refuses before the impact
+   * analysis and the cache evaluation below spend queries on a run that cannot
+   * happen. `startRun` asks again at the moment the row is written, and that
+   * answer is the one that decides.
    */
   const verdict = await canStartRun(actor.orgId);
   if (!verdict.allowed) {
@@ -591,7 +591,17 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
     for (const testId of assignment.testIds) shardOfTest.set(testId, assignment.index);
   }
 
-  const run = await prisma.run.create({
+  /*
+   * Gate, create, count — all three in lib/start-run.ts, which is the only
+   * place any of the seven run-creating paths is allowed to bring a Run into
+   * existence. `enforce` is the HTTP mode: over cap throws 402 PLAN_LIMIT here,
+   * the way this endpoint always has.
+   */
+  const { run } = await startRun({
+    db: prisma,
+    orgId: actor.orgId,
+    mode: 'enforce',
+    unscope: unscoped,
     data: {
       orgId: actor.orgId,
       projectId: environment.projectId,
@@ -631,12 +641,6 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
           }
         : {}),
     },
-  });
-
-  await prisma.usageRecord.upsert({
-    where: { orgId_metric_period: { orgId: actor.orgId, metric: 'runs', period: currentPeriod() } },
-    create: { orgId: actor.orgId, metric: 'runs', period: currentPeriod(), quantity: 1n },
-    update: { quantity: { increment: 1n } },
   });
 
   /*

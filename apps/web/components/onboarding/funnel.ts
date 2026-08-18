@@ -495,3 +495,210 @@ export function nameFromPaths(paths: readonly string[]): string | null {
   }
   return null;
 }
+
+// ─── Finishing: the round trips each path actually needs ─────────────────────
+
+/**
+ * The API client, injected rather than imported.
+ *
+ * `provision` below is the only part of the funnel that talks to the server,
+ * and it is also the part whose bugs are invisible to a screen test — a request
+ * that is never sent renders exactly like one that was. Taking the client as an
+ * argument is what lets a unit test assert on the calls themselves.
+ */
+export type ApiClient = <T>(path: string, init?: RequestInit) => Promise<T>;
+
+/** A test the funnel wrote, as the API hands it back. */
+export interface ProvisionedTest {
+  id: string;
+  name: string;
+  filePath: string;
+  type: TestType;
+}
+
+export interface ProvisionInput {
+  path: FunnelPath;
+  name: string;
+  language: Language;
+  framework: UiFramework;
+  /** Blank on every path but `url`, where the step will not let it be. */
+  baseUrl: string;
+  envKind: string;
+  types: readonly TestType[];
+  /** The repo read in this tab, on the `codebase` path only. */
+  files: readonly RepoFile[] | null;
+}
+
+export interface ProvisionHooks<P> {
+  api: ApiClient;
+  /** Names the round trip in flight, so the button says what it is doing. */
+  onBusy: (label: string) => void;
+  /**
+   * Raised the moment the project row exists — before the rest of the path
+   * runs, and therefore before it can fail. The stepper stops offering a jump
+   * back once this fires, because the earlier steps describe decisions that
+   * have already been acted on.
+   */
+  onProject: (project: P) => void;
+}
+
+export interface ProvisionResult<P> {
+  project: P;
+  /** Null when no URL was given, which is every path but `url`. */
+  environmentId: string | null;
+  createdTests: ProvisionedTest[];
+  /** Worth saying, but not a failure — currently only the upload trim. */
+  notice: string | null;
+  /** Where the funnel goes when this returns. */
+  next: 'result' | 'import';
+}
+
+/**
+ * Do what the chosen path promised, in order, each round trip named.
+ *
+ * The old screen ran up to three requests behind a single unlabelled press: no
+ * busy state, nothing to stop a second click, and a failure halfway through
+ * left a project with no environment and no way to tell. Every step below names
+ * itself through `onBusy`, and the caller disables the button while it is set.
+ *
+ * Anything that throws here is the FUNNEL's failure and is reported on the
+ * funnel's own step. That distinction is the whole reason the crawl is started
+ * from this function: see the `url` branch.
+ */
+export async function provision<P extends { id: string }>(
+  { api, onBusy, onProject }: ProvisionHooks<P>,
+  input: ProvisionInput,
+): Promise<ProvisionResult<P>> {
+  onBusy('Creating the app…');
+  const { project } = await api<{ project: P }>('/projects', {
+    method: 'POST',
+    body: JSON.stringify({
+      name: input.name.trim(),
+      primaryLanguage: input.language,
+      primaryFramework: input.framework,
+    }),
+  });
+  onProject(project);
+
+  // An environment is what a run needs; the URL is optional on every path
+  // except the crawl, so this is conditional rather than assumed.
+  let environmentId: string | null = null;
+  const baseUrl = input.baseUrl.trim();
+  if (baseUrl) {
+    onBusy('Adding the environment…');
+    const { environment } = await api<{ environment: { id: string } }>(
+      `/projects/${project.id}/environments`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: input.envKind.toLowerCase(),
+          kind: input.envKind,
+          baseUrl,
+        }),
+      },
+    );
+    environmentId = environment.id;
+  }
+
+  let notice: string | null = null;
+  let createdTests: ProvisionedTest[] = [];
+
+  if (input.path === 'url') {
+    /*
+     * Ask for the crawl. This is the half that went missing.
+     *
+     * The environment was still being created and its id thrown away, and the
+     * result step mounted CrawlPanel — which only ever WATCHES: an EventSource,
+     * a plan poll, and an opening log line ("Crawling …") that the client
+     * writes itself. So the screen was indistinguishable from a working crawl
+     * for five minutes and then told the person "the crawl did not finish — is
+     * the worker running?", blaming infrastructure that was idle because
+     * nothing had ever been enqueued. The user lost the entire point of the
+     * path they picked. Producer and consumer only work as a pair; do not
+     * remove one and leave the other rendering.
+     */
+    if (!environmentId) {
+      // Unreachable through the UI — the stack step will not release the `url`
+      // path without a URL — but a crawl with nothing to crawl must say so
+      // here rather than reach the result step and be waited on.
+      throw new Error('No environment was created, so there is nothing for the Explorer to crawl.');
+    }
+    onBusy('Starting the crawl…');
+    await api(`/projects/${project.id}/explore`, {
+      method: 'POST',
+      body: JSON.stringify({ environmentId, maxPages: 25, maxDepth: 3 }),
+    });
+  }
+
+  if (input.path === 'codebase' && input.files) {
+    /*
+     * The repo goes up as paths plus the contents of the files detection
+     * actually reads — readRepo already made that split in the browser, so a
+     * monorepo does not become a 200MB POST.
+     *
+     * Trimmed to what the API accepts before it is sent. The read is generous
+     * because it happens in this tab; the upload is not, because `express.json`
+     * rejects a 2MB body outright and the person would meet that as an
+     * unexplained failure at the last step of the funnel.
+     */
+    onBusy('Reading your codebase…');
+    const payload = uploadPayload(input.files);
+    await api(`/projects/${project.id}/source`, {
+      method: 'POST',
+      body: JSON.stringify({ files: payload.files }),
+    });
+    if (payload.droppedFiles > 0) {
+      notice =
+        `Sent ${payload.files.length.toLocaleString()} of ${input.files.length.toLocaleString()} ` +
+        'files — the rest were over the upload limit.';
+    }
+
+    onBusy('Proposing scenarios…');
+    await api(`/projects/${project.id}/analyze-source`, {
+      method: 'POST',
+      body: JSON.stringify({ autoApprove: false }),
+    });
+  }
+
+  if (input.path === 'scratch') {
+    /*
+     * A starter file per chosen type, from the same templates the editor's
+     * new-test dialog uses — so "start from scratch" opens on something that
+     * runs, not an empty tree. The templates are validated against their runner
+     * plugins by a test in packages/shared.
+     */
+    onBusy('Writing the starter tests…');
+    const made: ProvisionedTest[] = [];
+    for (const type of input.types) {
+      const template = NEW_TEST_TEMPLATES[type];
+      if (!template) continue;
+      const slug = `starter-${type.toLowerCase().replace(/_/g, '-')}`;
+      const { test } = await api<{ test: ProvisionedTest }>(`/projects/${project.id}/tests`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `Starter ${type.toLowerCase().replace(/_/g, ' ')} test`,
+          type,
+          feature: 'Hand-written',
+          priority: 'NICE_TO_HAVE',
+          filePath: `hand-written/${slug}${template.fileSuffix}`,
+          code: template.code,
+          // Spec-driven types carry a spec their plugin validates; the editor's
+          // create dialog sends it the same conditional way.
+          ...(template.spec !== undefined ? { spec: template.spec } : {}),
+        }),
+      });
+      made.push(test);
+    }
+    createdTests = made;
+  }
+
+  return {
+    project,
+    environmentId,
+    createdTests,
+    notice,
+    // The import screen owns its own upload and conversion; this funnel's job
+    // was the project and the stack it converts into.
+    next: input.path === 'import' ? 'import' : 'result',
+  };
+}

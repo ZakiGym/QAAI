@@ -1,9 +1,9 @@
 'use client';
 
-import { Suspense, useCallback, useMemo, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import type { Language, TestType, UiFramework } from '@qaai/shared';
-import { NEW_TEST_TEMPLATES } from '@qaai/shared';
 import { api, ApiError, type Project } from '../../lib/api';
 import { SetupHeader } from '../../components/setup/SetupHeader';
 import { Button } from '../../components/ui/Button';
@@ -17,9 +17,9 @@ import { TestTypesStep } from '../../components/onboarding/TestTypesStep';
 import {
   DEFAULT_TEST_TYPES,
   nameFromPaths,
+  provision,
   reconcileFramework,
   suggestStack,
-  uploadPayload,
   type FunnelPath,
 } from '../../components/onboarding/funnel';
 
@@ -49,6 +49,12 @@ type StepName = keyof typeof STEP_INDEX;
 /** The order steps unlock in, so the stepper can offer a jump back. */
 const ORDER: StepName[] = ['source', 'stack', 'types', 'result'];
 
+/** Only the parts of GET /billing this screen needs: the app cap, and its name. */
+interface PlanCap {
+  limits: { label: string; maxProjects: number };
+  usage: { projects: number };
+}
+
 function OnboardingInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -77,6 +83,14 @@ function OnboardingInner() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   /**
+   * The one thing to do about the error, when there is one.
+   *
+   * Only the plan cap sets this so far, and it is the reason it exists: "You
+   * have used all 1 project included with Free" is not actionable text, it is a
+   * dead end at the end of a four-step form.
+   */
+  const [errorAction, setErrorAction] = useState<{ label: string; href: string } | null>(null);
+  /**
    * Something worth saying that is not a failure — currently only the upload
    * trim. Kept apart from `error` because a repo that was too big to send whole
    * still produced a working project, and colouring that red would read as
@@ -85,6 +99,34 @@ function OnboardingInner() {
   const [notice, setNotice] = useState<string | null>(null);
   const [project, setProject] = useState<Project | null>(null);
   const [createdTests, setCreatedTests] = useState<CreatedTest[]>([]);
+
+  /**
+   * The project cap, asked BEFORE the form rather than discovered by the 402 at
+   * the end of it.
+   *
+   * A Free org is allowed one app. Every step of this funnel worked for someone
+   * who already had one — the picker, the folder read, the stack, the types —
+   * and the refusal arrived after all of it, on the press that was meant to
+   * finish. Reading /billing on arrival costs one request and turns that into a
+   * sentence on step 1. Failures are swallowed on purpose: an unreachable
+   * billing endpoint must not stop somebody adding their first app, and the
+   * 402 handler below is still there as the backstop.
+   */
+  const [cap, setCap] = useState<PlanCap | null>(null);
+  useEffect(() => {
+    let live = true;
+    api<PlanCap>('/billing')
+      .then((billing) => {
+        if (live) setCap(billing);
+      })
+      .catch(() => {
+        /* the notice simply does not appear; creating still reports the cap */
+      });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const atProjectCap = cap !== null && cap.usage.projects >= cap.limits.maxProjects;
 
   const suggestion = useMemo(
     () => (codebase ? suggestStack(codebase.detection) : null),
@@ -140,115 +182,40 @@ function OnboardingInner() {
     name.trim().length > 0 && (path !== 'url' || baseUrl.trim().length > 0);
 
   /**
-   * Everything the chosen path needs, in order, each round trip named.
+   * Everything the chosen path needs, in order — see `provision`.
    *
-   * The old screen ran up to three requests behind a single unlabelled press:
-   * no busy state, nothing to stop a second click, and a failure halfway
-   * through left a project with no environment and no way to tell. Each step
-   * below sets `busy` to what it is doing, and the button is disabled while it
-   * is set.
+   * The requests themselves live in funnel.ts because a request that is never
+   * SENT renders identically to one that was, and this component cannot be
+   * unit-tested. That is not a hypothetical: the crawl this funnel's `url` path
+   * exists to start went missing for a release, and the screen looked right the
+   * whole time.
    */
   async function finish() {
-    if (busy) return;
+    if (busy || !path) return;
     setError(null);
+    setErrorAction(null);
     setNotice(null);
 
     try {
-      setBusy('Creating the app…');
-      const { project: created } = await api<{ project: Project }>('/projects', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: name.trim(),
-          primaryLanguage: language,
-          primaryFramework: framework,
-        }),
-      });
-      setProject(created);
+      const result = await provision<Project>(
+        { api, onBusy: setBusy, onProject: setProject },
+        {
+          path,
+          name,
+          language,
+          framework,
+          baseUrl,
+          envKind,
+          types: [...types],
+          files: codebase?.files ?? null,
+        },
+      );
 
-      // An environment is what a run needs; the URL is optional on every path
-      // except the crawl, so this is conditional rather than assumed.
-      if (baseUrl.trim()) {
-        setBusy('Adding the environment…');
-        await api(`/projects/${created.id}/environments`, {
-          method: 'POST',
-          body: JSON.stringify({
-            name: envKind.toLowerCase(),
-            kind: envKind,
-            baseUrl: baseUrl.trim(),
-          }),
-        });
-      }
+      setNotice(result.notice);
+      setCreatedTests(result.createdTests);
 
-      if (path === 'codebase' && codebase) {
-        /*
-         * The repo goes up as paths plus the contents of the files detection
-         * actually reads — readRepo already made that split in the browser, so
-         * a monorepo does not become a 200MB POST.
-         */
-        setBusy('Reading your codebase…');
-        /*
-         * Trimmed to what the API accepts before it is sent. The read is
-         * generous because it happens in this tab; the upload is not, because
-         * `express.json` rejects a 2MB body outright and the person would meet
-         * that as an unexplained failure at the last step of the funnel.
-         */
-        const payload = uploadPayload(codebase.files);
-        await api(`/projects/${created.id}/source`, {
-          method: 'POST',
-          body: JSON.stringify({ files: payload.files }),
-        });
-        if (payload.droppedFiles > 0) {
-          setNotice(
-            `Sent ${payload.files.length.toLocaleString()} of ${codebase.files.length.toLocaleString()} files — the rest were over the upload limit.`,
-          );
-        }
-
-        setBusy('Proposing scenarios…');
-        await api(`/projects/${created.id}/analyze-source`, {
-          method: 'POST',
-          body: JSON.stringify({ autoApprove: false }),
-        });
-      }
-
-      if (path === 'scratch') {
-        /*
-         * A starter file per chosen type, from the same templates the editor's
-         * new-test dialog uses — so "start from scratch" opens on something
-         * that runs, not an empty tree. The templates are validated against
-         * their runner plugins by a test in packages/shared.
-         */
-        setBusy('Writing the starter tests…');
-        const made: CreatedTest[] = [];
-        for (const type of types) {
-          const template = NEW_TEST_TEMPLATES[type];
-          if (!template) continue;
-          const slug = `starter-${type.toLowerCase().replace(/_/g, '-')}`;
-          const { test } = await api<{ test: CreatedTest }>(
-            `/projects/${created.id}/tests`,
-            {
-              method: 'POST',
-              body: JSON.stringify({
-                name: `Starter ${type.toLowerCase().replace(/_/g, ' ')} test`,
-                type,
-                feature: 'Hand-written',
-                priority: 'NICE_TO_HAVE',
-                filePath: `hand-written/${slug}${template.fileSuffix}`,
-                code: template.code,
-                // Spec-driven types carry a spec their plugin validates; the
-                // editor's create dialog sends it the same conditional way.
-                ...(template.spec !== undefined ? { spec: template.spec } : {}),
-              }),
-            },
-          );
-          made.push(test);
-        }
-        setCreatedTests(made);
-      }
-
-      if (path === 'import') {
-        // The import screen owns its own upload and conversion; this funnel's
-        // job was the project and the stack it converts into.
-        router.push(`/import?project=${created.id}`);
+      if (result.next === 'import') {
+        router.push(`/import?project=${result.project.id}`);
         return;
       }
 
@@ -256,6 +223,18 @@ function OnboardingInner() {
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         router.push('/login');
+        return;
+      }
+      /*
+       * The plan cap, met at the last step. The API's sentence is the honest
+       * one — it names the plan and the number — but on its own it leaves the
+       * person on a form they can no longer submit, so it gets the one link
+       * that changes the answer. The notice on step 1 usually gets there first;
+       * this is what catches an org that filled a slot in another tab.
+       */
+      if (err instanceof ApiError && err.status === 402) {
+        setError(err.message);
+        setErrorAction({ label: 'See plans', href: '/settings/billing' });
         return;
       }
       setError(err instanceof Error ? err.message : 'Could not finish setting up');
@@ -289,16 +268,48 @@ function OnboardingInner() {
       )}
 
       {error && (
-        <p
+        <div
           role="alert"
           className="border-fail/40 bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] text-fail text-body-sm mt-5 rounded-md border px-3 py-2"
         >
-          {error}
-        </p>
+          <p>{error}</p>
+          {errorAction && (
+            <Link
+              href={errorAction.href}
+              className="mt-1.5 inline-block font-semibold underline underline-offset-2"
+            >
+              {errorAction.label} →
+            </Link>
+          )}
+        </div>
       )}
 
       {step === 'source' && (
         <div className="mt-6">
+          {/*
+            Said here, on the first step, rather than by a 402 on the last one.
+            Not a blocker — the plan can be changed in another tab and the
+            funnel picked up where it was left — so this is a notice with a
+            link, not a disabled Continue.
+          */}
+          {atProjectCap && cap && (
+            <div className="border-flake/40 text-body-sm mb-5 rounded-md border bg-[color-mix(in_srgb,var(--color-flake)_8%,transparent)] px-3 py-2">
+              <p className="text-ink-dim">
+                Your {cap.limits.label} plan includes{' '}
+                <span className="tabular-nums">{cap.limits.maxProjects}</span> app
+                {cap.limits.maxProjects === 1 ? '' : 's'}, and you already have{' '}
+                <span className="tabular-nums">{cap.usage.projects}</span>. Setting this one up will
+                be refused at the last step unless you upgrade first.
+              </p>
+              <Link
+                href="/settings/billing"
+                className="text-accent mt-1.5 inline-block font-semibold underline underline-offset-2"
+              >
+                See plans →
+              </Link>
+            </div>
+          )}
+
           <PathPicker value={path} onChange={setPath}>
             {(choice) =>
               choice === 'codebase' ? (

@@ -74,6 +74,8 @@ interface PendingInvite {
   email: string;
   role: OrgRole;
   orgId: string;
+  /** Who sent it. Read at acceptance to decide whether an OWNER seat is theirs to give. */
+  invitedBy: string;
   org: { id: string; name: string; slug: string; plan: string };
 }
 
@@ -93,6 +95,7 @@ async function findInvite(token: string): Promise<InviteLookup> {
         email: true,
         role: true,
         orgId: true,
+        invitedBy: true,
         expiresAt: true,
         acceptedAt: true,
         org: { select: { id: true, name: true, slug: true, plan: true } },
@@ -107,6 +110,38 @@ async function findInvite(token: string): Promise<InviteLookup> {
     return { ok: false, error: 'That invitation has expired. Ask for a new one.' };
   }
   return { ok: true, invite };
+}
+
+/**
+ * The role an invite can actually grant.
+ *
+ * The stored role is not taken on trust. `POST /settings/invites` refuses an
+ * ADMIN who asks for an OWNER invite, but rows written before that check landed
+ * are still in the table and THIS is the site that hands out the membership, so
+ * an OWNER seat is granted only when the person who sent the invite held OWNER
+ * themselves.
+ *
+ * What disagreed, and what it cost: the invite row said OWNER while nobody with
+ * the authority to grant OWNER had chosen it. An ADMIN who could not promote
+ * themselves through `PATCH /settings/members/:userId` invited an address they
+ * controlled at OWNER, accepted it, and came back holding the role that charges
+ * the org's card, exports every row it owns, sweeps artifacts irreversibly, and
+ * demotes the real owners. Do not drop this because the invite route now checks
+ * too — one check at the write site is one bug away from the same escalation.
+ *
+ * Clamped to ADMIN rather than refused: the recipient did nothing wrong, and a
+ * link that dead-ends is a support ticket for a role they were never owed.
+ */
+async function grantableRole(invite: PendingInvite): Promise<OrgRole> {
+  if (invite.role !== 'OWNER') return invite.role;
+
+  const inviter = await unscoped(() =>
+    prisma.membership.findFirst({
+      where: { orgId: invite.orgId, userId: invite.invitedBy },
+      select: { role: true },
+    }),
+  );
+  return inviter?.role === 'OWNER' ? 'OWNER' : 'ADMIN';
 }
 
 /**
@@ -130,7 +165,10 @@ authRouter.get('/invite', async (req, res) => {
   res.json({
     valid: true,
     email: found.invite.email,
-    role: found.invite.role,
+    // The role signup will actually grant, not the one the row asks for. The
+    // screen saying "join as owner" and the membership coming out ADMIN is the
+    // same disagreement one step earlier.
+    role: await grantableRole(found.invite),
     org: { name: found.invite.org.name },
   });
 });
@@ -173,6 +211,10 @@ authRouter.post('/signup', async (req, res) => {
       throw badRequest(`That invitation was sent to ${invite.email}. Sign up with that address.`);
     }
 
+    // Not `invite.role`: see grantableRole. This is the last gate before a
+    // membership row exists, and the only one an old invite row cannot bypass.
+    const granted = await grantableRole(invite);
+
     const result = await unscoped(() =>
       prisma.$transaction(async (tx) => {
         const created = await tx.user.create({
@@ -181,7 +223,7 @@ authRouter.post('/signup', async (req, res) => {
         });
 
         await tx.membership.create({
-          data: { orgId: invite.orgId, userId: created.id, role: invite.role },
+          data: { orgId: invite.orgId, userId: created.id, role: granted },
         });
 
         /*
@@ -202,7 +244,7 @@ authRouter.post('/signup', async (req, res) => {
 
     user = result;
     org = invite.org;
-    role = invite.role;
+    role = granted;
     joinedExisting = true;
   } else {
     // The union in signupSchema guarantees this, but the compiler does not know

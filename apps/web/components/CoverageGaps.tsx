@@ -11,6 +11,7 @@ import type {
   GapKind,
 } from '../lib/api';
 import { cn } from '../lib/cn';
+import { useProject } from './shell/ProjectContext';
 import { Button } from './ui/Button';
 import { EmptyState } from './ui/EmptyState';
 import { Modal } from './ui/Modal';
@@ -339,7 +340,9 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
             <ol className="space-y-1">
               {s.routes.map((r, i) => (
                 <li key={i} className="flex items-center gap-2">
-                  <span className="text-ink-faint text-meta w-4 shrink-0 tabular-nums">{i + 1}</span>
+                  <span className="text-ink-faint text-meta w-4 shrink-0 tabular-nums">
+                    {i + 1}
+                  </span>
                   <code className="text-body-sm font-mono">{r}</code>
                   {s.steps[i] && <span className="text-ink-faint text-meta">via {s.steps[i]}</span>}
                 </li>
@@ -388,7 +391,10 @@ function SubjectDetail({ gap }: { gap: CoverageGap }) {
           <KeyValue label="Routes it covers">
             <div className="flex flex-wrap gap-1.5">
               {s.routes.map((r) => (
-                <code key={r} className="bg-surface-2 text-body-sm rounded-sm px-1.5 py-0.5 font-mono">
+                <code
+                  key={r}
+                  className="bg-surface-2 text-body-sm rounded-sm px-1.5 py-0.5 font-mono"
+                >
                   {r}
                 </code>
               ))}
@@ -673,6 +679,13 @@ export function CoverageGaps({
 }) {
   const { report, testNames, loading, error, reload } = data;
   const toast = useToast();
+  /*
+   * Read here rather than taken as a prop: the empty state below has to tell an
+   * org with NO apps apart from one that simply has none selected, and the page
+   * that renders this component passes only the selected id — which is null for
+   * both of them.
+   */
+  const { projects } = useProject();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [kinds, setKinds] = useState<Set<GapKind>>(new Set());
   const [proposing, setProposing] = useState(false);
@@ -776,11 +789,22 @@ export function CoverageGaps({
     );
   }
 
+  /*
+   * "Pick one in the sidebar" is not an instruction an org with no apps can
+   * follow — the switcher it points at is empty, which made this the third
+   * screen to answer a new account with a dead end.
+   */
   if (!projectId || !report) {
+    const noApps = projects.length === 0;
     return (
       <EmptyState
-        title="No project selected"
-        body="Coverage is computed per app. Pick one in the sidebar and this fills in."
+        title={noApps ? 'No app to measure yet' : 'No project selected'}
+        body={
+          noApps
+            ? 'Coverage is what the crawler proved your app can do, put beside what the tests assert. Connect an app so there is something to crawl, and this fills in.'
+            : 'Coverage is computed per app. Pick one in the sidebar and this fills in.'
+        }
+        {...(noApps ? { action: { label: 'Add your app', href: '/onboarding' } } : {})}
       />
     );
   }

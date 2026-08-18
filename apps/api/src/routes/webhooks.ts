@@ -21,6 +21,7 @@ import { Router } from 'express';
 import { QUEUE_NAMES } from '@qaai/shared';
 import { prisma, unscoped, withTenant } from '../lib/prisma.js';
 import { enqueue } from '../lib/queues.js';
+import { startRun } from '../lib/start-run.js';
 import { badRequest, unauthorized } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { env } from '../env.js';
@@ -129,7 +130,15 @@ webhooksRouter.post('/github', async (req, res) => {
     return;
   }
 
-  const queued = await withTenant(integration.orgId, async () => {
+  /*
+   * Three outcomes, kept apart on purpose: a run, nothing to run, or a run this
+   * org is not allowed to start. The third used to be impossible because this
+   * path never asked — a free account that connected a repo got an unlimited
+   * number of PR runs, and none of them moved the usage counter either.
+   */
+  const queued = await withTenant(integration.orgId, async (): Promise<
+    { runId: string } | { refused: string } | null
+  > => {
     const project = integration.projectId
       ? await prisma.project.findUnique({
           where: { id: integration.projectId },
@@ -163,7 +172,19 @@ webhooksRouter.post('/github', async (req, res) => {
     });
     if (tests.length === 0) return null;
 
-    const run = await prisma.run.create({
+    /*
+     * `advisory`, not `enforce`. GitHub is the caller here, not a person: a 402
+     * thrown at a webhook is a retry loop that nobody reads and a PR that never
+     * hears anything. The refusal comes back as a value and is reported the way
+     * every other "we did nothing, here is why" on this endpoint is — 200 with
+     * an `ignored` reason GitHub can stop retrying, and the reason is the one
+     * the customer would see in the product.
+     */
+    const started = await startRun({
+      db: prisma,
+      orgId: integration.orgId,
+      mode: 'advisory',
+      unscope: unscoped,
       data: {
         orgId: integration.orgId,
         projectId: project.id,
@@ -180,11 +201,13 @@ webhooksRouter.post('/github', async (req, res) => {
           })),
         },
       },
-      select: { id: true },
     });
+    if (!started.created) {
+      return { refused: started.quota.reason ?? 'This org is at its monthly run limit.' };
+    }
 
-    await enqueue(QUEUE_NAMES.run, { orgId: integration.orgId, runId: run.id });
-    return run.id;
+    await enqueue(QUEUE_NAMES.run, { orgId: integration.orgId, runId: started.run.id });
+    return { runId: started.run.id };
   });
 
   if (!queued) {
@@ -192,8 +215,20 @@ webhooksRouter.post('/github', async (req, res) => {
     return;
   }
 
-  logger.info({ repoFullName, pr: pr.number, runId: queued }, 'queued a run for a pull request');
-  res.status(202).json({ ok: true, runId: queued });
+  if ('refused' in queued) {
+    logger.warn(
+      { repoFullName, pr: pr.number, orgId: integration.orgId },
+      'a pull-request run was refused: the org is at its monthly run limit',
+    );
+    res.json({ ok: true, ignored: queued.refused });
+    return;
+  }
+
+  logger.info(
+    { repoFullName, pr: pr.number, runId: queued.runId },
+    'queued a run for a pull request',
+  );
+  res.status(202).json({ ok: true, runId: queued.runId });
 });
 
 /*

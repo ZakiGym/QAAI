@@ -47,6 +47,10 @@ VERIFY** — loudly — when it cannot prove either way. It never says OK on a g
 
 ## Taking a backup
 
+The `qaai` command comes from the **`@qaai/cli`** package — `npm i -g @qaai/cli`.
+Install it by the scoped name: the unscoped `qaai` on npm belongs to an unrelated
+project, and these commands run against your production database.
+
 ```bash
 export DATABASE_URL='postgresql://qaai:…@db:5432/qaai'
 export VAULT_MASTER_KEY='…'   # only to fingerprint it; never written anywhere

@@ -40,6 +40,7 @@ import { QUEUE_NAMES } from '@qaai/shared';
 import { env } from '../env.js';
 import { prisma, unscoped, withTenant } from '../lib/prisma.js';
 import { enqueue } from '../lib/queues.js';
+import { startRun } from '../lib/start-run.js';
 import { audit } from '../lib/audit.js';
 import { logger } from '../lib/logger.js';
 import { badRequest, notFound, unauthorized } from '../lib/errors.js';
@@ -200,8 +201,15 @@ async function applyInstallation(event: InstallationEvent): Promise<number> {
  * it synchronously enough to answer 202 with its id. Environment selection is
  * the same rule POST /webhooks/github uses — a PR is a preview deploy and
  * running it against production would be actively dangerous.
+ *
+ * `null` means the repo is not runnable here at all; `refused` means it is, but
+ * the org has spent its month. The second was silently impossible until now —
+ * this path created runs without ever consulting the plan, so the re-run button
+ * was an unlimited supply of free browsers and none of them were counted.
  */
-async function queueRerun(event: CheckRunEvent): Promise<string | null> {
+type RerunOutcome = { runId: string } | { refused: string } | null;
+
+async function queueRerun(event: CheckRunEvent): Promise<RerunOutcome> {
   if (!event.repoFullName || !event.headSha) return null;
 
   // The webhook arrives with no session, so this one lookup runs unscoped —
@@ -241,7 +249,17 @@ async function queueRerun(event: CheckRunEvent): Promise<string | null> {
     });
     if (tests.length === 0) return null;
 
-    const run = await prisma.run.create({
+    /*
+     * `advisory`: GitHub is the caller, and a 402 thrown at a webhook is a retry
+     * loop nobody reads. The refusal is audited instead — the same place this
+     * function already records that it queued one — so an admin asking why the
+     * re-run button stopped working has a row that says so, with the reason.
+     */
+    const started = await startRun({
+      db: prisma,
+      orgId: project.orgId,
+      mode: 'advisory',
+      unscope: unscoped,
       data: {
         orgId: project.orgId,
         projectId: project.id,
@@ -260,8 +278,28 @@ async function queueRerun(event: CheckRunEvent): Promise<string | null> {
           })),
         },
       },
-      select: { id: true },
     });
+
+    if (!started.created) {
+      const refused = started.quota.reason ?? 'This org is at its monthly run limit.';
+      await audit({
+        actor: { userId: '', orgId: project.orgId, ip: null, impersonatedBy: null },
+        action: 'github_app.rerun_refused',
+        targetType: 'Project',
+        targetId: project.id,
+        metadata: {
+          repo: event.repoFullName,
+          commitSha: event.headSha,
+          checkRunId: event.checkRunId,
+          reason: refused,
+          plan: started.quota.plan,
+          runsThisMonth: started.quota.used,
+        },
+      });
+      return { refused };
+    }
+
+    const run = started.run;
 
     await enqueue(QUEUE_NAMES.run, { orgId: project.orgId, runId: run.id });
     // The check is created straight away, so the reviewer sees the button they
@@ -281,7 +319,7 @@ async function queueRerun(event: CheckRunEvent): Promise<string | null> {
       },
     });
 
-    return run.id;
+    return { runId: run.id };
   });
 }
 
@@ -343,15 +381,27 @@ githubWebhooksRouter.post('/github-app', async (req, res) => {
       res.json({ ok: true, ignored: `action ${parsed.action}` });
       return;
     }
-    const runId = await queueRerun(parsed);
-    if (!runId) {
+    const outcome = await queueRerun(parsed);
+    if (!outcome) {
       // 200 so GitHub stops retrying: the repo is genuinely not runnable here.
       logger.info({ repo: parsed.repoFullName }, 're-run requested for a repo QAAI cannot run');
       res.json({ ok: true, ignored: 'no project, environment or runnable tests for that repo' });
       return;
     }
-    logger.info({ repo: parsed.repoFullName, runId }, 'queued a re-run from the check');
-    res.status(202).json({ ok: true, runId });
+    if ('refused' in outcome) {
+      // Also 200, and for the same reason — retrying will not buy them a plan.
+      logger.warn(
+        { repo: parsed.repoFullName },
+        're-run refused: the org is at its monthly run limit',
+      );
+      res.json({ ok: true, ignored: outcome.refused });
+      return;
+    }
+    logger.info(
+      { repo: parsed.repoFullName, runId: outcome.runId },
+      'queued a re-run from the check',
+    );
+    res.status(202).json({ ok: true, runId: outcome.runId });
     return;
   }
 

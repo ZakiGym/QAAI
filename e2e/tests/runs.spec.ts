@@ -195,13 +195,28 @@ test.describe('a project with no tests yet', () => {
      * next action. Pinning only the happy path would let the empty case rot.
      */
     await expect(
-      page.getByRole('heading', { name: 'Proposed test plan' }).or(page.getByText(/No plan yet/)),
+      page
+        .getByRole('heading', { name: 'Proposed test plan' })
+        // The no-plan branch names THIS app, because a recovery that could be
+        // about any project is how this screen used to send people to the
+        // add-a-new-app funnel. The heading carries the project name now.
+        .or(page.getByRole('heading', { name: /No test plan for .+ yet/ })),
     ).toBeVisible();
+
+    /*
+     * And the action must act on THIS project. Every one of these does — the
+     * Explorer crawl, the source read, and adding the environment a crawl
+     * needs — which is what the old `/onboarding` link did not.
+     */
     await expect(
       page
         .getByRole('button', { name: /^Generate \d+ test/ })
-        .or(page.getByRole('link', { name: 'Run the Explorer' })),
+        .or(page.getByRole('button', { name: /^(Run the Explorer|Read the codebase)$/ }))
+        .or(page.getByRole('link', { name: 'Add an environment' })),
     ).toBeVisible();
+
+    // The regression this replaced: never offer to create a SECOND app here.
+    await expect(page.getByRole('link', { name: /Add (your |an )?app/i })).toHaveCount(0);
   });
 });
 
