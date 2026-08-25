@@ -1,4 +1,4 @@
-import { test as base, expect, API_URL, firstProject, projectTests, shortcut } from '../fixtures/qaai';
+import { test as base, expect, API_URL, firstProject, projectTests, shortcut, openTab, treeRow } from '../fixtures/qaai';
 
 /**
  * The editor — open a test, change it, save it.
@@ -87,16 +87,16 @@ test.describe('the editor', () => {
     await page.goto(`/editor?test=${open!.id}`);
     // The full path never renders in the redesigned editor (tree and tabs are
     // basenames); the close button's label is where the full path lives.
-    await expect(page.getByRole('button', { name: `Close ${open!.filePath}` })).toBeVisible();
+    await expect(openTab(page, open!.filePath)).toBeVisible();
 
     /*
      * The tree row, addressed by its tooltip — the test's NAME. Its file name
      * alone is ambiguous: the open-file tab above the editor carries the same
      * text, and the two are different controls doing different things.
      */
-    await page.getByTitle(target!.name, { exact: true }).click();
+    await treeRow(page, target!.filePath).click();
 
-    await expect(page.getByRole('button', { name: `Close ${target!.filePath}` })).toBeVisible();
+    await expect(openTab(page, target!.filePath)).toBeVisible();
     await expect(page.getByRole('code')).toBeVisible();
   });
 
@@ -185,9 +185,9 @@ test.describe('the editor', () => {
     await expect(page.getByText(/That test is not in this app/)).toBeVisible();
 
     // Nothing was opened in its place — that is the whole point.
-    await expect(page.getByRole('button', { name: /^Close / })).toHaveCount(0);
+    await expect(page.getByRole('tab')).toHaveCount(0);
     for (const t of existing.slice(0, 5)) {
-      await expect(page.getByRole('button', { name: `Close ${t.filePath}` })).toHaveCount(0);
+      await expect(openTab(page, t.filePath)).toHaveCount(0);
     }
   });
 
@@ -199,7 +199,7 @@ test.describe('the editor', () => {
     await page.goto('/editor');
 
     await expect(page.getByRole('code')).toBeVisible();
-    await expect(page.getByRole('button', { name: /^Close / })).toHaveCount(1);
+    await expect(page.getByRole('tab')).toHaveCount(1);
     await expect(page.getByText(/That test is not in this app/)).toHaveCount(0);
   });
 
@@ -229,7 +229,7 @@ test.describe('the editor', () => {
 
     // The file lands with the type's own extension, not .spec.ts…
     const filePath = `hand-written/dogfood-a11y-${stamp}.a11y.json`;
-    await expect(page.getByRole('button', { name: `Close ${filePath}` })).toBeVisible();
+    await expect(openTab(page, filePath)).toBeVisible();
     // …and the buffer holds the runnable JSON spec — the routes axe will scan —
     // rather than a Playwright stub the accessibility plugin would never read.
     await expect(page.getByRole('code')).toContainText('routes');
@@ -253,14 +253,16 @@ test.describe('the editor', () => {
     await code.click();
     await page.keyboard.type('//dirty');
 
-    await page.getByRole('button', { name: `Close ${scratch.filePath}` }).click();
+    // The ✕ INSIDE the tab, not the tab itself — clicking the tab just
+    // activates it, and the close path is what the dialog hangs off.
+    await openTab(page, scratch.filePath).getByRole('button', { name: /^Close / }).click();
 
     const dialog = page.getByRole('dialog', { name: 'Unsaved changes' });
     await expect(dialog).toBeVisible();
     await expect(dialog.getByText(scratch.filePath)).toBeVisible();
 
     await dialog.getByRole('button', { name: 'Close anyway' }).click();
-    await expect(page.getByRole('button', { name: `Close ${scratch.filePath}` })).toHaveCount(0);
+    await expect(openTab(page, scratch.filePath)).toHaveCount(0);
   });
 
   /*
@@ -367,7 +369,7 @@ test.describe('the editor', () => {
 
       // Both halves. Asserting only that the file opened is what let the bug
       // through: the file DID open, and the caret went to the wrong line.
-      await expect(page.getByRole('button', { name: `Close ${filePath}` })).toBeVisible();
+      await expect(openTab(page, filePath)).toBeVisible();
       await expect(page.getByText('Ln 5, Col 1')).toBeVisible();
     } finally {
       const removed = await api.delete(`${API_URL}/projects/${project.id}/tests/${target.id}`);

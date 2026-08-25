@@ -58,12 +58,31 @@ export interface SearchPanelProps {
    */
   focusTick: number;
   onOpenMatch: (testId: string, line: number) => void;
+  /**
+   * Feature 30 — "Find in folder". A path prefix the search is confined to,
+   * set when the tree hands one up. Null searches the whole project.
+   *
+   * Held here rather than folded into the query string because it is a
+   * different KIND of narrowing: the query is what you are looking for and the
+   * scope is where, and a person clearing one rarely means to clear the other.
+   * The panel shows the scope as a removable chip so it can never be silently
+   * in force — a search that quietly looked at a tenth of the suite and found
+   * nothing is the reassuring lie this product exists to avoid.
+   */
+  scopePath?: string | null;
+  onClearScope?: () => void;
 }
 
 /** Long enough that typing does not fire a request per keystroke. */
 const DEBOUNCE_MS = 220;
 
-export function SearchPanel({ projectId, focusTick, onOpenMatch }: SearchPanelProps) {
+export function SearchPanel({
+  projectId,
+  focusTick,
+  onOpenMatch,
+  scopePath = null,
+  onClearScope,
+}: SearchPanelProps) {
   const [query, setQuery] = useState('');
   const [matchCase, setMatchCase] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
@@ -92,6 +111,7 @@ export function SearchPanel({ projectId, focusTick, onOpenMatch }: SearchPanelPr
         const params = new URLSearchParams({ q: trimmed });
         if (matchCase) params.set('case', '1');
         if (wholeWord) params.set('word', '1');
+        if (scopePath) params.set('path', scopePath);
         const data = await api<SearchResponse>(
           `/projects/${projectId}/search?${params.toString()}`,
           { signal },
@@ -111,7 +131,9 @@ export function SearchPanel({ projectId, focusTick, onOpenMatch }: SearchPanelPr
         if (!signal.aborted) setLoading(false);
       }
     },
-    [projectId, query, matchCase, wholeWord],
+    // `scopePath` is a dependency: a chip that stayed while the results below
+    // it were computed without it would be a label describing the wrong set.
+    [projectId, query, matchCase, wholeWord, scopePath],
   );
 
   useEffect(() => {
@@ -186,6 +208,25 @@ export function SearchPanel({ projectId, focusTick, onOpenMatch }: SearchPanelPr
           Searches the code of every test in this project — the same text the editor shows you, so a
           spec-driven test is searched as the JSON you would edit.
         </p>
+      )}
+
+      {scopePath && (
+        <div className="border-line bg-surface-1 mt-2 flex items-center gap-1.5 rounded-sm border px-1.5 py-1">
+          <span className="text-ink-faint text-[10px] tracking-wide uppercase">in</span>
+          <span className="text-ink-dim min-w-0 flex-1 truncate font-mono text-[11px]" title={scopePath}>
+            {scopePath}/
+          </span>
+          <button
+            type="button"
+            onClick={onClearScope}
+            disabled={!onClearScope}
+            aria-label={`Search the whole project instead of ${scopePath}`}
+            title="Search the whole project"
+            className="text-ink-faint hover:text-ink shrink-0 leading-none disabled:opacity-40"
+          >
+            ✕
+          </button>
+        </div>
       )}
 
       {result?.truncated && (

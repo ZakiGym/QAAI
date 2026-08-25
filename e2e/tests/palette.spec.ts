@@ -1,4 +1,4 @@
-import { test, expect, shortcut, firstProject, projectTests, shellReady } from '../fixtures/qaai';
+import { test, expect, shortcut, firstProject, projectTests, shellReady, openTab } from '../fixtures/qaai';
 
 /**
  * The keyboard — ⌘K, ⌘P, ⌘\ and ⌘/.
@@ -137,7 +137,7 @@ test.describe('quick-open', () => {
     // truly open — the tree row's text is ALSO the basename, so any basename
     // match can pass with nothing open at all.
     await expect(
-      page.getByRole('button', { name: `Close ${target!.filePath}` }),
+      openTab(page, target!.filePath),
     ).toBeVisible();
   });
 });

@@ -15,11 +15,11 @@ import { CodeEditor } from '../../components/CodeEditor';
 import { NewTestDialog } from '../../components/NewTestDialog';
 import { AgentPanel } from '../../components/AgentPanel';
 import { RecordButton } from '../../components/RecordButton';
-import { FileTree } from '../../components/FileTree';
+import { FileTree } from '../../components/tree/FileTree';
 import { InlineEdit } from '../../components/InlineEdit';
 import { VersionHistory } from '../../components/VersionHistory';
 import type { LocatorSuggestion } from '../../components/CodeEditor';
-import { FIXTURE_PREFIX } from '../../lib/tree';
+import { FIXTURE_PREFIX } from '../../lib/tree/model';
 import { duration, relativeTime } from '../../components/ui';
 import { useProject } from '../../components/shell/ProjectContext';
 import { TestsHeader } from '../../components/TestsHeader';
@@ -31,6 +31,18 @@ import { Page } from '../../components/ui/layout';
 import { Breadcrumbs } from '../../components/editor/Breadcrumbs';
 import { SearchPanel } from '../../components/editor/SearchPanel';
 import { StatusBar } from '../../components/editor/StatusBar';
+import { TabStrip } from '../../components/editor/TabStrip';
+import { SplitEditor, type PaneIndex } from '../../components/editor/SplitEditor';
+import { DiffView } from '../../components/editor/DiffView';
+import {
+  EMPTY_TABS,
+  closeTab as closeTabState,
+  openTab,
+  promoteTab,
+  setDirty as setTabDirty,
+  tabById,
+  type TabsState,
+} from '../../components/editor/tabs';
 import { fileOutline, symbolTrailAt } from '../../components/editor/outline';
 import { useEditorPrefs } from '../../components/editor/prefs';
 import { defineTokenTheme } from '../../components/editor/theme';
@@ -60,6 +72,16 @@ interface TestSummary {
   filePath: string;
   reviewFlags: string[];
   quarantined: boolean;
+  /*
+   * What the tree needs to badge and tint a row. Both come from
+   * GET /projects/:id/tests already; they are declared here because a narrower
+   * type would silently degrade every badge to "none" rather than failing to
+   * compile, and a decoration that quietly stops appearing is indistinguishable
+   * from a test that has no problem.
+   */
+  lastStatus?: 'PASSED' | 'FAILED' | 'FLAKY' | 'SKIPPED' | null;
+  flakeRate?: number | null;
+  lastRunAt?: string | null;
 }
 
 interface FullTest extends TestSummary {
@@ -184,6 +206,12 @@ function failingLines(result: TestResult | null, filePath: string): number[] {
   return [...lines];
 }
 
+/**
+ * The element the active tab controls, named so `aria-controls` can point at
+ * it. A screen reader on a tab can then move straight to the buffer it opens.
+ */
+const EDITOR_PANEL_ID = 'qaai-editor-pane';
+
 export default function EditorPage() {
   const router = useRouter();
 
@@ -200,55 +228,181 @@ export default function EditorPage() {
    * Tabs are what remove the discard-confirm: switching files used to threaten
    * your unsaved work, which made the editor feel hostile to actually editing.
    */
-  const [tabs, setTabs] = useState<Array<{ test: FullTest; draft: string; dirty: boolean }>>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  /*
+   * TWO STRUCTURES, ON PURPOSE.
+   *
+   * `buffers` is the CONTENT of each open file — the loaded test, the working
+   * draft, and whether it differs from what was saved. It is the page's, because
+   * only the page fetches, saves and edits.
+   *
+   * `tabState` is the STRIP — order, which tab is a disposable preview, which are
+   * pinned, the most-recently-used stack ⌃Tab walks, and the closed-tab history
+   * ⇧⌘T restores from. It is a pure state machine in components/editor/tabs.ts,
+   * and every operation on it is a function that returns the next value.
+   *
+   * Keeping them apart is what lets the strip have VS Code's behaviour without
+   * the page caring: a preview tab being replaced is one call, and the buffer it
+   * held is dropped by reconciling against the tab list rather than by every
+   * close path remembering to do it.
+   *
+   * They are joined by the test id, and `reconcileBuffers` is the only place
+   * that has to agree — it drops any buffer whose tab has gone.
+   */
+  const [buffers, setBuffers] = useState<
+    Array<{ test: FullTest; draft: string; dirty: boolean }>
+  >([]);
+  const [tabState, setTabState] = useState<TabsState>(EMPTY_TABS);
+  /**
+   * The second editor group (feature 24).
+   *
+   * A separate TabsState rather than a second copy of everything: the two panes
+   * share one `buffers` store, so the same file open on both sides is ONE
+   * buffer and an edit on the left is already on the right. That is what makes
+   * a split useful for comparing a spec with the fixture it reads, and it is
+   * why the buffer store is keyed by test id rather than by tab.
+   */
+  const [rightTabs, setRightTabs] = useState<TabsState>(EMPTY_TABS);
+  const [split, setSplit] = useState(false);
+  const [focusedPane, setFocusedPane] = useState<PaneIndex>(0);
+  /**
+   * Two files being compared (feature 25), or null for the normal editor.
+   *
+   * Held as ids, not content: the buffers are the source of truth and a diff
+   * showing a stale copy of a file you are editing beside it would be its own
+   * small lie.
+   */
+  const [compare, setCompare] = useState<{ left: string; right: string } | null>(null);
   const [dialog, setDialog] = useState<Dialog | null>(null);
   // Stable, so the Modal's focus trap does not tear down and rebuild on every
   // keystroke in a PromptDialog.
   const closeDialog = useCallback(() => setDialog(null), []);
 
-  const activeTab = tabs.find((t) => t.test.id === activeId) ?? null;
-  const openTest = activeTab?.test ?? null;
-  const draft = activeTab?.draft ?? '';
-  const dirty = activeTab?.dirty ?? false;
+  // The FOCUSED pane decides what ⌘S saves and what the status bar describes.
+  const activeId = (focusedPane === 0 ? tabState : rightTabs).activeId;
+  const activeBuffer = buffers.find((b) => b.test.id === activeId) ?? null;
+  const openTest = activeBuffer?.test ?? null;
+  const draft = activeBuffer?.draft ?? '';
+  const dirty = activeBuffer?.dirty ?? false;
+
+  /*
+   * The diff reads THROUGH the buffers, so a file being edited on one side is
+   * compared as it stands rather than as it was last saved — otherwise the one
+   * screen whose whole job is showing a difference would hide the newest one.
+   */
+  const bufferText = useCallback(
+    (testId: string) => buffers.find((b) => b.test.id === testId)?.draft ?? '',
+    [buffers],
+  );
+  const bufferPath = useCallback(
+    (testId: string) => buffers.find((b) => b.test.id === testId)?.test.filePath ?? testId,
+    [buffers],
+  );
+  const compareLanguage = useMemo(() => {
+    const test = compare ? buffers.find((b) => b.test.id === compare.right)?.test : null;
+    return test ? editorLanguage(test) : 'typescript';
+  }, [compare, buffers]);
+
+  /**
+   * Apply the next tab state for a pane, and drop any buffer NEITHER pane holds.
+   *
+   * The reconciliation is across both groups on purpose: closing a file on the
+   * left while it is still open on the right must not throw away the buffer the
+   * right pane is rendering.
+   */
+  /*
+   * Takes a REDUCER, not a value.
+   *
+   * Two `openFile` calls awaited back to back both read `tabState` from the
+   * same render's closure, so the second computed its next state from the tab
+   * list as it was BEFORE the first — and overwrote it. The first file's tab
+   * vanished, the buffer reconciliation below then dropped its buffer, and the
+   * diff that opened next showed one real file against an empty pane labelled
+   * with a raw test id.
+   *
+   * Reducers make the sequence order-independent: each update sees whatever the
+   * one before it produced, which is the only correct reading of "open this,
+   * then open that".
+   */
+  const applyTabsFor = useCallback((pane: PaneIndex, update: (prev: TabsState) => TabsState) => {
+    const setter = pane === 0 ? setTabState : setRightTabs;
+    let applied: TabsState | null = null;
+    setter((prev) => {
+      applied = update(prev);
+      return applied;
+    });
+    setBuffers((prev) => {
+      // The OTHER pane is read through its setter for the same reason.
+      const otherSetter = pane === 0 ? setRightTabs : setTabState;
+      let other: TabsState = EMPTY_TABS;
+      otherSetter((current) => {
+        other = current;
+        return current;
+      });
+      const next = applied;
+      if (!next) return prev;
+      const live = new Set([...next.tabs, ...other.tabs].map((tab) => tab.id));
+      return prev.every((b) => live.has(b.test.id)) ? prev : prev.filter((b) => live.has(b.test.id));
+    });
+  }, []);
+
+  /**
+   * Close these files in BOTH panes.
+   *
+   * A delete that closed only the focused group would leave the other pane
+   * rendering a buffer for a test the project no longer has — and the next ⌘S
+   * there would 404 against a file nobody can see.
+   */
+  const closeEverywhere = useCallback(
+    (testIds: readonly string[]) => {
+      const shut = (prev: TabsState) => testIds.reduce((state, id) => closeTabState(state, id), prev);
+      applyTabsFor(0, shut);
+      applyTabsFor(1, shut);
+    },
+    [applyTabsFor],
+  );
+
+  const applyTabs = useCallback(
+    (next: TabsState) => applyTabsFor(focusedPane, () => next),
+    [applyTabsFor, focusedPane],
+  );
 
   const patchActive = useCallback(
     (patch: Partial<{ draft: string; dirty: boolean; test: FullTest }>) =>
-      setTabs((prev) =>
-        prev.map((t) => (t.test.id === activeId ? { ...t, ...patch } : t)),
-      ),
+      setBuffers((prev) => prev.map((b) => (b.test.id === activeId ? { ...b, ...patch } : b))),
     [activeId],
   );
   const setDraft = useCallback((value: string) => patchActive({ draft: value }), [patchActive]);
-  const setDirty = useCallback((value: boolean) => patchActive({ dirty: value }), [patchActive]);
 
-  /** Drop a tab and move the selection to a sensible neighbour. */
+  /**
+   * Mark the active buffer dirty or clean.
+   *
+   * The strip is told too, because a dirty tab shows a dot AND — VS Code's rule,
+   * and the reason a preview tab never eats your edits — an edited preview tab
+   * becomes permanent. `promoteTab` is a no-op on a tab that is already
+   * permanent, so this stays a single unconditional call.
+   */
+  const setDirty = useCallback(
+    (value: boolean) => {
+      patchActive({ dirty: value });
+      // Both groups: the same file can be open in each, and a dot on one and
+      // not the other would be two answers to one question.
+      const mark = (prev: TabsState): TabsState => {
+        if (!activeId || !tabById(prev, activeId)) return prev;
+        const marked = setTabDirty(prev, activeId, value);
+        return value ? promoteTab(marked, activeId) : marked;
+      };
+      setTabState(mark);
+      setRightTabs(mark);
+    },
+    [patchActive, activeId],
+  );
+
+  /** Drop a tab. The state machine picks the successor. */
   const discardTab = useCallback(
-    (testId: string) => {
-      setTabs((prev) => {
-        const next = prev.filter((t) => t.test.id !== testId);
-        if (testId === activeId) {
-          const index = prev.findIndex((t) => t.test.id === testId);
-          setActiveId(next[Math.min(index, next.length - 1)]?.test.id ?? null);
-        }
-        return next;
-      });
-    },
-    [activeId],
+    (testId: string) => closeEverywhere([testId]),
+    [applyTabs, tabState],
   );
 
-  /** Close a tab, warning once if it holds unsaved work. */
-  const closeTab = useCallback(
-    (testId: string) => {
-      const tab = tabs.find((t) => t.test.id === testId);
-      if (tab?.dirty) {
-        setDialog({ kind: 'close-dirty', testId, filePath: tab.test.filePath });
-        return;
-      }
-      discardTab(testId);
-    },
-    [tabs, discardTab],
-  );
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -279,6 +433,14 @@ export default function EditorPage() {
   const [leftPanel, setLeftPanel] = useState<'files' | 'search'>('files');
   /** Bumped per ⌘⇧F so a second press re-focuses and selects the query. */
   const [searchTick, setSearchTick] = useState(0);
+  /**
+   * Feature 30 — the folder "Find in folder" narrowed the search to.
+   *
+   * Lives on the page rather than inside SearchPanel because the tree is what
+   * sets it and the two are siblings. ⌘⇧F clears it, so the shortcut always
+   * means "search this project" and a scope can never be silently in force.
+   */
+  const [searchScope, setSearchScope] = useState<string | null>(null);
   /**
    * A line to jump to once the file it belongs to is the one on screen.
    *
@@ -317,8 +479,8 @@ export default function EditorPage() {
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
-    setTabs([]);
-    setActiveId(null);
+    setTabState(EMPTY_TABS);
+    setBuffers([]);
     setStatus(null);
     setError(null);
     void (async () => {
@@ -468,10 +630,27 @@ export default function EditorPage() {
     };
   }, [projectId, openTestId, versionsTick]);
 
-  async function openFile(projectId: string, testId: string) {
-    // Already open? Just focus it — no fetch, and no unsaved work at risk.
-    if (tabs.some((t) => t.test.id === testId)) {
-      setActiveId(testId);
+  /**
+   * Open a file.
+   *
+   * `permanent` is the preview-tab rule: a single click in the tree opens a
+   * disposable tab that the NEXT single click replaces, so browsing a folder
+   * leaves one tab behind rather than thirty. A double-click, or any edit,
+   * makes it permanent. Everything that is not casual browsing — ⌘P, a search
+   * hit, restoring a closed tab — opens permanently, because the person named
+   * the file they wanted.
+   */
+  async function openFile(projectId: string, testId: string, permanent = false) {
+    const known = buffers.find((b) => b.test.id === testId);
+    if (known) {
+      // Already loaded: focus it, and promote it if this open was deliberate.
+      applyTabsFor(focusedPane, (prev) =>
+        openTab(prev, {
+          id: testId,
+          path: known.test.filePath,
+          preview: !permanent && (tabById(prev, testId)?.preview ?? true),
+        }),
+      );
       setStatus(null);
       return;
     }
@@ -479,8 +658,10 @@ export default function EditorPage() {
     const initial = SPEC_DRIVEN.has(test.type)
       ? JSON.stringify(test.spec ?? {}, null, 2)
       : test.code;
-    setTabs((prev) => [...prev, { test, draft: initial, dirty: false }]);
-    setActiveId(test.id);
+    setBuffers((prev) => [...prev, { test, draft: initial, dirty: false }]);
+    applyTabsFor(focusedPane, (prev) =>
+      openTab(prev, { id: test.id, path: test.filePath, preview: !permanent }),
+    );
     setStatus(null);
   }
 
@@ -521,6 +702,46 @@ export default function EditorPage() {
       setSaving(false);
     }
   }, [project, openTest, draft, saving, loadTests, setDirty]);
+
+  /**
+   * Feature 29 — run exactly these tests.
+   *
+   * The tree collects the ids under a folder and hands them over; this owns the
+   * environment, the busy state and the navigation, because they belong to the
+   * page and not to a panel. It navigates to the cockpit rather than polling
+   * the way ⌘↵ does: one file finishes in seconds and is worth waiting for
+   * inline, a folder is a real run and belongs on the run screen.
+   */
+  const runTests = useCallback(
+    async (testIds: string[], label: string) => {
+      if (!project || running) return;
+      if (testIds.length === 0) {
+        setStatus(`Nothing runnable in ${label}`);
+        return;
+      }
+      const environmentId = project.environments[0]?.id;
+      if (!environmentId) {
+        setStatus('This project has no environment to run against');
+        return;
+      }
+      setRunning(true);
+      setStatus(`Starting ${testIds.length} test${testIds.length === 1 ? '' : 's'} from ${label}…`);
+      try {
+        if (dirty) await save();
+        const { run } = await api<{ run: Run }>('/runs', {
+          method: 'POST',
+          body: JSON.stringify({ environmentId, testIds, trigger: 'MANUAL' }),
+        });
+        setStatus(null);
+        router.push(`/runs/${run.id}`);
+      } catch (err) {
+        setStatus(err instanceof Error ? err.message : 'Could not start the run');
+      } finally {
+        setRunning(false);
+      }
+    },
+    [project, running, dirty, save, router],
+  );
 
   const runThis = useCallback(async () => {
     if (!project || !openTest || running) return;
@@ -637,6 +858,9 @@ export default function EditorPage() {
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'f') {
         e.preventDefault();
         setLeftPanel('search');
+        // The shortcut means the whole project. Leaving a folder scope in place
+        // would make ⌘⇧F quietly search a tenth of the suite and find nothing.
+        setSearchScope(null);
         setSearchTick((n) => n + 1);
       }
     };
@@ -812,10 +1036,7 @@ export default function EditorPage() {
     try {
       await fn();
       await loadTests(project.id);
-      if (closedTestId) {
-        setTabs((prev) => prev.filter((t) => t.test.id !== closedTestId));
-        setActiveId((cur) => (cur === closedTestId ? null : cur));
-      }
+      if (closedTestId) closeEverywhere([closedTestId]);
       setStatus(label);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : `${label} failed`);
@@ -923,6 +1144,8 @@ export default function EditorPage() {
               <SearchPanel
                 projectId={project.id}
                 focusTick={searchTick}
+                scopePath={searchScope}
+                onClearScope={() => setSearchScope(null)}
                 onOpenMatch={(testId, line) => {
                   setPendingReveal({ testId, line });
                   void openFile(project.id, testId);
@@ -968,17 +1191,47 @@ export default function EditorPage() {
               dirtyTestId={dirty ? (openTest?.id ?? null) : null}
               onOpen={(testId) => void openFile(project.id, testId)}
               onAdd={(folderPath) => createInFolder(folderPath)}
-              onRename={(t) => setDialog({ kind: 'move-file', testId: t.id, filePath: t.filePath })}
-              onDuplicate={(t) =>
-                void fileOp('Duplicated', () =>
-                  api(`/projects/${project.id}/tests/${t.id}/duplicate`, { method: 'POST' }),
-                )
-              }
-              onDelete={(t) =>
-                setDialog({ kind: 'delete-file', testId: t.id, filePath: t.filePath })
-              }
-              onRenameFolder={(path) => setDialog({ kind: 'move-folder', folderPath: path })}
-              onDeleteFolder={(path) => setDialog({ kind: 'delete-folder', folderPath: path })}
+              /*
+               * Awaited, not fired and forgotten: the panel holds its status
+               * line until the reload lands, so "Moved 3 files" appears over a
+               * tree that already shows them moved. Rename, delete, paste, drop
+               * and undo all route through here.
+               */
+              onChanged={async () => {
+                await loadTests(project.id);
+              }}
+              /*
+               * A tab whose file no longer exists is a buffer pointing at
+               * nothing: ⌘S would 404 and the editor would show a file the
+               * project does not have. The panel deletes; the page owns tabs,
+               * so it closes them.
+               */
+              onClosed={(ids) => closeEverywhere(ids)}
+              onFindInFolder={(folderPath) => {
+                setSearchScope(folderPath);
+                setLeftPanel('search');
+                setSearchTick((n) => n + 1);
+              }}
+              onRunTests={(testIds, label) => void runTests(testIds, label)}
+              /*
+               * Feature 25 — compare two files. Both are loaded before the diff
+               * opens, because DiffView reads their buffers and an unloaded one
+               * would render as an empty side, which reads as "this file is
+               * empty" rather than "we have not fetched it".
+               */
+              onCompare={(left, right) => {
+                if (!project) return;
+                void (async () => {
+                  try {
+                    await openFile(project.id, left, true);
+                    await openFile(project.id, right, true);
+                    setCompare({ left, right });
+                  } catch (err) {
+                    setStatus(err instanceof Error ? err.message : 'Could not open both files');
+                  }
+                })();
+              }}
+              onStatus={setStatus}
             />
           )}
 
@@ -1006,44 +1259,49 @@ export default function EditorPage() {
         {/* ── The file ────────────────────────────────────────────────────── */}
         <section className="flex min-h-0 min-w-0 flex-col">
           {/*
-            Open files, then the verbs. The row wraps rather than scrolls: at a
-            narrow width the Run button dropping to a second line is readable,
-            and a horizontally scrolled toolbar hides the only control on the
-            screen that starts anything.
+            The open files, in a strip that SCROLLS rather than wraps.
+            
+            The old row wrapped, on the argument that a wrapped Run button is
+            readable where a scrolled one is hidden. Splitting the two settles
+            it better: the tabs are their own scrolling strip, and the verbs
+            below keep a row they cannot be pushed out of.
           */}
-          <div className="border-line flex shrink-0 flex-wrap items-center gap-2 gap-y-1.5 border-b px-4 py-2">
-            {tabs.map((tab) => {
-              const active = tab.test.id === activeId;
-              return (
-                <span
-                  key={tab.test.id}
-                  className={cn(
-                    'text-micro inline-flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 font-mono whitespace-nowrap',
-                    active ? 'border-line bg-surface-1 text-ink border' : 'text-ink-faint',
-                  )}
-                >
-                  <button
-                    type="button"
-                    onClick={() => setActiveId(tab.test.id)}
-                    title={tab.test.filePath}
-                    className="max-w-44 truncate"
-                  >
-                    {tab.test.filePath.split('/').pop()}
-                  </button>
-                  {/* The dirty dot is the tab's state; ✕ is what you do about it. */}
-                  {tab.dirty && <span className="text-accent leading-none">●</span>}
-                  <button
-                    type="button"
-                    onClick={() => closeTab(tab.test.id)}
-                    aria-label={`Close ${tab.test.filePath}`}
-                    className="hover:text-ink shrink-0 leading-none"
-                  >
-                    ✕
-                  </button>
-                </span>
+          <TabStrip
+            state={tabState}
+            onChange={applyTabs}
+            panelId={EDITOR_PANEL_ID}
+            label="Open files"
+            onBeforeClose={(tab) => {
+              const buffer = buffers.find((b) => b.test.id === tab.id);
+              if (!buffer?.dirty) return true;
+              // The page owns the dialog, so the strip stands down and the
+              // confirm path closes the tab if the person says so.
+              setDialog({ kind: 'close-dirty', testId: tab.id, filePath: buffer.test.filePath });
+              return false;
+            }}
+            onSplitRight={(tab) => {
+              // Open the same file on the right and focus it, which is what
+              // "Split right" means everywhere else it exists.
+              setSplit(true);
+              const buffer = buffers.find((b) => b.test.id === tab.id);
+              setRightTabs((prev) =>
+                openTab(prev, { id: tab.id, path: buffer?.test.filePath ?? tab.path, preview: false }),
               );
-            })}
+              setFocusedPane(1);
+            }}
+            onCopyPath={(tab) => {
+              void navigator.clipboard?.writeText(tab.path);
+              setStatus(`Copied ${tab.path}`);
+            }}
+            onDropTests={(testIds) => {
+              // Dropped from the tree. Opened permanently — dragging a file
+              // onto the strip is as deliberate as an open gets.
+              if (!project) return;
+              for (const id of testIds) void openFile(project.id, id, true);
+            }}
+          />
 
+          <div className="border-line flex shrink-0 flex-wrap items-center gap-2 gap-y-1.5 border-b px-4 py-2">
             {status && (
               <span aria-live="polite" className="text-ink-faint text-micro min-w-0">
                 {status}
@@ -1087,8 +1345,14 @@ export default function EditorPage() {
             />
           )}
 
-          <div className="relative min-h-0 flex-1">
-            {openTest && inlineSelection && project && (
+          {/*
+            A flex COLUMN, not a block. SplitEditor's root is `flex-1`, which
+            needs a flex parent to mean anything — as a block child it computed
+            to five pixels and the editor rendered as a hairline. `relative`
+            stays because InlineEdit positions against this box.
+          */}
+          <div id={EDITOR_PANEL_ID} className="relative flex min-h-0 flex-1 flex-col">
+            {openTest && inlineSelection && project && !compare && (
               <InlineEdit
                 projectId={project.id}
                 testId={openTest.id}
@@ -1104,30 +1368,105 @@ export default function EditorPage() {
                 }}
               />
             )}
-            {openTest ? (
-              <CodeEditor
-                value={draft}
-                language={editorLanguage(openTest)}
-                onChange={(next) => {
-                  setDraft(next);
-                  setDirty(true);
-                }}
-                onSave={() => void save()}
-                prefs={prefs}
-                onCursor={setCaret}
-                onProblems={setProblems}
-                locators={locators}
-                onInlineEdit={(selection) => setInlineSelection(selection)}
-                onReady={(ed) => {
-                  editorRef.current = ed;
-                  failWashRef.current = null;
-                  setEditorReady((n) => n + 1);
-                }}
-              />
+
+            {compare ? (
+              <div className="flex min-h-0 flex-1 flex-col">
+                <div className="border-line flex shrink-0 items-center justify-between border-b px-3 py-1">
+                  <span className="text-ink-faint text-[10.5px]">Comparing two files</span>
+                  <button
+                    type="button"
+                    onClick={() => setCompare(null)}
+                    className="text-ink-faint hover:text-ink text-[11px]"
+                  >
+                    Close diff
+                  </button>
+                </div>
+              {/*
+                Comparing two files takes the whole pane rather than opening a
+                third one: a diff read in a third of the width is a diff nobody
+                reads. Closing returns to whatever was open.
+
+                Braced, because a bare block comment in JSX CHILDREN position is
+                not a comment — it is text, and it rendered verbatim across the
+                top of the diff.
+              */}
+              <DiffView
+                original={bufferText(compare.left)}
+                modified={bufferText(compare.right)}
+                originalLabel={bufferPath(compare.left)}
+                modifiedLabel={bufferPath(compare.right)}
+                language={compareLanguage}
+                onSwap={() =>
+                  setCompare((c) => (c ? { left: c.right, right: c.left } : c))
+                }
+                />
+              </div>
             ) : (
-              <p className="text-ink-faint text-body-sm p-6">
-                Select a test, or press <span className="font-mono">+ new test</span> to write one.
-              </p>
+              <SplitEditor
+                split={split}
+                focusedPane={focusedPane}
+                onFocusPane={setFocusedPane}
+                paneLabels={['Left editor', 'Right editor']}
+                onRatioChange={undefined}
+              >
+                {(pane: PaneIndex) => {
+                  const groupState = pane === 0 ? tabState : rightTabs;
+                  const paneBuffer =
+                    buffers.find((b) => b.test.id === groupState.activeId) ?? null;
+                  if (!paneBuffer) {
+                    return (
+                      <p className="text-ink-faint text-body-sm p-6">
+                        {pane === 0
+                          ? 'Select a test, or press + new test to write one.'
+                          : 'Open a file here, or close this pane.'}
+                      </p>
+                    );
+                  }
+                  return (
+                    <div className="flex min-h-0 flex-1 flex-col">
+                      {/* Each pane names its own file: with two open, the
+                          breadcrumb above the split would describe only one. */}
+                      {split && (
+                        <div className="border-line text-ink-faint truncate border-b px-3 py-1 font-mono text-[10.5px]">
+                          {paneBuffer.test.filePath}
+                        </div>
+                      )}
+                      <div className="min-h-0 flex-1">
+                        <CodeEditor
+                          value={paneBuffer.draft}
+                          language={editorLanguage(paneBuffer.test)}
+                          onChange={(next) => {
+                            setFocusedPane(pane);
+                            setDraft(next);
+                            setDirty(true);
+                          }}
+                          onSave={() => void save()}
+                          prefs={prefs}
+                          onCursor={pane === focusedPane ? setCaret : undefined}
+                          onProblems={pane === focusedPane ? setProblems : undefined}
+                          locators={locators}
+                          onInlineEdit={(selection) => {
+                            setFocusedPane(pane);
+                            setInlineSelection(selection);
+                          }}
+                          onReady={(ed) => {
+                            /*
+                             * Only the LEFT pane owns editorRef. The decorations,
+                             * the fail-wash and the reveal all address one editor,
+                             * and letting the right pane claim the ref would point
+                             * every one of them at whichever mounted last.
+                             */
+                            if (pane !== 0) return;
+                            editorRef.current = ed;
+                            failWashRef.current = null;
+                            setEditorReady((n) => n + 1);
+                          }}
+                        />
+                      </div>
+                    </div>
+                  );
+                }}
+              </SplitEditor>
             )}
           </div>
 

@@ -4,6 +4,7 @@
 
 import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
+import { z } from 'zod';
 import {
   FIXTURE_PREFIX,
   GIT_INTEGRATION_KINDS,
@@ -34,7 +35,13 @@ import {
   updateTestSchema,
   upsertSecretSchema,
 } from '@qaai/shared';
-import type { FlowMap, GitIntegrationKind, Language, UiFramework } from '@qaai/shared';
+import type {
+  FlowMap,
+  GitIntegrationKind,
+  Language,
+  TestResultStatus,
+  UiFramework,
+} from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
@@ -582,6 +589,77 @@ projectsRouter.post(
 );
 
 /** Suites and tests for the cockpit's left pane. */
+/** Worst first — the tie-break below, and the order a reader would want. */
+const RESULT_STATUS_RANK: Record<TestResultStatus, number> = {
+  FAILED: 0,
+  TIMED_OUT: 1,
+  FLAKY: 2,
+  PASSED: 3,
+  SKIPPED: 4,
+};
+
+/**
+ * How each test's most recent result ENDED, for every test in one query.
+ *
+ * `Test.lastRunAt` records *when* a test last ran and nothing about how it went,
+ * so a file tree that wants to colour a row by its last verdict had no column to
+ * read and the UI could only guess from `flakeRate` — which is a rate over a
+ * window, not an answer about the last run. This supplies the missing half.
+ *
+ * The obvious implementation is a `findFirst` per row ordered by `createdAt`,
+ * and it is the wrong one: this list is drawn for a whole suite, so that is a
+ * query per file and a thousand-file project pays a thousand round trips to
+ * paint one panel. The alternative usually reached for next — take the newest
+ * N×k results and keep the first sighting of each test — is an approximation,
+ * and it lies in exactly the case that matters most: a test nobody has touched
+ * in months falls outside the window and is reported as never run.
+ *
+ * So the question is asked as an aggregate instead. Grouping by
+ * `(testId, status)` and taking `_max(createdAt)` bounds the answer at one row
+ * per test per status — five, given the enum — rather than one per result ever
+ * recorded, and the pair with the greatest timestamp per test IS that test's
+ * last result. Exact, one statement, and it rides the existing
+ * `@@index([testId, createdAt])`.
+ *
+ * Grouping by status as well as by testId is what makes the status readable at
+ * all: Prisma's `groupBy` returns aggregates only of the columns it did NOT
+ * group by, so `by: ['testId']` can give the timestamp but never the status
+ * that goes with it, and recovering it would take a second query carrying a
+ * (testId, createdAt) pair per test in one enormous OR.
+ */
+async function lastResultStatuses(testIds: string[]): Promise<Map<string, TestResultStatus>> {
+  // Not merely an optimisation: `in: []` is a query that reads the table to
+  // return nothing, and the common case here is a brand-new project.
+  if (testIds.length === 0) return new Map();
+
+  const groups = await prisma.testResult.groupBy({
+    by: ['testId', 'status'],
+    where: { testId: { in: testIds } },
+    _max: { createdAt: true },
+  });
+
+  const latest = new Map<string, { at: number; status: TestResultStatus }>();
+  for (const group of groups) {
+    const at = group._max.createdAt?.getTime() ?? 0;
+    const held = latest.get(group.testId);
+    if (
+      !held ||
+      at > held.at ||
+      // A tie needs a rule, or the same suite renders differently on two loads.
+      // `@@unique([runId, testId])` makes one row per test per run, so a tie
+      // means two runs created in the same instant — and when a test both
+      // passed and failed at the same moment, the honest colour is the failure.
+      (at === held.at && RESULT_STATUS_RANK[group.status] < RESULT_STATUS_RANK[held.status])
+    ) {
+      latest.set(group.testId, { at, status: group.status });
+    }
+  }
+
+  const statuses = new Map<string, TestResultStatus>();
+  for (const [testId, held] of latest) statuses.set(testId, held.status);
+  return statuses;
+}
+
 projectsRouter.get('/:projectId/tests', async (req, res) => {
   const tests = await prisma.test.findMany({
     where: { projectId: String(req.params.projectId), disabledAt: null },
@@ -601,7 +679,22 @@ projectsRouter.get('/:projectId/tests', async (req, res) => {
       suiteId: true,
     },
   });
-  res.json({ tests });
+
+  /*
+   * A status string, not the result row. The row carries the error text, the
+   * network log, the console log and the trace key, and none of that is drawn
+   * on a list — attaching it would multiply this response by the size of every
+   * failure in the suite to colour a dot.
+   *
+   * `null` means "no result on record", which is a real and different state
+   * from every status in the enum: a test written five minutes ago has never
+   * run, and the tree must be able to say so rather than paint it as skipped.
+   */
+  const lastStatus = await lastResultStatuses(tests.map((test) => test.id));
+
+  res.json({
+    tests: tests.map((test) => ({ ...test, lastStatus: lastStatus.get(test.id) ?? null })),
+  });
 });
 
 /**
@@ -626,10 +719,19 @@ projectsRouter.get('/:projectId/tests', async (req, res) => {
  *    offered instead because both can be answered by `indexOf` plus a look at
  *    the two characters either side of the hit — a scan that is linear no matter
  *    what is typed, with no pattern-shaped input reaching a regex engine at all.
+ *
+ * `path` narrows the search to one folder — the tree's "Find in folder". It
+ * obeys the same rule: a path is not a pattern here either. It is normalised
+ * the way every other path in this file is, matched as a literal prefix in the
+ * query, and then re-checked on the folder BOUNDARY in JavaScript, which is
+ * what makes `tests/auth` a folder rather than a string that also happens to
+ * start `tests/authz/login.spec.ts`.
  */
 
 /** Longer than any query a person types; a longer one is a paste or a probe. */
 const SEARCH_MAX_QUERY = 200;
+/** Matches `relativeFilePath` in the shared schema — no path in the tree is longer. */
+const SEARCH_MAX_SCOPE = 300;
 /** Files reported. Past this the panel is a scroll, not an answer. */
 const SEARCH_MAX_FILES = 100;
 /** Rows per file. The panel says "+N more in this file" for the rest. */
@@ -679,13 +781,35 @@ projectsRouter.get('/:projectId/search', async (req, res) => {
   const wholeWord = req.query.word === '1';
 
   /*
+   * The folder to search in, or the whole project when absent.
+   *
+   * Normalised through the same function the move and delete routes use, so a
+   * scope typed with a leading slash, a Windows separator or a `.` segment
+   * means what the reader expects rather than silently matching nothing. A
+   * scope that normalises away to nothing — `/`, `.`, `""` — is not an error:
+   * it is the root, which is the unscoped search.
+   */
+  const rawScope = typeof req.query.path === 'string' ? req.query.path : '';
+  if (rawScope.length > SEARCH_MAX_SCOPE) {
+    throw badRequest(`path must be ${SEARCH_MAX_SCOPE} characters or fewer`);
+  }
+  const scope = normalisePath(rawScope);
+
+  /*
+   * Echoed back only when one was applied. An unscoped search's response is
+   * then byte-identical to the one this endpoint has always sent, which keeps
+   * the addition genuinely additive for every caller that predates it.
+   */
+  const echoScope = scope ? { scope } : {};
+
+  /*
    * An empty box is not an error. The panel clears its own results before it
    * would send one, so a blank `q` here is a direct caller or a race — and the
    * honest answer to "find nothing" is nothing found, not a 400 the UI would
    * have to special-case, and not a scan of every file in the project.
    */
   if (!query) {
-    res.json({ query, files: [], totalMatches: 0, truncated: false });
+    res.json({ query, ...echoScope, files: [], totalMatches: 0, truncated: false });
     return;
   }
 
@@ -697,7 +821,14 @@ projectsRouter.get('/:projectId/search', async (req, res) => {
    * building the client yourself, removes it silently.
    */
   const tests = await prisma.test.findMany({
-    where: { projectId: String(req.params.projectId), disabledAt: null },
+    where: {
+      projectId: String(req.params.projectId),
+      disabledAt: null,
+      // A literal prefix, added only when there is one — a parameterised LIKE,
+      // not a pattern the caller wrote. It narrows what is read off the disk;
+      // the folder boundary is settled below, where it can be settled exactly.
+      ...(scope ? { filePath: { startsWith: scope } } : {}),
+    },
     orderBy: [{ filePath: 'asc' }],
     select: { id: true, name: true, type: true, filePath: true, code: true, spec: true },
   });
@@ -716,6 +847,16 @@ projectsRouter.get('/:projectId/search', async (req, res) => {
   let truncated = false;
 
   for (const test of tests) {
+    /*
+     * The folder boundary, which the prefix filter above cannot express: a
+     * scope of `tests/auth` means that folder and the file `tests/auth` itself,
+     * and NOT `tests/authz/login.spec.ts`. Doing it here rather than in SQL is
+     * also what makes the LIKE's own metacharacters harmless — `%` in a scope
+     * can only ever widen the set the database returns, and this narrows it
+     * back to the one folder that was asked for.
+     */
+    if (scope && test.filePath !== scope && !test.filePath.startsWith(`${scope}/`)) continue;
+
     if (files.length >= SEARCH_MAX_FILES || totalMatches >= SEARCH_MAX_TOTAL) {
       truncated = true;
       break;
@@ -786,7 +927,7 @@ projectsRouter.get('/:projectId/search', async (req, res) => {
     });
   }
 
-  res.json({ query, files, totalMatches, truncated });
+  res.json({ query, ...echoScope, files, totalMatches, truncated });
 });
 
 projectsRouter.get('/:projectId/tests/:testId', async (req, res) => {
@@ -1808,35 +1949,156 @@ function assertFixtureBoundary(path: string, hasRunnableCode: boolean): void {
   }
 }
 
+/**
+ * How many files one batch may act on.
+ *
+ * Two hundred is well past any multi-select a person makes by hand and well
+ * short of the point where the request stops being a request: every file in a
+ * batch costs a statement inside an open transaction, so the cap is also the
+ * ceiling on how long that transaction holds its row locks. It bounds the audit
+ * row too — a batch move records every from/to pair, because an audit line
+ * reading "40 files moved" without saying which is not a record of anything.
+ *
+ * A tree that wants to move more than this has a folder in mind, and
+ * POST /folders/move already does whole folders in one statement-set.
+ */
+const BATCH_MAX_FILES = 200;
+
+/**
+ * A batch of moves. `filePath` and `name` are taken OFF the shared single-file
+ * schema rather than restated here — the traversal rule, the length cap and the
+ * name limits are the same rules or they are a second set of rules that drifts,
+ * and a batch endpoint that validates more loosely than the single-file one it
+ * shadows is a hole with a convenience API in front of it.
+ */
+const batchMoveSchema = z.object({
+  moves: z
+    .array(
+      z.object({
+        testId: z.string().min(1),
+        filePath: moveTestSchema.shape.filePath,
+        name: moveTestSchema.shape.name,
+      }),
+    )
+    .min(1)
+    .max(BATCH_MAX_FILES),
+});
+
+const batchDeleteSchema = z.object({
+  testIds: z.array(z.string().min(1)).min(1).max(BATCH_MAX_FILES),
+});
+
+/** One validated move: the row to write, and what it is being written over. */
+interface PlannedMove {
+  id: string;
+  from: string;
+  /** Present only when the caller also asked to rename the test. */
+  name?: string;
+  to: string;
+}
+
+/**
+ * Validate a whole set of moves against the project, and hand back the writes.
+ *
+ * This is the single-file route's validation, generalised — not a second copy of
+ * it. Both callers go through here, so the path rules (normalisation, the
+ * `fixtures/` boundary, collisions) cannot come to mean one thing when you drag
+ * one file and another when you drag forty.
+ *
+ * It THROWS BEFORE IT RETURNS if any move is bad, which is what lets the caller
+ * open its transaction knowing every destination is already settled. That
+ * ordering is the whole point: the failure this endpoint exists to prevent is a
+ * forty-file move that writes thirty-nine rows and then discovers the fortieth
+ * would land on an occupied path.
+ */
+async function planMoves(
+  projectId: string,
+  requests: ReadonlyArray<{ testId: string; filePath: string; name?: string }>,
+): Promise<PlannedMove[]> {
+  const ids = requests.map((request) => request.testId);
+  if (new Set(ids).size !== ids.length) {
+    // Two destinations for one file is not a batch, it is a contradiction —
+    // and whichever one won would depend on iteration order.
+    throw badRequest('The same file appears more than once in this batch');
+  }
+
+  /*
+   * `prisma` is the tenant-scoped client, so `projectId` here is joined by an
+   * implicit orgId — there is deliberately no orgId in this `where`. A test id
+   * from another organisation simply does not come back, and the size check
+   * below turns that into the same 404 as an id that never existed. The two are
+   * indistinguishable on purpose (lib/errors.ts): confirming that an id exists
+   * but is not yours is an existence oracle.
+   */
+  const rows = await prisma.test.findMany({
+    where: { projectId, id: { in: ids } },
+    select: { id: true, filePath: true, code: true },
+  });
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  if (byId.size !== ids.length) throw notFound('Test');
+
+  const planned: PlannedMove[] = requests.map((request) => {
+    const row = byId.get(request.testId)!;
+    const to = normalisePath(request.filePath);
+    if (!to) throw badRequest('A file needs a name');
+    assertFixtureBoundary(to, row.code.trim().length > 0 && !row.filePath.endsWith('.json'));
+    return { id: row.id, from: row.filePath, to, ...(request.name ? { name: request.name } : {}) };
+  });
+
+  // Collisions within the batch itself, which no query can see: two files
+  // dragged onto the same destination. Checked across every move including the
+  // ones that do not change path, so a file already sitting on the destination
+  // and along for the ride still counts as the occupant it is.
+  const destinations = new Set<string>();
+  for (const move of planned) {
+    if (destinations.has(move.to)) {
+      throw conflict(`Two files in this batch would both become ${move.to}`);
+    }
+    destinations.add(move.to);
+  }
+
+  /*
+   * Collisions with the rest of the project. `notIn` excludes the batch's own
+   * rows, and that exclusion is what makes a rotation work: A→B and B→A is a
+   * legal batch, because at the end no two live files share a path even though
+   * both destinations are occupied at the start. Filtering to the moves that
+   * actually change path keeps a no-op move behaving exactly as it always has
+   * on the single-file route, where the clash query is skipped outright.
+   */
+  const changed = planned.filter((move) => move.to !== move.from);
+  if (changed.length > 0) {
+    const clashes = await prisma.test.findMany({
+      where: {
+        projectId,
+        disabledAt: null,
+        filePath: { in: changed.map((move) => move.to) },
+        id: { notIn: planned.map((move) => move.id) },
+      },
+      select: { filePath: true },
+    });
+    if (clashes.length > 0) throw conflict(`${clashes[0]!.filePath} already exists`);
+  }
+
+  return planned;
+}
+
 /** Rename or move one file. */
 projectsRouter.patch('/:projectId/tests/:testId/path', requireRole('MEMBER'), async (req, res) => {
   const actor = actorOf(req);
   const input = moveTestSchema.parse(req.body);
   const projectId = String(req.params.projectId);
 
-  const test = await prisma.test.findUnique({
-    where: { id: String(req.params.testId) },
-    select: { id: true, projectId: true, filePath: true, name: true, code: true },
-  });
-  if (!test || test.projectId !== projectId) throw notFound('Test');
-
-  const target = normalisePath(input.filePath);
-  if (!target) throw badRequest('A file needs a name');
-
-  const hasRunnableCode = test.code.trim().length > 0 && !test.filePath.endsWith('.json');
-  assertFixtureBoundary(target, hasRunnableCode);
-
-  if (target !== test.filePath) {
-    const clash = await prisma.test.findFirst({
-      where: { projectId, filePath: target, disabledAt: null, id: { not: test.id } },
-      select: { id: true },
-    });
-    if (clash) throw conflict(`${target} already exists`);
-  }
+  const [move] = await planMoves(projectId, [
+    {
+      testId: String(req.params.testId),
+      filePath: input.filePath,
+      ...(input.name ? { name: input.name } : {}),
+    },
+  ]);
 
   const updated = await prisma.test.update({
-    where: { id: test.id },
-    data: { filePath: target, ...(input.name ? { name: input.name } : {}) },
+    where: { id: move!.id },
+    data: { filePath: move!.to, ...(move!.name ? { name: move!.name } : {}) },
     select: { id: true, name: true, filePath: true },
   });
 
@@ -1844,11 +2106,147 @@ projectsRouter.patch('/:projectId/tests/:testId/path', requireRole('MEMBER'), as
     actor,
     action: 'test.move',
     targetType: 'Test',
-    targetId: test.id,
-    metadata: { from: test.filePath, to: target },
+    targetId: move!.id,
+    metadata: { from: move!.from, to: move!.to },
   });
 
   res.json({ test: updated });
+});
+
+/**
+ * Move or rename many files at once — the tree's multi-select drag.
+ *
+ * The alternative the UI would otherwise be stuck with is forty PATCHes, and
+ * forty PATCHes is not a slower version of this: it is a different operation
+ * with a different failure mode. The thirty-ninth can 409 on a collision after
+ * thirty-eight have already been written, leaving a tree that matches neither
+ * what the user dragged nor what they had before, with no way to say which of
+ * the two it is closer to. So this validates the whole set first and writes it
+ * in one transaction — every file lands, or none does and the tree is exactly
+ * as it was.
+ */
+projectsRouter.post('/:projectId/tests/batch/move', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = batchMoveSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  const planned = await planMoves(projectId, input.moves);
+
+  const tests = await prisma.$transaction(async (tx) => {
+    for (const move of planned) {
+      /*
+       * A compare-and-set on the old path, not an update by id.
+       *
+       * Validation ran before the transaction opened, so between the two some
+       * other request may have moved or deleted one of these rows out from
+       * under the plan. Naming `filePath: move.from` in the `where` makes each
+       * write assert the world it was planned against: a row that moved matches
+       * nothing, the count comes back 0, and throwing here rolls the whole
+       * batch back rather than applying a plan to a tree that has changed.
+       *
+       * `updateMany` rather than `update` for the same reason it is used in
+       * team.ts — it reports a count instead of throwing a Prisma error we
+       * would have to translate, and it is filterable, so the tenancy extension
+       * merges the orgId into this `where` too.
+       */
+      const applied = await tx.test.updateMany({
+        where: { id: move.id, projectId, filePath: move.from },
+        data: { filePath: move.to, ...(move.name ? { name: move.name } : {}) },
+      });
+      if (applied.count !== 1) {
+        throw conflict(
+          `${move.from} changed while this batch was being applied — nothing was moved`,
+        );
+      }
+    }
+
+    return tx.test.findMany({
+      where: { id: { in: planned.map((move) => move.id) } },
+      orderBy: [{ filePath: 'asc' }],
+      select: { id: true, name: true, filePath: true },
+    });
+  });
+
+  await audit({
+    actor,
+    action: 'tests.batch-move',
+    targetType: 'Project',
+    targetId: projectId,
+    metadata: {
+      files: planned.length,
+      moves: planned.map((move) => ({ from: move.from, to: move.to })),
+    },
+  });
+
+  res.json({ moved: planned.length, tests });
+});
+
+/**
+ * Soft-delete many files at once. Same guarantee as the batch move, and soft
+ * for the same reason the single-file delete is (see below): a test carries its
+ * version history and its past results, and a hard delete would rewrite the
+ * record of what was tested when — forty times over, here.
+ */
+projectsRouter.post('/:projectId/tests/batch/delete', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = batchDeleteSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  /*
+   * Deduplicated rather than rejected, which is the opposite of what the batch
+   * move does with a repeated id — and deliberately. Two moves of one file are
+   * two different destinations and there is no right answer; two deletes of one
+   * file are the same instruction said twice, and the answer is obvious.
+   */
+  const ids = [...new Set(input.testIds)];
+
+  const rows = await prisma.test.findMany({
+    where: { projectId, id: { in: ids } },
+    select: { id: true, name: true, filePath: true, disabledAt: true },
+  });
+  // Scoped client: another org's id, another project's id and a made-up id all
+  // fail to come back and all become the same 404.
+  if (rows.length !== ids.length) throw notFound('Test');
+
+  const gone = rows.find((row) => row.disabledAt);
+  if (gone) throw conflict(`${gone.filePath} is already deleted`);
+
+  const deletedAt = new Date();
+
+  /*
+   * One statement would already be atomic; the transaction is here for the
+   * check that follows it. `disabledAt: null` in the `where` means a file
+   * deleted by someone else a moment ago is simply not among the rows updated —
+   * so the count is how the race is detected, and the rollback is how the batch
+   * stays all-or-nothing once it has been.
+   */
+  await prisma.$transaction(async (tx) => {
+    const applied = await tx.test.updateMany({
+      where: { projectId, id: { in: ids }, disabledAt: null },
+      data: { disabledAt: deletedAt },
+    });
+    if (applied.count !== ids.length) {
+      throw conflict(
+        'One of those files was deleted while this batch was being applied — nothing was deleted',
+      );
+    }
+  });
+
+  await audit({
+    actor,
+    action: 'tests.batch-delete',
+    targetType: 'Project',
+    targetId: projectId,
+    metadata: {
+      files: ids.length,
+      tests: rows.map((row) => ({ id: row.id, filePath: row.filePath })),
+    },
+  });
+
+  res.json({
+    deleted: ids.length,
+    tests: rows.map((row) => ({ id: row.id, name: row.name, filePath: row.filePath })),
+  });
 });
 
 /**

@@ -1,4 +1,4 @@
-import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
+import { test as base, expect, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { API_URL } from '../playwright.config';
 
 export { expect, API_URL };
@@ -233,4 +233,29 @@ export async function shellReady(page: Page): Promise<void> {
    * landed, so that is what this waits on.
    */
   await expect(page.getByRole('button', { name: 'No project' })).toHaveCount(0);
+}
+
+/**
+ * The open-file tab for `filePath`.
+ *
+ * Addressed by TITLE, not by the close button's name. The strip labels a tab
+ * with its BASENAME, the way every editor does — so `Close checkout/a.spec.ts`
+ * stopped existing when the panel was rebuilt, and a basename alone is not
+ * unique across folders. The tab's `title` is the full path, which is the only
+ * thing here that identifies one file and one file only.
+ */
+export function openTab(page: Page, filePath: string): Locator {
+  return page.locator(`[role="tab"][title^="${filePath}"]`);
+}
+
+/**
+ * The explorer row for `filePath`.
+ *
+ * By title, which on a file row IS the path. The old tree put the test's NAME
+ * there; the rebuilt one puts the path, because a name is neither unique nor
+ * stable and the row is a file. Anchored to `[role="treeitem"]` so this cannot
+ * accidentally match the tab strip, which also carries paths in titles.
+ */
+export function treeRow(page: Page, filePath: string): Locator {
+  return page.locator(`[role="treeitem"] [title="${filePath}"]`).first();
 }

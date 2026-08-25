@@ -71,8 +71,18 @@ test.describe('reading a real failure', () => {
   });
 
   test('the header states the counts and the gate decision', async ({ page, api }) => {
-    const [run] = await recentRuns(api, 1);
-    test.skip(!run, 'No runs in this org yet.');
+    /*
+     * The newest FINISHED run, not simply the newest.
+     *
+     * Counts and a gate decision are things a run has once it has stopped, and
+     * this suite itself queues runs it deliberately does not wait for — so
+     * `recentRuns(api, 1)` regularly hands back something still QUEUED and the
+     * test fails on data it created two files earlier.
+     */
+    const run = (await recentRuns(api, 25)).find((r) =>
+      ['PASSED', 'FAILED', 'ERRORED', 'CANCELLED'].includes(r.status),
+    );
+    test.skip(!run, 'No finished runs in this org yet. Let one complete, or seed the demo data.');
 
     await page.goto(`/runs/${run!.id}`);
 
