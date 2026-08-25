@@ -303,43 +303,56 @@ settingsRouter.get('/usage', async (req, res) => {
   const days = Math.min(90, Number(req.query.days ?? 30));
   const since = new Date(Date.now() - days * 86_400_000);
 
-  const calls = await prisma.agentCall.findMany({
-    where: { createdAt: { gte: since } },
-    orderBy: { createdAt: 'desc' },
-    select: {
-      agent: true,
-      model: true,
-      inputTokens: true,
-      outputTokens: true,
-      cacheReadTokens: true,
-      costCents: true,
-      durationMs: true,
-      error: true,
-      createdAt: true,
-    },
-  });
+  /*
+   * Five sums and a count, computed by Postgres.
+   *
+   * This used to `findMany` every AgentCall in the window and add the columns up
+   * in JavaScript. That is a linear read of a table that grows with every model
+   * call the product makes: a busy org's 30-day window is hundreds of thousands
+   * of rows, all of them serialised, shipped over the wire and turned into
+   * objects so that six numbers could come out the other end. `groupBy` does the
+   * same arithmetic where the rows already are and returns one row per agent —
+   * five, today, and never more than AgentKind has members.
+   *
+   * Both queries run through the tenant-scoped client, so `orgId` is on the
+   * where clause without being written here, and the pair is served by the
+   * existing (orgId, createdAt) index.
+   */
+  const [totals, failures] = await Promise.all([
+    prisma.agentCall.groupBy({
+      by: ['agent'],
+      where: { createdAt: { gte: since } },
+      _count: { _all: true },
+      _sum: { inputTokens: true, outputTokens: true, cacheReadTokens: true, costCents: true },
+    }),
+    /*
+     * A second pass rather than a CASE expression, because `_count` counts rows
+     * and `error` is nullable: one groupBy cannot both count every call and
+     * count the failed ones. Same index, same window, and the row count is the
+     * number of agents.
+     */
+    prisma.agentCall.groupBy({
+      by: ['agent'],
+      where: { createdAt: { gte: since }, error: { not: null } },
+      _count: { _all: true },
+    }),
+  ]);
 
-  const byAgent = new Map<
-    string,
-    { agent: string; calls: number; inputTokens: number; outputTokens: number; costCents: number; failures: number }
-  >();
+  const failuresByAgent = new Map(failures.map((row) => [row.agent, row._count._all]));
 
-  for (const call of calls) {
-    const row = byAgent.get(call.agent) ?? {
-      agent: call.agent,
-      calls: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      costCents: 0,
-      failures: 0,
-    };
-    row.calls += 1;
-    row.inputTokens += call.inputTokens + call.cacheReadTokens;
-    row.outputTokens += call.outputTokens;
-    row.costCents += call.costCents;
-    if (call.error) row.failures += 1;
-    byAgent.set(call.agent, row);
-  }
+  const byAgent = totals
+    .map((row) => ({
+      agent: row.agent,
+      calls: row._count._all,
+      // Cache reads are tokens the org was billed for at a discount, not tokens
+      // it did not send — the old loop folded them into input and this must keep
+      // doing that or the number on the screen changes meaning.
+      inputTokens: (row._sum.inputTokens ?? 0) + (row._sum.cacheReadTokens ?? 0),
+      outputTokens: row._sum.outputTokens ?? 0,
+      costCents: row._sum.costCents ?? 0,
+      failures: failuresByAgent.get(row.agent) ?? 0,
+    }))
+    .sort((a, b) => b.costCents - a.costCents);
 
   /*
    * The ceiling next to the meter. The budget is deploy-wide env
@@ -358,11 +371,14 @@ settingsRouter.get('/usage', async (req, res) => {
 
   res.json({
     days,
-    totalCalls: calls.length,
-    totalCostCents: calls.reduce((sum, c) => sum + c.costCents, 0),
+    // Summed from the groups rather than counted again: the groups already
+    // partition every call in the window, so a third query would only be a
+    // chance for the total and the breakdown to disagree.
+    totalCalls: byAgent.reduce((sum, row) => sum + row.calls, 0),
+    totalCostCents: byAgent.reduce((sum, row) => sum + row.costCents, 0),
     monthlyTokenBudget: env.QAAI_MONTHLY_TOKEN_BUDGET,
     tokensThisMonth: Number(monthRow?.quantity ?? 0n),
-    byAgent: [...byAgent.values()].sort((a, b) => b.costCents - a.costCents),
+    byAgent,
   });
 });
 

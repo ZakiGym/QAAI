@@ -297,7 +297,7 @@ export function servesPool(runnerPools: readonly string[], jobPool: string | nul
   return runnerPools.includes(jobPool);
 }
 
-interface RunnerSnapshot {
+export interface RunnerSnapshot {
   id: string;
   name: string;
   pools: string[];
@@ -311,6 +311,82 @@ export function isOnline(lastSeenAt: Date | null, now = Date.now()): boolean {
 }
 
 /**
+ * The five ways a pool can stand in relation to a piece of work.
+ *
+ * Ordered by what has to be fixed, which is also the order they are checked:
+ * you cannot have the wrong pool before you have a runner, and you cannot lack
+ * chromium before you are online.
+ */
+export type PoolReadinessCode =
+  | 'ready'
+  | 'no-runners'
+  | 'no-pool-runners'
+  | 'none-online'
+  | 'missing-capabilities';
+
+export interface PoolReadiness {
+  code: PoolReadinessCode;
+  ready: boolean;
+  /** Registered, unrevoked runners that serve this pool, in registration order. */
+  serving: RunnerSnapshot[];
+  /** How many of those checked in inside the online window. */
+  online: number;
+  /**
+   * The union of what the ONLINE runners lack, as sentence fragments. Empty
+   * unless `code` is `missing-capabilities`: a pool with nobody online has no
+   * shortfall to report, it has nobody to report one about.
+   */
+  missing: string[];
+}
+
+/**
+ * Where a pool stands, as facts rather than prose.
+ *
+ * Extracted so the two sentences that describe it — the past-tense one written
+ * onto a suppressed job by the sweep, and the future-tense one shown to
+ * whoever just started a run — are two renderings of ONE judgement. They are
+ * written for different moments and must read differently, but "is there a
+ * runner for this" is not allowed to have two answers depending on which of
+ * them you happen to be reading.
+ */
+export function assessPool(
+  requirements: JobRequirements,
+  pool: string | null,
+  runners: readonly RunnerSnapshot[],
+  now = Date.now(),
+): PoolReadiness {
+  const live = runners.filter((r) => !r.revokedAt);
+  const serving = live.filter((r) => servesPool(r.pools, pool));
+  const onlineRunners = serving.filter((r) => isOnline(r.lastSeenAt, now));
+  const base = { serving, online: onlineRunners.length };
+
+  if (live.length === 0) return { code: 'no-runners', ready: false, missing: [], ...base };
+  if (serving.length === 0) return { code: 'no-pool-runners', ready: false, missing: [], ...base };
+  if (onlineRunners.length === 0) return { code: 'none-online', ready: false, missing: [], ...base };
+
+  // Online, but possibly not equipped. Report the union of what is missing
+  // rather than one runner's shortfall: "install chromium" is actionable,
+  // "runner build-02 lacks chromium" invites installing it on the wrong box.
+  const shortfalls = onlineRunners.map((r) =>
+    missingCapabilities(requirements, parseCapabilities(r.capabilities)),
+  );
+  if (shortfalls.some((m) => m.length === 0)) {
+    return { code: 'ready', ready: true, missing: [], ...base };
+  }
+  return {
+    code: 'missing-capabilities',
+    ready: false,
+    missing: [...new Set(shortfalls.flat())],
+    ...base,
+  };
+}
+
+/** `" in the \"eu-staging\" pool"`, or nothing at all for the default pool. */
+function poolClause(pool: string | null): string {
+  return pool ? ` in the "${pool}" pool` : '';
+}
+
+/**
  * Why nothing in this org can run this job — or null when something can.
  *
  * Null is the fail-open answer and it is returned generously: if any runner
@@ -318,6 +394,10 @@ export function isOnline(lastSeenAt: Date | null, now = Date.now()): boolean {
  * has already waited. Only a positive "nobody can" produces a sentence, and
  * that sentence is the entire user-facing explanation of a suppressed test, so
  * it names what to install and where.
+ *
+ * Past tense throughout, because by the time anyone reads it the tests have
+ * already been reported SKIPPED. `describeDispatch` below is the same facts in
+ * the tense of a run that has just been queued.
  */
 export function describeUnservable(
   requirements: JobRequirements,
@@ -325,50 +405,311 @@ export function describeUnservable(
   runners: readonly RunnerSnapshot[],
   now = Date.now(),
 ): string | null {
-  const live = runners.filter((r) => !r.revokedAt);
-  const forPool = live.filter((r) => servesPool(r.pools, pool));
-  const where = pool ? ` in the "${pool}" pool` : '';
+  const state = assessPool(requirements, pool, runners, now);
+  const where = poolClause(pool);
 
-  if (live.length === 0) {
-    return (
-      `No on-prem runner has been registered for this organisation, so these tests never ran. ` +
-      `Register one in Settings → Runners and start the agent on a host inside the network ` +
-      `(\`qaai runner --api-url <your QAAI URL> --token <runner token>\`).`
-    );
+  switch (state.code) {
+    case 'ready':
+      return null;
+    case 'no-runners':
+      return (
+        `No on-prem runner has been registered for this organisation, so these tests never ran. ` +
+        `Register one in Settings → Runners and start the agent on a host inside the network ` +
+        `(\`qaai runner --api-url <your QAAI URL> --token <runner token>\`).`
+      );
+    case 'no-pool-runners':
+      return (
+        `No on-prem runner${where} is registered, so these tests never ran. ` +
+        `Add "${pool}" to the pools of an existing runner, or register one for it in Settings → Runners.`
+      );
+    case 'none-online':
+      return (
+        `No on-prem runner${where} has checked in recently, so these tests never ran. ` +
+        `Registered runners: ${state.serving.map((r) => r.name).slice(0, 5).join(', ')}. ` +
+        `Start the agent on those hosts — it only makes outbound ` +
+        `HTTPS to QAAI, so nothing needs to be opened inbound.`
+      );
+    case 'missing-capabilities':
+      return (
+        `No on-prem runner${where} has ${state.missing.join(', ')}, so these tests never ran. ` +
+        `Install what is missing on a runner host and restart the agent — it re-reports its ` +
+        `capabilities on every connect.`
+      );
   }
-  if (forPool.length === 0) {
-    return (
-      `No on-prem runner${where} is registered, so these tests never ran. ` +
-      `Add "${pool}" to the pools of an existing runner, or register one for it in Settings → Runners.`
-    );
+}
+
+/**
+ * What to tell the caller who just pointed a run at an on-prem pool.
+ *
+ * This is the honesty fix the whole feature turns on. A run dispatched to a
+ * pool that nothing is listening to sits QUEUED and looks *exactly* like a run
+ * that is executing slowly — same status, same spinner, same absence of
+ * results — and stays that way for the fifteen minutes the sweep waits before
+ * it will say anything at all. Fifteen minutes of "is it working?" is how a
+ * customer concludes the feature is broken, and they are not wrong to.
+ *
+ * So the moment the jobs are created we look at the pool and, if nothing there
+ * can take them, say so in the response — before anyone has had to wonder.
+ * Null when the pool is ready, because a warning that fires on the happy path
+ * is a warning people learn to scroll past.
+ *
+ * Deliberately NOT a refusal. The run is still created, the jobs are still
+ * queued, and an agent that starts thirty seconds later picks them up
+ * normally — a runner restarting during a deploy is the common case, and
+ * rejecting the run would turn a hiccup into a failed build.
+ */
+export function describeDispatch(
+  requirements: JobRequirements,
+  pool: string | null,
+  runners: readonly RunnerSnapshot[],
+  now = Date.now(),
+): string | null {
+  const state = assessPool(requirements, pool, runners, now);
+  const where = poolClause(pool);
+  const grace =
+    `Nothing needs to be opened inbound — the agent polls out — and if nothing claims this work ` +
+    `within ${Math.round(RUNNER_UNSERVABLE_GRACE_MS / 60_000)} minutes QAAI reports the tests as ` +
+    `skipped rather than leaving the run hanging.`;
+
+  switch (state.code) {
+    case 'ready':
+      return null;
+    case 'no-runners':
+      return (
+        `This run was sent to your on-prem pool, but no runner is registered for this ` +
+        `organisation, so nothing will claim it. Register one in Settings → Runners and start ` +
+        `the agent on a host that can reach this environment. ${grace}`
+      );
+    case 'no-pool-runners':
+      return (
+        `This run was sent to the "${pool}" pool, and no registered runner serves it, so nothing ` +
+        `will claim it. Add "${pool}" to the pools of an existing runner, or register one for ` +
+        `it in Settings → Runners. ${grace}`
+      );
+    case 'none-online':
+      return (
+        `No on-prem runner${where} has checked in within the last minute, so nothing is claiming ` +
+        `work there right now. Registered runners: ` +
+        `${state.serving.map((r) => r.name).slice(0, 5).join(', ')}. If one is restarting this ` +
+        `resolves on its own. ${grace}`
+      );
+    case 'missing-capabilities':
+      return (
+        `The runners${where} are online, but none of them has ${state.missing.join(', ')}, so ` +
+        `this run will not be claimed. Install what is missing on a runner host and restart the ` +
+        `agent — it re-reports its capabilities on every connect. ${grace}`
+      );
   }
+}
 
-  const online = forPool.filter((r) => isOnline(r.lastSeenAt, now));
-  if (online.length === 0) {
-    const names = forPool
-      .map((r) => r.name)
-      .slice(0, 5)
-      .join(', ');
-    return (
-      `No on-prem runner${where} has checked in recently, so these tests never ran. ` +
-      `Registered runners: ${names}. Start the agent on those hosts — it only makes outbound ` +
-      `HTTPS to QAAI, so nothing needs to be opened inbound.`
-    );
+// ─── The fleet, by pool ──────────────────────────────────────────────────────
+
+/** A runner as the pools view reads it: liveness plus when it last took work. */
+export interface PoolFleetMember extends RunnerSnapshot {
+  lastClaimAt: Date | null;
+}
+
+export interface PoolMemberView {
+  id: string;
+  name: string;
+  online: boolean;
+  lastSeenAt: Date | null;
+  lastClaimAt: Date | null;
+  /** True when this runner names no pools and therefore serves all of them. */
+  servesAll: boolean;
+}
+
+export interface PoolSummary {
+  /** Null is the default pool — where a run whose environment names none would go. */
+  pool: string | null;
+  code: PoolReadinessCode;
+  ready: boolean;
+  runners: PoolMemberView[];
+  online: number;
+  /** The environments whose runs route here. Empty means nothing will ever queue. */
+  environments: Array<{ id: string; projectId: string; name: string }>;
+  queued: number;
+  inFlight: number;
+  /**
+   * The newest claim by any runner serving this pool.
+   *
+   * The single most useful fact on the runners screen, and the one nothing
+   * rendered before: "online" says a process is running, `lastClaimAt` says it
+   * is actually asking for work. An agent wedged after a bad deploy heartbeats
+   * happily and claims nothing, which from every other angle looks healthy.
+   */
+  lastClaimAt: Date | null;
+  /** One sentence for the screen. Always present — a healthy pool says so too. */
+  note: string;
+}
+
+const NAMES_SHOWN = 4;
+
+function joinNames(names: string[]): string {
+  const shown = names.slice(0, NAMES_SHOWN).join(', ');
+  return names.length > NAMES_SHOWN ? `${shown} and ${names.length - NAMES_SHOWN} more` : shown;
+}
+
+/**
+ * The pools an org actually has, and whether anything is listening to each.
+ *
+ * This exists to answer one support question — "I registered a runner and
+ * nothing happens" — from the screen instead of from a database. Three
+ * independent things have to line up before a single test executes on-prem: an
+ * environment has to name a pool, a runner has to serve that pool, and its
+ * agent has to be running. Each of those was visible somewhere, none of them
+ * together, and the mismatch is invisible precisely because every individual
+ * piece looks fine.
+ *
+ * So the pool is the row, not the runner: a pool with an environment pointing
+ * at it and no runner serving it is a broken configuration that renders as
+ * nothing at all on a list of runners.
+ *
+ * Pure, and everything it needs is passed in — the route does the reading, and
+ * the arithmetic is testable without a database.
+ */
+export function summarisePools(args: {
+  runners: readonly PoolFleetMember[];
+  environments: readonly { id: string; projectId: string; name: string; runnerPool: string | null }[];
+  /**
+   * Live job counts per (pool, status) — a `groupBy`, not a page of rows. A
+   * `take` here would silently under-count the pool with the most work in it,
+   * which is precisely the pool anyone is looking at this screen about.
+   */
+  jobs: readonly { pool: string | null; status: RunnerJobStatus; count: number }[];
+  now?: number;
+}): PoolSummary[] {
+  const now = args.now ?? Date.now();
+  const live = args.runners.filter((r) => !r.revokedAt);
+
+  /*
+   * Which pools to show. The union of everything that names one, because each
+   * source alone hides a different failure: only-runners hides an environment
+   * pointed at a pool nobody serves, only-environments hides a runner sitting
+   * in a pool nothing routes to, and only-jobs hides both until a run is
+   * already stuck.
+   *
+   * The default pool (null) appears only when work is actually queued for it —
+   * an org with no on-prem environments should not be shown an empty row for a
+   * pool it has never used.
+   */
+  const named = new Set<string>();
+  for (const runner of live) for (const pool of runner.pools) named.add(pool);
+  for (const environment of args.environments) {
+    if (environment.runnerPool) named.add(environment.runnerPool);
   }
+  for (const job of args.jobs) if (job.pool && job.count > 0) named.add(job.pool);
 
-  // Online, but none of them has what the job needs. Report the union of what
-  // is missing rather than one runner's shortfall: "install chromium" is
-  // actionable, "runner build-02 lacks chromium" invites installing it on the
-  // wrong box.
-  const shortfalls = online.map((r) => missingCapabilities(requirements, parseCapabilities(r.capabilities)));
-  if (shortfalls.some((m) => m.length === 0)) return null;
+  const pools: Array<string | null> = [...named].sort((a, b) => a.localeCompare(b));
+  if (args.jobs.some((job) => job.pool === null && job.count > 0)) pools.push(null);
 
-  const needed = [...new Set(shortfalls.flat())];
-  return (
-    `No on-prem runner${where} has ${needed.join(', ')}, so these tests never ran. ` +
-    `Install what is missing on a runner host and restart the agent — it re-reports its ` +
-    `capabilities on every connect.`
-  );
+  return pools.map((pool) => {
+    const serving = live.filter((r) => servesPool(r.pools, pool));
+    const environments = args.environments
+      .filter((e) => e.runnerPool === pool)
+      .map((e) => ({ id: e.id, projectId: e.projectId, name: e.name }));
+    const forPool = args.jobs.filter((job) => job.pool === pool);
+    const total = (statuses: readonly RunnerJobStatus[]): number =>
+      forPool.reduce((sum, job) => (statuses.includes(job.status) ? sum + job.count : sum), 0);
+    const queued = total(['QUEUED']);
+    const inFlight = total(['CLAIMED', 'RUNNING']);
+
+    /*
+     * Capabilities are deliberately not assessed here. Whether a runner has
+     * chromium is a question about a JOB, and answering it at pool level would
+     * mean inventing a job that does not exist — so this asks the part that IS
+     * a property of the pool: is anyone registered, and is anyone up.
+     */
+    const state = assessPool({ testTypes: [], browsers: [], toolchains: [] }, pool, live, now);
+
+    const claims = serving
+      .map((r) => r.lastClaimAt)
+      .filter((d): d is Date => d !== null)
+      .sort((a, b) => b.getTime() - a.getTime());
+
+    return {
+      pool,
+      code: state.code,
+      ready: state.ready,
+      online: state.online,
+      environments,
+      queued,
+      inFlight,
+      lastClaimAt: claims[0] ?? null,
+      runners: serving.map((r) => ({
+        id: r.id,
+        name: r.name,
+        online: isOnline(r.lastSeenAt, now),
+        lastSeenAt: r.lastSeenAt,
+        lastClaimAt: r.lastClaimAt,
+        servesAll: r.pools.length === 0,
+      })),
+      note: poolNote({
+        pool,
+        code: state.code,
+        online: state.online,
+        serving: serving.map((r) => r.name),
+        environments: environments.length,
+        queued,
+        inFlight,
+      }),
+    };
+  });
+}
+
+/**
+ * The row's sentence.
+ *
+ * Written so that the FIRST clause is always the thing to fix. A pool that is
+ * healthy but that nothing routes to is still a misconfiguration — it is the
+ * exact state an operator reaches after registering their first runner and
+ * stopping — so it gets said out loud rather than rendering as a reassuring
+ * green row.
+ */
+function poolNote(s: {
+  pool: string | null;
+  code: PoolReadinessCode;
+  online: number;
+  serving: string[];
+  environments: number;
+  queued: number;
+  inFlight: number;
+}): string {
+  const where = s.pool ? `the "${s.pool}" pool` : 'the default pool';
+  const routed =
+    s.environments === 0
+      ? `No environment points at ${where}, so nothing will ever be queued for it — set the pool on an environment to send its runs here.`
+      : `${s.environments} environment${s.environments === 1 ? '' : 's'} route${s.environments === 1 ? 's' : ''} here.`;
+
+  switch (s.code) {
+    case 'no-runners':
+    case 'no-pool-runners':
+      return (
+        `No runner serves ${where}. ` +
+        (s.environments === 0
+          ? `Nothing points at it either, so it is inert.`
+          : `${s.environments} environment${s.environments === 1 ? '' : 's'} route${s.environments === 1 ? 's' : ''} here, so their runs queue with nobody to claim them and are reported skipped after ${Math.round(RUNNER_UNSERVABLE_GRACE_MS / 60_000)} minutes.`)
+      );
+    case 'none-online':
+      return (
+        `None of the ${s.serving.length} runner${s.serving.length === 1 ? '' : 's'} registered for ${where} has checked in within the last minute — ${joinNames(s.serving)}. ` +
+        (s.queued > 0
+          ? `${s.queued} job${s.queued === 1 ? ' is' : 's are'} waiting on them.`
+          : `Nothing is queued, so nothing is stuck yet.`)
+      );
+    default:
+      if (s.queued > 0) {
+        return (
+          `${s.queued} job${s.queued === 1 ? '' : 's'} waiting and ${s.inFlight} in flight, with ` +
+          `${s.online} runner${s.online === 1 ? '' : 's'} online. ${routed}`
+        );
+      }
+      return (
+        `${s.online} runner${s.online === 1 ? '' : 's'} online and idle` +
+        (s.inFlight > 0 ? `, ${s.inFlight} job${s.inFlight === 1 ? '' : 's'} in flight` : '') +
+        `. ${routed}`
+      );
+  }
 }
 
 // ─── Tokens ──────────────────────────────────────────────────────────────────

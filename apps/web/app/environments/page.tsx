@@ -16,6 +16,23 @@ import { cn } from '../../lib/cn';
 const KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
 
 /**
+ * Where an environment's runs execute.
+ *
+ * `runnerPool` is not on the shared `Environment` type because
+ * `GET /projects/:id/environments` does not return it — the pool lives on the
+ * runners side of the API, which is also the only place that knows which pool
+ * names are real. So this screen reads it from `GET /runners/pools`, which
+ * hands back the org's environments alongside the pools themselves.
+ */
+interface PoolsView {
+  knownPools: string[];
+  environments: Array<{ id: string; projectId: string; name: string; runnerPool: string | null }>;
+}
+
+/** The sentinel for "QAAI's own workers", which is a real choice and not an absence. */
+const CLOUD = '';
+
+/**
  * Environments + their secrets (§1–2).
  *
  * An environment is a base URL plus a set of credentials the tests run against.
@@ -46,6 +63,18 @@ export default function EnvironmentsPage() {
   // The base URL of the selected environment, and whether it has been edited.
   const [baseUrl, setBaseUrl] = useState('');
   const [savingUrl, setSavingUrl] = useState(false);
+
+  // Where runs against the selected environment execute. Null means the pools
+  // endpoint has not answered (or is unavailable) — distinct from an empty
+  // list, which is a real answer meaning "no runner is registered".
+  const [pools, setPools] = useState<PoolsView | null>(null);
+  const [pool, setPool] = useState<string>(CLOUD);
+  const [savingPool, setSavingPool] = useState(false);
+  // A confirmation and a refusal are different things and must not share a
+  // colour: the refusal names the pools that DO exist and is the whole point of
+  // saving rather than binding the select straight to the server.
+  const [poolNote, setPoolNote] = useState<string | null>(null);
+  const [poolError, setPoolError] = useState<string | null>(null);
 
   // The environment awaiting a delete confirmation.
   const [pendingDelete, setPendingDelete] = useState<Environment | null>(null);
@@ -88,13 +117,45 @@ export default function EnvironmentsPage() {
       .finally(() => setLoadingEnvs(false));
   }, [projectId, loadEnvs, router]);
 
+  /*
+   * The pools, loaded once per visit and reloaded after an edit.
+   *
+   * Soft on every failure: an org with no ENTERPRISE runners gets nothing
+   * useful from this endpoint, and it must never be the reason the environment
+   * list fails to render. `pools` staying null hides the control entirely.
+   */
+  const loadPools = useCallback(async () => {
+    const view = await api<PoolsView>('/runners/pools').catch(() => null);
+    setPools(view);
+  }, []);
+
+  useEffect(() => {
+    void loadPools();
+  }, [loadPools]);
+
   const selectedEnv = envs.find((e) => e.id === selected) ?? null;
+  const selectedPool =
+    pools?.environments.find((e) => e.id === selectedEnv?.id)?.runnerPool ?? null;
 
   // The field follows the selection: switching rows must show that row's URL,
   // not keep the one you were looking at a moment ago.
   useEffect(() => {
     setBaseUrl(selectedEnv?.baseUrl ?? '');
   }, [selectedEnv?.id, selectedEnv?.baseUrl]);
+
+  // The select mirrors the server's answer, including the one that arrives
+  // after a save. Deliberately NOT keyed on the environment as well: a
+  // successful save reloads the pools, which lands here, and clearing the
+  // confirmation in the same pass would make the save look like it did nothing.
+  useEffect(() => {
+    setPool(selectedPool ?? CLOUD);
+  }, [selectedPool]);
+
+  // Switching environments does clear both — each sentence names an environment.
+  useEffect(() => {
+    setPoolNote(null);
+    setPoolError(null);
+  }, [selectedEnv?.id]);
 
   async function createEnv(e: React.FormEvent) {
     e.preventDefault();
@@ -132,6 +193,43 @@ export default function EnvironmentsPage() {
       setError(err instanceof Error ? err.message : 'Could not update the base URL');
     } finally {
       setSavingUrl(false);
+    }
+  }
+
+  /**
+   * Move an environment between QAAI's workers and the customer's own.
+   *
+   * The API refuses a pool no registered runner answers to, and that refusal is
+   * the reason this is a save rather than a live-bound select: being told "no
+   * runner serves that" at the moment you choose it is the difference between
+   * finding out now and finding out from a run that sat queued for fifteen
+   * minutes.
+   */
+  async function savePool(env: Environment) {
+    if (savingPool) return;
+    const next = pool === CLOUD ? null : pool;
+    setSavingPool(true);
+    setPoolNote(null);
+    setPoolError(null);
+    try {
+      await api(`/runners/pools/environments/${env.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ runnerPool: next }),
+      });
+      await loadPools();
+      setPoolNote(
+        next === null
+          ? `Runs against ${env.name} go to QAAI's workers.`
+          : `Runs against ${env.name} are handed to the “${next}” pool.`,
+      );
+    } catch (err) {
+      // Kept beside the control rather than in the page-level banner: the
+      // message names the pools that do exist, and it is only readable next to
+      // the field that got it wrong.
+      setPoolError(err instanceof Error ? err.message : 'Could not change the runner pool');
+      setPool(selectedPool ?? CLOUD);
+    } finally {
+      setSavingPool(false);
     }
   }
 
@@ -315,6 +413,18 @@ export default function EnvironmentsPage() {
                   every run against {selectedEnv.name} starts here
                 </p>
 
+                <RunnerPoolField
+                  environmentName={selectedEnv.name}
+                  pools={pools}
+                  value={pool}
+                  current={selectedPool}
+                  saving={savingPool}
+                  note={poolNote}
+                  error={poolError}
+                  onChange={setPool}
+                  onSave={() => void savePool(selectedEnv)}
+                />
+
                 {projectId && (
                   <SecretsPanel projectId={projectId} environmentId={selectedEnv.id} />
                 )}
@@ -350,5 +460,102 @@ export default function EnvironmentsPage() {
         busy={deleting}
       />
     </Page>
+  );
+}
+
+/**
+ * Where this environment's runs execute — the switch the whole on-prem feature
+ * turns on.
+ *
+ * It is a select and not a text box because the pool name has to match a
+ * runner's, exactly, and a typo produces a run that queues against nothing and
+ * looks identical to a run that is merely slow. The options are the pools that
+ * registered runners actually answer to, which makes the common mistake
+ * unspellable.
+ *
+ * Hidden entirely when no runner is registered. An org on QAAI's workers has no
+ * decision to make here, and a disabled control offering an empty list is a
+ * question mark on a screen that is otherwise about base URLs and secrets.
+ */
+function RunnerPoolField({
+  environmentName,
+  pools,
+  value,
+  current,
+  saving,
+  note,
+  error,
+  onChange,
+  onSave,
+}: {
+  environmentName: string;
+  pools: PoolsView | null;
+  value: string;
+  /** What the server currently holds, so "dirty" is a comparison and not a guess. */
+  current: string | null;
+  saving: boolean;
+  note: string | null;
+  error: string | null;
+  onChange: (pool: string) => void;
+  onSave: () => void;
+}) {
+  /*
+   * Hidden for an org that has no runners and is not pointed at a pool — there
+   * is no decision to make, and a disabled control offering an empty list is a
+   * question mark on a screen otherwise about base URLs and secrets.
+   *
+   * `current` overrides that. An environment still pointed at a pool whose last
+   * runner was revoked is in the worst state this feature has, and hiding the
+   * control would leave the only evidence of it off the screen entirely.
+   */
+  if (!pools || (pools.knownPools.length === 0 && current === null)) return null;
+
+  const dirty = value !== (current ?? CLOUD);
+
+  return (
+    <div className="mt-7">
+      <SectionLabel>Executes on</SectionLabel>
+      <form
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          onSave();
+        }}
+      >
+        <select
+          aria-label="Runner pool"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="border-line bg-surface-1 focus:border-accent min-w-0 flex-1 rounded-md border px-3 py-2 text-[12px] outline-none transition-colors"
+        >
+          <option value={CLOUD}>QAAI&apos;s workers (cloud)</option>
+          {pools.knownPools.map((name) => (
+            <option key={name} value={name}>
+              your runners · {name}
+            </option>
+          ))}
+          {/* A pool the environment already names but no live runner serves —
+              a revoked runner, or a rename. Kept in the list so the control
+              shows the truth rather than silently reading as "cloud". */}
+          {current && !pools.knownPools.includes(current) && (
+            <option value={current}>{current} · no runner serves this</option>
+          )}
+        </select>
+        <Button type="submit" loading={saving} disabled={!dirty}>
+          Save
+        </Button>
+      </form>
+      {error && (
+        <p role="alert" className="text-fail text-micro mt-1.5 leading-relaxed">
+          {error}
+        </p>
+      )}
+      <p className="text-ink-faint text-micro mt-1.5 leading-relaxed">
+        {note ??
+          (current === null
+            ? `Runs against ${environmentName} execute on QAAI's workers, so this URL has to be reachable from the internet. Pick a pool to run them inside your own network instead.`
+            : `Runs against ${environmentName} are handed to your “${current}” pool and never touch QAAI's workers. If nothing in that pool is online, the run says so instead of hanging.`)}
+      </p>
+    </div>
   );
 }

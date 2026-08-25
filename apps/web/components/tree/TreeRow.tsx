@@ -72,6 +72,20 @@ export interface TreeRowProps {
   draggable: boolean;
   /** Files a `hide` pattern removed from beneath this folder. Never silently zero. */
   hiddenCount: number;
+  /**
+   * What this folder-shaped row IS, for the screen reader and the tooltips —
+   * `folder`, or `suite` when the tree is grouped by suite.
+   *
+   * A suite row is not a folder and announcing it as one is not a small
+   * inaccuracy: "Rename" on it renames a database row, and somebody who cannot
+   * see the panel has only this word to tell the two apart.
+   */
+  dirNoun?: string;
+  /**
+   * Whether the hover "+" appears. False on a row with no path — a new file
+   * "in" a suite heading would silently land at the project root.
+   */
+  canAdd?: boolean;
 
   onSelect: (mods: { shift: boolean; meta: boolean; ctrl: boolean }) => void;
   onToggle: (alsoSiblings: boolean) => void;
@@ -310,6 +324,8 @@ export function TreeRow(props: TreeRowProps) {
     renameError,
     draggable,
     hiddenCount,
+    dirNoun = 'folder',
+    canAdd = true,
     onSelect,
     onToggle,
     onSegment,
@@ -481,7 +497,7 @@ export function TreeRow(props: TreeRowProps) {
         </span>
       )}
 
-      {isDir && !renaming && (
+      {isDir && canAdd && !renaming && (
         <button
           type="button"
           tabIndex={-1}
@@ -505,7 +521,7 @@ export function TreeRow(props: TreeRowProps) {
    * itself as every filename underneath it.
    */
   const ariaLabel = isDir
-    ? [`${row.name} folder`, decoration?.label, hiddenCount > 0 ? `${hiddenCount} hidden` : null]
+    ? [`${row.name} ${dirNoun}`, decoration?.label, hiddenCount > 0 ? `${hiddenCount} hidden` : null]
         .filter(Boolean)
         .join(', ')
     : undefined;

@@ -24,6 +24,15 @@ const SHOW_DEMO_ACCOUNT = process.env.NODE_ENV !== 'production';
  * Nothing here decides anything. `/sso/discover` answers `{ available }` and
  * the server is the only thing that knows which org a domain belongs to; the
  * page never learns an org name from an address it was handed.
+ *
+ * The one rule this page has to keep is that the SSO button never leads
+ * nowhere. It used to: a SAML domain answered `available: true` with a start
+ * URL, and /sso/start then refused every SAML login outright, so the button
+ * bounced the browser straight back here with "not available on this
+ * deployment". SAML now starts for real, and the one case that still cannot
+ * work — a deployment with no XML signature verifier registered — comes back
+ * from `/sso/discover` as `available: false` with a reason, so this page can
+ * name what has to be installed instead of sending anyone to a refusal.
  */
 export default function LoginPage() {
   const [email, setEmail] = useState(SHOW_DEMO_ACCOUNT ? 'owner@qaai.local' : '');
@@ -76,16 +85,31 @@ export default function LoginPage() {
     setSsoBusy(true);
     setError(null);
     try {
-      const result = await api<{ available: boolean; startUrl?: string }>('/sso/discover', {
-        method: 'POST',
-        // POST, not a query string: an email address does not belong in a URL,
-        // a proxy log or a Referer header.
-        body: JSON.stringify({ email }),
-      });
+      const result = await api<{ available: boolean; startUrl?: string; reason?: string }>(
+        '/sso/discover',
+        {
+          method: 'POST',
+          // POST, not a query string: an email address does not belong in a URL,
+          // a proxy log or a Referer header.
+          body: JSON.stringify({ email }),
+        },
+      );
 
       if (!result.available || !result.startUrl) {
+        /*
+         * The button must never send someone somewhere that cannot work, so
+         * when the server knows why it cannot, it says which of the two it is
+         * — and the SAML case names the thing an administrator has to install,
+         * because "no SSO is set up for your domain" would be a lie told to
+         * someone whose administrator set it up correctly.
+         *
+         * `reason` is a fixed vocabulary the API defines; anything unrecognised
+         * falls back to the general sentence rather than being rendered.
+         */
         setError(
-          'No single sign-on is set up for that email domain. Sign in with your password instead.',
+          result.reason === 'SAML_UNAVAILABLE'
+            ? 'Single sign-on for that domain uses SAML, and this deployment cannot complete a SAML sign-in: no XML signature verifier is installed. Ask an administrator to install one, or sign in with your password.'
+            : 'No single sign-on is set up for that email domain. Sign in with your password instead.',
         );
         return;
       }

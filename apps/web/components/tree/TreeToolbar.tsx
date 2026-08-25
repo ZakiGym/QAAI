@@ -18,13 +18,25 @@
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { cn } from '../../lib/cn';
-import type { Grouping, SortMode, TreeCrumb } from '../../lib/tree/model';
+import type { SortMode, TreeCrumb } from '../../lib/tree/model';
 import type { TreePrefs } from '../../lib/tree/prefs';
+import type { SuiteGrouping } from '../../lib/tree/suites';
 
 export interface TreeToolbarProps {
   prefs: TreePrefs;
   onPrefs: (patch: Partial<TreePrefs>) => void;
   onToggle: (key: 'compactFolders' | 'tintByResult') => void;
+
+  /**
+   * The grouping in force, which is NOT `prefs.grouping`.
+   *
+   * `prefs.ts` persists two groupings and the panel offers three — suite
+   * grouping is remembered by the controller instead, because a value the prefs
+   * sanitiser does not know is a value it silently discards. So the radio group
+   * below is driven by this pair and never by the prefs it sits beside.
+   */
+  grouping: SuiteGrouping;
+  onGrouping: (value: SuiteGrouping) => void;
 
   query: string;
   onQuery: (value: string) => void;
@@ -45,6 +57,8 @@ export interface TreeToolbarProps {
   onCollapseAll: () => void;
   onNewFile: () => void;
   onNewFolder: () => void;
+  /** Suite grouping only: make an empty suite to drag files onto. */
+  onNewSuite: () => void;
 
   autoReveal: boolean;
   onAutoReveal: (value: boolean) => void;
@@ -68,9 +82,10 @@ const SORTS: ReadonlyArray<{ value: SortMode; label: string }> = [
   { value: 'flakiness', label: 'Flakiness' },
 ];
 
-const GROUPINGS: ReadonlyArray<{ value: Grouping; label: string }> = [
+const GROUPINGS: ReadonlyArray<{ value: SuiteGrouping; label: string }> = [
   { value: 'path', label: 'Folders' },
   { value: 'feature', label: 'Feature' },
+  { value: 'suite', label: 'Suite' },
 ];
 
 // ─── A small, real menu ──────────────────────────────────────────────────────
@@ -254,6 +269,9 @@ export function TreeToolbar(props: TreeToolbarProps) {
     onCollapseAll,
     onNewFile,
     onNewFolder,
+    onNewSuite,
+    grouping,
+    onGrouping,
     autoReveal,
     onAutoReveal,
     canUndo,
@@ -309,13 +327,25 @@ export function TreeToolbar(props: TreeToolbarProps) {
         <ToolButton label="New file" onClick={onNewFile}>
           +
         </ToolButton>
-        <ToolButton
-          label={structural ? 'New folder' : 'New folder — group by folder first'}
-          onClick={onNewFolder}
-          disabled={!structural}
-        >
-          ⊞
-        </ToolButton>
+        {/*
+          One button, two meanings, because they are the same intent in the two
+          views: make the container this grouping is made of. A suite is a real
+          row and can be created empty; a folder cannot, which is why the folder
+          half is disabled outside path grouping rather than doing something else.
+        */}
+        {grouping === 'suite' ? (
+          <ToolButton label="New suite" onClick={onNewSuite}>
+            ⊞
+          </ToolButton>
+        ) : (
+          <ToolButton
+            label={structural ? 'New folder' : 'New folder — group by folder first'}
+            onClick={onNewFolder}
+            disabled={!structural}
+          >
+            ⊞
+          </ToolButton>
+        )}
         <ToolButton label="Collapse all folders" onClick={onCollapseAll}>
           ⊟
         </ToolButton>
@@ -336,13 +366,13 @@ export function TreeToolbar(props: TreeToolbarProps) {
           ))}
 
           <MenuHeading>Group by</MenuHeading>
-          {GROUPINGS.map((grouping) => (
+          {GROUPINGS.map((option) => (
             <MenuOption
-              key={grouping.value}
+              key={option.value}
               role="menuitemradio"
-              checked={prefs.grouping === grouping.value}
-              label={grouping.label}
-              onSelect={() => onPrefs({ grouping: grouping.value })}
+              checked={grouping === option.value}
+              label={option.label}
+              onSelect={() => onGrouping(option.value)}
             />
           ))}
 
@@ -352,7 +382,7 @@ export function TreeToolbar(props: TreeToolbarProps) {
             checked={prefs.compactFolders}
             label="Compact folders"
             onSelect={() => onToggle('compactFolders')}
-            disabled={prefs.grouping !== 'path'}
+            disabled={grouping !== 'path'}
           />
           <MenuOption
             role="menuitemcheckbox"
@@ -405,7 +435,10 @@ export function TreeToolbar(props: TreeToolbarProps) {
 
       {/* Scope: the way back out of "Set as root". */}
       {scope.length > 0 && (
-        <nav aria-label="Folder scope" className="flex flex-wrap items-center gap-x-1">
+        <nav
+          aria-label={grouping === 'suite' ? 'Suite scope' : 'Folder scope'}
+          className="flex flex-wrap items-center gap-x-1"
+        >
           <button
             type="button"
             onClick={() => onScope(null)}
@@ -438,7 +471,9 @@ export function TreeToolbar(props: TreeToolbarProps) {
 
       {scopeMissing && (
         <p role="status" className="text-flake whitespace-normal">
-          The folder you had set as the root is gone — showing everything.{' '}
+          {grouping === 'suite'
+            ? 'The suite you had set as the root is gone — showing everything. '
+            : 'The folder you had set as the root is gone — showing everything. '}
           <button type="button" onClick={() => onScope(null)} className="text-accent underline">
             Clear it
           </button>

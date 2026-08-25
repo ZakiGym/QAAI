@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { api, ApiError, type Heal, type Project, type Run } from '../../lib/api';
+import { api, ApiError, type Project, type Run } from '../../lib/api';
 import { relativeTime } from '../../components/ui';
 import { useProject } from '../../components/shell/ProjectContext';
 import { Button } from '../../components/ui/Button';
@@ -169,17 +169,23 @@ export default function RunsPage() {
     let cancelled = false;
 
     const loadSignals = async () => {
+      /*
+       * Two counts from ONE request that counts, instead of two that returned
+       * lists.
+       *
+       * This used to fetch `/verdicts?state=PENDING` and `/heals` in full —
+       * up to a hundred triage verdicts and the whole heals payload twice
+       * over — every fifteen seconds, from every open tab, to render two
+       * numbers. `/badges` answers with the numbers.
+       */
       try {
-        const { verdicts } = await api<{ verdicts: unknown[] }>('/verdicts?state=PENDING');
-        if (!cancelled) setPendingVerdicts(verdicts.length);
+        const badges = await api<{ verdicts: number; heals: number }>('/badges');
+        if (!cancelled) {
+          setPendingVerdicts(badges.verdicts);
+          setHeals(badges.heals);
+        }
       } catch {
         /* keep whatever the last good answer was */
-      }
-      try {
-        const { heals } = await api<{ heals: Heal[] }>('/heals');
-        if (!cancelled) setHeals(heals.length);
-      } catch {
-        /* as above */
       }
       if (!projectId) return;
       try {
@@ -190,11 +196,24 @@ export default function RunsPage() {
       }
     };
 
+    /*
+     * Paused while the tab is hidden, and refreshed the moment it comes back.
+     *
+     * A background tab polling every fifteen seconds is load nobody is reading.
+     * Refreshing on `visibilitychange` is what keeps that honest: the numbers
+     * you look at are fetched when you look, so pausing costs freshness only
+     * while there is nobody to be stale for.
+     */
+    const tick = () => {
+      if (document.visibilityState === 'visible') void loadSignals();
+    };
     void loadSignals();
-    const timer = setInterval(() => void loadSignals(), 15_000);
+    const timer = setInterval(tick, 15_000);
+    document.addEventListener('visibilitychange', tick);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      document.removeEventListener('visibilitychange', tick);
     };
   }, [projectId]);
 

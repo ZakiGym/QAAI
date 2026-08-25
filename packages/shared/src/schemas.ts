@@ -180,10 +180,36 @@ export const updateProjectSchema = z
     'nothing to update',
   );
 
+/**
+ * The name of an on-prem runner pool, wherever one is named.
+ *
+ * Shared by runner registration and by the environment that points at a pool,
+ * because those two strings are compared with `===` (see `servesPool` in
+ * apps/api/src/lib/runners.ts) and a rule that lives on only one side is a rule
+ * that lets `"staging "` be registered and `"staging"` be pointed at, with no
+ * error anywhere and a queue that never drains.
+ *
+ * Trimmed rather than rejected-on-whitespace: the value is pasted or typed by a
+ * human into a form, and a trailing space is a slip, not an intent. NOT
+ * lowercased — a pool name is a label an operator chose for a network segment,
+ * and case-folding "EU-Staging" behind their back is a different kind of
+ * surprise.
+ */
+export const runnerPoolName = z.string().trim().min(1).max(64);
+
 export const createEnvironmentSchema = z.object({
   name: z.string().min(1).max(60),
   kind: z.enum(ENVIRONMENT_KINDS),
   baseUrl: httpUrl,
+  /**
+   * Execute this environment's runs on the customer's own agents instead of
+   * QAAI's workers (ENTERPRISE). Null — the default — means the cloud pool.
+   *
+   * Nullable, not merely optional, because clearing it is a real edit: an
+   * environment that stops being unreachable goes back to the shared workers,
+   * and `undefined` cannot express that on the PATCH below.
+   */
+  runnerPool: runnerPoolName.nullish(),
 });
 
 /** Rename / repoint an environment. Kind is immutable — LOCAL vs PRODUCTION is a
@@ -192,8 +218,13 @@ export const updateEnvironmentSchema = z
   .object({
     name: z.string().min(1).max(60).optional(),
     baseUrl: httpUrl.optional(),
+    /** See createEnvironmentSchema. `null` moves the environment back to the cloud pool. */
+    runnerPool: runnerPoolName.nullish(),
   })
-  .refine((v) => v.name !== undefined || v.baseUrl !== undefined, 'nothing to update');
+  .refine(
+    (v) => v.name !== undefined || v.baseUrl !== undefined || v.runnerPool !== undefined,
+    'nothing to update',
+  );
 
 /** SCREAMING_SNAKE_CASE, so a secret can be injected into a test process verbatim. */
 const secretName = z

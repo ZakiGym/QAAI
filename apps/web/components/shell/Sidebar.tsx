@@ -24,9 +24,23 @@ import { ACCENTS, useTheme } from './useTheme';
  * and the macOS traffic-light inset, both styled in globals.css.
  */
 
-/** How often the two live badges re-ask. Slower than a screen's own poll: this
- *  is peripheral vision, not the thing you are looking at. */
+/** How often the live badges re-ask while something is actually moving. Slower
+ *  than a screen's own poll: this is peripheral vision, not the thing you are
+ *  looking at. */
 const BADGE_POLL_MS = 10_000;
+
+/** The ceiling the interval backs off to while nothing changes. Reached after
+ *  about a minute of a completely still fleet; every event that could make the
+ *  badge matter again resets it to BADGE_POLL_MS. */
+const BADGE_POLL_MAX_MS = 60_000;
+
+/** GET /badges — four numbers, counted in the database. */
+interface Badges {
+  liveRuns: number;
+  lastRunStatus: Run['status'] | null;
+  verdicts: number;
+  heals: number;
+}
 
 interface Me {
   user: { id: string; email: string; name: string | null } | null;
@@ -92,38 +106,97 @@ export function Sidebar({ collapsed, mounted, onToggle, onOpenPalette }: Sidebar
   /*
    * The two live badges, and the health dot on the switcher.
    *
-   * Both fail soft and silently: a sidebar is navigation first, and a counter
-   * that 500s must never take the destinations down with it. Each call has its
-   * own catch so one failing endpoint does not blank the other's badge.
+   * ── What this used to cost ────────────────────────────────────────────────
+   * Two list endpoints, every ten seconds, in every open tab, on every screen,
+   * forever: `/runs?limit=25` for a count and one status, and
+   * `/verdicts?state=PENDING` for `.length` — up to a hundred verdicts, each
+   * carrying its test result, its test and its evidence. 720 requests an hour
+   * per tab, most of them into a tab nobody was looking at, to render two
+   * integers. It is now one request to `/badges`, which counts in the database
+   * and returns four numbers.
+   *
+   * ── Three rules, and why none of them can make the badge wrong ────────────
+   * 1. A HIDDEN TAB ASKS NOTHING. Not a longer interval — nothing at all. The
+   *    chain simply stops, and `wake` restarts it with an immediate fetch the
+   *    moment the tab is looked at again, so what you see on returning is
+   *    always freshly read rather than however stale the last answer was.
+   * 2. A STILL FLEET BACKS OFF, to a minute at the outside, and ANY change in
+   *    the numbers snaps it straight back to ten seconds. So the interval is
+   *    only ever long while nothing is happening — the case where a badge
+   *    cannot be misleading, because it is right and staying right.
+   * 3. EVERY EVENT THAT MAKES THE BADGE MATTER RESETS IT: looking at the tab,
+   *    focusing the window, switching project, and navigating anywhere at all
+   *    (`pathname` is a dependency). A stale count on a triage badge is worse
+   *    than a cheap one, so the moments a human could act on it are exactly the
+   *    moments it is re-read.
+   *
+   * It still fails soft and silently: a sidebar is navigation first, and a
+   * counter that 500s must never take the destinations down with it.
    */
   useEffect(() => {
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let delay = BADGE_POLL_MS;
+    let previous = '';
+    let lastAt = 0;
 
     const load = async () => {
+      // Also the guard for a timer that fires just as the tab is hidden: the
+      // chain ends here rather than being rescheduled, and `wake` owns
+      // restarting it.
+      if (cancelled || document.visibilityState !== 'visible') return;
+
       try {
-        const scope = projectId ? `&projectId=${encodeURIComponent(projectId)}` : '';
-        const { runs } = await api<{ runs: Run[] }>(`/runs?limit=25${scope}`);
+        const scope = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+        const badges = await api<Badges>(`/badges${scope}`);
         if (cancelled) return;
-        setLiveRuns(runs.filter((r) => r.status === 'RUNNING' || r.status === 'QUEUED').length);
-        setHealth(runs[0]?.status ?? null);
+        setLiveRuns(badges.liveRuns);
+        setHealth(badges.lastRunStatus);
+        setOpenVerdicts(badges.verdicts);
+
+        const signature = `${badges.liveRuns}:${badges.lastRunStatus}:${badges.verdicts}`;
+        delay = signature === previous ? Math.min(delay * 2, BADGE_POLL_MAX_MS) : BADGE_POLL_MS;
+        previous = signature;
       } catch {
-        /* keep whatever the last good answer was */
+        /* keep whatever the last good answer was, and ask again on schedule */
       }
-      try {
-        const { verdicts } = await api<{ verdicts: unknown[] }>('/verdicts?state=PENDING');
-        if (!cancelled) setOpenVerdicts(verdicts.length);
-      } catch {
-        /* as above */
-      }
+
+      if (cancelled) return;
+      lastAt = Date.now();
+      clearTimeout(timer);
+      timer = setTimeout(() => void load(), delay);
+    };
+
+    /**
+     * Back from a hidden tab or another window: reset the backoff and re-read.
+     *
+     * Immediately, unless the last read is younger than one base interval — a
+     * window can be focused and blurred as fast as a person can click, and a
+     * request per click would replace a poll nobody needed with a burst nobody
+     * asked for. Waiting out the remainder costs at most ten seconds of age on
+     * a number that was read within the last ten seconds.
+     */
+    const wake = () => {
+      clearTimeout(timer);
+      if (cancelled || document.visibilityState !== 'visible') return;
+      delay = BADGE_POLL_MS;
+      const due = Math.max(0, BADGE_POLL_MS - (Date.now() - lastAt));
+      if (due === 0) void load();
+      else timer = setTimeout(() => void load(), due);
     };
 
     void load();
-    const timer = setInterval(() => void load(), BADGE_POLL_MS);
+    document.addEventListener('visibilitychange', wake);
+    // `focus` as well as `visibilitychange`: alt-tabbing back to a browser whose
+    // tab never stopped being "visible" fires only this one.
+    window.addEventListener('focus', wake);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
     };
-  }, [projectId]);
+  }, [projectId, pathname]);
 
   // One outside-click / Escape handler for whichever menu is open. Escape hands
   // focus back to the button that opened it, or a keyboard user is dropped at

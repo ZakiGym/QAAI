@@ -93,6 +93,26 @@ import {
   type DropEffect,
 } from '../../lib/tree/dnd';
 import {
+  assignmentSummary,
+  buildSuiteTree,
+  canDropOnSuite,
+  freeSuiteName,
+  NO_SUITE_LABEL,
+  planSuiteDrop,
+  suiteAssignRequests,
+  suiteContext,
+  suiteDropTargetOf,
+  suiteGroupId,
+  suiteGroupOf,
+  suiteNamesExcept,
+  validateSuiteName,
+  type SuiteAssignOp,
+  type SuiteContext,
+  type SuiteGrouping,
+  type SuiteTreeModel,
+  type TreeSuite,
+} from '../../lib/tree/suites';
+import {
   canRedo,
   canUndo,
   commitRedo,
@@ -132,6 +152,15 @@ export interface TreeTestRow extends TreeTest {
   /** The last run's status. `null` for a test that has never run — not the same as skipped. */
   lastStatus?: LastResultStatus | null;
   quarantined?: boolean;
+  /**
+   * The suite this test is in, which is what `grouping: 'suite'` groups by.
+   *
+   * Optional for the same reason as the two above: `GET /projects/:id/tests` has
+   * always selected it, so it is in the payload whether or not a caller's own
+   * type declares it, and a caller that really does omit it gets one honest "No
+   * suite" group rather than a compile error.
+   */
+  suiteId?: string | null;
 }
 
 export interface TreeControllerOptions {
@@ -594,7 +623,32 @@ export type TreeRequest =
   | { kind: 'delete-file'; testId: string }
   | { kind: 'batch-delete'; testIds: string[] }
   | { kind: 'delete-folder'; path: string }
-  | { kind: 'restore-file'; testId: string };
+  | { kind: 'restore-file'; testId: string }
+  /**
+   * Putting tests into a suite, or taking them out. Addressed to the SUITE
+   * because the endpoint is: `direction` says which of its two batch routes,
+   * and both are atomic on the server.
+   */
+  | {
+      kind: 'suite-assign';
+      opIds: string[];
+      suiteId: string;
+      direction: 'assign' | 'unassign';
+      testIds: string[];
+    }
+  | { kind: 'suite-rename'; suiteId: string; name: string }
+  | { kind: 'suite-delete'; suiteId: string };
+
+/**
+ * Everything a gesture in this panel can plan.
+ *
+ * A `TreeOp` moves or copies a FILE PATH; a `SuiteAssignOp` changes which suite
+ * a test is in and touches no path at all. They are one union rather than two
+ * pipelines so that a drop, wherever it lands, goes through one planner, one
+ * executor and one status line — `requestsForOps` below is the single place the
+ * difference is read, and it reads `kind`, never a path.
+ */
+export type PanelOp = TreeOp | SuiteAssignOp;
 
 /**
  * How far a sequential batch got.
@@ -690,15 +744,27 @@ export const testIdOfRowId = (id: string): string =>
  * `pruneContained` has already removed anything nested inside a moving folder,
  * leaving the remaining operations independent of one another.
  */
-export function requestsForOps(ops: readonly TreeOp[]): {
+export function requestsForOps(ops: readonly PanelOp[]): {
   requests: TreeRequest[];
   unsupported: Unsupported[];
 } {
   const requests: TreeRequest[] = [];
   const unsupported: Unsupported[] = [];
   const fileMoves: TreeOp[] = [];
+  const assignments: SuiteAssignOp[] = [];
 
   for (const op of ops) {
+    /*
+     * An assignment is not a move with a different destination — nothing about
+     * the file's path changes — so it is split out on `kind` before anything
+     * here looks at `from`/`to`, which for these ops hold suite ids. Grouping
+     * and chunking them is `suites.ts`'s job, next to the planner that made
+     * them.
+     */
+    if (op.kind === 'assign') {
+      assignments.push(op);
+      continue;
+    }
     // `entity`, never the id: `clipboard.ts` states outright that a `d:` id
     // addresses nothing on the server, and guessing the kind from the path is
     // the mistake that field exists to stop.
@@ -738,6 +804,10 @@ export function requestsForOps(ops: readonly TreeOp[]): {
     });
   }
 
+  for (const call of suiteAssignRequests(assignments, BATCH_LIMIT)) {
+    requests.push({ kind: 'suite-assign', ...call });
+  }
+
   return { requests, unsupported };
 }
 
@@ -754,8 +824,11 @@ export function requestsForOps(ops: readonly TreeOp[]): {
 export function opIdsOf(requests: readonly TreeRequest[]): string[] {
   const out: string[] = [];
   for (const request of requests) {
-    if (request.kind === 'batch-move') out.push(...request.opIds);
-    else if ('opId' in request) out.push(request.opId);
+    if (request.kind === 'batch-move' || request.kind === 'suite-assign') {
+      out.push(...request.opIds);
+    } else if ('opId' in request) {
+      out.push(request.opId);
+    }
   }
   return out;
 }
@@ -1100,9 +1173,32 @@ export function buildDecorations(
 export const STRUCTURAL_OFF_IN_FEATURES =
   'Group by folder to move, rename or create files — a feature is a column, not a folder.';
 
-export function structuralOpsAllowed(prefs: Pick<TreePrefs, 'grouping'>): boolean {
+/**
+ * The same rule for suite grouping, said in its own words.
+ *
+ * A suite row IS a server row — it can be renamed and deleted, and files can be
+ * dropped into it — so borrowing the sentence above would be wrong twice over:
+ * it names the wrong thing, and it implies nothing here can be edited when a
+ * great deal can. What is off is only the PATH gestures.
+ */
+export const STRUCTURAL_OFF_IN_SUITES =
+  'Group by folder to move or create files — a suite holds tests, not paths.';
+
+/**
+ * Takes the grouping in an object so the prefs can be passed straight in, and
+ * accepts the suite grouping that `prefs.ts` does not persist.
+ */
+export function structuralOpsAllowed(prefs: { grouping: SuiteGrouping }): boolean {
   return prefs.grouping === 'path';
 }
+
+/** Which refusal a path gesture earns in the grouping that is on. */
+export function structuralRefusal(grouping: SuiteGrouping): string {
+  return grouping === 'suite' ? STRUCTURAL_OFF_IN_SUITES : STRUCTURAL_OFF_IN_FEATURES;
+}
+
+/** Where the panel remembers that it was left grouped by suite. See `prefs.ts`. */
+export const suiteGroupingKey = (projectId: string): string => `qaai.tree.suiteGrouping.${projectId}`;
 
 // ─── Drag state ──────────────────────────────────────────────────────────────
 
@@ -1131,7 +1227,20 @@ export const NO_DRAG: DragState = {
 export interface TreeController {
   prefs: TreePrefs;
   prefsApi: TreePrefsApi;
-  model: TreeModel;
+  /**
+   * The grouping actually in force.
+   *
+   * NOT `prefs.grouping`: `prefs.ts` persists a whitelist of two and this panel
+   * offers three. Suite grouping is remembered in a key of this hook's own
+   * (`suiteGroupingKey`), the way the collapsed set and auto-reveal already are,
+   * so nothing here writes a value the prefs sanitiser would silently drop on
+   * the next load.
+   */
+  grouping: SuiteGrouping;
+  setGrouping: (value: SuiteGrouping) => void;
+  /** The project's suites, loaded while suite grouping is on. Empty otherwise. */
+  suites: readonly TreeSuite[];
+  model: TreeModel | SuiteTreeModel;
   /** The rows on screen, in order. Keyboard navigation and Shift-ranges use ONLY this. */
   rows: PanelRow[];
   /** Every row in the tree, collapsed folders included. Planning uses ONLY this. */
@@ -1160,8 +1269,20 @@ export interface TreeController {
   autoReveal: boolean;
   /** Selected rows that are NOT on screen — collapsed away or filtered out. */
   hiddenSelected: number;
-  /** False in feature grouping, where rows have no path to act on. */
+  /** False in feature and suite grouping, where rows have no path to act on. */
   structural: boolean;
+  /**
+   * May this row be dragged?
+   *
+   * Per row rather than one flag, because suite grouping splits the answer: a
+   * FILE can be dragged (onto a suite, to be put in it — feature 31) while the
+   * suite heading above it cannot be dragged anywhere at all.
+   */
+  canDrag: (row: PanelRow) => boolean;
+  /** The suite a row IS, when it is one: what the panel may offer rename and delete on. */
+  suiteOfRow: (row: PanelRow) => TreeSuite | null;
+  /** Create a suite and open its name for editing. Suite grouping only. */
+  newSuite: () => void;
   canUndo: boolean;
   canRedo: boolean;
   undoLabel: string | null;
@@ -1218,6 +1339,15 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
   } = options;
 
   const [prefs, prefsApi] = useTreePrefs(projectId);
+  /*
+   * Suite grouping is held here rather than in `prefs`. `sanitizeTreePrefs`
+   * accepts exactly `path` and `feature` and falls back to `path` for anything
+   * else, so writing `suite` into the prefs would appear to work and then be
+   * dropped on the next load — a setting that forgets itself once per session is
+   * worse than one that is stored somewhere honest.
+   */
+  const [bySuite, setBySuite] = useState(false);
+  const [suites, setSuites] = useState<readonly TreeSuite[]>([]);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set<string>());
   const [uncompacted, setUncompacted] = useState<ReadonlySet<string>>(() => new Set<string>());
   const [query, setQuery] = useState('');
@@ -1259,6 +1389,11 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     } catch {
       setAutoRevealState(true);
     }
+    try {
+      setBySuite(localStorage.getItem(suiteGroupingKey(projectId)) === 'on');
+    } catch {
+      setBySuite(false);
+    }
   }, [projectId]);
 
   const writeCollapsed = useCallback(
@@ -1285,11 +1420,72 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     [projectId],
   );
 
+  // ── Grouping, and the suites it needs ────────────────────────────────────
+
+  const grouping: SuiteGrouping = bySuite ? 'suite' : prefs.grouping;
+
+  const refreshSuites = useCallback(async () => {
+    const { suites: loaded } = await api<{ suites: TreeSuite[] }>(`/projects/${projectId}/suites`);
+    setSuites(loaded);
+  }, [projectId]);
+
+  /*
+   * Fetched by the panel rather than passed in, because the one caller renders
+   * `<FileTree>` with the props it already had and adding a required one would
+   * make suite grouping a change to a screen this work does not own. Loaded only
+   * while the grouping is on: a project the user never groups by suite pays
+   * nothing for the feature.
+   */
+  useEffect(() => {
+    if (grouping !== 'suite') return;
+    let live = true;
+    void (async () => {
+      try {
+        await refreshSuites();
+      } catch (error) {
+        if (live) setStatus(messageOf(error, 'Could not load this project’s suites'));
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [grouping, refreshSuites]);
+
+  const suiteCtx: SuiteContext = useMemo(() => suiteContext(suites, tests), [suites, tests]);
+
+  const setGrouping = useCallback(
+    (next: SuiteGrouping) => {
+      const wantsSuites = next === 'suite';
+      setBySuite(wantsSuites);
+      try {
+        localStorage.setItem(suiteGroupingKey(projectId), wantsSuites ? 'on' : 'off');
+      } catch {
+        /* private mode — the choice is just for this session */
+      }
+      /*
+       * A scope belongs to the grouping it was set in: `suite:<id>` means
+       * nothing to the folder tree and a folder path means nothing to the suite
+       * tree, and leaving one behind would greet the switch with "the folder you
+       * had set as the root is gone".
+       */
+      const scopeIsSuite = prefs.scope !== null && suiteGroupOf(prefs.scope) !== null;
+      if (wantsSuites) {
+        if (prefs.scope !== null && !scopeIsSuite) prefsApi.set({ scope: null });
+        return;
+      }
+      prefsApi.set({ grouping: next, ...(scopeIsSuite ? { scope: null } : {}) });
+    },
+    [prefs.scope, prefsApi, projectId],
+  );
+
   // ── The model, and the two row lists ─────────────────────────────────────
 
   const model = useMemo(
-    () => buildTree(tests, { ...buildOptionsFromPrefs(prefs), uncompacted }),
-    [tests, prefs, uncompacted],
+    () =>
+      grouping === 'suite'
+        ? buildSuiteTree(tests, suites, { ...buildOptionsFromPrefs(prefs), uncompacted })
+        : buildTree(tests, { ...buildOptionsFromPrefs(prefs), uncompacted }),
+    [grouping, suites, tests, prefs, uncompacted],
   );
 
   const dirIds = useMemo(() => allDirIds(model.roots), [model]);
@@ -1373,8 +1569,27 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     [model, dirtyTestId],
   );
 
-  const structural = structuralOpsAllowed(prefs);
+  const structural = structuralOpsAllowed({ grouping });
+  const offMessage = structuralRefusal(grouping);
   const clipboardCutIds = useMemo(() => cutIds(clipboard), [clipboard]);
+
+  /** The suite behind a row, or null — the check every suite-only gesture starts with. */
+  const suiteOfRow = useCallback(
+    (row: PanelRow): TreeSuite | null => {
+      if (grouping !== 'suite' || row.kind !== 'dir') return null;
+      const group = suiteGroupOf(row.nodeId);
+      // `unassigned` deliberately answers null: it is a heading with no server
+      // row, so rename and delete must not be offered on it.
+      if (!group || group.kind !== 'suite') return null;
+      return suiteCtx.byId.get(group.suiteId) ?? null;
+    },
+    [grouping, suiteCtx],
+  );
+
+  const canDrag = useCallback(
+    (row: PanelRow): boolean => structural || (grouping === 'suite' && row.kind === 'file'),
+    [grouping, structural],
+  );
 
   /*
    * One tab stop for the whole tree. The lead row carries it while it is on
@@ -1530,6 +1745,21 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         case 'restore-file':
           await api(`${base}/tests/${request.testId}/restore`, { method: 'POST' });
           return {};
+        case 'suite-assign':
+          await api(`${base}/suites/${request.suiteId}/tests/${request.direction}`, {
+            method: 'POST',
+            body: JSON.stringify({ testIds: request.testIds }),
+          });
+          return {};
+        case 'suite-rename':
+          await api(`${base}/suites/${request.suiteId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ name: request.name }),
+          });
+          return {};
+        case 'suite-delete':
+          await api(`${base}/suites/${request.suiteId}`, { method: 'DELETE' });
+          return {};
       }
     },
     [projectId],
@@ -1564,16 +1794,33 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
   /** Run a gesture's requests, record what landed for undo, and reload the tree. */
   const applyOps = useCallback(
     async (
-      ops: readonly TreeOp[],
+      ops: readonly PanelOp[],
       refusals: readonly Refusal[],
       verb: string,
       closedTestIds: readonly string[] = [],
+      /**
+       * The headline for a gesture whose own planner writes it — an assignment
+       * says "Put 3 files in Smoke", which `verb + count + "items"` cannot. It
+       * also carries no "⌘Z" claim: `undo.ts` has four edit kinds and none of
+       * them is an assignment, so an assignment genuinely cannot be taken back
+       * from here and must not say it can.
+       */
+      headline?: (done: number) => string,
     ) => {
+      /*
+       * The hidden-file check is about PATHS, so only the path ops go through
+       * it. An assignment's `to` is a suite id; asking whether a suite id
+       * collides with a hidden file path would be a category error that happens
+       * to answer "no" almost every time — which is the worst kind.
+       */
+      const moves = ops.filter((op): op is TreeOp => op.kind !== 'assign');
+      const assigns = ops.filter((op): op is SuiteAssignOp => op.kind === 'assign');
       // A destination held by a file a `hide` pattern removed looks free to every
       // check the panel can make. Refuse it here, by name, instead of letting the
       // server answer with a uniqueness error about a file nobody can see.
-      const planned = splitHiddenConflicts(ops, hiddenPaths);
-      const { requests, unsupported } = requestsForOps(planned.ops);
+      const planned = splitHiddenConflicts(moves, hiddenPaths);
+      const plannedOps: PanelOp[] = [...planned.ops, ...assigns];
+      const { requests, unsupported } = requestsForOps(plannedOps);
       const refused = [...refusals, ...unsupported, ...planned.refused];
       if (requests.length === 0) {
         setStatus(refusalSummary(refused) ?? 'Nothing to do');
@@ -1583,9 +1830,11 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       try {
         const outcome = await sendAll(requests);
         const landed = new Set(opIdsOf(requests.slice(0, outcome.done)));
-        const applied = planned.ops.filter((op) => landed.has(op.id));
-        if (applied.length > 0) {
-          setUndoStack((previous) => record(previous, entryForOps(applied, outcome.created, verb)));
+        const applied = plannedOps.filter((op) => landed.has(op.id));
+        // Only the path ops become an undo entry — see `headline` above.
+        const undoable = applied.filter((op): op is TreeOp => op.kind !== 'assign');
+        if (undoable.length > 0) {
+          setUndoStack((previous) => record(previous, entryForOps(undoable, outcome.created, verb)));
         }
         if (closedTestIds.length > 0 && outcome.done > 0) onClosed?.([...closedTestIds]);
         /*
@@ -1595,14 +1844,21 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
          * next click re-sends moves that already went through.
          */
         await onChanged?.();
+        const tail = refusalSummary(refused);
+        const landedLine = headline
+          ? `${headline(applied.length)}${tail ? ` — ${tail}` : '.'}`
+          : outcomeMessage(verb, applied.length, refused);
         setStatus(
           outcome.error === null
-            ? outcomeMessage(verb, applied.length, refused)
+            ? landedLine
             : partialMessage(
                 applied.length,
-                planned.ops.length,
+                plannedOps.length,
                 messageOf(outcome.error, `${verb} failed`),
-                applied.length > 0,
+                // ⌘Z can only take back the path ops, so it is offered only when
+                // there are some. An assignment that half-landed says how far it
+                // got and stops there.
+                undoable.length > 0,
               ),
         );
       } catch (error) {
@@ -1624,6 +1880,15 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       note: string,
       failure: string,
       closedTestIds: readonly string[] = [],
+      /**
+       * A second reload this gesture needs, awaited beside the parent's.
+       *
+       * The suites list is a separate read from the tests list, so renaming or
+       * deleting a suite leaves this panel holding a name the server no longer
+       * has. Refreshing it from the call site instead would race the request it
+       * is refreshing after.
+       */
+      refresh?: () => Promise<void>,
     ) => {
       if (requests.length === 0) return;
       setBusy(true);
@@ -1641,6 +1906,14 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         // closed for a file that survived is reopened with one click, a tab left
         // open on a deleted file breaks the next save.
         if (closedTestIds.length > 0 && outcome.done > 0) onClosed?.([...closedTestIds]);
+        if (refresh) {
+          try {
+            await refresh();
+          } catch {
+            // The write landed; only the second read did not. Reporting this as
+            // a failed rename would send somebody to undo something that worked.
+          }
+        }
         await onChanged?.();
         setStatus(
           outcome.error === null
@@ -1697,15 +1970,21 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     (rowId: string) => {
       const row = rowById(allRows, rowId);
       if (!row) return;
-      if (!structural && !pendingPaths.has(row.path)) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+      /*
+       * A suite row is the one heading in this tree that CAN be renamed: there
+       * is a `Suite` with that id behind it. The unassigned group is not one —
+       * `suiteOfRow` answers null for it — and neither is a feature group, so
+       * both still fall through to the refusal.
+       */
+      if (!structural && !pendingPaths.has(row.path) && !suiteOfRow(row)) {
+        setStatus(offMessage);
         return;
       }
       setRenameError(null);
       setRenamingId(rowId);
       setSelection((previous) => selectOnly(previous, rowId));
     },
-    [allRows, structural, pendingPaths],
+    [allRows, offMessage, structural, pendingPaths, suiteOfRow],
   );
 
   const cancelRename = useCallback(() => {
@@ -1725,6 +2004,36 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         cancelRename();
         return;
       }
+
+      /*
+       * Renaming a SUITE is a different write with different rules — no path, no
+       * sibling files, no extension to preserve — so it is answered before any
+       * of the path arithmetic below runs. Validated locally first because the
+       * input is still open: a 409 from the server would have closed the editor
+       * and thrown the typing away.
+       */
+      const suite = suiteOfRow(row);
+      if (suite) {
+        const suiteCheck = validateSuiteName(name, suiteNamesExcept(suites, suite.id));
+        if (!suiteCheck.ok) {
+          setRenameError(suiteCheck.message);
+          return;
+        }
+        cancelRename();
+        void applyEdits(
+          [{ kind: 'suite-rename', suiteId: suite.id, name }],
+          // No undo entry: `undo.ts` has four edit kinds and a suite rename is
+          // none of them, so claiming ⌘Z here would be a claim the stack cannot
+          // honour.
+          null,
+          `Renamed the suite to ${name}`,
+          'Renaming the suite failed',
+          [],
+          refreshSuites,
+        );
+        return;
+      }
+
       const check = validateName(name, row.kind, siblingNames(allRows, row.parentPath, row.id));
       if (!check.ok) {
         setRenameError(check.message);
@@ -1763,7 +2072,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       };
       void applyEdits([request], entry, `Renamed to ${name}. Undo with ⌘Z.`, 'Rename failed');
     },
-    [allRows, applyEdits, cancelRename, hiddenPaths, pendingPaths],
+    [allRows, applyEdits, cancelRename, hiddenPaths, pendingPaths, refreshSuites, suiteOfRow, suites],
   );
 
   // ── New folder (feature 2) ────────────────────────────────────────────────
@@ -1771,12 +2080,12 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
   const newFolder = useCallback(
     (parentPath?: string) => {
       if (!structural) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
       const resolved = parentPath ?? folderTargetOf(allRows, selection.lead);
       if (resolved === null) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
       const parent = resolved;
@@ -1793,7 +2102,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       setRenameError(null);
       setStatus('Folders live inside file paths — this one is saved when a file lands in it.');
     },
-    [allRows, expandIds, selection.lead, structural],
+    [allRows, expandIds, offMessage, selection.lead, structural],
   );
 
   const addFile = useCallback((folderPath: string) => onAdd(folderPath), [onAdd]);
@@ -1819,7 +2128,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
   const doCut = useCallback(
     (ids?: string[]) => {
       if (!structural) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
       /*
@@ -1841,13 +2150,13 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         split.pending.length > 0 ? `${head} ${pendingRefusal(split.pending, 'move')}` : head,
       );
     },
-    [allRows, idsOrSelection, pendingPaths, structural],
+    [allRows, idsOrSelection, offMessage, pendingPaths, structural],
   );
 
   const doCopy = useCallback(
     (ids?: string[]) => {
       if (!structural) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
       // Same reason as `doCut`: there is nothing on the server to copy.
@@ -1864,7 +2173,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         split.pending.length > 0 ? `${head} ${pendingRefusal(split.pending, 'copy')}` : head,
       );
     },
-    [allRows, idsOrSelection, pendingPaths, structural],
+    [allRows, idsOrSelection, offMessage, pendingPaths, structural],
   );
 
   const doPaste = useCallback(
@@ -1878,14 +2187,14 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       // into `''` instead would move the files to the project root and look like
       // it had worked.
       if (target === null) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
       const result = clipPaste(allRows, clipboard, target);
       setClipboard(result.clipboard);
       void applyOps(result.ops, result.refusals, clipboard.mode === 'cut' ? 'Moved' : 'Copied');
     },
-    [allRows, applyOps, clipboard, selection.lead],
+    [allRows, applyOps, clipboard, offMessage, selection.lead],
   );
 
   // ── Delete ────────────────────────────────────────────────────────────────
@@ -1905,6 +2214,44 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       );
       if (targets.length === 0) return;
 
+      /*
+       * Deleting a SUITE is its own gesture and does not mix with deleting
+       * files. Mixed into one batch it would be an undo entry that claims to
+       * restore everything and can only restore the files — so a selection that
+       * names a suite is read as being about suites, and the files in it are
+       * deliberately left alone. Deleting the suite does not delete them anyway:
+       * the API unassigns them and says how many.
+       */
+      const groupTargets = targets.filter((row) => row.kind === 'dir');
+      if (grouping === 'suite' && groupTargets.length > 0) {
+        const requests: TreeRequest[] = [];
+        const names: string[] = [];
+        for (const row of groupTargets) {
+          const suite = suiteOfRow(row);
+          // The unassigned group has no server row. Skipped, not refused as an
+          // error: it is a heading, and there was nothing there to delete.
+          if (!suite) continue;
+          requests.push({ kind: 'suite-delete', suiteId: suite.id });
+          names.push(suite.name);
+        }
+        if (requests.length === 0) {
+          setStatus(`${NO_SUITE_LABEL} is a heading, not a suite — there is nothing to delete`);
+          return;
+        }
+        const what = names.length === 1 ? names[0] : `${names.length} suites`;
+        void applyEdits(
+          requests,
+          // Not undoable: there is no endpoint that puts a suite back, and the
+          // assignments it held are gone with it.
+          null,
+          `Deleted ${what}. The tests are still here, in no suite.`,
+          'Deleting the suite failed',
+          [],
+          refreshSuites,
+        );
+        return;
+      }
+
       const pendingTargets = targets.filter((row) => pendingPaths.has(row.path));
       if (pendingTargets.length > 0) {
         setPending((previous) =>
@@ -1919,7 +2266,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         return;
       }
       if (!structural && real.some((row) => row.kind === 'dir')) {
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(offMessage);
         return;
       }
 
@@ -1969,7 +2316,17 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         closed,
       );
     },
-    [allRows, applyEdits, idsOrSelection, pendingPaths, structural],
+    [
+      allRows,
+      applyEdits,
+      grouping,
+      idsOrSelection,
+      offMessage,
+      pendingPaths,
+      refreshSuites,
+      structural,
+      suiteOfRow,
+    ],
   );
 
   const doDuplicate = useCallback(
@@ -2008,6 +2365,45 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     },
     [allRows, onChanged, projectId],
   );
+
+  // ── New suite ─────────────────────────────────────────────────────────────
+
+  /*
+   * Unlike a folder, a suite is a real row and can be created empty — which is
+   * the whole reason this button exists. Without it the only way to get a suite
+   * would be to have one already, and every feature hanging off suites
+   * (schedules, monitors, running a named subset) stays unreachable.
+   *
+   * Created with a free name and immediately opened for renaming, the way "New
+   * Folder" does: the name matters, and typing it is the next thing anyone
+   * wants to do.
+   */
+  const newSuite = useCallback(() => {
+    if (grouping !== 'suite') {
+      setStatus('Group by suite first — the panel is showing folders');
+      return;
+    }
+    setBusy(true);
+    void (async () => {
+      try {
+        const name = freeSuiteName('New suite', suiteNamesExcept(suites, null));
+        const { suite } = await api<{ suite: TreeSuite }>(`/projects/${projectId}/suites`, {
+          method: 'POST',
+          body: JSON.stringify({ name }),
+        });
+        await refreshSuites();
+        const rowId = `${DIR_ROW_PREFIX}${suiteGroupId(suite.id)}`;
+        setSelection((previous) => selectOnly(previous, rowId));
+        setRenamingId(rowId);
+        setRenameError(null);
+        setStatus(`Created ${suite.name} — drag files onto it to put them in it.`);
+      } catch (error) {
+        setStatus(messageOf(error, 'Creating the suite failed'));
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [grouping, projectId, refreshSuites, suites]);
 
   // ── Undo / redo (feature 12) ──────────────────────────────────────────────
 
@@ -2097,9 +2493,13 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
         setStatus('Running from the tree is not wired up on this screen');
         return;
       }
-      onRunTests(ids, row.kind === 'dir' ? `${row.name}/` : row.name);
+      // A suite is not a folder, so it does not get a folder's trailing slash —
+      // this label ends up on the run itself, where "Smoke/" would read as a
+      // directory nobody has.
+      const label = row.kind === 'dir' && !suiteOfRow(row) ? `${row.name}/` : row.name;
+      onRunTests(ids, label);
     },
-    [onRunTests],
+    [onRunTests, suiteOfRow],
   );
 
   const findInFolder = useCallback(
@@ -2117,9 +2517,16 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
 
   const dragStart = useCallback(
     (row: PanelRow, event: ReactDragEvent) => {
-      if (!structural) {
+      /*
+       * Suite grouping is the one place a drag is allowed while path gestures
+       * are not: dragging a FILE onto a suite puts it in that suite, which
+       * changes no path at all (feature 31). A suite HEADING still cannot be
+       * dragged — there is nowhere for it to go — and is refused here rather
+       * than left to produce a drag that can only end in a refusal.
+       */
+      if (!canDrag(row)) {
         event.preventDefault();
-        setStatus(STRUCTURAL_OFF_IN_FEATURES);
+        setStatus(grouping === 'suite' ? 'A suite is not something to drag' : offMessage);
         return;
       }
       // An unsaved folder has no directory behind it, so there is nothing for a
@@ -2143,14 +2550,24 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       event.dataTransfer.setData('text/plain', payload.rows.map((entry) => entry.path).join('\n'));
       setDrag({ ...NO_DRAG, ids, effect: 'move' });
     },
-    [allRows, pendingPaths, projectId, selection, structural],
+    [allRows, canDrag, grouping, offMessage, pendingPaths, projectId, selection],
   );
 
   const dragOver = useCallback(
     (rowId: string | null, event: ReactDragEvent) => {
       if (drag.ids.length === 0) return;
       const effect = effectFromModifiers({ alt: event.altKey, ctrl: event.ctrlKey });
-      const check = canDropOn(allRows, drag.ids, rowId, effect);
+      /*
+       * In suite grouping the path planner is never consulted, and that is a
+       * correctness point rather than an optimisation: a file row here still
+       * carries its real `filePath`, so `canDropOn` would happily resolve a drop
+       * onto a file to the FOLDER that file lives in and light the row up for a
+       * move nobody asked for.
+       */
+      const check =
+        grouping === 'suite'
+          ? canDropOnSuite(suiteCtx, allRows, drag.ids, rowId)
+          : canDropOn(allRows, drag.ids, rowId, effect);
       /*
        * preventDefault only when the drop would land. Leaving it alone on a
        * refusal is what makes the browser draw its "no drop" cursor, and the
@@ -2159,7 +2576,10 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
        */
       if (check.ok) {
         event.preventDefault();
-        event.dataTransfer.dropEffect = effect;
+        // An assignment is never a copy: a test is in one suite, and ⌥ has
+        // nothing different to mean here. Showing the copy cursor would promise
+        // a second file that is not coming.
+        event.dataTransfer.dropEffect = grouping === 'suite' ? 'move' : effect;
       }
       setDrag((previous) =>
         previous.over &&
@@ -2178,7 +2598,7 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
             },
       );
     },
-    [allRows, drag.ids],
+    [allRows, drag.ids, grouping, suiteCtx],
   );
 
   const dragLeave = useCallback((rowId: string | null) => {
@@ -2198,10 +2618,25 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
       const effect = effectFromModifiers({ alt: event.altKey, ctrl: event.ctrlKey });
       setDrag(NO_DRAG);
       if (ids.length === 0) return;
+      if (grouping === 'suite') {
+        const target = suiteDropTargetOf(suiteCtx, allRows, rowId);
+        if (!target) {
+          // The panel background, or a heading whose suite this client no longer
+          // has. There is no root to fall back on when the tree is grouped by a
+          // column, so the honest answer is that nothing happened and why.
+          setStatus('Drop files onto a suite to put them in it');
+          return;
+        }
+        const plan = planSuiteDrop(suiteCtx, allRows, ids, target);
+        void applyOps(plan.ops, plan.refusals, 'Assigned', [], (done) =>
+          assignmentSummary(done, target),
+        );
+        return;
+      }
       const plan = planDropOn(allRows, ids, rowId, effect);
       void applyOps(plan.ops, plan.refusals, effect === 'copy' ? 'Copied' : 'Moved');
     },
-    [allRows, applyOps, drag.ids],
+    [allRows, applyOps, drag.ids, grouping, suiteCtx],
   );
 
   // ── The keyboard (features 6, 11) ─────────────────────────────────────────
@@ -2299,6 +2734,9 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
   return {
     prefs,
     prefsApi,
+    grouping,
+    setGrouping,
+    suites,
     model,
     rows,
     allRows,
@@ -2325,6 +2763,9 @@ export function useTreeController(options: TreeControllerOptions): TreeControlle
     busy,
     autoReveal,
     structural,
+    canDrag,
+    suiteOfRow,
+    newSuite,
     canUndo: canUndo(undoStack),
     canRedo: canRedo(undoStack),
     undoLabel: undoTop ? describeEntry(undoTop) : null,

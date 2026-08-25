@@ -114,13 +114,28 @@ export function FileTree(props: FileTreeProps) {
       const isDir = row.kind === 'dir';
       const selected = tree.selection.ids.size;
       const many = selected > 1 && tree.selection.ids.has(row.id);
+      /*
+       * The suite behind this row, when it is one. Everything below asks this
+       * rather than `isDir`: a suite heading and a folder are both `dir` rows
+       * and almost nothing they can do is the same. The unassigned group answers
+       * null here, which is exactly what keeps "Rename" and "Delete" off it.
+       */
+      const suite = tree.suiteOfRow(row);
       const subject = many ? `${selected} items` : isDir ? `${row.name}/` : row.name;
       const scoped = tree.prefs.scope !== null;
 
       const items: MenuItem[] = [];
 
-      if (isDir) {
-        items.push({ label: 'New file…', onSelect: () => tree.addFile(row.path) });
+      if (suite) {
+        items.push({ label: 'New suite…', onSelect: () => tree.newSuite() });
+      } else if (isDir) {
+        items.push({
+          label: 'New file…',
+          onSelect: () => tree.addFile(row.path),
+          // A suite grouping's headings have no path; "new file here" would put
+          // the file at the project root, which is not where it was asked for.
+          disabled: tree.grouping === 'suite',
+        });
         items.push({
           label: 'New folder…',
           onSelect: () => tree.newFolder(row.path),
@@ -131,7 +146,7 @@ export function FileTree(props: FileTreeProps) {
       }
 
       items.push({
-        label: isDir ? 'Run this folder' : 'Run this file',
+        label: suite ? 'Run this suite' : isDir ? 'Run this folder' : 'Run this file',
         onSelect: () => tree.runFolder(row),
         disabled: !props.onRunTests,
         separated: true,
@@ -139,7 +154,9 @@ export function FileTree(props: FileTreeProps) {
       items.push({
         label: isDir ? 'Find in folder' : 'Find in this folder',
         onSelect: () => tree.findInFolder(row),
-        disabled: !props.onFindInFolder,
+        // A heading has no folder to search inside, and searching the whole
+        // project instead would answer a question nobody asked.
+        disabled: !props.onFindInFolder || (isDir && tree.grouping === 'suite'),
       });
 
       /*
@@ -179,10 +196,17 @@ export function FileTree(props: FileTreeProps) {
       }
       if (scoped) items.push({ label: 'Clear root', onSelect: () => tree.setScope(null) });
 
+      /*
+       * Rename and delete are offered on a suite even though every other path
+       * gesture is off, because a suite IS a row on the server: `PATCH` and
+       * `DELETE /suites/:id` both exist. That asymmetry is the whole reason
+       * `suiteOfRow` returns a suite rather than a boolean — the item is enabled
+       * by the thing that will be sent, not by a guess from the grouping.
+       */
       items.push({
-        label: `Rename ${subject}`,
+        label: suite ? `Rename ${suite.name}` : `Rename ${subject}`,
         onSelect: () => tree.beginRename(row.id),
-        disabled: many || !tree.structural,
+        disabled: many || (!tree.structural && !suite),
         separated: true,
       });
       if (!isDir) {
@@ -209,8 +233,15 @@ export function FileTree(props: FileTreeProps) {
       }
 
       items.push({
-        label: isDir ? `Delete ${row.name}/ and everything in it` : `Delete ${subject}`,
+        label: suite
+          ? `Delete ${suite.name} — the tests stay`
+          : isDir
+            ? `Delete ${row.name}/ and everything in it`
+            : `Delete ${subject}`,
         onSelect: () => tree.doDelete(),
+        // A heading with no suite behind it — the "No suite" group — has nothing
+        // to delete, and offering it would promise a call that cannot be made.
+        disabled: isDir && tree.grouping === 'suite' && !suite,
         danger: true,
         separated: true,
       });
@@ -286,8 +317,16 @@ export function FileTree(props: FileTreeProps) {
           drop={drop}
           renaming={tree.renamingId === row.id}
           renameError={tree.renamingId === row.id ? tree.renameError : null}
-          draggable={tree.structural && tree.renamingId !== row.id}
+          // Per row, not one flag for the panel: in suite grouping a FILE can be
+          // dragged (onto a suite, to be put in it) while the suite heading
+          // above it cannot be dragged anywhere.
+          draggable={tree.canDrag(row) && tree.renamingId !== row.id}
           hiddenCount={row.node.kind === 'dir' ? row.node.hiddenCount : 0}
+          {...(isDir && tree.grouping === 'suite'
+            ? // The unassigned heading is a group and not a suite; announcing it
+              // as one would name a row the server has never heard of.
+              { dirNoun: tree.suiteOfRow(row) ? 'suite' : 'group', canAdd: false }
+            : {})}
           onSelect={(mods) => onSelect(row, mods)}
           onToggle={(alsoSiblings) => tree.toggleDir(row, alsoSiblings)}
           {...(compacted ? { onSegment: compacted } : {})}
@@ -357,6 +396,15 @@ export function FileTree(props: FileTreeProps) {
         </p>
       );
     }
+    if (tree.grouping === 'suite' && tree.suites.length === 0) {
+      // Grouped by something the project has none of. Saying "no files" here
+      // would send someone looking for tests that may well exist.
+      return (
+        <p className="text-ink-faint whitespace-normal">
+          No suites yet. Press ⊞ to make one, then drag files onto it.
+        </p>
+      );
+    }
     return (
       <p className="text-ink-faint whitespace-normal">
         No files yet. Press + to write one.
@@ -372,6 +420,9 @@ export function FileTree(props: FileTreeProps) {
         prefs={tree.prefs}
         onPrefs={tree.prefsApi.set}
         onToggle={tree.prefsApi.toggle}
+        grouping={tree.grouping}
+        onGrouping={tree.setGrouping}
+        onNewSuite={tree.newSuite}
         query={tree.query}
         onQuery={tree.setQuery}
         filterActive={tree.filterActive}

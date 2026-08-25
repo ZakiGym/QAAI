@@ -35,6 +35,9 @@ import { integrationsRouter } from './routes/integrations.js';
 import { recordRouter } from './routes/record.js';
 import { importRouter } from './routes/import.js';
 import { sourceRouter } from './routes/source.js';
+import { suitesRouter } from './routes/suites.js';
+import { schedulesRouter } from './routes/schedules.js';
+import { badgesRouter } from './routes/badges.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { clustersRouter } from './routes/clusters.js';
 import { compareRouter } from './routes/compare.js';
@@ -162,6 +165,17 @@ app.use('/github', githubRouter);
 // and terminates its own 404s, so an agent path never falls through into the
 // session-authenticated admin half.
 app.use('/runners', runnersRouter);
+
+/*
+ * The sidebar's two badge counts, on their own prefix.
+ *
+ * They used to come from `/verdicts` and `/heals` — two full list payloads,
+ * polled from every open tab every ten to fifteen seconds, for two numbers.
+ */
+app.use('/badges', badgesRouter);
+
+/* Schedules and monitors: the read/update/delete half the POSTs never had. */
+app.use('/automation', schedulesRouter);
 app.use('/team', teamRouter);
 app.use('/clusters', clustersRouter);
 app.use('/compare', compareRouter);
@@ -188,6 +202,12 @@ app.use('/', importRouter);
 // owned by the file that serves it. projectsRouter has no ':projectId/source'
 // route, so nothing shadows this one on the way past.
 app.use('/', sourceRouter);
+/*
+ * Declares its own full `/projects/:projectId/suites` paths, the way
+ * sourceRouter does, so it mounts at the root. projectsRouter owns no
+ * `:projectId/suites` route, so nothing above shadows it.
+ */
+app.use('/', suitesRouter);
 app.use('/', agentRouter);
 
 app.use(notFoundHandler);

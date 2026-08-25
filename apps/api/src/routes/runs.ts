@@ -13,15 +13,28 @@
  * Nothing about the default path changed: a POST that asks for none of them
  * loads the same column, queues the same job and executes the same suite it
  * always has.
+ *
+ * WHERE a run executes is decided here too, and it is a branch rather than an
+ * option: `Environment.runnerPool` set means the suite is handed to the
+ * customer's own agents (lib/runners.ts) and NOTHING is enqueued on our queue;
+ * null means the queue, exactly as before. `Run.runnerPool` records which, and
+ * it is what stops a run being executed twice, once in each place.
  */
 
 import { Router } from 'express';
 import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
-import type { ShardAssignment, ShardPlan, ShardedRunJob } from '@qaai/shared';
+import type { ShardAssignment, ShardPlan, ShardedRunJob, TestType } from '@qaai/shared';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, notFound, planLimit } from '../lib/errors.js';
 import { canStartRun, planFor } from '../lib/plan.js';
 import { startRun } from '../lib/start-run.js';
+import {
+  assessPool,
+  createRunnerJobs,
+  describeDispatch,
+  requirementsForTests,
+} from '../lib/runners.js';
+import type { RunnerSlice } from '../lib/runners.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
 import { subscribe } from '../lib/events.js';
@@ -430,13 +443,137 @@ async function evaluateResultCache(args: {
   };
 }
 
+// ─── On-prem dispatch (§ runners) ────────────────────────────────────────────
+
+interface OnPremDispatch {
+  pool: string;
+  /** RunnerJobs actually created. Fewer than the slices only on a retried POST. */
+  jobs: number;
+  /** Online runners serving the pool at the moment of dispatch. */
+  runnersOnline: number;
+  /** Null when the pool can take this work. A sentence naming the fix when not. */
+  warning: string | null;
+}
+
+/**
+ * Hand a run to the customer's own agents instead of our queue.
+ *
+ * One RunnerJob per slice — per shard when the run is sharded, one for the
+ * whole run when it is not — carrying what a runner must have before the job is
+ * offered to it. `createRunnerJobs` dedupes on `<runId>:<shard>`, so a retried
+ * POST cannot double-offer a slice.
+ *
+ * Then it looks at the pool and reports back. That second half is the whole
+ * point: creating the jobs is easy, and a job created into a pool nothing is
+ * listening to is exactly as invisible as no job at all.
+ */
+async function dispatchOnPrem(args: {
+  orgId: string;
+  runId: string;
+  pool: string;
+  testIds: string[];
+  types: ReadonlyArray<{ id: string; type: TestType }>;
+  /** Null when the run is not sharded — one job covering everything. */
+  shards: ReadonlyArray<{ index: number; testIds: string[] }> | null;
+}): Promise<OnPremDispatch> {
+  const typeOf = new Map(args.types.map((row) => [row.id, row.type]));
+
+  /*
+   * An id with no row was deleted between the selection query and this one.
+   * Dropping it can only UNDER-state what the slice needs, which sends the job
+   * to a runner that then reports SKIPPED naming the missing browser or binary
+   * — the same honest outcome by a slower path. Over-stating would be the
+   * dangerous direction: it would park the slice in the unservable sweep for a
+   * requirement no test in it actually has.
+   */
+  const testsIn = (ids: readonly string[]): Array<{ type: TestType }> =>
+    ids.flatMap((id) => {
+      const type = typeOf.get(id);
+      return type ? [{ type }] : [];
+    });
+
+  const slices: RunnerSlice[] = args.shards
+    ? args.shards.map((shard) => ({
+        shardIndex: shard.index,
+        requirements: requirementsForTests(testsIn(shard.testIds)),
+      }))
+    : [{ shardIndex: null, requirements: requirementsForTests(testsIn(args.testIds)) }];
+
+  const jobs = await createRunnerJobs({
+    orgId: args.orgId,
+    runId: args.runId,
+    pool: args.pool,
+    slices,
+  });
+
+  /*
+   * Revoked runners are fetched too, and filtered inside `assessPool`. It is
+   * the same read `skipUnservableJobs` does, deliberately: the sentence shown
+   * now and the sentence written fifteen minutes later must be two renderings
+   * of one judgement, and that only holds if they are given the same input.
+   */
+  const fleet = await prisma.runner.findMany({
+    select: {
+      id: true,
+      name: true,
+      pools: true,
+      capabilities: true,
+      lastSeenAt: true,
+      revokedAt: true,
+    },
+  });
+
+  // Per slice, not on the union of their requirements: a run whose k6 shard
+  // cannot be served while its browser shard can is not a run that "will not be
+  // claimed", and saying so would be the kind of over-warning that teaches
+  // people to ignore the field.
+  const warnings = [
+    ...new Set(
+      slices
+        .map((slice) => describeDispatch(slice.requirements, args.pool, fleet))
+        .filter((warning): warning is string => warning !== null),
+    ),
+  ];
+  const warning = warnings.length > 0 ? warnings.join(' ') : null;
+
+  /*
+   * Stamped onto the jobs, not only returned.
+   *
+   * The 202 reaches whoever made the request; the person who goes looking is on
+   * Settings → Runners, where a job's `errorMessage` IS the row. Guarded on
+   * QUEUED so a runner that claimed the work in the intervening milliseconds
+   * keeps its job untouched, and the reaper and the sweep overwrite it later
+   * with whatever is true then.
+   */
+  if (warning) {
+    await prisma.runnerJob.updateMany({
+      where: { runId: args.runId, status: 'QUEUED' },
+      data: { errorMessage: warning },
+    });
+  }
+
+  return {
+    pool: args.pool,
+    jobs,
+    runnersOnline: assessPool(
+      { testTypes: [], browsers: [], toolchains: [] },
+      args.pool,
+      fleet,
+    ).online,
+    warning,
+  };
+}
+
 runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (req, res) => {
   const actor = actorOf(req);
   const input = createRunSchema.parse(req.body);
 
   const environment = await prisma.environment.findUnique({
     where: { id: input.environmentId },
-    select: { id: true, projectId: true, baseUrl: true, updatedAt: true },
+    // `runnerPool` is THE switch between the two dispatch paths below. Read
+    // here, copied onto the run, and never read through the relation again —
+    // an environment edited mid-run must not move a run that is already going.
+    select: { id: true, projectId: true, baseUrl: true, updatedAt: true, runnerPool: true },
   });
   if (!environment) throw notFound('Environment');
 
@@ -592,6 +729,26 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
   }
 
   /*
+   * ── Which side of the firewall executes this ───────────────────────────────
+   *
+   * `Environment.runnerPool` is the switch, and it is read once, here, then
+   * copied onto the run. Everything downstream — the dispatch below, the repair
+   * endpoint, the agent's own claim — reads the run's copy, so an environment
+   * edited while a run is in flight cannot move that run's work to a different
+   * network halfway through.
+   *
+   * The test types are needed only on this path, to say what a runner must have
+   * before the job is offered to it. A cloud run does not pay for the query.
+   */
+  const onPremPool = environment.runnerPool;
+  const onPremTests = onPremPool
+    ? await prisma.test.findMany({
+        where: { id: { in: testIds } },
+        select: { id: true, type: true },
+      })
+    : [];
+
+  /*
    * Gate, create, count — all three in lib/start-run.ts, which is the only
    * place any of the seven run-creating paths is allowed to bring a Run into
    * existence. `enforce` is the HTTP mode: over cap throws 402 PLAN_LIMIT here,
@@ -613,6 +770,10 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       prNumber: input.prNumber ?? null,
       totalCount: testIds.length,
       shardCount: grantedShards,
+      // The durable record of which of the two dispatch paths owns this run.
+      // Non-null means no queue job was enqueued for it, and the repair
+      // endpoint refuses to create runner jobs for anything with it null.
+      runnerPool: onPremPool,
       // Results are created upfront as placeholders so the cockpit can render
       // the whole suite immediately with each test pending.
       results: {
@@ -644,6 +805,31 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
   });
 
   /*
+   * ── Dispatch, one path or the other and never both ─────────────────────────
+   *
+   * Enqueueing a run that also has RunnerJobs would execute the suite twice
+   * against one environment — once on our workers, once inside the customer's
+   * network — with two sets of results racing to finalise a single run. So the
+   * branch is a branch, `run.runnerPool` is its record, and the repair endpoint
+   * in routes/runners.ts refuses to create jobs for a run where it is null.
+   *
+   * Until this branch existed nothing in the codebase ever wrote `runnerPool`,
+   * so no RunnerJob was ever created, and an enterprise's registered agent
+   * long-polled forever against an empty queue while every run quietly executed
+   * on QAAI's own workers — the exact opposite of what they bought.
+   */
+  const onPremDispatch = onPremPool
+    ? await dispatchOnPrem({
+        orgId: actor.orgId,
+        runId: run.id,
+        pool: onPremPool,
+        testIds,
+        types: onPremTests,
+        shards: sharded ? (shardPlan?.assignments ?? []) : null,
+      })
+    : null;
+
+  /*
    * One job per shard, each carrying only its own index. The payload stays ids
    * — the worker re-reads the slice from `TestResult.shardIndex`, so a job that
    * sits in the queue while someone disables a test still does the right thing.
@@ -653,8 +839,9 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
    * a human re-runs. Silently retrying a slice while its siblings are already
    * aggregating counts is how a run reports numbers from two different attempts.
    */
-  const jobIds =
-    shardPlan && sharded
+  const jobIds = onPremDispatch
+    ? []
+    : shardPlan && sharded
       ? await Promise.all(
           shardPlan.assignments.map((assignment) => {
             const payload: ShardedRunJob = {
@@ -689,6 +876,23 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       trigger: input.trigger,
       ...(sharded ? { shards: grantedShards } : {}),
       /*
+       * Where the tests physically executed is the first thing anyone asks when
+       * an on-prem result looks wrong, and six months later this row is the only
+       * place that still remembers. The warning is recorded too: "queued against
+       * a pool nothing was listening to" is a fact about the dispatch, not about
+       * the tests, and it does not survive anywhere else once a runner connects.
+       */
+      ...(onPremDispatch
+        ? {
+            dispatch: {
+              target: 'on-prem',
+              pool: onPremDispatch.pool,
+              jobs: onPremDispatch.jobs,
+              ...(onPremDispatch.warning ? { unclaimable: onPremDispatch.warning } : {}),
+            },
+          }
+        : {}),
+      /*
        * A run that executed 6 of 200 tests is a different event from one that
        * executed 200, and six months later the audit log is the only place that
        * still remembers which this was. The strategy and the counts are recorded
@@ -716,9 +920,34 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
   res.status(202).json({
     run,
     // `jobId` stays a string for every existing caller; sharded runs add the
-    // full list rather than replacing it.
-    jobId: jobIds[0],
+    // full list rather than replacing it. An on-prem run has neither: nothing
+    // was enqueued on our queue, and reporting an id that names no job would be
+    // a worse answer than reporting none.
+    ...(jobIds.length > 0 ? { jobId: jobIds[0] } : {}),
     ...(jobIds.length > 1 ? { jobIds } : {}),
+    /*
+     * Where this run went, and — the part that matters — whether anything is
+     * listening there.
+     *
+     * A run queued against a pool with no live runner is indistinguishable from
+     * a run that is executing slowly: same QUEUED status, same empty results,
+     * for the fifteen minutes the sweep waits before it will say anything at
+     * all. That silence is the bug this whole change exists to close, so the
+     * answer travels back with the 202 rather than being something the caller
+     * has to go looking for. `warning` is null when the pool is healthy —
+     * a warning that fires on the happy path is one people learn to ignore.
+     */
+    ...(onPremDispatch
+      ? {
+          dispatch: {
+            target: 'on-prem' as const,
+            pool: onPremDispatch.pool,
+            jobs: onPremDispatch.jobs,
+            runnersOnline: onPremDispatch.runnersOnline,
+            warning: onPremDispatch.warning,
+          },
+        }
+      : {}),
     /*
      * What this run decided not to do, and why.
      *

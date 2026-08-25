@@ -282,6 +282,18 @@ projectsRouter.post('/:projectId/environments', requireRole('MEMBER'), async (re
       name: input.name,
       kind: input.kind,
       baseUrl: input.baseUrl,
+      /*
+       * Which on-prem runner pool executes this environment's runs, or null for
+       * QAAI's own workers.
+       *
+       * The schema accepted this field before anything persisted it, so a
+       * customer could set a pool, get a 201, and watch every run go to the
+       * shared cloud queue anyway — the exact shape of "correct code connected
+       * to nothing" this repo keeps finding. `?? null` rather than a spread,
+       * because an environment created without a pool must be explicitly
+       * cloud-run, not merely unspecified.
+       */
+      runnerPool: input.runnerPool ?? null,
     },
   });
 
@@ -290,7 +302,14 @@ projectsRouter.post('/:projectId/environments', requireRole('MEMBER'), async (re
     action: 'environment.create',
     targetType: 'Environment',
     targetId: environment.id,
-    metadata: { name: input.name, kind: input.kind, baseUrl: input.baseUrl },
+    // The pool is in the audit because "why did this run execute inside their
+    // network" is a question an incident asks, and this row is the answer.
+    metadata: {
+      name: input.name,
+      kind: input.kind,
+      baseUrl: input.baseUrl,
+      runnerPool: input.runnerPool ?? null,
+    },
   });
 
   res.status(201).json({ environment });
@@ -406,8 +425,13 @@ projectsRouter.patch(
       data: {
         ...(input.name !== undefined ? { name: input.name } : {}),
         ...(input.baseUrl !== undefined ? { baseUrl: input.baseUrl } : {}),
+        // Spread, unlike create: `undefined` means "not mentioned" and must
+        // leave the pool alone, while an explicit `null` means "move this back
+        // to the cloud" and has to be written. The schema's `.nullish()` is
+        // what makes those two distinguishable here.
+        ...(input.runnerPool !== undefined ? { runnerPool: input.runnerPool } : {}),
       },
-      select: { id: true, name: true, kind: true, baseUrl: true },
+      select: { id: true, name: true, kind: true, baseUrl: true, runnerPool: true },
     });
 
     await audit({
@@ -415,7 +439,11 @@ projectsRouter.patch(
       action: 'environment.update',
       targetType: 'Environment',
       targetId: environment.id,
-      metadata: { name: updated.name, baseUrl: updated.baseUrl },
+      metadata: {
+        name: updated.name,
+        baseUrl: updated.baseUrl,
+        runnerPool: updated.runnerPool,
+      },
     });
 
     res.json({ environment: updated });
@@ -1709,6 +1737,19 @@ projectsRouter.delete('/:projectId/monitors/:monitorId', requireRole('MEMBER'), 
  *
  * De-duplicated by (kind, code, location): the same axe violation on the same
  * element across forty runs is one problem, not forty.
+ *
+ * The ORDER BY is the expensive part, and it is now indexed: Finding(orgId,
+ * createdAt), added in 20260824000000_query_plan_indexes. `createdAt` was the
+ * only unindexed column in the query, so the planner had to materialise the
+ * whole two-hop join — every finding of every run the project has ever had —
+ * and sort it to return a thousand rows. With the index it walks that index
+ * backwards, probes the two parents per row, and stops at the LIMIT: bounded
+ * work rather than work proportional to the project's history.
+ *
+ * `mutedAt` is deliberately not in that index, and the reason is written out in
+ * the migration: `IS NULL` is not an equality to the planner, so a column
+ * between `orgId` and `createdAt` would destroy the ordering the sort needs.
+ * Keep the filter here; do not "improve" the index by adding it.
  */
 projectsRouter.get('/:projectId/findings', async (req, res) => {
   const projectId = String(req.params.projectId);

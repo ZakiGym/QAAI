@@ -96,9 +96,35 @@ export const NAV: NavItemDef[] = [
     href: '/environments',
     label: 'Setup',
     Icon: IconServer,
-    owns: ['/source-control', '/integrations', '/settings/runners', '/settings/github', '/onboarding'],
+    /*
+     * `/schedules` MUST be listed here as well as in the strip below.
+     *
+     * `isNavActive` prefix-matches a section's own href, and /schedules shares
+     * no prefix with /environments — so without this claim the sidebar goes
+     * dark on the schedules screen, `sectionFor` returns null, and the shell
+     * renders no tab strip at all, stranding the page with no way back into
+     * its own section.
+     */
+    owns: [
+      '/schedules',
+      '/source-control',
+      '/integrations',
+      '/settings/runners',
+      '/settings/github',
+      '/onboarding',
+    ],
     tabs: [
       { href: '/environments', label: 'Environments' },
+      /*
+       * A tab, not a sixteenth sidebar row — and a tab is enough, because the
+       * palette is built from tab hrefs rather than from section rows (see
+       * EXTRA_DESTINATIONS and the note above `nav` in AppShell). That is the
+       * fix for the redesign's one regression, where ten screens fell out of
+       * ⌘K the moment they stopped having a row; a screen listed here inherits
+       * it. Placed second because a schedule points at an environment, so this
+       * is the next question after "where does it run".
+       */
+      { href: '/schedules', label: 'Schedules' },
       { href: '/source-control', label: 'Source control' },
       { href: '/integrations', label: 'Integrations' },
       { href: '/settings/runners', label: 'Runners' },

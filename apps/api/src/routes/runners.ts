@@ -25,7 +25,7 @@ import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import express from 'express';
 import { z } from 'zod';
-import { STEP_STATUSES, TEST_RESULT_STATUSES } from '@qaai/shared';
+import { STEP_STATUSES, TEST_RESULT_STATUSES, runnerPoolName } from '@qaai/shared';
 import { artifactKey } from '@qaai/storage';
 import { prisma, unscoped, withTenant } from '../lib/prisma.js';
 import { hashToken } from '../lib/crypto.js';
@@ -58,7 +58,9 @@ import {
   requireLease,
   requirementsForTests,
   retentionDaysFor,
+  servesPool,
   skipUnservableJobs,
+  summarisePools,
 } from '../lib/runners.js';
 import type { RunnerCapabilities } from '../lib/runners.js';
 
@@ -787,10 +789,11 @@ runnersRouter.use('/agent', agentRouter);
 
 // ─── Admin ───────────────────────────────────────────────────────────────────
 //
-// Route order is load-bearing below: `/queue` is a literal that would be
-// swallowed by a `POST /:runnerId` if anyone ever adds one. If you need a route
-// on a single runner, give it a suffix (`/:runnerId/rotate`) like the two that
-// already exist.
+// Route order is load-bearing below: `/queue` and `/pools` are literals that
+// would be swallowed by a `POST /:runnerId` or a `PUT /:runnerId` if anyone
+// ever adds one. If you need a route on a single runner, give it a suffix
+// (`/:runnerId/rotate`) like the two that already exist, and keep the literals
+// above it.
 
 runnersRouter.use(requireAuth);
 
@@ -868,9 +871,162 @@ runnersRouter.get('/queue', async (req, res) => {
   res.json({ jobs });
 });
 
+/**
+ * The pools, and whether anything is listening to each of them.
+ *
+ * This is the answer to the one support question this feature generates: "I
+ * registered a runner and nothing happens." Three independent things have to
+ * line up before a single test executes on-prem — an environment names a pool,
+ * a runner serves that pool, its agent is running — and until now each was
+ * visible somewhere and none of them together. A pool with an environment
+ * pointed at it and no runner serving it renders as *nothing at all* on a list
+ * of runners, which is why the pool is the row here and not the runner.
+ *
+ * Sweeps first, for the same reason `GET /queue` does: the org that most needs
+ * a sweep is the one with no agent polling to drive it.
+ *
+ * Readable by any member. It contains no credential — names, liveness and
+ * counts — and the person debugging "why is my run stuck" is usually not the
+ * person who holds ADMIN.
+ */
+runnersRouter.get('/pools', async (req, res) => {
+  const actor = actorOf(req);
+  await sweepOrg(actor.orgId).catch(() => {});
+
+  const [runners, environments, jobs] = await Promise.all([
+    prisma.runner.findMany({
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        pools: true,
+        capabilities: true,
+        lastSeenAt: true,
+        lastClaimAt: true,
+        revokedAt: true,
+      },
+    }),
+    prisma.environment.findMany({
+      orderBy: { name: 'asc' },
+      select: { id: true, projectId: true, name: true, runnerPool: true },
+    }),
+    // A groupBy rather than a page of rows: a `take` would under-count exactly
+    // the pool with the most work backed up in it.
+    prisma.runnerJob.groupBy({
+      by: ['pool', 'status'],
+      where: { status: { in: ['QUEUED', 'CLAIMED', 'RUNNING'] } },
+      _count: { _all: true },
+    }),
+  ]);
+
+  res.json({
+    pools: summarisePools({
+      runners,
+      environments,
+      jobs: jobs.map((row) => ({ pool: row.pool, status: row.status, count: row._count._all })),
+    }),
+    /*
+     * Every pool name a live runner already answers to, so the environment
+     * editor can offer a choice instead of asking someone to retype a string
+     * that has to match exactly. Typing it by hand is the failure this whole
+     * screen exists to explain.
+     */
+    knownPools: [
+      ...new Set(runners.filter((r) => !r.revokedAt).flatMap((r) => r.pools)),
+    ].sort((a, b) => a.localeCompare(b)),
+    environments,
+  });
+});
+
+const environmentPoolSchema = z.object({
+  /** `null` moves the environment's runs back onto QAAI's own workers. */
+  runnerPool: runnerPoolName.nullable(),
+});
+
+/**
+ * Point an environment at an on-prem pool, or move it back to the cloud.
+ *
+ * Lives on the runners router rather than beside the environment's other
+ * fields because it is not a property of the environment so much as a routing
+ * decision about it — the same decision `POST /runners` makes from the other
+ * end — and because this screen is where the pool names are known to be real.
+ *
+ * MEMBER, matching the gate on the environment's name and base URL. A stricter
+ * gate here would be theatre: anyone who can repoint `baseUrl` or write the
+ * environment's secrets already holds strictly more power than choosing which
+ * of their own hosts executes the suite.
+ *
+ * Runs already in flight are untouched by design — `Run.runnerPool` was copied
+ * at creation precisely so that this edit cannot move work that is already
+ * being executed somewhere else.
+ */
+runnersRouter.put('/pools/environments/:environmentId', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = environmentPoolSchema.parse(req.body ?? {});
+
+  const environment = await prisma.environment.findUnique({
+    where: { id: String(req.params.environmentId) },
+    select: { id: true, name: true, projectId: true, runnerPool: true },
+  });
+  if (!environment) throw notFound('Environment');
+
+  /*
+   * Refuse a pool no live runner answers to.
+   *
+   * The alternative — accept anything and let the run discover it fifteen
+   * minutes later — is the failure this change exists to remove, and a typo is
+   * by far its most common cause. Clearing the pool is always allowed, because
+   * moving back to the cloud workers can never strand anything.
+   */
+  if (input.runnerPool) {
+    const known = await prisma.runner.findMany({
+      where: { revokedAt: null },
+      select: { name: true, pools: true },
+    });
+    const served = known.some((runner) => servesPool(runner.pools, input.runnerPool));
+    if (!served) {
+      const offered = [...new Set(known.flatMap((r) => r.pools))].sort();
+      throw badRequest(
+        `No registered runner serves a pool called "${input.runnerPool}", so every run against ` +
+          `${environment.name} would queue with nobody to claim it. ` +
+          (known.length === 0
+            ? 'Register a runner in Settings → Runners first.'
+            : offered.length === 0
+              ? 'Your runners serve the default pool only — give one this pool name, or leave the environment on QAAI’s workers.'
+              : `Pools your runners serve: ${offered.join(', ')}.`),
+      );
+    }
+  }
+
+  const updated = await prisma.environment.update({
+    where: { id: environment.id },
+    data: { runnerPool: input.runnerPool },
+    select: { id: true, projectId: true, name: true, kind: true, baseUrl: true, runnerPool: true },
+  });
+
+  await audit({
+    actor,
+    action: 'environment.runner-pool',
+    targetType: 'Environment',
+    targetId: environment.id,
+    // Both sides: "who moved staging off the on-prem pool" is unanswerable from
+    // the new value alone, and it is the question that gets asked.
+    metadata: { name: updated.name, from: environment.runnerPool, to: updated.runnerPool },
+  });
+
+  res.json({ environment: updated });
+});
+
 const createRunnerSchema = z.object({
   name: z.string().min(1).max(120),
-  pools: z.array(z.string().min(1).max(64)).max(16).default([]),
+  /*
+   * `runnerPoolName` rather than a local string, and the shared one trims.
+   * These strings are compared with `===` against `Environment.runnerPool`
+   * (see `servesPool`), so a rule applied on only one side lets `"staging "` be
+   * registered here and `"staging"` be pointed at from an environment, with no
+   * error anywhere and a queue that never drains.
+   */
+  pools: z.array(runnerPoolName).max(16).default([]),
 });
 
 /**

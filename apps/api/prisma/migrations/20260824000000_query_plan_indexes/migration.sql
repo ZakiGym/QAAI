@@ -1,0 +1,97 @@
+-- Two indexes, both of them for queries that were reading a whole table to
+-- answer a bounded question (§5, §11).
+--
+-- CONCURRENTLY on both, and that is the reason this is its own migration rather
+-- than a line in someone else's: Run and Finding are the two tables that grow
+-- once per test, per run, forever. A plain CREATE INDEX takes a SHARE lock,
+-- which blocks every INSERT for as long as the build takes — on an install with
+-- a few million runs that is minutes of workers unable to record results, i.e.
+-- an outage caused by an optimisation. CONCURRENTLY trades two table scans and
+-- a longer wall clock for never blocking a writer.
+--
+-- CONCURRENTLY cannot run inside a transaction block, so each statement below
+-- must reach the server on its own. If the runner applying this file wraps it,
+-- split the two statements into two migrations rather than dropping the keyword.
+-- IF NOT EXISTS makes a re-run after a partial apply a no-op; note that a
+-- CONCURRENTLY build that is interrupted leaves an INVALID index behind, which
+-- must be dropped before retrying (see the query at the foot of this file).
+
+-- CreateIndex
+--
+-- Serves the flake sweep in apps/worker/src/processors/flake.ts:
+--
+--   SELECT ... FROM "Run"
+--   WHERE "triggeredBy" LIKE 'flake-radar:%' AND "queuedAt" >= now() - '24h'
+--   ORDER BY "queuedAt"
+--
+-- which ran every five minutes, for every org at once, with nothing to key on:
+-- measured as a full scan of the cross-org Run table (Parallel Seq Scan,
+-- 301,500 rows, 5,014 buffers) or a full scan of the projectId index.
+--
+-- `text_pattern_ops` is load-bearing rather than stylistic. This database
+-- collates en_US.UTF-8, and under any non-C collation a default btree cannot be
+-- used for `LIKE 'prefix%'` — character ordering and byte ordering disagree, so
+-- the prefix is not a contiguous range. The same two columns without the
+-- operator class would produce an index the planner never opens.
+--
+-- Column order follows the query: the prefix is the only equality-shaped
+-- predicate, so it leads; `queuedAt` follows so the 24h bound is a condition
+-- INSIDE the index rather than a filter applied after fetching every
+-- confirmation run ever made. The reverse order would be useless — a leading
+-- `queuedAt` range cannot be combined with a prefix search on the second column.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Run_triggeredBy_queuedAt_idx"
+  ON "Run" ("triggeredBy" text_pattern_ops, "queuedAt");
+
+-- CreateIndex
+--
+-- Serves GET /projects/:projectId/findings in apps/api/src/routes/projects.ts:
+--
+--   SELECT ... FROM "Finding"
+--   JOIN "TestResult" ON ... JOIN "Run" ON ...
+--   WHERE "Finding"."orgId" = $1 AND "Run"."projectId" = $2
+--     AND "Finding"."mutedAt" IS NULL
+--   ORDER BY "Finding"."createdAt" DESC LIMIT 1000
+--
+-- `createdAt` was the only unindexed part, and it is the one the query sorts on,
+-- so the planner had to build the entire join — every finding of every run the
+-- project has ever had — and sort it to hand back a thousand rows.
+--
+-- Column order, which is the entire optimisation:
+--   orgId     — an equality on every read, because the tenant extension puts it
+--               there. An equality-constrained prefix is the precondition for
+--               the rest of the index to supply an ordering.
+--   createdAt — the ORDER BY. Ascending is right even though the query is DESC:
+--               btree scans backwards, and a single-direction sort needs no
+--               matching index direction.
+--
+-- `mutedAt` is deliberately absent. Wedging it between the two (the obvious
+-- "index every column in the WHERE" move) is wrong and was measured to be
+-- wrong: `mutedAt IS NULL` is not an equality to the planner, it joins no
+-- equivalence class, so it cannot pin that column — and a column the planner
+-- cannot pin destroys the ordering of every column after it. The three-column
+-- index produced no usable sort order and the planner ignored it in every plan
+-- tried. It stays a filter.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "Finding_orgId_createdAt_idx"
+  ON "Finding" ("orgId", "createdAt");
+
+-- Left behind by an interrupted CONCURRENTLY build, and invisible to the
+-- planner while it sits there:
+--   SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+--   WHERE NOT i.indisvalid;
+
+-- DropIndex
+--
+-- `Finding_orgId_idx` is now a strict PREFIX of the index above, which makes it
+-- dead weight rather than a second option: any query a single-column (orgId)
+-- index can answer, (orgId, createdAt) answers too, by scanning the same
+-- leading column. What it still costs is real — every INSERT into a table that
+-- grows once per finding maintains both btrees, and both are cached.
+--
+-- Verified rather than assumed, on a 250k-row corpus: the findings query plans
+-- as `Index Scan Backward using "Finding_orgId_createdAt_idx"` with `mutedAt`
+-- as a filter, which is the plan the composite was added for. Nothing chose the
+-- single-column index.
+--
+-- Not CONCURRENTLY: a DROP takes its lock for the moment it takes to unlink the
+-- index, not for a build, so there is nothing here to keep out of a writer's way.
+DROP INDEX IF EXISTS "Finding_orgId_idx";

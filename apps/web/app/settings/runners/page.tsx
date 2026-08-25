@@ -36,12 +36,45 @@ import { cn } from '../../../lib/cn';
  * a banner you dismiss deliberately, not a modal a stray Escape can eat.
  * Revoking cuts a runner off mid-job, so the confirmation names the run it is
  * holding and says where that work goes.
+ *
+ * Three sections, in the order the questions get asked. The FLEET answers "are
+ * my hosts up". The POOLS answer "is any of this wired to anything" — an
+ * environment has to name a pool, a runner has to serve it, and its agent has
+ * to be running, and every one of those looks fine on its own while the
+ * combination is broken. The QUEUE answers "what is stuck, and why".
  */
 
 /** Just enough of GET /auth/me to know whether the mutations will be allowed. */
 interface Viewer {
   activeOrgId: string;
   orgs: Array<{ id: string; role: string }>;
+}
+
+/**
+ * GET /runners/pools — mirrors `summarisePools` in apps/api/src/lib/runners.ts.
+ *
+ * Local to this screen rather than in lib/api.ts for the same reason
+ * `IconServer` lives in RunnerList: that file is not this change's to edit.
+ */
+interface PoolSummary {
+  /** Null is the default pool — where a runner naming no pools serves. */
+  pool: string | null;
+  code: 'ready' | 'no-runners' | 'no-pool-runners' | 'none-online' | 'missing-capabilities';
+  ready: boolean;
+  runners: Array<{
+    id: string;
+    name: string;
+    online: boolean;
+    lastSeenAt: string | null;
+    lastClaimAt: string | null;
+    servesAll: boolean;
+  }>;
+  online: number;
+  environments: Array<{ id: string; projectId: string; name: string }>;
+  queued: number;
+  inFlight: number;
+  lastClaimAt: string | null;
+  note: string;
 }
 
 /** Refresh cadence. Liveness is a clock reading; a stale one is the bug. */
@@ -55,6 +88,7 @@ export default function RunnersPage() {
 
   const [runners, setRunners] = useState<Runner[] | null>(null);
   const [jobs, setJobs] = useState<RunnerJob[]>([]);
+  const [poolHealth, setPoolHealth] = useState<PoolSummary[]>([]);
   /** Null means unavailable (a viewer below ADMIN, or the endpoint down) — hidden, never an error. */
   const [workerQueues, setWorkerQueues] = useState<WorkerQueueHealth[] | null>(null);
   const [canManage, setCanManage] = useState(false);
@@ -76,11 +110,17 @@ export default function RunnersPage() {
 
   const load = useCallback(async () => {
     try {
-      const [fleet, queue, health] = await Promise.all([
+      const [fleet, queue, pooled, health] = await Promise.all([
         api<{ runners: Runner[] }>('/runners'),
         // The queue sweep runs when this is fetched, which is how an org with
         // no runner left ever learns its jobs are unservable.
         api<{ jobs: RunnerJob[] }>('/runners/queue').catch(() => ({ jobs: [] as RunnerJob[] })),
+        // The pool view: which environments route where, who serves each pool,
+        // and whether anything is actually claiming. Soft-failed like the rest —
+        // it is the diagnosis, and a diagnosis must not take down the patient.
+        api<{ pools: PoolSummary[] }>('/runners/pools').catch(() => ({
+          pools: [] as PoolSummary[],
+        })),
         // Soft on every failure — 403 for a non-admin, 503 while Redis is down,
         // any 500. Queue telemetry is a bonus on this screen, and it must never
         // be the reason the runner fleet stops rendering.
@@ -88,6 +128,7 @@ export default function RunnersPage() {
       ]);
       setRunners(fleet.runners);
       setJobs(queue.jobs);
+      setPoolHealth(pooled.pools);
       setWorkerQueues(health ? health.queues : null);
       setNow(Date.now());
       setError(null);
@@ -242,6 +283,9 @@ export default function RunnersPage() {
             </p>
           )}
         </section>
+
+        {/* ── The pools ────────────────────────────────────────────────────── */}
+        {!loading && poolHealth.length > 0 && <PoolsSection pools={poolHealth} now={now} />}
 
         {/* ── The queue ────────────────────────────────────────────────────── */}
         {!loading && <QueueSection queue={queue} workerQueues={workerQueues} now={now} />}
@@ -451,6 +495,85 @@ function TokenBanner({
         export QAAI_RUNNER_TOKEN=&apos;…&apos; · never on the command line — argv is readable by
         every other process on that box; --token-file exists for that reason
       </p>
+    </div>
+  );
+}
+
+// ─── The pools ───────────────────────────────────────────────────────────────
+
+/**
+ * A pool per row, because the failure this screen exists to explain is not a
+ * property of any runner.
+ *
+ * Three things have to line up before one test executes inside the customer's
+ * network: an environment names a pool, a runner serves that pool, its agent is
+ * running. Each of those was already visible somewhere — none of them together
+ * — and every individual piece looks fine while the combination is broken. A
+ * pool with an environment pointed at it and no runner serving it renders as
+ * literally nothing on a list of runners, which is exactly what "I registered a
+ * runner and nothing happens" feels like from the outside.
+ *
+ * The second fact here that nothing rendered before is `lastClaimAt`. Online
+ * says a process is up; last-claimed says it is asking for work. An agent
+ * wedged after a bad deploy heartbeats happily and claims nothing, and from
+ * every other angle on this page it looks healthy.
+ */
+function PoolsSection({ pools, now }: { pools: PoolSummary[]; now: number }) {
+  return (
+    <section className="mt-6">
+      <SectionLabel>Pools · {pools.length}</SectionLabel>
+      {pools.map((pool) => (
+        <PoolRow key={pool.pool ?? ' default'} pool={pool} now={now} />
+      ))}
+    </section>
+  );
+}
+
+/** Green only when a pool is both served and pointed at. Anything else is a job to do. */
+function poolTone(pool: PoolSummary): { dot: string; text: string } {
+  if (!pool.ready) {
+    // Nobody registered while work routes here costs coverage; nobody online
+    // may just be a restart. Both are wrong, one is urgent.
+    return pool.code === 'none-online'
+      ? { dot: 'bg-flake', text: 'text-flake' }
+      : { dot: 'bg-fail', text: 'text-fail' };
+  }
+  // Served and up, but nothing routes here — a half-finished setup, not a fault.
+  if (pool.environments.length === 0) return { dot: 'bg-flake', text: 'text-flake' };
+  return { dot: 'bg-pass', text: 'text-ink-dim' };
+}
+
+function PoolRow({ pool, now }: { pool: PoolSummary; now: number }) {
+  const tone = poolTone(pool);
+  // Only meaningful when something serves the pool, which is the only branch
+  // that renders it.
+  const claim = pool.lastClaimAt
+    ? `last claimed work ${elapsed(pool.lastClaimAt, now)} ago`
+    : 'has never claimed work';
+
+  return (
+    <div className="border-line flex flex-wrap items-baseline gap-x-3.5 gap-y-1 border-b py-3">
+      <span
+        aria-hidden="true"
+        className={cn('h-[7px] w-[7px] shrink-0 self-center rounded-full', tone.dot)}
+      />
+      <span className="w-[120px] shrink-0 truncate font-mono text-[12px]">
+        {pool.pool ?? 'default'}
+      </span>
+
+      <span className={cn('min-w-0 flex-1 text-[12.5px]', tone.text)}>{pool.note}</span>
+
+      <span className="text-ink-faint text-micro max-w-[300px] shrink-0 truncate font-mono">
+        {pool.runners.length === 0
+          ? 'no runners'
+          : `${pool.runners.map((r) => r.name).join(', ')} · ${claim}`}
+      </span>
+
+      <span className="text-ink-faint text-micro w-24 shrink-0 text-right font-mono tabular-nums">
+        {pool.queued + pool.inFlight === 0
+          ? '—'
+          : `${pool.queued} waiting · ${pool.inFlight} live`}
+      </span>
     </div>
   );
 }

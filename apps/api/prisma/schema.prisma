@@ -836,6 +836,15 @@ model Run {
   @@index([projectId, queuedAt])
   @@index([status])
   @@index([commitSha])
+  /// The flake sweep's own query, and the only prefix search in the product:
+  /// "every confirmation run tagged `flake-radar:` queued in the last 24h",
+  /// cross-org, every five minutes. `text_pattern_ops` is not decoration — this
+  /// database collates en_US, and under a non-C collation a default btree
+  /// CANNOT serve `LIKE 'prefix%'` at all, so the same index without the
+  /// operator class would be ignored and the sweep would keep reading the whole
+  /// table. `queuedAt` trails the prefix so the 24h bound is applied inside the
+  /// index instead of by fetching every confirmation run ever made.
+  @@index([triggeredBy(ops: raw("text_pattern_ops")), queuedAt])
 }
 
 /// One slice of a sharded run: its own queue job, its own worker, its own tests.
@@ -954,9 +963,22 @@ model Finding {
 
   testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
 
-  @@index([orgId])
   @@index([testResultId])
   @@index([code])
+  /// GET /projects/:id/findings: newest-first, capped, filtered to the project
+  /// through TestResult -> Run. `createdAt` was the only unindexed part of it,
+  /// so the planner had to materialise every finding the project had ever
+  /// recorded and sort them to return a thousand.
+  ///
+  /// The column order is the whole optimisation. `orgId` first because the
+  /// tenant extension makes it an equality on every read; `createdAt` second
+  /// because that is the ORDER BY, and an equality-constrained prefix is what
+  /// lets the index supply the sort (scanned backwards) so LIMIT can stop.
+  /// `mutedAt` is deliberately NOT wedged in between: `mutedAt IS NULL` is not
+  /// an equality in the planner's sense, it joins no equivalence class, and a
+  /// column it cannot pin destroys the ordering of everything after it. That
+  /// index was measured and the planner never used it once.
+  @@index([orgId, createdAt])
 }
 
 model Artifact {

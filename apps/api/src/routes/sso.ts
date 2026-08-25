@@ -26,6 +26,22 @@
  *      test signals, where continuing is the safe direction. Here the signal is
  *      "is this stranger who they say they are", and the safe answer to "I
  *      cannot check" is no.
+ *
+ * ─── What changed, and what was already here ────────────────────────────────
+ *
+ * SAML's *return* leg has been complete for a while: `checkSamlAssertion` in
+ * lib/sso.ts, a real XML-signature verifier in lib/saml-verifier.ts registered
+ * at the composition root, and the `SsoAssertionSeen` unique index as the
+ * replay guard. What did not exist was the *outbound* leg — this file refused
+ * `protocol === 'SAML'` at /sso/start with a flat sentence, nothing ever built
+ * an `<AuthnRequest>`, and `SsoLoginRequest.samlRequestId` (a column that
+ * exists, and whose comment says what it is for) was never written. So SAML
+ * worked only IdP-initiated, by posting to the ACS out of nowhere, and the
+ * "Sign in with SSO" button on the login page led to a refusal.
+ *
+ * The ACS also asked for the wrong value: it passed the login request's *row
+ * id* as the expected `InResponseTo`, which is a database key no IdP has ever
+ * seen. Any real SP-initiated assertion would have been refused by it.
  */
 
 import { Router } from 'express';
@@ -34,6 +50,7 @@ import { Router } from 'express';
 // that it is worth naming here.
 import type { Request } from 'express';
 import { promises as dns } from 'node:dns';
+import { deflateRawSync } from 'node:zlib';
 import { z } from 'zod';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { generateToken, hashToken } from '../lib/crypto.js';
@@ -77,6 +94,7 @@ import {
   verifyJwtSignature,
   type Jwk,
   type OidcEndpoints,
+  type SamlAssertionFacts,
 } from '../lib/sso.js';
 
 export const ssoRouter: Router = Router();
@@ -472,6 +490,21 @@ ssoRouter.post('/discover', async (req, res) => {
     res.json({ available: false });
     return;
   }
+  /*
+   * A SAML domain on a deployment with no signature verifier is a button that
+   * cannot work, and the login page has to be able to say so rather than
+   * sending the browser to a refusal.
+   *
+   * `reason` is a fixed vocabulary of ours, and this one describes THIS
+   * deployment, not the organization — it reveals nothing about the customer
+   * that the `available` flag has not already revealed. The plan gate above
+   * deliberately gets no reason code: that one would be leaking somebody
+   * else's billing state to an anonymous caller.
+   */
+  if (row.connection.protocol === 'SAML' && !samlVerifier()) {
+    res.json({ available: false, reason: 'SAML_UNAVAILABLE' });
+    return;
+  }
 
   res.json({
     available: true,
@@ -480,6 +513,171 @@ ssoRouter.post('/discover', async (req, res) => {
     startUrl: `${env.API_PUBLIC_URL.replace(/\/+$/, '')}/sso/start/${row.connection.id}`,
   });
 });
+
+// ─── SAML: the outbound leg ──────────────────────────────────────────────────
+
+/*
+ * Duplicated from lib/sso.ts's private `xmlEscape` rather than exported from
+ * it, for the same reason `sessionCookie` above is duplicated from auth.ts:
+ * this change does not own that file. Six lines with no behaviour of their own
+ * is the cheaper of the two risks. Every value it is applied to below is one of
+ * ours — our entity id, our ACS URL, a token we generated — so this is defence
+ * against a URL containing an ampersand, not against an attacker.
+ */
+function xmlAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * The `<samlp:AuthnRequest>` this SP sends.
+ *
+ * UNSIGNED, and that is a decision rather than an omission: our SP metadata
+ * already advertises `AuthnRequestsSigned="false"`, and signing would mean
+ * holding an SP private key whose only job is to prove the request came from
+ * us — which nothing in this flow rests on. What binds the request to the
+ * assertion that comes back is `ID`, echoed by the IdP as `InResponseTo` and
+ * stored on the login request row before the browser leaves. Everything that
+ * decides whether to trust the answer happens on the way back in.
+ *
+ * `ID` is an xsd:ID, so it has to be an NCName. A base64url token is fine in
+ * the tail but may start with a digit, which an NCName may not — hence the
+ * leading underscore, which is why every IdP in the wild emits ids of exactly
+ * this shape.
+ *
+ * `NameIDPolicy` carries no `Format` on purpose. Our metadata names
+ * emailAddress, but nothing here depends on the NameID being an address —
+ * `samlEmail()` prefers an explicit attribute and only falls back to the
+ * NameID — and demanding a Format is the most common way an AuthnRequest gets
+ * refused outright by ADFS and Entra ID.
+ */
+function authnRequestXml(input: {
+  id: string;
+  issueInstant: Date;
+  destination: string;
+  issuer: string;
+  acsUrl: string;
+}): string {
+  return [
+    '<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"',
+    ' xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"',
+    ` ID="${xmlAttr(input.id)}"`,
+    ' Version="2.0"',
+    ` IssueInstant="${input.issueInstant.toISOString()}"`,
+    ` Destination="${xmlAttr(input.destination)}"`,
+    ' ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"',
+    ` AssertionConsumerServiceURL="${xmlAttr(input.acsUrl)}">`,
+    `<saml:Issuer>${xmlAttr(input.issuer)}</saml:Issuer>`,
+    '<samlp:NameIDPolicy AllowCreate="true"/>',
+    '</samlp:AuthnRequest>',
+  ].join('');
+}
+
+/**
+ * Send the browser to the IdP, HTTP-Redirect binding (SAML bindings §3.4).
+ *
+ * The refusals above the redirect name the one field an administrator still
+ * has to fill in. A SAML connection can legitimately exist half-configured —
+ * the IdP usually needs our metadata (which the admin surface serves from the
+ * connection the moment it is created) before it will tell you its entity id
+ * or hand over a certificate — so "not finished yet" is a normal state and
+ * deserves a sentence that says which half, not a flat "not available".
+ */
+async function startSamlLogin(
+  connection: ConnectionRow,
+  req: Request,
+  res: import('express').Response,
+): Promise<void> {
+  /*
+   * Fails closed BEFORE the browser leaves.
+   *
+   * With no verifier registered nothing coming back could be checked, and this
+   * is the kinder of the two refusals: sending someone to their IdP, making
+   * them authenticate, and rejecting them on the doorstep teaches them nothing
+   * and looks like their password was wrong.
+   */
+  if (!samlVerifier()) {
+    throw new SsoError(
+      'SAML sign-in is not available on this deployment. Use OIDC or password sign-in.',
+      'CONFIG',
+    );
+  }
+  if (!connection.samlSsoUrl) {
+    throw new SsoError(
+      'This connection has no identity-provider sign-on URL yet. An administrator adds it under Settings → Single sign-on, from the IdP’s SAML 2.0 metadata.',
+      'CONFIG',
+    );
+  }
+  if (!connection.samlIdpEntityId) {
+    throw new SsoError(
+      'This connection has no identity-provider entity id yet. An administrator copies it from the IdP’s metadata into Settings → Single sign-on.',
+      'CONFIG',
+    );
+  }
+  if (connection.samlIdpCertsPem.length === 0) {
+    throw new SsoError(
+      'This connection has no identity-provider signing certificate yet, and QAAI will not accept an assertion it cannot verify. An administrator adds the certificate under Settings → Single sign-on.',
+      'CONFIG',
+    );
+  }
+
+  // Re-validated at the point of use rather than trusted from the row — the
+  // same rule providerFetch states one section up, and for the same reason:
+  // rows outlive the validation that was in force when they were written.
+  const destination = safeOutboundUrl(connection.samlSsoUrl, 'SSO URL');
+
+  const state = generateToken(32);
+  const samlRequestId = `_${generateToken(16)}`;
+
+  await unscoped(() =>
+    prisma.ssoLoginRequest.create({
+      data: {
+        // Set by hand from the connection: `unscoped()` disables the tenancy
+        // extension's stamping, and the caller here is anonymous.
+        orgId: connection.orgId,
+        connectionId: connection.id,
+        stateHash: hashToken(state),
+        samlRequestId,
+        redirectTo: safeRelativePath(req.query.next),
+        ip: clientIp(req),
+        expiresAt: new Date(Date.now() + SSO_REQUEST_TTL_MS),
+      },
+      select: { id: true },
+    }),
+  );
+
+  const xml = authnRequestXml({
+    id: samlRequestId,
+    issueInstant: new Date(),
+    destination: destination.href,
+    issuer: spEntityId(env.API_PUBLIC_URL),
+    acsUrl: spAcsUrl(env.API_PUBLIC_URL, connection.id),
+  });
+
+  // RAW deflate — no zlib header, no checksum. SAML bindings §3.4.4.1 says the
+  // DEFLATE encoding of RFC 1951, and an IdP handed a zlib-wrapped stream
+  // reports a malformed request with no clue as to why.
+  destination.searchParams.set(
+    'SAMLRequest',
+    deflateRawSync(Buffer.from(xml, 'utf8')).toString('base64'),
+  );
+  /*
+   * RelayState is the only thing the IdP hands back that identifies this
+   * browser's in-flight login, so it is the same opaque single-use token the
+   * OIDC leg calls `state`, stored the same way — hashed, and consumed by the
+   * conditional update in `consumeState`.
+   *
+   * The binding caps RelayState at 80 bytes; `generateToken(32)` is 43
+   * base64url characters, which fits with room to spare.
+   */
+  destination.searchParams.set('RelayState', state);
+
+  res.redirect(302, destination.href);
+}
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 
@@ -490,13 +688,8 @@ ssoRouter.get('/start/:connectionId', async (req, res) => {
     await assertUsable(connection);
 
     if (connection.protocol === 'SAML') {
-      // Everything up to here works; the assertion coming back is what we
-      // cannot check. Refusing at the start is kinder than sending someone to
-      // their IdP and rejecting them on the way home.
-      throw new SsoError(
-        'SAML sign-in is not available on this deployment. Use OIDC or password sign-in.',
-        'CONFIG',
-      );
+      await startSamlLogin(connection, req, res);
+      return;
     }
 
     if (!connection.oidcIssuer || !connection.oidcClientId) {
@@ -579,6 +772,7 @@ async function consumeState(state: string) {
         orgId: true,
         connectionId: true,
         nonceHash: true,
+        samlRequestId: true,
         pkceVerifierEnc: true,
         keyVersion: true,
         redirectTo: true,
@@ -772,16 +966,19 @@ ssoRouter.get('/saml/:connectionId/metadata', async (req, res) => {
 /**
  * The assertion consumer service.
  *
- * Every check this endpoint would run is written and tested in lib/sso.ts —
- * `checkSamlAssertion` covers signature wrapping (via the verifier contract),
- * unsigned assertions, Destination, Recipient, Audience, InResponseTo,
- * NotBefore/NotOnOrAfter, and the replay table below is ready for the assertion
- * id. What is missing is the one thing that cannot be written safely here: the
- * XML signature check itself.
+ * Reached two ways, and the difference matters for exactly one check. An
+ * SP-initiated login arrives with the RelayState `startSamlLogin` minted, and
+ * the assertion must answer the AuthnRequest that went with it. An
+ * IdP-initiated login (the tile in someone's Okta dashboard) arrives with no
+ * RelayState at all, and the assertion must then carry no `InResponseTo`
+ * whatsoever — `checkSamlAssertion` enforces both directions.
  *
- * So this refuses, loudly, with an actionable sentence — and the code path that
- * would run afterwards is left in place, unreachable but reviewable, so whoever
- * installs the dependency can see exactly what they are wiring into.
+ * The trust decisions are elsewhere and stay elsewhere: the XML signature in
+ * lib/saml-verifier.ts, every condition on the assertion in
+ * `checkSamlAssertion`, replay in a unique index. This handler's own job is to
+ * refuse before any of them when the connection is not configured to be
+ * checkable, and to never turn a refusal into a page that echoes the
+ * attacker's XML back at the user.
  */
 ssoRouter.post('/saml/:connectionId/acs', async (req, res) => {
   try {
@@ -791,10 +988,30 @@ ssoRouter.post('/saml/:connectionId/acs', async (req, res) => {
 
     const verifier = samlVerifier();
     if (!verifier) {
-      // Fails CLOSED. See the file header for why this is the one place the
-      // "skip, never fail" rule does not apply.
+      /*
+       * Fails CLOSED, and this branch stays here even though index.ts registers
+       * a verifier at the composition root. It is the guarantee that signature
+       * checking has no opt-out: there is no configuration, no environment
+       * variable and no request parameter that reaches the code below without a
+       * verifier having run. Deleting the registration turns SAML off; it does
+       * not turn signature checking off.
+       */
       throw new SsoError(
         'SAML sign-in is not available on this deployment. Use OIDC or password sign-in.',
+        'CONFIG',
+      );
+    }
+
+    /*
+     * The trust anchors, checked here as well as in `startSamlLogin` because an
+     * IdP-initiated login never passes through /sso/start at all — this is the
+     * only gate it crosses. `verify()` would refuse an empty certificate list
+     * too, but as an unverifiable-assertion error, which is the wrong sentence
+     * for an administrator who simply has not pasted the certificate in yet.
+     */
+    if (!connection.samlIdpEntityId || connection.samlIdpCertsPem.length === 0) {
+      throw new SsoError(
+        'This SAML connection is not finished: it still needs the identity provider’s entity id and signing certificate before an assertion can be accepted.',
         'CONFIG',
       );
     }
@@ -823,13 +1040,62 @@ ssoRouter.post('/saml/:connectionId/acs', async (req, res) => {
 
     // Throws unless the signature verified; the facts come back from inside the
     // signed subtree only (see the SamlAssertionFacts contract).
-    const facts = verifier.verify(xml, connection.samlIdpCertsPem);
+    let facts: SamlAssertionFacts;
+    try {
+      facts = verifier.verify(xml, connection.samlIdpCertsPem);
+    } catch (err) {
+      /*
+       * Caught rather than left to `failToLogin`, for two reasons.
+       *
+       * The verifier's own messages interpolate values read out of the
+       * attacker's XML — a transform URI, an element id — and this handler ends
+       * in a redirect that puts its message into a query string on the login
+       * page. Echoing it would be a reflection primitive on an unauthenticated
+       * endpoint.
+       *
+       * And an unverifiable assertion is not a bug in QAAI, so it must not take
+       * the `logger.error` branch that exists to surface ones that are. Warn,
+       * audit, and say one sentence.
+       */
+      logger.warn(
+        { err, connectionId: connection.id },
+        'saml assertion failed signature verification',
+      );
+      await audit({
+        actor: {
+          userId: ANONYMOUS_ACTOR,
+          orgId: connection.orgId,
+          ip: clientIp(req),
+          impersonatedBy: null,
+        },
+        action: 'sso.login_refused',
+        targetType: 'SsoConnection',
+        targetId: connection.id,
+        metadata: { reason: 'the assertion signature did not verify' },
+      });
+      throw new SsoError(
+        'That sign-in response could not be verified against this connection’s signing certificate.',
+        'AUTH',
+      );
+    }
 
     const verdict = checkSamlAssertion(facts, {
       spEntityId: spEntityId(env.API_PUBLIC_URL),
       acsUrl: spAcsUrl(env.API_PUBLIC_URL, connection.id),
-      idpEntityId: connection.samlIdpEntityId ?? '',
-      requestId: pending?.id ?? null,
+      idpEntityId: connection.samlIdpEntityId,
+      /*
+       * The AuthnRequest ID we generated — NOT the login request's row id.
+       *
+       * They are different values on purpose: the row id is a database key the
+       * IdP has never seen, so requiring it as `InResponseTo` refused every
+       * real SP-initiated assertion. `samlRequestId` is the value that actually
+       * went out in the `<AuthnRequest>`.
+       *
+       * A `pending` row with no `samlRequestId` falls through to null, which
+       * drops into the IdP-initiated rules — the strictly stricter branch,
+       * because those require the assertion to carry no `InResponseTo` at all.
+       */
+      requestId: pending?.samlRequestId ?? null,
       now: new Date(),
     });
     if (!verdict.ok) {

@@ -437,6 +437,26 @@ async function advanceInvestigations(
 ): Promise<ActiveInvestigations> {
   const active: ActiveInvestigations = { total: 0, byProject: new Map(), tests: new Set() };
 
+  /*
+   * The one query in this file that touches every org at once, five minutes
+   * apart, forever — so it is the one that has to be an index lookup rather
+   * than a scan. It is served by Run(triggeredBy text_pattern_ops, queuedAt),
+   * added in 20260824000000_query_plan_indexes, and three things about it are
+   * load-bearing:
+   *
+   *   - `startsWith`, not `contains` and not a regex. Prisma turns it into
+   *     LIKE 'flake-radar:%', which is the only shape a btree can answer; any
+   *     other match on this column goes straight back to reading the table.
+   *   - the operator class on that index. The database collates en_US, and
+   *     under a non-C collation a DEFAULT btree cannot serve a prefix LIKE at
+   *     all — the same index without text_pattern_ops is never opened.
+   *   - the 24h floor stays in this where. It is the second index column, so
+   *     the bound is applied inside the index; drop it and the sweep starts
+   *     fetching every confirmation run the install has ever made.
+   *
+   * Measured on 301,500 runs: full scan, 1,052 buffers, 5.0 ms -> index scan,
+   * 35 buffers, 0.09 ms.
+   */
   const runs = await prisma.run.findMany({
     where: {
       triggeredBy: { startsWith: FLAKE_RUN_PREFIX },
