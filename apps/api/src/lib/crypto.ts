@@ -7,9 +7,10 @@
  * per hash on commodity hardware.
  */
 
-import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { API_KEY_PREFIX } from '@qaai/shared';
+import { env } from '../env.js';
 
 const scrypt = promisify(scryptCb) as (
   password: string | Buffer,
@@ -53,12 +54,43 @@ export async function verifyPassword(password: string, stored: string): Promise<
 }
 
 /**
- * Session cookies, API keys, invite tokens: we store only the hash, so a database
- * leak does not hand out live credentials. SHA-256 (not scrypt) because these are
- * already 256 bits of entropy — stretching buys nothing and costs a lot per request.
+ * Session cookies, API keys, invite and runner tokens: we store only the hash,
+ * so a database leak does not hand out live credentials.
+ *
+ * HMAC-SHA256 keyed on SESSION_SECRET, not a bare SHA-256. Not scrypt: these
+ * are already 256 bits of entropy from `generateToken`, so stretching buys
+ * nothing against a guessing attack and costs a lot on every authenticated
+ * request.
+ *
+ * ── Why keyed, when the input is already unguessable ────────────────────────
+ *
+ * Honestly: the guessing argument does not need it. 256 random bits are not
+ * brute-forced and not rainbow-tabled, so an unkeyed digest of one is already
+ * safe against the attack people usually mean.
+ *
+ * It is keyed because SESSION_SECRET was REQUIRED AT BOOT — the API refuses to
+ * start without 32 characters of it — and nothing read it. `deploy/.env.example`
+ * and `deploy/README.md` told operators it signed session cookies. It did not.
+ * A secret an operator generates, stores, rotates and protects, that has no
+ * effect, is worse than no secret: it spends real trust on nothing, and the
+ * first person to discover it stops believing the other things those docs say.
+ *
+ * So either it had to go or it had to work. Making it work is the better half
+ * of that choice, because it does buy one real thing: the database alone is no
+ * longer enough. A dump — a stolen backup, a replica, an errant analytics
+ * export — cannot be turned into live sessions without also holding the secret,
+ * which lives in the environment and, per deploy/backup.md, is deliberately
+ * kept out of the backups.
+ *
+ * ── Deploying this invalidates every existing token ─────────────────────────
+ *
+ * The digest changes, so sessions, API keys and runner tokens minted before it
+ * no longer match. Everyone signs in again; CI keys and runner tokens must be
+ * regenerated. That is a one-time cost that is acceptable now and would not be
+ * later, which is exactly why it is being paid now.
  */
 export function hashToken(raw: string): string {
-  return createHash('sha256').update(raw).digest('hex');
+  return createHmac('sha256', env.SESSION_SECRET).update(raw).digest('hex');
 }
 
 export function generateToken(bytes = 32): string {

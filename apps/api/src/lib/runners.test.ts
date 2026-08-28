@@ -42,6 +42,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
  */
 vi.mock('../env.js', () => ({
   env: {
+    // hashToken() is an HMAC keyed on this; without it every token
+    // digest throws. A fixed value keeps the digests stable across runs.
+    SESSION_SECRET: 'test-session-secret-at-least-32-characters-long',
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
     VAULT_MASTER_KEY: Buffer.alloc(32, 7).toString('base64'),

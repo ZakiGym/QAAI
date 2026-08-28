@@ -57,6 +57,9 @@ const h = vi.hoisted(
 // developer's local file would otherwise decide what these tests see.
 vi.mock('../env.js', () => ({
   env: {
+    // hashToken() is an HMAC keyed on this; without it every token
+    // digest throws. A fixed value keeps the digests stable across runs.
+    SESSION_SECRET: 'test-session-secret-at-least-32-characters-long',
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
     SESSION_TTL_HOURS: 72,

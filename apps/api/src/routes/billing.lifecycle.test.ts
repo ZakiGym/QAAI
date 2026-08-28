@@ -60,7 +60,13 @@ const h = vi.hoisted(
   (): Hoisted => ({
     prisma: {},
     currentOrg: () => null,
-    env: {},
+    // hashToken() is an HMAC keyed on SESSION_SECRET; the auth middleware
+    // hashes the session cookie on every request, so an empty env throws
+    // before any handler runs. Tests that reassign `h.env` must keep it.
+    env: { SESSION_SECRET: 'test-session-secret-at-least-32-characters-long' } as Record<
+      string,
+      unknown
+    >,
     stripe: { subscriptions: [], sessionsCreate: [], subscriptionsUpdate: [], customersCreate: [] },
     mail: { sent: [] },
   }),
@@ -527,6 +533,10 @@ beforeEach(() => {
   // Mutated, never reassigned — the env mock holds this object by reference.
   for (const key of Object.keys(h.env)) delete h.env[key];
   Object.assign(h.env, {
+    // Rebuilt every test because the loop above clears the object. Without it
+    // `hashToken` — the HMAC the auth middleware runs on every request — throws
+    // before any handler is reached.
+    SESSION_SECRET: 'test-session-secret-at-least-32-characters-long',
     NODE_ENV: 'test',
     LOG_LEVEL: 'silent',
     SESSION_TTL_HOURS: 72,

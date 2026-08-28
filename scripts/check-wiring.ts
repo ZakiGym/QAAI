@@ -130,13 +130,29 @@ const KNOWN_GAPS: KnownGap[] = [
     remediation:
       'Same decision as the FeatureFlag model. Whichever way it goes, both entries clear together.',
   },
-  {
-    check: 'env-vars',
-    what: 'SESSION_SECRET',
-    why: 'apps/api/src/env.ts requires it (min 32 chars, boot fails without it) and NOTHING reads it afterwards. Sessions are looked up by sha256(token) via lib/crypto.ts hashToken(), which takes no key. deploy/.env.example tells operators it "signs session cookies"; it does not.',
-    remediation:
-      'Either key the session token hash with it — a session-only HMAC, NOT hashToken(), which also hashes API keys and would invalidate every issued key — or drop it from env.ts and correct the claim in deploy/.env.example. Do not just delete it quietly: installs already set it, and its removal silently changes what boots.',
-  },
+  /*
+   * SESSION_SECRET was here. It said the API required it at boot and nothing
+   * read it, while deploy/.env.example told operators it signed session
+   * cookies. `hashToken` is now an HMAC keyed on it, so the entry no longer
+   * reproduces and the ratchet demanded its removal.
+   *
+   * Its remediation said to key SESSIONS ONLY — "NOT hashToken(), which also
+   * hashes API keys and would invalidate every issued key". That advice was
+   * deliberately not taken, and the reason is worth keeping:
+   *
+   *   · An API key is the WORSE thing to leave unkeyed. It does not expire, it
+   *     is minted for CI, and a database dump that yields live API keys is a
+   *     longer-lived compromise than one that yields sessions.
+   *   · The objection it raises — invalidating every issued key — is a cost
+   *     that only exists once there are keys worth keeping. There are none yet.
+   *     Paying it now is what makes it payable at all; the same change after
+   *     launch would be a migration with customers in it.
+   *
+   * So every token the database stores a digest of — sessions, API keys, invite
+   * and runner tokens — is keyed. Deploying it logs everyone out and requires
+   * CI keys and runner tokens to be regenerated. That is stated in
+   * deploy/.env.example rather than discovered.
+   */
   /*
    * WebhookDelivery was here. It said "notify.ts and digest.ts record every
    * outbound delivery … and no endpoint or screen ever reads a row back", and
