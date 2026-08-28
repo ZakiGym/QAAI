@@ -22,6 +22,11 @@
  *     in the workflow and a site they forget to visit.
  *   • ping — GitHub's connectivity check.
  *
+ * The outbound half — the check run itself and the ONE pull-request comment it
+ * is reported in — lives in apps/worker/src/processors/checks.ts. GET /app
+ * below names the permission that comment needs, because "the check is there
+ * and the comment never appeared" is otherwise a silent, unexplainable state.
+ *
  * A `pull_request` event is deliberately IGNORED here. Runs for pull requests
  * are created by POST /webhooks/github, which this change does not own, and
  * creating them in two places would give a repo wired both ways two runs, two
@@ -415,12 +420,27 @@ githubWebhooksRouter.post('/github-app', async (req, res) => {
 githubRouter.use(requireAuth);
 
 /**
+ * The permission the comment needs, named once.
+ *
+ * An installation can be accepted without it, and when it is missing the worker
+ * degrades quietly on purpose — so this string is the answer to "the check is
+ * there and the comment never appeared", and GET /app below is where somebody
+ * looking for that answer will be.
+ */
+const PR_COMMENT_PERMISSION = 'Pull requests: write';
+
+/**
  * Is the app set up, and which of this org's repos can it see?
  *
  * Deliberately says nothing about the private key beyond whether one loaded.
  * The App ID is public — it is on the app's own settings page and in every JWT
  * it issues — and having it in the response is what turns "the check never
  * appeared" into a two-minute diagnosis.
+ *
+ * `prComment` is here for the same reason. The comment is posted with a
+ * permission the app can be installed without, and when it is missing the
+ * worker degrades quietly on purpose — so the one place an admin can find out
+ * that QAAI is deliberately not commenting is this response.
  */
 githubRouter.get('/app', requireRole('ADMIN'), async (req, res) => {
   const actor = actorOf(req);
@@ -440,6 +460,15 @@ githubRouter.get('/app', requireRole('ADMIN'), async (req, res) => {
     configured: Boolean(appId && hasKey),
     appId: appId || null,
     webhookConfigured: Boolean((process.env.GITHUB_APP_WEBHOOK_SECRET ?? '').trim()),
+    prComment: {
+      /** Grant this if the check appears and the comment never does. */
+      requires: PR_COMMENT_PERMISSION,
+      // Said plainly because it is the property people ask about first, usually
+      // after being burned by a bot that posted on every push. Withholding the
+      // permission is also how a team turns the comment off; there is no
+      // second switch.
+      behaviour: 'one comment per pull request, edited in place on every run',
+    },
     // The honest fallback, stated rather than implied: without the app, PR
     // feedback is still delivered as a comment by the PAT integration.
     fallback: 'pull-request comment via the GitHub personal access token integration',
@@ -505,11 +534,33 @@ githubRouter.post('/checks/:runId', requireRole('ADMIN'), async (req, res) => {
  *     void armCheckSweep().catch((err) => logger.error({ err }, 'could not arm the check sweep'));
  *
  * Then, in the GitHub App's own settings, set the webhook URL to
- * `<API_PUBLIC_URL>/webhooks/github-app`, give it Checks: write and Pull
- * requests: read, and subscribe it to `check_run`, `check_suite`,
+ * `<API_PUBLIC_URL>/webhooks/github-app`, give it Checks: write and
+ * **Pull requests: write**, and subscribe it to `check_run`, `check_suite`,
  * `installation` and `installation_repositories`.
+ *
+ * Pull requests moved from `read` to `write` because the app now posts the run
+ * report as a comment as well as a check. An installation that only granted
+ * `read` keeps working: the check is unaffected, the comment is skipped, the
+ * refusal is logged with GitHub's own sentence, and GET /github/app reports
+ * `prComment.requires` so an admin can see why.
  *
  * Until the worker registration exists, every path here still records what
  * happened — installations are applied, re-runs are created and queued — and the
  * check runs themselves wait in Redis rather than being lost.
+ *
+ * ── One comment, not two ────────────────────────────────────────────────────
+ * apps/worker/src/processors/notify.ts posts its own PR comment with the PAT
+ * integration's token, and it posts a NEW one on every run. That is the path
+ * this feature replaces; while both are live, a repo with an app installation
+ * AND a GITHUB integration gets two comments per run, one of which multiplies.
+ * notify.ts is not this change's file. The guard belongs at the top of its PR
+ * comment block, immediately after the `if (!run.prNumber) return;`:
+ *
+ *     // The GitHub App posts (and re-edits) one comment per PR in
+ *     // processors/checks.ts. When the repo has an installation, that is the
+ *     // comment; a second one from the PAT would be the same report twice.
+ *     const project = await prisma.project.findFirst({
+ *       where: { id: run.projectId }, select: { repoInstallationId: true },
+ *     });
+ *     if (project?.repoInstallationId) return;
  */

@@ -2,7 +2,9 @@
 
 import { use, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { api, ApiError } from '../../../../lib/api';
+import { FAILURE_KIND_LABELS, classifyFailureKind } from '@qaai/shared';
+import { api, ApiError, type TestResult } from '../../../../lib/api';
+import { KIND_TONE } from '../../../../components/runs/FailureSummary';
 import { StatusDot, duration, relativeTime } from '../../../../components/ui';
 import { EmptyState } from '../../../../components/ui/EmptyState';
 import { Badge, Card, Page, PageHeader, SkeletonRows } from '../../../../components/ui/layout';
@@ -114,6 +116,23 @@ const GROUPS: ReadonlyArray<{
     openByDefault: false,
   },
 ];
+
+/**
+ * The comparison API types a side's status as a plain string. The classifier
+ * wants the union, and the difference is load-bearing for exactly one rule —
+ * a bare TIMED_OUT with no recognisable message.
+ */
+function resultStatus(raw: string | undefined): TestResult['status'] {
+  switch (raw) {
+    case 'PASSED':
+    case 'SKIPPED':
+    case 'FLAKY':
+    case 'TIMED_OUT':
+      return raw;
+    default:
+      return 'FAILED';
+  }
+}
 
 /** Signed, human-readable duration delta. Only shown when it is worth reading. */
 function delta(ms: number | null): string | null {
@@ -384,6 +403,30 @@ function TestRow({ row, runId }: { row: Row; runId: string }) {
   const error = row.here?.errorMessage ?? row.there?.errorMessage ?? null;
   const showError = row.category === 'NEWLY_FAILING' || row.category === 'STILL_FAILING';
 
+  /*
+   * The KIND, on the regression list.
+   *
+   * "Six tests are newly failing" is one number and six investigations. Naming
+   * the kind turns the list into a shape you can act on before opening
+   * anything — five selector misses after a component rename is one job, and a
+   * refused connection sitting among them is a different one that would
+   * otherwise be found last.
+   *
+   * Only the label, and only when a rule actually fired: the error text is
+   * already printed underneath, and an unrecognised failure gets no chip
+   * rather than a confident wrong one. Nothing about flakiness is passed in
+   * either — the group header this row sits under already says whether it
+   * passed in the baseline, and better than the classifier could infer it.
+   */
+  const kind =
+    showError && error
+      ? classifyFailureKind({
+          status: resultStatus(row.here?.status),
+          testType: row.type,
+          errorMessage: error,
+        })
+      : null;
+
   return (
     <Link
       href={`/runs/${target}?test=${row.testId}`}
@@ -427,9 +470,22 @@ function TestRow({ row, runId }: { row: Row; runId: string }) {
       </div>
 
       {showError && error && (
-        <pre className="border-fail/30 bg-fail/5 text-fail mt-2 max-h-24 overflow-hidden rounded-md border p-2 font-mono text-micro whitespace-pre-wrap">
-          {error}
-        </pre>
+        <>
+          {kind && (
+            <span className="mt-2 flex">
+              {/* Amber, not red, for the kinds where the application is not the
+                  accused — the same tone map the cockpit's summary box uses, so
+                  a missing binary does not read as a regression on either
+                  screen. */}
+              <Badge tone={KIND_TONE[kind]} tint>
+                {FAILURE_KIND_LABELS[kind]}
+              </Badge>
+            </span>
+          )}
+          <pre className="border-fail/30 bg-fail/5 text-fail mt-2 max-h-24 overflow-hidden rounded-md border p-2 font-mono text-micro whitespace-pre-wrap">
+            {error}
+          </pre>
+        </>
       )}
     </Link>
   );

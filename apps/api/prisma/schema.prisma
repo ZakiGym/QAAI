@@ -831,6 +831,7 @@ model Run {
   artifacts   Artifact[]
   shards      RunShard[]
   runnerJobs  RunnerJob[]
+  shares      RunShare[]
 
   @@index([orgId])
   @@index([projectId, queuedAt])
@@ -998,6 +999,63 @@ model Artifact {
   @@index([orgId])
   @@index([runId])
   @@index([expiresAt])
+}
+
+/// A public, read-only link to ONE run — the bridge between "QA found a bug" and
+/// "the dev fixed it" for a developer who has no QAAI login.
+///
+/// The row is a CREDENTIAL RECORD, and every column here exists to make that
+/// credential accountable rather than merely functional:
+///
+///   · `tokenHash` and nothing else. The link is 256 bits from `generateToken`
+///     and the database stores only `hashToken(raw)` — the same HMAC keyed on
+///     SESSION_SECRET that sessions, API keys, invites and runner tokens use.
+///     A database dump therefore hands out no working links, and there is
+///     deliberately no way to show a link a second time: losing it means
+///     minting a new one, which revokes the old.
+///   · `revokedAt` is a timestamp, not a delete, so the audit row that says who
+///     minted this link keeps pointing at a row that still exists.
+///   · `viewCount` / `lastViewedAt` are the whole reason a minter can answer
+///     "has anyone actually opened this?", which is the first question asked
+///     about a link that was sent and not replied to. They are the only record
+///     of a public read: an anonymous GET has no actor, so it cannot produce a
+///     meaningful audit row.
+///
+/// Scope is the run and nothing above it. There is no projectId or suiteId here
+/// on purpose — the reader resolves `runId` and stops, so a link can never grow
+/// into a view of the project it belongs to.
+model RunShare {
+  id    String @id @default(cuid())
+  orgId String
+  runId String
+
+  /// HMAC-SHA256 of the link token, exactly like ApiKey.keyHash and
+  /// Runner.tokenHash. Unique so a lookup is a single indexed read on the
+  /// digest — the raw token is never stored, compared or logged.
+  tokenHash   String @unique
+  /// `sh_a1b2c3d4` — enough to name a link in the UI and in an audit row,
+  /// and far too little to authenticate with.
+  tokenPrefix String
+
+  /// Optional deadline. Null means the link works until it is revoked, which is
+  /// a real choice a person can make and therefore has to be visible on the
+  /// screen that made it.
+  expiresAt DateTime?
+  revokedAt DateTime?
+
+  /// Who minted it. Null-able because an org-scoped API key has no user.
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  viewCount    Int       @default(0)
+  lastViewedAt DateTime?
+
+  run Run @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  /// "Is there a live link on this run?" — the read behind the run page's
+  /// control, and the one the mint path uses to revoke whatever it replaces.
+  @@index([runId, revokedAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

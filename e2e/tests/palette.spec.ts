@@ -86,9 +86,23 @@ test.describe('quick-open', () => {
 
     const palette = page.getByRole('dialog', { name: 'Go to file' });
     await expect(palette).toBeVisible();
-    // Loaded lazily on first open, so the assertion is on the file appearing,
-    // not on the dialog having appeared.
-    await expect(palette.getByRole('button', { name: new RegExp(escapeRe(tests[0]!.name)) })).toBeVisible();
+
+    /*
+     * TYPE the name, the way a person does — do not expect it to be on screen
+     * already.
+     *
+     * With no query the palette renders the first 60 entries, and the demo
+     * project has 326. Whether `tests[0]` was among them depended on the API's
+     * `feature asc, name asc` and the palette's own order agreeing, which they
+     * need not: this test failed intermittently for exactly that reason and the
+     * flake said nothing about quick-open being broken.
+     *
+     * Typing is also the real feature. "Is my file in the first sixty" is not
+     * what anybody uses ⌘P for; "can I find my file" is.
+     */
+    const target = tests[0]!;
+    await palette.getByRole('textbox').fill(target.name.slice(0, 24));
+    await expect(palette.getByRole('button', { name: new RegExp(escapeRe(target.name)) })).toBeVisible();
   });
 
   test('picking a file opens it in the editor', async ({ page, api }) => {

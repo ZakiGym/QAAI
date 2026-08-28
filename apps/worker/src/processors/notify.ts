@@ -2,20 +2,28 @@
  * Outbound notifications (§7) — pull-request comments, chat, and webhooks.
  *
  * One processor decides who hears about a finished run: a PR-triggered run gets
- * a comment on the pull request, a failing run reaches the chat integrations
- * that asked for failures (the default), and a monitor crossing its failure
- * threshold pages chat directly. A green run reaches only an integration whose
- * notification preference says `runFinished: 'all'` — by default it stays
- * quiet, because nobody wants that notification.
+ * a comment on the pull request, a run that FAILED OR WAS BLOCKED BY A QUALITY
+ * GATE reaches the chat integrations that asked for failures (the default), and
+ * a monitor crossing its failure threshold pages chat directly. A run that is
+ * green and unblocked reaches only an integration whose notification preference
+ * says `runFinished: 'all'` — by default it stays quiet, because nobody wants
+ * that notification.
  *
  * The PR comment deliberately reports triage verdicts rather than raw pass/fail.
  * "3 failed" makes a reviewer open QAAI; "2 look like real bugs, 1 is an
  * intended change with a fix proposed" lets them act without leaving GitHub.
+ *
+ * The chat MESSAGE is held to the same bar as the PR comment, for the same
+ * reason: the person reading it is on a phone, at night, deciding whether to
+ * get up. "3 test(s) failed. Run cmx…" — which was this file's chat text — asks
+ * them to open a laptop to learn what broke and where, so the alert renderers
+ * below name the project and the environment, count what happened, name the
+ * first few tests that failed, and always end in a LINK.
  */
 
 import { createHmac, randomUUID } from 'node:crypto';
 import { describeWebhookFailure } from '@qaai/shared';
-import type { NotifyJob } from '@qaai/shared';
+import type { GateResult, NotifyJob } from '@qaai/shared';
 import { logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
 import { enqueueDelivery, type DeliveryJob } from '../queues.js';
@@ -37,69 +45,159 @@ import {
 } from '../../../api/src/lib/chat-integrations.js';
 import type { ChatCredentials, NotifyPrefs } from '../../../api/src/lib/chat-integrations.js';
 
-const VERDICT_LABEL: Record<string, string> = {
-  REAL_BUG: '🐞 likely a real bug',
-  INTENDED_CHANGE: '🔁 an intended change',
-  FLAKE: '🎲 a flake',
-  ENV_ISSUE: '🌐 an environment issue',
-};
+/*
+ * `VERDICT_LABEL` and `MAX_FAILURES_LISTED` lived here for the PR comment this
+ * file used to build. That moved to processors/checks.ts, which owns the one
+ * comment it edits in place; these went with it rather than staying as two
+ * constants nothing reads.
+ */
 
-/** GitHub caps a comment at 65536 chars; stay well under and stay readable. */
-const MAX_FAILURES_LISTED = 10;
 
-function buildComment(run: {
+// ─── The chat alert itself ───────────────────────────────────────────────────
+
+/**
+ * Where a chat alert points.
+ *
+ * The app URL, because it is the only link this repo can mint today. A public,
+ * unauthenticated share link would be the better destination for a page that
+ * reaches a phone at 3am — the on-call person may not be signed in, and may not
+ * even have an account — and when one exists it belongs HERE, in the one
+ * function every alert routes through, rather than sprinkled through the
+ * renderers. Until then an app link that asks for a login still beats a bare
+ * run id, which asks for a login AND a search.
+ */
+function runLink(runId: string): string {
+  return `${process.env.WEB_PUBLIC_URL ?? 'http://localhost:3000'}/runs/${runId}`;
+}
+
+/** How many failing tests a chat message names before it starts summarising. */
+const MAX_FAILURES_IN_CHAT = 5;
+
+/**
+ * The blocking half of a gate result, as sentences.
+ *
+ * Only BLOCK evaluations: a WARN is by definition the thing the team decided
+ * not to be woken for, and folding warnings into a page is how a page gets
+ * muted. Reads through `unknown` because `Run.gateResult` is a Json column —
+ * a run finalised by an older worker, or one still in flight, has whatever it
+ * has, and an alert must not throw on the way to being sent.
+ */
+export function blockingGateRules(gateResult: unknown): string[] {
+  const gate = (gateResult ?? null) as Partial<GateResult> | null;
+  if (!gate || !Array.isArray(gate.evaluations)) return [];
+  return gate.evaluations
+    .filter((evaluation) => evaluation?.action === 'BLOCK')
+    .map((evaluation) => String(evaluation.detail ?? 'a quality gate rule'));
+}
+
+export interface RunAlertInput {
   id: string;
-  status: string;
   passedCount: number;
   failedCount: number;
   flakyCount: number;
+  gateResult: unknown;
+  project: { name: string } | null;
+  environment: { name: string } | null;
   results: Array<{
     status: string;
-    errorMessage: string | null;
     test: { name: string; filePath: string };
-    verdict: { verdict: string; confidence: number; explanation: string } | null;
   }>;
-  gateResult: unknown;
-}, webUrl: string): string {
+}
+
+/**
+ * What a finished run says in chat.
+ *
+ * Four questions in the order they get asked — what happened, where, what
+ * broke, and where do I look — and the last line is always the link. A gate
+ * that blocked is stated in its own line even when tests also failed: a run
+ * can be red because of the gate alone (a flake rate or a p95 rule crossing
+ * its threshold with every test green), and that run used to announce itself
+ * as "✅ all 41 passed" while the deploy it blocked sat waiting.
+ */
+export function renderRunAlert(run: RunAlertInput): string {
+  const blocked = blockingGateRules(run.gateResult);
   const failures = run.results.filter((r) => r.status === 'FAILED' || r.status === 'TIMED_OUT');
-  const gate = (run.gateResult ?? null) as { passed?: boolean } | null;
 
-  const header =
-    failures.length === 0
-      ? `### ✅ QAAI — ${run.passedCount} passed`
-      : `### ❌ QAAI — ${failures.length} failed, ${run.passedCount} passed`;
+  const counts = [
+    run.failedCount > 0 ? `${run.failedCount} failed` : null,
+    `${run.passedCount} passed`,
+    run.flakyCount > 0 ? `${run.flakyCount} flaky` : null,
+  ]
+    .filter(Boolean)
+    .join(', ');
 
-  const lines: string[] = [header, ''];
+  const headline =
+    run.failedCount > 0
+      ? `❌ QAAI — ${counts}`
+      : blocked.length > 0
+        ? `⛔ QAAI — the quality gate blocked this run (${counts})`
+        : `✅ QAAI — ${counts}`;
 
-  if (gate && gate.passed === false) {
-    lines.push('> **The quality gate is blocking this PR.**', '');
+  const where = [run.project?.name, run.environment?.name].filter(Boolean).join(' · ');
+  const lines = [headline];
+  if (where) lines.push(where);
+
+  // Named even when tests also failed: "which gate" is the difference between
+  // "someone broke checkout" and "we are one flaky test over the threshold".
+  for (const rule of blocked) lines.push(`⛔ ${rule}`);
+
+  for (const failure of failures.slice(0, MAX_FAILURES_IN_CHAT)) {
+    lines.push(`• ${failure.test.name} — ${failure.test.filePath}`);
   }
-  if (run.flakyCount > 0) {
-    lines.push(`_${run.flakyCount} test(s) passed only on retry and are counted as flaky._`, '');
+  if (failures.length > MAX_FAILURES_IN_CHAT) {
+    lines.push(`• …and ${failures.length - MAX_FAILURES_IN_CHAT} more`);
   }
 
-  for (const failure of failures.slice(0, MAX_FAILURES_LISTED)) {
-    lines.push(`**${failure.test.name}**`);
-    lines.push(`\`${failure.test.filePath}\``);
-    if (failure.verdict) {
-      const label = VERDICT_LABEL[failure.verdict.verdict] ?? failure.verdict.verdict;
-      lines.push(
-        `- Triage: ${label} (${Math.round(failure.verdict.confidence * 100)}% confident)`,
-        `- ${failure.verdict.explanation.split('\n')[0]}`,
-      );
+  lines.push(runLink(run.id));
+  return lines.join('\n');
+}
+
+export interface MonitorAlertInput {
+  name: string;
+  streak: number;
+  runId: string;
+  /** The failing check itself. Null when the run could not be read — see below. */
+  run: {
+    failedCount: number;
+    passedCount: number;
+    environment: { name: string } | null;
+    results: Array<{ status: string; test: { name: string; filePath: string } }>;
+  } | null;
+}
+
+/**
+ * What a monitor crossing its threshold says in chat.
+ *
+ * This is the message most likely to be read half-asleep, so it leads with the
+ * monitor, the streak and the environment — "which of our things is down, and
+ * where" — before it gets to which tests. `run` is nullable and the message
+ * degrades rather than failing: the page is the point, and a run row that
+ * cannot be read (retention swept it, the read failed) must cost detail, never
+ * the alert.
+ */
+export function renderMonitorAlert(alert: MonitorAlertInput): string {
+  const where = alert.run?.environment?.name;
+  const lines = [
+    `🔴 ${alert.name} is down — ${alert.streak} failed check${alert.streak === 1 ? '' : 's'} in a row`,
+  ];
+
+  if (alert.run) {
+    const total = alert.run.failedCount + alert.run.passedCount;
+    lines.push(
+      `${where ? `${where} · ` : ''}${alert.run.failedCount} of ${total} test${total === 1 ? '' : 's'} failing`,
+    );
+    const failures = alert.run.results.filter(
+      (r) => r.status === 'FAILED' || r.status === 'TIMED_OUT',
+    );
+    for (const failure of failures.slice(0, MAX_FAILURES_IN_CHAT)) {
+      lines.push(`• ${failure.test.name} — ${failure.test.filePath}`);
     }
-    if (failure.errorMessage) {
-      const snippet = failure.errorMessage.split('\n').slice(0, 3).join('\n').slice(0, 500);
-      lines.push('', '```', snippet, '```');
+    if (failures.length > MAX_FAILURES_IN_CHAT) {
+      lines.push(`• …and ${failures.length - MAX_FAILURES_IN_CHAT} more`);
     }
-    lines.push('');
   }
 
-  if (failures.length > MAX_FAILURES_LISTED) {
-    lines.push(`_…and ${failures.length - MAX_FAILURES_LISTED} more._`, '');
-  }
-
-  lines.push(`[Open the full run in QAAI](${webUrl}/runs/${run.id})`);
+  if (alert.runId) lines.push(runLink(alert.runId));
   return lines.join('\n');
 }
 
@@ -458,12 +556,32 @@ export async function processNotify(job: NotifyJob, jobKey?: string): Promise<vo
   if (event === 'monitor.down') {
     const name = String(payload.name ?? 'A monitor');
     const streak = Number(payload.streak ?? 0);
-    await fanOutToChat(
-      orgId,
-      event,
-      `🔴 ${name} has failed ${streak} checks in a row. QAAI run ${String(payload.runId ?? '')}`,
-      key,
-    );
+    const runId = String(payload.runId ?? '');
+
+    /*
+     * Enrichment, not a precondition. The sweep hands over the monitor's name,
+     * its streak and the run id; the environment, the counts and the tests
+     * that failed live on the run. Reading them is what turns "a monitor is
+     * down" into an alert someone can act on — but a page that failed to send
+     * because a JOIN failed is a far worse outcome than a terse one, so this
+     * read is allowed to come back empty and the renderer degrades.
+     */
+    let run: MonitorAlertInput['run'] = null;
+    try {
+      run = await prisma.run.findFirst({
+        where: { id: runId, orgId },
+        select: {
+          failedCount: true,
+          passedCount: true,
+          environment: { select: { name: true } },
+          results: { select: { status: true, test: { select: { name: true, filePath: true } } } },
+        },
+      });
+    } catch (err) {
+      logger.warn({ err, runId }, 'could not read the run behind a monitor page; paging anyway');
+    }
+
+    await fanOutToChat(orgId, event, renderMonitorAlert({ name, streak, runId, run }), key);
     return;
   }
 
@@ -483,6 +601,10 @@ export async function processNotify(job: NotifyJob, jobKey?: string): Promise<vo
       flakyCount: true,
       gateResult: true,
       projectId: true,
+      // For the chat alert: "3 failed" is a fact, "Storefront · staging, 3
+      // failed" is an alert someone can triage without opening anything.
+      project: { select: { name: true } },
+      environment: { select: { name: true } },
       results: {
         select: {
           status: true,
@@ -503,76 +625,35 @@ export async function processNotify(job: NotifyJob, jobKey?: string): Promise<vo
    * run, only `'all'` hears a green one, and `'off'` hears neither. The
    * filter is per integration, inside the fan-out, so one org can keep a
    * loud #qa-firehose and a failures-only #eng in the same breath.
+   *
+   * What counts as "a red run" is deliberately NOT `failedCount > 0`.
+   *
+   * A quality gate can block a run whose tests all passed — MAX_FLAKE_RATE and
+   * MAX_P95_LATENCY_MS are rules about the shape of the run, not about any one
+   * test — and that run is exactly the one someone needs to hear about, because
+   * it is the one holding up a merge. Counting only failures meant such a run
+   * announced itself as "✅ all 41 passed" and reached only the channels that
+   * asked for EVERY run; the blocked deploy was silent in the failures-only
+   * channel that exists to catch it. `off` still hears nothing: that is a
+   * channel saying it does not want run reports at all.
    */
-  const runFailed = run.failedCount > 0;
-  await fanOutToChat(
-    orgId,
-    event,
-    runFailed
-      ? `❌ QAAI: ${run.failedCount} test(s) failed, ${run.passedCount} passed. Run ${run.id}`
-      : `✅ QAAI: all ${run.passedCount} test(s) passed. Run ${run.id}`,
-    key,
-    (prefs) => wantsRunFinished(prefs, runFailed),
+  const gateBlocked = blockingGateRules(run.gateResult).length > 0;
+  const newsworthy = run.failedCount > 0 || gateBlocked;
+  await fanOutToChat(orgId, event, renderRunAlert(run), key, (prefs) =>
+    wantsRunFinished(prefs, newsworthy),
   );
 
-  // Only PR-triggered runs get a comment; a nightly run posting to a PR would
-  // be noise.
-  if (!run.prNumber) return;
-
-  const integration = await prisma.integration.findFirst({
-    where: { orgId, kind: 'GITHUB', enabled: true },
-    select: { id: true, config: true, configEnc: true },
-  });
-  if (!integration?.configEnc) {
-    logger.warn({ runId }, 'PR run finished but no GitHub token is stored; skipping the comment');
-    return;
-  }
-
-  const cfg = (integration.config ?? {}) as { repo?: string; keyVersion?: number };
-  const repo = (cfg.repo ?? '').replace(/^https:\/\/github\.com\//, '').replace(/\.git$/, '');
-  if (!repo.includes('/')) {
-    logger.warn({ runId, repo }, 'GitHub integration has no owner/repo; skipping the comment');
-    return;
-  }
-
-  let token: string;
-  try {
-    token = openSecret(
-      integration.configEnc,
-      cfg.keyVersion ?? 1,
-      orgId,
-      `integration:${integration.id}`,
-    );
-  } catch (err) {
-    logger.error({ err, runId }, 'could not decrypt the GitHub token');
-    return;
-  }
-
-  const body = buildComment(run, process.env.WEB_PUBLIC_URL ?? 'http://localhost:3000');
-
-  const response = await fetch(
-    `https://api.github.com/repos/${repo}/issues/${run.prNumber}/comments`,
-    {
-      method: 'POST',
-      headers: {
-        authorization: `Bearer ${token}`,
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        'content-type': 'application/json',
-        'user-agent': 'qaai',
-      },
-      body: JSON.stringify({ body }),
-    },
-  );
-
-  if (!response.ok) {
-    // Never log the response body verbatim — an auth failure echoes the request.
-    logger.error(
-      { runId, status: response.status, repo, pr: run.prNumber },
-      'posting the PR comment failed',
-    );
-    return;
-  }
-
-  logger.info({ runId, repo, pr: run.prNumber }, 'posted the PR comment');
+  /*
+   * The PR comment used to be posted from here, and is not any more.
+   *
+   * This path POSTed a NEW comment on every finished run, so a branch with
+   * eight pushes ended with eight QAAI comments and a reviewer scrolling past
+   * seven of them — the reason people mute bots. `syncPrComment` in
+   * processors/checks.ts now owns it: one comment per pull request, found by a
+   * stable marker and EDITED in place, beside the check run it belongs with.
+   *
+   * Deleted rather than left behind a flag, because both were live at once and
+   * every PR run was getting two comments — one that updated and one that did
+   * not.
+   */
 }

@@ -38,6 +38,8 @@ import { sourceRouter } from './routes/source.js';
 import { suitesRouter } from './routes/suites.js';
 import { schedulesRouter } from './routes/schedules.js';
 import { badgesRouter } from './routes/badges.js';
+import { terminalRouter } from './routes/terminal.js';
+import { shareRouter } from './routes/share.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { clustersRouter } from './routes/clusters.js';
 import { compareRouter } from './routes/compare.js';
@@ -173,6 +175,23 @@ app.use('/runners', runnersRouter);
  * polled from every open tab every ten to fifteen seconds, for two numbers.
  */
 app.use('/badges', badgesRouter);
+
+/*
+ * A shell in the container the run executed in. The router declares its own
+ * `/agent/...` half for the runner and a cockpit half behind requireAuth, so it
+ * mounts after attachActor like every other authenticated surface.
+ */
+app.use('/terminal', terminalRouter);
+
+/*
+ * Public, read-only run reports.
+ *
+ * Mounted at the ROOT because the router declares both halves of its own
+ * surface — `/share/:token` for the public page and `/runs/:runId/share` for
+ * the owner minting the link — the way sourceRouter and suitesRouter do. The
+ * public half deliberately carries no requireAuth: its credential is the token.
+ */
+app.use('/', shareRouter);
 
 /* Schedules and monitors: the read/update/delete half the POSTs never had. */
 app.use('/automation', schedulesRouter);

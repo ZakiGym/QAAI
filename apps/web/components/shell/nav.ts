@@ -110,6 +110,7 @@ export const NAV: NavItemDef[] = [
       '/source-control',
       '/integrations',
       '/settings/runners',
+      '/settings/alerts',
       '/settings/github',
       '/onboarding',
     ],
@@ -127,6 +128,13 @@ export const NAV: NavItemDef[] = [
       { href: '/schedules', label: 'Schedules' },
       { href: '/source-control', label: 'Source control' },
       { href: '/integrations', label: 'Integrations' },
+      /*
+       * Next to Integrations because they are the same question asked twice —
+       * one is where results GO, the other is who gets TOLD. A screen you
+       * cannot reach is a screen nobody configures, and an alert nobody
+       * configured is the 3am failure discovered from a customer.
+       */
+      { href: '/settings/alerts', label: 'Alerts' },
       { href: '/settings/runners', label: 'Runners' },
       { href: '/onboarding', label: 'Add app' },
     ],

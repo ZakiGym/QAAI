@@ -60,7 +60,8 @@ vi.mock('../vault.js', () => ({
   },
 }));
 
-const { processDelivery, processNotify } = await import('./notify.js');
+const { blockingGateRules, processDelivery, processNotify, renderMonitorAlert, renderRunAlert } =
+  await import('./notify.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -197,6 +198,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -605,5 +607,254 @@ describe('the dead letter is the row', () => {
     await expect(processDelivery(JOB, FIRST_OF_FIVE)).resolves.toBeUndefined();
 
     expect(h.log.some((l) => l.startsWith('error:') && l.includes('could not record'))).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The message itself
+//
+// An alert is only worth sending if the person reading it on a phone can act on
+// it, so these assert the four things this file's messages used to omit: what
+// happened, WHERE, which tests, and a link. The expectations are written out by
+// hand rather than rebuilt from the renderer — a test that formats the string
+// the same way the code does proves only that the code is self-consistent.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const alertRun = (over: Record<string, unknown> = {}) => ({
+  id: 'run1',
+  passedCount: 41,
+  failedCount: 2,
+  flakyCount: 1,
+  gateResult: null as unknown,
+  project: { name: 'Storefront' } as { name: string } | null,
+  environment: { name: 'staging' } as { name: string } | null,
+  results: [
+    {
+      status: 'FAILED',
+      test: { name: 'checkout applies a promo code', filePath: 'specs/checkout.spec.ts' },
+    },
+    { status: 'PASSED', test: { name: 'home renders', filePath: 'specs/home.spec.ts' } },
+  ],
+  ...over,
+});
+
+/** A gate result as evaluateGates writes it: BLOCK is the only paging action. */
+const gate = (evaluations: Array<{ action: string; detail: string }>) => ({
+  passed: evaluations.every((e) => e.action !== 'BLOCK'),
+  evaluations,
+});
+
+describe('a run alert names what broke, where, and how to open it', () => {
+  beforeEach(() => {
+    vi.stubEnv('WEB_PUBLIC_URL', 'https://app.qaai.test');
+  });
+
+  it('leads with the counts, then the project and environment, then the failing tests', () => {
+    const text = renderRunAlert(alertRun());
+    const lines = text.split('\n');
+
+    expect(lines[0]).toBe('❌ QAAI — 2 failed, 41 passed, 1 flaky');
+    expect(lines[1]).toBe('Storefront · staging');
+    expect(text).toContain('• checkout applies a promo code — specs/checkout.spec.ts');
+    // Passing tests are not the alert. Listing them is how a page becomes a wall.
+    expect(text).not.toContain('home renders');
+  });
+
+  it('always ends in a link to the run', () => {
+    const lines = renderRunAlert(alertRun()).split('\n');
+    expect(lines[lines.length - 1]).toBe('https://app.qaai.test/runs/run1');
+  });
+
+  it('names five failing tests and counts the rest, so a broken suite is not a wall of text', () => {
+    const results = Array.from({ length: 7 }, (_, i) => ({
+      status: 'FAILED',
+      test: { name: `test ${i}`, filePath: `specs/${i}.spec.ts` },
+    }));
+    const text = renderRunAlert(alertRun({ failedCount: 7, results }));
+
+    expect(text).toContain('• test 4 — specs/4.spec.ts');
+    expect(text).not.toContain('• test 5 —');
+    expect(text).toContain('• …and 2 more');
+  });
+
+  it('says a green run was blocked by the gate, and by WHICH rule', () => {
+    const text = renderRunAlert(
+      alertRun({
+        failedCount: 0,
+        flakyCount: 4,
+        results: [],
+        gateResult: gate([
+          { action: 'BLOCK', detail: 'Flake rate under 5% — 8.0% flaky (4/50)' },
+          { action: 'WARN', detail: 'p95 under 2000ms — p95 was 3100ms' },
+        ]),
+      }),
+    );
+
+    expect(text.split('\n')[0]).toBe(
+      '⛔ QAAI — the quality gate blocked this run (41 passed, 4 flaky)',
+    );
+    expect(text).toContain('⛔ Flake rate under 5% — 8.0% flaky (4/50)');
+    // A WARN is the rule the team decided not to be woken for.
+    expect(text).not.toContain('p95 was 3100ms');
+  });
+
+  it('reads a green, unblocked run as green', () => {
+    const text = renderRunAlert(alertRun({ failedCount: 0, flakyCount: 0, results: [] }));
+    expect(text.split('\n')[0]).toBe('✅ QAAI — 41 passed');
+  });
+
+  it('survives a gateResult that is not a gate result — the column is Json', () => {
+    // A run finalised by an older worker, or one still in flight. An alert must
+    // not throw on the way out.
+    expect(blockingGateRules(null)).toEqual([]);
+    expect(blockingGateRules({})).toEqual([]);
+    expect(blockingGateRules({ evaluations: 'nope' })).toEqual([]);
+    expect(blockingGateRules(gate([{ action: 'PASS', detail: 'fine' }]))).toEqual([]);
+  });
+});
+
+describe('a monitor page', () => {
+  beforeEach(() => {
+    vi.stubEnv('WEB_PUBLIC_URL', 'https://app.qaai.test');
+  });
+
+  it('names the monitor, the streak, the environment and the damage', () => {
+    const text = renderMonitorAlert({
+      name: 'checkout smoke',
+      streak: 3,
+      runId: 'run9',
+      run: {
+        failedCount: 2,
+        passedCount: 10,
+        environment: { name: 'production' },
+        results: [
+          { status: 'FAILED', test: { name: 'can pay', filePath: 'specs/pay.spec.ts' } },
+          { status: 'PASSED', test: { name: 'can browse', filePath: 'specs/browse.spec.ts' } },
+        ],
+      },
+    });
+    const lines = text.split('\n');
+
+    expect(lines[0]).toBe('🔴 checkout smoke is down — 3 failed checks in a row');
+    expect(lines[1]).toBe('production · 2 of 12 tests failing');
+    expect(text).toContain('• can pay — specs/pay.spec.ts');
+    expect(lines[lines.length - 1]).toBe('https://app.qaai.test/runs/run9');
+  });
+
+  it('degrades to the bare page when the run cannot be read, keeping the link', () => {
+    const text = renderMonitorAlert({
+      name: 'checkout smoke',
+      streak: 1,
+      runId: 'run9',
+      run: null,
+    });
+
+    // Singular, because "1 failed checks" is the kind of detail that makes an
+    // alert read like it was written by a machine that does not care.
+    expect(text).toBe(
+      '🔴 checkout smoke is down — 1 failed check in a row\nhttps://app.qaai.test/runs/run9',
+    );
+  });
+});
+
+describe('a quality gate that blocks is news, even when every test passed', () => {
+  const blockedGreenRun = {
+    id: 'run1',
+    status: 'FAILED',
+    prNumber: null,
+    passedCount: 50,
+    failedCount: 0,
+    flakyCount: 4,
+    projectId: 'p1',
+    project: { name: 'Storefront' },
+    environment: { name: 'staging' },
+    results: [],
+    gateResult: gate([{ action: 'BLOCK', detail: 'Flake rate under 5% — 8.0% flaky (4/50)' }]),
+  };
+  const finished = { orgId: 'org1', event: 'run.finished', payload: { runId: 'run1' } };
+
+  it('reaches a failures-only channel, which is the channel that exists to catch it', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]); // default prefs: failures only
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => blockedGreenRun };
+
+    await processNotify(finished, 'j1');
+
+    /*
+     * The regression this test exists for: newsworthiness used to be
+     * `failedCount > 0`, so this run — zero failures, merge blocked — was
+     * announced as "all 50 passed" and reached only `runFinished: 'all'`.
+     */
+    expect(db.created).toHaveLength(1);
+    expect(String((db.created[0]! as { payload: { text: string } }).payload.text)).toContain(
+      'the quality gate blocked this run',
+    );
+    expect(h.enqueued).toEqual([{ orgId: 'org1', deliveryId: 'wd-j1-int1' }]);
+  });
+
+  it('still respects a channel that switched run reports off', async () => {
+    stubFetch();
+    const db = fanOutDb([slack({ config: { notify: { runFinished: 'off', digest: true } } })]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => blockedGreenRun };
+
+    await processNotify(finished, 'j1');
+
+    expect(db.created).toHaveLength(0);
+  });
+
+  it('does not page for a gate that only WARNed — that is the muting failure', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = {
+      findFirst: async () => ({
+        ...blockedGreenRun,
+        status: 'PASSED',
+        gateResult: gate([{ action: 'WARN', detail: 'p95 under 2000ms — p95 was 3100ms' }]),
+      }),
+    };
+
+    await processNotify(finished, 'j1');
+
+    expect(db.created).toHaveLength(0);
+    expect(h.enqueued).toEqual([]);
+  });
+});
+
+describe('the monitor page is enriched from the run, but never blocked by it', () => {
+  it('reads the environment and the counts off the run behind the streak', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = {
+      findFirst: async () => ({
+        failedCount: 2,
+        passedCount: 10,
+        environment: { name: 'production' },
+        results: [{ status: 'FAILED', test: { name: 'can pay', filePath: 'specs/pay.spec.ts' } }],
+      }),
+    };
+
+    await processNotify(monitorDown, 'job7');
+
+    const text = String((db.created[0]! as { payload: { text: string } }).payload.text);
+    expect(text).toContain('production · 2 of 12 tests failing');
+    expect(text).toContain('• can pay — specs/pay.spec.ts');
+  });
+
+  it('pages anyway when that read fails — a page lost to a JOIN is the worse bug', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = {
+      findFirst: async () => {
+        throw new Error('connection terminated');
+      },
+    };
+
+    await processNotify(monitorDown, 'job7');
+
+    expect(db.created).toHaveLength(1);
+    expect(String((db.created[0]! as { payload: { text: string } }).payload.text)).toContain(
+      '🔴 checkout is down',
+    );
+    expect(h.log.some((l) => l.startsWith('warn:') && l.includes('paging anyway'))).toBe(true);
   });
 });

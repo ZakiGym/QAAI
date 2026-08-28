@@ -1,6 +1,6 @@
 'use client';
 
-import { use, useCallback, useEffect, useState } from 'react';
+import { use, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { API_URL, api, type Run } from '../../../lib/api';
@@ -12,6 +12,8 @@ import { useToast } from '../../../components/ui/Toast';
 import type { EvidenceResult } from '../../../components/EvidenceRail';
 import { CauseRail } from '../../../components/runs/CauseRail';
 import { FailureStory } from '../../../components/runs/FailureStory';
+import { FailureSummary } from '../../../components/runs/FailureSummary';
+import { Terminal } from '../../../components/editor/Terminal';
 import { TriageRail } from '../../../components/runs/TriageRail';
 import { wallClock } from '../../../components/runs/format';
 import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
@@ -640,6 +642,9 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
             >
               junit
             </a>
+            {/* The way out of the workspace. Everything else on this strip is
+                for somebody who already has a login. */}
+            <ShareControl runId={run.id} />
           </span>
         </div>
       </header>
@@ -717,13 +722,34 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           onSelectTest={selectTest}
         />
 
-        <FailureStory
-          runId={run.id}
-          result={selected}
-          selectedStep={selectedStep}
-          onSelectStep={setSelectedStep}
-        />
+        {/*
+          The middle COLUMN, not two of them.
+          
+          `FailureSummary` belongs above the story — it is the sentence you read
+          before the evidence — but the grid has exactly three tracks and a
+          fourth child would take the triage rail's. So the two share the middle
+          track, stacked, with the story keeping the scroll.
+        */}
+        <div className="flex min-h-0 min-w-0 flex-col">
+          <FailureSummary runId={run.id} result={selected} />
+          <div className="flex min-h-0 flex-1 flex-col">
+            <FailureStory
+              runId={run.id}
+              result={selected}
+              selectedStep={selectedStep}
+              onSelectStep={setSelectedStep}
+            />
+          </div>
+        </div>
 
+        {/*
+          A shell in the container this run executed in, under the triage rail.
+          
+          It draws its own "Open a session" card and its own refusal, so it is
+          safe on a run that can never have one — the card explains why rather
+          than offering a prompt that would not work.
+        */}
+        <div className="flex min-h-0 min-w-0 flex-col">
         <TriageRail
           runId={run.id}
           result={selected}
@@ -732,6 +758,8 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           onReviewed={() => void load()}
           live={live}
         />
+          <Terminal runId={run.id} />
+        </div>
       </div>
     </div>
   );
@@ -810,5 +838,284 @@ function CockpitSkeleton() {
         </div>
       </div>
     </div>
+  );
+}
+
+// ─── The share link ──────────────────────────────────────────────────────────
+
+interface ShareState {
+  id: string;
+  /** `sh_a1b2c3d4` — names the link, cannot open it. */
+  tokenPrefix: string;
+  expiresAt: string | null;
+  createdAt: string;
+  createdBy: string | null;
+  viewCount: number;
+  lastViewedAt: string | null;
+}
+
+const EXPIRY_CHOICES: ReadonlyArray<{ label: string; days: number | null }> = [
+  { label: '7 days', days: 7 },
+  { label: '30 days', days: 30 },
+  { label: '90 days', days: 90 },
+  { label: 'no expiry', days: null },
+];
+
+/**
+ * Mint, revoke, and see the state of the run's public link.
+ *
+ * ── Why the state is fetched on mount rather than when the panel opens ──────
+ *
+ * "This run is readable by anyone holding a URL" is a security-relevant fact
+ * about the screen you are looking at, and a fact you only find by opening a
+ * menu is one nobody finds. The cost is one indexed read per cockpit open; the
+ * benefit is that the word in the header says `shared` for as long as a link is
+ * live, and goes back to `share` the moment it is revoked.
+ *
+ * ── Why "replace" and not "copy again" ──────────────────────────────────────
+ *
+ * The URL is unrecoverable by construction — the API stores only an HMAC of the
+ * token, so there is no endpoint that could return it a second time and no
+ * amount of UI can invent one. That is the right trade for a credential, and it
+ * makes the honest control a `replace` that says plainly that the old URL stops
+ * working. A button labelled "copy link" that silently minted a new one would
+ * be the worst of both.
+ */
+function ShareControl({ runId }: { runId: string }) {
+  const [open, setOpen] = useState(false);
+  const [share, setShare] = useState<ShareState | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  /** Held only until the tab is closed. The API cannot return it again. */
+  const [url, setUrl] = useState<string | null>(null);
+  const [days, setDays] = useState<number | null>(30);
+  const root = useRef<HTMLSpanElement>(null);
+  const toast = useToast();
+
+  /*
+   * Escape and a click outside close it. Both, not one: this panel can hold the
+   * only copy of a URL that cannot be reissued, so it must not be dismissible
+   * by an accident the user cannot undo — but a popover that traps you until
+   * you find its trigger again is worse. Escape is the deliberate exit; the
+   * outside click is the one everybody tries first.
+   */
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    const onClick = (event: MouseEvent) => {
+      if (!root.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onClick);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onClick);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ share: ShareState | null }>(`/runs/${runId}/share`)
+      .then(({ share }) => {
+        if (cancelled) return;
+        setShare(share);
+        setLoaded(true);
+      })
+      // Fails soft: the cockpit is a triage tool first, and a share control that
+      // 500s must not take the header down with it.
+      .catch(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [runId]);
+
+  async function mint() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const created = await api<{ share: ShareState; url: string; replacedLinks: number }>(
+        `/runs/${runId}/share`,
+        { method: 'POST', body: JSON.stringify({ expiresInDays: days }) },
+      );
+      setShare(created.share);
+      setUrl(created.url);
+      await copy(created.url);
+      toast.success(
+        created.replacedLinks > 0
+          ? 'New link copied. The previous one no longer works.'
+          : 'Public link copied to your clipboard.',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not create the link');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await api(`/runs/${runId}/share`, { method: 'DELETE' });
+      setShare(null);
+      setUrl(null);
+      toast.success('Link turned off. Anyone holding it now sees an explanation, not the run.');
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Could not revoke the link');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copy(value: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      // No clipboard permission, or an insecure origin. The URL is rendered in
+      // a selectable field for exactly this case, so there is nothing to say.
+    }
+  }
+
+  const live = share !== null;
+
+  return (
+    <span className="relative inline-flex" ref={root}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        title={
+          live
+            ? 'This run has a public link. Anyone holding it can read the failure.'
+            : 'Create a public link to this run — for a developer with no QAAI login'
+        }
+        className={cn(
+          'transition-colors',
+          live ? 'text-accent' : 'text-ink-faint hover:text-ink',
+        )}
+      >
+        {live ? 'shared' : 'share'}
+      </button>
+
+      {open && (
+        <div
+          className="border-line-strong bg-surface-1 absolute top-full right-0 z-30 mt-2.5 w-[364px] rounded-xl border p-4 text-left shadow-[var(--shadow-overlay)]"
+          role="dialog"
+          aria-label="Public link to this run"
+        >
+          {!loaded ? (
+            <Skeleton className="h-16 w-full" />
+          ) : live ? (
+            <>
+              <p className="text-ink text-body-sm font-medium">This run has a public link</p>
+              <p className="text-ink-dim mt-1.5 text-[12.5px] leading-relaxed">
+                Anyone holding the URL can read this run — the failures, the steps, the screenshots
+                and the assertions. The browser console, the network bodies and the trace are not
+                published, and the page says so.
+              </p>
+
+              {url ? (
+                <input
+                  readOnly
+                  value={url}
+                  onFocus={(e) => e.currentTarget.select()}
+                  aria-label="The public URL"
+                  className="border-line bg-surface-2 text-ink mt-3 w-full rounded-md border px-2.5 py-1.5 font-mono text-[11.5px]"
+                />
+              ) : (
+                /* The URL is a digest in the database and cannot be shown twice.
+                   Saying that is better than a disabled Copy button nobody can
+                   explain. */
+                <p className="border-line bg-surface-2 text-ink-faint mt-3 rounded-md border px-2.5 py-1.5 text-[11.5px]">
+                  <span className="font-mono">{share.tokenPrefix}…</span> — the full URL is stored
+                  only as a hash and cannot be shown again.
+                </p>
+              )}
+
+              <p className="text-ink-faint mt-2.5 text-[11.5px]">
+                {share.viewCount === 0
+                  ? 'Not opened yet'
+                  : `Opened ${share.viewCount} time${share.viewCount === 1 ? '' : 's'}`}
+                {' · '}
+                {share.expiresAt
+                  ? `expires ${new Date(share.expiresAt).toLocaleDateString()}`
+                  : 'no expiry'}
+              </p>
+
+              <div className="mt-3.5 flex items-center gap-2">
+                {url && (
+                  <Button size="sm" variant="secondary" onClick={() => void copy(url)}>
+                    Copy
+                  </Button>
+                )}
+                <Button size="sm" variant="secondary" loading={busy} onClick={() => void mint()}>
+                  Replace
+                </Button>
+                <Button
+                  size="sm"
+                  variant="danger"
+                  loading={busy}
+                  onClick={() => void revoke()}
+                  className="ml-auto"
+                >
+                  Turn off
+                </Button>
+              </div>
+              <p className="text-ink-faint mt-2 text-[11px]">
+                Replacing mints a new URL and stops the old one working.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-ink text-body-sm font-medium">Send this failure to a developer</p>
+              <p className="text-ink-dim mt-1.5 text-[12.5px] leading-relaxed">
+                A public, read-only page for this one run — no QAAI account needed. It shows what
+                failed, where, the error, the steps and the screenshots. It withholds the browser
+                console, network request bodies, the trace and the video, and it reaches nothing
+                else in this workspace.
+              </p>
+
+              <label className="text-ink-dim mt-3.5 flex items-center gap-2 text-[12.5px]">
+                Expires after
+                <select
+                  value={days === null ? 'never' : String(days)}
+                  onChange={(e) =>
+                    setDays(e.target.value === 'never' ? null : Number(e.target.value))
+                  }
+                  className="border-line bg-surface-2 text-ink rounded-md border px-2 py-1 text-[12.5px]"
+                >
+                  {EXPIRY_CHOICES.map((choice) => (
+                    <option
+                      key={choice.label}
+                      value={choice.days === null ? 'never' : String(choice.days)}
+                    >
+                      {choice.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <Button
+                size="sm"
+                variant="primary"
+                loading={busy}
+                onClick={() => void mint()}
+                className="mt-3.5"
+              >
+                Create public link
+              </Button>
+              <p className="text-ink-faint mt-2 text-[11px]">
+                You can turn it off at any time, and you will be able to see whether it has been
+                opened.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+    </span>
   );
 }
