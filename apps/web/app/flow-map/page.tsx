@@ -280,7 +280,7 @@ export default function FlowMapPage() {
 
   return (
     <Page width="full">
-      <TestsHeader detail={`${map.nodeCount} states`} />
+      <TestsHeader />
 
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(220px,320px)_minmax(300px,1fr)] overflow-x-auto">
         <aside className="border-line min-h-0 overflow-y-auto border-r px-3.5 py-4">

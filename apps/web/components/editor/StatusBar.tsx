@@ -26,6 +26,20 @@ const LANGUAGE_LABEL: Record<string, string> = {
 };
 
 export interface StatusBarProps {
+  /**
+   * The blocks the caret sits inside — `Checkout › adds an item to the cart`.
+   *
+   * This used to be its own band under the tab strip, above the code. The
+   * FILE half of it was the third place on screen naming the open file (the
+   * tab and the tree already did), so the row cost 28 pixels to restate two
+   * things and add one. The one it added is this, and it belongs beside the
+   * caret's line and column: both answer "where am I", and the status bar is
+   * where a person already looks for that.
+   */
+  trail?: Array<{ name: string; startLine: number }>;
+  /** A control or two for the page to add — the rail toggle lives here. */
+  extras?: React.ReactNode;
+  onRevealLine?: (line: number) => void;
   /** Null before the editor has mounted, or with no file open. */
   position: { line: number; column: number } | null;
   /** Present only while something is selected. */
@@ -76,6 +90,9 @@ function Cell({
 
 export function StatusBar({
   position,
+  trail,
+  onRevealLine,
+  extras,
   selection,
   language,
   tabSize,
@@ -94,6 +111,38 @@ export function StatusBar({
       <Cell className="font-mono tabular-nums">
         {position ? `Ln ${position.line}, Col ${position.column}` : 'Ln —, Col —'}
       </Cell>
+
+      {/*
+        Outermost block first, and each one clickable — a trail you cannot
+        follow is a caption. The separator is dimmer than the names so the row
+        reads as a path rather than a sentence.
+      */}
+      {trail && trail.length > 0 && (
+        <nav aria-label="Enclosing blocks" className="flex min-w-0 items-center">
+          {trail.map((symbol, index) => (
+            <span key={`${symbol.startLine}-${symbol.name}`} className="flex min-w-0 items-center">
+              {index > 0 && (
+                <span aria-hidden className="text-ink-faint/50 px-[3px] select-none">
+                  ›
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => onRevealLine?.(symbol.startLine)}
+                disabled={!onRevealLine}
+                title={`Go to line ${symbol.startLine}`}
+                className={cn(
+                  'max-w-[22ch] truncate rounded-sm px-1 transition-colors',
+                  'hover:bg-surface-2 hover:text-ink',
+                  index === trail.length - 1 ? 'text-ink-dim' : 'text-ink-faint',
+                )}
+              >
+                {symbol.name}
+              </button>
+            </span>
+          ))}
+        </nav>
+      )}
 
       {selection && selection.chars > 0 && (
         <Cell className="font-mono tabular-nums">
@@ -143,6 +192,7 @@ export function StatusBar({
         </Cell>
         <Cell className="font-mono tabular-nums">Spaces: {tabSize}</Cell>
         <Cell className="font-mono">{LANGUAGE_LABEL[language] ?? language}</Cell>
+        {extras}
       </div>
     </div>
   );

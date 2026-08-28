@@ -28,7 +28,6 @@ import { ConfirmDialog } from '../../components/ui/Modal';
 import { PromptDialog } from '../../components/ui/Field';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Page } from '../../components/ui/layout';
-import { Breadcrumbs } from '../../components/editor/Breadcrumbs';
 import { SearchPanel } from '../../components/editor/SearchPanel';
 import { StatusBar } from '../../components/editor/StatusBar';
 import { TabStrip } from '../../components/editor/TabStrip';
@@ -441,6 +440,36 @@ export default function EditorPage() {
    * means "search this project" and a scope can never be silently in force.
    */
   const [searchScope, setSearchScope] = useState<string | null>(null);
+  /**
+   * Is the right rail open?
+   *
+   * The three columns were fixed, and the code — the only thing on this screen
+   * a person came to read — got 43% of the window. The rail carries the last
+   * run, the version list and the agent: real, and none of it needed while you
+   * are typing. Closing it hands its width to the editor.
+   *
+   * Remembered per session rather than per project: it is an answer about the
+   * window you are working in, like the sidebar's own collapse.
+   */
+  const [railOpen, setRailOpen] = useState(true);
+  useEffect(() => {
+    try {
+      setRailOpen(localStorage.getItem('qaai.editor.rail') !== 'closed');
+    } catch {
+      /* private mode — the rail is open, which is the old behaviour */
+    }
+  }, []);
+  const toggleRail = useCallback(() => {
+    setRailOpen((open) => {
+      const next = !open;
+      try {
+        localStorage.setItem('qaai.editor.rail', next ? 'open' : 'closed');
+      } catch {
+        /* the choice is just for this session */
+      }
+      return next;
+    });
+  }, []);
   /**
    * A line to jump to once the file it belongs to is the one on screen.
    *
@@ -1124,9 +1153,21 @@ export default function EditorPage() {
         />
       )}
 
-      <TestsHeader detail={tests.length > 0 ? `${tests.length} tests` : undefined} />
+      <TestsHeader />
 
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(150px,220px)_minmax(320px,1fr)_minmax(180px,290px)] overflow-x-auto">
+      {/*
+        The tree stays narrow, the code takes what is left, and the rail can be
+        shut. A file tree wants enough room for a name and no more; the editor
+        wants everything else.
+      */}
+      <div
+        className={cn(
+          'grid min-h-0 flex-1 overflow-x-auto',
+          railOpen
+            ? 'grid-cols-[minmax(150px,200px)_minmax(320px,1fr)_minmax(180px,270px)]'
+            : 'grid-cols-[minmax(150px,200px)_minmax(320px,1fr)]',
+        )}
+      >
         {/* ── The tree, or search ─────────────────────────────────────────── */}
         {leftPanel === 'search' && project ? (
           <aside className="border-line flex min-h-0 flex-col overflow-hidden border-r">
@@ -1271,6 +1312,46 @@ export default function EditorPage() {
             onChange={applyTabs}
             panelId={EDITOR_PANEL_ID}
             label="Open files"
+            /*
+              Record / Save / Run ride ALONG the tab strip rather than on a band
+              of their own. They were a full row for three controls, and the
+              strip already has the width: the tabs scroll, so the verbs keep a
+              place on the right that cannot be pushed off by an eleventh file.
+            */
+            actions={
+              <div className="flex shrink-0 items-center gap-2">
+                {status && (
+                  <span aria-live="polite" className="text-ink-faint text-micro min-w-0 truncate">
+                    {status}
+                  </span>
+                )}
+                <RecordButton
+                  projectId={project?.id ?? ''}
+                  environmentId={project?.environments[0]?.id ?? null}
+                  onRecorded={(testId) => {
+                    if (project) {
+                      void loadTests(project.id).then(() => void openFile(project.id, testId, true));
+                    }
+                  }}
+                />
+                <Button size="sm" onClick={() => void save()} loading={saving} disabled={!dirty}>
+                  Save <span className="text-ink-faint font-mono text-[9.5px]">⌘S</span>
+                </Button>
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={() => void runThis()}
+                  loading={running}
+                  disabled={!openTest || openIsFixture}
+                  title={
+                    openIsFixture ? 'Fixtures hold test data — there is nothing to run' : undefined
+                  }
+                >
+                  {running ? 'Running…' : 'Run'}{' '}
+                  <span className="font-mono text-[9.5px] opacity-70">⌘⏎</span>
+                </Button>
+              </div>
+            }
             onBeforeClose={(tab) => {
               const buffer = buffers.find((b) => b.test.id === tab.id);
               if (!buffer?.dirty) return true;
@@ -1301,56 +1382,6 @@ export default function EditorPage() {
             }}
           />
 
-          <div className="border-line flex shrink-0 flex-wrap items-center gap-2 gap-y-1.5 border-b px-4 py-2">
-            {status && (
-              <span aria-live="polite" className="text-ink-faint text-micro min-w-0">
-                {status}
-              </span>
-            )}
-
-            <div className="ml-auto flex flex-wrap items-center gap-2 gap-y-1.5">
-              <RecordButton
-                projectId={project?.id ?? ''}
-                environmentId={project?.environments[0]?.id ?? null}
-                onRecorded={(testId) => {
-                  if (project) {
-                    void loadTests(project.id).then(() => void openFile(project.id, testId));
-                  }
-                }}
-              />
-              <Button size="sm" onClick={() => void save()} loading={saving} disabled={!dirty}>
-                Save <span className="text-ink-faint font-mono text-[9.5px]">⌘S</span>
-              </Button>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => void runThis()}
-                loading={running}
-                disabled={!openTest || openIsFixture}
-                title={
-                  openIsFixture ? 'Fixtures hold test data — there is nothing to run' : undefined
-                }
-              >
-                {running ? 'Running…' : 'Run'}{' '}
-                <span className="font-mono text-[9.5px] opacity-70">⌘⏎</span>
-              </Button>
-            </div>
-          </div>
-
-          {openTest && (
-            <Breadcrumbs
-              filePath={openTest.filePath}
-              trail={symbolTrail}
-              onReveal={revealLine}
-            />
-          )}
-
-          {/*
-            A flex COLUMN, not a block. SplitEditor's root is `flex-1`, which
-            needs a flex parent to mean anything — as a block child it computed
-            to five pixels and the editor rendered as a hairline. `relative`
-            stays because InlineEdit positions against this box.
-          */}
           <div id={EDITOR_PANEL_ID} className="relative flex min-h-0 flex-1 flex-col">
             {openTest && inlineSelection && project && !compare && (
               <InlineEdit
@@ -1477,10 +1508,23 @@ export default function EditorPage() {
               language={editorLanguage(openTest)}
               tabSize={2}
               problems={problems}
+              trail={symbolTrail}
+              onRevealLine={revealLine}
               prefs={prefs}
               onTogglePref={togglePref}
               onFormat={formatDocument}
               onGoToProblem={goToProblem}
+              extras={
+                <button
+                  type="button"
+                  onClick={toggleRail}
+                  aria-pressed={railOpen}
+                  title={railOpen ? 'Hide the run panel' : 'Show the run panel'}
+                  className="hover:bg-surface-2 hover:text-ink rounded-sm px-1.5 py-[1px] whitespace-nowrap transition-colors"
+                >
+                  Panel
+                </button>
+              }
             />
           )}
 
@@ -1500,6 +1544,7 @@ export default function EditorPage() {
         </section>
 
         {/* ── The rail ────────────────────────────────────────────────────── */}
+        {railOpen && (
         <aside className="border-line flex min-h-0 flex-col overflow-y-auto border-l px-[18px] py-4">
           <LastRunPanel
             lastRun={lastRun}
@@ -1594,6 +1639,7 @@ export default function EditorPage() {
             )}
           </section>
         </aside>
+        )}
       </div>
 
       {/* ── Dialogs ───────────────────────────────────────────────────────── */}
