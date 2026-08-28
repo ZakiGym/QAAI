@@ -145,11 +145,27 @@ export const SETTINGS_ITEM: NavItemDef = {
   href: '/settings',
   label: 'Settings',
   Icon: IconSliders,
-  owns: ['/settings/billing'],
+  owns: ['/settings/billing', '/settings/plugins'],
   tabs: [
     { href: '/settings?tab=organization', label: 'Organization' },
     { href: '/settings?tab=members', label: 'Members' },
     { href: '/settings?tab=apiKeys', label: 'API keys' },
+    /*
+     * A TAB, not a sixteenth sidebar row — and a tab is what earns the screen
+     * its place in ⌘K, because the palette is built from tab hrefs (see
+     * EXTRA_DESTINATIONS and the note above `nav` in AppShell). This is the
+     * regression the note further up this file is about: ten screens fell out
+     * of the palette the moment they stopped having a row, and the fix was to
+     * list them here rather than to give them one back.
+     *
+     * Next to API keys because they are the same question asked twice — one is
+     * what we let into your account, the other is whose code we let into your
+     * runs. Both belong to whoever is answerable for the org, which is also why
+     * this sits in Settings rather than in Setup: installing a plugin is not
+     * configuring where tests run, it is deciding whose software is allowed to
+     * touch them.
+     */
+    { href: '/settings/plugins', label: 'Plugins' },
     { href: '/settings/billing', label: 'Billing' },
     { href: '/settings?tab=account', label: 'Account' },
   ],

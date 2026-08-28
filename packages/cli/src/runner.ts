@@ -55,6 +55,8 @@ import { argv, env, exit, stderr, stdout } from 'node:process';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 import type { StepStatus, TestResultStatus, TestType } from '@qaai/shared';
+import { TERMINAL_TOOLCHAIN, runShellCommand } from './shell.js';
+import type { OutputStream } from './shell.js';
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -203,6 +205,21 @@ export interface RunnerConfig {
   workspaceRoot: string;
   /** `default`, plus optional per-TestType overrides keyed by TestType. */
   executors: Record<string, ExecutorSpec>;
+  /**
+   * Whether this host will pick up terminal commands while it holds a job.
+   *
+   * On by default, and the default is a judgement call worth stating. Against
+   * it: a version upgrade that silently opens a command channel into a build
+   * host is a change of posture nobody consented to. For it, and decisive: the
+   * channel only exists while this agent is executing a job the org already
+   * chose to send here, it runs nothing but the read-only allowlist in
+   * `shell.ts`, every command is audited server-side against a named user, and
+   * the alternative default makes the server's own refusal message ("upgrade
+   * the agent") false. An operator who disagrees turns it off in one line, and
+   * the startup log says which way it is set rather than leaving them to find
+   * out from a screenshot.
+   */
+  terminal: { enabled: boolean };
   /** Reported to the server; empty lists mean "did not say", not "cannot". */
   capabilities: {
     browsers?: string[];
@@ -265,6 +282,31 @@ function parseExecutor(raw: unknown, where: string): ExecutorSpec {
 }
 
 /**
+ * Is the terminal on, given the config value and the environment override?
+ *
+ * Accepts `"terminal": false` and `"terminal": { "enabled": false }`, because
+ * both are what people write, and `QAAI_TERMINAL` as the switch a systemd unit
+ * can flip without editing a config file that was baked into an image. The env
+ * var wins when it is set to something recognisable and is ignored otherwise:
+ * a typo must not be read as "off" (which would be a silent feature loss) nor
+ * as "on" (which would be a silent posture change), so an unrecognised value
+ * leaves the config's answer alone.
+ */
+export function terminalEnabled(configured: unknown, override?: string): boolean {
+  const fromConfig =
+    configured === false
+      ? false
+      : configured && typeof configured === 'object'
+        ? (configured as { enabled?: unknown }).enabled !== false
+        : true;
+
+  const flag = (override ?? '').trim().toLowerCase();
+  if (['0', 'false', 'off', 'no'].includes(flag)) return false;
+  if (['1', 'true', 'on', 'yes'].includes(flag)) return true;
+  return fromConfig;
+}
+
+/**
  * Read the operator's config.
  *
  * A `token` field is refused rather than ignored. Config files get committed,
@@ -295,6 +337,7 @@ export function parseRunnerConfig(raw: unknown, source: string): RunnerConfig {
     apiUrl: typeof c.apiUrl === 'string' ? c.apiUrl : '',
     workspaceRoot: typeof c.workspaceRoot === 'string' ? c.workspaceRoot : '.qaai-runner',
     executors,
+    terminal: { enabled: terminalEnabled(c.terminal, env.QAAI_TERMINAL) },
     capabilities: {
       browsers: stringArray(capabilities.browsers, 'capabilities.browsers'),
       testTypes: stringArray(capabilities.testTypes, 'capabilities.testTypes'),
@@ -718,6 +761,22 @@ export async function probeCapabilities(config: RunnerConfig): Promise<ReportedC
     toolchains = present.filter((v): v is string => v !== null);
   }
 
+  /*
+   * The terminal capability is DERIVED, never declared.
+   *
+   * The server opens a session only if this list contains `terminal`, and it
+   * does that because a session on an agent that will not poll for commands is
+   * a prompt that hangs forever — the exact fake shell the whole feature was
+   * not allowed to be. So the flag has to mean "this process will pick up
+   * commands", which is a fact about the code and the config, not a string an
+   * operator can put in `capabilities.toolchains`. It is therefore added when
+   * the terminal is on and REMOVED when it is off, even if it was declared:
+   * declaring it while it is disabled recreates precisely the hang the gate
+   * exists to prevent.
+   */
+  toolchains = toolchains.filter((tool) => tool !== TERMINAL_TOOLCHAIN);
+  if (config.terminal.enabled) toolchains = [...toolchains, TERMINAL_TOOLCHAIN];
+
   return {
     browsers,
     // Omitted unless configured. The server reads an empty testTypes list as
@@ -750,7 +809,7 @@ export function backoffMs(consecutiveFailures: number, random = Math.random): nu
 
 // ─── The HTTP channel ────────────────────────────────────────────────────────
 
-interface ApiResponse {
+export interface ApiResponse {
   status: number;
   json: unknown;
 }
@@ -767,9 +826,18 @@ async function request(
   endpoint: PinnedEndpoint,
   token: string,
   path: string,
-  init: { method?: string; body?: unknown; raw?: Buffer; contentType?: string; timeoutMs?: number } = {},
+  init: {
+    method?: string;
+    body?: unknown;
+    raw?: Buffer;
+    contentType?: string;
+    timeoutMs?: number;
+    /** Extra headers. Merged first, so nothing here can replace the token. */
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<ApiResponse> {
   const headers: Record<string, string> = {
+    ...(init.headers ?? {}),
     authorization: `Bearer ${token}`,
     accept: 'application/json',
     'user-agent': 'qaai-runner',
@@ -816,6 +884,247 @@ function errorMessageOf(json: unknown, fallback: string): string {
   return typeof message === 'string' ? message : fallback;
 }
 
+// ─── The terminal channel ────────────────────────────────────────────────────
+
+/** What `POST /terminal/agent/jobs/:jobId/next` hands back. */
+interface NextCommandResponse {
+  session: { id: string; expiresAt: string } | null;
+  command: { id: string; argv: string[]; timeoutSeconds: number; maxOutputBytes: number } | null;
+  pollSeconds: number;
+}
+
+/**
+ * Ceilings the agent applies to whatever the server asks for.
+ *
+ * The server sends a timeout and an output cap, and today they are 30s and
+ * 256KB. They are still clamped here, because "the server said so" is not a
+ * reason to let a process run on somebody else's machine for an hour: the
+ * numbers arrive over the network from a component that can be wrong, and the
+ * agent is the one that has to live with the consequence.
+ */
+const AGENT_MAX_COMMAND_MS = 60_000;
+const AGENT_MAX_OUTPUT_BYTES = 512 * 1024;
+
+export interface TerminalChannelOptions {
+  /** Authenticated, lease-stamped POST to the pinned origin. */
+  call: (path: string, init?: { body?: unknown; timeoutMs?: number }) => Promise<ApiResponse>;
+  jobId: string;
+  /** The workspace: the same directory the executor ran in. */
+  cwd: string;
+  /** Already stripped of the run's secrets — see `terminalEnvironment`. */
+  env: Record<string, string>;
+  /** Values scrubbed from output on the way out. */
+  redact?: readonly string[];
+  log: (line: string) => void;
+  /** Only tests pass these. */
+  sleep?: (ms: number) => Promise<void>;
+  idlePollMs?: number;
+}
+
+/**
+ * Poll for shell commands while this agent holds a job, run them, report back.
+ *
+ * This is the half the feature was missing: the server has been able to queue a
+ * command since the last wave, and nothing was draining the queue. The refusal
+ * at the door (`TERMINAL_CAPABILITY` in lib/pty.ts) was honest about that; this
+ * class is what makes advertising the capability true.
+ *
+ * ── Cadence ──────────────────────────────────────────────────────────────────
+ *
+ * The server suggests 15s, which is the heartbeat interval and the right answer
+ * for the common case: almost no run ever has a shell open, and forty agents
+ * polling a shell endpoint they will never need is pure cost. So the idle
+ * cadence is the server's, and the moment a session appears on this job the
+ * cadence drops to one second — somebody is sitting at a prompt, and fifteen
+ * seconds to see the output of `pwd` is a tool people stop using. One request
+ * per second, for at most ten minutes, for at most five sessions per org, is a
+ * cost worth paying for a debugging tool that feels like one. After a command
+ * finishes we poll immediately, because the next one is usually already typed.
+ *
+ * ── Failure is not fatal ─────────────────────────────────────────────────────
+ *
+ * Nothing this class does may cost the job its results. A poll that fails is
+ * retried on the next tick; a poll that comes back 409 means the lease is gone
+ * and the channel stops (the executor's own heartbeat is the thing that
+ * notices, and it says so once). The one case that stops it permanently is a
+ * 401, which will not fix itself.
+ */
+export class TerminalChannel {
+  private stopping = false;
+  private readonly aborts = new AbortController();
+  private loop: Promise<void> | null = null;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private wake: (() => void) | null = null;
+
+  constructor(private readonly options: TerminalChannelOptions) {
+    this.sleep = options.sleep ?? sleep;
+  }
+
+  start(): void {
+    if (this.loop) return;
+    this.loop = this.run().catch((err: unknown) => {
+      this.options.log(
+        `terminal channel stopped: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+
+  /**
+   * Stop, and take any running command with us.
+   *
+   * Called from the job's `finally`, immediately before the workspace is
+   * removed. A command still reading a file in a directory that is about to be
+   * deleted is the reason this aborts rather than waits.
+   */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    this.aborts.abort();
+    this.wake?.();
+    await this.loop?.catch(() => {});
+    this.loop = null;
+  }
+
+  private async pause(ms: number): Promise<void> {
+    // Racing a wake-up against the timer is what makes `stop()` prompt: without
+    // it a shutdown waits out a full idle poll before the process can exit.
+    await Promise.race([
+      this.sleep(ms),
+      new Promise<void>((resolveWake) => {
+        this.wake = resolveWake;
+      }),
+    ]);
+    this.wake = null;
+  }
+
+  private async run(): Promise<void> {
+    const idle = Math.max(1_000, this.options.idlePollMs ?? 15_000);
+    // The first poll is immediate. A session can only be opened against a job
+    // that is already running, so by the time this channel exists somebody may
+    // already be waiting at a prompt, and one request per job is a cheap way
+    // not to make them wait out a full idle interval for their first command.
+    let wait = 0;
+
+    while (!this.stopping) {
+      await this.pause(wait);
+      if (this.stopping) return;
+
+      let response: ApiResponse;
+      try {
+        response = await this.options.call(
+          `/terminal/agent/jobs/${encodeURIComponent(this.options.jobId)}/next`,
+          // Shorter than the default. This endpoint answers out of memory plus
+          // one indexed read, so ten seconds is already generous — and it is
+          // what bounds how long a finishing job can be held up by a poll that
+          // is in flight when the executor finishes.
+          { timeoutMs: 10_000 },
+        );
+      } catch {
+        // Unreachable API, a proxy blip, a VPN reconnect. The job's own
+        // heartbeat is the thing that decides whether this runner is still
+        // alive; a failed shell poll just waits.
+        wait = idle;
+        continue;
+      }
+
+      if (response.status === 401 || response.status === 409) {
+        // 401: the token was rotated or revoked. 409: the lease is gone and
+        // another runner has this job. Neither improves by asking again, and
+        // the session the server had is already being closed on its side.
+        return;
+      }
+      if (response.status !== 200) {
+        wait = idle;
+        continue;
+      }
+
+      const next = (response.json ?? {}) as Partial<NextCommandResponse>;
+      const serverIdle = Math.max(1_000, Math.round((next.pollSeconds ?? 15) * 1000));
+
+      if (!next.session) {
+        wait = serverIdle;
+        continue;
+      }
+      if (!next.command) {
+        // A prompt is open with nothing queued: somebody is typing.
+        wait = 1_000;
+        continue;
+      }
+
+      if (this.stopping) return;
+      await this.execute(next.command);
+      // Straight back round. The next command is usually already typed.
+      wait = 0;
+    }
+  }
+
+  private async execute(command: NonNullable<NextCommandResponse['command']>): Promise<void> {
+    const commandId = String(command.id ?? '');
+    if (!commandId) return;
+
+    const base = `/terminal/agent/jobs/${encodeURIComponent(this.options.jobId)}/commands/${encodeURIComponent(commandId)}`;
+
+    const outcome = await runShellCommand({
+      argv: Array.isArray(command.argv) ? command.argv : [],
+      cwd: this.options.cwd,
+      env: this.options.env,
+      // Clamped, because these arrived over the network. `Number.isFinite`
+      // rather than a default: a NaN would sail through `Math.min` and become
+      // NaN, and a NaN timeout is a command with no timeout at all.
+      timeoutMs: clamp(command.timeoutSeconds * 1000, 1_000, AGENT_MAX_COMMAND_MS, 30_000),
+      maxOutputBytes: clamp(command.maxOutputBytes, 1_024, AGENT_MAX_OUTPUT_BYTES, 256 * 1024),
+      ...(this.options.redact ? { redact: this.options.redact } : {}),
+      signal: this.aborts.signal,
+      onOutput: async (stream: OutputStream, chunk: string) => {
+        const posted = await this.options.call(`${base}/output`, { body: { stream, chunk } });
+        /*
+         * Stop sending on anything but a clean accept. A 404 is the session
+         * being gone — closed by its owner, reaped, or handed to another
+         * runner — and `truncated` is the server saying it has hit its own cap
+         * and is discarding what follows. Both mean the remaining output has
+         * no reader, so it is not worth a customer's egress or our ingest.
+         */
+        if (posted.status !== 200) return 'stop';
+        const body = (posted.json ?? {}) as { truncated?: boolean };
+        return body.truncated ? 'stop' : undefined;
+      },
+    });
+
+    // Worth the operator's log as well as the panel: a refusal here means the
+    // server asked this host for something its own allowlist does not contain,
+    // and that is a line somebody should be able to find later.
+    if (outcome.notice) this.options.log(`terminal (${outcome.ended}): ${outcome.notice.trim()}`);
+
+    /*
+     * Always report an exit, even for a refusal or a kill.
+     *
+     * The session runs one command at a time and the server only clears the
+     * slot when an exit arrives; a command we ran but never finished leaves the
+     * user with a prompt that refuses everything they type until the sweep
+     * abandons it thirty seconds later. So this is the one call in the channel
+     * that is worth a retry, and it gets exactly one — enough to survive a
+     * dropped connection, not enough to sit here while the job waits.
+     */
+    for (const attempt of [0, 1]) {
+      try {
+        const posted = await this.options.call(`${base}/exit`, {
+          body: { exitCode: outcome.exitCode },
+        });
+        if (posted.status === 200 || posted.status === 404 || posted.status === 409) return;
+      } catch {
+        // fall through to the retry
+      }
+      if (attempt === 0 && !this.stopping) await this.sleep(500);
+    }
+    this.options.log(`terminal: could not report the exit of command ${commandId}`);
+  }
+}
+
+/** A finite number in range, or the fallback. NaN never survives this. */
+function clamp(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
+}
+
 // ─── The agent ───────────────────────────────────────────────────────────────
 
 export interface AgentOptions {
@@ -854,6 +1163,25 @@ export class RunnerAgent {
     return request(this.options.endpoint, this.options.token, path, init);
   }
 
+  /**
+   * A call about a job this agent is holding, fenced with its lease.
+   *
+   * Every `/runners/agent/jobs/*` and `/terminal/agent/jobs/*` endpoint calls
+   * `requireLease`, which reads the lease out of `x-qaai-lease` and refuses
+   * without it. This agent held the lease id and never sent it, so every
+   * heartbeat, result batch, artifact and completion was answered 400 — the
+   * fence the server describes was not being presented by the only process
+   * that has one. Sending it here, in one place, rather than at each call site,
+   * so a new job-scoped endpoint cannot be added without it.
+   */
+  private jobCall(
+    leaseId: string,
+    path: string,
+    init?: Parameters<typeof request>[3],
+  ): Promise<ApiResponse> {
+    return this.call(path, { ...init, headers: { ...(init?.headers ?? {}), 'x-qaai-lease': leaseId } });
+  }
+
   private async capabilities(): Promise<ReportedCapabilities> {
     if (this.probed && Date.now() - this.probed.at < RunnerAgent.PROBE_TTL_MS) {
       return this.probed.capabilities;
@@ -883,6 +1211,22 @@ export class RunnerAgent {
       `connected to ${this.options.endpoint.origin} — browsers: ${
         capabilities.browsers.join(', ') || 'none detected'
       }; tools: ${capabilities.toolchains.join(', ') || 'none detected'}`,
+    );
+
+    /*
+     * Said out loud, every start, whichever way it is set. This is the one
+     * line that tells the person running the agent that people in their QAAI
+     * org can execute commands on this host — and the one that tells them the
+     * shape of it, so "a shell into our build machine" is met with what it
+     * actually is rather than what it sounds like.
+     */
+    this.log(
+      this.options.config.terminal.enabled
+        ? 'terminal sessions: ENABLED — while this agent is running a job, a MEMBER of your QAAI ' +
+            'org can run read-only allowlisted commands (no writes, no network, no environment ' +
+            'dump) in that job’s workspace on this host. Every command is audited. ' +
+            'Set "terminal": false in the config, or QAAI_TERMINAL=off, to refuse.'
+        : 'terminal sessions: disabled — QAAI will refuse to open a shell on this host.',
     );
   }
 
@@ -959,11 +1303,33 @@ export class RunnerAgent {
 
     let completion: 'COMPLETED' | 'FAILED' = 'COMPLETED';
     let completionError: string | null = null;
+    let shell: TerminalChannel | null = null;
 
     try {
       await materialiseWorkspace(root, job);
       const executor = executorFor(this.options.config, [...new Set(job.tests.map((t) => t.type))]);
-      const outcome = await this.runExecutor(root, executor, job);
+      const childEnv = executorEnvironment(executor, job);
+
+      /*
+       * The shell channel starts AFTER the workspace exists and stops before it
+       * is removed, because the workspace is the session's working directory.
+       * It runs alongside the executor rather than after it — the whole point
+       * is to look at the machine while the suite is on it — and it holds no
+       * part of the job's own path: if it throws, the run still reports.
+       */
+      if (this.options.config.terminal.enabled) {
+        shell = new TerminalChannel({
+          call: (path, init) => this.jobCall(job.leaseId, path, init),
+          jobId: job.jobId,
+          cwd: root,
+          env: terminalEnvironment(childEnv, Object.keys(job.secrets ?? {})),
+          redact: [...Object.values(job.secrets ?? {}), this.options.token],
+          log: this.log,
+        });
+        shell.start();
+      }
+
+      const outcome = await this.runExecutor(root, executor, job, childEnv);
 
       const reports = mapReport(job.tests, outcome.cases, outcome.note);
       await this.reportResults(job, reports);
@@ -979,6 +1345,10 @@ export class RunnerAgent {
       this.log(`job ${job.jobId} failed locally: ${completionError}`);
     } finally {
       this.stopHeartbeat();
+      // Before the rm, always: a command reading a file in a directory that is
+      // about to be deleted is how a session outlives the thing it was looking
+      // at. `stop()` kills whatever is running, process tree and all.
+      await shell?.stop();
       await rm(root, { recursive: true, force: true }).catch(() => {});
     }
 
@@ -1003,17 +1373,8 @@ export class RunnerAgent {
     root: string,
     executor: ExecutorSpec,
     job: JobAssignment,
+    childEnv: Record<string, string>,
   ): Promise<{ cases: JunitCase[]; note: string }> {
-    const childEnv: Record<string, string> = {
-      ...(env as Record<string, string>),
-      ...(executor.env ?? {}),
-      QAAI_BASE_URL: job.environment.baseUrl,
-      QAAI_RUN_ID: job.runId,
-      QAAI_RANDOM_SEED: String(job.determinism.randomSeed),
-    };
-    // Secrets last, so a badly-chosen executor env key cannot shadow one.
-    for (const [name, value] of Object.entries(job.secrets ?? {})) childEnv[name] = value;
-
     const result = await spawnExecutor(executor, root, childEnv);
 
     if (result.missing) {
@@ -1052,7 +1413,8 @@ export class RunnerAgent {
   private async reportResults(job: JobAssignment, reports: ExecutionReport[]): Promise<void> {
     const BATCH = 25;
     for (let i = 0; i < reports.length; i += BATCH) {
-      const response = await this.call(
+      const response = await this.jobCall(
+        job.leaseId,
         `/runners/agent/jobs/${encodeURIComponent(job.jobId)}/results`,
         { body: { results: reports.slice(i, i + BATCH) } },
       );
@@ -1088,7 +1450,8 @@ export class RunnerAgent {
       const body = await readFile(path).catch(() => null);
       if (!body) continue;
 
-      const response = await this.call(
+      const response = await this.jobCall(
+        job.leaseId,
         `/runners/agent/jobs/${encodeURIComponent(job.jobId)}/artifacts?name=${encodeURIComponent(entry.name)}`,
         { raw: body, timeoutMs: 120_000 },
       ).catch((err: unknown) => {
@@ -1105,7 +1468,8 @@ export class RunnerAgent {
     status: 'COMPLETED' | 'FAILED',
     errorMessage: string | null,
   ): Promise<void> {
-    const response = await this.call(
+    const response = await this.jobCall(
+      job.leaseId,
       `/runners/agent/jobs/${encodeURIComponent(job.jobId)}/complete`,
       { body: { status, errorMessage } },
     ).catch((err: unknown) => {
@@ -1121,7 +1485,7 @@ export class RunnerAgent {
   private startHeartbeat(job: JobAssignment): void {
     const every = Math.max(5_000, (job.heartbeatSeconds || 15) * 1000);
     this.heartbeat = setInterval(() => {
-      void this.call(`/runners/agent/jobs/${encodeURIComponent(job.jobId)}/heartbeat`)
+      void this.jobCall(job.leaseId, `/runners/agent/jobs/${encodeURIComponent(job.jobId)}/heartbeat`)
         .then((response) => {
           if (response.status === 409) {
             /*
@@ -1158,9 +1522,10 @@ export class RunnerAgent {
     this.stopHeartbeat();
     if (!this.held) return;
 
-    await this.call(`/runners/agent/jobs/${encodeURIComponent(this.held.jobId)}/release`).catch(
-      () => {},
-    );
+    await this.jobCall(
+      this.held.leaseId,
+      `/runners/agent/jobs/${encodeURIComponent(this.held.jobId)}/release`,
+    ).catch(() => {});
     this.log(`released job ${this.held.jobId} on shutdown`);
     this.held = null;
   }
@@ -1171,6 +1536,65 @@ function sleep(ms: number): Promise<void> {
     const timer = setTimeout(resolveSleep, ms);
     timer.unref?.();
   });
+}
+
+/**
+ * The environment the test runs in.
+ *
+ * Secrets go last, so a badly-chosen executor env key cannot shadow one, and
+ * they go in the ENVIRONMENT rather than the arguments because arguments are
+ * world-readable in `ps`.
+ */
+export function executorEnvironment(
+  executor: ExecutorSpec,
+  job: Pick<JobAssignment, 'environment' | 'runId' | 'determinism' | 'secrets'>,
+  base: Record<string, string | undefined> = env,
+): Record<string, string> {
+  const childEnv: Record<string, string> = {
+    ...(base as Record<string, string>),
+    ...(executor.env ?? {}),
+    QAAI_BASE_URL: job.environment.baseUrl,
+    QAAI_RUN_ID: job.runId,
+    QAAI_RANDOM_SEED: String(job.determinism.randomSeed),
+  };
+  for (const [name, value] of Object.entries(job.secrets ?? {})) childEnv[name] = value;
+  return childEnv;
+}
+
+/**
+ * The environment a TERMINAL command runs in: the test's, minus the credentials.
+ *
+ * The point of the feature is that the shell sees what the test saw, so this is
+ * the executor's environment — the agent's own env, the executor's configured
+ * additions, `QAAI_BASE_URL`, `QAAI_RUN_ID`, `QAAI_RANDOM_SEED`, and the
+ * workspace as the working directory. Say it exactly, because the difference is
+ * the interesting part:
+ *
+ *  - **The run's injected secrets are removed, by name.** They are the reason
+ *    `env` and `printenv` are not on the allowlist at all, and the panel says
+ *    so. But an allowlist is a list somebody will add to, and the day a command
+ *    that prints an environment is added, the secrets should not be sitting
+ *    there waiting. Removing them means the *only* way for a session to read
+ *    one is for a test to have written it into the workspace — which is the
+ *    customer's own file on the customer's own disk, and is redacted on the way
+ *    out anyway.
+ *  - **`QAAI_RUNNER_TOKEN` is removed.** It is this agent's credential, not the
+ *    test's, and nothing the test does needs it. A shell that could read it
+ *    could impersonate the runner.
+ *  - **Everything else about the operator's machine is inherited unchanged**,
+ *    including whatever else is in the agent's own environment. That is not an
+ *    oversight: no allowlisted command prints an environment, and a heuristic
+ *    that guessed which of the operator's own variables looked secret would be
+ *    a blocklist — wrong in both directions and impossible to reason about.
+ */
+export function terminalEnvironment(
+  full: Record<string, string>,
+  secretNames: readonly string[],
+): Record<string, string> {
+  const hidden = new Set([...secretNames, 'QAAI_RUNNER_TOKEN']);
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(full)) if (!hidden.has(name)) out[name] = value;
+  return out;
 }
 
 export interface ExecutorOutcome {
@@ -1227,8 +1651,19 @@ Usage:
   qaai runner [--api-url <url>] [--config <path>]
 
 The agent makes only OUTBOUND https to the QAAI URL you give it. Nothing needs
-to be opened inbound, and it never accepts a command from the server — it runs
-the executor named in your own config file.
+to be opened inbound, and it never accepts an arbitrary command from the server
+— it runs the executor named in your own config file.
+
+Terminal sessions:
+  While a job is running, a MEMBER of your QAAI org can open a terminal on it.
+  That is NOT a shell: it is a fixed list of read-only commands (node/npm/npx
+  --version, pwd, ls, cat, head, tail, uname, df, ps, git rev-parse|status|log)
+  which this agent checks again itself and runs with no shell involved. Each one
+  is bounded at 30s and 256KB of output, killed with its whole process tree, and
+  audited against the user who typed it. It runs in that job's workspace, with
+  the environment the test had MINUS the run's injected secrets and this agent's
+  own token, and known secret values are stripped from the output.
+  Turn it off with "terminal": false in the config file, or QAAI_TERMINAL=off.
 
 Options:
   --api-url <url>     Your QAAI URL. Default: $QAAI_API_URL

@@ -40,6 +40,7 @@ import { schedulesRouter } from './routes/schedules.js';
 import { badgesRouter } from './routes/badges.js';
 import { terminalRouter } from './routes/terminal.js';
 import { shareRouter } from './routes/share.js';
+import { pluginsRouter } from './routes/plugins.js';
 import { webhooksRouter } from './routes/webhooks.js';
 import { clustersRouter } from './routes/clusters.js';
 import { compareRouter } from './routes/compare.js';
@@ -182,6 +183,9 @@ app.use('/badges', badgesRouter);
  * mounts after attachActor like every other authenticated surface.
  */
 app.use('/terminal', terminalRouter);
+
+/* The plugin registry: what an org has installed, and who it trusts to sign. */
+app.use('/plugins', pluginsRouter);
 
 /*
  * Public, read-only run reports.

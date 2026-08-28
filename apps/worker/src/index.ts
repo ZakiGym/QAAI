@@ -57,6 +57,13 @@ import {
   processBackupTick,
   type BackupTickJob,
 } from './processors/backup.js';
+import {
+  ACTIONS_QUEUE,
+  closeActionsQueue,
+  dispatchActionsForNotify,
+  processActionEvent,
+  type ActionEventJob,
+} from './processors/actions.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
@@ -187,14 +194,28 @@ register<EditJob>(QUEUE_NAMES.edit, config.concurrency * 2, processEdit);
 // is given which attempt this is, because the attempt that exhausts the
 // retries is the one that must flip the row to FAILED (the dead-letter the
 // deliveries endpoint reads).
-register<NotifyJob | DeliveryJob>(QUEUE_NAMES.notify, config.concurrency, (payload, job) =>
-  job.name === DELIVERY_JOB
-    ? processDelivery(payload as DeliveryJob, {
-        attempt: job.attemptsMade + 1,
-        maxAttempts: job.opts.attempts ?? 1,
-      })
-    : processNotify(payload as NotifyJob, String(job.id ?? '')),
-);
+register<NotifyJob | DeliveryJob>(QUEUE_NAMES.notify, config.concurrency, async (payload, job) => {
+  if (job.name === DELIVERY_JOB) {
+    await processDelivery(payload as DeliveryJob, {
+      attempt: job.attemptsMade + 1,
+      maxAttempts: job.opts.attempts ?? 1,
+    });
+    return;
+  }
+
+  const notify = payload as NotifyJob;
+  await processNotify(notify, String(job.id ?? ''));
+
+  /*
+   * Event actions ride the same trigger as the chat message, and in this order
+   * on purpose: the notification is a person being woken up, the action is a
+   * machine being poked, and on a bad day the human should win. The call is
+   * an ENQUEUE, not a dispatch — an action that resolves slowly must not hold
+   * the notify lane — and it never throws, so a broken action cannot cost a
+   * page its delivery.
+   */
+  await dispatchActionsForNotify(notify);
+});
 // One repeating sweep rather than a timer per schedule: timers drift, do not
 // survive a restart, and a scheduler that quietly stops is worse than none.
 //
@@ -289,6 +310,23 @@ register<BackupTickJob>(BACKUP_QUEUE, 1, (payload) => processBackupTick(payload)
 // and a restart cannot double-schedule.
 void armBackupSweep().catch((err) => logger.error({ err }, 'could not arm the backup tick'));
 
+// Event actions (§7): fan one observed event out to whatever automation the
+// customer registered for it. Registered here rather than riding the notify
+// queue because an action's destination is a host we do not control — a slow
+// or hostile resolver on one action must not sit in the lane that carries the
+// pages. Capped at the browser-bound concurrency for the same reason: each job
+// does a DNS lookup per destination, and those are the one thing here that can
+// block for seconds.
+//
+// Wrapped in an arrow so register()'s second argument (the BullMQ Job) is never
+// mistaken for processActionEvent's own deps parameter — that slot is the test
+// seam for injecting a resolver, and a Job landing in it would be a silent
+// no-op today and a confusing bug the day the two types grow a matching field.
+// Same reasoning as the backup tick above.
+register<ActionEventJob>(ACTIONS_QUEUE, config.concurrency, (payload) =>
+  processActionEvent(payload),
+);
+
 logger.info(
   {
     concurrency: config.concurrency,
@@ -319,6 +357,7 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     // hold the process past the shutdown that is supposed to end it.
     await closeRetentionQueue().catch(() => {});
     await closeBackupQueue().catch(() => {});
+    await closeActionsQueue().catch(() => {});
     await prisma.$disconnect().catch(() => {});
     connection.disconnect();
     process.exit(0);

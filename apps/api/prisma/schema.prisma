@@ -514,6 +514,7 @@ model Project {
   ownershipRules OwnershipRule[]
   triageBatches  TriageBatch[]
   digest         DigestSubscription?
+  pluginEnablements PluginEnablement[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -1963,4 +1964,163 @@ model DigestSubscription {
 
   @@index([orgId])
   @@index([enabled, nextRunAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plugin registry (§4) — code QAAI did not write
+//
+// Three tables and the reason there are three:
+//
+//   PluginPublisher  WHO an org has decided to trust. Trust is a property of
+//                    the organisation, not of the plugin, and not of this
+//                    build: no key ships in the binary, so "unknown publisher"
+//                    is a real refusal rather than a formality.
+//   Plugin           WHAT is installed, org-wide, exactly as it was verified.
+//   PluginEnablement WHERE it is allowed to run. Installing is not running.
+//
+// The last split is the one worth defending. Merging install and enablement
+// would make "install" mean "start executing this against every project I
+// have", which is a far larger act than the word describes, and would leave no
+// way to take a plugin off production while leaving it on staging.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A signing key this organisation trusts, and therefore a set of plugins it
+/// will accept.
+///
+/// Adding one is the security decision in this whole feature. It is separate
+/// from installing so that the trust and the artifact are approved at different
+/// moments by different sentences: "we believe this key belongs to Acme" is a
+/// claim about the world that somebody has to check against Acme's own site,
+/// and it is not answerable by looking at the plugin.
+model PluginPublisher {
+  id    String @id @default(cuid())
+  orgId String
+
+  /// The `publisher` field manifests are signed under — lowercase kebab.
+  publisherId String
+  /// What to call them on screen. Free text, from whoever added the key.
+  displayName String
+
+  /// Base64 of the RAW 32-byte Ed25519 public key.
+  ///
+  /// Normalised on the way in (packages/shared/src/plugin-manifest.ts accepts
+  /// the SPKI DER too) so that this column has exactly one representation.
+  /// Storing whatever the operator pasted would mean the same key could sit
+  /// here twice under two encodings, and a revocation would only cut off one
+  /// of them.
+  publicKey String
+  /// SHA-256 of the key, grouped in fours. Derived, and stored anyway: it is
+  /// what a person compares against the publisher's website, and recomputing it
+  /// for a list means the UI can only show it after a round trip.
+  fingerprint String
+
+  /// Revocation is a timestamp, not a delete, for the same reason it is on
+  /// Runner: the plugins installed under this key still point at it, and an
+  /// audit trail that dangles cannot answer "what did we trust in July".
+  revokedAt DateTime?
+  revokedBy String?
+
+  addedBy   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  plugins Plugin[]
+
+  /// One key per publisher name per org. Two rows for "acme" would make
+  /// "is this signature from acme" a question with two answers, and a
+  /// verification loop that tries them all is a verification that succeeds if
+  /// ANY key matches — which is how a revoked key keeps working.
+  @@unique([orgId, publisherId])
+  @@index([orgId])
+}
+
+/// One installed plugin, org-wide.
+model Plugin {
+  id    String @id @default(cuid())
+  orgId String
+
+  /// From the manifest. Unique per org, and refused outright when it collides
+  /// with a first-party plugin name — see RESERVED_PLUGIN_NAMES.
+  name    String
+  version String
+
+  publisherRowId String
+  /// Denormalised from the publisher row so a listing can name the publisher
+  /// without a join, and so the audit trail still says who signed it after the
+  /// publisher row is renamed.
+  publisher String
+
+  displayName String
+  description String
+  homepage    String?
+
+  /// The runner contract this build was accepted against. Stored rather than
+  /// re-derived: when QAAI's protocol moves, this column is what says which
+  /// installs need attention, and re-reading it from the manifest JSON would
+  /// mean a scan.
+  protocol Int
+
+  /// PluginCapability[] — the vocabulary in @qaai/shared. Held as a column and
+  /// not only inside `manifest` because it is queried ("what can reach our
+  /// secrets?"), rendered on every row, and enforced by the runner, and a
+  /// question asked that often should not require parsing a JSON blob.
+  capabilities String[] @default([])
+  /// The subset that needed the org's plan to permit it. Recorded at install
+  /// time so a later downgrade is answerable — it says what was granted under
+  /// which plan, rather than leaving it to be recomputed from today's.
+  governedCapabilities String[] @default([])
+
+  /// SHA-256 of the code bundle, from inside the signed manifest. THE integrity
+  /// anchor: the runner must refuse to load bytes that do not hash to this.
+  codeSha256 String
+  codeBytes  Int
+  /// Entry path inside the bundle, relative, validated on install.
+  codeEntry  String
+
+  /// The verified manifest, verbatim, and the detached signature over it.
+  ///
+  /// Kept so verification can be REDONE — on a protocol bump, on a key
+  /// rotation, on the runner before it loads anything — rather than trusting
+  /// the columns above, which are a convenience copy this row could in
+  /// principle drift from. Order is not preserved by jsonb, which is exactly
+  /// why the signature is over a canonical serialisation.
+  manifest  Json
+  signature String
+
+  installedBy String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  publisherRow PluginPublisher    @relation(fields: [publisherRowId], references: [id], onDelete: Restrict)
+  enablements  PluginEnablement[]
+
+  @@unique([orgId, name])
+  @@index([orgId])
+  @@index([publisherRowId])
+}
+
+/// Whether an installed plugin may run against one project.
+///
+/// A row means a decision was made; no row means the default, which is OFF.
+/// That is deliberate: absence has to read as "not enabled", because the
+/// failure mode of the other convention is a plugin installed once and silently
+/// live on every project created afterwards.
+model PluginEnablement {
+  id        String @id @default(cuid())
+  orgId     String
+  pluginId  String
+  projectId String
+
+  enabled   Boolean @default(true)
+  updatedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  plugin  Plugin  @relation(fields: [pluginId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([pluginId, projectId])
+  @@index([orgId])
+  @@index([projectId, enabled])
 }

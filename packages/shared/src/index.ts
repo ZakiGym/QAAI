@@ -20,6 +20,7 @@ export * from './types';
 export * from './schemas';
 export * from './mask';
 export * from './failure-summary';
+export * from './plugin-capabilities';
 export * from './webhook-failure';
 export * from './job-enums';
 export * from './jobs';

@@ -116,8 +116,33 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
     );
   }
 
-  const wait = flags.wait !== false; // wait by default; --no-wait to fire and forget
+  /*
+   * Wait by default; `--no-wait` to fire and forget.
+   *
+   * `flags.wait !== false` alone never saw `--no-wait`: parseFlags stores the
+   * flag under the key it was written with, so `--no-wait` lands as
+   * `flags['no-wait']` and `flags.wait` stays undefined. The documented flag
+   * (docs/ci.md, and this file's own --help) has therefore been a no-op — every
+   * `--no-wait` run polled to completion anyway. Noticed while adding
+   * `--reporter`, which genuinely cannot run against an unfinished run.
+   */
+  const wait = flags['no-wait'] !== true && flags.wait !== false;
   const junitPath = flags.junit as string | undefined;
+
+  /*
+   * Reporters are resolved BEFORE the run is queued. A misspelled --reporter
+   * should cost a second, not a ten-minute suite whose results then go nowhere.
+   * The module is imported only when the flag is present, for the same reason
+   * `backup` and `runner` are lazy: `qaai status` should not pay for it.
+   */
+  const reporting = args.includes('--reporter') ? await import('./report.js') : null;
+  const reporterRequests = reporting ? reporting.parseReporterArgs(args) : [];
+  const testRailRunId = reporting ? reporting.readTestRailRunId(flags, env) : undefined;
+  if (reporterRequests.length > 0 && !wait) {
+    throw new CliError(
+      '--reporter needs a finished run to report on, so it cannot be combined with --no-wait.',
+    );
+  }
 
   const body: Record<string, unknown> = {
     environmentId,
@@ -161,13 +186,60 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
     if (!opts.json) stderr.write(`\nJUnit XML written to ${junitPath}\n`);
   }
 
+  /*
+   * Reporting happens after the run is terminal and before the verdict is
+   * printed, so a reporting failure can still change the exit code. The run's
+   * full detail — every result, not just the counters `RunView` carries — is
+   * fetched once, here, because that is the only shape the reporters can work
+   * from.
+   */
+  let reports: import('./report.js').EmitResult = { outcomes: [], failures: [] };
+
+  if (reporting && reporterRequests.length > 0) {
+    const detail = await apiCall<{ run: import('./report.js').ApiRunPayload }>(
+      opts,
+      `/runs/${run.id}`,
+    );
+    // Only a URL the operator actually configured. Guessing a web address from
+    // the API's would put a dead link in every Allure report.
+    const appUrl = env.QAAI_APP_URL?.replace(/\/+$/, '');
+    reports = await reporting.emitReports({
+      report: reporting.runReportFromApi(
+        detail.run,
+        appUrl ? { url: `${appUrl}/runs/${run.id}` } : {},
+      ),
+      requests: reporterRequests,
+      env,
+      ...(testRailRunId === undefined ? {} : { testRailRunId }),
+      fetchJunitXml: () => fetchJunit(opts, run.id),
+    });
+
+    if (!opts.json) {
+      stderr.write('\n');
+      for (const outcome of reports.outcomes) {
+        stderr.write(`${outcome.reporter}: ${outcome.destination}\n`);
+        // Warnings are what a reporter left out. Printing them is the whole
+        // difference between a document that is short and one that lies.
+        for (const warning of outcome.warnings) stderr.write(`  ! ${warning}\n`);
+      }
+      // Printed even when the tests passed, and the exit code below agrees.
+      for (const failure of reports.failures) stderr.write(`reporting failed — ${failure}\n`);
+    }
+  }
+
   const gateBlocked = view.gateResult ? !view.gateResult.passed : false;
   // Exit nonzero on any failure OR a blocking gate — the build must go red.
   const failed =
     view.failedCount > 0 || view.status === 'FAILED' || view.status === 'ERRORED' || gateBlocked;
 
   if (opts.json) {
-    stdout.write(JSON.stringify({ ...view, ci: { failed } }) + '\n');
+    stdout.write(
+      JSON.stringify({
+        ...view,
+        ci: { failed, reportingFailed: reports.failures.length > 0 },
+        ...(reporterRequests.length > 0 ? { reports } : {}),
+      }) + '\n',
+    );
   } else {
     stderr.write('\n');
     stdout.write(
@@ -180,7 +252,11 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
     }
   }
 
-  return failed ? 1 : 0;
+  if (failed) return 1;
+  // A run that passed and whose results never reached the dashboard is not a
+  // green step. 2 rather than 1 so a pipeline can tell "the tests failed" from
+  // "the tests passed and the report did not ship".
+  return reports.failures.length > 0 ? 2 : 0;
 }
 
 // ─── qaai deploy-check ───────────────────────────────────────────────────────
@@ -192,7 +268,26 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
  */
 async function cmdDeployCheck(opts: GlobalOptions, args: string[]): Promise<number> {
   const flags = parseFlags(args);
+  /*
+   * The reporter flags are forwarded from raw argv rather than through
+   * `flags`, because they are repeatable and order-sensitive — a
+   * `--reporter-out` belongs to the `--reporter` before it — and `parseFlags`
+   * keeps only the last value of a repeated flag.
+   */
+  const reporterArgs: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg !== '--reporter' && arg !== '--reporter-out' && arg !== '--testrail-run') continue;
+    reporterArgs.push(arg);
+    const next = args[i + 1];
+    if (next !== undefined && !next.startsWith('--')) {
+      reporterArgs.push(next);
+      i++;
+    }
+  }
+
   return cmdRun(opts, [
+    ...reporterArgs,
     ...(flags.env ? ['--env', String(flags.env)] : []),
     ...(flags.junit ? ['--junit', String(flags.junit)] : []),
     ...(flags.commit ? ['--commit', String(flags.commit)] : []),
@@ -246,13 +341,41 @@ Run options:
   --no-wait           Queue the run and return its id without waiting
   --timeout <sec>     Give up waiting after this many seconds (default 600)
 
+Reporters (repeatable, and composable with --junit):
+  --reporter <name>   junit | allure | testrail
+  --reporter-out <p>  Where the --reporter before it writes. Defaults:
+                      junit -> junit.xml, allure -> allure-results/ (a
+                      directory), testrail -> uploaded, no file written
+  --testrail-run <id> The TestRail run to add results to
+
+    qaai run --env <id> --reporter allure --reporter-out ./allure-results \\
+                        --reporter testrail --testrail-run 4821
+
+  TestRail keys results on case ids, so put the id in the test name as C1234;
+  tests without one are named in a warning rather than uploaded to a guess.
+
 Global:
   --api-url <url>     Default: $QAAI_API_URL or http://localhost:4000
   --api-key <key>     Default: $QAAI_API_KEY
   --json              Machine-readable output
 
+Environment:
+  QAAI_API_KEY        API key for the run (or --api-key)
+  QAAI_APP_URL        Your QAAI web address, used to link Allure results back
+                      to the run. Omitted rather than guessed.
+  TESTRAIL_HOST       https://acme.testrail.io
+  TESTRAIL_USER       The TestRail account email
+  TESTRAIL_API_KEY    From TestRail: My Settings -> API Keys
+  TESTRAIL_RUN_ID     Alternative to --testrail-run
+
+TestRail credentials are read from the environment and there is deliberately no
+flag for them: anything in argv shows up in the CI log, in \`ps\` on a shared
+build host, and in the shell history of whoever ran it once by hand.
+
 Exit code is nonzero when any test failed or a quality gate blocked, so your
-build goes red without any extra scripting.`;
+build goes red without any extra scripting. Exit 2 means the run itself passed
+but a reporter could not publish — a step that never delivered its results is
+not a green step.`;
 
 /*
  * `backup` and `runner` live in their own modules because each is substantial,
@@ -300,6 +423,11 @@ async function main(): Promise<number> {
 main()
   .then((code) => exit(code))
   .catch((err) => {
-    stderr.write(`${err instanceof CliError ? err.message : `Unexpected error: ${err}`}\n`);
+    // A ReportError from ./report.js is already a printable sentence, exactly
+    // like a CliError. It is matched by name rather than by class so this file
+    // does not have to import the reporting module eagerly to catch it.
+    const printable =
+      err instanceof CliError || (err instanceof Error && err.name === 'ReportError');
+    stderr.write(`${printable ? err.message : `Unexpected error: ${err}`}\n`);
     exit(2);
   });
