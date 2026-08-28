@@ -22,6 +22,7 @@ import { describe, expect, it } from 'vitest';
 import {
   DETECTABLE_RUNNERS,
   detectProject,
+  needsContent,
   type RepoFile,
   type RunnerCandidate,
 } from './detect';
@@ -799,5 +800,48 @@ describe('the ecosystem catalogue is the only runner vocabulary', () => {
 
   it('has no two records claiming the same id', () => {
     expect(new Set(all.map((e) => e.id)).size).toBe(all.length);
+  });
+});
+
+describe('needsContent — which files the funnel loads as text', () => {
+  /*
+   * This decides what the browser reads out of a whole repository, so it is a
+   * budget as much as a rule. It grew a route-table clause because the analyser
+   * stopped inferring routes from paths in code-declared routers: without the
+   * table the honest answer became "no routes", which for a React Router app is
+   * an empty plan — the whole product.
+   */
+  it('reads manifests', () => {
+    for (const path of ['package.json', 'apps/web/package.json', 'pyproject.toml', 'Gemfile']) {
+      expect(needsContent(path)).toBe(true);
+    }
+  });
+
+  it('reads a route table wherever it lives', () => {
+    for (const path of [
+      'src/App.tsx',
+      'src/main.tsx',
+      'src/routes/crmRoutes.tsx',
+      'src/router.ts',
+      'src/router/index.tsx',
+      'app/routes.tsx',
+    ]) {
+      expect(needsContent(path), path).toBe(true);
+    }
+  });
+
+  it('does not read the rest of the repository', () => {
+    // Every one of these would be a file loaded into the tab as text, over a
+    // tree with twenty thousand of them.
+    for (const path of [
+      'src/index.ts',
+      'src/components/button/index.ts',
+      'src/components/Table.tsx',
+      'src/pages/admin/analytics/ChurnTab.tsx',
+      'src/lib/format.ts',
+      'README.md',
+    ]) {
+      expect(needsContent(path), path).toBe(false);
+    }
   });
 });

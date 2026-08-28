@@ -602,3 +602,663 @@ describe('alongside detectProject', () => {
     expect(Object.keys(analysis)).not.toContain('candidates');
   });
 });
+
+// ─── Fixture 6: a React Router SPA ───────────────────────────────────────────
+
+/**
+ * Modelled on a real 1245-file React Router application, down to the file names.
+ *
+ * Its `src/pages/` tree is a naming convention and nothing more: eight of the
+ * files below are the tab components of ONE analytics page, and
+ * `/admin/analytics/ChurnTab` is a URL that has never existed. The route table
+ * is in App.tsx, where it is nested three deep, and reading it is the only way
+ * to learn that the members area lives under `/portal/:gymId/member`.
+ */
+const REACT_ROUTER_SPA: RepoFile[] = [
+  f(
+    'package.json',
+    JSON.stringify({
+      name: 'gym',
+      dependencies: { react: '^18.3.1', 'react-router-dom': '^6.26.2' },
+      devDependencies: { vite: '^5.4.0', cypress: '^13.0.0' },
+    }),
+  ),
+  f('vite.config.ts', 'export default {};'),
+  // The components. Every one of these was reported as a page route before.
+  f('src/pages/LandingPage.tsx', 'export default function LandingPage() { return null; }'),
+  f('src/pages/NotFound.tsx', 'export default function NotFound() { return null; }'),
+  f('src/pages/admin/AdminProfile.tsx', 'export default function AdminProfile() { return null; }'),
+  f('src/pages/admin/analytics/AnalyticsPage.tsx', 'export default function A() { return null; }'),
+  f('src/pages/admin/analytics/ChurnTab.tsx', 'export default function ChurnTab() { return null; }'),
+  f('src/pages/admin/analytics/FeedbackTab.tsx', 'export default function F() { return null; }'),
+  f('src/pages/admin/analytics/RevenueTab.tsx', 'export default function R() { return null; }'),
+  f('src/pages/superadmin/dashboard/DashboardPage.tsx', 'export default function D(){ return null; }'),
+  f('src/pages/members/MemberBookings.tsx', 'export default function MB() { return null; }'),
+  // The route table.
+  f(
+    'src/App.tsx',
+    `import { Routes, Route } from "react-router-dom";
+
+     /* Two identical <Route path="pricing"> declarations used to exist here;
+        React Router took the first and the second was dead. */
+     export default function App() {
+       return (
+         <Routes>
+           <Route path="/" element={<RootRedirect />} />
+           <Route path="/pricing" element={<PricingRoute />} />
+           <Route path="auth" element={<AuthLayout />}>
+             <Route path="login" element={<Login />} />
+             <Route path="accept-invite/:token" element={<AcceptInvite />} />
+           </Route>
+           <Route
+             path="superadmin/*"
+             element={
+               <RequireRoles roles={["superadmin"]}>
+                 <SuperAdminLayout />
+               </RequireRoles>
+             }
+           >
+             <Route path="dashboard" element={<SADashboard />} />
+             <Route path="gyms/:gymId" element={<SAGymLayout />}>
+               <Route index element={<SAGymOverview />} />
+               <Route path="features" element={<SAGymFeatures />} />
+             </Route>
+           </Route>
+           <Route path="portal/:gymId/member" element={<MemberLayout />}>
+             <Route path="bookings" element={<MemberBookings />} />
+           </Route>
+           <Route path="crm/*" element={<CrmRoutes />} />
+           <Route path="*" element={<NotFound />} />
+         </Routes>
+       );
+     }`,
+  ),
+  // A descendant route table: mounted by whoever renders <CrmRoutes />, and
+  // nothing in this file says where that is.
+  f(
+    'src/routes/crmRoutes.tsx',
+    `import { Routes, Route, Navigate } from "react-router-dom";
+     export default function CrmRoutes() {
+       return (
+         <Routes>
+           <Route index element={<CrmDashboard />} />
+           <Route path="contacts" element={<ContactsPage />} />
+           <Route path="contacts/:contactId" element={<ContactDetailPage />} />
+           <Route path="*" element={<Navigate to="../.." replace />} />
+         </Routes>
+       );
+     }`,
+  ),
+  // Nav links. `path:` in an options bag is not a route declaration, and the
+  // file imports react-router only because it renders <Link>.
+  f(
+    'src/components/site/SiteNavbar.tsx',
+    `import { Link } from "react-router-dom";
+     const LINKS = [
+       { path: "/terms", label: "Terms" },
+       { path: "/support", label: "Support" },
+       { path: "/help-me-i-am-not-a-route", label: "Help" },
+     ];
+     export const SiteNavbar = () => LINKS.map((l) => <Link to={l.path}>{l.label}</Link>);`,
+  ),
+];
+
+describe('a React Router application', () => {
+  const analysis = analyseCodebase(REACT_ROUTER_SPA);
+
+  it('does not turn a component in src/pages/ into a page route', () => {
+    // The bug this fixture exists for: eight tab components read as eight URLs.
+    for (const invented of [
+      '/admin/analytics/ChurnTab',
+      '/admin/analytics/FeedbackTab',
+      '/admin/analytics/RevenueTab',
+      '/admin/analytics/AnalyticsPage',
+      '/admin/AdminProfile',
+      '/superadmin/dashboard/DashboardPage',
+      '/LandingPage',
+      '/NotFound',
+    ]) {
+      expect(routes(analysis)).not.toContain(invented);
+    }
+    expect(analysis.routes.every((r) => r.detector !== 'pages-directory')).toBe(true);
+  });
+
+  it('says WHY the pages/ tree was not read, rather than silently skipping it', () => {
+    const report = detector(analysis, 'pages-directory');
+    expect(report.filesExamined).toBe(9);
+    expect(report.found).toBe(0);
+    expect(report.blocked).toMatch(/React Router/);
+    expect(report.blocked).toMatch(/react-router-dom in dependencies/);
+    expect(report.blocked).toMatch(/component, not a URL/);
+    // And it is in the summary a user reads, not only in the detector table.
+    expect(analysis.notes.some((n) => n.includes('component, not a URL'))).toBe(true);
+  });
+
+  it('reads the route table out of the source, nesting and all', () => {
+    expect(routes(analysis)).toEqual([
+      '/',
+      '/auth',
+      '/auth/accept-invite/:token',
+      '/auth/login',
+      '/crm/*',
+      '/portal/:gymId/member',
+      '/portal/:gymId/member/bookings',
+      '/pricing',
+      '/superadmin',
+      '/superadmin/dashboard',
+      '/superadmin/gyms/:gymId',
+      '/superadmin/gyms/:gymId/features',
+    ]);
+  });
+
+  it('resolves a parent chain instead of reporting a child path on its own', () => {
+    const login = analysis.routes.find((r) => r.route === '/auth/login');
+    expect(login?.evidence).toBe(
+      'src/App.tsx declares <Route path="login"> nested under "/auth"',
+    );
+    // /login is what the old pass reported, and it 404s.
+    expect(routes(analysis)).not.toContain('/login');
+    expect(routes(analysis)).not.toContain('/dashboard');
+    expect(routes(analysis)).not.toContain('/bookings');
+  });
+
+  it('drops a parent’s trailing splat, which exists only so children can match', () => {
+    // Verified against the router itself: matchRoutes(['superadmin/*' > 'dashboard'])
+    // matches the URL /superadmin/dashboard, not /superadmin/*/dashboard.
+    expect(routes(analysis)).toContain('/superadmin/dashboard');
+    expect(routes(analysis)).not.toContain('/superadmin/*/dashboard');
+    expect(routes(analysis)).toContain('/superadmin');
+    // A splat on a LEAF route is left alone: there it names a real prefix.
+    expect(routes(analysis)).toContain('/crm/*');
+  });
+
+  it('reads an index route as the URL its parent sits at', () => {
+    const overview = analysis.routes.find((r) => r.route === '/superadmin/gyms/:gymId');
+    expect(overview).toBeTruthy();
+    expect(overview!.dynamic).toBe(true);
+  });
+
+  it('never claims the catch-all, which matches every URL and names none', () => {
+    expect(routes(analysis)).not.toContain('/*');
+  });
+
+  it('refuses a descendant route table whose mount point it cannot resolve', () => {
+    // crmRoutes.tsx is mounted at /crm by App.tsx, but only an import graph says so.
+    expect(routes(analysis)).not.toContain('/contacts');
+    expect(routes(analysis)).not.toContain('/contacts/:contactId');
+    expect(analysis.routes.every((r) => r.file !== 'src/routes/crmRoutes.tsx')).toBe(true);
+    expect(analysis.notes.some((n) => n.includes('declares only relative paths'))).toBe(true);
+    expect(analysis.notes.some((n) => n.includes('would send every test to a 404'))).toBe(true);
+  });
+
+  it('does not read a nav-link array as a route table', () => {
+    expect(routes(analysis)).not.toContain('/help-me-i-am-not-a-route');
+    expect(analysis.routes.every((r) => !r.file.includes('SiteNavbar'))).toBe(true);
+  });
+
+  it('is not fooled by a <Route> written inside a comment', () => {
+    // A phantom opening tag with no closing partner reparents every declaration
+    // after it, which is how a whole route table silently becomes unresolvable.
+    expect(routes(analysis)).toContain('/pricing');
+    expect(analysis.routes.find((r) => r.route === '/pricing')!.evidence).not.toMatch(/nested/);
+  });
+
+  it('never claims a file path implies a URL in an app whose router is code', () => {
+    for (const route of analysis.routes) {
+      expect(route.evidence).not.toMatch(/path is the URL/);
+      expect(route.evidence).toMatch(/declares/);
+    }
+  });
+
+  it('names React Router as the framework and finds the login surface', () => {
+    expect(analysis.frameworks.map((x) => x.framework)).toContain('React Router');
+    expect(analysis.authSurfaces.map((s) => s.path)).toContain('/auth/login');
+  });
+});
+
+// ─── Fixture 7: a route table built from objects ─────────────────────────────
+
+const DATA_ROUTER: RepoFile[] = [
+  f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.26.0' } })),
+  f('src/pages/Dashboard.tsx', 'export default function Dashboard() { return null; }'),
+  f(
+    'src/router.tsx',
+    `import { createBrowserRouter } from "react-router-dom";
+     export const router = createBrowserRouter([
+       {
+         path: "/",
+         element: <Root />,
+         errorElement: <ErrorPage message="a { brace } and a 'quote'" />,
+         children: [
+           { index: true, element: <Home /> },
+           { path: "orders", element: <Orders />, children: [
+             { path: ":orderId", element: <Order /> },
+           ] },
+           { path: "*", element: <NotFound /> },
+         ],
+       },
+       { path: "/login", element: <Login /> },
+     ]);`,
+  ),
+];
+
+describe('a route table built from objects', () => {
+  const analysis = analyseCodebase(DATA_ROUTER);
+
+  it('follows children: into the nesting', () => {
+    expect(routes(analysis)).toEqual(['/', '/login', '/orders', '/orders/:orderId']);
+  });
+
+  it('is not derailed by braces and quotes inside a sibling property', () => {
+    expect(routes(analysis)).not.toContain('/a { brace } and a ');
+  });
+
+  it('says the nested ones are nested', () => {
+    const order = analysis.routes.find((r) => r.route === '/orders/:orderId');
+    expect(order?.evidence).toMatch(/nested under "\/orders"/);
+    expect(order?.dynamic).toBe(true);
+  });
+});
+
+// ─── Fixture 8: Vue Router ───────────────────────────────────────────────────
+
+const VUE_APP: RepoFile[] = [
+  f('package.json', JSON.stringify({ dependencies: { vue: '^3.4.0', 'vue-router': '^4.4.0' } })),
+  f('src/pages/AboutPanel.vue', '<template><div /></template>'),
+  f(
+    'src/router/index.ts',
+    `import { createRouter, createWebHistory } from 'vue-router';
+     const routes = [
+       { path: '/', component: Home },
+       { path: '/users/:id', component: User, children: [
+         { path: 'profile', component: Profile },
+       ] },
+     ];
+     export default createRouter({ history: createWebHistory(), routes });`,
+  ),
+];
+
+describe('a Vue Router application', () => {
+  const analysis = analyseCodebase(VUE_APP);
+
+  it('resolves child records against their parent record', () => {
+    expect(routes(analysis)).toEqual(['/', '/users/:id', '/users/:id/profile']);
+  });
+
+  it('leaves the pages/ directory alone, because Vue Router is not a file router', () => {
+    expect(routes(analysis)).not.toContain('/AboutPanel');
+    expect(detector(analysis, 'pages-directory').blocked).toMatch(/Vue Router/);
+  });
+});
+
+// ─── The file-convention half must stay confident ────────────────────────────
+
+describe('an application whose router IS the filesystem', () => {
+  it('keeps reading Next.js pages/ paths as URLs, and names what makes that true', () => {
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { next: '^14.2.0' } })),
+      f('pages/index.tsx', 'export default function Home() { return null; }'),
+      f('pages/orders/[id].tsx', 'export default function Order() { return null; }'),
+      f('pages/_app.tsx', 'export default function App({ Component }) { return <Component />; }'),
+      f('pages/api/orders.ts', "export default function h(req, res) { if (req.method === 'POST') {} }"),
+    ]);
+    expect(routes(analysis)).toEqual(['/', '/orders/:id']);
+    expect(analysis.routes[0]!.evidence).toMatch(/Next\.js \(next in dependencies/);
+    expect(detector(analysis, 'pages-directory').blocked).toBeNull();
+    expect(endpoints(analysis)).toEqual(['POST /api/orders']);
+  });
+
+  it('reads pages/ on the layout convention alone when no framework is named', () => {
+    // A paths-only upload with no manifest body. The convention is all there is,
+    // and nothing contradicts it, so it is still read.
+    const analysis = analyseCodebase([f('pages/index.vue'), f('pages/_id.vue')]);
+    expect(routes(analysis)).toEqual(['/', '/:id']);
+    expect(detector(analysis, 'pages-directory').blocked).toBeNull();
+  });
+
+  it('still trusts Next when its own specials are the only evidence', () => {
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.0.0' } })),
+      f('web/pages/_document.tsx'),
+      f('web/pages/settings.tsx'),
+    ]);
+    expect(routes(analysis)).toContain('/settings');
+    expect(analysis.routes[0]!.evidence).toMatch(/only the Pages Router looks for/);
+  });
+
+  it('will not read an app/ tree as Next when the router is declared in code', () => {
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.0.0' } })),
+      f('src/app/dashboard/page.tsx', 'export default function Page() { return null; }'),
+    ]);
+    expect(analysis.routes).toEqual([]);
+    expect(detector(analysis, 'next-app-router').filesExamined).toBe(1);
+    expect(detector(analysis, 'next-app-router').blocked).toMatch(/React Router/);
+  });
+});
+
+// ─── Bounds on the new scanners ──────────────────────────────────────────────
+
+describe('the route-table scanners under stress', () => {
+  it('terminates on a file of unbalanced route syntax', () => {
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.0.0' } })),
+      f(
+        'src/Broken.tsx',
+        `import { Routes, Route } from "react-router-dom";
+         <Routes><Route path="/a" element={<X` + '{'.repeat(500),
+      ),
+      f(
+        'src/Broken2.tsx',
+        `import { createBrowserRouter } from "react-router-dom";
+         createBrowserRouter([{ path: "/b", children: [` + '{ path: "/c", children: ['.repeat(200),
+      ),
+    ]);
+    expect(analysis.detectors).toHaveLength(SOURCE_DETECTORS.length);
+    expect(analysis.routes.length).toBeLessThan(50);
+  });
+
+  it('bounds one file’s declarations rather than reading all of them', () => {
+    const table = Array.from({ length: 4000 }, (_, i) => `<Route path="/p${i}" />`).join('\n');
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.0.0' } })),
+      f('src/Many.tsx', `import { Routes } from "react-router-dom";\n<Routes>${table}</Routes>`),
+    ]);
+    expect(analysis.routes.length).toBe(2000);
+  });
+});
+
+// ─── Fixture 9: the monorepo, which is what a customer actually uploads ──────
+
+/**
+ * Two applications in one upload that disagree about their own routing.
+ *
+ * `apps/marketing` is Next.js and its `pages/**` really are URLs.
+ * `apps/console` is React Router and its `src/pages/**` are components with no
+ * URL of their own. A verdict taken once over the whole upload finds `next` in
+ * one workspace and unlocks "the path is the URL" in the other — the original
+ * defect, scoped to `pages/` rather than removed. Both halves are asserted here
+ * because either one alone would pass while the bug is intact: refuse
+ * everything and marketing's routes vanish, claim everything and console's tabs
+ * come back as URLs that 404.
+ */
+const MIXED_MONOREPO: RepoFile[] = [
+  f(
+    'package.json',
+    JSON.stringify({
+      name: 'acme',
+      private: true,
+      workspaces: ['apps/*'],
+      devDependencies: { turbo: '^2.3.0' },
+    }),
+  ),
+
+  f(
+    'apps/marketing/package.json',
+    JSON.stringify({
+      name: '@acme/marketing',
+      dependencies: { next: '^15.0.0', react: '^19.0.0' },
+    }),
+  ),
+  f('apps/marketing/next.config.mjs', 'export default {};'),
+  f('apps/marketing/pages/index.tsx', 'export default function Home() { return null; }'),
+  f('apps/marketing/pages/pricing.tsx', 'export default function Pricing() { return null; }'),
+  f('apps/marketing/pages/blog/[slug].tsx', 'export default function Post() { return null; }'),
+  f(
+    'apps/marketing/pages/api/lead.ts',
+    "export default function h(req, res) { if (req.method === 'POST') {} }",
+  ),
+
+  f(
+    'apps/console/package.json',
+    JSON.stringify({
+      name: '@acme/console',
+      dependencies: { 'react-router-dom': '^6.26.0', react: '^19.0.0' },
+    }),
+  ),
+  f('apps/console/src/pages/Dashboard.tsx', 'export default function Dashboard() { return null; }'),
+  f('apps/console/src/pages/billing/InvoicesTab.tsx', 'export const InvoicesTab = () => null;'),
+  f('apps/console/src/pages/billing/PlanTab.tsx', 'export const PlanTab = () => null;'),
+  f(
+    'apps/console/src/routes.tsx',
+    `import { Routes, Route } from "react-router-dom";
+     export const ConsoleRoutes = () => (
+       <Routes>
+         <Route path="/console" element={<Dashboard />} />
+         <Route path="/console/billing" element={<Billing />} />
+       </Routes>
+     );`,
+  ),
+];
+
+describe('a monorepo whose packages route differently', () => {
+  const analysis = analyseCodebase(MIXED_MONOREPO);
+
+  it('reads the Next workspace’s pages/ tree as URLs', () => {
+    expect(routes(analysis)).toContain('/');
+    expect(routes(analysis)).toContain('/pricing');
+    expect(routes(analysis)).toContain('/blog/:slug');
+    expect(endpoints(analysis)).toContain('POST /api/lead');
+    const pricing = analysis.routes.find((r) => r.route === '/pricing')!;
+    expect(pricing.detector).toBe('pages-directory');
+    // The evidence cites apps/marketing's OWN Next signal, not a sibling's.
+    expect(pricing.evidence).toMatch(
+      /Next\.js \(found apps\/marketing\/next\.config\.mjs\).*path under pages\/ is the URL/,
+    );
+  });
+
+  it('does NOT read the React Router workspace’s pages/ tree as URLs', () => {
+    for (const invented of ['/Dashboard', '/billing/InvoicesTab', '/billing/PlanTab']) {
+      expect(routes(analysis)).not.toContain(invented);
+    }
+    // And the routes it does have there came from the table, not the tree.
+    expect(routes(analysis)).toContain('/console');
+    expect(routes(analysis)).toContain('/console/billing');
+    expect(analysis.routes.find((r) => r.route === '/console')!.detector).toBe('react-router');
+  });
+
+  it('refuses per package, and says which package it is refusing for', () => {
+    const report = detector(analysis, 'pages-directory');
+    // Four files claimed in apps/marketing (three pages and one api handler),
+    // three refused in apps/console.
+    expect(report.filesExamined).toBe(7);
+    expect(report.found).toBe(4);
+    expect(report.blocked).toMatch(/^3 files sit under a pages\/ directory, but apps\/console declares/);
+    expect(report.blocked).toMatch(/react-router-dom in dependencies \(apps\/console\/package\.json\)/);
+    expect(report.blocked).toMatch(/a file in apps\/console's pages\/ tree is a component, not a URL/);
+    // The refusal must not speak for the repository, and must not name the
+    // neighbour that is the reason the old global verdict got this wrong.
+    expect(report.blocked).not.toMatch(/this repo declares/);
+    expect(report.blocked).not.toMatch(/Next\.js/);
+    expect(report.blocked).not.toMatch(/apps\/marketing/);
+  });
+
+  it('puts the per-package refusal in the summary even though other packages did yield routes', () => {
+    // The old condition waited for the detector's total to be zero, which in a
+    // monorepo is exactly when the mixed answer is most worth reading.
+    expect(analysis.notes.some((n) => n.includes("apps/console's pages/ tree"))).toBe(true);
+  });
+
+  it('never lets one workspace’s dependency answer for another', () => {
+    for (const route of analysis.routes) {
+      const fromMarketing = route.file.startsWith('apps/marketing/');
+      if (route.detector === 'pages-directory') expect(fromMarketing).toBe(true);
+      if (fromMarketing) expect(route.evidence).not.toMatch(/React Router/);
+      else expect(route.evidence).not.toMatch(/Next\.js/);
+    }
+  });
+});
+
+describe('the sentence a refusal ends on', () => {
+  it('names a detector id that exists, so the reader can go and read it', () => {
+    const analysis = analyseCodebase(MIXED_MONOREPO);
+    const blocked = detector(analysis, 'pages-directory').blocked!;
+    const named = /see the (\S+) detector/.exec(blocked)?.[1];
+    expect(named).toBe('react-router');
+    expect(SOURCE_DETECTORS as readonly string[]).toContain(named);
+    // The old sentence said "see the React Router detector" — a label, not an id.
+    expect(blocked).not.toMatch(/see the React Router detector/);
+  });
+
+  it('does not promise a reading for a router this pass cannot read', () => {
+    const analysis = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { '@tanstack/react-router': '^1.0.0' } })),
+      f('src/pages/Dashboard.tsx', 'export default function Dashboard() { return null; }'),
+    ]);
+    expect(analysis.routes).toEqual([]);
+    const blocked = detector(analysis, 'pages-directory').blocked!;
+    expect(blocked).toMatch(/TanStack Router/);
+    expect(blocked).toMatch(/no detector for TanStack Router, so its route table was not read/);
+    expect(blocked).not.toMatch(/see the .* detector/);
+  });
+
+  it('every detector a refusal points at is one this module publishes', () => {
+    for (const fixture of [MIXED_MONOREPO, REACT_ROUTER_SPA, VUE_APP]) {
+      for (const report of analyseCodebase(fixture).detectors) {
+        for (const m of (report.blocked ?? '').matchAll(/see the (\S+) detector/g)) {
+          expect(SOURCE_DETECTORS as readonly string[]).toContain(m[1]);
+        }
+      }
+    }
+  });
+});
+
+// ─── The auth vocabulary, on names a real application actually uses ──────────
+
+describe('what a path has to say before it is called a session surface', () => {
+  const GYM_SPA: RepoFile[] = [
+    f('package.json', JSON.stringify({ dependencies: { 'react-router-dom': '^6.26.0' } })),
+    f(
+      'src/routes.tsx',
+      `import { Routes, Route } from "react-router-dom";
+       export const AppRoutes = () => (
+         <Routes>
+           <Route path="/portal/:gymId/member/training-sessions" element={<TrainingSessions />} />
+           <Route path="/portal/:gymId/member/session-notes" element={<SessionNotes />} />
+           <Route path="/portal/:gymId/staff/refresh-schedule" element={<RefreshSchedule />} />
+           <Route path="/portal/:gymId/trainer/SessionPlanner" element={<SessionPlanner />} />
+           <Route path="/auth/login" element={<Login />} />
+         </Routes>
+       );`,
+    ),
+  ];
+
+  const analysis = analyseCodebase(GYM_SPA);
+
+  it('does not read a booking screen as an authentication surface', () => {
+    // Each of these matched `session`/`sessions`/`refresh` as a WORD inside a
+    // hyphenated or camel-cased segment, and each produced a critical-path test
+    // titled "a session outlives a reload" against a page about gym classes.
+    const paths = analysis.authSurfaces.map((s) => s.path);
+    expect(paths).not.toContain('/portal/:gymId/member/training-sessions');
+    expect(paths).not.toContain('/portal/:gymId/member/session-notes');
+    expect(paths).not.toContain('/portal/:gymId/staff/refresh-schedule');
+    expect(paths).not.toContain('/portal/:gymId/trainer/SessionPlanner');
+    expect(analysis.authSurfaces.filter((s) => s.kind === 'SESSION')).toEqual([]);
+    // The one real auth surface in the file is still found.
+    expect(analysis.authSurfaces.map((s) => `${s.kind} ${s.path}`)).toEqual(['LOGIN /auth/login']);
+  });
+
+  it('still reads the session exchange the entry exists for', () => {
+    const sessions = analyseCodebase([
+      f('package.json', JSON.stringify({ dependencies: { express: '^4.19.0' } })),
+      f(
+        'src/routes/session.js',
+        `const { Router } = require('express');
+         const router = Router();
+         router.post('/sessions', create);
+         router.delete('/session', destroy);
+         router.post('/auth/refresh', rotate);
+         router.post('/refresh-token', exchange);
+         module.exports = router;`,
+      ),
+    ]);
+    const auth = sessions.authSurfaces.map((s) => `${s.kind} ${s.path}`);
+    expect(auth).toContain('SESSION /sessions');
+    expect(auth).toContain('SESSION /session');
+    expect(auth).toContain('SESSION /auth/refresh');
+    expect(auth).toContain('SESSION /refresh-token');
+  });
+});
+
+describe('the evidence on a surface identified by its filename', () => {
+  it('describes the filename, not the path the surface sits at', () => {
+    const analysis = analyseCodebase(NEXT_APP);
+    const surface = analysis.authSurfaces.find(
+      (s) => s.from === 'form' && s.file === 'components/LoginForm.tsx',
+    )!;
+    // The form posts to /api/auth/session, so the surface's own path names no
+    // sign-in at all. Reusing the vocabulary's "the path names a sign-in" here
+    // described a path that does not say that.
+    expect(surface.path).toBe('/api/auth/session');
+    expect(surface.kind).toBe('LOGIN');
+    expect(surface.evidence).toMatch(/its filename names a sign-in/);
+    expect(surface.evidence).not.toMatch(/the path names/);
+  });
+
+  it('still says "the path names …" when it really was the path', () => {
+    const analysis = analyseCodebase(EXPRESS_API);
+    const login = analysis.authSurfaces.find((s) => s.path === '/login')!;
+    expect(login.evidence).toMatch(/^POST \/login — the path names a sign-in$/);
+  });
+});
+
+describe('a sibling workspace does not speak for you', () => {
+  /*
+   * The scoping fix ended in a union of the whole upload, which quietly put the
+   * original defect back one level up: a workspace whose own manifest named no
+   * router inherited every OTHER workspace's. A sibling is not an ancestor.
+   */
+  const files: RepoFile[] = [
+    { path: 'package.json', content: '{"name":"root","private":true}' },
+    // Names a code-declared router. Its own pages/ must be refused.
+    {
+      path: 'apps/console/package.json',
+      content: '{"name":"console","dependencies":{"react-router-dom":"^6.0.0"}}',
+    },
+    { path: 'apps/console/src/pages/Dashboard.tsx', content: 'export default () => null;' },
+    // Names NOTHING. It must not inherit console's verdict in either direction.
+    { path: 'apps/legacy/package.json', content: '{"name":"legacy","dependencies":{"lodash":"^4"}}' },
+    { path: 'apps/legacy/pages/reports.tsx', content: 'export default () => null;' },
+  ];
+
+  it('refuses the workspace that declares its routes in code', () => {
+    const routes = analyseCodebase(files).routes.map((r) => r.route);
+    expect(routes).not.toContain('/Dashboard');
+  });
+
+  it('does not let that refusal reach a workspace which named no router', () => {
+    // `apps/legacy` said nothing, so nothing is known about it — and "unknown"
+    // is the permissive answer, the same one a paths-only upload gets. What it
+    // must NOT be is an answer borrowed from the workspace next door.
+    const analysis = analyseCodebase(files);
+    expect(analysis.routes.map((r) => r.route)).toContain('/reports');
+  });
+
+  it('names the workspace it refused, never the repo', () => {
+    const report = analyseCodebase(files).detectors.find((d) => d.id === 'pages-directory');
+    expect(report?.blocked ?? '').toContain('apps/console');
+    expect(report?.blocked ?? '').not.toContain('this repo declares');
+  });
+});
+
+describe('token is only a session token in the right company', () => {
+  const surfacesFor = (route: string) =>
+    analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"next":"^14"}}' },
+      { path: `pages${route}.tsx`, content: 'export default () => null;' },
+    ]).authSurfaces;
+
+  it.each(['/notifications/push-token', '/devices/device-token', '/messaging/fcm-token'])(
+    '%s is not an authentication surface',
+    (route) => {
+      // Each of these would have produced a test titled "a session outlives a
+      // reload" pointed at a notification endpoint.
+      expect(surfacesFor(route)).toHaveLength(0);
+    },
+  );
+
+  it.each(['/auth/refresh-token', '/auth/access-token'])('%s still is', (route) => {
+    expect(surfacesFor(route).map((s) => s.kind)).toContain('SESSION');
+  });
+});

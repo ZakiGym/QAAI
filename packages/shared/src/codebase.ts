@@ -225,10 +225,16 @@ export interface AuthSurface {
 /**
  * One detector's own account of itself.
  *
- * Read it as a three-way answer to "did you look?":
+ * Read it as a four-way answer to "did you look?":
  *   filesExamined === 0            nothing in the repo was its kind of file
  *   filesExamined > 0, found === 0 it read them and they declared nothing
- *   blocked !== null               it found its files and was given no contents
+ *   blocked !== null               it found its files and could not turn them
+ *                                  into facts. Two ways that happens: the
+ *                                  bodies were never uploaded, or the files do
+ *                                  not mean what their layout suggests — a
+ *                                  `pages/` tree in an app whose routes are
+ *                                  declared in code is a folder of components,
+ *                                  not a routing table.
  */
 export interface DetectorReport {
   id: SourceDetectorId;
@@ -408,6 +414,7 @@ class Ledger {
   private readonly examined = new Map<SourceDetectorId, number>();
   private readonly found = new Map<SourceDetectorId, number>();
   private readonly blocked = new Map<SourceDetectorId, number>();
+  private readonly refusals = new Map<SourceDetectorId, string>();
 
   examine(id: SourceDetectorId, n = 1): void {
     this.examined.set(id, (this.examined.get(id) ?? 0) + n);
@@ -422,9 +429,32 @@ class Ledger {
     this.blocked.set(id, (this.blocked.get(id) ?? 0) + 1);
   }
 
+  /**
+   * This detector found its files, read them, and deliberately claimed nothing.
+   * Distinct from `starve`, and the distinction is the point: nothing is missing
+   * from the upload, the files simply do not mean what the detector would
+   * otherwise take them to mean. Saying so is a finding; an empty list is not.
+   */
+  refuse(id: SourceDetectorId, reason: string): void {
+    this.refusals.set(id, reason);
+  }
+
+  /**
+   * The refusal itself, for the summary a user reads.
+   *
+   * Separate from `report()` because a refusal is a finding on its own terms: in
+   * a monorepo one package can refuse while another yields routes, so waiting
+   * for the detector's total to be zero would hide the sentence exactly where
+   * the mixed answer makes it most worth reading.
+   */
+  refusalFor(id: SourceDetectorId): string | null {
+    return this.refusals.get(id) ?? null;
+  }
+
   report(): DetectorReport[] {
     return SOURCE_DETECTORS.map((id) => {
       const starved = this.blocked.get(id) ?? 0;
+      const refusal = this.refusals.get(id) ?? null;
       return {
         id,
         label: DETECTOR_META[id].label,
@@ -432,12 +462,347 @@ class Ledger {
         filesExamined: this.examined.get(id) ?? 0,
         found: this.found.get(id) ?? 0,
         blocked:
-          starved > 0
+          refusal ??
+          (starved > 0
             ? `${starved} matching file${starved === 1 ? '' : 's'} had no content in the upload, so ${starved === 1 ? 'it' : 'they'} could not be read`
-            : null,
+            : null),
       };
     });
   }
+}
+
+// ─── Is the filesystem this app's routing table? ─────────────────────────────
+
+/**
+ * The single most expensive mistake this file can make.
+ *
+ * In Next.js, Nuxt and Astro the filesystem *is* the router: `pages/orders.tsx`
+ * is reachable at `/orders` because the framework says so, and reading the route
+ * off the path is exact. In React Router, TanStack Router and Vue Router it is
+ * not: routes are declared in code, and `src/pages/` is a folder people name by
+ * convention and fill however they like. A React Router repo's
+ * `src/pages/admin/analytics/ChurnTab.tsx` is a tab component rendered inside
+ * one analytics page — there is no `/admin/analytics/ChurnTab` to visit, and a
+ * generated test that tries will 404 on a URL the application never had.
+ *
+ * So before any path is read as a URL, the upload is asked which kind of app
+ * this is. The answer has three states and only one of them is a refusal, so
+ * this cannot quietly turn into "find nothing, ever":
+ *
+ *   confirmed    a file-convention framework is named outright — its config
+ *                file, or its package on the manifest. Read paths as URLs, and
+ *                say which framework makes that true.
+ *   contradicted no such framework is named AND a code-declared router is.
+ *                The `pages/` tree is a naming convention here. Claim nothing,
+ *                and say why in the detector's own report.
+ *   unknown      neither is named — typically a paths-only upload with no
+ *                manifest body. The layout convention is all there is, so it is
+ *                still read, and `notes` says the claim rests on it.
+ *
+ * And the answer is asked PER PACKAGE, not per upload. What a customer uploads
+ * is a monorepo: `apps/web` is Next.js, `apps/admin` is React Router, and both
+ * have a `pages/` tree. A verdict taken once over every file in the upload would
+ * find `next` somewhere and unlock "the path is the URL" for `pages/**` in every
+ * workspace beside it — which is the original defect, scoped down but not gone.
+ * So signals are filed under the directory of the `package.json` that owns them,
+ * and a file is judged by its NEAREST such ancestor: `apps/admin/src/pages/Foo`
+ * answers to `apps/admin/package.json`, never to `apps/web`'s three directories
+ * away. Falling back, in order, to the root manifest and then to whatever the
+ * upload named anywhere — because a file under no manifest at all is still
+ * better served by the repository's one answer than by none.
+ */
+interface RouterSignal {
+  name: string;
+  evidence: string;
+  /**
+   * The detector that DOES read this router's table, when there is one. Named so
+   * a refusal can point the reader at a report that exists: the refusal used to
+   * end "see the React Router detector", and no id in `SOURCE_DETECTORS` is
+   * called that, so it pointed at nothing. Undefined for routers this pass
+   * cannot read at all, and the refusal then says that instead of implying a
+   * detector picked the work up.
+   */
+  detector?: SourceDetectorId;
+}
+
+interface RoutingVerdict {
+  /** Frameworks whose router is the filesystem, each with the trees it owns. */
+  fileConvention: Array<RouterSignal & { trees: string[] }>;
+  /** Routers whose table is a literal in the source. */
+  codeDeclared: RouterSignal[];
+}
+
+/** Package names that mean "the filesystem is the router", by the tree they own. */
+const FILE_CONVENTION_DEPS: Array<{ dep: RegExp; name: string; trees: string[] }> = [
+  { dep: /^next$/, name: 'Next.js', trees: ['app', 'pages'] },
+  { dep: /^nuxt(3|-edge)?$/, name: 'Nuxt', trees: ['pages'] },
+  { dep: /^astro$/, name: 'Astro', trees: ['pages'] },
+  { dep: /^@sveltejs\/kit$/, name: 'SvelteKit', trees: [] },
+  { dep: /^@remix-run\/(react|dev|node|serve)$/, name: 'Remix', trees: ['app'] },
+];
+
+/**
+ * Package names that mean "the route table is written in code, not in the tree".
+ *
+ * `detector` is the id of the pass that reads that table, where one exists. Only
+ * two of these six are read today, and the refusal sentence has to be able to
+ * tell the reader which case they are in — "its table was read instead" is a
+ * promise, and it is false for the four with no detector.
+ */
+const CODE_DECLARED_DEPS: Array<{ dep: RegExp; name: string; detector?: SourceDetectorId }> = [
+  { dep: /^react-router(-dom|-native)?$/, name: 'React Router', detector: 'react-router' },
+  { dep: /^vue-router$/, name: 'Vue Router', detector: 'vue-router' },
+  { dep: /^@tanstack\/(react-)?router$/, name: 'TanStack Router' },
+  { dep: /^@angular\/router$/, name: 'Angular Router' },
+  { dep: /^wouter$/, name: 'Wouter' },
+  { dep: /^@reach\/router$/, name: 'Reach Router' },
+];
+
+/** Config files that name a file-convention framework without needing a manifest body. */
+const FILE_CONVENTION_CONFIG: Array<{ file: RegExp; name: string; trees: string[] }> = [
+  { file: /^next\.config\.[cm]?[jt]s$/, name: 'Next.js', trees: ['app', 'pages'] },
+  { file: /^nuxt\.config\.[cm]?[jt]s$/, name: 'Nuxt', trees: ['pages'] },
+  { file: /^astro\.config\.[cm]?[jt]s$/, name: 'Astro', trees: ['pages'] },
+];
+
+/** The directory part of a repo-relative path; '' for a file at the root. */
+function dirname(path: string): string {
+  const i = path.lastIndexOf('/');
+  return i === -1 ? '' : path.slice(0, i);
+}
+
+/**
+ * What a file-convention detector is allowed to claim about ONE file, and the
+ * sentence it owes the user either way.
+ */
+interface TreeGate {
+  claim: boolean;
+  /** Names the framework that makes "the path is the URL" true, when one is named. */
+  because: string | null;
+  /** Why nothing was claimed, for the detector report. Null when it claimed. */
+  refusal: string | null;
+}
+
+/**
+ * The verdict, resolved per file rather than per upload.
+ *
+ * `gateFor(path, tree)` is the whole interface: hand it the file about to be
+ * read as a URL and it answers for the package that file belongs to.
+ */
+interface RoutingGates {
+  gateFor(path: string, tree: 'app' | 'pages'): TreeGate;
+}
+
+function routingVerdict(files: AnalysedFile[]): RoutingGates {
+  // Pass one: every directory holding a manifest. A workspace is a package.json
+  // and the subtree under it, and that subtree is the unit the routing question
+  // has a single answer for. The repo root is always a bucket, so a file under
+  // no manifest at all still has somewhere to fall back to.
+  const owners = new Set<string>(['']);
+  for (const file of files) {
+    if (basename(file.path) === 'package.json') owners.add(dirname(file.path));
+  }
+
+  const ownerCache = new Map<string, string>();
+  /** The nearest ancestor directory that owns a manifest. '' when none does. */
+  const ownerOf = (path: string): string => {
+    let dir = dirname(path);
+    const cached = ownerCache.get(dir);
+    if (cached !== undefined) return cached;
+    const start = dir;
+    for (;;) {
+      if (owners.has(dir)) break;
+      if (dir === '') break;
+      dir = dirname(dir);
+    }
+    ownerCache.set(start, dir);
+    return dir;
+  };
+
+  const byOwner = new Map<string, RoutingVerdict>();
+  // Deduped per owner, not globally: two workspaces both depending on Next each
+  // deserve their own signal, because each will be quoted in its own evidence.
+  const seen = new Set<string>();
+  const verdictFor = (owner: string): RoutingVerdict => {
+    let verdict = byOwner.get(owner);
+    if (!verdict) {
+      verdict = { fileConvention: [], codeDeclared: [] };
+      byOwner.set(owner, verdict);
+    }
+    return verdict;
+  };
+
+  const addFileConvention = (
+    owner: string,
+    name: string,
+    evidence: string,
+    trees: string[],
+  ): void => {
+    const key = `${owner}\u0000fs:${name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    verdictFor(owner).fileConvention.push({ name, evidence, trees });
+  };
+
+  const addCodeDeclared = (
+    owner: string,
+    name: string,
+    evidence: string,
+    detector: SourceDetectorId | undefined,
+  ): void => {
+    const key = `${owner}\u0000code:${name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    verdictFor(owner).codeDeclared.push({ name, evidence, detector });
+  };
+
+  for (const file of files) {
+    const base = basename(file.path);
+
+    for (const entry of FILE_CONVENTION_CONFIG) {
+      if (!entry.file.test(base)) continue;
+      addFileConvention(ownerOf(file.path), entry.name, `found ${file.path}`, entry.trees);
+    }
+
+    // Next's own specials are proof of Next even with no manifest in the upload:
+    // nothing but the Pages Router looks for a file called `pages/_app.tsx`.
+    if (/(?:^|\/)(?:src\/)?pages\/_(app|document)\.[cm]?[jt]sx?$/.test(file.path)) {
+      addFileConvention(
+        ownerOf(file.path),
+        'Next.js',
+        `found ${file.path}, which only the Pages Router looks for`,
+        ['app', 'pages'],
+      );
+    }
+
+    if (base !== 'package.json' || file.content === undefined) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(file.content);
+    } catch {
+      continue; // An unparseable manifest is reported by the caller, not here.
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    const pkg = parsed as Record<string, unknown>;
+    // A manifest speaks for its own directory, never for a sibling workspace.
+    const owner = dirname(file.path);
+    for (const section of ['dependencies', 'devDependencies']) {
+      const deps = pkg[section];
+      if (!deps || typeof deps !== 'object') continue;
+      for (const name of Object.keys(deps)) {
+        const lower = name.toLowerCase();
+        const fs = FILE_CONVENTION_DEPS.find((entry) => entry.dep.test(lower));
+        if (fs) {
+          addFileConvention(owner, fs.name, `${name} in ${section} (${file.path})`, fs.trees);
+        }
+        const code = CODE_DECLARED_DEPS.find((entry) => entry.dep.test(lower));
+        if (code) {
+          addCodeDeclared(owner, code.name, `${name} in ${section} (${file.path})`, code.detector);
+        }
+      }
+    }
+  }
+
+  /**
+   * No opinion. Reached when neither the file's own workspace nor any ancestor
+   * named a router, and it means UNKNOWN — which the gate reads as "claim", the
+   * permissive answer a paths-only upload needs.
+   */
+  const silent: RoutingVerdict = { fileConvention: [], codeDeclared: [] };
+
+  const answers = (verdict: RoutingVerdict): boolean =>
+    verdict.fileConvention.length > 0 || verdict.codeDeclared.length > 0;
+
+  /**
+   * The nearest ancestor manifest with an opinion, then the root's, then none.
+   *
+   * There is deliberately NO union-of-the-whole-upload at the end of this
+   * chain. That fallback existed and it quietly reintroduced the defect this
+   * scoping was built to remove: a workspace whose own manifest named no router
+   * inherited every SIBLING's, so `apps/legacy` was judged by whatever
+   * `apps/console` happened to depend on. A sibling is not an ancestor and does
+   * not speak for you — two workspaces in one repo are exactly the case where
+   * "somewhere in this upload" is the wrong question.
+   *
+   * Ancestors still speak, because they genuinely do: a root manifest declaring
+   * Next for the whole repo is a fact about every directory under it.
+   */
+  const resolve = (path: string): { verdict: RoutingVerdict; owner: string } => {
+    let dir = ownerOf(path);
+    for (;;) {
+      const verdict = byOwner.get(dir);
+      if (verdict && answers(verdict)) return { verdict, owner: dir };
+      if (dir === '') break;
+      // `ownerOf` starts from the DIRNAME of what it is given, so this always
+      // moves strictly up and the walk terminates at the root.
+      dir = ownerOf(dir);
+    }
+    const root = byOwner.get('');
+    if (root && answers(root)) return { verdict: root, owner: '' };
+    return { verdict: silent, owner: ownerOf(path) };
+  };
+
+  const gateCache = new Map<string, TreeGate>();
+  return {
+    gateFor(path: string, tree: 'app' | 'pages'): TreeGate {
+      const key = `${ownerOf(path)}\u0000${tree}`;
+      const cached = gateCache.get(key);
+      if (cached) return cached;
+      const { verdict, owner } = resolve(path);
+      const gate = gateForVerdict(verdict, owner, tree);
+      gateCache.set(key, gate);
+      return gate;
+    },
+  };
+}
+
+function gateForVerdict(verdict: RoutingVerdict, owner: string, tree: string): TreeGate {
+  // A framework's answer is scoped to the trees it owns: Remix owns `app/` and
+  // says nothing whatever about `pages/`, so filtering here rather than at build
+  // time is what keeps one framework from answering for another's directory.
+  const fs = verdict.fileConvention.filter((f) => f.trees.includes(tree));
+  const code = verdict.codeDeclared;
+  if (fs.length > 0) {
+    return { claim: true, because: `${fs[0]!.name} (${fs[0]!.evidence})`, refusal: null };
+  }
+  if (code.length > 0) {
+    // Prefer a router this pass can actually read, so the refusal can point at a
+    // report the reader can go and look at. Falls back to the first named.
+    const router = code.find((entry) => entry.detector !== undefined) ?? code[0]!;
+    // Whose routes these are. Naming the repository when it is one workspace of
+    // eight is the same over-claim in prose that the verdict itself just stopped
+    // making in code.
+    const whose = owner === '' ? 'this repo declares' : `${owner} declares`;
+    // Not `${owner}/${tree}/`: the tree may sit under a `src/` the owner path
+    // does not mention, and a literal directory that does not exist would be one
+    // more evidence string a reader cannot check.
+    const where = owner === '' ? `a file under ${tree}/` : `a file in ${owner}'s ${tree}/ tree`;
+    return {
+      claim: false,
+      because: null,
+      refusal:
+        `${whose} its routes in code — ${router.name}, ${router.evidence} — and names no ` +
+        `framework that routes by filename, so ${where} is a component, not a URL. ` +
+        (router.detector
+          ? `Its route table was read from the source instead; see the ${router.detector} detector`
+          : `This pass has no detector for ${router.name}, so its route table was not read either`),
+    };
+  }
+  return { claim: true, because: null, refusal: null };
+}
+
+/**
+ * One sentence per distinct refusal.
+ *
+ * A monorepo answers differently per package, so a detector can refuse in
+ * `apps/admin` and claim in `apps/web` on the same run. Folding those into one
+ * global sentence would name one workspace's router as if it were the whole
+ * repository's — which is the same lie, in prose, that the per-package verdict
+ * exists to stop telling.
+ */
+function refusalSummary(counts: Map<string, number>, lead: (n: number) => string): string | null {
+  if (counts.size === 0) return null;
+  return [...counts.entries()].map(([reason, n]) => `${lead(n)}, but ${reason}`).join('; ');
 }
 
 // ─── File-convention routing ─────────────────────────────────────────────────
@@ -531,7 +896,15 @@ const RAILS_APP_SUBDIRS = new Set([
   'policies',
 ]);
 
-function detectNextAppRouter(files: AnalysedFile[], out: Collector, ledger: Ledger): void {
+function detectNextAppRouter(
+  files: AnalysedFile[],
+  out: Collector,
+  ledger: Ledger,
+  gates: RoutingGates,
+): void {
+  // Keyed by the refusal sentence, because in a monorepo there is one sentence
+  // per package and the report has to carry all of them.
+  const refusals = new Map<string, number>();
   for (const file of files) {
     const match = /(?:^|\/)(?:src\/)?app\/(.+)$/.exec(file.path);
     if (!match) continue;
@@ -545,6 +918,11 @@ function detectNextAppRouter(files: AnalysedFile[], out: Collector, ledger: Ledg
     if (stem !== 'page' && stem !== 'route') continue;
 
     ledger.examine('next-app-router');
+    const gate = gates.gateFor(file.path, 'app');
+    if (!gate.claim) {
+      if (gate.refusal) refusals.set(gate.refusal, (refusals.get(gate.refusal) ?? 0) + 1);
+      continue;
+    }
     const route = joinSegments(parts.map(appSegment));
 
     if (stem === 'page') {
@@ -553,7 +931,9 @@ function detectNextAppRouter(files: AnalysedFile[], out: Collector, ledger: Ledg
           route,
           detector: 'next-app-router',
           file: file.path,
-          evidence: `${file.path} is an App Router page; its directory path is the URL`,
+          evidence: gate.because
+            ? `${file.path} is an App Router page in a ${gate.because} app; its directory path is the URL`
+            : `${file.path} is an App Router page; its directory path is the URL`,
           dynamic: isDynamic(route),
         })
       ) {
@@ -600,6 +980,14 @@ function detectNextAppRouter(files: AnalysedFile[], out: Collector, ledger: Ledg
       }
     }
   }
+
+  const summary = refusalSummary(
+    refusals,
+    (n) =>
+      `${n} file${n === 1 ? '' : 's'} under app/ ${n === 1 ? 'is' : 'are'} named the ` +
+      `way an App Router page is`,
+  );
+  if (summary) ledger.refuse('next-app-router', summary);
 }
 
 /**
@@ -618,7 +1006,13 @@ function pagesSegment(segment: string, vueStyle: boolean): string | null {
   return segment;
 }
 
-function detectPagesDirectory(files: AnalysedFile[], out: Collector, ledger: Ledger): void {
+function detectPagesDirectory(
+  files: AnalysedFile[],
+  out: Collector,
+  ledger: Ledger,
+  gates: RoutingGates,
+): void {
+  const refusals = new Map<string, number>();
   for (const file of files) {
     const match = /(?:^|\/)(?:src\/)?pages\/(.+)$/.exec(file.path);
     if (!match) continue;
@@ -634,6 +1028,11 @@ function detectPagesDirectory(files: AnalysedFile[], out: Collector, ledger: Led
     if (NEXT_PAGES_SPECIALS.has(leaf)) continue;
 
     ledger.examine('pages-directory');
+    const gate = gates.gateFor(file.path, 'pages');
+    if (!gate.claim) {
+      if (gate.refusal) refusals.set(gate.refusal, (refusals.get(gate.refusal) ?? 0) + 1);
+      continue;
+    }
     const vueStyle = file.ext === '.vue';
     if (leaf === 'index') parts.pop();
     const segments = parts.map((s) => pagesSegment(s, vueStyle));
@@ -647,7 +1046,9 @@ function detectPagesDirectory(files: AnalysedFile[], out: Collector, ledger: Led
           route,
           detector: 'pages-directory',
           file: file.path,
-          evidence: `${file.path} sits in a pages/ directory; its path is the URL`,
+          evidence: gate.because
+            ? `${file.path} is a ${gate.because} page; its path under pages/ is the URL`
+            : `${file.path} sits in a pages/ directory; its path is the URL`,
           dynamic: isDynamic(route),
         })
       ) {
@@ -679,6 +1080,12 @@ function detectPagesDirectory(files: AnalysedFile[], out: Collector, ledger: Led
       }
     }
   }
+
+  const summary = refusalSummary(
+    refusals,
+    (n) => `${n} file${n === 1 ? '' : 's'} sit${n === 1 ? 's' : ''} under a pages/ directory`,
+  );
+  if (summary) ledger.refuse('pages-directory', summary);
 }
 
 function svelteSegment(segment: string): string | null {
@@ -774,73 +1181,599 @@ function paramsToColon(path: string): string {
 
 const JS_EXT = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts']);
 
-function detectReactRouter(files: AnalysedFile[], out: Collector, ledger: Ledger): boolean {
-  let sawRelative = false;
+/**
+ * A route table that is written down rather than implied by a filename.
+ *
+ * React Router, TanStack Router and Vue Router all put their routes in a literal
+ * — a `<Route>` tree, or an array of `{ path, children }` objects — which means
+ * the table can be read exactly. The one thing that must not be skipped is the
+ * nesting. `<Route path="login">` inside `<Route path="auth">` serves
+ * `/auth/login`; reported on its own as `/login` it names a URL the application
+ * will 404 on, which is worse than reporting nothing at all.
+ *
+ * What follows is a lexical scan, not a parse: it tracks strings, comments and
+ * brace depth, so a `path` inside `element={<Nav path="x" />}` is never mistaken
+ * for the route's own and a `>` inside an element expression never ends a tag
+ * early. That is enough for a literal route table, which is what all three of
+ * these routers ask you to write.
+ */
+
+/** Cap on route declarations read out of any one file. */
+const MAX_DECLARATIONS_PER_FILE = 2000;
+/** How deep nesting is followed. Real route tables are three or four deep. */
+const MAX_ROUTE_DEPTH = 32;
+
+/** Index past a quoted string or template literal that starts at `i`. */
+function skipQuoted(src: string, i: number): number {
+  const quote = src[i];
+  let j = i + 1;
+  while (j < src.length) {
+    const ch = src[j];
+    if (ch === '\\') {
+      j += 2;
+      continue;
+    }
+    if (ch === quote) return j + 1;
+    j += 1;
+  }
+  return src.length;
+}
+
+/** Index past a comment that starts at `i`, or `i` when none does. */
+function skipComment(src: string, i: number): number {
+  if (src[i] !== '/') return i;
+  if (src[i + 1] === '/') {
+    const nl = src.indexOf('\n', i);
+    return nl === -1 ? src.length : nl + 1;
+  }
+  if (src[i + 1] === '*') {
+    const close = src.indexOf('*/', i + 2);
+    return close === -1 ? src.length : close + 2;
+  }
+  return i;
+}
+
+function skipTrivia(src: string, i: number): number {
+  let j = i;
+  for (;;) {
+    while (j < src.length && /\s/.test(src[j]!)) j += 1;
+    const past = skipComment(src, j);
+    if (past === j) return j;
+    j = past;
+  }
+}
+
+/** Index past a balanced `()`, `[]` or `{}` run starting at `i`, strings and comments honoured. */
+function skipBalanced(src: string, i: number): number {
+  const open = src[i];
+  const close = open === '(' ? ')' : open === '[' ? ']' : '}';
+  let depth = 0;
+  let j = i;
+  while (j < src.length) {
+    const ch = src[j]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      j = skipQuoted(src, j);
+      continue;
+    }
+    const past = skipComment(src, j);
+    if (past !== j) {
+      j = past;
+      continue;
+    }
+    if (ch === open) depth += 1;
+    else if (ch === close) {
+      depth -= 1;
+      if (depth === 0) return j + 1;
+    }
+    j += 1;
+  }
+  return src.length;
+}
+
+const JSX_ATTR_NAME = /[A-Za-z_$][\w$.:-]*/y;
+const OBJECT_KEY = /[A-Za-z_$][\w$]*/y;
+
+interface JsxTag {
+  /** Attributes given a literal string; one given an expression maps to null. */
+  values: Map<string, string | null>;
+  /** Every attribute name, so a bare boolean like `index` is still visible. */
+  present: Set<string>;
+  end: number;
+  selfClosing: boolean;
+}
+
+/** Read one JSX opening tag whose name ends at `from`. */
+function readJsxTag(src: string, from: number): JsxTag {
+  const values = new Map<string, string | null>();
+  const present = new Set<string>();
+  let i = from;
+  while (i < src.length) {
+    i = skipTrivia(src, i);
+    const ch = src[i];
+    if (ch === undefined) break;
+    if (ch === '>') return { values, present, end: i + 1, selfClosing: false };
+    if (ch === '/' && src[i + 1] === '>') return { values, present, end: i + 2, selfClosing: true };
+    // `{...props}` — a spread carries attributes this pass cannot see.
+    if (ch === '{') {
+      i = skipBalanced(src, i);
+      continue;
+    }
+    JSX_ATTR_NAME.lastIndex = i;
+    const name = JSX_ATTR_NAME.exec(src)?.[0];
+    if (name === undefined) {
+      i += 1;
+      continue;
+    }
+    i += name.length;
+    present.add(name);
+    const afterName = skipTrivia(src, i);
+    if (src[afterName] !== '=') {
+      i = afterName;
+      continue; // A bare attribute: `index`, `caseSensitive`.
+    }
+    const valueAt = skipTrivia(src, afterName + 1);
+    const value = src[valueAt];
+    if (value === '"' || value === "'") {
+      const close = skipQuoted(src, valueAt);
+      values.set(name, src.slice(valueAt + 1, close - 1));
+      i = close;
+    } else if (value === '{') {
+      values.set(name, null);
+      i = skipBalanced(src, valueAt);
+    } else {
+      values.set(name, null);
+      i = valueAt + 1;
+    }
+  }
+  return { values, present, end: src.length, selfClosing: false };
+}
+
+interface RouteDecl {
+  /** The literal `path`; null when the attribute is absent or is an expression. */
+  path: string | null;
+  /** True when `path` was written as an expression, which is unreadable here. */
+  computed: boolean;
+  index: boolean;
+  /** Index of the enclosing `<Route>`, or null when this is a top-level one. */
+  parent: number | null;
+  /** Which `<Routes>` element this sits in; -1 when it sits in none. */
+  block: number;
+}
+
+const ROUTE_TAG = /<(\/?)(Routes|Route)(?![\w$])/y;
+
+/**
+ * Whether a quote here opens a string literal or is just a character in JSX text.
+ *
+ * It has to be asked. A file's prose — `Don't`, `members'`, a comment — is full
+ * of apostrophes, and treating one as the start of a string would skip forward
+ * to the next one and swallow whatever route declarations lie between. A quote
+ * that opens a string never follows a word, a `>`, or a closing brace or bracket;
+ * one sitting in prose almost always does.
+ */
+function opensString(src: string, i: number): boolean {
+  if (src[i] === '`') return true;
+  let j = i - 1;
+  while (j >= 0 && (src[j] === ' ' || src[j] === '\t')) j -= 1;
+  return j < 0 || !/[\w$>}\]]/.test(src[j]!);
+}
+
+/**
+ * Read a file's `<Route>` elements as a tree, preserving who nests under whom.
+ *
+ * The walk is character by character rather than a bare regex sweep because a
+ * `<Route path="pricing">` written inside a comment is a real thing that happens
+ * — gymmm-frontend's App.tsx has one — and a phantom opening tag with no closing
+ * partner reparents every route declared after it.
+ */
+function scanRouteElements(src: string): RouteDecl[] {
+  const decls: RouteDecl[] = [];
+  const open: number[] = [];
+  const blocks: number[] = [];
+  let block = -1;
+  let blocksSeen = 0;
+
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i]!;
+    if ((ch === '"' || ch === "'" || ch === '`') && opensString(src, i)) {
+      i = skipQuoted(src, i);
+      continue;
+    }
+    const pastComment = skipComment(src, i);
+    if (pastComment !== i) {
+      i = pastComment;
+      continue;
+    }
+    if (ch !== '<') {
+      i += 1;
+      continue;
+    }
+
+    ROUTE_TAG.lastIndex = i;
+    const match = ROUTE_TAG.exec(src);
+    if (match === null) {
+      i += 1;
+      continue;
+    }
+    const isClosing = match[1] === '/';
+    const isRoutes = match[2] === 'Routes';
+
+    if (isClosing) {
+      const gt = src.indexOf('>', i);
+      i = gt === -1 ? src.length : gt + 1;
+      if (isRoutes) block = blocks.pop() ?? -1;
+      else open.pop();
+      continue;
+    }
+
+    const tag = readJsxTag(src, i + match[0].length);
+    i = Math.max(tag.end, i + match[0].length);
+
+    if (isRoutes) {
+      if (!tag.selfClosing) {
+        blocks.push(block);
+        blocksSeen += 1;
+        block = blocksSeen;
+      }
+      continue;
+    }
+
+    if (decls.length >= MAX_DECLARATIONS_PER_FILE) break;
+    const raw = tag.values.get('path');
+    decls.push({
+      path: raw === undefined ? null : raw,
+      computed: tag.present.has('path') && raw === null,
+      index: tag.present.has('index'),
+      parent: open.length > 0 ? open[open.length - 1]! : null,
+      block,
+    });
+    if (!tag.selfClosing && open.length < MAX_ROUTE_DEPTH) open.push(decls.length - 1);
+  }
+  return decls;
+}
+
+/**
+ * Join a child path onto its parent the way the router does at match time.
+ *
+ * The trailing splat is the subtle part. `<Route path="superadmin/*">` wrapping
+ * `<Route path="dashboard">` serves `/superadmin/dashboard`, not
+ * `/superadmin/*\/dashboard`: the router matches each ancestor's pattern in turn
+ * with the end unanchored, so a parent's `/*` consumes nothing on the way down.
+ */
+function joinChildRoute(parent: string, child: string): string {
+  return normaliseRoute(paramsToColon(`${stripSplat(parent)}/${child}`));
+}
+
+/**
+ * Drop a trailing splat. Two places need it: joining a child onto its parent,
+ * and reporting the parent itself. `<Route path="superadmin/*">` that wraps
+ * child routes is a layout whose splat exists only so the children can match —
+ * the URL it sits at is `/superadmin`, and `/superadmin/*` is not a page anyone
+ * can open. A splat on a route with NO children is left alone: there it names a
+ * real prefix, usually a descendant route table mounted underneath.
+ */
+function stripSplat(path: string): string {
+  const stripped = path.replace(/\/?\*+$/, '');
+  return stripped === '' ? '/' : stripped;
+}
+
+/** What a code-declared router detector could not resolve, for the notes. */
+interface DeclaredRoutingReport {
+  /** Route tables whose own mount point is decided elsewhere in the import graph. */
+  unmountedTables: number;
+  /** `path` values computed at runtime rather than written as a literal. */
+  computedPaths: number;
+}
+
+/**
+ * A file whose route elements are mounted at the site root — either it builds
+ * the router itself, or one of its top-level routes is an absolute path, which
+ * React Router only permits where there is no parent prefix to prepend.
+ */
+const ROOT_ROUTER_CONSTRUCT =
+  /<(?:BrowserRouter|HashRouter|MemoryRouter|StaticRouter)\b|create(?:Browser|Hash|Memory)Router\s*\(/;
+
+const REACT_ROUTER_TABLE =
+  /\b(createBrowserRouter|createHashRouter|createMemoryRouter|useRoutes)\s*\(\s*(?=\[)/g;
+
+function detectReactRouter(
+  files: AnalysedFile[],
+  out: Collector,
+  ledger: Ledger,
+  report: DeclaredRoutingReport,
+): void {
   for (const file of files) {
     if (!JS_EXT.has(file.ext)) continue;
     if (file.content === undefined) continue;
-    // The import is the gate. Without it, `path:` matches webpack config,
-    // tsconfig helpers and every options bag in the repo.
+    // The import is the gate. Without it, `<Route` and `path:` match a router
+    // someone wrote for something else entirely.
     if (!/from\s+['"]react-router(?:-dom|-native)?['"]/.test(file.content)) continue;
+    const content = file.content;
     ledger.examine('react-router');
 
-    const seen = new Set<string>();
-    const push = (raw: string, how: string): void => {
-      if (!raw || raw.includes('${')) return;
-      if (!raw.startsWith('/')) sawRelative = true;
-      const route = normaliseRoute(paramsToColon(raw));
-      if (seen.has(route)) return;
-      seen.add(route);
-      if (
-        out.addRoute({
-          route,
-          detector: 'react-router',
-          file: file.path,
-          evidence: `${file.path} declares ${how}`,
-          dynamic: isDynamic(route),
-        })
-      ) {
-        ledger.hit('react-router');
+    // ── The <Route> tree ─────────────────────────────────────────────────────
+    const decls = scanRouteElements(content);
+    if (decls.length > 0) {
+      const hasOwnRouter = ROOT_ROUTER_CONSTRUCT.test(content);
+      const rootBlocks = new Set<number>();
+      const allBlocks = new Set<number>();
+      for (const decl of decls) {
+        allBlocks.add(decl.block);
+        if (decl.parent === null && decl.path !== null && decl.path.startsWith('/')) {
+          rootBlocks.add(decl.block);
+        }
       }
-    };
+      if (hasOwnRouter) for (const b of allBlocks) rootBlocks.add(b);
+      for (const b of allBlocks) if (!rootBlocks.has(b)) report.unmountedTables += 1;
 
-    for (const m of file.content.matchAll(/<Route\b[^>]*?\bpath\s*=\s*["']([^"']*)["']/g)) {
-      push(m[1]!, `<Route path="${m[1]}">`);
+      const hasChildren = new Set<number>();
+      for (const decl of decls) if (decl.parent !== null) hasChildren.add(decl.parent);
+
+      const bases: Array<string | null | undefined> = new Array(decls.length).fill(undefined);
+      const baseOf = (i: number): string | null => {
+        const cached = bases[i];
+        if (cached !== undefined) return cached;
+        bases[i] = null; // Breaks a cycle a malformed tag pairing could produce.
+        const decl = decls[i]!;
+        const parentBase =
+          decl.parent === null ? (rootBlocks.has(decl.block) ? '/' : null) : baseOf(decl.parent);
+        let base: string | null;
+        if (parentBase === null || decl.computed) base = null;
+        else if (decl.path === null || decl.path === '') base = parentBase;
+        else if (decl.path.startsWith('/')) base = normaliseRoute(paramsToColon(decl.path));
+        else base = joinChildRoute(parentBase, decl.path);
+        if (base !== null && hasChildren.has(i)) base = stripSplat(base);
+        bases[i] = base;
+        return base;
+      };
+
+      for (let i = 0; i < decls.length; i += 1) {
+        const decl = decls[i]!;
+        if (decl.computed) report.computedPaths += 1;
+        // `path="*"` is the fallback that matches everything unmatched. It names
+        // no URL, so a test told to visit it has nowhere to go.
+        if (decl.path === '*') continue;
+        // A pathless <Route> is a layout: it wraps a subtree and is reachable at
+        // no URL of its own, exactly like a Next.js layout.tsx.
+        if (!decl.index && (decl.path === null || decl.path === '')) continue;
+        const base = baseOf(i);
+        if (base === null) continue;
+        const parentBase = decl.parent === null ? '/' : (bases[decl.parent] ?? '/');
+        const how =
+          decl.path === null || decl.path === ''
+            ? `an index <Route> under "${parentBase}"`
+            : decl.parent === null
+              ? `<Route path="${decl.path}">`
+              : `<Route path="${decl.path}"> nested under "${parentBase}"`;
+        if (
+          out.addRoute({
+            route: base,
+            detector: 'react-router',
+            file: file.path,
+            evidence: `${file.path} declares ${how}`,
+            dynamic: isDynamic(base),
+          })
+        ) {
+          ledger.hit('react-router');
+        }
+      }
     }
-    for (const m of file.content.matchAll(/\bpath\s*:\s*["']([^"']*)["']/g)) {
-      push(m[1]!, `a route object with path: "${m[1]}"`);
+
+    // ── The route-object form ────────────────────────────────────────────────
+    REACT_ROUTER_TABLE.lastIndex = 0;
+    let call: RegExpExecArray | null;
+    while ((call = REACT_ROUTER_TABLE.exec(content)) !== null) {
+      const at = REACT_ROUTER_TABLE.lastIndex;
+      const nodes = parseRouteArray(content, at, 0);
+      REACT_ROUTER_TABLE.lastIndex = Math.max(skipBalanced(content, at), at + 1);
+      if (nodes.length === 0) continue;
+      // `createBrowserRouter` IS the router, so its table sits at the root.
+      // `useRoutes` is a hook inside a component that may itself be mounted
+      // anywhere, so it is trusted only when it declares an absolute path.
+      const rooted =
+        call[1] !== 'useRoutes' || nodes.some((n) => n.path !== null && n.path.startsWith('/'));
+      if (!rooted) {
+        report.unmountedTables += 1;
+        continue;
+      }
+      emitObjectRoutes(nodes, '/', file, 'react-router', out, ledger, report, 0);
     }
   }
-  return sawRelative;
 }
 
-function detectVueRouter(files: AnalysedFile[], out: Collector, ledger: Ledger): boolean {
-  let sawRelative = false;
+/** Where a Vue Router table is written down. */
+const VUE_ROUTER_TABLE = /\broutes\s*:\s*(?=\[)|\b(?:const|let|var)\s+routes\b[^=\n]*=\s*(?=\[)/g;
+
+function detectVueRouter(
+  files: AnalysedFile[],
+  out: Collector,
+  ledger: Ledger,
+  report: DeclaredRoutingReport,
+): void {
   for (const file of files) {
     if (!JS_EXT.has(file.ext) && file.ext !== '.vue') continue;
     if (file.content === undefined) continue;
     if (!/from\s+['"]vue-router['"]|createRouter\s*\(/.test(file.content)) continue;
+    const content = file.content;
     ledger.examine('vue-router');
 
-    for (const m of file.content.matchAll(/\bpath\s*:\s*["']([^"']*)["']/g)) {
-      const raw = m[1]!;
-      if (!raw) continue;
-      if (!raw.startsWith('/')) sawRelative = true;
-      const route = normaliseRoute(paramsToColon(raw));
-      if (
-        out.addRoute({
-          route,
-          detector: 'vue-router',
-          file: file.path,
-          evidence: `${file.path} declares a Vue Router record with path: "${raw}"`,
-          dynamic: isDynamic(route),
-        })
-      ) {
-        ledger.hit('vue-router');
-      }
+    VUE_ROUTER_TABLE.lastIndex = 0;
+    while (VUE_ROUTER_TABLE.exec(content) !== null) {
+      const at = VUE_ROUTER_TABLE.lastIndex;
+      const nodes = parseRouteArray(content, at, 0);
+      VUE_ROUTER_TABLE.lastIndex = Math.max(skipBalanced(content, at), at + 1);
+      // A Vue Router record at the top of `routes` is absolute by the library's
+      // own rule; only `children` are relative to it.
+      emitObjectRoutes(nodes, '/', file, 'vue-router', out, ledger, report, 0);
     }
   }
-  return sawRelative;
+}
+
+interface ObjectRoute {
+  path: string | null;
+  computed: boolean;
+  index: boolean;
+  children: ObjectRoute[];
+}
+
+/** Read an array literal of route objects, following `children` into the nesting. */
+function parseRouteArray(src: string, i: number, depth: number): ObjectRoute[] {
+  const out: ObjectRoute[] = [];
+  if (depth > MAX_ROUTE_DEPTH || src[i] !== '[') return out;
+  let j = i + 1;
+  while (j < src.length && out.length < MAX_DECLARATIONS_PER_FILE) {
+    j = skipTrivia(src, j);
+    const ch = src[j];
+    if (ch === undefined || ch === ']') break;
+    if (ch === '{') {
+      const end = skipBalanced(src, j);
+      out.push(parseRouteObject(src, j, end, depth));
+      j = end;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      j = skipQuoted(src, j);
+      continue;
+    }
+    if (ch === '[' || ch === '(') {
+      j = skipBalanced(src, j);
+      continue;
+    }
+    j += 1;
+  }
+  return out;
+}
+
+function parseRouteObject(src: string, start: number, end: number, depth: number): ObjectRoute {
+  const route: ObjectRoute = { path: null, computed: false, index: false, children: [] };
+  let j = start + 1;
+  while (j < end - 1) {
+    j = skipTrivia(src, j);
+    const ch = src[j];
+    if (ch === undefined) break;
+
+    let key: string | null = null;
+    if (ch === '"' || ch === "'") {
+      const close = skipQuoted(src, j);
+      key = src.slice(j + 1, close - 1);
+      j = close;
+    } else {
+      OBJECT_KEY.lastIndex = j;
+      const name = OBJECT_KEY.exec(src)?.[0];
+      if (name !== undefined) {
+        key = name;
+        j += name.length;
+      }
+    }
+
+    if (key === null) {
+      // A spread, a computed key, a nested literal — nothing this pass reads.
+      if (ch === '{' || ch === '[' || ch === '(') j = skipBalanced(src, j);
+      else j += 1;
+      continue;
+    }
+
+    j = skipTrivia(src, j);
+    if (src[j] !== ':') continue;
+    j = skipTrivia(src, j + 1);
+    const value = src[j];
+    if (value === undefined) break;
+
+    if (key === 'path' && (value === '"' || value === "'")) {
+      const close = skipQuoted(src, j);
+      route.path = src.slice(j + 1, close - 1);
+      j = close;
+      continue;
+    }
+    if (key === 'path') route.computed = true;
+    if (key === 'index') route.index = /^true\b/.test(src.slice(j, j + 5));
+    if (key === 'children' && value === '[') {
+      route.children = parseRouteArray(src, j, depth + 1);
+      j = skipBalanced(src, j);
+      continue;
+    }
+    if (value === '{' || value === '[' || value === '(') {
+      j = skipBalanced(src, j);
+      continue;
+    }
+    if (value === '"' || value === "'" || value === '`') {
+      j = skipQuoted(src, j);
+      continue;
+    }
+    // Any other value runs to the next comma at this object's own depth. It has
+    // to be walked rather than searched for: a TSX `element: <Err msg="a } b" />`
+    // carries braces and quotes that would otherwise end the object early and
+    // take its `children` with it.
+    while (j < end - 1) {
+      const c = src[j]!;
+      if (c === '"' || c === "'" || c === '`') {
+        j = skipQuoted(src, j);
+        continue;
+      }
+      const past = skipComment(src, j);
+      if (past !== j) {
+        j = past;
+        continue;
+      }
+      if (c === '{' || c === '[' || c === '(') {
+        j = skipBalanced(src, j);
+        continue;
+      }
+      if (c === ',' || c === '}') break;
+      j += 1;
+    }
+    j += 1;
+  }
+  return route;
+}
+
+function emitObjectRoutes(
+  nodes: ObjectRoute[],
+  parentBase: string | null,
+  file: AnalysedFile,
+  detector: SourceDetectorId,
+  out: Collector,
+  ledger: Ledger,
+  report: DeclaredRoutingReport,
+  depth: number,
+): void {
+  if (depth > MAX_ROUTE_DEPTH) return;
+  for (const node of nodes) {
+    if (node.computed) report.computedPaths += 1;
+    if (node.path === '*') continue;
+
+    let base: string | null;
+    if (parentBase === null || node.computed) base = null;
+    else if (node.path === null || node.path === '') base = parentBase;
+    else if (node.path.startsWith('/')) base = normaliseRoute(paramsToColon(node.path));
+    else base = joinChildRoute(parentBase, node.path);
+    if (base !== null && node.children.length > 0) base = stripSplat(base);
+
+    const named = node.path !== null && node.path !== '';
+    if (base !== null && (named || node.index)) {
+      const how = !named
+        ? `an index route under "${parentBase}"`
+        : parentBase === '/'
+          ? `a route object with path: "${node.path}"`
+          : `a route object with path: "${node.path}" nested under "${parentBase}"`;
+      if (
+        out.addRoute({
+          route: base,
+          detector,
+          file: file.path,
+          evidence: `${file.path} declares ${how}`,
+          dynamic: isDynamic(base),
+        })
+      ) {
+        ledger.hit(detector);
+      }
+    }
+
+    if (node.children.length > 0) {
+      emitObjectRoutes(node.children, base, file, detector, out, ledger, report, depth + 1);
+    }
+  }
 }
 
 /**
@@ -1466,53 +2399,189 @@ function detectForms(files: AnalysedFile[], out: Collector, ledger: Ledger): voi
 // ─── Auth surfaces ───────────────────────────────────────────────────────────
 
 /**
- * Ordered: the first pattern that matches wins, so `/auth/logout` is a LOGOUT
- * rather than the SESSION its `/auth` prefix would also match.
+ * A path broken into the words a human reads in it.
+ *
+ * Segments do not arrive pre-tokenised. A file-convention router turns
+ * `src/pages/auth/ForgotPassword.tsx` into the route `/auth/ForgotPassword`, so
+ * a vocabulary anchored on whole segments sees one opaque word `forgotpassword`
+ * and matches none of `forgot`, `password` or `reset`. That is how a real
+ * repository's password, signup and invite pages — every file under an `auth/`
+ * directory — came back as SESSION: nothing matched them except the `auth`
+ * directory itself, which used to be in the SESSION vocabulary and swallowed
+ * the lot.
+ *
+ * `words` therefore carries each segment split on camelCase, kebab-case,
+ * snake_case and dots, plus each ADJACENT PAIR run together, so `sign-out`,
+ * `SignOut` and `SignOutButton` all answer to `signout`. `segments` carries the
+ * raw lower-cased segment, which is all the ambiguous half of the vocabulary is
+ * ever matched against.
  */
-const AUTH_PATTERNS: Array<{ kind: AuthSurfaceKind; re: RegExp; why: string }> = [
+/** Every spelling of a dynamic segment the route detectors above can emit. */
+const PARAM_SEGMENT = /^(:.*|\[.*\]|\{.*\}|<.*>|\*+)$/;
+
+function authWords(path: string): { words: Set<string>; segments: Set<string> } {
+  const words = new Set<string>();
+  const segments = new Set<string>();
+  for (const raw of path.split('/')) {
+    // A parameter names a value the caller supplies, not the surface. Reading
+    // one as vocabulary made `/accept-invite/:token` a SESSION on the strength
+    // of the word `token`, which is the name of the invite code in the URL.
+    if (PARAM_SEGMENT.test(raw)) continue;
+    // A file extension is not a word: a form surface's path is its own file.
+    const segment = raw.replace(/\.[A-Za-z0-9]+$/, '');
+    if (segment === '') continue;
+    segments.add(segment.toLowerCase());
+    const parts = segment
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .split(/[^A-Za-z0-9]+/)
+      .filter((part) => part !== '')
+      .map((part) => part.toLowerCase());
+    parts.forEach((part, i) => {
+      words.add(part);
+      const next = parts[i + 1];
+      if (next !== undefined) words.add(part + next);
+    });
+  }
+  return { words, segments };
+}
+
+/**
+ * Ordered: the first entry that matches wins, so `/auth/logout` is a LOGOUT
+ * rather than the LOGIN its `login`-adjacent neighbours might also suggest.
+ *
+ * `strong` words are specific enough to mean what they say wherever they appear
+ * in a path — nothing called `password` is not a password flow. `weak` words
+ * are common English that only means auth when it is the WHOLE segment: `reset`
+ * matches `/reset` but must not turn `/settings/reset-onboarding` into a
+ * password test, and `confirm` must not do the same to `/orders/ConfirmOrder`.
+ *
+ * `auth` is deliberately in neither list. It names a DIRECTORY, not a surface,
+ * and while it sat in the SESSION vocabulary every unrecognised file under
+ * `auth/` was reported as a session — a wrong kind, which yields a wrongly
+ * titled item with wrong steps. An auth-ish path this table cannot name now
+ * yields no surface at all, which is the honest answer.
+ */
+const AUTH_VOCABULARY: Array<{
+  kind: AuthSurfaceKind;
+  strong: readonly string[];
+  /**
+   * A word that only means what this entry means when another word is present.
+   * `token` is a session token beside `refresh`, and a push token beside
+   * `notifications`; on its own it decides nothing.
+   */
+  qualified?: { word: string; by: readonly string[] };
+  weak: readonly string[];
+  /**
+   * What the matched words name, as a bare noun phrase. Two callers word the
+   * sentence around it differently — a URL names this, or a FILENAME does — and
+   * a single pre-written `why` string meant the second one described the first.
+   */
+  names: string;
+}> = [
   {
     kind: 'LOGOUT',
-    re: /(^|\/)(logout|log-out|signout|sign-out)(\/|$)/i,
-    why: 'the path segment names a sign-out',
+    strong: ['logout', 'signout'],
+    weak: [],
+    names: 'a sign-out',
   },
   {
     kind: 'SIGNUP',
-    re: /(^|\/)(signup|sign-up|register|registration|join|create-account)(\/|$)/i,
-    why: 'the path segment names an account creation',
+    strong: ['signup', 'register', 'registration', 'createaccount'],
+    weak: ['join'],
+    names: 'an account creation',
   },
   {
     kind: 'PASSWORD_RESET',
-    re: /(^|\/)(forgot|forgot-password|reset|reset-password|password|change-password)(\/|$)/i,
-    why: 'the path segment names a password flow',
+    strong: ['password'],
+    weak: ['forgot', 'reset'],
+    names: 'a password flow',
   },
   {
     kind: 'VERIFY',
-    re: /(^|\/)(verify|verification|confirm|activate|otp|mfa|2fa|two-factor)(\/|$)/i,
-    why: 'the path segment names a verification step',
+    strong: ['verify', 'verification', 'otp', 'mfa', '2fa', 'twofactor'],
+    weak: ['confirm', 'activate'],
+    names: 'a verification step',
   },
   {
     kind: 'SSO',
-    re: /(^|\/)(sso|saml|oidc|oauth|oauth2|callback)(\/|$)/i,
-    why: 'the path segment names a federated sign-in',
+    strong: ['sso', 'saml', 'oidc', 'oauth', 'oauth2'],
+    weak: ['callback'],
+    names: 'a federated sign-in',
   },
   {
     kind: 'LOGIN',
-    re: /(^|\/)(login|log-in|signin|sign-in|authenticate)(\/|$)/i,
-    why: 'the path segment names a sign-in',
+    strong: ['login', 'signin', 'authenticate'],
+    weak: [],
+    names: 'a sign-in',
   },
   {
+    /*
+     * `session`, `sessions` and `refresh` are WEAK, and the demotion is the
+     * whole point of this entry.
+     *
+     * As strong words they matched anywhere in a path, and `words` carries every
+     * hyphen- and camel-split part — so a gym app's `/training-sessions`,
+     * `/classes/:id/session-notes` and `/refresh-schedule` all came back as
+     * authentication surfaces, each yielding a critical-path test titled "a
+     * session outlives a reload" against a booking screen. A booking screen is
+     * not a session surface. What the entry actually means is the endpoint a
+     * session is created at or exchanged through — `/api/auth/session`,
+     * `/auth/refresh`, `POST /sessions` — and in every one of those the word IS
+     * the whole segment, which is exactly what `weak` requires.
+     *
+     * `token` is QUALIFIED rather than strong. It was strong on the argument
+     * that "no ordinary noun in an application path is built out of it", and
+     * that is not true of applications people actually write: a gym app with
+     * mobile push has `/notifications/push-token`, and `device-token` and
+     * `fcm-token` are just as common. None of them is a session surface, and
+     * each would have produced a test titled "a session outlives a reload"
+     * pointed at a notification endpoint.
+     *
+     * So `token` counts only next to a word that makes it an AUTH token —
+     * `refresh-token`, `access-token`, `auth/token`. That keeps the shapes the
+     * entry exists for and drops the ones it never meant. A parameter named
+     * `:token` is skipped before this list is consulted, so an invite link does
+     * not reach here either.
+     */
     kind: 'SESSION',
-    re: /(^|\/)(session|sessions|token|refresh|auth)(\/|$)/i,
-    why: 'the path segment names a session or token exchange',
+    strong: [],
+    qualified: { word: 'token', by: ['refresh', 'access', 'auth', 'session', 'bearer', 'id'] },
+    weak: ['session', 'sessions', 'refresh'],
+    names: 'a session or token exchange',
   },
 ];
 
-function classifyAuthPath(path: string): { kind: AuthSurfaceKind; why: string } | null {
-  for (const pattern of AUTH_PATTERNS) {
-    if (pattern.re.test(path)) return { kind: pattern.kind, why: pattern.why };
+function classifyAuthPath(path: string): { kind: AuthSurfaceKind; names: string } | null {
+  const { words, segments } = authWords(path);
+  for (const entry of AUTH_VOCABULARY) {
+    // A qualified word counts only in the company of one that gives it the
+    // meaning the entry is about — `token` alone is a push token as often as a
+    // session one, and guessing wrong titles the test after the wrong thing.
+    const qualified =
+      entry.qualified !== undefined &&
+      words.has(entry.qualified.word) &&
+      entry.qualified.by.some((word) => words.has(word));
+    const hit =
+      entry.strong.some((word) => words.has(word)) ||
+      qualified ||
+      entry.weak.some((word) => segments.has(word));
+    if (hit) return { kind: entry.kind, names: entry.names };
   }
   return null;
 }
+
+/**
+ * The kinds a form with a password field can plausibly be.
+ *
+ * Used to decide whether a file NAME is allowed to overrule the field-shape
+ * guess below. A file called `logout.tsx` holding a password field is a name
+ * that does not describe the form, so the shape wins there.
+ */
+const CREDENTIAL_FORM_KINDS: ReadonlySet<AuthSurfaceKind> = new Set<AuthSurfaceKind>([
+  'LOGIN',
+  'SIGNUP',
+  'PASSWORD_RESET',
+]);
 
 function detectAuthSurfaces(collector: Collector, ledger: Ledger): AuthSurface[] {
   const surfaces: AuthSurface[] = [];
@@ -1535,7 +2604,7 @@ function detectAuthSurfaces(collector: Collector, ledger: Ledger): AuthSurface[]
         path: route.route,
         from: 'route',
         file: route.file,
-        evidence: `${route.route} — ${hit.why}`,
+        evidence: `${route.route} — the path names ${hit.names}`,
       });
     }
   }
@@ -1548,15 +2617,42 @@ function detectAuthSurfaces(collector: Collector, ledger: Ledger): AuthSurface[]
         path: endpoint.path,
         from: 'endpoint',
         file: endpoint.file,
-        evidence: `${endpoint.method} ${endpoint.path} — ${hit.why}`,
+        evidence: `${endpoint.method} ${endpoint.path} — the path names ${hit.names}`,
       });
     }
   }
-  // A password field is the strongest signal there is, and it does not depend on
-  // anyone naming the route sensibly.
+  // A password field is the strongest signal there is that a form is a
+  // credential form, and it does not depend on anyone naming the route sensibly.
+  // WHICH credential form it is, though, is a guess — and a name beats a guess.
   for (const form of collector.forms) {
     ledger.examine('auth-surfaces');
     if (!form.fields.some((f) => f.semantic === 'password')) continue;
+
+    // `ResetPassword.tsx` holds a password and a confirmation, which is the
+    // shape of a sign-up and is not a sign-up. The shape rule below exists for
+    // repositories that name nothing; where the file names itself, and names
+    // something a password form can actually be, the name is the better answer.
+    // Read off the FILE and not the action: an action of `/api/auth/session` is
+    // where the sign-in form posts, not what the sign-in form is.
+    const named = classifyAuthPath(form.file);
+    if (named && CREDENTIAL_FORM_KINDS.has(named.kind)) {
+      push({
+        kind: named.kind,
+        path: form.action ?? form.file,
+        from: 'form',
+        file: form.file,
+        // Says what actually decided this, which is the FILENAME. The old
+        // wording borrowed the vocabulary's own sentence — "the path names a
+        // sign-in" — and the surface's path here is the form's `action`, which
+        // for `LoginForm.tsx` is `/api/auth/session` and names no such thing.
+        evidence:
+          `${form.file} holds a form with a password field, and its filename names ` +
+          `${named.names} — a name that specific beats the field shape, which cannot ` +
+          `tell a password reset from a sign-up`,
+      });
+      continue;
+    }
+
     const names = form.fields.map((f) => f.name.toLowerCase()).join(' ');
     const confirms = /confirm|repeat|verify/.test(names);
     const kind: AuthSurfaceKind = confirms ? 'SIGNUP' : 'LOGIN';
@@ -1638,7 +2734,7 @@ function detectFrameworks(files: AnalysedFile[]): AppFrameworkSignal[] {
           for (const section of ['dependencies', 'devDependencies']) {
             const deps = pkg[section];
             if (!deps || typeof deps !== 'object') continue;
-            for (const name of Object.keys(deps as Record<string, unknown>)) {
+            for (const name of Object.keys(deps)) {
               const hit = FRAMEWORK_DEPS.find((entry) => entry.dep.test(name.toLowerCase()));
               if (hit) note(hit.framework, `${name} in ${section} (${file.path})`, file.path);
             }
@@ -1720,11 +2816,17 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
   const collector = new Collector();
   const ledger = new Ledger();
 
-  detectNextAppRouter(analysed, collector, ledger);
-  detectPagesDirectory(analysed, collector, ledger);
+  // Which kind of app this is decides whether a file path may be read as a URL
+  // at all. The signals are read once, here; the ANSWER is per file, because a
+  // monorepo is many apps and they do not agree.
+  const gates = routingVerdict(analysed);
+  const declared: DeclaredRoutingReport = { unmountedTables: 0, computedPaths: 0 };
+
+  detectNextAppRouter(analysed, collector, ledger, gates);
+  detectPagesDirectory(analysed, collector, ledger, gates);
   detectSvelteKit(analysed, collector, ledger);
-  const sawRelativeReactRoutes = detectReactRouter(analysed, collector, ledger);
-  const sawRelativeVueRoutes = detectVueRouter(analysed, collector, ledger);
+  detectReactRouter(analysed, collector, ledger, declared);
+  detectVueRouter(analysed, collector, ledger, declared);
   const sawMountPrefix = detectExpressFastify(analysed, collector, ledger);
   const sawDjangoInclude = detectDjangoUrls(analysed, collector, ledger);
   detectRailsRoutes(analysed, collector, ledger);
@@ -1784,17 +2886,30 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
         'included module are listed as that module declares them, without the parent prefix.',
     );
   }
-  if (sawRelativeReactRoutes) {
+  if (declared.unmountedTables > 0) {
     notes.push(
-      'Some <Route path> values are relative, which means they nest under a parent route. They are ' +
-        'recorded as written; the parent chain was not resolved.',
+      `${declared.unmountedTables} route table${declared.unmountedTables === 1 ? '' : 's'} in this ` +
+        `app declare${declared.unmountedTables === 1 ? 's' : ''} only relative paths, which means ` +
+        'the whole table hangs off a parent route ' +
+        'somewhere else — a descendant <Routes> rendered by a component that is itself mounted at ' +
+        'a URL. Which URL that is takes an import graph this static pass does not have, so those ' +
+        'declarations are NOT listed above: a guessed prefix would send every test to a 404.',
     );
   }
-  if (sawRelativeVueRoutes) {
+  if (declared.computedPaths > 0) {
     notes.push(
-      'Some Vue Router records use a relative path, which nests under a parent record. They are ' +
-        'recorded as written; the parent chain was not resolved.',
+      `${declared.computedPaths} route path${declared.computedPaths === 1 ? ' was' : 's were'} ` +
+        'written as an expression rather than a literal string, so the URL it resolves to is ' +
+        'decided at runtime and was not read.',
     );
+  }
+
+  // A refusal is a finding. If a detector found its files and deliberately
+  // claimed nothing from them, the reason belongs in the summary a user reads,
+  // not only in the detector table further down the page.
+  for (const id of ['pages-directory', 'next-app-router'] as const) {
+    const refusal = ledger.refusalFor(id);
+    if (refusal) notes.push(`${DETECTOR_META[id].label}: ${refusal}.`);
   }
 
   const unknownMethods = collector.endpoints.filter((e) => e.method === 'UNKNOWN').length;

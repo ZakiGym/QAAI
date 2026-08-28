@@ -478,11 +478,15 @@ export function parseCodebaseAnalysis(raw: unknown): CodebaseAnalysis | null {
       .map((f) => parseForm(f, null))
       .filter((f): f is SourceForm => f !== null),
   );
-  const authSurfaces = arr(raw.authSurfaces, MAX_AUTH_SURFACES)
-    .map(parseAuthSurface)
-    .filter((a): a is SourceAuthSurface => a !== null)
+  const authSurfaces = dedupeAuthSurfaces(
+    arr(raw.authSurfaces, MAX_AUTH_SURFACES)
+      .map(parseAuthSurface)
+      .filter((a): a is SourceAuthSurface => a !== null),
+  )
     // The producer's `AuthSurface` carries no form, so the credential fields
-    // are matched in from the list above — see `formForSurface`.
+    // are matched in from the list above — see `formForSurface`. Deduping first
+    // is deliberate: `formForSurface` keys on the file, so the surface that
+    // survives inherits the fields of the reading that was folded into it.
     .map((surface) => (surface.form ? surface : { ...surface, form: formForSurface(surface, forms) }));
 
   return {
@@ -616,6 +620,50 @@ function formForSurface(surface: SourceAuthSurface, forms: SourceForm[]): Source
     candidates[0] ??
     null
   );
+}
+
+/**
+ * True when a surface's `path` is nothing but its own file.
+ *
+ * That is the producer's fallback for a form that declares no `action` — an SPA
+ * form almost never does — so the "path" is `src/pages/auth/login.tsx` rather
+ * than a URL anyone can navigate to.
+ */
+function isFileShaped(surface: SourceAuthSurface): boolean {
+  return surface.path === normalisePath(surface.file);
+}
+
+/**
+ * One item per auth surface a tester would actually visit.
+ *
+ * Two readings collapse here. First, the same kind at the same path is one
+ * surface however many files declared it — the rule `dedupeRoutes` already
+ * applies one line up. Second, and the reason this exists: a file-shaped
+ * surface is the FORM detector's reading of a page the ROUTE detector already
+ * reported. `src/pages/auth/login.tsx` yielded LOGIN twice, once as
+ * `/auth/login` and once as `/src/pages/auth/login.tsx`, and those became two
+ * rows on the approval screen carrying the identical sentence about signing in.
+ * The route-shaped reading wins because it is the only one holding a URL the
+ * generated test can navigate to.
+ *
+ * Nothing is lost when a form-shaped surface is folded away: it is folded only
+ * into a surface citing the same file, and `formForSurface` matches the fields
+ * back on by exactly that file.
+ */
+function dedupeAuthSurfaces(surfaces: SourceAuthSurface[]): SourceAuthSurface[] {
+  const routeShaped = new Set(
+    surfaces.filter((s) => !isFileShaped(s)).map((s) => `${s.kind} ${s.file}`),
+  );
+  const out: SourceAuthSurface[] = [];
+  const seen = new Set<string>();
+  for (const surface of surfaces) {
+    if (isFileShaped(surface) && routeShaped.has(`${surface.kind} ${surface.file}`)) continue;
+    const key = `${surface.kind} ${surface.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(surface);
+  }
+  return out;
 }
 
 /** METHOD + path is the identity of an endpoint; the same pair twice is one. */
@@ -953,12 +1001,101 @@ export const AUTH_TITLES: Record<AuthSurfaceKind, string> = {
   SESSION: 'A session outlives a reload, and ends when it should',
 };
 
-function authItem(surface: SourceAuthSurface): PlanItem {
+/** The plan-wide cap on a title, and the width a person reads one in. */
+const TITLE_MAX = 160;
+
+/**
+ * How much of a title the disambiguating path may take.
+ *
+ * A title is read in a narrow column on the approval screen, so the sentence
+ * has to survive: `Sign in with valid credentials, and fail with invalid ones`
+ * is the part that says what the test does, and a path long enough to push it
+ * off the end would trade one unreadable title for another.
+ */
+const LOCATOR_MAX = 40;
+
+/**
+ * The shortest honest way to point at one surface.
+ *
+ * Paths are already short in practice — `/forgot-password`, `/auth/SignUp` —
+ * so the whole path is the locator whenever it fits. Only a deeply nested one
+ * gets trimmed, and it is trimmed from the FRONT at a segment boundary, because
+ * the tail is the half that names the page.
+ */
+function authLocator(path: string): string {
+  /*
+   * The extension stays.
+   *
+   * It used to be shaved off unconditionally, which turned a file-derived
+   * surface into `src/pages/auth/SignUp` on the approval screen — a string that
+   * is neither a filename nor a URL, and cannot be pasted into either an editor
+   * or a browser. A surface found in a file is located BY that file, extension
+   * and all; a surface found on a route has no extension to lose.
+   *
+   * The only thing the strip ever bought was two characters against the length
+   * budget, and the trimming below already handles length honestly, from the
+   * front, at a segment boundary.
+   */
+  const trimmed = path;
+  if (trimmed.length <= LOCATOR_MAX) return trimmed;
+
+  const segments = trimmed.split('/').filter((s) => s !== '');
+  let tail = segments[segments.length - 1] ?? trimmed;
+  for (let i = segments.length - 2; i >= 0; i--) {
+    const wider = `${segments[i]}/${tail}`;
+    if (wider.length + 2 > LOCATOR_MAX) break;
+    tail = wider;
+  }
+  return `…/${clamp(tail, LOCATOR_MAX - 2)}`;
+}
+
+/**
+ * `AUTH_TITLES` is one sentence per KIND, and a repository has more than one
+ * surface per kind.
+ *
+ * A real run produced four rows all reading "A session outlives a reload, and
+ * ends when it should" — the rationales differed, but the title is what a
+ * person reads while ticking boxes, and four identical rows is a list nobody
+ * can act on. Most of those four were a misclassification and are fixed at
+ * source; the collision is not, because a gym app genuinely has a
+ * `/forgot-password`, a `/reset-password` and a `/change-password`.
+ *
+ * So: the sentence stays exactly as written, and where a kind occurs more than
+ * once the path is appended — the path is already on the surface and is already
+ * what distinguishes them. A kind that occurs once keeps the bare sentence.
+ */
+function authTitles(surfaces: SourceAuthSurface[]): string[] {
+  const perKind = new Map<AuthSurfaceKind, number>();
+  for (const surface of surfaces) perKind.set(surface.kind, (perKind.get(surface.kind) ?? 0) + 1);
+
+  const used = new Set<string>();
+  const unique = (title: string): string => {
+    // Only reachable when two locators collide after trimming, which needs two
+    // surfaces of one kind under paths agreeing for their last 38 characters.
+    // Ugly, and still better than two rows a person cannot tell apart.
+    let candidate = title;
+    for (let n = 2; used.has(candidate); n++) candidate = `${title} (${n})`;
+    used.add(candidate);
+    return candidate;
+  };
+
+  return surfaces.map((surface) => {
+    const sentence = AUTH_TITLES[surface.kind];
+    if ((perKind.get(surface.kind) ?? 0) < 2) return unique(clamp(sentence, TITLE_MAX));
+    const locator = authLocator(surface.path);
+    // Budget the sentence around the locator rather than the other way round:
+    // the locator is the entire reason this branch exists, so it must not be
+    // the half the clamp removes.
+    return unique(`${clamp(sentence, TITLE_MAX - locator.length - 3)} — ${locator}`);
+  });
+}
+
+function authItem(surface: SourceAuthSurface, title: string): PlanItem {
   const fields = surface.form?.fields ?? [];
 
   return {
     id: itemId('auth', `${surface.kind}-${surface.path}`),
-    title: clamp(AUTH_TITLES[surface.kind], 160),
+    title: clamp(title, TITLE_MAX),
     rationale: clamp(
       `\`${surface.file}\` declares a ${surface.kind.toLowerCase().replace(/_/g, ' ')} surface at \`${surface.path}\`` +
         (fields.length > 0
@@ -1085,7 +1222,10 @@ export function scenariosFromSource(
   if (wants('SMOKE')) items.push(...analysis.routes.map(smokeItem));
   if (wants('API')) items.push(...analysis.endpoints.map(apiItem));
   if (wants('E2E')) {
-    items.push(...analysis.authSurfaces.map(authItem));
+    // Titled as a set, not one at a time: whether a title needs the path on it
+    // is a fact about the other auth surfaces, not about this one.
+    const titles = authTitles(analysis.authSurfaces);
+    items.push(...analysis.authSurfaces.map((surface, i) => authItem(surface, titles[i]!)));
     items.push(...forms.map(({ form, behindAuth }) => formItem(form, behindAuth)));
   }
   if (wants('ACCESSIBILITY') && analysis.routes.length > 0) {

@@ -991,9 +991,57 @@ const READ_AS_TEXT_RE = /^(pytest\.ini|setup\.cfg|tox\.ini)$/;
  * paths, which is the difference between a folder pick that is instant and one
  * that loads a monorepo into a tab as text.
  */
+/**
+ * Files that plausibly hold a ROUTE TABLE, which must be read as text.
+ *
+ * Added because the analyser stopped inferring routes from file paths in apps
+ * whose routes are declared in code — correctly, since `src/pages/Foo.tsx` is a
+ * component there and not a URL. But the funnel was sending bodies for
+ * MANIFESTS ONLY, so the route table never arrived, and the honest "I could not
+ * read your routes" replaced the dishonest "here are 192 of them" with nothing
+ * at all. For a React Router or Vue Router app that is an empty plan, which is
+ * the whole product.
+ *
+ * Deliberately narrow. This list is read in the browser, over a whole repo, and
+ * every entry is a file loaded into a tab as text: `routes` and `router` by
+ * name catch `crmRoutes.tsx` and `router/index.ts`, and the four entry-point
+ * names catch the common `<BrowserRouter>` host. A pattern like `*.tsx` would
+ * be every file in the repository.
+ */
+const ROUTE_TABLE_RE = /^(?:app|main|routes?|router)\.[cm]?[jt]sx?$/i;
+const ROUTE_NAMED_RE = /rout(?:e|er)s?\.[cm]?[jt]sx?$/i;
+/**
+ * `index` is the entry point that hosts `<BrowserRouter>` in a Create React App
+ * — and it is also the name of every barrel file in every `src/**` tree ever
+ * written. Reading them all would load a large fraction of a repo into the tab
+ * to find one router.
+ *
+ * So it counts only at the top AND only in JSX: `index.tsx` or `src/index.tsx`,
+ * never `src/components/button/index.ts` and never a bare `src/index.ts`. An
+ * entry point lives at an entrance, and one that mounts a router renders
+ * markup — a `.ts` index is a barrel file, which is the thing being avoided.
+ */
+const ENTRY_INDEX_RE = /^(?:[^/]+\/)?index\.[cm]?[jt]sx$/i;
+/**
+ * An index whose PARENT is the routing directory, at any depth.
+ *
+ * `src/router/index.ts` is Vue Router's documented layout and a common React
+ * one, and it is a route table wherever it sits — the folder name says so. This
+ * is not the barrel-file problem the rule above avoids: `components/index.ts`
+ * does not match, only `router/` and `routes/` do.
+ */
+const ROUTE_DIR_INDEX_RE = /(?:^|\/)rout(?:e|er)s?\/index\.[cm]?[jt]sx?$/i;
+
 export function needsContent(path: string): boolean {
-  const base = basename(normalisePath(path));
-  return MANIFEST_RE.test(base) || base.endsWith('.sln') || READ_AS_TEXT_RE.test(base);
+  const normal = normalisePath(path);
+  const base = basename(normal);
+  if (MANIFEST_RE.test(base) || base.endsWith('.sln') || READ_AS_TEXT_RE.test(base)) return true;
+  return (
+    ROUTE_TABLE_RE.test(base) ||
+    ROUTE_NAMED_RE.test(base) ||
+    ENTRY_INDEX_RE.test(normal) ||
+    ROUTE_DIR_INDEX_RE.test(normal)
+  );
 }
 
 // ─── Roots ───────────────────────────────────────────────────────────────────

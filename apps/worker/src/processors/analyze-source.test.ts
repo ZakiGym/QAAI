@@ -1159,3 +1159,279 @@ describe('processAnalyzeSource', () => {
 function defaultPlanSize(): number {
   return scenariosFromSource(analysis(), testTypeChoiceFromProject({})).items.length;
 }
+
+// ─── 6. Auth surfaces: the kind must be true, and the title must be its own ──
+
+/**
+ * Both halves of this section come from one run of the real product against a
+ * real 1245-file React Router application, and neither was visible on the
+ * seeded demo data.
+ *
+ * The plan contained FOUR rows reading, verbatim, "A session outlives a reload,
+ * and ends when it should". The rationale under each named a different file, but
+ * the title is what a person reads while ticking approval boxes, and four
+ * identical rows is a list nobody can act on. The four files were
+ * `src/pages/auth/{AcceptInvite,ForgotPassword,RegisterGym,ResetPassword}.tsx`:
+ * two password flows, a signup and an invite acceptance, none of them a session.
+ *
+ * The cause was two-fold and both parts are pinned below. The vocabulary matched
+ * whole path SEGMENTS, so a route read off a filename — `/auth/ForgotPassword` —
+ * matched nothing in it; and `auth` sat in the SESSION vocabulary, so everything
+ * that matched nothing else matched that. Filenames are the realistic case, not
+ * the exotic one, so the fixtures here use those files' real names.
+ */
+describe('auth surfaces are named for what they are', () => {
+  /** The subject repo's own auth page names, under a tree Next.js owns. */
+  const nextAuthPages = (): RepoFile[] => [
+    { path: 'package.json', content: '{"dependencies":{"next":"^15.0.0"}}' },
+    { path: 'pages/auth/AcceptInvite.tsx', content: 'export default function AcceptInvite() {}' },
+    { path: 'pages/auth/ForgotPassword.tsx', content: 'export default function ForgotPassword() {}' },
+    { path: 'pages/auth/RegisterGym.tsx', content: 'export default function RegisterGym() {}' },
+    { path: 'pages/auth/ResetPassword.tsx', content: 'export default function ResetPassword() {}' },
+    { path: 'pages/auth/SignUp.tsx', content: 'export default function SignUp() {}' },
+    { path: 'pages/auth/login.tsx', content: 'export default function Login() {}' },
+  ];
+
+  /** kind by the file it was read from — the two facts the defect got wrong. */
+  const kindsByFile = (files: RepoFile[]): Record<string, string[]> => {
+    const out: Record<string, string[]> = {};
+    for (const surface of analyseCodebase(files).authSurfaces) {
+      (out[surface.file] ??= []).push(surface.kind);
+    }
+    return out;
+  };
+
+  it('reads a camelCased filename as the words in it, not as one opaque segment', () => {
+    const kinds = kindsByFile(nextAuthPages());
+    expect(kinds['pages/auth/ForgotPassword.tsx']).toEqual(['PASSWORD_RESET']);
+    expect(kinds['pages/auth/ResetPassword.tsx']).toEqual(['PASSWORD_RESET']);
+    expect(kinds['pages/auth/RegisterGym.tsx']).toEqual(['SIGNUP']);
+    expect(kinds['pages/auth/SignUp.tsx']).toEqual(['SIGNUP']);
+    expect(kinds['pages/auth/login.tsx']).toEqual(['LOGIN']);
+  });
+
+  it('claims no surface at all for the one it cannot honestly name', () => {
+    // Invite acceptance has no kind in the vocabulary. A wrong kind produces a
+    // wrongly-titled item with wrong steps, which is worse than no item: the
+    // honest outcome is silence.
+    expect(kindsByFile(nextAuthPages())['pages/auth/AcceptInvite.tsx']).toBeUndefined();
+  });
+
+  it('never calls a file a SESSION merely for sitting under auth/', () => {
+    const surfaces = analyseCodebase(nextAuthPages()).authSurfaces;
+    expect(surfaces.map((s) => s.kind)).not.toContain('SESSION');
+
+    // The directory on its own is a directory, not a surface.
+    const bare = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"next":"^15.0.0"}}' },
+      { path: 'pages/auth/index.tsx', content: 'export default function Auth() {}' },
+    ]).authSurfaces;
+    expect(bare).toEqual([]);
+  });
+
+  it('still reports a SESSION where one is actually declared', () => {
+    // Dropping `auth` from the vocabulary must not cost the kind its real hits:
+    // a token exchange names itself and is still found.
+    const surfaces = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"express":"^4.0.0"}}' },
+      {
+        path: 'src/server.ts',
+        content: [
+          "import express from 'express';",
+          'const app = express();',
+          "app.post('/api/auth/session', (req, res) => res.json({}));",
+          "app.post('/api/auth/refresh', (req, res) => res.json({}));",
+        ].join('\n'),
+      },
+    ]).authSurfaces;
+    expect(surfaces.map((s) => `${s.kind} ${s.path}`).sort()).toEqual([
+      'SESSION /api/auth/refresh',
+      'SESSION /api/auth/session',
+    ]);
+  });
+
+  it('reads a URL parameter as a value, not as vocabulary', () => {
+    // `/accept-invite/:token` is an invite code in a URL. Read as words it says
+    // "token", and the first fix here turned it into a SESSION — trading one
+    // wrong answer for another on the very file that started this.
+    const surfaces = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"express":"^4.0.0"}}' },
+      {
+        path: 'src/server.ts',
+        content: [
+          "import express from 'express';",
+          'const app = express();',
+          "app.get('/accept-invite/:token', (req, res) => res.send('x'));",
+        ].join('\n'),
+      },
+    ]).authSurfaces;
+    expect(surfaces).toEqual([]);
+  });
+
+  it('keeps common English out of names that merely contain it', () => {
+    // `reset`, `confirm` and `callback` are auth words only as a whole segment.
+    // Splitting segments into words would otherwise make a settings page a
+    // password test and an order page a verification test.
+    const surfaces = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"express":"^4.0.0"}}' },
+      {
+        path: 'src/server.ts',
+        content: [
+          "import express from 'express';",
+          'const app = express();',
+          "app.get('/settings/reset-onboarding', (req, res) => res.send('x'));",
+          "app.get('/orders/ConfirmOrder', (req, res) => res.send('x'));",
+          "app.get('/billing/PaymentCallback', (req, res) => res.send('x'));",
+          "app.get('/reset', (req, res) => res.send('x'));",
+        ].join('\n'),
+      },
+    ]).authSurfaces;
+    expect(surfaces.map((s) => `${s.kind} ${s.path}`)).toEqual(['PASSWORD_RESET /reset']);
+  });
+
+  it('lets the filename overrule the field-shape guess, but not the form action', () => {
+    // A password plus a confirmation is the SHAPE of a sign-up and is not a
+    // sign-up on `ResetPassword.tsx`. The shape rule exists for repos that name
+    // nothing, so a name that says something wins — read off the FILE, because
+    // a sign-in form's action is `/api/auth/session` and that is where it posts,
+    // not what it is.
+    const reset = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"react":"^19.0.0"}}' },
+      {
+        path: 'src/pages/auth/ResetPassword.tsx',
+        content:
+          '<form><input name="password" type="password" />' +
+          '<input name="confirmPassword" type="password" /><button>Reset</button></form>',
+      },
+    ]).authSurfaces;
+    // Filtered to the form reading: the pages tree also yields a route surface
+    // for the same file, and collapsing that pair is the consumer's job below.
+    expect(reset.filter((s) => s.from === 'form').map((s) => s.kind)).toEqual(['PASSWORD_RESET']);
+    expect(reset.map((s) => s.kind)).not.toContain('SIGNUP');
+
+    const login = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"react":"^19.0.0"}}' },
+      {
+        path: 'src/components/SignInPanel.tsx',
+        content:
+          '<form action="/api/auth/session"><input name="email" type="email" />' +
+          '<input name="password" type="password" /><button>Sign in</button></form>',
+      },
+    ]).authSurfaces;
+    expect(login.map((s) => s.kind)).toEqual(['LOGIN']);
+  });
+
+  it('falls back to the field shape when the filename says nothing', () => {
+    // `AdminProfile.tsx` is a real file in the subject repo with a password and
+    // a confirmation on it. Nothing in its name is auth vocabulary, so the guess
+    // is all there is — and the guess must still run.
+    const surfaces = analyseCodebase([
+      { path: 'package.json', content: '{"dependencies":{"react":"^19.0.0"}}' },
+      {
+        path: 'src/pages/admin/AdminProfile.tsx',
+        content:
+          '<form><input name="password" type="password" />' +
+          '<input name="confirmPassword" type="password" /><button>Save</button></form>',
+      },
+    ]).authSurfaces;
+    expect(surfaces.map((s) => `${s.kind} ${s.from}`)).toEqual(['SIGNUP form']);
+  });
+});
+
+describe('no two auth items on the approval screen carry the same title', () => {
+  const authItems = (surfaces: unknown[]): PlanItem[] => {
+    const parsed = parseCodebaseAnalysis({ ...rawAnalysis, authSurfaces: surfaces })!;
+    return scenariosFromSource(parsed, allTypes(['E2E'])).items.filter(
+      (i) => i.feature === 'Authentication',
+    );
+  };
+
+  const surface = (kind: string, path: string, file: string) => ({
+    kind,
+    path,
+    from: 'route',
+    file,
+    evidence: `${path} — the path names it`,
+  });
+
+  /** The subject repo's real password pages: three of them, one kind. */
+  const passwordPages = [
+    surface('PASSWORD_RESET', '/change-password', 'src/App.tsx'),
+    surface('PASSWORD_RESET', '/forgot-password', 'src/App.tsx'),
+    surface('PASSWORD_RESET', '/reset-password', 'src/App.tsx'),
+    surface('PASSWORD_RESET', '/trainer/change-password', 'src/pages/trainer/change-password.tsx'),
+  ];
+
+  it('distinguishes rows a person has to tell apart, by the path already on them', () => {
+    const titles = authItems(passwordPages).map((i) => i.title);
+    expect(new Set(titles).size).toBe(titles.length);
+    expect(titles).toEqual([
+      'Request a password reset and complete it — /change-password',
+      'Request a password reset and complete it — /forgot-password',
+      'Request a password reset and complete it — /reset-password',
+      'Request a password reset and complete it — /trainer/change-password',
+    ]);
+  });
+
+  it('leaves the sentence alone when the kind occurs once', () => {
+    // The suffix is a cost, not a feature: "Sign in with valid credentials, and
+    // fail with invalid ones" is the whole title when nothing collides with it.
+    const titles = authItems([
+      surface('LOGIN', '/login', 'src/App.tsx'),
+      ...passwordPages,
+    ]).map((i) => i.title);
+    expect(titles).toContain(AUTH_TITLES.LOGIN);
+  });
+
+  it('keeps every title inside the plan cap, sentence first', () => {
+    const deep = '/' + Array.from({ length: 12 }, (_, i) => `segment-number-${i}`).join('/');
+    const items = authItems([
+      surface('PASSWORD_RESET', `${deep}/forgot-password`, 'src/a.tsx'),
+      surface('PASSWORD_RESET', `${deep}/reset-password`, 'src/b.tsx'),
+    ]);
+    const titles = items.map((i) => i.title);
+    expect(new Set(titles).size).toBe(2);
+    for (const title of titles) {
+      expect(title.length).toBeLessThanOrEqual(160);
+      // The sentence is the part a narrow column shows first, so it survives
+      // whole and the PATH is what gets trimmed.
+      expect(title.startsWith(AUTH_TITLES.PASSWORD_RESET)).toBe(true);
+      expect(title).toMatch(/…\//);
+    }
+  });
+
+  it('reads a route and the form on it as one surface, not two rows', () => {
+    // The producer reports both: `/auth/login` from the route detector and
+    // `src/pages/auth/login.tsx` from the form detector, because a form in an
+    // SPA declares no action and falls back to its own file. That is one sign-in
+    // page, and it reached the approval screen as two rows saying the same thing.
+    const items = authItems([
+      surface('LOGIN', '/auth/login', 'src/pages/auth/login.tsx'),
+      { ...surface('LOGIN', 'src/pages/auth/login.tsx', 'src/pages/auth/login.tsx'), from: 'form' },
+    ]);
+    expect(items.map((i) => i.title)).toEqual([AUTH_TITLES.LOGIN]);
+  });
+
+  it('keeps a form-shaped surface the route detector never saw', () => {
+    // The collapse above must not become "drop every form surface": a form on a
+    // page no route detector claimed is the only reading there is.
+    const items = authItems([
+      surface('LOGIN', '/auth/login', 'src/pages/auth/login.tsx'),
+      { ...surface('SIGNUP', 'src/pages/admin/AdminProfile.tsx', 'src/pages/admin/AdminProfile.tsx'), from: 'form' },
+    ]);
+    expect(items).toHaveLength(2);
+  });
+
+  it('carries the credential fields onto the surface that survives the collapse', () => {
+    // `formForSurface` matches on the file, so the route-shaped survivor
+    // inherits the fields of the form-shaped reading folded into it. Without
+    // that, collapsing would cost the generated test everything to fill in.
+    const items = authItems([
+      surface('LOGIN', '/login', 'app/login/page.tsx'),
+      { ...surface('LOGIN', 'app/login/page.tsx', 'app/login/page.tsx'), from: 'form' },
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]!.steps.join(' ')).toContain('"Email"');
+    expect(items[0]!.steps.join(' ')).toContain('"Password"');
+  });
+});
