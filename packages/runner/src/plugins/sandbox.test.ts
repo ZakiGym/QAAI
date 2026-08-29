@@ -29,6 +29,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_SANDBOX_LIMITS,
   MEDIATED_CAPABILITIES,
+  checkHttpDestination,
   clampLimits,
   classifyCapability,
   containmentTier,
@@ -44,14 +45,16 @@ interface RunOptions {
   limits?: Partial<SandboxLimits>;
   onCall?: (call: { capability: string; method: string; args: unknown[] }) => Promise<unknown>;
   signal?: AbortSignal;
+  baseUrl?: string;
+  spec?: unknown;
 }
 
 function run(code: string, options: RunOptions = {}): Promise<SandboxOutcome> {
   return runInSandbox({
     code,
     request: {
-      baseUrl: 'http://127.0.0.1:1/',
-      spec: { hello: 'world' },
+      baseUrl: options.baseUrl ?? 'http://127.0.0.1:1/',
+      spec: options.spec ?? { hello: 'world' },
       test: { id: 'test_1', name: 'a test', filePath: 'plugins/x.spec.ts', tags: [] },
     },
     granted: new Set(options.granted ?? []),
@@ -442,5 +445,224 @@ describe('the install screen and the sandbox agree on what a plugin may ask for'
     for (const capability of PLUGIN_CAPABILITIES) {
       expect(PLUGIN_CAPABILITY_COPY[capability], capability).toBeTruthy();
     }
+  });
+});
+
+// ─── Egress ──────────────────────────────────────────────────────────────────
+
+describe('the mediated http capability is confined to the environment under test', () => {
+  const BASE = 'https://staging.acme.test';
+
+  /**
+   * Runs a plugin that makes one `http` call and reports what came back, and
+   * tells the test whether the host was ever asked to perform it.
+   *
+   * The `reached` flag is the assertion that matters. Checking only the error
+   * the plugin saw would pass just as well if the request HAD been made and the
+   * response merely withheld — and "the request was made" is the entire
+   * vulnerability. `onCall` here stands in for the real mediation, which fetches.
+   */
+  async function attempt(
+    url: string,
+    baseUrl = BASE,
+  ): Promise<{ outcome: SandboxOutcome; reached: string[] }> {
+    const reached: string[] = [];
+    const outcome = await run(
+      `export const execute = async (api) => {
+         let seen = null;
+         try { seen = await api.http.request({ url: ${JSON.stringify(url)} }); }
+         catch (err) { seen = 'REFUSED: ' + err.message; }
+         return { status: 'PASSED', steps: [], findings: [], seen };
+       };`,
+      {
+        granted: ['http'],
+        baseUrl,
+        onCall: async (call) => {
+          const init = call.args[0] as { url?: string };
+          reached.push(String(init?.url));
+          return { status: 200, body: 'ok' };
+        },
+      },
+    );
+    return { outcome, reached };
+  }
+
+  it('lets the plugin reach the environment’s own origin', async () => {
+    const { outcome, reached } = await attempt('/ping');
+    if (!outcome.ok) throw new Error(faultOf(outcome));
+    expect(reached).toEqual(['/ping']);
+    expect(JSON.parse(outcome.json).seen).toEqual({ status: 200, body: 'ok' });
+  });
+
+  it('reaches the environment even when it is loopback, because that is a local run', async () => {
+    // The rule cannot be "refuse private addresses": every `npm run dev` run
+    // points at 127.0.0.1, and a guard that broke those would be turned off.
+    const { reached } = await attempt('/ping', 'http://127.0.0.1:3000');
+    expect(reached).toEqual(['/ping']);
+  });
+
+  it.each([
+    ['the cloud metadata service', 'http://169.254.169.254/latest/meta-data/'],
+    ['a database port on loopback', 'http://127.0.0.1:5432/'],
+    ['loopback by name', 'http://localhost:5432/'],
+    ['an RFC1918 address', 'http://10.0.0.5/admin'],
+    ['IPv6 loopback', 'http://[::1]:6379/'],
+    ["EC2's IPv6 metadata endpoint", 'http://[fd00:ec2::254]/latest/'],
+    ['IPv4-mapped IPv6', 'http://[::ffff:169.254.169.254]/'],
+    ['the 6to4 encoding of it', 'http://[2002:a9fe:a9fe::]/'],
+    ['the octal encoding of loopback', 'http://0177.0.0.1/'],
+    ['the decimal encoding of loopback', 'http://2130706433/'],
+    ['the hex encoding of loopback', 'http://0x7f.0.0.1/'],
+    ['a cluster-internal name', 'http://kubernetes.default.svc/api'],
+    ['a single-label service name', 'http://redis/'],
+    ['a trailing-dot bypass of the name list', 'http://localhost./'],
+    /*
+     * The three encoded forms are in this list for the behaviour, not because
+     * `classifyHost`'s ambiguity branch is what catches them here: `new URL()`
+     * normalises `0177.0.0.1`, `2130706433` and `0x7f.0.0.1` to `127.0.0.1`
+     * before the guard sees a hostname at all. They stay because that
+     * normalisation is a property of Node's parser rather than of this file,
+     * and the day it changes this is the test that says so.
+     */
+  ])('ends the run rather than requesting %s', async (_label, url) => {
+    const { outcome, reached } = await attempt(url);
+    // Nothing was asked of the host: the refusal is upstream of the fetch.
+    expect(reached).toEqual([]);
+    expect(faultOf(outcome)).toBe('EGRESS_REFUSED');
+  });
+
+  it('refuses an off-origin public destination without ending the run', async () => {
+    // Exfiltration, not a network probe: the plugin wanted to POST somewhere it
+    // chose. It is a bug in the plugin, so the plugin observes it and carries on
+    // — the same treatment an undeclared fixture gets.
+    const { outcome, reached } = await attempt('https://collector.example.com/x');
+    expect(reached).toEqual([]);
+    if (!outcome.ok) throw new Error(faultOf(outcome));
+    expect(JSON.parse(outcome.json).seen).toContain('collector.example.com');
+  });
+
+  it('refuses a scheme that is not http or https', async () => {
+    const { outcome, reached } = await attempt('file:///etc/passwd');
+    expect(reached).toEqual([]);
+    if (!outcome.ok) throw new Error(faultOf(outcome));
+    expect(JSON.parse(outcome.json).seen).toContain('"file:" is not an allowed scheme');
+  });
+
+  it('refuses the next hop of a redirect that starts public and lands private', async () => {
+    /*
+     * Nobody follows redirects for the plugin — the host fetches with
+     * `redirect: 'manual'` — so the second hop is a second `http` call, and it
+     * arrives at the same guard. This is that call: the plugin read a Location
+     * header off a 302 and asked for it.
+     */
+    const { outcome, reached } = await attempt('http://169.254.169.254/latest/meta-data/iam/');
+    expect(reached).toEqual([]);
+    expect(faultOf(outcome)).toBe('EGRESS_REFUSED');
+  });
+
+  it('is not fooled by a same-host request on a different port', async () => {
+    // Origin is scheme, host AND port. The app under test being on :443 says
+    // nothing about what else that machine is listening on.
+    const { outcome, reached } = await attempt('https://staging.acme.test:9200/_cat/indices');
+    expect(reached).toEqual([]);
+    expect(outcome.ok).toBe(true);
+  });
+
+  it('is enforced even when the plugin forges the host call itself', async () => {
+    /*
+     * The `api.http` object the bootstrap builds is a convenience. Plugin code
+     * can import node:worker_threads and post the message itself, which is
+     * exactly what this does — if the guard lived in that object rather than on
+     * the host side of the port, it would be decoration.
+     */
+    const reached: string[] = [];
+    const outcome = await run(
+      `import { parentPort } from 'node:worker_threads';
+       export const execute = async () => {
+         parentPort.postMessage({ type: 'call', id: 99, capability: 'http', method: 'request',
+                                  args: [{ url: 'http://169.254.169.254/' }] });
+         await new Promise((r) => setTimeout(r, 3000));
+         return { status: 'PASSED', steps: [], findings: [] };
+       };`,
+      {
+        granted: ['http'],
+        baseUrl: BASE,
+        onCall: async (call) => {
+          reached.push(String((call.args[0] as { url?: string })?.url));
+          return null;
+        },
+      },
+    );
+    expect(reached).toEqual([]);
+    expect(faultOf(outcome)).toBe('EGRESS_REFUSED');
+  });
+});
+
+describe('checkHttpDestination', () => {
+  const BASE = 'https://staging.acme.test';
+
+  it('allows only the environment’s exact origin', () => {
+    expect(checkHttpDestination('/a', BASE)).toEqual({
+      verdict: 'allow',
+      url: 'https://staging.acme.test/a',
+    });
+    expect(checkHttpDestination('https://staging.acme.test/a?b=1', BASE).verdict).toBe('allow');
+    expect(checkHttpDestination('http://staging.acme.test/a', BASE).verdict).toBe('refuse');
+    expect(checkHttpDestination('https://staging.acme.test:8080/a', BASE).verdict).toBe('refuse');
+    expect(checkHttpDestination('https://evil.staging.acme.test/a', BASE).verdict).toBe('refuse');
+  });
+
+  it('refuses everything when the environment has no usable URL', () => {
+    // Fail closed: an unparseable baseUrl must grant nothing, not everything.
+    expect(checkHttpDestination('https://anywhere.example.com/', 'not a url').verdict).toBe(
+      'refuse',
+    );
+    expect(checkHttpDestination('/a', '').verdict).toBe('refuse');
+  });
+
+  it('refuses a URL carrying embedded credentials', () => {
+    expect(checkHttpDestination('https://u:p@staging.acme.test/a', BASE).verdict).toBe('refuse');
+  });
+
+  it('refuses a non-string url without throwing', () => {
+    expect(checkHttpDestination(undefined, BASE).verdict).toBe('refuse');
+    expect(checkHttpDestination({ toString: () => '/a' }, BASE).verdict).toBe('refuse');
+  });
+
+  it('calls an address inside our network a probe and an ordinary origin a refusal', () => {
+    // The distinction the fault kinds rest on: one ends the run, the other does
+    // not, and the difference is whether QAAI's network position was the point.
+    expect(checkHttpDestination('http://169.254.169.254/', BASE).verdict).toBe('probe');
+    expect(checkHttpDestination('https://collector.example.com/', BASE).verdict).toBe('refuse');
+  });
+
+  it('names the class of the address it refused, so the fault is actionable', () => {
+    const verdict = checkHttpDestination('http://169.254.169.254/', BASE);
+    if (verdict.verdict !== 'probe') throw new Error('expected a probe');
+    expect(verdict.reason).toContain('link-local');
+  });
+});
+
+describe('runInSandbox never rejects, whatever it is handed', () => {
+  /*
+   * This is the attribution guarantee, and it is a guarantee about the RETURN
+   * TYPE. `executeExternal` converts a fault into a SKIPPED execution that says
+   * the plugin broke; a REJECTION propagates out of the plugin's `execute()`
+   * and apps/worker/src/processors/run.ts records it as the customer's
+   * application failing. "Your checkout is broken, because a plugin's spec had
+   * a function in it" is the worst thing this feature can print.
+   */
+  it('returns a fault when the isolate cannot be started at all', async () => {
+    // `new Worker(...)` runs synchronously, outside the promise, and clones
+    // workerData: a spec carrying anything structured-clone cannot copy throws
+    // DataCloneError before the isolate exists.
+    const outcome = await run(`export const execute = async () => ({ status: 'PASSED' });`, {
+      spec: { probe: () => 1 },
+    });
+    expect(faultOf(outcome)).toBe('CRASHED');
+    if (outcome.ok) throw new Error('unreachable');
+    expect(outcome.fault.message).toContain('could not be started');
+    // Still the plugin's fault, never the application's.
+    expect(isPluginAtFault(outcome.fault)).toBe(true);
   });
 });

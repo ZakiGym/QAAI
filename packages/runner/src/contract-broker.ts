@@ -53,8 +53,14 @@ const PUBLISH_TIMEOUT_MS = 15_000;
  * one. `.svc` and `.cluster.local` are in the list because QAAI workers commonly
  * run in Kubernetes, where `kubernetes.default.svc` is reachable from every pod.
  */
-const INTERNAL_HOST =
-  /^(localhost|.+\.localhost|.+\.local|.+\.internal|.+\.intranet|.+\.lan|.+\.corp|.+\.private|.+\.svc|.+\.cluster\.local|.+\.home\.arpa)$/i;
+/*
+ * The list lives in @qaai/shared/private-address. There were FIVE copies of
+ * this regex across the repo — here, the SSO discovery guard, the issue linker,
+ * the action dispatcher and the plugin sandbox — and the `.svc` entry in the
+ * comment above is the record of one of them learning a lesson the others had
+ * not. An attacker only needs the copy that has not learned it yet.
+ */
+import { isPrivateNetworkName } from '@qaai/shared/private-address';
 
 /**
  * Cloud metadata endpoints that answer on a PUBLIC-looking name. The IP forms
@@ -130,7 +136,7 @@ export function brokerOrigin(
    */
   const host = url.hostname.replace(/\.+$/, '').toLowerCase();
   const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
-  if (isIpLiteral || INTERNAL_HOST.test(host) || METADATA_HOST.has(host) || !host.includes('.')) {
+  if (isIpLiteral || isPrivateNetworkName(host) || METADATA_HOST.has(host) || !host.includes('.')) {
     return {
       refused: `refusing to send a broker token to ${host || '(no host)'} — use the public hostname of your broker`,
     };

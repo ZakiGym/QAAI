@@ -1,4 +1,4 @@
-import { test, expect, shortcut, firstProject, projectTests, shellReady, openTab } from '../fixtures/qaai';
+import { test, expect, shortcut, projectTests, shellReady, openTab, selectedProject } from '../fixtures/qaai';
 
 /**
  * The keyboard — ⌘K, ⌘P, ⌘\ and ⌘/.
@@ -75,12 +75,13 @@ test.describe('the command palette', () => {
 
 test.describe('quick-open', () => {
   test('⌘P lists the selected project’s test files', async ({ page, api }) => {
-    const project = await firstProject(api);
-    const tests = await projectTests(api, project.id);
-    test.skip(tests.length === 0, 'This project has no tests to quick-open. Seed the demo data.');
-
     await page.goto('/runs');
     await shellReady(page);
+
+    // The project the SIDEBAR has, not the one the API happens to list first.
+    const project = await selectedProject(page, api);
+    const tests = await projectTests(api, project.id);
+    test.skip(tests.length === 0, 'This project has no tests to quick-open. Seed the demo data.');
 
     await shortcut(page, 'p');
 
@@ -106,7 +107,11 @@ test.describe('quick-open', () => {
   });
 
   test('picking a file opens it in the editor', async ({ page, api }) => {
-    const project = await firstProject(api);
+    await page.goto('/runs');
+    await shellReady(page);
+
+    // Ask the sidebar, not the API's ordering — see `selectedProject`.
+    const project = await selectedProject(page, api);
     const tests = await projectTests(api, project.id);
     /*
      * A target whose name is not a substring of any other test's, so the
@@ -121,9 +126,6 @@ test.describe('quick-open', () => {
           tests.every((o) => o === t || !o.name.includes(t.name)),
       ) ?? tests.find((t) => t.filePath.endsWith('.spec.ts'));
     test.skip(!target, 'This project has no tests to open. Seed the demo data.');
-
-    await page.goto('/runs');
-    await shellReady(page);
 
     await shortcut(page, 'p');
     const palette = page.getByRole('dialog', { name: 'Go to file' });

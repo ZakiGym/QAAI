@@ -484,6 +484,12 @@ const refuse = (
  * the capability list — is a fact a known publisher put their key behind. Check
  * the capability set first and you are quoting an attacker's JSON back to the
  * user inside a sentence that sounds like the product vouching for it.
+ *
+ * "Then publisher" is two questions, not one: is there a trusted row, and is it
+ * the row for the publisher THIS MANIFEST NAMES. The second was missing, and
+ * without it step three verifies a signature under whatever key the caller
+ * passed while step four onwards prints the name the manifest claimed. See the
+ * comment on the check itself.
  */
 export function evaluateInstall(candidate: InstallCandidate): PluginVerdict {
   const parsed = pluginManifestSchema.safeParse(candidate.manifest);
@@ -508,6 +514,40 @@ export function evaluateInstall(candidate: InstallCandidate): PluginVerdict {
       { publisher: manifest.publisher },
     );
   }
+  /*
+   * The row the caller read back must be the publisher the MANIFEST names.
+   *
+   * Every check after this one is "does this signature verify under
+   * `publisher.publicKey`", and the sentence that result is reported in says
+   * `manifest.publisher`. Nothing tied those two together: hand this function a
+   * manifest claiming `acme` alongside the trusted-publisher row for `evilcorp`
+   * and it verifies evilcorp's signature, approves the install, and prints
+   * acme's name while doing it.
+   *
+   * Not reachable through POST /plugins today — that route looks the row up BY
+   * `manifest.publisher`, so the pair always matches — which is exactly why it
+   * has to be asserted HERE. This is a pure function whose whole reason for
+   * existing (see the docblock) is that the next caller, the bulk installer or
+   * the re-verify sweep, does not get to reimplement six of seven checks. A
+   * precondition that only holds because of how today's single caller happens
+   * to query is not a precondition, it is a coincidence.
+   *
+   * Reported as UNKNOWN_PUBLISHER rather than as a new code, and the code is
+   * accurate: nobody has told this organisation to trust the publisher this
+   * manifest names. The `detail` carries both ids so an operator reading the
+   * audit row can see it was a mismatched pair rather than an absent one.
+   */
+  if (publisher.publisherId !== manifest.publisher) {
+    return refuse(
+      'UNKNOWN_PUBLISHER',
+      `This manifest is published by "${manifest.publisher}", but the signing key offered for ` +
+        `it belongs to "${publisher.publisherId}". A key vouches only for its own publisher. ` +
+        `Add "${manifest.publisher}"'s key under Trusted publishers — confirm the fingerprint ` +
+        `against their own site first — and install again.`,
+      { publisher: manifest.publisher, offeredKeyFor: publisher.publisherId },
+    );
+  }
+
   if (publisher.revokedAt) {
     return refuse(
       'PUBLISHER_REVOKED',

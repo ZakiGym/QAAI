@@ -32,6 +32,7 @@ import process from 'node:process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_EXECUTOR,
+  RunnerAgent,
   RunnerError,
   TerminalChannel,
   backoffMs,
@@ -611,6 +612,124 @@ describe('TerminalChannel', () => {
     // the rest was not pushed across the customer's egress to be discarded.
     expect(api.bodies('/output')).toHaveLength(1);
     expect(api.bodies('/exit')).toHaveLength(1);
+  });
+});
+
+// ─── 5b. The fence the server actually checks ────────────────────────────────
+
+describe('every job-scoped call presents the lease', () => {
+  let dir = '';
+  let realFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'qaai-lease-'));
+    realFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('stamps x-qaai-lease on every /jobs/ request, and on nothing else', async () => {
+    /*
+     * `x-qaai-lease` is a FENCING TOKEN, and an untested one is the worst kind.
+     * Every `/runners/agent/jobs/*` endpoint runs `requireLease`, which reads
+     * the header and answers 400 without it — so an agent that holds a lease id
+     * and never sends it has every result batch, every artifact and every
+     * completion refused, while its own tests stay green because nothing in
+     * them ever looks at a header. This drives a whole job through a stubbed
+     * `fetch` and reads the headers the server would have read.
+     *
+     * The negative half matters as much: `/claim` is not job-scoped and has no
+     * lease to present, so stamping it everywhere would be a different bug that
+     * this assertion would not otherwise notice.
+     */
+    const sent: Array<{ path: string; lease: string | null }> = [];
+
+    // Typed as the narrow form the agent actually calls — `request()` always
+    // passes a string URL — so this stub never has to guess at a Request body.
+    globalThis.fetch = (async (input: string, init?: RequestInit) => {
+      const url = input;
+      const headers = new Headers(init?.headers ?? {});
+      sent.push({ path: new URL(url).pathname, lease: headers.get('x-qaai-lease') });
+
+      if (url.endsWith('/runners/agent/claim')) {
+        return new Response(
+          JSON.stringify({
+            job: {
+              jobId: 'job_9',
+              leaseId: 'lease_abc123',
+              runId: 'run_9',
+              shardIndex: null,
+              attempt: 1,
+              leaseSeconds: 60,
+              heartbeatSeconds: 15,
+              projectId: 'proj_9',
+              environment: { id: 'env_9', name: 'staging', baseUrl: 'https://staging.acme.com' },
+              tests: [
+                {
+                  id: 'test_9',
+                  name: 'checkout',
+                  type: 'E2E',
+                  code: '// spec',
+                  filePath: 'tests/checkout.spec.ts',
+                  spec: null,
+                  timeoutMs: 30_000,
+                  quarantined: false,
+                  tags: [],
+                },
+              ],
+              secrets: {},
+              fixtures: {},
+              determinism: { randomSeed: 1, waitForNetworkIdle: true, retryOnce: false },
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const config = parseRunnerConfig(
+      {
+        workspaceRoot: dir,
+        terminal: false,
+        // A binary that does not exist, so the job reaches its reporting and
+        // completion calls — the ones that carry the fence — without this test
+        // depending on a test runner being installed.
+        executors: { default: { command: 'qaai-no-such-executor', args: [], report: 'junit.xml' } },
+        capabilities: { browsers: [], toolchains: [] },
+      },
+      'test',
+    );
+
+    const agent = new RunnerAgent({
+      endpoint: pinEndpoint('http://localhost:4000'),
+      token: 'qaai_rt_testtoken',
+      config,
+      log: () => {},
+      maxCycles: 1,
+    });
+    await agent.loop();
+
+    const jobScoped = sent.filter((call) => call.path.includes('/jobs/'));
+    // Results and completion at minimum; both are job-scoped and both were
+    // being answered 400 for want of this header.
+    expect(jobScoped.length).toBeGreaterThanOrEqual(2);
+    expect(jobScoped.map((call) => call.path)).toEqual(
+      expect.arrayContaining(['/runners/agent/jobs/job_9/results', '/runners/agent/jobs/job_9/complete']),
+    );
+    for (const call of jobScoped) {
+      expect(call.lease, call.path).toBe('lease_abc123');
+    }
+
+    // ...and the claim, which has no lease yet, does not invent one.
+    const claim = sent.find((call) => call.path === '/runners/agent/claim');
+    expect(claim).toBeDefined();
+    expect(claim?.lease).toBeNull();
   });
 });
 

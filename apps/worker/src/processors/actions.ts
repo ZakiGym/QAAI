@@ -64,32 +64,31 @@
 
 import { promises as dns } from 'node:dns';
 import { Queue } from 'bullmq';
-import { describeWebhookFailure } from '@qaai/shared';
-import type { NotifyJob } from '@qaai/shared';
 /*
- * WHY THIS IMPORT IS A RELATIVE PATH: @qaai/shared exports only its barrel and
- * `./constants`, and adding `action-events` to packages/shared/src/index.ts is
- * a change to a file this wave does not own. Same workaround, for the same
- * reason and with the same resolution behaviour under tsc, tsx and vitest, as
- * the @qaai/storage `gc.js` import at the top of processors/retention.ts. It is
- * one line for the owner of that barrel to fix; see the report.
+ * The vocabulary now comes through the package barrel like everything else.
+ * It used to be reached by relative path because `./action-events` was missing
+ * from packages/shared/src/index.ts, which also meant the API and the web app
+ * could not import the contract they are meant to build against at all.
  */
 import {
   MAX_FAILURES_IN_ACTION_EVENT,
   buildActionEvent,
+  describeWebhookFailure,
   deriveRunEventTypes,
   encodeActionEventBody,
   parseActionSubscription,
   pickActionEvent,
-} from '../../../../packages/shared/src/action-events.js';
+} from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import type {
   ActionEvent,
   ActionEventType,
   FlakeDetectedData,
   HealProposedData,
   MonitorDownData,
+  NotifyJob,
   RunEventData,
-} from '../../../../packages/shared/src/action-events.js';
+} from '@qaai/shared';
 import { connection, logger, prisma } from '../context.js';
 import { enqueueDelivery } from '../queues.js';
 import { open as openSecret } from '../vault.js';
@@ -132,18 +131,38 @@ export const ACTIONS_QUEUE = 'qaai.actions';
 // ─── Bounds ──────────────────────────────────────────────────────────────────
 
 /**
- * How many actions one event may fan out to.
+ * How many SUBSCRIBED actions one event may fan out to.
  *
  * An event is triggered by a run, and a run is triggered by a push. Without a
  * ceiling, one org with a scripted integration import turns every commit into
  * hundreds of outbound requests from our egress — which is a bill, a rate-limit
  * problem at whoever receives them, and a fine denial-of-service amplifier
  * pointed at a third party. Twenty is generous for a real team and small enough
- * to be uninteresting as a weapon. Exceeding it is logged at error rather than
- * silently truncated: a customer whose 21st action never fires deserves to have
- * that fact exist somewhere.
+ * to be uninteresting as a weapon.
+ *
+ * SUBSCRIBED is the word that carries the weight, and it was wrong. The cap
+ * used to be applied to the raw list of enabled WEBHOOK integrations, before
+ * anyone asked which of them had subscribed to this event — so an org with
+ * twenty webhooks that ignore run events and a twenty-first that asked for
+ * `run.failed` fanned out to nobody, with no delivery, no row and no error. A
+ * cap on work nobody asked for is not a cap, it is a lottery. It now counts
+ * only the actions that would actually receive this event, and every subscriber
+ * it does drop gets a FAILED delivery row saying so — see `recordRefusal`. A
+ * cap that silently discards work is indistinguishable from a bug.
  */
 export const MAX_ACTIONS_PER_EVENT = 20;
+
+/**
+ * How many enabled webhook integrations one dispatch will even look at.
+ *
+ * The read still has to be bounded — nothing that runs inside a dispatch loop
+ * gets to be unbounded because somebody scripted an import — but this bound is
+ * the READ, not the fan-out, and the two are deliberately far apart. It has to
+ * be comfortably above `MAX_ACTIONS_PER_EVENT` or row order silently becomes
+ * the subscription filter again, which is the bug this number exists to stop
+ * coming back. An org that manages to exceed even this is logged at error.
+ */
+export const MAX_ACTIONS_SCANNED = 500;
 
 /**
  * Ceiling on one serialised envelope. The payload is already bounded field by
@@ -292,201 +311,23 @@ export async function dispatchActionsForNotify(job: NotifyJob): Promise<void> {
 
 /**
  * What an address is, for the purpose of "may we POST a customer's test results
- * at it from inside our network".
+ * at it from inside our network". Re-exported under this module's own name so
+ * existing importers do not move; the definition is @qaai/shared's.
  */
-export type AddressClass =
-  | 'public'
-  | 'loopback'
-  | 'link-local'
-  | 'private'
-  | 'multicast'
-  | 'reserved'
-  | 'unspecified'
-  | 'unparseable';
+export type { AddressClass } from '@qaai/shared/private-address';
 
-/**
- * Classify a dotted-quad.
+/*
+ * The address classifier lives in @qaai/shared/private-address, not here.
  *
- * Anything that is not exactly four plain decimal octets is `unparseable`, and
- * `unparseable` is refused — including octets with leading zeros, which some
- * resolvers and many parsers read as octal (`0177.0.0.1` is 127.0.0.1 to one
- * library and a nonsense hostname to the next). Disagreement between two
- * parsers about what an address means is the entire mechanism of this class of
- * bypass, so the only safe reading of an ambiguous string is "no".
+ * There were three copies of this: this one, the plugin sandbox's, and the
+ * anchored `INTERNAL_HOST` regex in apps/api/src/lib/issues.ts. Three
+ * implementations of "is this address inside our network" is three chances to
+ * disagree about one — and the whole point of the guard is that an attacker
+ * only needs the weakest of them. `0177.0.0.1`, `::ffff:127.0.0.1` and
+ * `2130706433` are all 127.0.0.1 to somebody's resolver, so a copy that has
+ * learned one encoding and not another is a hole wearing a fix's clothes.
  */
-export function classifyIpv4(ip: string): AddressClass {
-  const parts = ip.split('.');
-  if (parts.length !== 4) return 'unparseable';
 
-  const octets: number[] = [];
-  for (const part of parts) {
-    if (!/^\d{1,3}$/.test(part)) return 'unparseable';
-    if (part.length > 1 && part.startsWith('0')) return 'unparseable';
-    const value = Number(part);
-    if (value > 255) return 'unparseable';
-    octets.push(value);
-  }
-
-  const [a = 0, b = 0, c = 0] = octets;
-
-  if (a === 0) return 'unspecified';
-  if (a === 127) return 'loopback';
-  if (a === 10) return 'private';
-  if (a === 172 && b >= 16 && b <= 31) return 'private';
-  if (a === 192 && b === 168) return 'private';
-  // Carrier-grade NAT. Not "the internet" by any useful definition, and it is
-  // where a surprising number of container networks land.
-  if (a === 100 && b >= 64 && b <= 127) return 'private';
-  // 169.254.0.0/16. The cloud metadata service — 169.254.169.254 on AWS, GCP
-  // and Azure alike — lives here. This single line is most of the point of
-  // this function.
-  if (a === 169 && b === 254) return 'link-local';
-  if (a === 192 && b === 0 && c === 0) return 'reserved';
-  if (a === 192 && b === 0 && c === 2) return 'reserved';
-  if (a === 192 && b === 88 && c === 99) return 'reserved';
-  if (a === 198 && (b === 18 || b === 19)) return 'reserved';
-  if (a === 198 && b === 51 && c === 100) return 'reserved';
-  if (a === 203 && b === 0 && c === 113) return 'reserved';
-  if (a >= 224 && a <= 239) return 'multicast';
-  if (a >= 240) return 'reserved';
-
-  return 'public';
-}
-
-/**
- * Expand an IPv6 literal into its eight groups, or null if it is not one.
- *
- * Written out rather than delegated to `net.isIP` because knowing that a string
- * IS an IPv6 address tells us nothing about WHICH address, and the whole
- * question here is which. Handles `::` once, and a trailing embedded IPv4
- * (`::ffff:127.0.0.1`), and refuses a zone index outright — `%eth0` only ever
- * appears on a link-local address, and an address that needs to name an
- * interface is by definition not on the public internet.
- */
-export function expandIpv6(ip: string): number[] | null {
-  const raw = ip.trim().toLowerCase();
-  if (raw.includes('%')) return null;
-  if (raw.length === 0 || raw.includes(':::')) return null;
-
-  // A trailing dotted-quad contributes two groups.
-  let tail: number[] = [];
-  let head = raw;
-  const lastColon = raw.lastIndexOf(':');
-  const suffix = lastColon >= 0 ? raw.slice(lastColon + 1) : '';
-  if (suffix.includes('.')) {
-    if (classifyIpv4(suffix) === 'unparseable') return null;
-    const [a = 0, b = 0, c = 0, d = 0] = suffix.split('.').map(Number);
-    tail = [(a << 8) | b, (c << 8) | d];
-    head = raw.slice(0, lastColon);
-    // `::1.2.3.4` leaves head as `:`, which must still parse as the `::` form.
-    if (head === '') head = ':';
-  }
-
-  const doubleColon = head.indexOf('::');
-  if (doubleColon !== head.lastIndexOf('::')) return null;
-
-  const toGroups = (text: string): number[] | null => {
-    if (text === '') return [];
-    const out: number[] = [];
-    for (const piece of text.split(':')) {
-      if (!/^[0-9a-f]{1,4}$/.test(piece)) return null;
-      out.push(Number.parseInt(piece, 16));
-    }
-    return out;
-  };
-
-  let groups: number[];
-  if (doubleColon >= 0) {
-    const left = toGroups(head.slice(0, doubleColon));
-    const right = toGroups(head.slice(doubleColon + 2));
-    if (!left || !right) return null;
-    const fill = 8 - (left.length + right.length + tail.length);
-    if (fill < 0) return null;
-    groups = [...left, ...new Array<number>(fill).fill(0), ...right, ...tail];
-  } else {
-    const only = toGroups(head);
-    if (!only) return null;
-    groups = [...only, ...tail];
-  }
-
-  return groups.length === 8 ? groups : null;
-}
-
-/**
- * Classify an IPv6 address.
- *
- * The embedded-IPv4 forms are the interesting ones and each gets handled rather
- * than falling through to `public`: `::ffff:169.254.169.254`, the 6to4 encoding
- * `2002:a9fe:a9fe::`, and NAT64's `64:ff9b::a9fe:a9fe` all name the metadata
- * service, and all three look like ordinary global unicast if you only check
- * the first group. Unique-local `fc00::/7` covers `fd00:ec2::254`, which is
- * exactly the IPv6 metadata endpoint on EC2.
- */
-export function classifyIpv6(ip: string): AddressClass {
-  const g = expandIpv6(ip);
-  if (!g) return 'unparseable';
-
-  const [g0 = 0, g1 = 0, g2 = 0, g3 = 0, g4 = 0, g5 = 0, g6 = 0, g7 = 0] = g;
-  const embedded = (hi: number, lo: number): string =>
-    `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`;
-
-  if (g.every((group) => group === 0)) return 'unspecified';
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1) {
-    return 'loopback';
-  }
-
-  // ::ffff:a.b.c.d — an IPv4 address wearing an IPv6 costume.
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
-    return classifyIpv4(embedded(g6, g7));
-  }
-  // 64:ff9b::/96 — NAT64. Same trick, different prefix.
-  if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
-    return classifyIpv4(embedded(g6, g7));
-  }
-  // 2002::/16 — 6to4 carries the IPv4 address in groups 1 and 2.
-  if (g0 === 0x2002) return classifyIpv4(embedded(g1, g2));
-  // 100::/64 — the discard-only prefix.
-  if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) return 'reserved';
-  // 2001:db8::/32 — documentation.
-  if (g0 === 0x2001 && g1 === 0x0db8) return 'reserved';
-  if ((g0 & 0xffc0) === 0xfe80) return 'link-local';
-  if ((g0 & 0xffc0) === 0xfec0) return 'private';
-  if ((g0 & 0xfe00) === 0xfc00) return 'private';
-  if ((g0 & 0xff00) === 0xff00) return 'multicast';
-
-  return 'public';
-}
-
-/** Classify whatever a resolver handed back, v4 or v6. */
-export function classifyAddress(ip: string): AddressClass {
-  return ip.includes(':') ? classifyIpv6(ip) : classifyIpv4(ip);
-}
-
-/**
- * The static half of the egress policy: everything decidable from the URL text.
- *
- * Stricter than `checkChatDestination`'s generic-WEBHOOK rules on purpose, and
- * strictly stricter — anything this admits, that function admits too, which
- * matters because it runs again inside `processDelivery` immediately before the
- * POST. A rule here that the send-time check disagreed with would mean an
- * action that passes at dispatch and dead-letters at send, forever.
- *
- * The extra rules, and why:
- *
- *  • Port must be the https default. A generic webhook may legitimately live on
- *    an odd port; an action pointed at one is indistinguishable from a port
- *    scan run from our address space, and the value of the feature does not
- *    include that.
- *  • No IP literals at all, public ones included. An action names a HOST, so the
- *    resolver's answer is the thing we get to inspect, and there is no second
- *    "trusted literal" path to reason about. One rule is one rule.
- *  • The hostname must look like a hostname. The URL parser has already
- *    punycoded any unicode, so anything left outside `[a-z0-9.-]` is a parser
- *    disagreement waiting to happen.
- *
- * The reason strings name the HOST and never the path: for a webhook the path
- * IS the bearer credential, and the host is already shown in the cockpit.
- */
 export function checkActionDestination(
   rawUrl: string,
 ): { ok: true; url: string; host: string } | { ok: false; reason: string } {
@@ -1055,18 +896,18 @@ export async function processActionEvent(
   const rows = await prisma.integration.findMany({
     where: { orgId: job.orgId, enabled: true, kind: 'WEBHOOK' },
     select: { id: true, config: true, configEnc: true },
-    // Total and stable, so the cap below always cuts the same tail rather than
-    // a different one per attempt.
+    // Total and stable, so a retried dispatch considers the same actions in the
+    // same order and any cut below lands in the same place.
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-    take: MAX_ACTIONS_PER_EVENT + 1,
+    take: MAX_ACTIONS_SCANNED + 1,
   });
 
-  let actions: ActionRow[] = rows;
-  if (rows.length > MAX_ACTIONS_PER_EVENT) {
-    actions = rows.slice(0, MAX_ACTIONS_PER_EVENT);
+  const scanned: ActionRow[] = rows.slice(0, MAX_ACTIONS_SCANNED);
+  if (rows.length > MAX_ACTIONS_SCANNED) {
     logger.error(
-      { orgId: job.orgId, cap: MAX_ACTIONS_PER_EVENT },
-      'more actions are registered than one event may fan out to; the newest were not dispatched',
+      { orgId: job.orgId, scanned: MAX_ACTIONS_SCANNED },
+      'this org has more enabled webhook integrations than one dispatch will read; ' +
+        'the oldest were considered and the rest were not read at all',
     );
   }
 
@@ -1075,7 +916,19 @@ export async function processActionEvent(
   let failed = 0;
   let skipped = 0;
 
-  for (const action of actions) {
+  /*
+   * SUBSCRIPTION FIRST, CAP SECOND.
+   *
+   * Both passes are cheap and pure — `parseActionSubscription` reads a JSON
+   * column and `pickActionEvent` walks a bounded pattern list — so the whole
+   * scanned set is filtered before anything is dropped. Doing it the other way
+   * round meant an action's chance of firing depended on how many integrations
+   * happened to sit in front of it, which is not a rule anybody could have been
+   * told about in advance.
+   */
+  const subscribers: Array<{ action: ActionRow; event: ActionEvent }> = [];
+
+  for (const action of scanned) {
     const subscription = parseActionSubscription(action.config);
     if (subscription.unknown.length > 0) {
       // A typo in a subscription is otherwise indistinguishable from an event
@@ -1095,17 +948,62 @@ export async function processActionEvent(
       continue;
     }
 
-    const event = buildActionEvent({
-      type,
-      orgId: built.orgId,
-      projectId: built.projectId,
-      subject: built.subject,
-      occurredAt: built.occurredAt,
-      // The payload shape is fixed by `type` in the contract; `buildEvent`
-      // produced exactly the one this candidate list belongs to.
-      data: built.data,
+    subscribers.push({
+      action,
+      event: buildActionEvent({
+        type,
+        orgId: built.orgId,
+        projectId: built.projectId,
+        subject: built.subject,
+        occurredAt: built.occurredAt,
+        // The payload shape is fixed by `type` in the contract; `buildEvent`
+        // produced exactly the one this candidate list belongs to.
+        data: built.data,
+      }),
     });
+  }
 
+  const dispatching = subscribers.slice(0, MAX_ACTIONS_PER_EVENT);
+  const dropped = subscribers.slice(MAX_ACTIONS_PER_EVENT);
+
+  if (dropped.length > 0) {
+    logger.error(
+      { orgId: job.orgId, cap: MAX_ACTIONS_PER_EVENT, dropped: dropped.length },
+      'more actions are subscribed to this event than one event may fan out to; ' +
+        'the newest were dropped and recorded as failed deliveries',
+    );
+  }
+
+  /*
+   * The drop is WRITTEN DOWN, not just counted.
+   *
+   * A subscriber that hits the cap is the one case where QAAI decides not to do
+   * work a customer explicitly asked for, and the delivery log is where they
+   * will look for it — the same place a refused destination lands, with a
+   * sentence that names the cap rather than leaving them to infer one. The
+   * write is per-action and caught, because a row that will not write must not
+   * cost the twenty above it their delivery any more than a broken action does.
+   */
+  for (const { action, event } of dropped) {
+    try {
+      await recordRefusal(
+        job.orgId,
+        action,
+        event,
+        `More than ${MAX_ACTIONS_PER_EVENT} actions in this org are subscribed to ` +
+          `${event.type}; this one was over the per-event limit and was not sent.`,
+      );
+      refused += 1;
+    } catch (err) {
+      failed += 1;
+      logger.error(
+        { err, integrationId: action.id, event: event.type },
+        'could not record an action that was dropped at the per-event cap',
+      );
+    }
+  }
+
+  for (const { action, event } of dispatching) {
     try {
       const outcome = await dispatchOne(job.orgId, action, event, lookup);
       if (outcome === 'queued') queued += 1;
@@ -1119,14 +1017,14 @@ export async function processActionEvent(
        */
       failed += 1;
       logger.error(
-        { err, integrationId: action.id, event: type },
+        { err, integrationId: action.id, event: event.type },
         'an event action failed to dispatch; the others are unaffected',
       );
     }
   }
 
   logger.info(
-    { orgId: job.orgId, kind: job.kind, queued, refused, failed, skipped },
+    { orgId: job.orgId, kind: job.kind, queued, refused, failed, skipped, dropped: dropped.length },
     'event actions dispatched',
   );
 }

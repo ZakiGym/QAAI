@@ -78,18 +78,38 @@ const {
   MAX_ACTIONS_PER_EVENT,
   actionJobsFromNotify,
   checkActionDestination,
-  classifyAddress,
-  classifyIpv4,
-  classifyIpv6,
   dispatchActionsForNotify,
-  expandIpv6,
   processActionEvent,
   resolveIsPublic,
 } = await import('./actions.js');
 
-const { decodeActionEventBody } = await import(
-  '../../../../packages/shared/src/action-events.js'
+/*
+ * The address classifiers come from the package now, not from this processor.
+ *
+ * There were three implementations of "is this address inside our network" —
+ * here, in the plugin sandbox, and behind a regex in the API's issue linker.
+ * An attacker needs only the weakest of the three, so they collapsed into one.
+ * These cases stay because they are asserting the guard this file applies; the
+ * classifier's own edge cases live beside it in private-address.test.ts.
+ */
+const { classifyAddress, classifyIpv4, classifyIpv6, expandIpv6 } = await import(
+  '@qaai/shared/private-address'
 );
+
+/*
+ * Through the PACKAGE, not by relative path. The event vocabulary is a public
+ * contract the API validates subscriptions against and the web app renders
+ * labels from, and it was missing from packages/shared/src/index.ts — so the
+ * only consumers that could reach it were the ones willing to reach across the
+ * workspace into another package's source tree. Importing it the way a real
+ * consumer must is what makes that a tested property rather than a note.
+ */
+const {
+  ACTION_EVENT_LABELS,
+  ACTION_EVENT_TYPES,
+  decodeActionEventBody,
+  parseActionSubscription,
+} = await import('@qaai/shared');
 
 beforeEach(() => {
   h.prisma = {};
@@ -776,19 +796,100 @@ describe('processActionEvent — isolation and bounds', () => {
     expect(statuses.sort()).toEqual(['FAILED', 'PENDING']);
   });
 
-  it('caps the fan-out and says so out loud', async () => {
+  it('caps the fan-out and records every subscriber it dropped', async () => {
     const many = Array.from({ length: MAX_ACTIONS_PER_EVENT + 1 }, (_unused, index) =>
       action({ id: `act${index}` }),
     );
-    setupDb({ actions: many });
+    const db = setupDb({ actions: many });
     await processActionEvent({ orgId: 'org1', kind: 'run', runId: 'run1' }, {
       lookup: publicLookup,
     });
 
     expect(h.delivered).toHaveLength(MAX_ACTIONS_PER_EVENT);
-    // Logged, not silently truncated: a customer whose 21st action never fires
-    // deserves to have that fact exist somewhere.
-    expect(h.log.some((line) => line.msg.includes('more actions are registered'))).toBe(true);
+    expect(h.log.some((line) => line.msg.includes('more actions are subscribed'))).toBe(true);
+
+    /*
+     * A log line is for us; the row is for the customer. A dropped subscriber
+     * gets the same FAILED delivery a refused destination gets, with a sentence
+     * naming the cap — because "my action did not fire and there is nothing
+     * anywhere saying why" is indistinguishable from a bug, which is the point.
+     */
+    const rows = [...db.rows.values()];
+    expect(rows).toHaveLength(MAX_ACTIONS_PER_EVENT + 1);
+    const droppedRow = rows.find((row) => row.status === 'FAILED');
+    expect(droppedRow).toBeDefined();
+    expect(droppedRow).toMatchObject({ integrationId: 'act20', attempts: 0 });
+    expect(String(droppedRow?.lastError)).toContain(
+      `More than ${MAX_ACTIONS_PER_EVENT} actions in this org are subscribed to run.failed`,
+    );
+  });
+
+  it('caps the actions SUBSCRIBED to the event, not every webhook in the org', async () => {
+    /*
+     * The bug this pins, and it was silent in the worst way: the cap used to be
+     * applied to the raw list of enabled WEBHOOK integrations, before anybody
+     * asked which of them had subscribed. So an org whose first twenty webhooks
+     * ignore run events entirely — Jira mirrors, a chat relay, an archiver —
+     * and whose twenty-first asked for `run.failed` got NOTHING: no delivery,
+     * no row, no error. The subscribed action is last on purpose; ordering it
+     * first would let the broken implementation pass.
+     */
+    const bystanders = Array.from({ length: MAX_ACTIONS_PER_EVENT }, (_unused, index) =>
+      action({ id: `bystander${index}`, config: { actions: { events: ['monitor.down'] } } }),
+    );
+    const db = setupDb({
+      actions: [...bystanders, action({ id: 'theOneThatAsked', config: { actions: { events: ['run.failed'] } } })],
+    });
+    await processActionEvent({ orgId: 'org1', kind: 'run', runId: 'run1' }, {
+      lookup: publicLookup,
+    });
+
+    expect(h.delivered).toHaveLength(1);
+    const rows = [...db.rows.values()];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      integrationId: 'theOneThatAsked',
+      status: 'PENDING',
+      event: 'run.failed',
+    });
+    // Nothing was dropped, so nothing may claim it was.
+    expect(h.log.some((line) => line.msg.includes('more actions are subscribed'))).toBe(false);
+  });
+
+  it('refuses an envelope that serialised past the body ceiling, and sends nothing', async () => {
+    /*
+     * `MAX_ACTION_BODY_BYTES` had no test at all: a reviewer deleted the guard
+     * outright and all fifty tests here stayed green, which is how an unbounded
+     * POST reaches somebody's endpoint.
+     *
+     * The payload is bounded field by field, so the only way past the ceiling
+     * is a field that grew unexpectedly — a test name pasted out of a stack
+     * trace is the realistic one, and that is exactly what this builds: twenty
+     * failures (the field cap) with names long enough that the envelope clears
+     * 64KB.
+     */
+    const enormous = Array.from({ length: 20 }, (_unused, index) => ({
+      status: 'FAILED',
+      testId: `t${index}`,
+      test: { name: `checkout ${'x'.repeat(5_000)}`, filePath: 'a.spec.ts' },
+    }));
+    const db = setupDb({
+      run: runRow({ failedCount: 20, results: enormous }),
+      actions: [action()],
+    });
+    await processActionEvent({ orgId: 'org1', kind: 'run', runId: 'run1' }, {
+      lookup: publicLookup,
+    });
+
+    // Refused and recorded, never attempted: the delivery job is the thing that
+    // would have made the request, and it was never enqueued.
+    expect(h.delivered).toEqual([]);
+    expect(db.rows.size).toBe(1);
+    const row = [...db.rows.values()][0]!;
+    expect(row).toMatchObject({ status: 'FAILED', attempts: 0 });
+    expect(String(row.lastError)).toContain('65536 bytes');
+    // The oversized body is not smuggled onto the row either.
+    expect(JSON.stringify(row.payload)).not.toContain('xxxxxxxxxx');
   });
 
   it('re-throws when the actions could not be read at all', async () => {
@@ -884,5 +985,26 @@ describe('the notify bridge', () => {
     ).resolves.toBeUndefined();
     expect(h.log.some((line) => line.msg.includes('could not enqueue an event action'))).toBe(true);
     spy.mockRestore();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The contract, as a consumer sees it
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('@qaai/shared re-exports the event vocabulary', () => {
+  it('hands a consumer the types, the labels and the subscription parser', () => {
+    /*
+     * The API cannot validate a subscription it cannot name, and the web app
+     * cannot render a checkbox list it cannot import. This asserts the barrel,
+     * not the module: a deep relative import would pass this while every real
+     * consumer stayed broken.
+     */
+    expect(ACTION_EVENT_TYPES).toContain('run.failed');
+    expect(ACTION_EVENT_LABELS['gate.blocked']).toContain('quality gate');
+    expect(parseActionSubscription({ actions: { events: ['run.*', 'nonsense'] } })).toEqual({
+      events: ['run.*'],
+      unknown: ['nonsense'],
+    });
   });
 });

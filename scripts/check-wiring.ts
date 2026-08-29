@@ -844,6 +844,28 @@ function checkPackageExports(): void {
     else if (json.bin) for (const v of Object.values(json.bin)) addRoot(v);
     addRoot(join('src', 'index.ts'));
 
+    /*
+     * A SUBPATH EXPORT is a declaration of public API, exactly like the barrel.
+     *
+     * This check knew only about `src/index.ts`, so a module reachable as
+     * `@qaai/shared/private-address` read as "tested and unreachable" — and its
+     * own remediation said to re-export it from the barrel, which for that
+     * module is the one thing that must not happen: it imports `node:dns`, and
+     * the barrel is what the web app's bundler consumes. The check was telling
+     * the reader to break the web build.
+     *
+     * A path listed in `exports` is consumed from outside this repo by
+     * definition, so it is a root for the same reason `main` and `bin` are.
+     */
+    const collectExportTargets = (node: unknown): void => {
+      if (typeof node === 'string') return addRoot(node);
+      if (!node || typeof node !== 'object') return;
+      for (const value of Object.values(node as Record<string, unknown>)) {
+        collectExportTargets(value);
+      }
+    };
+    collectExportTargets(json.exports);
+
     // The barrel is the package's declared public API.
     const barrel = join(src, 'index.ts');
     const reexported = new Set<string>();

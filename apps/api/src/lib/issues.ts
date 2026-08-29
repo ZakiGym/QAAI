@@ -191,19 +191,21 @@ export function githubRepoSlug(repo: string): string {
  * here — with or without a trailing dot — so a Jira integration pointed at it
  * would have received the unsealed credential.
  */
-const INTERNAL_HOST =
-  /^(localhost|.+\.localhost|.+\.local|.+\.internal|.+\.intranet|.+\.lan|.+\.corp|.+\.private|.+\.svc|.+\.cluster\.local|.+\.home\.arpa)$/i;
-
 /**
- * Exported for lib/chat-integrations.ts, which validates generic-webhook URLs
- * under the same rule. One list: a name added here (the `.svc` lesson above) is
- * automatically refused a webhook payload too, rather than waiting for someone
- * to remember the second copy. Callers must strip trailing dots first.
+ * The internal-hostname rule lives in @qaai/shared/private-address now.
+ *
+ * There were THREE implementations of "is this address inside our network":
+ * this anchored regex, the worker's action dispatcher, and the plugin sandbox.
+ * An attacker needs only the weakest of the three, and the `.svc` lesson in the
+ * comment above is exactly the kind of thing that gets learned in one copy and
+ * not the others — this one had already been through that once.
+ *
+ * Re-exported under the original name so callers here and in
+ * lib/chat-integrations.ts do not move.
  */
-export function isInternalHostname(host: string): boolean {
-  return INTERNAL_HOST.test(host);
-}
+import { isPrivateNetworkName } from '@qaai/shared/private-address';
 
+export { isPrivateNetworkName as isInternalHostname };
 /** IPv4 literal or anything with a colon (IPv6, or a port smuggled into a host). */
 export function isIpLiteralHost(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
@@ -256,7 +258,7 @@ export function jiraSite(baseUrl: string): string {
    * correctly refused, and the vault-unsealed Jira credential went with it.
    */
   const host = url.hostname.replace(/\.+$/, '');
-  if (isIpLiteralHost(host) || isInternalHostname(host) || !host.includes('.')) {
+  if (isIpLiteralHost(host) || isPrivateNetworkName(host) || !host.includes('.')) {
     throw new IssueFilingError(
       `Refusing to send a Jira token to ${host}: use the public hostname of your Jira site.`,
     );

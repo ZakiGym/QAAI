@@ -24,3 +24,12 @@ export * from './plugin-capabilities';
 export * from './webhook-failure';
 export * from './job-enums';
 export * from './jobs';
+/*
+ * The event-action vocabulary. It is a PUBLIC contract — the API validates a
+ * subscription against it and the web app renders the labels from it — and
+ * neither could import it while it was missing from this barrel. Safe to add
+ * here specifically because `action-events.ts` holds types, constants and pure
+ * functions only: no `node:crypto`, no `node:dns`, nothing the web bundler
+ * would choke on. The dispatcher that does have those lives in the worker.
+ */
+export * from './action-events';

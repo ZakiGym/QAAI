@@ -270,6 +270,53 @@ describe('evaluateInstall', () => {
     expect(verdict.message).toMatch(/signing key/i);
   });
 
+  it('refuses a key that belongs to a different publisher than the manifest names', () => {
+    /*
+     * The verification step asks "does this signature check out under
+     * publisher.publicKey" and the refusal it prints says manifest.publisher —
+     * and nothing tied the two together. So this candidate is INTERNALLY
+     * CONSISTENT in every way the function used to look at: the manifest is
+     * published by "evilcorp", the signature is genuinely evilcorp's, and the
+     * key verifies. The only thing wrong with it is that the trusted-publisher
+     * row the caller handed over is acme's.
+     *
+     * Without the cross-check this returns ok:true and the org installs
+     * evilcorp's code on the strength of a row that says "we trust acme".
+     */
+    const m = manifest({ publisher: 'evilcorp' });
+    const verdict = evaluateInstall(
+      candidate({
+        manifest: m,
+        signature: sign(m, impostor.privateKey),
+        publisher: trusted({ publisherId: 'acme', publicKey: impostor.raw }),
+      }),
+    );
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.code).toBe('UNKNOWN_PUBLISHER');
+    expect(verdict.message).toContain('"evilcorp"');
+    expect(verdict.message).toContain('"acme"');
+    expect(verdict.detail).toMatchObject({ publisher: 'evilcorp', offeredKeyFor: 'acme' });
+  });
+
+  it('cross-checks the publisher before it reports anything the signature vouches for', () => {
+    // Same mismatch, but the manifest is ALSO malformed-adjacent: a reserved
+    // name. The refusal must still be the publisher one, because a sentence
+    // about the name is a sentence quoting a document verified under the wrong
+    // party's key.
+    const m = manifest({ publisher: 'evilcorp', name: 'qaai-pro' });
+    const verdict = evaluateInstall(
+      candidate({
+        manifest: m,
+        signature: sign(m, impostor.privateKey),
+        publisher: trusted({ publisherId: 'acme', publicKey: impostor.raw }),
+      }),
+    );
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) return;
+    expect(verdict.code).toBe('UNKNOWN_PUBLISHER');
+  });
+
   it('refuses a revoked key and says when it was revoked', () => {
     const verdict = evaluateInstall(
       candidate({ publisher: trusted({ revokedAt: new Date('2026-07-04T00:00:00.000Z') }) }),

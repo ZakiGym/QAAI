@@ -53,6 +53,24 @@
  * is switched on, `containmentTier()` reports it, because the permission model
  * IS per-process and therefore does cover worker threads.
  *
+ * ─── The one capability that leaves the process: `http` ──────────────────────
+ *
+ * `http` is mediated rather than granted precisely so that QAAI, and not the
+ * plugin, decides where the connection goes. That argument only holds if this
+ * file actually decides. It did not: the destination check lived entirely on
+ * the host's side of `onCall`, where it compared the URL against a SET of
+ * allowed origins that the installed record could extend — so an origin list
+ * reading `["http://169.254.169.254"]` was honoured verbatim, and the mediated
+ * capability became an SSRF primitive pointed at our own network.
+ *
+ * `checkHttpDestination` moves the rule to the boundary the plugin crosses,
+ * ahead of `onCall`, and states it as the capability's own copy states it to
+ * the person approving the install: the environment under test's own origin,
+ * scheme host and port, and nothing else. A host may narrow that; it cannot
+ * widen it. An off-origin request is a refusal the plugin observes; a request
+ * aimed INSIDE our network ends the run, because that is a boundary probe and
+ * not a bug.
+ *
  * ─── The one that bites: giant strings ───────────────────────────────────────
  *
  * Measured on Node 25, not inferred. `'x'.repeat(300 * 1024 * 1024)` inside a
@@ -73,6 +91,13 @@
  */
 
 import { Worker } from 'node:worker_threads';
+/*
+ * A SUBPATH, not the barrel: private-address.ts reaches for `node:dns`, and the
+ * barrel is what the web app's bundler consumes. The subpath keeps one
+ * definition of "is this address inside our network" reachable from the worker
+ * and the runner without dragging dns into a browser tab.
+ */
+import { classifyHost } from '@qaai/shared/private-address';
 
 // ─── Capability model ────────────────────────────────────────────────────────
 
@@ -250,6 +275,7 @@ export type PluginFaultKind =
   | 'BAD_SHAPE'
   | 'TOO_MANY_EMITTED'
   | 'HOST_CALL_LIMIT'
+  | 'EGRESS_REFUSED'
   | 'CANCELLED';
 
 export interface PluginFault {
@@ -465,6 +491,150 @@ const BOOTSTRAP_FAULT_KINDS = new Set<string>([
   'BAD_SHAPE',
 ]);
 
+// ─── Egress policy for the mediated `http` capability ────────────────────────
+
+/**
+ * What the host is allowed to do with one `http` request the plugin asked for.
+ *
+ * Three outcomes rather than two, and the third one is the whole point:
+ *
+ *  - `allow` — the destination is the environment under test. Go.
+ *  - `refuse` — the plugin asked for somewhere it is not entitled to reach, and
+ *    that is a BUG IN THE PLUGIN. It observes a rejected promise and keeps
+ *    running, exactly like asking for a fixture it never declared.
+ *  - `probe` — the plugin asked QAAI to open a connection INSIDE QAAI'S OWN
+ *    NETWORK: the cloud metadata service, a database port on loopback, a
+ *    cluster-internal name, or an address written in a form chosen so that two
+ *    parsers would read it differently. That is not a bug, it is somebody using
+ *    the mediated capability as an SSRF primitive, and it ends the run — the
+ *    same treatment `UNDECLARED_CAPABILITY` already gets, for the same reason:
+ *    a boundary probe must not be a retryable error the caller can swallow.
+ */
+export type HttpDestination =
+  | { verdict: 'allow'; url: string }
+  | { verdict: 'refuse'; reason: string }
+  | { verdict: 'probe'; reason: string };
+
+/**
+ * Decide where a plugin's `http` call may go.
+ *
+ * ─── Why this lives HERE and not only in the mediation ───────────────────────
+ *
+ * The host's `onCall` builds the request, so the obvious place for this check
+ * is there — and there is one there. It compares the destination against a SET
+ * of allowed origins: the environment's baseUrl plus whatever extra origins the
+ * installed record carries. That set is data, and the moment anything ever
+ * populates the extra half, `http` becomes an SSRF primitive with no address
+ * classification anywhere behind it: an origin list reading
+ * `["http://169.254.169.254"]` was, when this was written, accepted verbatim
+ * and the request attempted, from our network, with the body handed back.
+ *
+ * So the rule the CAPABILITY'S OWN COPY promises the person installing the
+ * plugin — "QAAI makes the request, against the environment's own origin" — is
+ * enforced at the boundary the plugin actually crosses, before `onCall` is
+ * consulted at all. A host may be more restrictive than this; it cannot be less.
+ *
+ * ─── Same origin, exactly ────────────────────────────────────────────────────
+ *
+ * `url.origin === base.origin` is scheme, host AND port. It is the strongest
+ * rule available and it needs no resolver: the operator pointed this run at
+ * this origin, so it is the environment by definition — including when it is
+ * `http://127.0.0.1:3000`, which is what a local run looks like and which no
+ * address-classification rule could admit without admitting every loopback
+ * port on the box.
+ *
+ * That leaves classification with exactly one job, and it is the one that
+ * matters: deciding whether an OFF-origin destination is merely wrong or is
+ * pointed at our insides.
+ *
+ * ─── Redirects ───────────────────────────────────────────────────────────────
+ *
+ * A redirect is not followed by anybody: the host fetches with
+ * `redirect: 'manual'`, so a 3xx comes back to the plugin as a status and a
+ * Location header. If the plugin wants the next hop it must ask for it, and the
+ * ask arrives here — so "starts public, lands private" is refused on the hop
+ * that lands, not trusted because the first hop looked fine.
+ */
+export function checkHttpDestination(rawUrl: unknown, baseUrl: string): HttpDestination {
+  let base: URL;
+  try {
+    base = new URL(baseUrl);
+  } catch {
+    // No environment origin means there is nothing a plugin is entitled to
+    // reach. Refusing everything is the only reading that fails closed.
+    return {
+      verdict: 'refuse',
+      reason: 'this run has no usable environment URL, so `http` can reach nothing',
+    };
+  }
+
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0) {
+    return { verdict: 'refuse', reason: 'the plugin asked for a URL QAAI could not parse' };
+  }
+
+  let url: URL;
+  try {
+    url = new URL(rawUrl, base);
+  } catch {
+    return { verdict: 'refuse', reason: 'the plugin asked for a URL QAAI could not parse' };
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return { verdict: 'refuse', reason: `"${url.protocol}" is not an allowed scheme` };
+  }
+  if (url.username || url.password) {
+    return {
+      verdict: 'refuse',
+      reason: 'a mediated request may not carry credentials embedded in the URL',
+    };
+  }
+
+  if (url.origin === base.origin) return { verdict: 'allow', url: url.toString() };
+
+  const host = classifyHost(url.hostname);
+  const label = url.origin.slice(0, 120);
+
+  /*
+   * `ambiguous` is a probe and never a refusal. `0177.0.0.1`, `2130706433` and
+   * `0x7f.0.0.1` are all loopback to something in the stack below us and a
+   * hostname to something else; nobody types one by accident, and the only
+   * reason to write an address that way is that some check in between reads it
+   * differently from the socket that opens.
+   */
+  if (host.kind === 'ambiguous') {
+    return { verdict: 'probe', reason: `${label} — ${host.why}` };
+  }
+  if (host.kind === 'address' && host.class !== 'public') {
+    return {
+      verdict: 'probe',
+      reason: `${label} is a ${host.class} address, which is inside QAAI's own network`,
+    };
+  }
+  if (host.kind === 'name' && host.internal) {
+    return {
+      verdict: 'probe',
+      reason: `${label} is a name that resolves inside a private network`,
+    };
+  }
+
+  /*
+   * Off-origin but plausibly on the public internet. This is the exfiltration
+   * shape — a plugin holding a response body and wanting to POST it somewhere
+   * it chose — and it is a refusal rather than a probe because the run is not
+   * being used to reach anything of ours. The plugin sees it and can carry on.
+   *
+   * NOTE what is deliberately NOT done: the name is not resolved. Every
+   * off-origin destination is refused whatever it resolves to, so a lookup
+   * would change no outcome while turning the refusal path into an outbound
+   * DNS request a plugin can aim. `resolvesPublicly` in the shared module is
+   * for callers that will actually connect.
+   */
+  return {
+    verdict: 'refuse',
+    reason: `the plugin asked to reach ${label}, which is not the environment under test (${base.origin})`,
+  };
+}
+
 /** Bounds what an untrusted argument can cost us before we look at it. */
 const MAX_CALL_ARGS = 8;
 const MAX_CALL_STRING = 8192;
@@ -511,148 +681,211 @@ export async function runInSandbox(options: SandboxOptions): Promise<SandboxOutc
     return { ok: false, fault: { kind: 'CANCELLED', message: 'the run was cancelled' }, usage: usage() };
   }
 
-  const worker = new Worker(BOOTSTRAP, {
-    eval: true,
-    workerData: { code, request, granted: [...granted], limits },
-    // An empty environment is the strongest single control here: the vault key,
-    // the database URL and the S3 credentials are not merely unreadable, they
-    // are absent from the isolate.
-    env: {},
-    argv: [],
-    execArgv: [],
-    resourceLimits: {
-      maxOldGenerationSizeMb: limits.memoryMb,
-      maxYoungGenerationSizeMb: Math.min(16, Math.max(4, Math.floor(limits.memoryMb / 8))),
-      stackSizeMb: 4,
-    },
-    // Detached from the parent's streams, then drained. A plugin that writes a
-    // gigabyte to stdout would otherwise either fill the operator's logs or,
-    // unread, buffer in the parent's heap.
-    stdout: true,
-    stderr: true,
-  });
-  worker.stdout.resume();
-  worker.stderr.resume();
+  /*
+   * From here to the end of the function everything is inside one try, and the
+   * catch turns a throw into a FAULT rather than a rejection.
+   *
+   * The docblock above has always said this function never throws, and the
+   * loader's attribution guarantee rests on that sentence: `executeExternal`
+   * awaits this and converts a fault into a SKIPPED execution, while a
+   * REJECTION propagates out of the plugin's `execute()` and is recorded by
+   * apps/worker/src/processors/run.ts as the customer's application failing —
+   * the single worst bug this feature can ship.
+   *
+   * The sentence was not true. `new Worker(...)` runs synchronously, outside
+   * the promise below, and it throws: a `request.spec` carrying anything
+   * structured-clone cannot copy raises DataCloneError before the isolate
+   * exists (`() => 1 could not be cloned.`, verified on Node 25), and thread
+   * creation itself fails with EAGAIN on a loaded host. Both came back as
+   * "your checkout is broken".
+   */
+  let started: Worker | null = null;
+  try {
+    const worker = new Worker(BOOTSTRAP, {
+      eval: true,
+      workerData: { code, request, granted: [...granted], limits },
+      // An empty environment is the strongest single control here: the vault key,
+      // the database URL and the S3 credentials are not merely unreadable, they
+      // are absent from the isolate.
+      env: {},
+      argv: [],
+      execArgv: [],
+      resourceLimits: {
+        maxOldGenerationSizeMb: limits.memoryMb,
+        maxYoungGenerationSizeMb: Math.min(16, Math.max(4, Math.floor(limits.memoryMb / 8))),
+        stackSizeMb: 4,
+      },
+      // Detached from the parent's streams, then drained. A plugin that writes a
+      // gigabyte to stdout would otherwise either fill the operator's logs or,
+      // unread, buffer in the parent's heap.
+      stdout: true,
+      stderr: true,
+    });
+    // Recorded for the catch below, which must clean up a worker that was
+    // created before the throw rather than leave the thread running.
+    started = worker;
+    worker.stdout.resume();
+    worker.stderr.resume();
 
-  return await new Promise<SandboxOutcome>((resolve) => {
-    const finish = (outcome: SandboxOutcome): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      signal.removeEventListener('abort', onAbort);
-      // Unconditional: a plugin whose report already arrived may still be
-      // holding an interval open, and that keeps the worker's loop — and the
-      // run — alive past the test.
-      void worker.terminate();
-      resolve(outcome);
-    };
+    return await new Promise<SandboxOutcome>((resolve) => {
+      const finish = (outcome: SandboxOutcome): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadline);
+        signal.removeEventListener('abort', onAbort);
+        // Unconditional: a plugin whose report already arrived may still be
+        // holding an interval open, and that keeps the worker's loop — and the
+        // run — alive past the test.
+        void worker.terminate();
+        resolve(outcome);
+      };
 
-    const fail = (kind: PluginFaultKind, message: string, stack: string | null = null): void =>
-      finish({ ok: false, fault: { kind, message, stack }, usage: usage() });
+      const fail = (kind: PluginFaultKind, message: string, stack: string | null = null): void =>
+        finish({ ok: false, fault: { kind, message, stack }, usage: usage() });
 
-    const deadline = setTimeout(() => {
-      fail(
-        'TIMEOUT',
-        `the plugin did not finish within ${limits.wallClockMs}ms and was stopped`,
-      );
-    }, limits.wallClockMs);
-
-    const onAbort = (): void => fail('CANCELLED', 'the run was cancelled');
-    signal.addEventListener('abort', onAbort, { once: true });
-
-    const handleCall = (raw: Record<string, unknown>): void => {
-      const id = raw.id;
-      const capability = raw.capability;
-      const method = raw.method;
-
-      // The grant check lives HERE, not in the api object the bootstrap builds,
-      // because plugin code can reach parentPort directly and forge this
-      // message. Asking for something it never declared is a boundary probe,
-      // so it ends the run rather than returning an error the plugin can retry.
-      if (typeof capability !== 'string' || !granted.has(capability as Capability)) {
+      const deadline = setTimeout(() => {
         fail(
-          'UNDECLARED_CAPABILITY',
-          `the plugin asked the host for "${typeof capability === 'string' ? capability.slice(0, 60) : 'an unnamed capability'}", which its manifest does not declare`,
+          'TIMEOUT',
+          `the plugin did not finish within ${limits.wallClockMs}ms and was stopped`,
         );
-        return;
-      }
+      }, limits.wallClockMs);
 
-      hostCalls += 1;
-      if (hostCalls > limits.maxHostCalls) {
-        fail('HOST_CALL_LIMIT', `the plugin made more than ${limits.maxHostCalls} host calls`);
-        return;
-      }
+      const onAbort = (): void => fail('CANCELLED', 'the run was cancelled');
+      signal.addEventListener('abort', onAbort, { once: true });
 
-      if (typeof method !== 'string' || method.length > 64 || !argsAreSane(raw.args)) {
-        fail('BAD_SHAPE', 'the plugin sent a malformed host call');
-        return;
-      }
+      const handleCall = (raw: Record<string, unknown>): void => {
+        const id = raw.id;
+        const capability = raw.capability;
+        const method = raw.method;
 
-      void onCall({ capability: capability as Capability, method, args: raw.args })
-        .then((value) => {
-          if (!settled) worker.postMessage({ id, value });
-        })
-        .catch((err: unknown) => {
-          if (settled) return;
-          const message = err instanceof Error ? err.message : String(err);
-          worker.postMessage({ id, error: message.slice(0, 500) });
-        });
+        // The grant check lives HERE, not in the api object the bootstrap builds,
+        // because plugin code can reach parentPort directly and forge this
+        // message. Asking for something it never declared is a boundary probe,
+        // so it ends the run rather than returning an error the plugin can retry.
+        if (typeof capability !== 'string' || !granted.has(capability as Capability)) {
+          fail(
+            'UNDECLARED_CAPABILITY',
+            `the plugin asked the host for "${typeof capability === 'string' ? capability.slice(0, 60) : 'an unnamed capability'}", which its manifest does not declare`,
+          );
+          return;
+        }
+
+        hostCalls += 1;
+        if (hostCalls > limits.maxHostCalls) {
+          fail('HOST_CALL_LIMIT', `the plugin made more than ${limits.maxHostCalls} host calls`);
+          return;
+        }
+
+        if (typeof method !== 'string' || method.length > 64 || !argsAreSane(raw.args)) {
+          fail('BAD_SHAPE', 'the plugin sent a malformed host call');
+          return;
+        }
+
+        /*
+         * The egress rule is enforced BEFORE the host is asked to perform the
+         * effect, so the promise the capability's copy makes ("QAAI makes the
+         * request, against the environment's own origin") is a property of this
+         * boundary rather than of whatever mediation happens to be wired in. A
+         * host may narrow this further; it cannot widen it.
+         */
+        if (capability === 'http') {
+          const args = raw.args as unknown[];
+          const init = isRecord(args[0]) ? args[0] : {};
+          const destination = checkHttpDestination(init.url, request.baseUrl);
+          if (destination.verdict === 'probe') {
+            fail(
+              'EGRESS_REFUSED',
+              `the plugin asked QAAI to make a request inside its own network — ${destination.reason}`,
+            );
+            return;
+          }
+          if (destination.verdict === 'refuse') {
+            // Observed by the plugin as a rejected promise, the same as any other
+            // refusal it can provoke. It keeps running; it just does not get this.
+            worker.postMessage({ id, error: destination.reason.slice(0, 500) });
+            return;
+          }
+        }
+
+        void onCall({ capability: capability as Capability, method, args: raw.args })
+          .then((value) => {
+            if (!settled) worker.postMessage({ id, value });
+          })
+          .catch((err: unknown) => {
+            if (settled) return;
+            const message = err instanceof Error ? err.message : String(err);
+            worker.postMessage({ id, error: message.slice(0, 500) });
+          });
+      };
+
+      worker.on('message', (raw: unknown) => {
+        if (settled || !isRecord(raw)) return;
+
+        if (raw.type === 'call') return handleCall(raw);
+
+        if (raw.type === 'fault') {
+          // The kind arrives from inside the isolate, so it is a claim rather
+          // than a fact. Anything outside the set the bootstrap can legitimately
+          // raise collapses to THREW — a plugin must not be able to relabel its
+          // own crash as, say, CANCELLED and have the run stop blaming it.
+          const kind = typeof raw.kind === 'string' ? raw.kind : 'THREW';
+          return fail(
+            BOOTSTRAP_FAULT_KINDS.has(kind) ? (kind as PluginFaultKind) : 'THREW',
+            typeof raw.message === 'string' ? raw.message.slice(0, 2000) : 'the plugin failed',
+            typeof raw.stack === 'string' ? raw.stack.slice(0, 4000) : null,
+          );
+        }
+
+        if (raw.type !== 'result') return;
+
+        // Size is checked against the raw buffer before a single byte is decoded,
+        // so a forged oversized payload costs a length comparison, not a decode.
+        const buffer = raw.bytes;
+        const len = raw.len;
+        if (!(buffer instanceof ArrayBuffer) || typeof len !== 'number') {
+          return fail('BAD_SHAPE', 'the plugin sent a report QAAI could not read');
+        }
+        if (
+          buffer.byteLength > limits.maxOutputBytes ||
+          len > limits.maxOutputBytes ||
+          len > buffer.byteLength ||
+          len < 0
+        ) {
+          return fail(
+            'OUTPUT_TOO_LARGE',
+            `the plugin's report exceeds the ${limits.maxOutputBytes}-byte budget`,
+          );
+        }
+        outputBytes = len;
+        const json = new TextDecoder().decode(new Uint8Array(buffer, 0, len));
+        return finish({ ok: true, json, usage: usage() });
+      });
+
+      worker.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code === 'ERR_WORKER_OUT_OF_MEMORY') {
+          return fail('OUT_OF_MEMORY', `the plugin exceeded its ${limits.memoryMb}MB memory limit`);
+        }
+        // A throw at module scope surfaces here rather than as a fault message,
+        // because the bootstrap's own catch never gets to run.
+        return fail('LOAD_ERROR', err.message.slice(0, 2000), err.stack?.slice(0, 4000) ?? null);
+      });
+
+      worker.on('exit', (exitCode) => {
+        fail('CRASHED', `the plugin's isolate exited with code ${exitCode} before reporting`);
+      });
+    });
+  } catch (err) {
+    if (started) void started.terminate();
+    return {
+      ok: false,
+      fault: {
+        kind: 'CRASHED',
+        message: `the plugin's isolate could not be started: ${
+          err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500)
+        }`,
+        stack: err instanceof Error ? (err.stack?.slice(0, 4000) ?? null) : null,
+      },
+      usage: usage(),
     };
-
-    worker.on('message', (raw: unknown) => {
-      if (settled || !isRecord(raw)) return;
-
-      if (raw.type === 'call') return handleCall(raw);
-
-      if (raw.type === 'fault') {
-        // The kind arrives from inside the isolate, so it is a claim rather
-        // than a fact. Anything outside the set the bootstrap can legitimately
-        // raise collapses to THREW — a plugin must not be able to relabel its
-        // own crash as, say, CANCELLED and have the run stop blaming it.
-        const kind = typeof raw.kind === 'string' ? raw.kind : 'THREW';
-        return fail(
-          BOOTSTRAP_FAULT_KINDS.has(kind) ? (kind as PluginFaultKind) : 'THREW',
-          typeof raw.message === 'string' ? raw.message.slice(0, 2000) : 'the plugin failed',
-          typeof raw.stack === 'string' ? raw.stack.slice(0, 4000) : null,
-        );
-      }
-
-      if (raw.type !== 'result') return;
-
-      // Size is checked against the raw buffer before a single byte is decoded,
-      // so a forged oversized payload costs a length comparison, not a decode.
-      const buffer = raw.bytes;
-      const len = raw.len;
-      if (!(buffer instanceof ArrayBuffer) || typeof len !== 'number') {
-        return fail('BAD_SHAPE', 'the plugin sent a report QAAI could not read');
-      }
-      if (
-        buffer.byteLength > limits.maxOutputBytes ||
-        len > limits.maxOutputBytes ||
-        len > buffer.byteLength ||
-        len < 0
-      ) {
-        return fail(
-          'OUTPUT_TOO_LARGE',
-          `the plugin's report exceeds the ${limits.maxOutputBytes}-byte budget`,
-        );
-      }
-      outputBytes = len;
-      const json = new TextDecoder().decode(new Uint8Array(buffer, 0, len));
-      return finish({ ok: true, json, usage: usage() });
-    });
-
-    worker.on('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'ERR_WORKER_OUT_OF_MEMORY') {
-        return fail('OUT_OF_MEMORY', `the plugin exceeded its ${limits.memoryMb}MB memory limit`);
-      }
-      // A throw at module scope surfaces here rather than as a fault message,
-      // because the bootstrap's own catch never gets to run.
-      return fail('LOAD_ERROR', err.message.slice(0, 2000), err.stack?.slice(0, 4000) ?? null);
-    });
-
-    worker.on('exit', (exitCode) => {
-      fail('CRASHED', `the plugin's isolate exited with code ${exitCode} before reporting`);
-    });
-  });
+  }
 }

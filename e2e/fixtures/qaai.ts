@@ -259,3 +259,36 @@ export function openTab(page: Page, filePath: string): Locator {
 export function treeRow(page: Page, filePath: string): Locator {
   return page.locator(`[role="treeitem"] [title="${filePath}"]`).first();
 }
+
+/**
+ * The project the UI actually has selected, not the one the API lists first.
+ *
+ * `firstProject` returns `projects[0]`, and GET /projects is newest-first — so
+ * any spec that creates a project changes what it means, mid-suite, for every
+ * other spec. The sidebar meanwhile keeps its own choice in localStorage, which
+ * the stored auth state carries between runs. The two drift apart, and a test
+ * comparing UI content against `firstProject` data then fails for a reason that
+ * has nothing to do with what it was testing. This suite has chased that flake
+ * three times.
+ *
+ * Anything asserting on what a SCREEN shows for the current project should ask
+ * here. `firstProject` is still right for API-only work.
+ */
+export async function selectedProject(
+  page: Page,
+  api: APIRequestContext,
+): Promise<ProjectLite> {
+  const label = await page
+    .getByRole('button', { name: /^Project: / })
+    .getAttribute('aria-label');
+  const name = (label ?? '').replace(/^Project:\s*/, '').trim();
+
+  const { projects } = await getJson<{ projects: ProjectLite[] }>(api, '/projects');
+  const chosen = projects.find((p) => p.name === name);
+  expect(
+    chosen,
+    `The sidebar shows "${name}" and GET /projects does not list it. The UI and the API ` +
+      'disagree about which projects exist, which is a real defect and not a flake.',
+  ).toBeDefined();
+  return chosen!;
+}

@@ -37,6 +37,12 @@ import {
 import type { InstalledPlugin } from './external-loader.js';
 import { DEFAULT_SANDBOX_LIMITS } from './sandbox.js';
 import type { SandboxLimits } from './sandbox.js';
+import {
+  PLUGIN_MANIFEST_SCHEMA,
+  PLUGIN_PROTOCOL_VERSION,
+  bundleDigest,
+  evaluateInstall,
+} from '../../../shared/src/plugin-manifest.js';
 
 let server: Server;
 let baseUrl: string;
@@ -134,6 +140,72 @@ async function execute(
 const OK_REPORT = `{ status: 'PASSED', steps: [{ title: 'measured LCP', status: 'PASSED' }], findings: [] }`;
 
 // ─── Content hash ────────────────────────────────────────────────────────────
+
+// ─── One hash, not two ───────────────────────────────────────────────────────
+
+describe('the loader and the registry mean the same digest', () => {
+  /*
+   * There used to be two definitions of "the content hash" and they were over
+   * different things: the registry's `code.sha256` is a SHA-256 over the bundle
+   * bytes, computed by `bundleDigest`, signed by the publisher and refused at
+   * install when it disagrees; this file's was a SHA-256 over the entry file's
+   * source as a UTF-8 string, computed by nobody at install time.
+   *
+   * The registry's won, on provenance — see `pluginContentHash`. These tests
+   * pin the consequences of that choice, because both values are a SHA-256 and
+   * would coincide for any input either could handle: what changed is which
+   * bytes and which function, and neither is visible in a digest.
+   */
+  const bundle = Buffer.from('export const execute = async () => ({});', 'utf8');
+
+  it('produces exactly the digest the manifest carries', () => {
+    expect(pluginContentHash(bundle)).toBe(`sha256:${bundleDigest(bundle)}`);
+  });
+
+  it('verifies against the bare hex an install stored, unprefixed', () => {
+    // `Plugin.codeSha256` is the manifest's `code.sha256`: 64 lowercase hex
+    // characters and no scheme. If the runtime could only accept its own
+    // prefixed form, the verification would refuse every real install.
+    const stored = bundleDigest(bundle);
+    expect(stored).toMatch(/^[0-9a-f]{64}$/);
+    expect(verifyContentHash(bundle, stored)).toBeNull();
+  });
+
+  it('accepts the digest evaluateInstall refuses installs on', () => {
+    // The end-to-end statement of the contract: the value the API demands the
+    // bundle hash to is the value the runtime will verify it against. A change
+    // to either side's domain — hashing the entry file, hashing a re-encoding,
+    // adding a prefix — breaks this and nothing else in the repo.
+    const verdict = evaluateInstall({
+      manifest: {
+        schema: PLUGIN_MANIFEST_SCHEMA,
+        name: 'acme-lighthouse',
+        version: '1.4.2',
+        publisher: 'acme',
+        displayName: 'Acme Lighthouse',
+        description: 'Measures the pages the suite visits.',
+        protocol: PLUGIN_PROTOCOL_VERSION,
+        capabilities: ['http'],
+        code: { sha256: bundleDigest(bundle), bytes: bundle.length, entry: 'dist/index.js' },
+      },
+      signature: { algorithm: 'ed25519', value: 'unchecked' },
+      bundleSha256: bundleDigest(bundle),
+      // No trusted publisher, so the verdict is UNKNOWN_PUBLISHER — which is
+      // the point: the digest comparison sits BEHIND the signature check, so
+      // reaching a hash refusal at all would mean the order had been reversed.
+      publisher: null,
+      plan: { label: 'Business', allowsGovernedCapabilities: true },
+    });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) throw new Error('unreachable');
+    expect(verdict.code).toBe('UNKNOWN_PUBLISHER');
+    expect(verifyContentHash(bundle, bundleDigest(bundle))).toBeNull();
+  });
+
+  it('hashes bytes, so a bundle and its source string agree', () => {
+    expect(pluginContentHash(bundle)).toBe(pluginContentHash(bundle.toString('utf8')));
+  });
+});
 
 describe('the content hash is checked before anything executes', () => {
   it('accepts code that hashes to what the registry recorded', () => {

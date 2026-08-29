@@ -265,15 +265,82 @@ export function checkArgv(argv: readonly string[]): ArgvCheck {
  * ordinary output and hide more than it protects. Longest first, so a value
  * that contains another is not left half-replaced.
  */
+export const MIN_REDACTABLE_LENGTH = 8;
+
+/** The values `redactSecrets` will actually act on, longest first. */
+function redactable(secrets: readonly string[]): string[] {
+  return [
+    ...new Set(
+      secrets.filter(
+        (value) => typeof value === 'string' && value.length >= MIN_REDACTABLE_LENGTH,
+      ),
+    ),
+  ].sort((a, b) => b.length - a.length);
+}
+
 export function redactSecrets(text: string, secrets: readonly string[]): string {
-  const values = [...new Set(secrets.filter((value) => typeof value === 'string' && value.length >= 8))].sort(
-    (a, b) => b.length - a.length,
-  );
   let out = text;
-  for (const value of values) {
+  for (const value of redactable(secrets)) {
     if (out.includes(value)) out = out.split(value).join('[redacted by the QAAI agent]');
   }
   return out;
+}
+
+/**
+ * Redaction that survives a chunk boundary.
+ *
+ * `redactSecrets` on its own is only correct when it can see a whole secret at
+ * once, and a stream cannot promise that. A pipe read lands wherever the
+ * kernel put it: anything longer than a pipe buffer, or written by a process in
+ * two `write` calls, arrives split — and a secret split across two reads was
+ * passing through as two halves that reassemble perfectly in the browser. Each
+ * half is unrecognisable to a substring search and the pair is the credential.
+ * That is the exact scenario `redactSecrets` exists to prevent, so per-chunk
+ * redaction was not a weaker version of the guarantee; it was none of it.
+ *
+ * The fix is a BOUNDARY WINDOW. Everything seen so far but not yet released is
+ * redacted as one string, and the last `longest secret - 1` characters are held
+ * back rather than released, because a secret that begins inside them cannot
+ * yet be recognised. Any occurrence starting before that point is wholly
+ * present and therefore already replaced; any occurrence starting at or after
+ * it lies entirely inside what is still held. So one character of a secret can
+ * never leave ahead of the rest, however the reads fall.
+ *
+ * With no eligible secrets the window is zero and text passes straight through
+ * — the terminal is a live one, and holding output back for a session with
+ * nothing to redact would buy latency for nothing.
+ *
+ * `flush()` releases the tail. It MUST be called when the stream ends, or the
+ * last few characters of a command's output are silently eaten.
+ */
+export interface Redactor {
+  push(text: string): string;
+  flush(): string;
+}
+
+export function createRedactor(secrets: readonly string[]): Redactor {
+  const values = redactable(secrets);
+  const longest = values.reduce((max, value) => Math.max(max, value.length), 0);
+  const window = longest > 0 ? longest - 1 : 0;
+
+  let held = '';
+
+  return {
+    push(text: string): string {
+      if (window === 0) return redactSecrets(text, values);
+      if (!text) return '';
+      const pending = redactSecrets(held + text, values);
+      const keep = Math.min(pending.length, window);
+      held = pending.slice(pending.length - keep);
+      return pending.slice(0, pending.length - keep);
+    },
+    flush(): string {
+      if (!held) return '';
+      const tail = redactSecrets(held, values);
+      held = '';
+      return tail;
+    },
+  };
 }
 
 /**
@@ -331,6 +398,8 @@ export type CommandEnding =
   | 'timeout'
   | 'output-cap'
   | 'aborted'
+  /** The far end stopped accepting output, so the command was killed. */
+  | 'sink-closed'
   | 'abandoned';
 
 export interface ShellCommandOutcome {
@@ -359,7 +428,9 @@ export interface ShellCommandRequest {
    * output cap either way, but the backpressure is what keeps memory flat.
    *
    * Returning `'stop'` means the far end has stopped accepting (the session was
-   * closed, or the server hit its own cap) and the command is killed.
+   * closed, or the server hit its own cap) and the command is killed — process
+   * group and all — rather than left running to produce output with no reader.
+   * A thrown error is treated the same way.
    */
   onOutput: (stream: OutputStream, chunk: string) => Promise<void | 'stop'> | void | 'stop';
   /** Stopping the agent, or losing the job, kills whatever is running. */
@@ -432,19 +503,34 @@ export async function runShellCommand(request: ShellCommandRequest): Promise<She
   /** Serialises the uploads; each chunk waits for the one before it. */
   let chain: Promise<void> = Promise.resolve();
 
+  /*
+   * Set once the process exists, because that is the first moment there is
+   * anything to kill. `emit` runs before then — a refused argv and a failed
+   * spawn both report through it — and reaching a `const` declared further down
+   * this function from inside that path would be a temporal-dead-zone throw on
+   * the one code path with no process to signal anyway.
+   */
+  let onSinkClosed: (() => void) | null = null;
+
+  const closeSink = (): void => {
+    if (sinkClosed) return;
+    sinkClosed = true;
+    onSinkClosed?.();
+  };
+
   const emit = (stream: OutputStream, text: string): void => {
     if (!text) return;
     chain = chain.then(async () => {
       if (sinkClosed) return;
       try {
         const verdict = await request.onOutput(stream, text);
-        if (verdict === 'stop') sinkClosed = true;
+        if (verdict === 'stop') closeSink();
       } catch {
         // The channel is broken — the session was closed, or the API went
         // away. Dropping the rest is right: there is nobody to show it to, and
         // retrying a chunk of a terminal nobody is watching is not worth a
         // round trip. The command is still killed and still reported.
-        sinkClosed = true;
+        closeSink();
       }
     });
   };
@@ -498,11 +584,42 @@ export async function runShellCommand(request: ShellCommandRequest): Promise<She
     hard.unref?.();
   };
 
-  const deliver = (stream: OutputStream, raw: string): void => {
-    if (truncated || !raw) return;
-    // Redaction happens before the cap is applied, so what is counted is what
+  /*
+   * The kill-on-stop half of `onOutput`'s contract.
+   *
+   * The docs on `ShellCommandRequest.onOutput` have always said that returning
+   * `'stop'` kills the command; only the "stop sending" half was implemented,
+   * so a `cat` on a huge file whose session had closed went on reading it to
+   * the end on the customer's build host, with nobody left to show it to. The
+   * notice is recorded for the agent's own log and deliberately not emitted:
+   * the thing that would have displayed it is precisely the thing that just
+   * said it has stopped accepting output.
+   */
+  onSinkClosed = (): void => {
+    if (killing) return;
+    stop('sink-closed', null);
+    notice =
+      `qaai: "${shown}" was stopped because the far end stopped accepting its output — ` +
+      `the session was closed, or the server hit its own cap.\n`;
+  };
+
+  /*
+   * One redactor per stream, and per stream is the point: stdout and stderr are
+   * separate pipes whose reads interleave arbitrarily, so a single shared window
+   * would splice one stream's tail onto the other's head and invent matches
+   * that were never written next to each other.
+   */
+  const redactors: Record<OutputStream, Redactor> = {
+    stdout: createRedactor(redact),
+    stderr: createRedactor(redact),
+  };
+
+  /** Send text that has already been through the redactor. */
+  const release = (stream: OutputStream, redacted: string): void => {
+    if (truncated || !redacted) return;
+    // The cap is applied to what redaction produced, so what is counted is what
     // is actually sent.
-    let text = redactSecrets(raw, redact);
+    let text = redacted;
     const size = Buffer.byteLength(text, 'utf8');
 
     if (bytes + size > cap) {
@@ -519,6 +636,25 @@ export async function runShellCommand(request: ShellCommandRequest): Promise<She
         `\nqaai: "${shown}" produced more than ${Math.round(cap / 1024)} KB of output, ` +
           `so it was stopped here. The rest was never sent.\n`,
       );
+    }
+  };
+
+  const deliver = (stream: OutputStream, raw: string): void => {
+    if (truncated || !raw) return;
+    release(stream, redactors[stream].push(raw));
+  };
+
+  /**
+   * Release the boundary window each redactor is still holding.
+   *
+   * Called once the process is over, from every path that ends it. Skipping it
+   * would swallow the last few characters of the command's output — which,
+   * since the window is only ever as long as the longest secret, is exactly the
+   * kind of loss nobody would attribute to redaction.
+   */
+  const flushRedactors = (): void => {
+    for (const stream of ['stdout', 'stderr'] as const) {
+      release(stream, redactors[stream].flush());
     }
   };
 
@@ -603,6 +739,10 @@ export async function runShellCommand(request: ShellCommandRequest): Promise<She
 
   clearTimeout(timer);
   request.signal?.removeEventListener('abort', onAbort);
+  // After the process is over and before the uploads are awaited: every ending
+  // — a clean exit, a kill, an unkillable child — comes through here, so this
+  // is the one place the boundary window is guaranteed to be emptied.
+  flushRedactors();
   await chain;
 
   /*

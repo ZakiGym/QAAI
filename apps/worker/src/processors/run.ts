@@ -20,7 +20,8 @@
  * bug cannot reach a run that never asked to be sharded.
  */
 
-import { evaluateGates, pluginFor, reasonUnsupported } from '@qaai/runner';
+import { evaluateGates, reasonUnsupported } from '@qaai/runner';
+import { loadProjectPlugins, resolveTestPlugin } from '../lib/plugin-loading.js';
 import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS, RUN_SHARD_TERMINAL } from '@qaai/shared';
 import type { GridIntegrationKind, RunShardRef } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
@@ -372,6 +373,51 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     // Never hold the process open for a heartbeat.
     heartbeat?.unref?.();
 
+    /*
+     * The plugins this org enabled on this project (§4).
+     *
+     * Read once per run rather than per test — the answer cannot change
+     * mid-suite without making half the results mean something different from
+     * the other half — and read AFTER the run has been declared started, so a
+     * run that turns out not to be startable costs the registry nothing.
+     *
+     * `loadProjectPlugins` never throws and never fails a run. Every plugin it
+     * refuses is reported here as a plugin fault, on its own event and its own
+     * log line, and then the suite executes exactly as it would have. That is
+     * the rule the whole feature rests on: somebody else's broken plugin must
+     * never be reported as the customer's broken application, and must never
+     * be the reason a merge is blocked.
+     */
+    const projectPlugins = await loadProjectPlugins(prisma, {
+      orgId,
+      projectId: run.projectId,
+    });
+    for (const admission of projectPlugins.admissions) {
+      if (!admission.fault) continue;
+      logger.warn(
+        {
+          runId: run.id,
+          pluginId: admission.pluginId,
+          plugin: admission.label,
+          publisher: admission.publisher,
+          kind: admission.fault.kind,
+        },
+        'installed plugin was not run',
+      );
+      publishEvent(orgId, {
+        runId: run.id,
+        type: 'plugin.fault',
+        data: {
+          pluginId: admission.pluginId,
+          plugin: admission.label,
+          publisher: admission.publisher,
+          kind: admission.fault.kind,
+          message: admission.fault.message,
+        },
+        at: new Date().toISOString(),
+      });
+    }
+
     for (const [index, result] of run.results.entries()) {
       const test = result.test;
 
@@ -435,7 +481,12 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         at: new Date().toISOString(),
       });
 
-      const plugin = pluginFor(test.type);
+      /*
+       * First-party first, unconditionally — `resolveTestPlugin` does not
+       * consult the installed map for a type QAAI implements, so no registry
+       * row can put third-party code in front of the built-in plugin for E2E.
+       */
+      const plugin = resolveTestPlugin(test.type, projectPlugins);
       if (!plugin) {
         // A missing plugin is a product gap, not a test failure — recording it as
         // SKIPPED with the reason keeps the run honest and the UI truthful.

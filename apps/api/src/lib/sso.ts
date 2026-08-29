@@ -223,8 +223,14 @@ export function safeRelativePath(next: unknown, fallback = '/runs'): string {
  * a token-carrying request and the two lists must be allowed to diverge only
  * deliberately. If you add an entry here, add it there too.
  */
-const INTERNAL_HOST =
-  /^(localhost|.+\.localhost|.+\.local|.+\.internal|.+\.intranet|.+\.lan|.+\.corp|.+\.private|.+\.svc|.+\.cluster\.local|.+\.home\.arpa)$/i;
+/*
+ * The list lives in @qaai/shared/private-address. There were FIVE copies of
+ * this regex across the repo — here, the SSO discovery guard, the issue linker,
+ * the action dispatcher and the plugin sandbox — and the `.svc` entry in the
+ * comment above is the record of one of them learning a lesson the others had
+ * not. An attacker only needs the copy that has not learned it yet.
+ */
+import { isPrivateNetworkName } from '@qaai/shared/private-address';
 
 /**
  * Hosts an issuer is permitted to name in its discovery document, beyond its
@@ -275,7 +281,7 @@ export function safeOutboundUrl(raw: string, what: string): URL {
 
   const host = url.hostname.replace(/\.+$/, '');
   const isIpLiteral = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':');
-  if (isIpLiteral || INTERNAL_HOST.test(host) || !host.includes('.')) {
+  if (isIpLiteral || isPrivateNetworkName(host) || !host.includes('.')) {
     throw new SsoError(`Refusing to send a request to ${host}: use a public hostname.`, 'CONFIG');
   }
   if (url.pathname.includes('..')) {

@@ -33,8 +33,15 @@
  * context, with the plugin's declarations as the allowlist.
  */
 
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual } from 'node:crypto';
 import { TEST_TYPES, maskDeep, maskUrl } from '@qaai/shared';
+/*
+ * By path, not from the barrel: `plugin-manifest` imports node:crypto and
+ * @qaai/shared's barrel is what the web app's bundler consumes, so it is
+ * deliberately absent from it (see that file's header). Every real execution
+ * path here — vitest, tsc, tsx — resolves the relative import.
+ */
+import { bundleDigest } from '../../../shared/src/plugin-manifest.js';
 import type {
   ConsoleEntry,
   ExecutableTest,
@@ -91,26 +98,70 @@ function asString(value: unknown): string {
  * Deliberately a plain structural type rather than an import from the registry:
  * the runner must be able to refuse a record whose shape it does not recognise,
  * and sharing the manifest type would make "the registry said so" the check.
+ *
+ * ─── Which of these an install can actually supply ───────────────────────────
+ *
+ * Four of them, and no more. `id`, `name`, `version` and `capabilities` are
+ * columns on `Plugin`; `contentHash` is `code.sha256` off the signed manifest.
+ * The rest — `code`, `testType`, `secretNames`, `fixturePaths`, `httpOrigins`
+ * and `limits` — have NO source in what an install records, and each `NOT
+ * STORED` below is a thing a future schema change has to add before this
+ * interface can be filled in from the database rather than by a test.
+ *
+ * That gap is why `apps/worker/src/lib/plugin-loading.ts` verifies enabled
+ * plugins and then refuses them by name instead of calling `loadExternalPlugin`
+ * with fabricated values. Guessing any of these would be worse than refusing:
+ * an invented `secretNames` is an invented approval, and an invented `testType`
+ * is a third party silently answering for somebody's E2E suite.
  */
 export interface InstalledPlugin {
   id: string;
   name: string;
   version: string;
-  /** The TestType this plugin claims to implement. */
+  /**
+   * The TestType this plugin claims to implement.
+   *
+   * NOT STORED. `pluginManifestSchema` is `.strict()` and has no field for it,
+   * so a publisher currently cannot say which tests their plugin is for.
+   */
   testType: string;
-  /** ESM source. Must export `execute(api, request)`. */
+  /**
+   * The bundle, as the publisher published it. Must export `execute(api,
+   * request)` and must be the EXACT bytes `contentHash` covers — see
+   * `pluginContentHash`.
+   *
+   * NOT STORED. The install path is handed a digest of the bundle, never the
+   * bundle: there is no blob column, no object-storage key and no fetch URL on
+   * `Plugin`.
+   */
   code: string;
-  /** `sha256:<hex>` (bare hex accepted) recorded by the registry at install. */
+  /**
+   * The digest the publisher signed: `code.sha256` from the manifest, bare
+   * lowercase hex. A `sha256:`-prefixed value is accepted too.
+   */
   contentHash: string;
   /** Capability names from the manifest. Anything unmediated is refused. */
   capabilities: readonly string[];
-  /** Secret names the plugin may ask for. A name outside this list is refused. */
+  /**
+   * Secret names the plugin may ask for. A name outside this list is refused.
+   *
+   * NOT STORED. The manifest declares the `secrets` CAPABILITY but never names
+   * the individual secrets, so the per-name allowlist this file enforces has
+   * nothing to be built from — and the install screen's promise that each
+   * secret is approved one at a time has nothing behind it either.
+   */
   secretNames?: readonly string[];
-  /** Fixture paths the plugin may read. Same rule. */
+  /** Fixture paths the plugin may read. Same rule. NOT STORED. */
   fixturePaths?: readonly string[];
-  /** Extra origins `http` may reach, beyond the environment's own baseUrl. */
+  /**
+   * Extra origins `http` may reach, beyond the environment's own baseUrl.
+   * NOT STORED.
+   */
   httpOrigins?: readonly string[];
-  /** A REQUEST for tighter limits. It can only lower the ceiling, never raise it. */
+  /**
+   * A REQUEST for tighter limits. It can only lower the ceiling, never raise
+   * it. NOT STORED.
+   */
   limits?: Partial<SandboxLimits>;
 }
 
@@ -126,13 +177,38 @@ export type LoadedPlugin =
 // ─── Content hash ────────────────────────────────────────────────────────────
 
 /**
- * The one hash function the registry and the runtime must agree on. Exported so
- * the install path computes it with this code rather than with its own copy —
- * two implementations of "the content hash" is how a verification step quietly
- * starts passing on everything.
+ * The one hash function the registry and the runtime must agree on.
+ *
+ * ─── Which of the two definitions won, and why ───────────────────────────────
+ *
+ * There were two, and they were over different things. The registry's digest is
+ * `bundleDigest(bytes)` — a SHA-256 over the code bundle, carried as
+ * `code.sha256` INSIDE the manifest the publisher signs, refused at install
+ * when the bytes disagree (`evaluateInstall`), and stored on `Plugin`. This
+ * file's was a SHA-256 over the entry file's source decoded as a UTF-8 string,
+ * computed by nobody at install time.
+ *
+ * The registry's wins, on provenance. Its value is covered by the publisher's
+ * signature, so it is a claim somebody is accountable for; a digest the runtime
+ * computes over whatever it happens to be holding proves only that the runtime
+ * is self-consistent, which it would be while executing an attacker's file. A
+ * hash nobody signed is not an integrity anchor, it is a checksum.
+ *
+ * So this function no longer computes a digest — it delegates to the shared one
+ * — and what it hashes is BYTES, the same bytes the manifest describes. The
+ * consequence for a caller is the part that matters: `InstalledPlugin.code`
+ * must be the exact bundle content the publisher digested, not a re-encoding of
+ * it and not one file pulled out of a larger archive, because otherwise there
+ * is no arrangement of these two values under which the check can pass.
+ *
+ * The `sha256:` prefix stays on the way out because `verifyContentHash`'s
+ * messages read better with it and `normaliseHash` accepts the manifest's bare
+ * hex either way. The prefix is presentation; the digest underneath is now
+ * literally the same function the API refuses installs with.
  */
-export function pluginContentHash(code: string): string {
-  return `sha256:${createHash('sha256').update(code, 'utf8').digest('hex')}`;
+export function pluginContentHash(code: string | Uint8Array): string {
+  const bytes = typeof code === 'string' ? Buffer.from(code, 'utf8') : code;
+  return `sha256:${bundleDigest(bytes)}`;
 }
 
 function normaliseHash(raw: string): string | null {
@@ -150,7 +226,10 @@ function normaliseHash(raw: string): string | null {
  * signature over the code will live, and a comparison that is already constant
  * time cannot be the thing that was forgotten on the day it starts mattering.
  */
-export function verifyContentHash(code: string, expected: string): PluginFault | null {
+export function verifyContentHash(
+  code: string | Uint8Array,
+  expected: string,
+): PluginFault | null {
   const want = normaliseHash(expected);
   if (!want) {
     return {
