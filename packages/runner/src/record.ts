@@ -22,6 +22,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { playwrightCliPath } from './playwright-harness.js';
+import { childEnv } from './child-env.js';
 
 /** A recording browser left open forever should not leak a process indefinitely. */
 const MAX_RECORD_MS = 20 * 60_000;
@@ -82,7 +83,9 @@ export function startRecording(url: string): RecordingSession {
         child = spawn(
           playwrightCliPath,
           ['codegen', '--target', 'playwright-test', '--output', outputPath, url],
-          { stdio: ['ignore', 'ignore', 'pipe'] },
+          // Explicit env: omitting it inherits the worker's own, secrets
+          // included. See child-env.ts.
+          { env: childEnv(), stdio: ['ignore', 'ignore', 'pipe'] },
         );
         liveChildren.add(child);
 

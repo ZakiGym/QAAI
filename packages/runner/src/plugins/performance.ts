@@ -97,6 +97,7 @@ import type {
 } from '@qaai/shared';
 import type { BrowserContext, Page } from 'playwright';
 import { acquireBrowser } from '../browser-pool.js';
+import { childEnv } from '../child-env.js';
 
 // ─── Shapes ──────────────────────────────────────────────────────────────────
 
@@ -730,7 +731,8 @@ function runCommand(opts: {
   return new Promise<CommandResult>((done) => {
     const child = spawn(opts.command, opts.args, {
       cwd: opts.cwd,
-      env: { ...process.env, CI: '1' },
+      // Allowlisted, not inherited — `opts.command` can be tenant-named.
+      env: childEnv({ extra: { CI: '1' } }),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

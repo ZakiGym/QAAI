@@ -40,6 +40,7 @@ import {
   summariseReport,
   toStepResults,
 } from '../reports/index.js';
+import { childEnv } from '../child-env.js';
 
 /** Guard: a spec-supplied report path must stay inside the workspace. */
 export function safeReportPath(workspace: string, relPath: string): string {
@@ -149,13 +150,13 @@ export async function runExternal(
   }>((done) => {
     const child = spawn(spec.command, spec.args, {
       cwd: join(workspace, spec.cwd),
-      env: {
-        ...process.env,
-        ...spec.env,
-        ...exposed,
-        QAAI_BASE_URL: ctx.baseUrl,
-        CI: '1',
-      },
+      // Allowlisted, not inherited: `spec.command` is an executable a MEMBER
+      // named, so this child is tenant-controlled and must not see the
+      // platform's keys. See child-env.ts.
+      env: childEnv({
+        extra: { ...spec.env, QAAI_BASE_URL: ctx.baseUrl, CI: '1' },
+        secrets: exposed,
+      }),
       // Never a shell: the spec is data, and interpolation here would be RCE.
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],

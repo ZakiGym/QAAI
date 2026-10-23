@@ -1,6 +1,7 @@
 export * from './registry.js';
 export * from './browser-pool.js';
 export * from './determinism.js';
+export * from './child-env.js';
 export * from './playwright-harness.js';
 export * from './gates.js';
 export { e2ePlugin } from './plugins/e2e.js';

@@ -17,6 +17,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadTestSpecSchema } from '@qaai/shared';
+import { childEnv } from '../child-env.js';
 import type {
   ExecutableTest,
   LoadTestSpec,
@@ -128,8 +129,12 @@ export const loadPlugin: RunnerPlugin = {
             ['run', '--summary-export', summaryPath, '--quiet', scriptPath],
             {
               cwd: dir,
-              // Secrets reach the script as env vars, never inlined into it.
-              env: { ...process.env, ...ctx.secrets, QAAI_BASE_URL: ctx.baseUrl },
+              // Secrets reach the script as env vars, never inlined into it —
+              // and the rest is allowlisted, not inherited (child-env.ts).
+              env: childEnv({
+                extra: { QAAI_BASE_URL: ctx.baseUrl },
+                secrets: ctx.secrets,
+              }),
               stdio: ['ignore', 'pipe', 'pipe'],
             },
           );

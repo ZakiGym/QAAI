@@ -27,6 +27,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { VisualIntegrationKind } from '@qaai/shared';
+import { childEnv } from './child-env.js';
 
 export interface VisualServiceResult {
   status: 'PASSED' | 'FAILED' | 'SKIPPED';
@@ -170,13 +171,17 @@ export async function runVisualService(
      */
     const child = spawn(binPath, args, {
       cwd: options.cwd,
-      env: {
-        ...process.env,
-        [vendor.envVar]: token,
-        // Vendors colourise for a TTY; the escape codes wreck the URL match.
-        FORCE_COLOR: '0',
-        NO_COLOR: '1',
-      },
+      // Allowlisted, not inherited (child-env.ts). The vendor token is the
+      // tenant's own credential, so it goes through `secrets` — `extra` screens
+      // anything whose name looks like a secret, which that token does.
+      env: childEnv({
+        extra: {
+          // Vendors colourise for a TTY; the escape codes wreck the URL match.
+          FORCE_COLOR: '0',
+          NO_COLOR: '1',
+        },
+        secrets: { [vendor.envVar]: token },
+      }),
       shell: false,
     });
 

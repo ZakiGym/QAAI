@@ -23,6 +23,7 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { cliTestSpecSchema, createMasker } from '@qaai/shared';
+import { childEnv } from '../child-env.js';
 import type {
   CliTestSpec,
   ExecutableTest,
@@ -223,13 +224,12 @@ export const cliPlugin: RunnerPlugin = {
       );
     }
 
-    const env: Record<string, string> = {
-      ...(process.env as Record<string, string>),
-      ...spec.env,
-      ...exposed,
-      QAAI_BASE_URL: ctx.baseUrl,
-      CI: '1',
-    };
+    // Allowlisted, not inherited: `spec.command` is an executable a MEMBER
+    // named, so this child is tenant-controlled. See child-env.ts.
+    const env: Record<string, string> = childEnv({
+      extra: { ...spec.env, QAAI_BASE_URL: ctx.baseUrl, CI: '1' },
+      secrets: exposed,
+    });
 
     if (ctx.signal.aborted) {
       return finish('SKIPPED', [], 'The run was cancelled before the command started.');

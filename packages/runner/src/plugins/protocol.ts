@@ -23,6 +23,7 @@
 import { spawn } from 'node:child_process';
 import { isAbsolute, join, resolve, sep } from 'node:path';
 import { PROTOCOL_KINDS, maskDeep, protocolTestSpecSchema } from '@qaai/shared';
+import { childEnv } from '../child-env.js';
 import type {
   ConsoleEntry,
   ExecutableTest,
@@ -1433,7 +1434,13 @@ function runGrpcurl(
   return new Promise<GrpcurlResult>((done) => {
     // Never a shell: a spec is org-authored data, and string interpolation into
     // a shell here would turn a test definition into remote code execution.
-    const child = spawn('grpcurl', args, { shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    // `env` is explicit because omitting it inherits the worker's entire
+    // environment, which is the same leak by default. See child-env.ts.
+    const child = spawn('grpcurl', args, {
+      env: childEnv(),
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
     let stdout = '';
     let stderr = '';

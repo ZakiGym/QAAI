@@ -60,6 +60,7 @@ import type {
   TestExecution,
 } from '@qaai/shared';
 import { safeReportPath } from './external.js';
+import { childEnv } from '../child-env.js';
 
 /** Captured output is kept as a TAIL: every stdout-parsed tool prints its summary last. */
 const OUTPUT_LIMIT = 200_000;
@@ -866,13 +867,12 @@ export const mutationPlugin: RunnerPlugin = {
       const value = ctx.secrets[name];
       if (value !== undefined) exposed[name] = value;
     }
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...spec.env,
-      ...exposed,
-      QAAI_BASE_URL: ctx.baseUrl,
-      CI: '1',
-    };
+    // Allowlisted, not inherited: `spec.command` below is tenant-named, so this
+    // child must not receive the platform's keys. See child-env.ts.
+    const env: NodeJS.ProcessEnv = childEnv({
+      extra: { ...spec.env, QAAI_BASE_URL: ctx.baseUrl, CI: '1' },
+      secrets: exposed,
+    });
 
     const relReport = spec.reportPath ?? adapter.reportPath;
     const command = spec.command ?? (await resolveCommand(cwd, adapter));

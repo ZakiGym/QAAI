@@ -57,6 +57,7 @@ import type {
   XcuitestMobileSpec,
 } from '@qaai/shared';
 import { parseReport, summariseReport, toStepResults } from '../reports/index.js';
+import { childEnv } from '../child-env.js';
 import type { ParsedReport, ReportTest } from '../reports/index.js';
 
 /** Per-stream capture cap, matching the CLI and external plugins. */
@@ -1596,13 +1597,12 @@ async function runCliDriver(
 
   const result = await runTool(ctx, plan.command, plan.args, {
     cwd,
-    env: {
-      ...(process.env as Record<string, string>),
-      ...spec.env,
-      ...exposed,
-      QAAI_BASE_URL: ctx.baseUrl,
-      CI: '1',
-    },
+    // Allowlisted, not inherited (child-env.ts) — this drives a tenant-named
+    // build/test tool, which must not see the platform's keys.
+    env: childEnv({
+      extra: { ...spec.env, QAAI_BASE_URL: ctx.baseUrl, CI: '1' },
+      secrets: exposed,
+    }),
     timeoutSeconds: spec.timeoutSeconds,
   });
 

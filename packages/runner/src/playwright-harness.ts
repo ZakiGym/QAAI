@@ -32,6 +32,7 @@ import {
   type DeterminismOptions,
   type DeterminismPlan,
 } from './determinism.js';
+import { childEnv } from './child-env.js';
 
 /** Hard ceiling for a whole spec file, independent of per-test timeouts. */
 const PROCESS_TIMEOUT_MS = 10 * 60_000;
@@ -359,25 +360,30 @@ function runPlaywright(ws: Workspace, ctx: RunContext, plan: DeterminismPlan): P
     const d = plan.determinism;
     const child = spawn(cliPath, ['test', '--config', 'playwright.config.ts'], {
       cwd: ws.dir,
-      env: {
-        ...process.env,
+      // Allowlisted, not inherited. A generated spec is tenant-authored code and
+      // this worker holds VAULT_MASTER_KEY, SESSION_SECRET and DATABASE_URL —
+      // spreading process.env here handed every customer's keys to every test.
+      // See child-env.ts.
+      env: childEnv({
+        extra: {
+          QAAI_BASE_URL: ctx.baseUrl,
+          QAAI_RUN_ID: ctx.runId,
+          QAAI_STORAGE_STATE: ctx.storageState ? join(ws.dir, 'storage-state.json') : '',
+          // The seed the run actually used, so a spec that generates its own data
+          // reads the same number that decided the test order.
+          QAAI_SEED: String(d.seed),
+          QAAI_DETERMINISM_SEED: String(d.seed),
+          ...(d.clockAtIso ? { QAAI_FROZEN_CLOCK: d.clockAtIso } : {}),
+          // Node reads TZ at startup, and the test process formats dates too —
+          // pinning only the browser would leave the assertions in a different
+          // zone from the page they are asserting on.
+          ...(d.timezoneId ? { TZ: d.timezoneId } : {}),
+          CI: '1',
+        },
         // Secrets reach the test process as env vars — never inlined into the
         // generated source, which gets committed to the customer's repo.
-        ...ctx.secrets,
-        QAAI_BASE_URL: ctx.baseUrl,
-        QAAI_RUN_ID: ctx.runId,
-        QAAI_STORAGE_STATE: ctx.storageState ? join(ws.dir, 'storage-state.json') : '',
-        // The seed the run actually used, so a spec that generates its own data
-        // reads the same number that decided the test order.
-        QAAI_SEED: String(d.seed),
-        QAAI_DETERMINISM_SEED: String(d.seed),
-        ...(d.clockAtIso ? { QAAI_FROZEN_CLOCK: d.clockAtIso } : {}),
-        // Node reads TZ at startup, and the test process formats dates too —
-        // pinning only the browser would leave the assertions in a different
-        // zone from the page they are asserting on.
-        ...(d.timezoneId ? { TZ: d.timezoneId } : {}),
-        CI: '1',
-      },
+        secrets: ctx.secrets,
+      }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
