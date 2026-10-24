@@ -64,6 +64,13 @@ import {
   processActionEvent,
   type ActionEventJob,
 } from './processors/actions.js';
+import {
+  RECOMPUTE_COVERAGE_QUEUE,
+  closeRecomputeCoverageQueue,
+  processRecomputeCoverage,
+  requestRecompute,
+  type RecomputeCoverageJob,
+} from './processors/recompute-coverage.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
@@ -171,15 +178,78 @@ function register<T>(
   workers.push(worker);
 }
 
+/*
+ * ── The coverage recompute triggers ─────────────────────────────────────────
+ *
+ * Five of the registrations below are wrapped so that finishing them asks for a
+ * dark-surface recompute (processors/recompute-coverage.ts). Four of them change
+ * one of the number's inputs: a crawl writes the FlowMap, a run writes
+ * TestResults, and generate and import write Test rows. Nothing else in the
+ * worker moves the number. The fifth, analyze-source, only READS its input and
+ * is hooked as the nearest in-worker proxy for a repository landing — see the
+ * comment on that registration.
+ *
+ * Three properties of the wrapping, each one deliberate:
+ *
+ *   • AFTER, not before. The write each job performs is committed before the
+ *     processor returns, so a recompute asked for here can never measure the
+ *     previous surface and store it as current.
+ *   • `finally`, not a success path. A crawl that wrote its FlowMap and then
+ *     died in the planning step still changed the surface; so did a run that
+ *     recorded 300 results before its 301st test blew up. The enqueue is safe
+ *     to repeat (it coalesces by project), so the honest rule is "the inputs
+ *     moved, measure them".
+ *   • `requestRecompute` never throws — which is what makes an `await` inside
+ *     these `finally` blocks safe. A throw there would REPLACE the error the
+ *     job actually failed with, and a Redis blip would be reported as a crawl
+ *     failure. That contract is stated on the function and tested.
+ *
+ * The triggers live here rather than inside the five processors because this
+ * file is the one this wave owns, and a feature needing an edit in five files
+ * other people are editing arrives half-wired. Same reasoning as
+ * `dispatchActionsForNotify` below.
+ */
+
 // Browser-bound: one job holds a Chromium process for its whole duration.
-register<RunJob>(QUEUE_NAMES.run, config.concurrency, processRun);
+register<RunJob>(QUEUE_NAMES.run, config.concurrency, async (payload) => {
+  try {
+    await processRun(payload);
+  } finally {
+    // A run job carries no project id, so the recompute resolves one (and the
+    // commit the snapshot should record) from the Run row. A 20-shard run fires
+    // this twenty times and all twenty collapse onto one job.
+    await requestRecompute({ reason: 'run', orgId: payload.orgId, runId: payload.runId });
+  }
+});
 register<ExploreJob>(
   QUEUE_NAMES.explore,
   Math.max(1, Math.floor(config.concurrency / 2)),
-  processExplore,
+  async (payload) => {
+    try {
+      await processExplore(payload);
+    } finally {
+      await requestRecompute({
+        reason: 'crawl',
+        orgId: payload.orgId,
+        projectId: payload.projectId,
+      });
+    }
+  },
 );
 // Network-bound on the LLM, so a wider pool is fine.
-register<GenerateJob>(QUEUE_NAMES.generate, config.concurrency * 2, processGenerate);
+register<GenerateJob>(QUEUE_NAMES.generate, config.concurrency * 2, async (payload) => {
+  try {
+    await processGenerate(payload);
+  } finally {
+    // Writing a test moves items from UNCOVERED to ASSERTED_NOT_RUN — which is
+    // not COVERED, and is exactly the distinction the number exists to make.
+    await requestRecompute({
+      reason: 'tests-changed',
+      orgId: payload.orgId,
+      projectId: payload.projectId,
+    });
+  }
+});
 register<TriageJob>(QUEUE_NAMES.triage, config.concurrency * 2, processTriage);
 // A copilot turn can hold a browser for minutes via run_tests, so it is capped
 // at the browser-bound concurrency rather than the wider LLM pool.
@@ -237,21 +307,50 @@ register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
   await processDigestTick().catch((err) => logger.error({ err }, 'the digest sweep failed'));
 });
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
-register<ImportJob>(QUEUE_NAMES.import, config.concurrency, processImport);
+register<ImportJob>(QUEUE_NAMES.import, config.concurrency, async (payload) => {
+  try {
+    await processImport(payload);
+  } finally {
+    // An imported suite is new Test rows, so the numerator moved.
+    await requestRecompute({
+      reason: 'tests-changed',
+      orgId: payload.orgId,
+      projectId: payload.projectId,
+    });
+  }
+});
 
 // "Learn my codebase". Cheap and model-free — it reads a stored analysis and
 // writes a plan, never a browser and never a token — so it rides the wider
 // pool. Without this registration POST /projects/:id/analyze-source answers
 // "queued" and the job sits in Redis forever, which is the bisect-queue defect
 // exactly; `npm run check:wiring` fails if the line is removed.
-register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, (payload) =>
+register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, async (payload) => {
   // Wrapped in an arrow so register()'s second argument (the BullMQ Job) is
   // never mistaken for processAnalyzeSource's own deps parameter — that slot is
   // the test seam for injecting a fake project row, and a Job landing in it
   // would be a silent no-op today and a confusing bug the day the two types
   // grow a matching field. Same reasoning as the backup tick below.
-  processAnalyzeSource(payload),
-);
+  try {
+    await processAnalyzeSource(payload);
+  } finally {
+    /*
+     * This job READS the stored CodebaseSnapshot rather than writing it, so it
+     * is not really the source-analysis trigger — the row lands in
+     * apps/api/src/routes/source.ts, which this wave does not own. It is hooked
+     * anyway because it is the nearest in-worker signal that somebody imported
+     * a repository and expects a number from it, and it costs one coalesced
+     * job. A repository imported with nobody then asking for a plan still needs
+     * the enqueue at that create; see the handover note on
+     * processors/recompute-coverage.ts.
+     */
+    await requestRecompute({
+      reason: 'source-analysis',
+      orgId: payload.orgId,
+      projectId: payload.projectId,
+    });
+  }
+});
 
 // The flake sweep: one tick, concurrency 1, its own queue. It shares nothing
 // with the scheduler tick deliberately — confirming a flake has nothing to do
@@ -327,6 +426,29 @@ register<ActionEventJob>(ACTIONS_QUEUE, config.concurrency, (payload) =>
   processActionEvent(payload),
 );
 
+/*
+ * The dark-surface recompute. Concurrency 1, and for a reason beyond load: this
+ * job is the only writer of the CoverageItem inventory, and two recomputes of
+ * the same project interleaving their upserts is the one way the denominator
+ * can end up describing neither commit. The coalescing job id makes that
+ * unlikely; serialising the lane makes it impossible within a worker.
+ *
+ * Nobody is waiting on it either — the synchronous answer is
+ * POST /surface/:projectId/recompute — so a single lane costs nothing a user
+ * can feel. Without this registration every trigger above enqueues into a queue
+ * nobody drains, the stored snapshot never moves again, and the CI gate quietly
+ * compares every pull request against a measurement from whenever somebody last
+ * clicked recompute. That is the bisect-queue defect with a worse blast radius;
+ * `npm run check:wiring` fails if this line is removed.
+ *
+ * Wrapped in an arrow for the same reason as the backup tick: register()'s
+ * second argument is the BullMQ Job, and that slot in processRecomputeCoverage
+ * is the test seam for injecting the computation.
+ */
+register<RecomputeCoverageJob>(RECOMPUTE_COVERAGE_QUEUE, 1, async (payload) => {
+  await processRecomputeCoverage(payload);
+});
+
 logger.info(
   {
     concurrency: config.concurrency,
@@ -352,12 +474,14 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
     await Promise.all(workers.map((w) => w.close()));
     await closeProducers().catch(() => {});
-    // retention.ts and backup.ts build their producers lazily and outside
-    // queues.ts, so closeProducers() does not know about them. Left open, they
-    // hold the process past the shutdown that is supposed to end it.
+    // retention.ts, backup.ts, actions.ts and recompute-coverage.ts build their
+    // producers lazily and outside queues.ts, so closeProducers() does not know
+    // about them. Left open, they hold the process past the shutdown that is
+    // supposed to end it.
     await closeRetentionQueue().catch(() => {});
     await closeBackupQueue().catch(() => {});
     await closeActionsQueue().catch(() => {});
+    await closeRecomputeCoverageQueue().catch(() => {});
     await prisma.$disconnect().catch(() => {});
     connection.disconnect();
     process.exit(0);

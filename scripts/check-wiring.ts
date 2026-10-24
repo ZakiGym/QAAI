@@ -265,7 +265,10 @@ function loadSources(): void {
     // Collapse whitespace, then close it up around dots and colons, so a
     // prettier-wrapped `prisma.webhookDelivery\n  .create({` reads as
     // `prisma.webhookDelivery.create({` — the form every search below expects.
-    const flat = text.replace(/\s+/g, ' ').replace(/\s*\.\s*/g, '.').replace(/:\s+/g, ': ');
+    const flat = text
+      .replace(/\s+/g, ' ')
+      .replace(/\s*\.\s*/g, '.')
+      .replace(/:\s+/g, ': ');
     return { path, text, flat };
   });
 }
@@ -319,7 +322,10 @@ const rel = (p: string): string => relative(ROOT, p);
 function stripComments(src: string): string {
   return src
     .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
-    .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, (m, lead: string) => lead + ' '.repeat(m.length - lead.length));
+    .replace(
+      /(^|[^:"'`\\])\/\/[^\n]*/g,
+      (m, lead: string) => lead + ' '.repeat(m.length - lead.length),
+    );
 }
 
 // ─── 1. Express routers: mounted, and answering ──────────────────────────────
@@ -406,7 +412,11 @@ function auditRouters(): RouterAudit | null {
   for (const m of indexSrc.matchAll(/import\s*\{([^}]+)\}\s*from\s*'\.\/routes\/([\w-]+)\.js'/g)) {
     const file = join(routesDir, `${m[2]!}.ts`);
     for (const raw of m[1]!.split(',')) {
-      const name = raw.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0]!.trim();
+      const name = raw
+        .trim()
+        .replace(/^type\s+/, '')
+        .split(/\s+as\s+/)[0]!
+        .trim();
       if (name) importedFrom.set(name, file);
     }
   }
@@ -426,7 +436,9 @@ function auditRouters(): RouterAudit | null {
   for (const file of readdirSync(routesDir)) {
     if (!file.endsWith('.ts') || isTestFile(file)) continue;
     const full = join(routesDir, file);
-    for (const m of read(full).matchAll(/export\s+const\s+(\w+)(?:\s*:\s*Router)?\s*=\s*Router\(/g)) {
+    for (const m of read(full).matchAll(
+      /export\s+const\s+(\w+)(?:\s*:\s*Router)?\s*=\s*Router\(/g,
+    )) {
       exported.set(m[1]!, full);
     }
   }
@@ -502,7 +514,9 @@ function isUnmountedResponse(status: number, body: string): boolean {
   if (status !== 404) return false;
   try {
     const parsed = JSON.parse(body) as { error?: { message?: string } };
-    return typeof parsed.error?.message === 'string' && parsed.error.message.startsWith('No route for');
+    return (
+      typeof parsed.error?.message === 'string' && parsed.error.message.startsWith('No route for')
+    );
   } catch {
     return false;
   }
@@ -948,8 +962,9 @@ function checkNpmScripts(): void {
             fix: 'Fix the -w target or remove the script.',
           });
         } else {
-          const targetScripts = (JSON.parse(read(targetManifest)) as { scripts?: Record<string, string> })
-            .scripts ?? {};
+          const targetScripts =
+            (JSON.parse(read(targetManifest)) as { scripts?: Record<string, string> }).scripts ??
+            {};
           if (!targetScripts[delegated[1]!]) {
             add({
               check: 'npm-scripts',
@@ -1008,8 +1023,8 @@ function checkWorkspaceSweeps(): void {
 
   // Which workspaces the root sweeps, read from the root's own scripts rather
   // than assumed — if someone narrows the sweep with -w flags, this follows.
-  const rootScripts = (JSON.parse(read(rootManifest)) as { scripts?: Record<string, string> })
-    .scripts ?? {};
+  const rootScripts =
+    (JSON.parse(read(rootManifest)) as { scripts?: Record<string, string> }).scripts ?? {};
 
   for (const sweep of SWEPT) {
     const command = rootScripts[sweep];
@@ -1099,7 +1114,11 @@ function checkCliInstallName(): void {
   const INVOCATION =
     /(?:npx(?:\s+--?\w+)*\s+|npm\s+(?:i|install|add)\s+(?:-g|--global)\s+)(?:"|')?qaai(?![\w/-])/g;
 
-  const docs = [...walk(join(ROOT, 'docs')), ...walk(join(ROOT, 'deploy')), ...walk(join(ROOT, '.github'))]
+  const docs = [
+    ...walk(join(ROOT, 'docs')),
+    ...walk(join(ROOT, 'deploy')),
+    ...walk(join(ROOT, '.github')),
+  ]
     .concat(existsSync(join(ROOT, 'README.md')) ? [join(ROOT, 'README.md')] : [])
     .filter((f) => /\.(md|ya?ml)$/.test(f));
 
@@ -1109,7 +1128,9 @@ function checkCliInstallName(): void {
     for (const line of text.split('\n')) {
       // Prose explaining the hazard names the bad form on purpose. A line that
       // is a comment or narrative, not a command, is not an invocation.
-      const isProse = /^\s*(#|>|\*|-\s|\/\/)/.test(line) || /\b(unscoped|belongs to|used to run|different project|somebody else)\b/i.test(line);
+      const isProse =
+        /^\s*(#|>|\*|-\s|\/\/)/.test(line) ||
+        /\b(unscoped|belongs to|used to run|different project|somebody else)\b/i.test(line);
       if (isProse) continue;
       INVOCATION.lastIndex = 0;
       if (INVOCATION.test(line)) offenders.push(`${rel(file)}: ${line.trim().slice(0, 100)}`);
@@ -1164,7 +1185,7 @@ function checkDesktopServices(): void {
       detail:
         'The SERVICES table could not be parsed, so none of the workspaces or health paths ' +
         'the desktop app boots are being validated.',
-      fix: 'Either restore the table\'s shape or update checkDesktopServices. A check that silently matches nothing is worse than no check.',
+      fix: "Either restore the table's shape or update checkDesktopServices. A check that silently matches nothing is worse than no check.",
     });
     return;
   }
@@ -1200,7 +1221,9 @@ function checkDesktopServices(): void {
     // The route has to be declared by whichever app owns that port. Matching on
     // the literal is enough: these are hand-written probe paths, not built ones.
     const owner = SOURCES.filter((s) => rel(s.path).startsWith(`apps/${name}/`));
-    const served = owner.some((s) => s.flat.includes(`'${route}'`) || s.flat.includes(`"${route}"`));
+    const served = owner.some(
+      (s) => s.flat.includes(`'${route}'`) || s.flat.includes(`"${route}"`),
+    );
     if (!served) {
       add({
         check: 'desktop',
@@ -1217,7 +1240,9 @@ function checkDesktopServices(): void {
 function scriptTargets(command: string): string[] {
   const out: string[] = [];
   for (const part of command.split(/\s*&&\s*/)) {
-    const tsx = /(?:^|\s)(?:tsx|node|ts-node)(?:\s+watch)?\s+([^\s]+\.(?:ts|mjs|cjs|js))/.exec(part);
+    const tsx = /(?:^|\s)(?:tsx|node|ts-node)(?:\s+watch)?\s+([^\s]+\.(?:ts|mjs|cjs|js))/.exec(
+      part,
+    );
     if (tsx) out.push(tsx[1]!);
     const proj = /(?:tsc|vitest|eslint)[^&|]*?-p\s+([^\s]+\.json)/.exec(part);
     if (proj) out.push(proj[1]!);
@@ -1266,7 +1291,8 @@ async function checkTestTypes(): Promise<void> {
         check: 'test-types',
         severity: 'fail',
         what: type,
-        detail: 'pluginFor() returns null, so every test of this type is recorded SKIPPED at run time.',
+        detail:
+          'pluginFor() returns null, so every test of this type is recorded SKIPPED at run time.',
         fix: `Register a plugin for ${type} in packages/runner/src/registry.ts, or take it out of TEST_TYPES.`,
       });
     }
@@ -1284,7 +1310,8 @@ async function checkTestTypes(): Promise<void> {
         check: 'test-types',
         severity: 'fail',
         what: type,
-        detail: 'createTestSchema rejects it, so nothing can create a test of this type through the API.',
+        detail:
+          'createTestSchema rejects it, so nothing can create a test of this type through the API.',
         fix: 'Widen the type enum in packages/shared/src/schemas.ts.',
       });
     }
@@ -1361,9 +1388,7 @@ const CODE_GENERATORS = new Set([
 function envKeysDocumented(file: string): Set<string> {
   const p = join(ROOT, file);
   if (!existsSync(p)) return new Set();
-  return new Set(
-    [...read(p).matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!),
-  );
+  return new Set([...read(p).matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((m) => m[1]!));
 }
 
 function checkEnvVars(): void {
@@ -1458,7 +1483,8 @@ function checkEnvVars(): void {
    * line is not what makes an unread key honest.
    */
   for (const key of schemaKeys) {
-    if (productionSources().some((s) => s.path !== apiEnv && s.flat.includes(`env.${key}`))) continue;
+    if (productionSources().some((s) => s.path !== apiEnv && s.flat.includes(`env.${key}`)))
+      continue;
     add({
       check: 'env-vars',
       severity: 'fail',
@@ -1506,7 +1532,8 @@ function checkEnvVars(): void {
       if (deployExample.has(key) || compose.includes(key)) continue;
       // Only the ones a production deployment genuinely has to supply. A dev
       // convenience left out of the deploy example is not a defect.
-      if (!/^(SESSION_SECRET|VAULT_MASTER_KEY|STRIPE_|GITHUB_APP|GITHUB_WEBHOOK)/.test(key)) continue;
+      if (!/^(SESSION_SECRET|VAULT_MASTER_KEY|STRIPE_|GITHUB_APP|GITHUB_WEBHOOK)/.test(key))
+        continue;
       add({
         check: 'env-vars',
         severity: 'warn',
@@ -1566,7 +1593,15 @@ function checkPrismaModels(): void {
   ]);
 
   const READ_OPS = ['findUnique', 'findFirst', 'findMany', 'count', 'aggregate', 'groupBy'];
-  const WRITE_OPS = ['create', 'createMany', 'update', 'updateMany', 'upsert', 'delete', 'deleteMany'];
+  const WRITE_OPS = [
+    'create',
+    'createMany',
+    'update',
+    'updateMany',
+    'upsert',
+    'delete',
+    'deleteMany',
+  ];
 
   for (const model of models.keys()) {
     const accessor = model[0]!.toLowerCase() + model.slice(1);
@@ -1602,7 +1637,8 @@ function checkPrismaModels(): void {
         check: 'prisma-models',
         severity: 'fail',
         what: model,
-        detail: 'Nothing in the repo reads or writes this table. It is a schema entry for a feature that does not exist.',
+        detail:
+          'Nothing in the repo reads or writes this table. It is a schema entry for a feature that does not exist.',
         fix: `Build the feature, or drop model ${model} in a migration.`,
       });
     } else if (writes.length === 0) {
@@ -1668,6 +1704,460 @@ function checkFeatureFlags(): void {
   }
 }
 
+// ─── 9. The surface vocabulary: one list, declared four times ────────────────
+
+/**
+ * The coverage feature's vocabulary exists more than once, in three packages,
+ * and until now nothing compared any copy with any other:
+ *
+ *   enum SurfaceKind (apps/api/prisma/schema.prisma)    what a row may hold
+ *   SURFACE_KINDS (packages/shared/src/surface.ts)      what the code can name
+ *   MEASURED_SURFACE_KINDS (same file)                  what enters the denominator
+ *   MATCHERS (packages/agent/src/surface-coverage.ts)   what can be matched at all
+ *
+ * Every pair of those can diverge without a type error, and each divergence
+ * produces a WRONG NUMBER rather than a crash — which, for a feature whose
+ * entire output is one percentage and a list of named gaps, is the worst
+ * failure available:
+ *
+ *   · A kind the shared list has and the Prisma enum does not. The API computes
+ *     items the database then refuses, so the snapshot persists short and the
+ *     stored percentage is over a denominator nobody can read back.
+ *   · A kind the Prisma enum has and the shared list does not. Rows exist that
+ *     no code can name, label or filter by: in the table, off every screen.
+ *   · A kind listed MEASURED with no matcher. analyseSurfaceCoverage looks the
+ *     kind up in MATCHERS, finds nothing, matches nothing — and reports every
+ *     item on that axis UNCOVERED. A whole axis of gaps that are not gaps,
+ *     stated with the same confidence as a real one. Nothing throws and nothing
+ *     logs; it simply invents work for the customer.
+ *   · A matcher for a kind that is not measured. The matcher runs and its
+ *     matches are then excluded from every total, so the axis reports nothing
+ *     and the work that built the matcher is invisible.
+ *
+ * The last two are the pair this file exists for. They are two lists that must
+ * agree, in different packages, with nothing checking — the same shape as the
+ * seven unmounted routers and the queue with no consumer, except that the
+ * symptom is a plausible number instead of a 404.
+ */
+const SHARED_SURFACE_FILE = 'packages/shared/src/surface.ts';
+const AGENT_COVERAGE_FILE = 'packages/agent/src/surface-coverage.ts';
+const AGENT_INVENTORY_FILE = 'packages/agent/src/surface-inventory.ts';
+
+/** Enums declared once for the database and once for the code. */
+const SURFACE_VOCABULARY: Array<{ prismaEnum: string; sharedConst: string }> = [
+  { prismaEnum: 'SurfaceKind', sharedConst: 'SURFACE_KINDS' },
+  { prismaEnum: 'SurfaceStatus', sharedConst: 'SURFACE_STATUSES' },
+  { prismaEnum: 'SurfaceOrigin', sharedConst: 'SURFACE_ORIGINS' },
+];
+
+/**
+ * The members of `const X = ['A', 'B'] as const`, or of an annotated
+ * `const X: readonly T[] = [...]`, in declaration order.
+ *
+ * Callers pass comment-stripped source. SURFACE_KINDS documents every member
+ * with a doc comment, and one of those comments contains a quoted string
+ * ("a VIEWER requesting /admin/billing") that a naive read takes for a member.
+ *
+ * `[^=;]*?` between the name and the `=` is lazy deliberately. Greedy, it runs
+ * off the end of the array it was asked for and matches the NEXT `= [` in the
+ * file: asked for SURFACE_KINDS it returned the contents of
+ * MEASURED_SURFACE_KINDS, which is a silent pass for the one comparison this
+ * section exists to make.
+ */
+function constStringArray(text: string, name: string): string[] | null {
+  const m = new RegExp(`\\bconst\\s+${name}\\b[^=;]*?=\\s*\\[([^\\]]*)\\]`).exec(text);
+  if (!m) return null;
+  return [...m[1]!.matchAll(/'([^']+)'/g)].map((x) => x[1]!);
+}
+
+/**
+ * The kinds MATCHERS has an entry for.
+ *
+ * Read out of the source rather than imported, because MATCHERS is
+ * module-private and should stay that way — widening packages/agent's public
+ * surface for the convenience of a check is the wrong trade. The cost of
+ * reading source is that a shape change can make this find nothing, so finding
+ * nothing is reported as a failure of this check rather than as agreement.
+ */
+function matcherKinds(text: string): string[] | null {
+  const m = /\bconst\s+MATCHERS\b[\s\S]*?=\s*\{([^}]*)\}/.exec(text);
+  if (!m) return null;
+  return [...m[1]!.matchAll(/^\s*([A-Z][A-Z0-9_]*)\s*:/gm)].map((x) => x[1]!);
+}
+
+function checkSurfaceVocabulary(): void {
+  const CHECK = 'surface-vocabulary';
+  const sharedPath = join(ROOT, SHARED_SURFACE_FILE);
+  const coveragePath = join(ROOT, AGENT_COVERAGE_FILE);
+
+  const absent = [sharedPath, coveragePath].filter((p) => !existsSync(p)).map(rel);
+  if (!schemaPrisma()) absent.push('apps/api/prisma/schema.prisma');
+  if (absent.length > 0) {
+    add({
+      check: CHECK,
+      severity: 'skip',
+      what: 'the surface vocabulary',
+      detail: `Cannot compare the declarations: ${absent.join(', ')} not found.`,
+      fix: `Run this from the repo root; if the coverage feature moved, update SHARED_SURFACE_FILE and AGENT_COVERAGE_FILE in ${SELF}.`,
+    });
+    return;
+  }
+
+  const shared = stripComments(read(sharedPath));
+  const coverage = stripComments(read(coveragePath));
+
+  // ── The database's enums against the code's lists ──────────────────────────
+  for (const { prismaEnum, sharedConst } of SURFACE_VOCABULARY) {
+    const db = prismaEnumMembers(prismaEnum);
+    const ts = constStringArray(shared, sharedConst);
+
+    if (!db || db.length === 0) {
+      add({
+        check: CHECK,
+        severity: 'fail',
+        what: prismaEnum,
+        detail: `apps/api/prisma/schema.prisma declares no enum ${prismaEnum}, while ${SHARED_SURFACE_FILE} still declares ${sharedConst}. Either the enum is gone — and then no row can hold any of those values — or this check can no longer read it.`,
+        fix: `Restore enum ${prismaEnum} in apps/api/prisma/schema.prisma, or, if it was renamed, rename it in SURFACE_VOCABULARY in ${SELF}.`,
+      });
+      continue;
+    }
+    if (!ts || ts.length === 0) {
+      add({
+        check: CHECK,
+        severity: 'fail',
+        what: sharedConst,
+        detail: `Parsed zero members out of ${sharedConst} in ${SHARED_SURFACE_FILE}, while the Prisma enum ${prismaEnum} has ${db.length}. Either the list is gone, or it is no longer a flat array of quoted members and this comparison is itself the broken thing — and a comparison that silently finds nothing is a green light for the drift it was added to stop.`,
+        fix: `Keep ${sharedConst} as a flat array of quoted members, or teach constStringArray in ${SELF} to read whatever shape replaced it.`,
+      });
+      continue;
+    }
+
+    const absentFromDb = ts.filter((v) => !db.includes(v));
+    const absentFromTs = db.filter((v) => !ts.includes(v));
+    const reasons: string[] = [];
+
+    if (absentFromDb.length > 0) {
+      reasons.push(
+        `${absentFromDb.join(', ')} ${absentFromDb.length === 1 ? 'is' : 'are'} in ${sharedConst} and not in the Prisma enum, so an item carrying that value cannot be stored — the API computes it and the write is rejected.`,
+      );
+    }
+    if (absentFromTs.length > 0) {
+      reasons.push(
+        `${absentFromTs.join(', ')} ${absentFromTs.length === 1 ? 'is' : 'are'} in the Prisma enum and not in ${sharedConst}, so rows can exist that no TypeScript code can name, label or filter by.`,
+      );
+    }
+    /*
+     * Order, and only once membership agrees. Two declarations of one
+     * vocabulary are kept in step by being read side by side, which is only
+     * possible while they are literally comparable. Nothing is mis-stored by a
+     * reordering on its own — and that is said in the finding, so nobody hunts
+     * for a storage bug — but it is the cheapest available signal that one copy
+     * was edited alone, which is how a member goes missing from the other next.
+     */
+    if (reasons.length === 0 && db.join(',') !== ts.join(',')) {
+      reasons.push(
+        `Same members, different order (schema.prisma: ${db.join(', ')} · ${sharedConst}: ${ts.join(', ')}). Nothing is mis-stored by this alone; it means one of the two declarations was edited without the other.`,
+      );
+    }
+
+    if (reasons.length > 0) {
+      add({
+        check: CHECK,
+        severity: 'fail',
+        what: prismaEnum,
+        detail: reasons.join(' '),
+        fix: `Edit both declarations in one change — enum ${prismaEnum} in apps/api/prisma/schema.prisma and ${sharedConst} in ${SHARED_SURFACE_FILE} — and migrate.`,
+      });
+    }
+  }
+
+  // ── Measured axes, and the matchers that are the whole of "measured" ──────
+  const kinds = constStringArray(shared, 'SURFACE_KINDS') ?? [];
+  const measured = constStringArray(shared, 'MEASURED_SURFACE_KINDS');
+  const matchers = matcherKinds(coverage);
+
+  if (!measured || measured.length === 0) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: 'MEASURED_SURFACE_KINDS',
+      detail: `Parsed zero members out of MEASURED_SURFACE_KINDS in ${SHARED_SURFACE_FILE}. If the list really is empty then totalsForItems divides by nothing and every percent is null; if it is not, this check cannot read it and the matcher comparison below never happens.`,
+      fix: `Keep MEASURED_SURFACE_KINDS as a flat array of quoted kinds, or teach constStringArray in ${SELF} to read its new shape.`,
+    });
+  }
+  if (!matchers || matchers.length === 0) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: 'MATCHERS',
+      detail: `Parsed no kinds out of the MATCHERS map in ${AGENT_COVERAGE_FILE}. A MATCHERS with no entries matches nothing and reports the customer's entire application uncovered; a MATCHERS this check cannot read is worse, because it reports agreement it never verified.`,
+      fix: `Keep MATCHERS as an object literal keyed by SurfaceKind, or teach matcherKinds in ${SELF} to read whatever replaced it.`,
+    });
+  }
+  if (!measured || measured.length === 0 || !matchers || matchers.length === 0) return;
+
+  // A measured kind that is not a kind at all: nothing can produce an item of
+  // it, so the axis cannot appear in byKind and the claim is unfalsifiable.
+  if (kinds.length > 0) {
+    const notAKind = measured.filter((k) => !kinds.includes(k));
+    if (notAKind.length > 0) {
+      add({
+        check: CHECK,
+        severity: 'fail',
+        what: 'MEASURED_SURFACE_KINDS',
+        detail: `${notAKind.join(', ')} ${notAKind.length === 1 ? 'is' : 'are'} listed as measured and ${notAKind.length === 1 ? 'is' : 'are'} not in SURFACE_KINDS at all. No extractor can emit an item of a kind the vocabulary does not have, so the axis never appears in byKind and the claim that it is measured can never be checked.`,
+        fix: `Add ${notAKind.join(', ')} to SURFACE_KINDS (and to the Prisma enum) or remove ${notAKind.length === 1 ? 'it' : 'them'} from MEASURED_SURFACE_KINDS in ${SHARED_SURFACE_FILE}.`,
+      });
+    }
+  }
+
+  /*
+   * The two directions are reported per kind, and they cannot collide: a kind
+   * is in at most one of the two sets, so `what` stays unambiguous and the
+   * ratchet can name either one on its own.
+   */
+  for (const kind of measured) {
+    if (matchers.includes(kind)) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: kind,
+      detail: `MEASURED_SURFACE_KINDS claims this axis is measured and ${AGENT_COVERAGE_FILE} has no matcher for it, so analyseSurfaceCoverage matches nothing and marks every ${kind} item UNCOVERED. That is a whole axis of false gaps, in the denominator, indistinguishable on the report from a real one.`,
+      fix: `Add a ${kind} matcher to MATCHERS in ${AGENT_COVERAGE_FILE}, or take ${kind} out of MEASURED_SURFACE_KINDS so it is named as an unmeasured axis instead — "we do not measure this" is a fact about us, "0% covered" is a lie about them.`,
+    });
+  }
+
+  for (const kind of matchers) {
+    if (measured.includes(kind)) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: kind,
+      detail: `${AGENT_COVERAGE_FILE} has a matcher for ${kind} and MEASURED_SURFACE_KINDS does not list it, so totalsForItems leaves the axis out of the headline denominator. The matcher runs on every recompute and nothing it finds is ever divided by anything.`,
+      fix: `Add ${kind} to MEASURED_SURFACE_KINDS in ${SHARED_SURFACE_FILE} if the matcher is good enough to count, or delete the matcher.`,
+    });
+  }
+
+  okIfClean(
+    CHECK,
+    `${kinds.length} kinds · ${measured.length} measured`,
+    'The Prisma enums and the shared lists hold the same members in the same order, and every measured axis has a matcher and vice versa.',
+  );
+}
+
+// ─── 10. The unmeasured axes are named, not implied ──────────────────────────
+
+/**
+ * Rule 4 of the coverage feature, enforced on the two places that can break it.
+ *
+ * Eight of the twelve axes have no extractor. The product's position is that
+ * naming them is mandatory — "we do not measure component states" is a true
+ * sentence about QAAI, while the 0% a silent omission implies is a false one
+ * about the customer's application. That position is only as good as the list
+ * of axes the report is handed, and there are two of those: a hand-written
+ * literal in missingAxes(), and a field on SurfaceInventory.
+ */
+/**
+ * True when missingAxes() delegates to the derived list instead of restating it.
+ *
+ * A delegation cannot drift from SURFACE_KINDS minus MEASURED_SURFACE_KINDS,
+ * because it IS that subtraction. So this is the state the check wants, and
+ * finding it means there is no literal left to compare — not that the literal
+ * became unreadable.
+ */
+function missingAxesIsDerived(text: string): boolean {
+  const body = /\bfunction\s+missingAxes\b([\s\S]*?)\n\}/.exec(text);
+  if (!body) return false;
+  return /\breturn\s+unmeasuredKinds\(\s*\)/.test(body[1]!);
+}
+
+function hardcodedMissingAxes(text: string): string[] | null {
+  const body = /\bfunction\s+missingAxes\b([\s\S]*?)\n\}/.exec(text);
+  if (!body) return null;
+  // The first bracketed block that actually contains a quoted member: the
+  // return type annotation `SurfaceKind[]` is a bracketed block too, and an
+  // unqualified match on `[...]` reads it as an empty axis list.
+  const arr = /\[([^\]]*'[^\]]*)\]/.exec(body[1]!);
+  if (!arr) return null;
+  return [...arr[1]!.matchAll(/'([^']+)'/g)].map((x) => x[1]!);
+}
+
+/**
+ * The two constants that DOCUMENT the arithmetic must also DRIVE it.
+ *
+ * COVERED_STATUSES says "statuses that count toward the numerator" and
+ * EXCLUDED_STATUSES says "statuses excluded from the denominator entirely".
+ * Both were inert: the numerator was the literal `count('COVERED')` and the
+ * exclusion was `mine.length - waived`, in a different package from the
+ * constants claiming to govern them. Two mutation experiments proved it —
+ * adding ASSERTED_NOT_RUN to COVERED_STATUSES and UNKNOWN to
+ * EXCLUDED_STATUSES each changed nothing but a caveat, and the whole suite
+ * stayed green.
+ *
+ * That is this repo's signature defect wearing a new hat. The danger is not
+ * today's arithmetic, which happens to agree; it is that the next person told
+ * to stop counting something as covered will edit the documented lever, watch
+ * the tests pass, and ship no change at all.
+ */
+function checkCoverageArithmeticLevers(): void {
+  const CHECK = 'coverage-levers';
+  const sharedPath = join(ROOT, SHARED_SURFACE_FILE);
+
+  if (!existsSync(sharedPath)) {
+    add({
+      check: CHECK,
+      severity: 'skip',
+      what: 'the coverage arithmetic levers',
+      detail: `${SHARED_SURFACE_FILE} not found.`,
+      fix: `Run this from the repo root; if the coverage feature moved, update the file name in ${SELF}.`,
+    });
+    return;
+  }
+
+  const shared = stripComments(read(sharedPath));
+  const totals = /\bfunction\s+totalsForKind\b([\s\S]*?)\n\}/.exec(shared);
+  if (!totals) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: 'totalsForKind',
+      detail: `Could not find totalsForKind in ${SHARED_SURFACE_FILE}. It is the only place a per-axis count is derived, so a shape this check cannot read is arithmetic nothing is checking.`,
+      fix: `Keep totalsForKind as a top-level function declaration, or teach ${SELF} to read its new shape.`,
+    });
+    return;
+  }
+  const body = totals[1]!;
+
+  for (const lever of ['COVERED_STATUSES', 'EXCLUDED_STATUSES'] as const) {
+    if (body.includes(lever)) continue;
+    const role =
+      lever === 'COVERED_STATUSES'
+        ? 'the numerator is computed without it, so changing which statuses count as covered changes nothing'
+        : 'the denominator is computed without it, so changing which statuses are excluded changes nothing';
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: lever,
+      detail: `totalsForKind does not reference ${lever}, so ${role}. The constant's own doc comment claims it governs that arithmetic, which makes it a lever wired to nothing — and the next person to pull it will believe they changed the number.`,
+      fix: `Compute from ${lever} in totalsForKind (${SHARED_SURFACE_FILE}) instead of matching a status literal, or delete the constant so nothing can mistake it for the control.`,
+    });
+  }
+
+  /*
+   * A status literal where a lever belongs. Caught separately from the check
+   * above because a body could reference the constant AND still branch on a
+   * literal next to it, which is the half-migrated state.
+   */
+  for (const [literal, lever] of [
+    ["count('COVERED')", 'COVERED_STATUSES'],
+    ["count('WAIVED')", 'EXCLUDED_STATUSES'],
+  ] as const) {
+    if (!body.includes(literal)) continue;
+    // `waived` is reported as its own field, so counting it is legitimate —
+    // what must not happen is the DENOMINATOR being derived from that literal.
+    if (lever === 'EXCLUDED_STATUSES' && !/denominator\s*=\s*[^;]*waived/.test(body)) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: `${literal} in totalsForKind`,
+      detail: `totalsForKind branches on the status literal ${literal} where ${lever} is the documented control. The two agree today, which is exactly why nothing notices when they stop.`,
+      fix: `Derive it from ${lever} in ${SHARED_SURFACE_FILE}.`,
+    });
+  }
+}
+
+function checkUnmeasuredAxes(): void {
+  const CHECK = 'unmeasured-axes';
+  const sharedPath = join(ROOT, SHARED_SURFACE_FILE);
+  const inventoryPath = join(ROOT, AGENT_INVENTORY_FILE);
+
+  if (!existsSync(sharedPath) || !existsSync(inventoryPath)) {
+    add({
+      check: CHECK,
+      severity: 'skip',
+      what: 'the unmeasured axes',
+      detail: `${SHARED_SURFACE_FILE} or ${AGENT_INVENTORY_FILE} not found.`,
+      fix: `Run this from the repo root; if the coverage feature moved, update the file names in ${SELF}.`,
+    });
+    return;
+  }
+
+  const shared = stripComments(read(sharedPath));
+  const inventory = stripComments(read(inventoryPath));
+
+  const kinds = constStringArray(shared, 'SURFACE_KINDS') ?? [];
+  const measured = constStringArray(shared, 'MEASURED_SURFACE_KINDS') ?? [];
+  // Both lists are reported by checkSurfaceVocabulary when they cannot be read.
+  // Carrying on with empty ones here would report all eight axes as missing.
+  if (kinds.length === 0 || measured.length === 0) return;
+
+  const unmeasured = kinds.filter((k) => !measured.includes(k));
+
+  // The good state: nothing to compare, because nothing is restated.
+  const derived = missingAxesIsDerived(inventory);
+  const listed = derived ? null : hardcodedMissingAxes(inventory);
+
+  if (!derived && (!listed || listed.length === 0)) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: 'missingAxes',
+      detail: `Could not read the axis list inside missingAxes() in ${AGENT_INVENTORY_FILE}. It is the list the API returns as unmeasuredKinds, so a change this check cannot follow is a change nothing is checking.`,
+      fix: `Derive missingAxes() from SURFACE_KINDS and MEASURED_SURFACE_KINDS — unmeasuredKinds() in ${SHARED_SURFACE_FILE} already does exactly that — or update hardcodedMissingAxes in ${SELF}.`,
+    });
+  } else if (listed) {
+    /*
+     * Membership only, not order. The order the axes are named in is cosmetic,
+     * and failing a build over it here would be crying wolf: unlike the Prisma
+     * enum and its shared list, this literal is not maintained by being read
+     * beside another one.
+     */
+    const unnamed = unmeasured.filter((k) => !listed.includes(k));
+    const invented = listed.filter((k) => !unmeasured.includes(k));
+    const reasons: string[] = [];
+    if (unnamed.length > 0) {
+      reasons.push(
+        `${unnamed.join(', ')} ${unnamed.length === 1 ? 'has' : 'have'} no extractor and ${unnamed.length === 1 ? 'is' : 'are'} not in the literal, so the report never names ${unnamed.length === 1 ? 'it' : 'them'} and a reader is left to assume the axis was measured and found clean.`,
+      );
+    }
+    if (invented.length > 0) {
+      reasons.push(
+        `${invented.join(', ')} ${invented.length === 1 ? 'is' : 'are'} in the literal and ${invented.length === 1 ? 'is' : 'are'} measured, so the report tells the customer we do not look at something we do measure and hands back a pessimistic picture of our own coverage.`,
+      );
+    }
+    if (reasons.length > 0) {
+      add({
+        check: CHECK,
+        severity: 'fail',
+        what: 'missingAxes',
+        detail: `The axis list hand-written in missingAxes() (${AGENT_INVENTORY_FILE}) no longer equals SURFACE_KINDS minus MEASURED_SURFACE_KINDS. ${reasons.join(' ')}`,
+        fix: `Return unmeasuredKinds() from ${SHARED_SURFACE_FILE} — it derives the same list from the vocabulary, so it cannot drift — or correct the literal.`,
+      });
+    }
+  }
+
+  /*
+   * A placeholder where the axis list belongs. Checked as a literal because
+   * that is exactly what it is: `unmeasuredKinds: []` on a field whose own doc
+   * comment says it names the axes with no extractor.
+   */
+  if (/unmeasuredKinds:\s*\[\s*\]/.test(inventory)) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: 'SurfaceInventory.unmeasuredKinds',
+      detail: `buildSurfaceInventory in ${AGENT_INVENTORY_FILE} returns \`unmeasuredKinds: []\` for a field its own doc comment describes as "axes with no extractor, named so our own measurement gap is stated". ${unmeasured.length} axes have no extractor, so anything that reads the inventory is told there are none — the precise claim rule 4 exists to forbid. No shipped number is wrong yet only because apps/api/src/lib/coverage-store.ts calls missingAxes() instead of reading the field.`,
+      fix: `Return missingAxes() from buildSurfaceInventory in ${AGENT_INVENTORY_FILE}, or delete the field so nothing can read the placeholder.`,
+    });
+  }
+
+  okIfClean(
+    CHECK,
+    `${unmeasured.length} unmeasured axes`,
+    'Every axis with no extractor is named by missingAxes(), and the inventory reports the same list.',
+  );
+}
+
 // ─── Ratchet + reporting ─────────────────────────────────────────────────────
 
 function applyKnownGaps(): { suppressed: KnownGap[]; stale: KnownGap[] } {
@@ -1718,14 +2208,20 @@ function report(suppressed: KnownGap[], stale: KnownGap[]): number {
   const skips = findings.filter((f) => f.severity === 'skip');
   const oks = findings.filter((f) => f.severity === 'ok');
 
-  console.log(`\n${paint(BOLD, 'check-wiring')} — is anything in this repo connected to nothing?\n`);
+  console.log(
+    `\n${paint(BOLD, 'check-wiring')} — is anything in this repo connected to nothing?\n`,
+  );
 
   for (const f of oks) {
-    console.log(`${paint(GREEN, '  ok  ')} ${paint(DIM, f.check.padEnd(18))} ${f.what} — ${f.detail}`);
+    console.log(
+      `${paint(GREEN, '  ok  ')} ${paint(DIM, f.check.padEnd(18))} ${f.what} — ${f.detail}`,
+    );
   }
 
   if (skips.length) {
-    console.log(`\n${paint(BLUE, 'SKIPPED')} — could not be proved here, and that is not a failure:`);
+    console.log(
+      `\n${paint(BLUE, 'SKIPPED')} — could not be proved here, and that is not a failure:`,
+    );
     for (const f of skips) {
       console.log(`  ${paint(DIM, f.check)} ${paint(BOLD, f.what)}`);
       console.log(`      ${f.detail}`);
@@ -1774,8 +2270,11 @@ function report(suppressed: KnownGap[], stale: KnownGap[]): number {
 
   if (failed === 0 && suppressed.length > 0) {
     console.log(
-      paint(DIM, `  ${suppressed.length} known gaps are listed above in full. They are not fixed;\n` +
-        `  they are recorded. Each one fails this check the moment it stops reproducing.\n`),
+      paint(
+        DIM,
+        `  ${suppressed.length} known gaps are listed above in full. They are not fixed;\n` +
+          `  they are recorded. Each one fails this check the moment it stops reproducing.\n`,
+      ),
     );
   }
 
@@ -1802,6 +2301,9 @@ async function main(): Promise<void> {
   checkEnvVars();
   checkPrismaModels();
   checkFeatureFlags();
+  checkSurfaceVocabulary();
+  checkUnmeasuredAxes();
+  checkCoverageArithmeticLevers();
 
   const { suppressed, stale } = applyKnownGaps();
   const code = report(suppressed, stale);

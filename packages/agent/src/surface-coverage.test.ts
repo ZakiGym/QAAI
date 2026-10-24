@@ -20,7 +20,11 @@
 import { describe, expect, it } from 'vitest';
 import type { CodebaseAnalysis, FlowMap, SurfaceItem } from '@qaai/shared';
 import { totalsForItems } from '@qaai/shared';
-import { buildSurfaceInventory, endpointIdentity, fingerprintInventory } from './surface-inventory.js';
+import {
+  buildSurfaceInventory,
+  endpointIdentity,
+  fingerprintInventory,
+} from './surface-inventory.js';
 import {
   analyseSurfaceCoverage,
   rankUncovered,
@@ -349,7 +353,13 @@ describe('buildSurfaceInventory', () => {
             file: 'app/login/page.tsx',
             submitLabel: 'Sign in',
             fields: [
-              { name: 'email', label: 'Email', inputType: 'email', required: true, semantic: 'email' },
+              {
+                name: 'email',
+                label: 'Email',
+                inputType: 'email',
+                required: true,
+                semantic: 'email',
+              },
             ],
           },
         ],
@@ -552,7 +562,9 @@ describe('analyseSurfaceCoverage — routes', () => {
     const result = run({
       items: [ROUTE_ITEM],
       tests: [test_({ routes: ['/orders/:param'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
     expect(result.entries[0]?.matches[0]?.basis).toBe('LITERAL');
@@ -562,7 +574,9 @@ describe('analyseSurfaceCoverage — routes', () => {
     const result = run({
       items: [ROUTE_ITEM],
       tests: [test_({ routes: ['/orders/123'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
     expect(result.entries[0]?.matches[0]?.basis).toBe('NORMALISED');
@@ -576,14 +590,94 @@ describe('analyseSurfaceCoverage — routes', () => {
     expect(result.caveats.join(' ')).toContain('never been run');
   });
 
-  it('does not call an item covered when its only run failed', () => {
+  /**
+   * A failing test is coverage. It is covered AND failing, and those are two
+   * facts, not one.
+   *
+   * This asserted ASSERTED_NOT_RUN, which was wrong twice over: the item has a
+   * test that demonstrably runs, and the label on that status says "a test
+   * exists but has never run" — a false sentence about a test the customer has
+   * watched fail. Coverage asks whether a test exists and runs; whether it
+   * passes is the run report's job.
+   */
+  it('calls an item covered when its test ran and failed, and keeps the failure visible', () => {
     const result = run({
       items: [ROUTE_ITEM],
       tests: [test_({ routes: ['/orders/1'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'FAILED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'FAILED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
+    });
+    expect(result.entries[0]?.status).toBe('COVERED');
+    expect(result.entries[0]?.verification.lastStatus).toBe('FAILED');
+    expect(result.entries[0]?.verification.everPassed).toBe(false);
+  });
+
+  it('does not count a SKIPPED result as a run — a skipped test asserted nothing', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'SKIPPED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('ASSERTED_NOT_RUN');
+    expect(result.entries[0]?.verification.executed).toBe(false);
+  });
+
+  /**
+   * The regression test for the worst defect this feature shipped.
+   *
+   * A PASSED result used to overwrite lastRunId/lastStatus whatever its date,
+   * so an item whose newest run FAILED reported "last run: PASSED" from an
+   * older one. A wrong fact, in the direction that flatters the vendor, on a
+   * surface whose only test is red.
+   */
+  it('reports the genuinely newest run, never an older happier one', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [
+        {
+          testId: 'tst_1',
+          runId: 'run_new',
+          status: 'FAILED',
+          atIso: '2026-10-22T00:00:00.000Z',
+          everPassed: true,
+        },
+      ],
+    });
+    expect(result.entries[0]?.verification.lastRunId).toBe('run_new');
     expect(result.entries[0]?.verification.lastStatus).toBe('FAILED');
+    // The pass is still reported — as its own field, not as the last status.
+    expect(result.entries[0]?.verification.everPassed).toBe(true);
+  });
+
+  it('picks the newest run across several matched tests, not the first one seen', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [
+        test_({ id: 'tst_old', routes: ['/orders/1'] }),
+        test_({ id: 'tst_new', routes: ['/orders/2'] }),
+      ],
+      executions: [
+        {
+          testId: 'tst_old',
+          runId: 'run_old',
+          status: 'PASSED',
+          atIso: '2026-10-01T00:00:00.000Z',
+        },
+        {
+          testId: 'tst_new',
+          runId: 'run_new',
+          status: 'FAILED',
+          atIso: '2026-10-22T00:00:00.000Z',
+        },
+      ],
+    });
+    expect(result.entries[0]?.verification.lastRunId).toBe('run_new');
+    expect(result.entries[0]?.verification.lastStatus).toBe('FAILED');
+    expect(result.entries[0]?.verification.everPassed).toBe(true);
   });
 
   /** Rule 2 — the most important rule in the file. */
@@ -628,7 +722,9 @@ describe('analyseSurfaceCoverage — routes', () => {
     const result = run({
       items: [ROUTE_ITEM],
       tests: [test_({ code: "await page.goto('/orders/1');", routes: ['/orders/1'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
   });
@@ -657,7 +753,9 @@ describe('analyseSurfaceCoverage — endpoints', () => {
     const both = run({
       items: [endpoint],
       tests: [test_({ code: "await request.post('/api/refunds');" })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(both.entries[0]?.status).toBe('COVERED');
   });
@@ -666,7 +764,9 @@ describe('analyseSurfaceCoverage — endpoints', () => {
     const result = run({
       items: [endpoint],
       tests: [test_({ testType: 'API', code: 'url: /api/refunds' })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
   });
@@ -681,7 +781,9 @@ describe('analyseSurfaceCoverage — endpoints', () => {
     const result = run({
       items: [unknown],
       tests: [test_({ code: "await request.get('/api/refunds');" })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
     expect(result.entries[0]?.matches[0]?.basis).toBe('HEURISTIC');
@@ -700,7 +802,10 @@ describe('analyseSurfaceCoverage — forms', () => {
     detector: null,
     meta: {
       submitLabel: 'Sign in',
-      fields: [{ name: 'emailAddress', label: 'Email address' }, { name: 'id', label: null }],
+      fields: [
+        { name: 'emailAddress', label: 'Email address' },
+        { name: 'id', label: null },
+      ],
     },
   };
 
@@ -708,7 +813,9 @@ describe('analyseSurfaceCoverage — forms', () => {
     const result = run({
       items: [form],
       tests: [test_({ code: "await page.fill('#emailAddress', 'a@b.c');" })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
   });
@@ -729,7 +836,9 @@ describe('analyseSurfaceCoverage — forms', () => {
     const result = run({
       items: [form],
       tests: [test_({ code: "await page.getByRole('button', { name: 'Sign in' }).click();" })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
   });
@@ -761,9 +870,14 @@ describe('analyseSurfaceCoverage — auth surfaces', () => {
     const result = run({
       items: [login],
       tests: [
-        test_({ routes: ['/login'], code: "await page.fill('#password', 'hunter2'); await signIn();" }),
+        test_({
+          routes: ['/login'],
+          code: "await page.fill('#password', 'hunter2'); await signIn();",
+        }),
       ],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.status).toBe('COVERED');
   });
@@ -811,7 +925,9 @@ describe('the headline arithmetic', () => {
     const result = run({
       items,
       tests: [test_({ routes: ['/r0'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.totals.percent).toBe(33.3);
   });
@@ -840,7 +956,13 @@ describe('the headline arithmetic', () => {
         item,
         status: 'UNCOVERED' as const,
         matches: [],
-        verification: { lastRunId: null, lastStatus: null, executed: false, mutationKilled: null },
+        verification: {
+          lastRunId: null,
+          lastStatus: null,
+          executed: false,
+          everPassed: false,
+          mutationKilled: null,
+        },
       })),
     );
     expect(totals.denominator).toBe(1);
@@ -873,7 +995,9 @@ describe('the headline arithmetic', () => {
     const result = run({
       items: [ROUTE_ITEM],
       tests: [test_({ routes: ['/orders/1'] })],
-      executions: [{ testId: 'tst_1', runId: 'run_1', status: 'PASSED' }],
+      executions: [
+        { testId: 'tst_1', runId: 'run_1', status: 'PASSED', atIso: '2026-10-20T00:00:00.000Z' },
+      ],
     });
     expect(result.entries[0]?.verification.mutationKilled).toBeNull();
     expect(result.caveats.join(' ')).toContain('not known to assert anything meaningful');
@@ -881,9 +1005,19 @@ describe('the headline arithmetic', () => {
 
   it('records a mutation kill when a run reported one', () => {
     const executions: TestExecutionFact[] = [
-      { testId: 'tst_1', runId: 'run_1', status: 'PASSED', mutationKilled: true },
+      {
+        testId: 'tst_1',
+        runId: 'run_1',
+        status: 'PASSED',
+        atIso: '2026-10-20T00:00:00.000Z',
+        mutationKilled: true,
+      },
     ];
-    const result = run({ items: [ROUTE_ITEM], tests: [test_({ routes: ['/orders/1'] })], executions });
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions,
+    });
     expect(result.entries[0]?.verification.mutationKilled).toBe(true);
   });
 });
@@ -895,7 +1029,12 @@ describe('rankUncovered', () => {
       { ...ROUTE_ITEM, kind: 'ROUTE', key: 'ROUTE:/crawled', origin: 'CRAWL_ONLY' },
       { ...ROUTE_ITEM, kind: 'ROUTE', key: 'ROUTE:/declared', origin: 'SOURCE_ONLY' },
       { ...ROUTE_ITEM, kind: 'AUTH_SURFACE', key: 'AUTH_SURFACE:LOGIN@/login' },
-      { ...ROUTE_ITEM, kind: 'ENDPOINT', key: 'ENDPOINT:POST /api/x', meta: { method: 'POST', path: '/api/x' } },
+      {
+        ...ROUTE_ITEM,
+        kind: 'ENDPOINT',
+        key: 'ENDPOINT:POST /api/x',
+        meta: { method: 'POST', path: '/api/x' },
+      },
     ];
     const ranked = rankUncovered(run({ items }).entries);
     expect(ranked.map((entry) => entry.item.key)).toEqual([

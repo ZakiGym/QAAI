@@ -1,0 +1,866 @@
+# The coverage gate as a pull-request check (§6).
+#
+# WHY THIS FILE EXISTS
+#
+# `../qaai` runs a suite and fails the build when a test fails. That answers
+# "did what we wrote pass?" It cannot answer "what did this pull request leave
+# with no test at all?", because a suite's results only ever mention the
+# surfaces somebody already thought to test. This action asks the other
+# question: it reads the percentage of the SOURCE-DECLARED surface that has a
+# test which has actually run, fails the job below a floor the team sets, and —
+# the part that makes it worth adding to a pipeline — writes the NAMED LIST of
+# untested surfaces into the job summary.
+#
+# A reviewer who sees "coverage 61%" learns nothing they can act on. A reviewer
+# who sees "/admin/billing and 4 API endpoints have no test, here are the files
+# they are declared in" can either write the tests or say out loud that they are
+# not going to. That list is the product; the percentage is a field on it.
+#
+# WHY A SEPARATE ACTION RATHER THAN MORE INPUTS ON `../qaai`
+#
+# Three reasons, in order of how much they would have cost:
+#
+#  1. `../qaai` has `environment-id: required: true` — it cannot be configured
+#     into running nothing. Overloading it with a coverage mode means making
+#     that input optional and branching on which mode the caller meant, so the
+#     one guarantee that action makes would be gone.
+#  2. The two have different lifecycles. A coverage check needs no environment,
+#     no browser, no deploy and no minutes of waiting; it is a read of an
+#     analysis the platform already holds, so it belongs in a cheap job that
+#     runs on every pull request, alongside lint — not behind a suite.
+#  3. A composite action cannot cleanly delegate to its neighbour. A relative
+#     `uses: ./.github/actions/...` inside a composite action resolves against
+#     the WORKFLOW's repository checkout, not the action's own directory, so a
+#     delegating step works while both actions are vendored into the customer's
+#     repo and breaks the day they consume this by its published name. The gate
+#     therefore lives here, once, with no second copy to drift.
+#
+# WHY THE PACKAGE NAME IS SCOPED AND PINNED — the same rule as ../qaai
+#
+# The unscoped name `qaai` on the public npm registry belongs to somebody else:
+# an unrelated OpenAPI-to-Jest generator which ships its own `qaai` binary. So
+# `npx --yes qaai coverage …` would hand a stranger's package control of a step
+# that has just put the customer's QAAI_API_KEY in its environment. `@qaai/*`
+# cannot be squatted that way, and pinning the version on top means a
+# compromised later release cannot be pulled into a workflow that has not
+# changed. Keep `cli-version` here and in ../qaai moving together.
+
+name: QAAI coverage
+description: Fail a pull request when too much of the application's surface has no test, and write the untested list to the job summary
+
+inputs:
+  api-key:
+    description: QAAI API key (store as a repository secret)
+    required: true
+  project:
+    description: The project whose surface to measure
+    required: true
+  min-coverage:
+    description: >-
+      The floor, as a percentage (0-100). The job fails when measured coverage
+      is below it. Deliberately has no default: a gate whose floor we chose for
+      you is either a number you did not agree to or a 0 that can never fail.
+    required: true
+  api-url:
+    description: QAAI API base URL
+    required: false
+    default: http://localhost:4000
+  limit:
+    description: >-
+      How many untested surfaces to name in the summary (1-1000). The counts
+      are always the full picture; this caps the list, and the summary says so
+      when it has been capped.
+    required: false
+    default: '100'
+  kind:
+    description: >-
+      Comma-separated surface kinds to NAME in the summary — ROUTE, ENDPOINT,
+      FORM, AUTH_SURFACE. This narrows the list only. It does not narrow the
+      percentage, which is always measured over the whole surface.
+    required: false
+    default: ''
+  status:
+    description: >-
+      Comma-separated states to NAME in the summary. Default UNCOVERED, which
+      is also the only setting the API returns worst-first. The COUNT of every
+      state is in the summary whatever this is set to.
+    required: false
+    default: UNCOVERED
+  origin:
+    description: >-
+      Narrow the named list by provenance — SOURCE_ONLY (declared in your code,
+      never reached by a crawl), CRAWL_ONLY, BOTH. Like `kind`, this changes
+      the list and not the percentage.
+    required: false
+    default: ''
+  json-path:
+    description: >-
+      Where to write the gate's --json output. Keep it: this file is the whole
+      basis on which a customer can re-derive our number instead of taking it
+      on faith. Upload it with actions/upload-artifact.
+    required: false
+    default: qaai-coverage.json
+  cli-version:
+    description: >-
+      Version of @qaai/cli to run. Pinned by default so a workflow that has not
+      changed cannot start executing different code; override to upgrade. NOTE:
+      the `coverage` command is newer than 0.1.0, so until the release carrying
+      it is published this has to be set explicitly — a pinned CLI that predates
+      the command fails with exit 2 and a summary that says so.
+    required: false
+    default: 0.1.0
+
+outputs:
+  percent:
+    description: >-
+      The measured percentage, to one decimal place. EMPTY when there was
+      nothing to divide — never 0, which would be a different claim.
+    value: ${{ steps.report.outputs.percent }}
+  state:
+    description: >-
+      PASS, BELOW_FLOOR, NOT_MEASURED, UNREADABLE, or CLI_FAILED when the CLI
+      failed for a reason this action does not recognise. Key on this rather
+      than on the summary's wording if a workflow needs to treat one case
+      specially.
+    value: ${{ steps.report.outputs.state }}
+  exit-code:
+    description: >-
+      The verdict as the CLI's exit code — 0 at or above the floor, 1 below it,
+      2 the gate never ran, 3 nothing to measure. Any other value is a CLI
+      failure this action does not recognise, passed through unchanged.
+    value: ${{ steps.report.outputs.exit-code }}
+  uncovered:
+    description: How many surfaces have no test at all.
+    value: ${{ steps.report.outputs.uncovered }}
+  denominator:
+    description: How many surfaces the percentage was measured over.
+    value: ${{ steps.report.outputs.denominator }}
+
+runs:
+  using: composite
+  steps:
+    # `required: true` above is documentation, not enforcement — the runner does
+    # not check it for composite actions, so a workflow that forgets `project`
+    # gets a confusing API error unless we check here. Cheap, and before the
+    # network call.
+    - name: Check the inputs
+      shell: bash
+      env:
+        QAAI_API_KEY: ${{ inputs.api-key }}
+        QAAI_PROJECT: ${{ inputs.project }}
+        QAAI_MIN_COVERAGE: ${{ inputs.min-coverage }}
+        QAAI_LIMIT: ${{ inputs.limit }}
+      run: |
+        # Inputs reach the script through the environment, never by being
+        # interpolated into the command line as a workflow expression. A
+        # workflow is free to pass a value that came from a pull-request title,
+        # and an interpolated value carrying a command substitution would
+        # execute during expansion. (The expression syntax is deliberately not
+        # written out even in a comment: the runner evaluates it anywhere in a
+        # run body.)
+        node -e '
+          const fail = (message) => {
+            process.stdout.write(`::error title=QAAI coverage::${message}\n`);
+            process.exit(2);
+          };
+          if (!process.env.QAAI_API_KEY) fail("api-key is empty. Store the key as a repository secret and pass it as `api-key`.");
+          if (!process.env.QAAI_PROJECT) fail("project is empty. Pass the id of the project whose surface to measure.");
+          const min = Number(process.env.QAAI_MIN_COVERAGE);
+          if (process.env.QAAI_MIN_COVERAGE === undefined || process.env.QAAI_MIN_COVERAGE === "" || !Number.isFinite(min) || min < 0 || min > 100) {
+            fail(`min-coverage must be a number between 0 and 100, not "${process.env.QAAI_MIN_COVERAGE ?? ""}".`);
+          }
+          const limit = Number(process.env.QAAI_LIMIT);
+          if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+            fail(`limit must be a whole number between 1 and 1000, not "${process.env.QAAI_LIMIT ?? ""}".`);
+          }
+        '
+
+    # Measures, and deliberately does NOT decide. The CLI's exit code is data
+    # here, not a crash: the summary is the point of this action and it has to
+    # be written on the failing path too, so the verdict is deferred to the step
+    # below and this one always exits 0.
+    - name: Measure the surface
+      shell: bash
+      env:
+        QAAI_API_KEY: ${{ inputs.api-key }}
+        QAAI_API_URL: ${{ inputs.api-url }}
+        QAAI_PROJECT: ${{ inputs.project }}
+        QAAI_MIN_COVERAGE: ${{ inputs.min-coverage }}
+        QAAI_LIMIT: ${{ inputs.limit }}
+        QAAI_KIND: ${{ inputs.kind }}
+        QAAI_STATUS: ${{ inputs.status }}
+        QAAI_ORIGIN: ${{ inputs.origin }}
+        QAAI_JSON_PATH: ${{ inputs.json-path }}
+        QAAI_CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -uo pipefail
+        # Not `set -e`: a nonzero exit from the gate is the normal failing case.
+        set +e
+
+        args=(coverage
+          --project "$QAAI_PROJECT"
+          --min "$QAAI_MIN_COVERAGE"
+          --status "$QAAI_STATUS"
+          --limit "$QAAI_LIMIT"
+          --json)
+        if [ -n "$QAAI_KIND" ]; then args+=(--kind "$QAAI_KIND"); fi
+        if [ -n "$QAAI_ORIGIN" ]; then args+=(--origin "$QAAI_ORIGIN"); fi
+
+        # --json goes to stdout and the human-readable progress to stderr, so
+        # redirecting stdout to a file leaves the log readable and the file
+        # parseable. Both are wanted: the log is where a transport error is
+        # explained, the file is where the arithmetic is.
+        npx --yes "@qaai/cli@${QAAI_CLI_VERSION}" "${args[@]}" > "$QAAI_JSON_PATH"
+        status=$?
+
+        # Handed to the next step in a file rather than $GITHUB_ENV: the exit
+        # code belongs to this measurement, and putting it in the job's
+        # environment would leak it to every later step in the job.
+        echo "$status" > "${RUNNER_TEMP:-.}/qaai-coverage.exit"
+        echo "qaai coverage exited $status; JSON at $QAAI_JSON_PATH"
+        exit 0
+
+    # Writes the summary and sets the verdict. `always()` so a failed
+    # measurement still explains itself where a reviewer is looking.
+    - name: Report the untested surface
+      id: report
+      if: always()
+      shell: bash
+      env:
+        QAAI_MIN_COVERAGE: ${{ inputs.min-coverage }}
+        QAAI_JSON_PATH: ${{ inputs.json-path }}
+        QAAI_KIND: ${{ inputs.kind }}
+        QAAI_STATUS: ${{ inputs.status }}
+        QAAI_ORIGIN: ${{ inputs.origin }}
+        QAAI_LIMIT: ${{ inputs.limit }}
+        QAAI_CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -uo pipefail
+        temp="${RUNNER_TEMP:-.}"
+        summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+
+        # No exit-code file means the measurement step never ran — an input
+        # check failed above and has already made the job red with a specific
+        # message. Saying it twice, less precisely, helps nobody.
+        if [ ! -f "$temp/qaai-coverage.exit" ]; then
+          {
+            echo "## QAAI surface coverage"
+            echo
+            echo "The coverage gate stopped before it measured anything. See the failing step above."
+          } >> "$summary"
+          exit 0
+        fi
+
+        cat > "$temp/qaai-coverage-summary.mjs" <<'NODE'
+        /**
+         * Render a QAAI coverage measurement into a GitHub step summary, and
+         * decide the check's verdict.
+         *
+         * WHY THE VERDICT IS DECIDED HERE AS WELL AS IN THE CLI
+         *
+         * Not out of distrust of the CLI, but because of the one failure mode
+         * that would discredit this whole product: passing a check when nothing
+         * was measured. `percent` is null — not 0, not 100 — whenever there is
+         * nothing to divide by, and a gate that reads null as "not below the
+         * floor" is a green tick on a repository QAAI has never analysed. So
+         * this script reaches its own verdict from the figures in the JSON, and
+         * the exit code is the STRICTER of the two. It can only ever turn a
+         * pass into a failure, never the reverse.
+         *
+         * WHY THE LABELS ARE SPELLED OUT INSTEAD OF IMPORTED
+         *
+         * This runs in the customer's CI with nothing installed but the pinned
+         * CLI, so it cannot import SURFACE_KIND_LABELS / SURFACE_STATUS_LABELS
+         * from @qaai/shared. The strings below mirror that file deliberately; if
+         * the vocabulary there changes, this is the second place to change.
+         */
+        import { appendFileSync, readFileSync } from 'node:fs';
+
+        const EXIT_PASS = 0;
+        const EXIT_BELOW_FLOOR = 1;
+        const EXIT_USAGE = 2;
+        const EXIT_NOT_MEASURED = 3;
+
+        const jsonPath = process.env.QAAI_JSON_PATH || 'qaai-coverage.json';
+        const min = Number(process.env.QAAI_MIN_COVERAGE);
+        const cliExit = Number(process.env.QAAI_CLI_EXIT ?? '0');
+        const headSha = process.env.GITHUB_SHA || '';
+        const filters = {
+          kind: process.env.QAAI_KIND || '',
+          status: process.env.QAAI_STATUS || 'UNCOVERED',
+          origin: process.env.QAAI_ORIGIN || '',
+          limit: process.env.QAAI_LIMIT || '',
+        };
+
+        const KIND_LABELS = {
+          ROUTE: 'Routes',
+          ENDPOINT: 'API endpoints',
+          FORM: 'Forms',
+          AUTH_SURFACE: 'Auth surfaces',
+          ROLE_CELL: 'Route × role cells',
+          COMPONENT_STATE: 'Component states',
+          FLAG_COMBINATION: 'Feature-flag combinations',
+          BACKGROUND_JOB: 'Jobs, crons and webhooks',
+          NOTIFICATION: 'Emails and notifications',
+          ERROR_STATE: 'Error and empty states',
+          DEVICE_LOCALE: 'Devices and locales',
+          DATA_VARIANT: 'Data variants',
+        };
+        const STATUS_LABELS = {
+          COVERED: 'covered',
+          ASSERTED_NOT_RUN: 'a test exists but has never run',
+          UNCOVERED: 'no test',
+          UNKNOWN: 'cannot tell',
+          WAIVED: 'waived',
+        };
+        const ORIGIN_SHORT = {
+          SOURCE_ONLY: 'source only — never crawled',
+          CRAWL_ONLY: 'crawl only — not found in source',
+          BOTH: 'source + crawl',
+        };
+
+        // ─── Output buffer ───────────────────────────────────────────────────
+        //
+        // GitHub truncates a step summary over 1 MiB, and a summary that is cut
+        // off mid-table is a summary that has silently dropped rows. So the
+        // budget is tracked and the cut is announced.
+        const BUDGET_BYTES = 900_000;
+        const out = [];
+        let budget = BUDGET_BYTES;
+        let budgetHit = false;
+
+        function line(text = '') {
+          if (budgetHit) return;
+          const chunk = `${text}\n`;
+          if (chunk.length >= budget) {
+            budgetHit = true;
+            out.push(
+              '\n_Cut off here: GitHub caps a job summary at 1 MiB. Every row is in the JSON output._\n',
+            );
+            return;
+          }
+          budget -= chunk.length;
+          out.push(chunk);
+        }
+
+        function cell(value) {
+          return String(value ?? '')
+            .replace(/\|/g, '\\|')
+            .replace(/\r?\n/g, ' ')
+            .trim();
+        }
+        function code(value) {
+          const text = cell(value).replace(/`/g, "'");
+          return text ? `\`${text}\`` : '—';
+        }
+        function clamp(value, length) {
+          const text = cell(value);
+          return text.length > length ? `${text.slice(0, length - 1)}…` : text;
+        }
+        /** `Routes` → `routes`, but `API endpoints` is left alone. */
+        function lowerFirst(label) {
+          return /^[A-Z][a-z]/.test(label) ? label[0].toLowerCase() + label.slice(1) : label;
+        }
+        function kindLabel(kind) {
+          return KIND_LABELS[kind] ?? kind;
+        }
+        function annotate(level, message) {
+          process.stdout.write(
+            `::${level} title=QAAI coverage::${String(message).replace(/\r?\n/g, ' ')}\n`,
+          );
+        }
+        /**
+         * The verdict as data, for a workflow that needs to treat one case
+         * specially. `percent` is written EMPTY when there is nothing to
+         * divide: an output of `0` would be a claim about the customer's
+         * application rather than an absence of one.
+         */
+        function setOutputs(values) {
+          const target = process.env.GITHUB_OUTPUT;
+          if (!target) return;
+          const text = Object.entries(values)
+            .map(([key, value]) => `${key}=${String(value).replace(/\r?\n/g, ' ')}\n`)
+            .join('');
+          appendFileSync(target, text, 'utf8');
+        }
+
+        function flush() {
+          const text = out.join('');
+          const target = process.env.GITHUB_STEP_SUMMARY;
+          // Falling back to stdout is what makes this script runnable outside
+          // Actions, which is the only way it gets tested.
+          if (target) appendFileSync(target, text, 'utf8');
+          else process.stdout.write(text);
+        }
+
+        // ─── Reading what the gate produced ──────────────────────────────────
+
+        /**
+         * The gate's --json output, or null with the reason why not.
+         *
+         * The second attempt exists because a wrapper that prints a banner line
+         * before the JSON is a likely future accident, and failing a customer's
+         * build over it would be our bug charged to them.
+         */
+        function readPayload() {
+          let raw;
+          try {
+            raw = readFileSync(jsonPath, 'utf8');
+          } catch (error) {
+            return { error: `no readable JSON at ${jsonPath} (${error.code ?? error.message})` };
+          }
+          if (raw.trim() === '') return { error: `${jsonPath} is empty` };
+          try {
+            return { payload: JSON.parse(raw) };
+          } catch {
+            for (const candidate of raw.split('\n').reverse()) {
+              const trimmed = candidate.trim();
+              if (!trimmed.startsWith('{')) continue;
+              try {
+                return { payload: JSON.parse(trimmed) };
+              } catch {
+                /* keep looking */
+              }
+            }
+            return { error: `${jsonPath} is not JSON` };
+          }
+        }
+
+        /**
+         * Finds the report inside the payload.
+         *
+         * The shape this expects is the one the committed API returns from
+         * GET /surface/:projectId — `snapshot.totals` plus `items`. A verdict
+         * wrapper around it is accepted too, because a gate reasonably reports
+         * its own decision alongside the measurement. Anything else is refused
+         * loudly rather than guessed at: inventing a denominator because a key
+         * was missing is precisely the failure this product is sold against.
+         */
+        function locateReport(payload) {
+          const candidates = [payload, payload?.report, payload?.coverage, payload?.surface, payload?.data];
+          for (const candidate of candidates) {
+            if (candidate && typeof candidate === 'object' && candidate.snapshot?.totals) return candidate;
+          }
+          return null;
+        }
+
+        function explainUnreadable(detail, keys) {
+          line('## QAAI surface coverage');
+          line();
+          line(`**The gate did not produce a readable measurement** — ${detail}.`);
+          line();
+          line('This is a failure of the check itself, not a coverage figure. It is reported as a');
+          line('failure rather than a pass, because "we could not measure" and "you are above the');
+          line('floor" must never arrive at the same green tick.');
+          line();
+          line('Likely causes, in the order they happen:');
+          line();
+          line(
+            `- the pinned \`cli-version\` (\`${cell(process.env.QAAI_CLI_VERSION || 'unset')}\`) predates the \`qaai coverage\` command — bump it`,
+          );
+          line('- the API rejected the request (a wrong `project`, a key without `tests:read`) — the step log has the message');
+          line('- the API was unreachable from this runner');
+          if (keys?.length) line(`- the JSON came back in an unexpected shape; its top-level keys were: ${keys.map((key) => `\`${cell(key)}\``).join(', ')}`);
+          flush();
+          const code = cliExit !== 0 ? cliExit : EXIT_USAGE;
+          setOutputs({ percent: '', state: 'UNREADABLE', 'exit-code': code, uncovered: '', denominator: '' });
+          annotate('error', `QAAI coverage could not be measured: ${detail}.`);
+          process.exit(code);
+        }
+
+        const read = readPayload();
+        if (read.error) explainUnreadable(read.error);
+        const report = locateReport(read.payload);
+        if (!report) {
+          explainUnreadable(
+            'the JSON carried no snapshot totals',
+            read.payload && typeof read.payload === 'object' ? Object.keys(read.payload) : [],
+          );
+        }
+
+        // ─── The figures ─────────────────────────────────────────────────────
+
+        const snapshot = report.snapshot ?? {};
+        const totals = snapshot.totals ?? {};
+        const byKind = Array.isArray(totals.byKind) ? totals.byKind : [];
+        const percent = typeof totals.percent === 'number' ? totals.percent : null;
+        const denominator = Number(totals.denominator ?? 0);
+        const covered = Number(totals.covered ?? 0);
+        const caveats = Array.isArray(snapshot.caveats) ? snapshot.caveats : [];
+        const unmeasured = Array.isArray(report.unmeasuredKinds) ? report.unmeasuredKinds : [];
+        const items = (Array.isArray(report.items) ? report.items : Array.isArray(report.uncovered) ? report.uncovered : [])
+          .filter((entry) => entry && typeof entry === 'object' && entry.item);
+        const namedTotal = Number.isFinite(Number(report.total)) ? Number(report.total) : items.length;
+
+        /*
+         * Null percent and a zero denominator are checked separately although
+         * the shared helper derives one from the other. If they ever disagree,
+         * the honest reading is still "nothing was measured".
+         */
+        /*
+         * The same division the docs tell a customer to run with jq, run here.
+         * If the headline and the per-axis rows disagree, one of them is wrong
+         * and the discrepancy is OURS — reporting it is the difference between a
+         * number that can be audited and one that merely claims to be.
+         */
+        const measuredRows = byKind.filter((row) => row?.measured !== false);
+        const derivedCovered = measuredRows.reduce((sum, row) => sum + Number(row?.covered ?? 0), 0);
+        const derivedDenominator = measuredRows.reduce(
+          (sum, row) => sum + Number(row?.denominator ?? 0),
+          0,
+        );
+        const derivedPercent =
+          derivedDenominator > 0 ? Math.round((derivedCovered / derivedDenominator) * 1000) / 10 : null;
+        const disagrees =
+          byKind.length > 0 &&
+          (derivedCovered !== covered ||
+            derivedDenominator !== denominator ||
+            (percent !== null && derivedPercent !== null && Math.abs(derivedPercent - percent) > 0.05));
+
+        const verdict = percent === null || denominator <= 0
+          ? 'NOT_MEASURED'
+          : percent < min
+            ? 'BELOW_FLOOR'
+            : 'PASS';
+
+        const ourExit =
+          verdict === 'NOT_MEASURED' ? EXIT_NOT_MEASURED : verdict === 'BELOW_FLOOR' ? EXIT_BELOW_FLOOR : EXIT_PASS;
+        // The stricter of the two verdicts. See the header.
+        const exitCode = ourExit !== EXIT_PASS ? ourExit : cliExit;
+
+        // ─── The headline, and what it could not see ─────────────────────────
+
+        line('## QAAI surface coverage');
+        line();
+
+        if (verdict === 'NOT_MEASURED') {
+          line('### Not measured yet');
+          line();
+          line(
+            `**There is nothing to divide.** QAAI found ${denominator} measurable surfaces for this project, so there is no percentage — not 0%, and not 100%.`,
+          );
+          line();
+          line('This check fails rather than passes, because a floor cannot be met by a repository');
+          line('that has never been measured.');
+          line();
+          line('To fix it:');
+          line();
+          line('1. Connect the repository to this project, so the source analysis has something to read.');
+          line('2. Let an analysis finish (or `POST /surface/<projectId>/recompute`) and confirm the project shows a surface inventory.');
+          line('3. Re-run this check.');
+        } else {
+          const headline = `**${percent.toFixed(1)}%** of the measured surface has a test that has run — ${covered} of ${denominator} surfaces.`;
+          if (verdict === 'BELOW_FLOOR') {
+            line(`${headline} The floor is **${min}%**, so this check fails.`);
+          } else {
+            line(`${headline} The floor is ${min}%, so this check passes.`);
+          }
+          line();
+          line(
+            `_Covered means a test is matched to the surface **and** that test has been seen to run. A test that exists but has never executed is counted separately below, not here._`,
+          );
+        }
+
+        line();
+        // Rule: caveats go next to the figure. A measurement whose limits are a
+        // click away is a measurement whose limits nobody reads.
+        line('### What this number could not see');
+        line();
+        if (caveats.length === 0) {
+          line('> Nothing recorded. The measurement had a source analysis and a crawl to work from.');
+        } else {
+          for (const caveat of caveats) line(`> - ${cell(caveat)}`);
+        }
+
+        /*
+         * `stale.note` is the CLI's own derived caveat — "nothing has been
+         * stored for this project yet", or "the stored snapshot's fingerprint
+         * differs from this one". It is a sentence about what the number could
+         * not see, so it goes where the rest of them are rather than only in
+         * the step log where a reviewer never looks.
+         */
+        const staleNote = typeof read.payload?.stale?.note === 'string' ? read.payload.stale.note : null;
+        if (staleNote) line(`> - ${cell(staleNote)}`);
+
+        if (disagrees) {
+          line(
+            `> - **The headline and the per-axis rows do not agree.** The axes marked measured sum to ${derivedCovered} covered of ${derivedDenominator} (${derivedPercent === null ? 'nothing to divide' : `${derivedPercent.toFixed(1)}%`}), while the snapshot reports ${covered} of ${denominator}${percent === null ? '' : ` (${percent.toFixed(1)}%)`}. That is a defect in QAAI, not in your tests. The verdict below uses the snapshot's own figure; please send us this summary.`,
+          );
+        }
+
+        // A snapshot measured against another commit is the caveat this action
+        // is uniquely placed to notice, because only CI knows the head sha.
+        const snapshotSha = typeof snapshot.commitSha === 'string' ? snapshot.commitSha : null;
+        const shaMismatch =
+          snapshotSha && headSha && !headSha.startsWith(snapshotSha) && !snapshotSha.startsWith(headSha);
+        if (shaMismatch) {
+          line(
+            `> - This was measured against \`${cell(snapshotSha)}\`, **not** this pull request's head \`${cell(headSha.slice(0, 12))}\`. Surfaces this branch adds are not in the denominator until the repository is analysed again.`,
+          );
+        } else if (!snapshotSha && headSha) {
+          line(
+            '> - The measurement is not tied to a commit, so it reflects the analysis QAAI currently holds for this project rather than this pull request.',
+          );
+        }
+
+        // ─── The list. The reason the check is worth having. ─────────────────
+
+        const ORDER = ['UNCOVERED', 'ASSERTED_NOT_RUN', 'UNKNOWN', 'WAIVED', 'COVERED'];
+        const SECTIONS = {
+          UNCOVERED: {
+            heading: 'What nothing tests',
+            blurb: 'No test is matched to these at all. This is the number this check exists to shrink.',
+            lastColumn: 'Why it is in the denominator',
+          },
+          ASSERTED_NOT_RUN: {
+            heading: 'A test exists, but it has never run',
+            blurb:
+              'Not counted as covered. A test that has never executed has not been shown to pass, and has not been shown to assert anything.',
+            lastColumn: 'Why it is in the denominator',
+          },
+          UNKNOWN: {
+            heading: 'QAAI could not tell',
+            blurb:
+              'Not gaps — do not treat them as a to-do list. Static analysis could not resolve which surface these reach, usually because a test navigates to a URL built at run time. They stay in the denominator because the uncertainty is ours, not yours.',
+            lastColumn: 'Why it is in the denominator',
+          },
+          WAIVED: {
+            heading: 'Waived',
+            blurb: 'Excluded from the denominator on the record, with a reason and an owner.',
+            lastColumn: 'Reason it was waived',
+          },
+          COVERED: {
+            heading: 'Covered',
+            blurb: 'A test is matched to these and has been seen to run.',
+            lastColumn: 'Evidence',
+          },
+        };
+
+        const grouped = new Map();
+        for (const entry of items) {
+          const status = typeof entry.status === 'string' ? entry.status : 'UNKNOWN';
+          if (!grouped.has(status)) grouped.set(status, []);
+          grouped.get(status).push(entry);
+        }
+
+        const uncovered = grouped.get('UNCOVERED') ?? [];
+        if (uncovered.length > 0) {
+          const kindCounts = byKind
+            .filter((row) => Number(row?.uncovered ?? 0) > 0)
+            .map((row) => {
+              // The shared labels are plural ("Routes", "API endpoints"), so a
+              // count of one needs the singular. Dropping a trailing `s` is
+              // crude, and correct for all four axes that can appear here.
+              const label = lowerFirst(kindLabel(row.kind));
+              return `${row.uncovered} ${Number(row.uncovered) === 1 ? label.replace(/s$/, '') : label}`;
+            });
+          const named = uncovered.slice(0, 2).map((entry) => code(entry.item.label ?? entry.item.key));
+          // The global count, not the page's: the sentence is about the
+          // application, and the list below is a (possibly filtered) sample of it.
+          const rest = Math.max(Number(totals.uncovered ?? 0) - named.length, 0);
+          line();
+          line(
+            `This pull request leaves ${named.join(', ')}${rest > 0 ? ` and ${rest} more` : ''} with no test${kindCounts.length ? ` — ${kindCounts.join(', ')}` : ''}.`,
+          );
+        }
+
+        for (const status of ORDER) {
+          const rows = grouped.get(status);
+          if (!rows || rows.length === 0) continue;
+          const section = SECTIONS[status] ?? {
+            heading: STATUS_LABELS[status] ?? status,
+            blurb: '',
+            lastColumn: 'Evidence',
+          };
+
+          line();
+          line(`### ${section.heading} (${rows.length})`);
+          line();
+          if (section.blurb) {
+            line(section.blurb);
+            line();
+          }
+          line(`| Kind | Surface | Declared in | Provenance | ${section.lastColumn} |`);
+          line('| --- | --- | --- | --- | --- |');
+          for (const entry of rows) {
+            const item = entry.item ?? {};
+            const where = item.file ? `${item.file}${item.line ? `:${item.line}` : ''}` : '';
+            const waiver = entry.waiver;
+            const last =
+              status === 'WAIVED'
+                ? `${waiver?.reason ?? 'no reason recorded'} — ${waiver?.byEmail ?? 'no owner recorded'}, ${waiver?.expiresAtIso ? `expires ${waiver.expiresAtIso}` : 'no expiry'}`
+                : item.evidence ?? '—';
+            line(
+              `| ${cell(kindLabel(item.kind))} | ${code(item.label ?? item.key)} | ${code(where)} | ${cell(ORIGIN_SHORT[item.origin] ?? item.origin ?? '—')} | ${clamp(last, 200)} |`,
+            );
+          }
+        }
+
+        // Truncation is announced once, for the whole list, and the API's own
+        // `truncated` flag is honoured as well as the arithmetic — a list that
+        // quietly stops at the limit is how a report ends up claiming a repo has
+        // 100 untested surfaces when it has 400.
+        const notListed = Math.max(namedTotal - items.length, 0);
+        if (notListed > 0 || report.truncated === true) {
+          line();
+          line(
+            `_Showing ${items.length} of ${namedTotal} matched surfaces; the \`limit\` input is ${cell(filters.limit)}. Every count in this summary is the full picture regardless._`,
+          );
+        }
+
+        if (items.length === 0 && verdict !== 'NOT_MEASURED') {
+          line();
+          line(`_Nothing to name: no surface came back in the ${cell(filters.status)} state._`);
+        }
+
+        // ─── Every state, and every axis ─────────────────────────────────────
+
+        line();
+        line('### Every state');
+        line();
+        line('| State | Surfaces | In the percentage? |');
+        line('| --- | --- | --- |');
+        line(`| ${STATUS_LABELS.COVERED} | ${Number(totals.covered ?? 0)} | yes — the numerator |`);
+        line(
+          `| ${STATUS_LABELS.ASSERTED_NOT_RUN} | ${Number(totals.assertedNotRun ?? 0)} | in the denominator, not the numerator |`,
+        );
+        line(`| ${STATUS_LABELS.UNCOVERED} | ${Number(totals.uncovered ?? 0)} | in the denominator, not the numerator |`);
+        line(
+          `| ${STATUS_LABELS.UNKNOWN} | ${Number(totals.unknown ?? 0)} | in the denominator, not the numerator, and not a gap |`,
+        );
+        line(`| ${STATUS_LABELS.WAIVED} | ${Number(totals.waived ?? 0)} | excluded from both |`);
+
+        if (byKind.length > 0) {
+          line();
+          line('### By axis');
+          line();
+          line('| Axis | Covered | Test never ran | No test | Cannot tell | Waived | Coverage |');
+          line('| --- | --- | --- | --- | --- | --- | --- |');
+          for (const row of byKind) {
+            const measured = row?.measured !== false;
+            const rowPercent =
+              !measured
+                ? 'not measured by QAAI'
+                : typeof row.percent === 'number'
+                  ? `${row.percent.toFixed(1)}%`
+                  : 'nothing to divide';
+            line(
+              `| ${cell(kindLabel(row?.kind))} | ${Number(row?.covered ?? 0)} | ${Number(row?.assertedNotRun ?? 0)} | ${Number(row?.uncovered ?? 0)} | ${Number(row?.unknown ?? 0)} | ${Number(row?.waived ?? 0)} | ${rowPercent} |`,
+            );
+          }
+          if (byKind.some((row) => row?.measured === false)) {
+            line();
+            line(
+              '_Rows marked `not measured by QAAI` hold surfaces found by other means and are excluded from the headline percentage._',
+            );
+          }
+        }
+
+        if (unmeasured.length > 0) {
+          line();
+          line('### Axes QAAI does not measure');
+          line();
+          line(
+            `No extractor exists yet for ${unmeasured.map((kind) => `**${cell(kindLabel(kind))}**`).join(', ')}.`,
+          );
+          line(
+            'They are named rather than reported as 0%. "0% of your component states are covered" would be a claim about your application; "we do not measure component states" is a fact about ours, and only the second one is true.',
+          );
+        }
+
+        // ─── Provenance, and how to check the arithmetic ─────────────────────
+
+        const inputs = snapshot.inputs ?? {};
+        const lastStored = report.lastStored ?? null;
+        line();
+        line('<details><summary>Where this number came from, and how to check it yourself</summary>');
+        line();
+        line(`- snapshot \`${cell(snapshot.id || 'not persisted — this was a read')}\`, measured ${cell(snapshot.createdAtIso || 'at an unrecorded time')}`);
+        line(`- commit \`${cell(snapshotSha || 'none recorded')}\`${headSha ? ` · this check ran on \`${cell(headSha.slice(0, 12))}\`` : ''}`);
+        line(
+          `- inputs: analysis \`${cell(inputs.analysisId || 'none')}\`, flow map version \`${cell(inputs.flowMapVersion ?? 'none')}\`, ${Number(inputs.testCount ?? 0)} tests, run \`${cell(inputs.runId || 'none')}\``,
+        );
+        line(`- fingerprint \`${cell(snapshot.fingerprint || 'none')}\``);
+        line(
+          `- reconciliation: ${Number(totals.declaredNeverReached ?? 0)} declared in source but never reached by a crawl, ${Number(totals.reachedNeverDeclared ?? 0)} reached by a crawl but never found in source`,
+        );
+        // `lastStored` is the FLAT Prisma row, not a SurfaceSnapshot: its percent
+        // is `lastStored.percent`, not `lastStored.totals.percent`, and its date
+        // is `createdAt`, not `createdAtIso`. Guarding on `.totals` made this
+        // whole line dead code — it never rendered once.
+        if (lastStored && typeof lastStored === 'object') {
+          const previous = typeof lastStored.percent === 'number' ? lastStored.percent : null;
+          const delta = previous !== null && percent !== null ? percent - previous : null;
+          line(
+            `- last stored measurement: ${previous === null ? 'not measured' : `${previous.toFixed(1)}%`} on ${cell(lastStored.createdAt || 'an unrecorded date')}${delta === null ? '' : ` (${delta >= 0 ? '+' : ''}${delta.toFixed(1)} points)`} — stored snapshots are not necessarily of this commit`,
+          );
+        }
+        if (filters.kind || filters.origin) {
+          const narrowed = [
+            filters.kind ? `kinds \`${cell(filters.kind)}\`` : '',
+            filters.origin ? `origin \`${cell(filters.origin)}\`` : '',
+          ].filter(Boolean);
+          line(
+            `- the named list was filtered to ${narrowed.join(' and ')}. Filters narrow the list only; the percentage is always measured over the whole surface.`,
+          );
+        }
+        line();
+        line(`Every count above is in \`${cell(jsonPath)}\`, which this action leaves in the workspace. Re-derive the headline from it:`);
+        line();
+        line('```bash');
+        line(
+          `jq '[.snapshot.totals.byKind[] | select(.measured)] | (map(.covered) | add) as $c | (map(.denominator) | add) as $d | if $d > 0 then (($c / $d) * 1000 | round) / 10 else "not measured yet" end' ${cell(jsonPath)}`,
+        );
+        line('```');
+        line();
+        line('That is the whole formula. See `docs/coverage-gate.md` for checking the counts themselves, not just the division.');
+        line();
+        line('</details>');
+
+        flush();
+
+        if (verdict === 'NOT_MEASURED') {
+          annotate(
+            'error',
+            'QAAI has no measurable surface for this project, so coverage is not a number yet. Connect the repository and let an analysis finish, then re-run this check.',
+          );
+        } else if (verdict === 'BELOW_FLOOR') {
+          annotate(
+            'error',
+            `QAAI surface coverage is ${percent.toFixed(1)}%, below the ${min}% floor. ${Number(totals.uncovered ?? 0)} surfaces have no test; the job summary names them.`,
+          );
+        } else if (exitCode !== EXIT_PASS) {
+          // The figures read as a pass and the CLI disagreed. Report the CLI's
+          // verdict and say which one we are following, rather than quietly
+          // preferring the friendlier number.
+          annotate(
+            'error',
+            `qaai coverage exited ${cliExit} although the measurement reads ${percent.toFixed(1)}% against a ${min}% floor. Following the CLI; see the step log.`,
+          );
+        }
+
+        /*
+         * When our own verdict is the failing one it is the state; when the CLI
+         * failed on something we read as a pass, the state comes from ITS code
+         * rather than from a guess, and an unrecognised code says so instead of
+         * being rounded to the nearest familiar failure.
+         */
+        const STATE_BY_CODE = {
+          [EXIT_PASS]: 'PASS',
+          [EXIT_BELOW_FLOOR]: 'BELOW_FLOOR',
+          [EXIT_USAGE]: 'UNREADABLE',
+          [EXIT_NOT_MEASURED]: 'NOT_MEASURED',
+        };
+        setOutputs({
+          percent: percent === null ? '' : percent.toFixed(1),
+          state: ourExit !== EXIT_PASS ? verdict : STATE_BY_CODE[exitCode] ?? 'CLI_FAILED',
+          'exit-code': exitCode,
+          uncovered: Number(totals.uncovered ?? 0),
+          denominator: denominator,
+        });
+
+        process.exit(exitCode);
+        NODE
+
+        QAAI_CLI_EXIT="$(cat "$temp/qaai-coverage.exit")" \
+          node "$temp/qaai-coverage-summary.mjs"

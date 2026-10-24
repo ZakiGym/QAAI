@@ -52,6 +52,19 @@ export interface TestExecutionFact {
   runId: string;
   /** The runner's own vocabulary; see TEST_RESULT_STATUSES in shared. */
   status: TestResultStatus;
+  /**
+   * When this result was recorded, ISO-8601.
+   *
+   * Load-bearing: several tests can match one surface item, so "the last run"
+   * is only answerable by comparing dates. Without it the matcher took
+   * whichever matched test it happened to see first.
+   */
+  atIso: string;
+  /**
+   * Whether this test has EVER passed, which the caller knows from history the
+   * single latest result cannot show.
+   */
+  everPassed?: boolean;
   /** Null when no mutation run has had an opinion about this test. */
   mutationKilled?: boolean | null;
 }
@@ -291,6 +304,7 @@ const MATCHERS: Partial<
 function statusFor(
   item: SurfaceItem,
   matches: readonly SurfaceMatch[],
+  /** A terminal status was observed — not necessarily a passing one. */
   executed: boolean,
   opaqueNavigation: boolean,
   waived: boolean,
@@ -321,24 +335,32 @@ export function analyseSurfaceCoverage(input: SurfaceCoverageInput): SurfaceCove
     const matcher = MATCHERS[item.kind];
     const matches = matcher ? matcher(item, tests) : [];
 
-    // Rule 3: a match is not an execution. `executed` is true only when a
-    // matched test was actually seen to run and pass.
-    let lastRunId: string | null = null;
-    let lastStatus: TestResultStatus | null = null;
+    /*
+     * Rule 3: a match is not an execution — and the three questions below are
+     * three different questions.
+     *
+     * This block used to let a PASSED result overwrite `lastRunId`/`lastStatus`
+     * whatever its date, so an item whose newest run FAILED reported
+     * `lastStatus: 'PASSED'` from an older run. That is a wrong fact in the
+     * direction that flatters the vendor, printed on a surface whose only test
+     * is red. It also took the FIRST matched test's result as "the last run",
+     * which is only correct when exactly one test matches.
+     *
+     * So: `lastRunId`/`lastStatus` is the genuinely newest execution across
+     * every matched test, chosen by timestamp; `everPassed` is its own field;
+     * and `executed` means a terminal status was observed, pass or fail.
+     */
+    let latest: TestExecutionFact | null = null;
+    let everPassed = false;
     let executed = false;
     let mutationKilled: boolean | null = null;
     for (const match of matches) {
       const fact = executions.get(match.testId);
       if (!fact) continue;
-      if (!lastRunId) {
-        lastRunId = fact.runId;
-        lastStatus = fact.status;
-      }
-      if (fact.status === 'PASSED') {
-        executed = true;
-        lastRunId = fact.runId;
-        lastStatus = fact.status;
-      }
+      // SKIPPED is not a run: a skipped test asserted nothing.
+      if (fact.status !== 'SKIPPED') executed = true;
+      if (fact.status === 'PASSED' || fact.everPassed === true) everPassed = true;
+      if (!latest || fact.atIso > latest.atIso) latest = fact;
       if (fact.mutationKilled === true) mutationKilled = true;
       else if (fact.mutationKilled === false && mutationKilled === null) mutationKilled = false;
     }
@@ -350,7 +372,13 @@ export function analyseSurfaceCoverage(input: SurfaceCoverageInput): SurfaceCove
       item,
       status,
       matches,
-      verification: { lastRunId, lastStatus, executed, mutationKilled },
+      verification: {
+        lastRunId: latest?.runId ?? null,
+        lastStatus: latest?.status ?? null,
+        executed,
+        everPassed,
+        mutationKilled,
+      },
       ...(waiver ? { waiver } : {}),
     };
   });
@@ -377,7 +405,8 @@ export function analyseSurfaceCoverage(input: SurfaceCoverageInput): SurfaceCove
   }
 
   const unverifiedAssertions = entries.filter(
-    (entry) => COVERED_STATUSES.includes(entry.status) && entry.verification.mutationKilled !== true,
+    (entry) =>
+      COVERED_STATUSES.includes(entry.status) && entry.verification.mutationKilled !== true,
   ).length;
   if (unverifiedAssertions > 0) {
     caveats.push(

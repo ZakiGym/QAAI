@@ -20,6 +20,34 @@
 # If the pinned version is not published, this fails with a plain 404 naming the
 # package — loud and correct, which is what the old line was not.
 
+# THE COVERAGE GATE IS ITS SIBLING, NOT ANOTHER MODE OF THIS ACTION
+#
+# ../qaai-coverage fails a pull request when too much of the application's
+# SOURCE-DECLARED surface has no test, and writes the named list of untested
+# routes, endpoints, forms and auth surfaces into the job summary. It is a
+# separate action on purpose, and the reasoning is worth keeping here because
+# the obvious instinct is to add two inputs to this file instead:
+#
+#   - `environment-id` above is `required: true`, which is the one guarantee
+#     this action makes: it cannot be configured into running nothing. A
+#     coverage mode needs no environment, so adding it means making that input
+#     optional and branching on which mode the caller meant.
+#   - The lifecycles do not match. A coverage check is a read of an analysis the
+#     platform already holds — no browser, no deploy, no minutes of waiting — so
+#     it belongs in a cheap job that runs on every pull request alongside lint,
+#     not behind a suite.
+#   - A composite action cannot cleanly delegate to its neighbour either: a
+#     relative `uses: ./.github/actions/...` inside a composite action resolves
+#     against the WORKFLOW's checkout rather than the action's own directory, so
+#     a delegating step would work while both are vendored into the customer's
+#     repository and break the day they consume this by its published name.
+#
+# Both files pin `cli-version`, and for the reason above that pin is a security
+# property rather than a preference. MOVE THEM TOGETHER: a customer running two
+# versions of the CLI in one pipeline gets two vocabularies for "covered".
+#
+# Usage of both together is documented in docs/ci.md and docs/coverage-gate.md.
+
 name: QAAI
 description: Run a QAAI test suite and block the build on failures
 inputs:
@@ -34,7 +62,12 @@ inputs:
     required: false
     default: http://localhost:4000
   suite:
-    description: Run only this suite (default: the whole project)
+    # Quoted, and it has to be: an unquoted plain scalar cannot contain a
+    # colon followed by a space. Without the quotes this line ends the mapping
+    # early and the whole file fails to load with "mapping values are not
+    # allowed here" — which is how the action looked to every workflow that
+    # tried to use it, since the runner parses this file before it runs a step.
+    description: 'Run only this suite (default: the whole project)'
     required: false
   junit-path:
     description: Where to write JUnit XML

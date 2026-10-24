@@ -47,8 +47,8 @@
 
 import { createHash } from 'node:crypto';
 import {
-  MEASURED_SURFACE_KINDS,
   surfaceKey,
+  unmeasuredKinds,
   type AuthSurface,
   type CodebaseAnalysis,
   type FlowMap,
@@ -253,10 +253,7 @@ function routeItemFromFlowNode(node: FlowNode, baseUrl: string): SurfaceItem {
 }
 
 /** A crawled form, as its own item. Only used when there is no source analysis. */
-function formItemFromFlowNode(
-  node: FlowNode,
-  form: FlowNode['forms'][number],
-): SurfaceItem {
+function formItemFromFlowNode(node: FlowNode, form: FlowNode['forms'][number]): SurfaceItem {
   const identity = canonicalRoute(node.route);
   return {
     kind: 'FORM',
@@ -466,7 +463,10 @@ export function buildSurfaceInventory(input: SurfaceInventoryInput): SurfaceInve
 
   return {
     items,
-    unmeasuredKinds: [],
+    // Derived, not hardcoded and not empty. This returned [] for a field whose
+    // own doc comment says it names the unmeasured axes, so every caller had to
+    // know to ignore it and get the real list from somewhere else.
+    unmeasuredKinds: unmeasuredKinds(),
     caveats,
     reconciliation,
     fingerprint: fingerprintInventory(items),
@@ -493,18 +493,15 @@ export function fingerprintInventory(items: readonly SurfaceItem[]): string {
   return hash.digest('hex').slice(0, 16);
 }
 
-/** The axes QAAI has no extractor for, for a report to name rather than omit. */
+/**
+ * The axes QAAI has no extractor for.
+ *
+ * Delegates to shared rather than restating the list. This used to hardcode
+ * eight strings while `unmeasuredKinds()` in shared derived the same answer
+ * from MEASURED_SURFACE_KINDS and had no caller — two derivations of one fact,
+ * with the drift-prone copy wired in. Adding a ninth axis would have updated
+ * the real list and left this one stale.
+ */
 export function missingAxes(): SurfaceKind[] {
-  return (
-    [
-      'ROLE_CELL',
-      'COMPONENT_STATE',
-      'FLAG_COMBINATION',
-      'BACKGROUND_JOB',
-      'NOTIFICATION',
-      'ERROR_STATE',
-      'DEVICE_LOCALE',
-      'DATA_VARIANT',
-    ] as SurfaceKind[]
-  ).filter((kind) => !MEASURED_SURFACE_KINDS.includes(kind));
+  return unmeasuredKinds();
 }

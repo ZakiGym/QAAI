@@ -151,9 +151,19 @@ export const SURFACE_ORIGIN_LABELS: Record<SurfaceOrigin, string> = {
  * asserts anything. {@link SurfaceItemCoverage.verification} keeps them apart.
  */
 export const SURFACE_STATUSES = [
-  /** A test is matched to it and has been observed to run. */
+  /**
+   * A test is matched to it and has been observed to run. Whether that run
+   * passed is a separate question — see {@link SurfaceVerification}.
+   */
   'COVERED',
-  /** A test is matched to it, but no run has exercised that test yet. */
+  /**
+   * A test is matched to it and no run has ever exercised that test.
+   *
+   * This must mean literally never run, because that is what its label says.
+   * It previously also caught a test that ran and FAILED, which made the
+   * sentence shown to the customer — "a test exists but has never run" —
+   * false about a test they had watched fail.
+   */
   'ASSERTED_NOT_RUN',
   /** Nothing is matched to it. The number this product exists to shrink. */
   'UNCOVERED',
@@ -237,21 +247,48 @@ export interface SurfaceMatch {
   evidence: string;
 }
 
-/** Whether the matched tests have actually been seen to execute. */
+/**
+ * Whether the matched tests have actually been seen to execute.
+ *
+ * THE THREE FIELDS ARE THREE DIFFERENT QUESTIONS, AND MERGING ANY TWO LIES
+ *
+ * An earlier version had `executed` mean "a matched test passed" and let a
+ * PASSED result overwrite `lastRunId`/`lastStatus`. The effect was that an item
+ * whose newest run FAILED reported `lastStatus: 'PASSED'` from an older run —
+ * a wrong fact, in the direction that flatters the vendor, on a surface whose
+ * only test is red. That is precisely the failure mode this feature exists to
+ * avoid, so the fields are now separate and each answers exactly one thing.
+ *
+ * `executed` also no longer requires a pass. Coverage asks whether a test
+ * exists and runs; whether it passes is the run report's job. An item whose
+ * test runs and fails IS covered — and failing — and calling it uncovered
+ * would be the false sentence "no test has ever asserted anything about this"
+ * about a surface that has a test asserting something and finding a bug.
+ */
 export interface SurfaceVerification {
-  /** The most recent run that executed a test matched to this item. */
+  /**
+   * The genuinely most recent run that executed a matched test — whatever it
+   * reported. Never upgraded by an older, happier result.
+   */
   lastRunId: string | null;
   /**
-   * The status that run reported for it, in the vocabulary the database and the
-   * runner already use — never a parallel spelling invented here.
+   * The status that run reported, in the vocabulary the database and the runner
+   * already use — never a parallel spelling invented here.
    */
   lastStatus: TestResultStatus | null;
   /**
-   * True when a matched test ran and passed. The difference between this and
-   * `matches.length > 0` is the difference between a coverage number and a
-   * coverage claim.
+   * True when a matched test has been observed to run with a terminal status.
+   * SKIPPED does not count: a skipped test asserted nothing.
+   *
+   * The difference between this and `matches.length > 0` is the difference
+   * between a coverage number and a coverage claim.
    */
   executed: boolean;
+  /**
+   * True when a matched test has run and passed at some point. Reported, but
+   * deliberately NOT what makes an item covered — see the note above.
+   */
+  everPassed: boolean;
   /**
    * Whether any matched test has been shown to kill a mutant in the code behind
    * this item. Null until a mutation run has had an opinion.
@@ -360,7 +397,13 @@ export interface SurfaceSnapshotTotals {
  * pages, that belongs next to the figure it produced, not in a tooltip.
  */
 export interface SurfaceSnapshot {
-  id: string;
+  /**
+   * Null when this measurement was computed and not stored — which is every
+   * GET, by design. It was previously the empty string, which is a value that
+   * looks like an id and silently fails any truthiness check a consumer
+   * forgets to write.
+   */
+  id: string | null;
   projectId: string;
   createdAtIso: string;
   /** The commit this was measured against, when the caller knew it. */
@@ -423,9 +466,23 @@ export function totalsForKind(
   const mine = items.filter((entry) => entry.item.kind === kind);
   const count = (status: SurfaceStatus) => mine.filter((entry) => entry.status === status).length;
 
+  /*
+   * Driven by COVERED_STATUSES and EXCLUDED_STATUSES, not by string literals.
+   *
+   * This read `count('COVERED')` and `mine.length - count('WAIVED')`, which
+   * happened to agree with the two constants while leaving them inert — a
+   * mutation adding ASSERTED_NOT_RUN to COVERED_STATUSES changed nothing but a
+   * caveat, and EXCLUDED_STATUSES had no reader anywhere in the repo.
+   *
+   * That is this codebase's signature defect in miniature: the documented lever
+   * and the thing it claims to govern were in different packages with nothing
+   * connecting them, so the next person to implement "stop counting X as
+   * covered" would edit the constant, see the tests pass, and ship no change.
+   */
   const waived = count('WAIVED');
-  const covered = count('COVERED');
-  const denominator = mine.length - waived;
+  const covered = mine.filter((entry) => COVERED_STATUSES.includes(entry.status)).length;
+  const excluded = mine.filter((entry) => EXCLUDED_STATUSES.includes(entry.status)).length;
+  const denominator = mine.length - excluded;
 
   return {
     kind,

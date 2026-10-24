@@ -70,6 +70,26 @@ export interface ComputeOptions {
   persist?: boolean;
 }
 
+/**
+ * Ensures the inventory exists as rows, so an item can be addressed.
+ *
+ * A GET deliberately never persists, which left waivers unreachable: the waiver
+ * endpoint needs a CoverageItem row to hang off, and on a project nobody had
+ * explicitly recomputed there were none — so every gap the screen legitimately
+ * showed was impossible to waive. Materialising on first write is the fix that
+ * does not make reads start writing.
+ */
+export async function ensureInventory(options: {
+  orgId: string;
+  projectId: string;
+}): Promise<void> {
+  const existing = await prisma.coverageItem.count({
+    where: { projectId: options.projectId, retiredAt: null },
+  });
+  if (existing > 0) return;
+  await computeCoverage({ ...options, persist: true });
+}
+
 export interface ComputedCoverage {
   entries: SurfaceItemCoverage[];
   uncovered: SurfaceItemCoverage[];
@@ -125,11 +145,20 @@ async function loadFlowMap(
 }
 
 /**
- * The last execution of each test.
+ * Each test's genuinely latest execution, plus whether it has ever passed.
  *
- * This is what separates COVERED from ASSERTED_NOT_RUN, so it is loaded rather
- * than assumed. One row per test — its most recent result — because the
- * question is "has this ever been shown to work", not "what is its history".
+ * TWO FACTS, NOT ONE — AND THE BUG THAT CAME FROM MERGING THEM
+ *
+ * This used to let a PASSED result "upgrade" an entry a later failure had
+ * already written, on the reasoning that `executed` asked whether the test had
+ * ever worked. The effect was that `lastStatus` stopped being the last status:
+ * a test whose newest run failed reported PASSED from an older one, and the
+ * surface it covered displayed "last run: PASSED" while its only test was red.
+ *
+ * So the two questions are answered separately. The newest result wins
+ * `status`/`runId`/`atIso` unconditionally; `everPassed` is its own flag. The
+ * matcher then decides what each one means for coverage, which is its job and
+ * not this function's.
  */
 async function loadExecutions(projectId: string): Promise<TestExecutionFact[]> {
   const results = await prisma.testResult.findMany({
@@ -145,24 +174,19 @@ async function loadExecutions(projectId: string): Promise<TestExecutionFact[]> {
   for (const result of results) {
     if (!result.testId) continue;
     const existing = latest.get(result.testId);
-    // Newest first, so the first sighting is the latest — except that a PASSED
-    // anywhere in recent history is what `executed` asks about, so a pass
-    // upgrades an entry a later failure already wrote.
     if (!existing) {
+      // Newest first, so the first sighting of a test IS its latest result.
       latest.set(result.testId, {
         testId: result.testId,
         runId: result.runId,
         status: result.status,
+        atIso: result.createdAt.toISOString(),
+        everPassed: result.status === 'PASSED',
       });
       continue;
     }
-    if (existing.status !== 'PASSED' && result.status === 'PASSED') {
-      latest.set(result.testId, {
-        testId: result.testId,
-        runId: result.runId,
-        status: 'PASSED',
-      });
-    }
+    // Older rows contribute nothing but history. They may not touch `status`.
+    if (result.status === 'PASSED') existing.everPassed = true;
   }
   return [...latest.values()];
 }
@@ -233,7 +257,8 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
   const caveats = [...inventory.caveats, ...result.caveats];
 
   const snapshot: SurfaceSnapshot = {
-    id: '',
+    // Null until persist() returns an id. A GET leaves it null on purpose.
+    id: null,
     projectId,
     createdAtIso: new Date().toISOString(),
     commitSha: options.commitSha ?? null,

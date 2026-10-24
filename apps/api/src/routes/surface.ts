@@ -44,7 +44,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { SURFACE_KINDS, SURFACE_STATUSES, parseSurfaceKey } from '@qaai/shared';
 import type { SurfaceItemCoverage, SurfaceKind, SurfaceStatus } from '@qaai/shared';
-import { computeCoverage, latestSnapshot, snapshotTrend } from '../lib/coverage-store.js';
+import {
+  computeCoverage,
+  ensureInventory,
+  latestSnapshot,
+  snapshotTrend,
+} from '../lib/coverage-store.js';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
@@ -257,6 +262,10 @@ surfaceRouter.post(
     }
 
     const project = await projectOr404(String(req.params.projectId));
+    // A GET never persists, so on a project nobody has explicitly recomputed
+    // there are no rows and every visible gap would be unwaivable. This is a
+    // write endpoint, so materialising here is appropriate; reads stay reads.
+    await ensureInventory({ orgId: project.orgId, projectId: project.id });
     const item = await prisma.coverageItem.findUnique({
       where: { projectId_key: { projectId: project.id, key } },
       select: { id: true, label: true },

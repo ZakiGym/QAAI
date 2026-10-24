@@ -86,8 +86,30 @@ export const NAV: NavItemDef[] = [
     href: '/insights',
     label: 'Insights',
     Icon: IconSearch,
+    /*
+     * `/surface` MUST be claimed here as well as listed in the strip below.
+     *
+     * `isNavActive` prefix-matches a section's own href, and /surface shares no
+     * prefix with /insights — so without this claim the sidebar goes dark on
+     * that screen, `sectionFor` returns null, and the shell renders no tab
+     * strip at all, stranding the page with no way back into its section. The
+     * same trap the note on Setup's /schedules records.
+     */
+    owns: ['/surface'],
     tabs: [
       { href: '/insights/coverage', label: 'Coverage' },
+      /*
+       * A tab, not a seventh sidebar row — and a tab is enough, because the
+       * command palette is built from tab hrefs (see EXTRA_DESTINATIONS and the
+       * note above `nav` in AppShell), so a screen listed here inherits ⌘K.
+       *
+       * Placed second, directly after Coverage, because the two are the same
+       * question asked against two different denominators and the difference is
+       * the product: Coverage divides by what a crawl REACHED, this divides by
+       * what the source DECLARES. A surface nothing has ever reached is missing
+       * from the first number entirely and named in the second.
+       */
+      { href: '/surface', label: 'Dark surface' },
       { href: '/insights/health', label: 'Suite health' },
       { href: '/insights/impact', label: 'Impact' },
     ],

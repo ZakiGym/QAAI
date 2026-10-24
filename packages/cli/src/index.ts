@@ -330,6 +330,7 @@ Usage:
   qaai run --env <id> [options]         Run a suite and wait for the verdict
   qaai deploy-check --env <id> [opts]   Post-deploy smoke run (exit 1 on failure)
   qaai status <runId>                   Print the status of a run
+  qaai coverage --project <id>          What has nothing ever tested? (--min to gate)
   qaai backup <create|verify|restore>   Back up or restore the database
   qaai runner [--api-url <url>]         Run tests inside your own network
 
@@ -340,6 +341,17 @@ Run options:
   --junit <path>      Write JUnit XML to this path for the CI to report
   --no-wait           Queue the run and return its id without waiting
   --timeout <sec>     Give up waiting after this many seconds (default 600)
+
+Coverage options (qaai coverage, full detail in \`qaai coverage\` with no args):
+  --project <id>      The project to report on (required)
+  --min <percent>     Fail the build below this floor. Exit 1 below it, and
+                      exit 3 — a different failure — when there is nothing to
+                      divide, because coverage that was never computed did not
+                      drop. Exit 2 stays "the gate never ran".
+  --limit <n>         How many items to print (default 50). Whatever is held
+                      back is counted out loud; the totals are always complete.
+  --kind/--status/--origin   Narrow the list
+                      Default status is UNCOVERED, which is the point of it.
 
 Reporters (repeatable, and composable with --junit):
   --reporter <name>   junit | allure | testrail
@@ -398,6 +410,17 @@ async function main(): Promise<number> {
       return cmdDeployCheck(opts, rest);
     case 'status':
       return cmdStatus(opts, rest);
+    /*
+     * Lazy like `backup` and `runner`, and for the same reason: `qaai status`
+     * should not pay to load a renderer it will never use. Its own exit codes
+     * are richer than this file's (3 means "nothing was measured", which is
+     * neither a failure of the tests nor of the transport), so the command owns
+     * the whole mapping and returns the code rather than throwing.
+     */
+    case 'coverage': {
+      const { cmdCoverage } = await import('./commands/coverage.js');
+      return cmdCoverage(opts, rest);
+    }
     case 'backup':
     case 'restore': {
       const { backupMain } = await import('./backup.js');
