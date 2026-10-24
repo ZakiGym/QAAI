@@ -15,6 +15,7 @@ export * from './detect';
 export * from './new-test-templates';
 export * from './ecosystems';
 export * from './flow-map';
+export * from './surface';
 export * from './locators';
 export * from './types';
 export * from './schemas';

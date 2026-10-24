@@ -20,3 +20,5 @@ export * from './traffic.js';
  * above.
  */
 export * from './coverage.js';
+export * from './surface-inventory.js';
+export * from './surface-coverage.js';

@@ -9,8 +9,8 @@
 // Prisma 7: the connection URL lives in prisma.config.ts (for Migrate) and is
 // supplied to PrismaClient through a driver adapter (see src/lib/prisma.ts).
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
   moduleFormat = "esm"
 }
 
@@ -285,43 +285,44 @@ enum PlanItemState {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model User {
-  id             String    @id @default(cuid())
-  email          String    @unique
-  emailVerified  DateTime?
-  name           String
+  id            String    @id @default(cuid())
+  email         String    @unique
+  emailVerified DateTime?
+  name          String
   /// Null for users who only ever signed in with OAuth.
-  passwordHash   String?
-  avatarUrl      String?
+  passwordHash  String?
+  avatarUrl     String?
   /// §11 — grants access to /admin. Never settable through the public API.
-  isSuperuser    Boolean   @default(false)
+  isSuperuser   Boolean   @default(false)
   /// Encrypted TOTP seed (§1 2FA). Null until the user enrols.
-  totpSecretEnc  String?
-  totpEnabledAt  DateTime?
-  lastLoginAt    DateTime?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  totpSecretEnc String?
+  totpEnabledAt DateTime?
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  memberships    Membership[]
-  sessions       Session[]
-  oauthAccounts  OAuthAccount[]
-  auditLogs      AuditLog[]
-  chatMessages   ChatMessage[]
+  memberships   Membership[]
+  sessions      Session[]
+  oauthAccounts OAuthAccount[]
+  auditLogs     AuditLog[]
+  chatMessages  ChatMessage[]
 
   teamMemberships TeamMember[]
   ownedRules      OwnershipRule[]
+  coverageWaivers CoverageWaiver[]
 
   @@index([email])
 }
 
 model OAuthAccount {
-  id                String   @id @default(cuid())
+  id                String    @id @default(cuid())
   userId            String
   provider          String // "google" | "github"
   providerAccountId String
   accessTokenEnc    String?
   refreshTokenEnc   String?
   expiresAt         DateTime?
-  createdAt         DateTime @default(now())
+  createdAt         DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -330,17 +331,17 @@ model OAuthAccount {
 }
 
 model Session {
-  id           String   @id @default(cuid())
-  userId       String
+  id          String    @id @default(cuid())
+  userId      String
   /// SHA-256 of the cookie value. The raw token is never stored.
-  tokenHash    String   @unique
+  tokenHash   String    @unique
   /// The org this session is currently acting in; switchable without re-login.
-  activeOrgId  String?
-  ip           String?
-  userAgent    String?
-  expiresAt    DateTime
-  revokedAt    DateTime?
-  createdAt    DateTime @default(now())
+  activeOrgId String?
+  ip          String?
+  userAgent   String?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -350,13 +351,13 @@ model Session {
 
 /// Email verification and password reset both use this table, discriminated by `purpose`.
 model VerificationToken {
-  id        String   @id @default(cuid())
+  id        String    @id @default(cuid())
   email     String
-  tokenHash String   @unique
+  tokenHash String    @unique
   purpose   String // "EMAIL_VERIFY" | "PASSWORD_RESET" | "INVITE"
   expiresAt DateTime
   usedAt    DateTime?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
 
   @@index([email, purpose])
 }
@@ -366,34 +367,34 @@ model VerificationToken {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Organization {
-  id        String   @id @default(cuid())
-  name      String
-  slug      String   @unique
-  plan      Plan     @default(FREE)
+  id             String       @id @default(cuid())
+  name           String
+  slug           String       @unique
+  plan           Plan         @default(FREE)
   /// Per-org overrides on top of PLAN_LIMITS; used for trials and enterprise deals.
   limitOverrides Json?
   /// Record-and-notify only (§9 dunning) — see the BillingState doc comment.
-  billingState BillingState @default(OK)
+  billingState   BillingState @default(OK)
   /// Stripe's clock (`event.created`) for the LAST invoice event applied. The
   /// ordering guard for dunning: an invoice.payment_failed that is older than
   /// the invoice.paid already applied must not mark a healthy org PAST_DUE.
   /// Same single-clock rule as Subscription.planSyncedAt, for the same reason.
   billingStateAt DateTime?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
-  memberships   Membership[]
-  invites       Invite[]
-  projects      Project[]
-  apiKeys       ApiKey[]
-  auditLogs     AuditLog[]
-  subscription  Subscription?
-  usageRecords  UsageRecord[]
-  agentCalls    AgentCall[]
-  integrations  Integration[]
-  featureFlags  FeatureFlagOverride[]
+  memberships    Membership[]
+  invites        Invite[]
+  projects       Project[]
+  apiKeys        ApiKey[]
+  auditLogs      AuditLog[]
+  subscription   Subscription?
+  usageRecords   UsageRecord[]
+  agentCalls     AgentCall[]
+  integrations   Integration[]
+  featureFlags   FeatureFlagOverride[]
   ssoConnections SsoConnection[]
-  runners       Runner[]
+  runners        Runner[]
 
   @@index([slug])
 }
@@ -413,15 +414,15 @@ model Membership {
 }
 
 model Invite {
-  id        String   @id @default(cuid())
-  orgId     String
-  email     String
-  role      OrgRole  @default(MEMBER)
-  tokenHash String   @unique
-  invitedBy String
-  expiresAt DateTime
+  id         String    @id @default(cuid())
+  orgId      String
+  email      String
+  role       OrgRole   @default(MEMBER)
+  tokenHash  String    @unique
+  invitedBy  String
+  expiresAt  DateTime
   acceptedAt DateTime?
-  createdAt DateTime @default(now())
+  createdAt  DateTime  @default(now())
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
@@ -452,21 +453,21 @@ model ApiKey {
 
 /// §1 — every mutating action. Append-only; there is no update or delete path.
 model AuditLog {
-  id         String   @id @default(cuid())
-  orgId      String
-  userId     String?
+  id             String   @id @default(cuid())
+  orgId          String
+  userId         String?
   /// "project.create", "secret.update", "verdict.override", ...
-  action     String
-  targetType String
-  targetId   String?
+  action         String
+  targetType     String
+  targetId       String?
   /// Diff or payload summary, already secret-masked.
-  metadata   Json?
-  ip         String?
-  userAgent  String?
-  requestId  String?
+  metadata       Json?
+  ip             String?
+  userAgent      String?
+  requestId      String?
   /// Set when a superuser was impersonating (§11).
   impersonatedBy String?
-  createdAt  DateTime @default(now())
+  createdAt      DateTime @default(now())
 
   org  Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
   user User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
@@ -480,26 +481,26 @@ model AuditLog {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Project {
-  id               String      @id @default(cuid())
-  orgId            String
-  name             String
-  slug             String
-  repoUrl          String?
+  id                       String      @id @default(cuid())
+  orgId                    String
+  name                     String
+  slug                     String
+  repoUrl                  String?
   /// Owner/name, set when the GitHub App is installed on the repo.
-  repoFullName     String?
-  repoInstallationId String?
-  defaultBranch    String      @default("main")
-  primaryLanguage  Language    @default(TYPESCRIPT)
-  primaryFramework UiFramework @default(PLAYWRIGHT)
+  repoFullName             String?
+  repoInstallationId       String?
+  defaultBranch            String      @default("main")
+  primaryLanguage          Language    @default(TYPESCRIPT)
+  primaryFramework         UiFramework @default(PLAYWRIGHT)
   /// GateRule[] — see packages/shared types.
-  gateRules        Json        @default("[]")
+  gateRules                Json        @default("[]")
   /// Org-level opt-in to auto-approving SELECTOR_ONLY heals (§3.4).
-  autoApproveSelectorHeals Boolean @default(false)
-  archivedAt       DateTime?
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
+  autoApproveSelectorHeals Boolean     @default(false)
+  archivedAt               DateTime?
+  createdAt                DateTime    @default(now())
+  updatedAt                DateTime    @updatedAt
 
-  org           Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  org           Organization       @relation(fields: [orgId], references: [id], onDelete: Cascade)
   environments  Environment[]
   suites        Suite[]
   tests         Test[]
@@ -511,30 +512,32 @@ model Project {
   conversations ChatConversation[]
   baselines     VisualBaseline[]
 
-  ownershipRules OwnershipRule[]
-  triageBatches  TriageBatch[]
-  digest         DigestSubscription?
+  ownershipRules    OwnershipRule[]
+  triageBatches     TriageBatch[]
+  digest            DigestSubscription?
   pluginEnablements PluginEnablement[]
+  coverageItems     CoverageItem[]
+  coverageSnapshots CoverageSnapshot[]
 
   @@unique([orgId, slug])
   @@index([orgId])
 }
 
 model Environment {
-  id        String          @id @default(cuid())
-  orgId     String
-  projectId String
-  name      String
-  kind      EnvironmentKind
-  baseUrl   String
+  id         String          @id @default(cuid())
+  orgId      String
+  projectId  String
+  name       String
+  kind       EnvironmentKind
+  baseUrl    String
   /// The on-prem runner pool this environment executes on, or null for the
   /// cloud worker (ENTERPRISE). This is THE switch: a staging environment that
   /// never faces the internet cannot be reached from our infrastructure at all,
   /// so a run against it must be handed to an agent inside the customer's
   /// network instead of being enqueued on our own queue. See Run.runnerPool.
   runnerPool String?
-  createdAt DateTime        @default(now())
-  updatedAt DateTime        @updatedAt
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
 
   project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
   secrets      Secret[]
@@ -570,18 +573,18 @@ model Secret {
 }
 
 model AuthProfile {
-  id            String          @id @default(cuid())
-  orgId         String
-  environmentId String
-  name          String
-  kind          AuthProfileKind
+  id                    String          @id @default(cuid())
+  orgId                 String
+  environmentId         String
+  name                  String
+  kind                  AuthProfileKind
   /// Non-secret config; secret-bearing fields reference Secret.name.
-  config        Json
+  config                Json
   /// Cached Playwright storageState, refreshed on expiry (§2).
-  storageState  Json?
+  storageState          Json?
   storageStateExpiresAt DateTime?
-  createdAt     DateTime        @default(now())
-  updatedAt     DateTime        @updatedAt
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
 
   environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
 
@@ -594,19 +597,19 @@ model AuthProfile {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model FlowMap {
-  id            String   @id @default(cuid())
-  orgId         String
-  projectId     String
-  environmentId String
-  version       Int
+  id              String   @id @default(cuid())
+  orgId           String
+  projectId       String
+  environmentId   String
+  version         Int
   /// Serialised FlowMap from packages/shared. Kept whole rather than normalised:
   /// it is written once per crawl, read as a unit, and diffed version-to-version.
-  graph         Json
-  nodeCount     Int      @default(0)
-  edgeCount     Int      @default(0)
-  journeyCount  Int      @default(0)
+  graph           Json
+  nodeCount       Int      @default(0)
+  edgeCount       Int      @default(0)
+  journeyCount    Int      @default(0)
   truncatedReason String?
-  createdAt     DateTime @default(now())
+  createdAt       DateTime @default(now())
 
   project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
@@ -617,13 +620,13 @@ model FlowMap {
 }
 
 model TestPlan {
-  id          String   @id @default(cuid())
-  orgId       String
-  projectId   String
-  flowMapId   String?
-  summary     String
-  skipped     Json     @default("[]")
-  createdAt   DateTime @default(now())
+  id        String   @id @default(cuid())
+  orgId     String
+  projectId String
+  flowMapId String?
+  summary   String
+  skipped   Json     @default("[]")
+  createdAt DateTime @default(now())
 
   project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
   flowMap FlowMap?   @relation(fields: [flowMapId], references: [id], onDelete: SetNull)
@@ -633,24 +636,24 @@ model TestPlan {
 }
 
 model PlanItem {
-  id            String        @id @default(cuid())
-  orgId         String
-  testPlanId    String
-  title         String
-  rationale     String
-  feature       String
-  priority      Priority
-  testType      TestType
-  steps         Json // string[]
-  assertions    Json // string[]
-  journeyId     String?
-  authProfileId String?
-  state         PlanItemState @default(PROPOSED)
-  decidedBy     String?
-  decidedAt     DateTime?
+  id              String        @id @default(cuid())
+  orgId           String
+  testPlanId      String
+  title           String
+  rationale       String
+  feature         String
+  priority        Priority
+  testType        TestType
+  steps           Json // string[]
+  assertions      Json // string[]
+  journeyId       String?
+  authProfileId   String?
+  state           PlanItemState @default(PROPOSED)
+  decidedBy       String?
+  decidedAt       DateTime?
   /// Set once the Generator turns this into a Test.
   generatedTestId String?
-  createdAt     DateTime      @default(now())
+  createdAt       DateTime      @default(now())
 
   testPlan TestPlan @relation(fields: [testPlanId], references: [id], onDelete: Cascade)
 
@@ -703,26 +706,26 @@ model Test {
   timeoutMs Int      @default(60000)
 
   /// Flake radar (§5). Maintained by the run finaliser, not computed on read.
-  quarantined      Boolean   @default(false)
-  quarantinedAt    DateTime?
-  quarantineReason String?
-  flakeRate        Float     @default(0)
-  lastRunAt        DateTime?
-  consecutiveFailures Int    @default(0)
+  quarantined         Boolean   @default(false)
+  quarantinedAt       DateTime?
+  quarantineReason    String?
+  flakeRate           Float     @default(0)
+  lastRunAt           DateTime?
+  consecutiveFailures Int       @default(0)
 
   /// Selectors the Generator was unsure about; the cockpit shows a review badge.
-  reviewFlags String[] @default([])
+  reviewFlags String[]  @default([])
   /// Which plan item produced this, when it came from the Explorer.
   planItemId  String?
   disabledAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  project  Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  suite    Suite?        @relation(fields: [suiteId], references: [id], onDelete: SetNull)
-  versions TestVersion[]
-  results  TestResult[]
-  heals    HealProposal[]
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite     Suite?           @relation(fields: [suiteId], references: [id], onDelete: SetNull)
+  versions  TestVersion[]
+  results   TestResult[]
+  heals     HealProposal[]
   baselines VisualBaseline[]
 
   ownershipRules OwnershipRule[]
@@ -766,9 +769,9 @@ model Run {
   triggeredBy   String?
 
   /// CI context, when the run came from a PR or a deploy.
-  commitSha     String?
-  branch        String?
-  prNumber      Int?
+  commitSha       String?
+  branch          String?
+  prNumber        Int?
   /// Preview-deploy runs override the environment's base URL (§6).
   baseUrlOverride String?
 
@@ -783,13 +786,13 @@ model Run {
   skippedCount Int @default(0)
 
   /// GateResult from packages/shared. Null until the run finalises.
-  gateResult Json?
+  gateResult   Json?
   /// Set when the run itself blew up rather than tests failing.
   errorMessage String?
 
   /// How many shards the suite was split across (§5 build sharding). 1 means the
   /// run was not sharded, which is every run unless the caller asked for more.
-  shardCount Int @default(1)
+  shardCount  Int       @default(1)
   /// The finalisation claim. Set by a conditional UPDATE, so exactly one shard
   /// can win it and write the run's terminal status; see apps/worker run.ts.
   /// Distinct from `finishedAt`, which the cancel endpoint also writes.
@@ -803,7 +806,7 @@ model Run {
   /// running. Five workers polling one row is how cancellation already works;
   /// inventing a second channel for the same idea is how two shards come to
   /// disagree about whether the run is over.
-  failFast Boolean @default(false)
+  failFast        Boolean   @default(false)
   /// Stamped the moment something decides this run should stop early: the worker
   /// on the first real failure of a fail-fast run, or a human pressing stop.
   ///
@@ -813,7 +816,7 @@ model Run {
   stopRequestedAt DateTime?
   /// Why it stopped, in a sentence the run page can show verbatim — which test
   /// tripped it, or who pressed stop.
-  stopReason String?
+  stopReason      String?
 
   /// Copied from Environment.runnerPool when the run is created, and the reason
   /// this column exists rather than being read through the relation: it is the
@@ -874,9 +877,9 @@ model RunShard {
   flakyCount   Int @default(0)
   skippedCount Int @default(0)
 
-  queuedAt   DateTime  @default(now())
-  startedAt  DateTime?
-  finishedAt DateTime?
+  queuedAt    DateTime  @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
   /// Stamped on a timer while the shard executes. A worker that dies stops
   /// stamping, which is how the surviving shards notice and reap it instead of
   /// leaving the run open forever.
@@ -892,28 +895,28 @@ model RunShard {
 }
 
 model TestResult {
-  id         String           @id @default(cuid())
-  orgId      String
-  runId      String
-  testId     String
-  status     TestResultStatus
-  durationMs Int              @default(0)
-  errorMessage String?
+  id               String           @id @default(cuid())
+  orgId            String
+  runId            String
+  testId           String
+  status           TestResultStatus
+  durationMs       Int              @default(0)
+  errorMessage     String?
   /// §5 — a retry that passes is not a pass. Recorded so the gate can see it.
-  retriedAndPassed Boolean    @default(false)
+  retriedAndPassed Boolean          @default(false)
   /// NetworkEntry[] and ConsoleEntry[], already secret-masked.
-  network    Json?
-  consoleLog Json?
-  videoKey   String?
-  traceKey   String?
-  createdAt  DateTime         @default(now())
+  network          Json?
+  consoleLog       Json?
+  videoKey         String?
+  traceKey         String?
+  createdAt        DateTime         @default(now())
   /// Which shard of a sharded run owns this test. Null on an unsharded run,
   /// which is what makes sharding additive: every existing row and every
   /// existing code path reads null and behaves exactly as before.
-  shardIndex Int?
+  shardIndex       Int?
 
-  run      Run              @relation(fields: [runId], references: [id], onDelete: Cascade)
-  test     Test             @relation(fields: [testId], references: [id], onDelete: Cascade)
+  run      Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
+  test     Test           @relation(fields: [testId], references: [id], onDelete: Cascade)
   steps    Step[]
   findings Finding[]
   verdict  TriageVerdict?
@@ -984,16 +987,16 @@ model Finding {
 }
 
 model Artifact {
-  id          String   @id @default(cuid())
+  id          String    @id @default(cuid())
   orgId       String
   runId       String
   /// S3 object key, or a path under .artifacts when ARTIFACTS_LOCAL=true.
-  key         String   @unique
+  key         String    @unique
   contentType String
-  sizeBytes   Int      @default(0)
+  sizeBytes   Int       @default(0)
   /// Retention is by plan (§5); a sweeper deletes rows and objects past this.
   expiresAt   DateTime?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
 
   run Run @relation(fields: [runId], references: [id], onDelete: Cascade)
 
@@ -1064,24 +1067,24 @@ model RunShare {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model TriageVerdict {
-  id           String             @id @default(cuid())
-  orgId        String
-  testResultId String             @unique
-  verdict      Verdict
-  confidence   Float
-  explanation  String
+  id            String             @id @default(cuid())
+  orgId         String
+  testResultId  String             @unique
+  verdict       Verdict
+  confidence    Float
+  explanation   String
   /// Evidence[] from packages/shared.
-  evidence     Json
+  evidence      Json
   suspectCommit Json?
-  model        String
+  model         String
   /// A human can disagree; the override is what gates and what trains prompts.
-  reviewState  VerdictReviewState @default(PENDING)
-  reviewedBy   String?
-  reviewedAt   DateTime?
-  overriddenTo Verdict?
+  reviewState   VerdictReviewState @default(PENDING)
+  reviewedBy    String?
+  reviewedAt    DateTime?
+  overriddenTo  Verdict?
   /// Set when this verdict was filed as a bug (§7).
-  issueUrl     String?
-  createdAt    DateTime           @default(now())
+  issueUrl      String?
+  createdAt     DateTime           @default(now())
 
   testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
 
@@ -1119,19 +1122,19 @@ model HealProposal {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model VisualBaseline {
-  id         String   @id @default(cuid())
-  orgId      String
-  projectId  String
-  testId     String
+  id            String   @id @default(cuid())
+  orgId         String
+  projectId     String
+  testId        String
   /// One baseline per (test, viewport, browser).
-  viewport   String
-  browser    String
-  imageKey   String
+  viewport      String
+  browser       String
+  imageKey      String
   /// Rectangles to exclude from the diff, from the ignore-region editor.
-  ignoreRegions Json  @default("[]")
-  approvedBy String?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  ignoreRegions Json     @default("[]")
+  approvedBy    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   test    Test    @relation(fields: [testId], references: [id], onDelete: Cascade)
@@ -1145,19 +1148,19 @@ model VisualBaseline {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Schedule {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   orgId         String
   projectId     String
   suiteId       String
   environmentId String
   name          String
   cron          String
-  timezone      String   @default("UTC")
-  enabled       Boolean  @default(true)
+  timezone      String    @default("UTC")
+  enabled       Boolean   @default(true)
   lastRunAt     DateTime?
   nextRunAt     DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   suite       Suite       @relation(fields: [suiteId], references: [id], onDelete: Cascade)
@@ -1169,23 +1172,23 @@ model Schedule {
 
 /// Synthetic monitoring (§6) — a smoke suite against prod every N minutes.
 model Monitor {
-  id             String   @id @default(cuid())
-  orgId          String
-  projectId      String
-  suiteId        String
-  environmentId  String
-  name           String
-  intervalMinutes Int     @default(15)
-  enabled        Boolean  @default(true)
+  id                  String     @id @default(cuid())
+  orgId               String
+  projectId           String
+  suiteId             String
+  environmentId       String
+  name                String
+  intervalMinutes     Int        @default(15)
+  enabled             Boolean    @default(true)
   /// Consecutive failures before alerting, to avoid paging on one blip.
-  failureThreshold Int    @default(2)
-  consecutiveFailures Int @default(0)
-  lastStatus     RunStatus?
-  lastCheckedAt  DateTime?
+  failureThreshold    Int        @default(2)
+  consecutiveFailures Int        @default(0)
+  lastStatus          RunStatus?
+  lastCheckedAt       DateTime?
   /// Integration ids to notify.
-  notifyVia      String[] @default([])
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  notifyVia           String[]   @default([])
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
 
   project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   suite       Suite       @relation(fields: [suiteId], references: [id], onDelete: Cascade)
@@ -1200,17 +1203,17 @@ model Monitor {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Integration {
-  id         String          @id @default(cuid())
-  orgId      String
-  projectId  String?
-  kind       IntegrationKind
-  name       String
+  id        String          @id @default(cuid())
+  orgId     String
+  projectId String?
+  kind      IntegrationKind
+  name      String
   /// Non-secret settings (channel, project key, repo). Tokens go in configEnc.
-  config     Json            @default("{}")
-  configEnc  String?
-  enabled    Boolean         @default(true)
-  createdAt  DateTime        @default(now())
-  updatedAt  DateTime        @updatedAt
+  config    Json            @default("{}")
+  configEnc String?
+  enabled   Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
 
   org        Organization      @relation(fields: [orgId], references: [id], onDelete: Cascade)
   deliveries WebhookDelivery[]
@@ -1230,19 +1233,19 @@ enum WebhookDeliveryStatus {
 }
 
 model WebhookDelivery {
-  id            String   @id @default(cuid())
-  orgId         String
-  integrationId String
-  event         String
-  payload       Json
+  id             String                @id @default(cuid())
+  orgId          String
+  integrationId  String
+  event          String
+  payload        Json
   /// HMAC-SHA256 signature sent with the request (§7 "signed").
-  signature     String
-  status        WebhookDeliveryStatus @default(PENDING)
+  signature      String
+  status         WebhookDeliveryStatus @default(PENDING)
   responseStatus Int?
-  attempts      Int      @default(0)
-  deliveredAt   DateTime?
-  lastError     String?
-  createdAt     DateTime @default(now())
+  attempts       Int                   @default(0)
+  deliveredAt    DateTime?
+  lastError      String?
+  createdAt      DateTime              @default(now())
 
   integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
 
@@ -1311,23 +1314,23 @@ enum ImportState {
 /// batch is one auditable, resumable unit. Detection runs synchronously in the
 /// request; conversion is the worker's job because it calls the model.
 model ImportBatch {
-  id             String      @id @default(cuid())
-  orgId          String
-  projectId      String
+  id                  String      @id @default(cuid())
+  orgId               String
+  projectId           String
   /// Detected source framework (a SourceFramework from packages/agent).
-  framework      String
-  detectionConfidence Float  @default(0)
+  framework           String
+  detectionConfidence Float       @default(0)
   /// SourceFile[] — [{ path, content }]. The suite as uploaded.
-  files          Json
-  state          ImportState @default(DETECTED)
+  files               Json
+  state               ImportState @default(DETECTED)
   /// Free-text conversion summary once the worker finishes.
-  summary        String?
+  summary             String?
   /// How many tests were produced, for the coverage report.
-  convertedCount Int         @default(0)
-  error          String?
-  requestedBy    String
-  createdAt      DateTime    @default(now())
-  updatedAt      DateTime    @updatedAt
+  convertedCount      Int         @default(0)
+  error               String?
+  requestedBy         String
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
 
   @@index([orgId, projectId])
 }
@@ -1349,27 +1352,27 @@ model ImportBatch {
 /// and they let a user see exactly which files we looked at. Re-ingesting is one
 /// request away.
 model CodebaseSnapshot {
-  id           String   @id @default(cuid())
-  orgId        String
-  projectId    String
+  id          String   @id @default(cuid())
+  orgId       String
+  projectId   String
   /// string[] — the repo-relative paths that were analysed. No file contents.
-  paths        Json
+  paths       Json
   /// How many files the upload carried, before ignores and caps.
-  fileCount    Int      @default(0)
+  fileCount   Int      @default(0)
   /// How many arrived with a body. The rest contributed only their path, which
   /// bounds what the analysis below could possibly have seen.
-  withContent  Int      @default(0)
+  withContent Int      @default(0)
   /// Bytes of source received, for the audit trail and the rate story.
-  totalBytes   Int      @default(0)
+  totalBytes  Int      @default(0)
   /// ProjectDetection — packages/shared/src/detect.ts. Runners, languages,
   /// package managers: how you would RUN this repo's tests.
-  detection    Json
+  detection   Json
   /// CodebaseAnalysis — packages/shared/src/codebase.ts. Routes, endpoints,
   /// forms, auth surfaces: what the application EXPOSES.
-  analysis     Json
-  requestedBy  String
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  analysis    Json
+  requestedBy String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   @@index([orgId, projectId])
 }
@@ -1412,22 +1415,22 @@ model AgentProposal {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Subscription {
-  id                   String   @id @default(cuid())
-  orgId                String   @unique
-  stripeCustomerId     String?  @unique
-  stripeSubscriptionId String?  @unique
-  plan                 Plan     @default(FREE)
-  status               String   @default("active")
+  id                   String    @id @default(cuid())
+  orgId                String    @unique
+  stripeCustomerId     String?   @unique
+  stripeSubscriptionId String?   @unique
+  plan                 Plan      @default(FREE)
+  status               String    @default("active")
   currentPeriodEnd     DateTime?
-  cancelAtPeriodEnd    Boolean  @default(false)
+  cancelAtPeriodEnd    Boolean   @default(false)
   /// Stripe's `event.created` for the last subscription state applied here.
   /// Stripe does not promise delivery order, so the webhook refuses to write a
   /// subscription event older than this — a redelivered `updated` from before a
   /// cancellation must not resurrect the plan. Null on rows that predate the
   /// column; the first event to arrive claims it.
   planSyncedAt         DateTime?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 }
@@ -1447,13 +1450,13 @@ model StripeEventSeen {
 
 /// Metered regardless of plan (§9), so pricing can change without a data migration.
 model UsageRecord {
-  id       String   @id @default(cuid())
-  orgId    String
+  id        String   @id @default(cuid())
+  orgId     String
   /// "runs" | "agent_tokens" | "storage_bytes" | "worker_minutes"
-  metric   String
+  metric    String
   /// First day of the billing month, UTC. One row per (org, metric, period).
-  period   DateTime
-  quantity BigInt   @default(0)
+  period    DateTime
+  quantity  BigInt   @default(0)
   updatedAt DateTime @updatedAt
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
@@ -1464,21 +1467,21 @@ model UsageRecord {
 
 /// One row per LLM call (§0 token accounting). Rolled up nightly into UsageRecord.
 model AgentCall {
-  id              String    @id @default(cuid())
-  orgId           String
-  projectId       String?
-  agent           AgentKind
-  model           String
-  subjectId       String?
-  inputTokens     Int       @default(0)
-  outputTokens    Int       @default(0)
-  cacheReadTokens Int       @default(0)
-  cacheWriteTokens Int      @default(0)
-  costCents       Float     @default(0)
-  durationMs      Int       @default(0)
+  id               String    @id @default(cuid())
+  orgId            String
+  projectId        String?
+  agent            AgentKind
+  model            String
+  subjectId        String?
+  inputTokens      Int       @default(0)
+  outputTokens     Int       @default(0)
+  cacheReadTokens  Int       @default(0)
+  cacheWriteTokens Int       @default(0)
+  costCents        Float     @default(0)
+  durationMs       Int       @default(0)
   /// Set when the call failed after retries; kept so cost of failure is visible.
-  error           String?
-  createdAt       DateTime  @default(now())
+  error            String?
+  createdAt        DateTime  @default(now())
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
 
@@ -1576,11 +1579,11 @@ model SsoConnection {
 /// org. DNS ownership is therefore proved before `verifiedAt` is set, and
 /// nothing on the login path looks at an unverified row.
 model SsoDomain {
-  id           String @id @default(cuid())
-  orgId        String
-  connectionId String
+  id                String    @id @default(cuid())
+  orgId             String
+  connectionId      String
   /// Lowercase, trailing dot stripped, no leading `@`.
-  domain       String @unique
+  domain            String    @unique
   /// Published by the customer as a TXT record at `_qaai-verify.<domain>`.
   verificationToken String
   verifiedAt        DateTime?
@@ -1595,13 +1598,13 @@ model SsoDomain {
 /// One in-flight login. Single-use: `consumedAt` is set by a conditional
 /// update, so a replayed callback loses the race instead of minting a session.
 model SsoLoginRequest {
-  id           String @id @default(cuid())
-  orgId        String
-  connectionId String
+  id              String    @id @default(cuid())
+  orgId           String
+  connectionId    String
   /// SHA-256 of the opaque `state`. The raw value exists only in the URL.
-  stateHash    String @unique
+  stateHash       String    @unique
   /// SHA-256 of the OIDC nonce, compared against the ID token's claim.
-  nonceHash    String?
+  nonceHash       String?
   /// PKCE verifier, sealed under `sso:<requestId>:pkce`. Sealed rather than
   /// stored raw so a database read alone cannot complete a stolen code.
   pkceVerifierEnc String?
@@ -1693,8 +1696,8 @@ model Runner {
   /// Stamped on every authenticated call. Liveness is derived from this rather
   /// than stored: a status column would need something to write OFFLINE, and
   /// the thing that would write it is the process that just died.
-  lastSeenAt   DateTime?
-  lastClaimAt  DateTime?
+  lastSeenAt  DateTime?
+  lastClaimAt DateTime?
 
   tokenRotatedAt DateTime?
   /// Revocation is a timestamp, not a delete, so the audit trail keeps pointing
@@ -1717,9 +1720,9 @@ model Runner {
 /// agent inside a customer's network can vanish without a packet, and this is
 /// the only place that remembers the work existed.
 model RunnerJob {
-  id     String          @id @default(cuid())
-  orgId  String
-  runId  String
+  id         String          @id @default(cuid())
+  orgId      String
+  runId      String
   /// 0-based and matching TestResult.shardIndex, or null for the whole run —
   /// the same convention the cloud path uses.
   shardIndex Int?
@@ -1735,19 +1738,19 @@ model RunnerJob {
 
   /// JobRequirements: what a runner must have to be offered this. Derived from
   /// the tests in the slice, never from the agent.
-  requirements Json   @default("{}")
+  requirements Json    @default("{}")
   /// Run.runnerPool at dispatch, so routing survives an environment edit.
   pool         String?
 
   /// Who holds it. Kept after the job finishes: "which runner ran this" is the
   /// first question asked when an on-prem result looks wrong.
-  runnerId String?
+  runnerId       String?
   /// The fencing token. Minted fresh on every claim and required on every
   /// subsequent call, so a runner that lost its lease — paused VM, partitioned
   /// network, a reap it never saw — cannot write results into work another
   /// runner is now executing. Without this, "reclaimable" and "never executes
   /// twice" are not both true.
-  leaseId  String?
+  leaseId        String?
   /// The lease deadline. A job past it with a live status is reclaimable.
   leaseExpiresAt DateTime?
   /// Stamped by the agent while it works, exactly like RunShard.heartbeatAt.
@@ -1880,24 +1883,24 @@ model OwnershipRule {
 /// entire feature. This table is what lets both be true at once: N decisions,
 /// one act, reversible.
 model TriageBatch {
-  id        String @id @default(cuid())
-  orgId     String
-  projectId String?
+  id           String    @id @default(cuid())
+  orgId        String
+  projectId    String?
   /// The run the selection came from, when it came from one.
-  runId     String?
+  runId        String?
   /// The failure cluster (apps/api/src/lib/cluster.ts) the batch was expanded
   /// from, when the selection was "everything with this cause".
-  clusterId String?
+  clusterId    String?
   /// "accept" | "override" | "mute" — applied to every member.
-  action    String
+  action       String
   /// Set only when the action was an override.
   overriddenTo Verdict?
   /// The reviewer's note: why one verdict is right for all of them.
-  note      String?
-  appliedBy String
-  createdAt DateTime  @default(now())
-  undoneAt  DateTime?
-  undoneBy  String?
+  note         String?
+  appliedBy    String
+  createdAt    DateTime  @default(now())
+  undoneAt     DateTime?
+  undoneBy     String?
 
   project Project?          @relation(fields: [projectId], references: [id], onDelete: SetNull)
   items   TriageBatchItem[]
@@ -1947,8 +1950,8 @@ model DigestSubscription {
   /// empty list reads as "wherever the failures go", not "nowhere".
   notifyVia String[] @default([])
 
-  lastRunAt DateTime?
-  nextRunAt DateTime?
+  lastRunAt     DateTime?
+  nextRunAt     DateTime?
   /// The end of the window the last DELIVERED digest covered.
   ///
   /// Separate from `lastRunAt` on purpose. A digest that could not be delivered
@@ -2008,7 +2011,7 @@ model PluginPublisher {
   /// Storing whatever the operator pasted would mean the same key could sit
   /// here twice under two encodings, and a revocation would only cut off one
   /// of them.
-  publicKey String
+  publicKey   String
   /// SHA-256 of the key, grouped in fours. Derived, and stored anyway: it is
   /// what a person compares against the publisher's website, and recomputing it
   /// for a list means the UI can only show it after a round trip.
@@ -2048,7 +2051,7 @@ model Plugin {
   /// Denormalised from the publisher row so a listing can name the publisher
   /// without a join, and so the audit trail still says who signed it after the
   /// publisher row is renamed.
-  publisher String
+  publisher      String
 
   displayName String
   description String
@@ -2064,7 +2067,7 @@ model Plugin {
   /// not only inside `manifest` because it is queried ("what can reach our
   /// secrets?"), rendered on every row, and enforced by the runner, and a
   /// question asked that often should not require parsing a JSON blob.
-  capabilities String[] @default([])
+  capabilities         String[] @default([])
   /// The subset that needed the org's plan to permit it. Recorded at install
   /// time so a later downgrade is answerable — it says what was granted under
   /// which plan, rather than leaving it to be recomputed from today's.
@@ -2123,4 +2126,173 @@ model PluginEnablement {
   @@unique([pluginId, projectId])
   @@index([orgId])
   @@index([projectId, enabled])
+}
+
+// ─── Coverage of the application under test (the denominator) ────────────────
+
+/// Which axis a surface item sits on. Mirrors SURFACE_KINDS in
+/// packages/shared/src/surface.ts — the two lists must not drift, and
+/// `check:wiring` asserts they do not.
+enum SurfaceKind {
+  ROUTE
+  ENDPOINT
+  FORM
+  AUTH_SURFACE
+  ROLE_CELL
+  COMPONENT_STATE
+  FLAG_COMBINATION
+  BACKGROUND_JOB
+  NOTIFICATION
+  ERROR_STATE
+  DEVICE_LOCALE
+  DATA_VARIANT
+}
+
+/// Where an item came from. SOURCE_ONLY is the one no runtime-only tool can see:
+/// the code declares it and no crawl has ever reached it.
+enum SurfaceOrigin {
+  SOURCE_ONLY
+  CRAWL_ONLY
+  BOTH
+}
+
+enum SurfaceStatus {
+  COVERED
+  ASSERTED_NOT_RUN
+  UNCOVERED
+  UNKNOWN
+  WAIVED
+}
+
+/// One testable thing in the customer's application.
+///
+/// Rows, not a recomputed blob. The previous coverage implementation derived its
+/// answer on every request from the flow map and threw it away, which meant no
+/// trend, no gate, nothing to diff a release against, and no way to name an item
+/// in a waiver. A denominator has to be addressable to be defensible.
+///
+/// `key` is the identity and is stable across runs by construction — derived
+/// from the kind and the canonical identity only, never from a line number, so
+/// reformatting a file does not retire an item and mint a new one.
+model CoverageItem {
+  id        String        @id @default(cuid())
+  orgId     String
+  projectId String
+  kind      SurfaceKind
+  /// `KIND:identity`, e.g. `ROUTE:/orders/:id`. Unique per project.
+  key       String
+  label     String
+  /// Repo-relative file the source detector read it from.
+  file      String?
+  /// For the editor link only. Deliberately not part of `key`.
+  line      Int?
+  origin    SurfaceOrigin
+  /// The sentence justifying the item's existence, in the customer's terms.
+  /// This is what makes the denominator auditable rather than asserted.
+  evidence  String
+  detector  String?
+  /// Kind-specific detail: a form's fields, an auth surface's kind.
+  meta      Json          @default("{}")
+
+  status  SurfaceStatus @default(UNCOVERED)
+  /// SurfaceMatch[] — which tests cover it, and on what basis.
+  matches Json          @default("[]")
+
+  /// Execution verification, kept apart from `matches` on purpose: a test
+  /// existing and a test running are different claims, and conflating them is
+  /// how a coverage number stops being true.
+  lastRunId      String?
+  lastStatus     TestResultStatus?
+  executed       Boolean           @default(false)
+  /// Whether a matched test has been shown to kill a mutant behind this item.
+  /// Null until a mutation run has had an opinion. No competitor publishes this.
+  mutationKilled Boolean?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  /// Set when the extractor stops finding it, rather than deleting the row — a
+  /// disappearing denominator needs an audit trail as much as a growing one.
+  retiredAt   DateTime?
+
+  project Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  waiver  CoverageWaiver?
+
+  @@unique([projectId, key])
+  @@index([orgId])
+  @@index([projectId, status])
+  @@index([projectId, kind, status])
+  @@index([projectId, origin])
+  @@index([projectId, retiredAt])
+}
+
+/// A recorded decision not to test something.
+///
+/// Without waivers 100% is unreachable, and an unreachable target gets gamed
+/// rather than met. `byUserId` is required in spirit: a waiver with no owner is
+/// a silent exclusion, which is the failure mode this table has to avoid.
+model CoverageWaiver {
+  id        String    @id @default(cuid())
+  orgId     String
+  projectId String
+  itemId    String    @unique
+  reason    String
+  byUserId  String?
+  byEmail   String?
+  /// A waiver with no expiry is how a denominator quietly shrinks forever, so
+  /// the UI proposes one. Still nullable: some exclusions are permanent facts.
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+
+  item CoverageItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  user User?        @relation(fields: [byUserId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+  @@index([projectId, expiresAt])
+}
+
+/// A stored measurement, so a trend exists and a gate has something to compare.
+///
+/// The inputs are on the row beside the number because a percentage without its
+/// inputs cannot be defended in a meeting. If the crawl was truncated at 60
+/// pages, that belongs next to the figure it produced.
+model CoverageSnapshot {
+  id        String  @id @default(cuid())
+  orgId     String
+  projectId String
+  commitSha String?
+
+  /// The headline. Null, not zero, when there is nothing to divide — an empty
+  /// denominator means our extractor found nothing, and printing 0% or 100%
+  /// would be a claim about the customer's app made from our own silence.
+  percent              Float?
+  denominator          Int
+  covered              Int
+  assertedNotRun       Int    @default(0)
+  uncovered            Int
+  unknown              Int    @default(0)
+  waived               Int    @default(0)
+  /// Items the source declares that no crawl reached, and the mirror.
+  declaredNeverReached Int    @default(0)
+  reachedNeverDeclared Int    @default(0)
+
+  /// SurfaceKindTotals[] — per-axis arithmetic, so the division is checkable.
+  byKind Json @default("[]")
+
+  /// What it was computed from.
+  analysisId     String?
+  flowMapVersion Int?
+  testCount      Int     @default(0)
+  runId          String?
+
+  /// Things a reader must know before trusting the number.
+  caveats     Json     @default("[]")
+  /// Changes whenever the answer could change.
+  fingerprint String
+  createdAt   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@index([projectId, createdAt])
+  @@index([projectId, commitSha])
 }
