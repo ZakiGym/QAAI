@@ -43,8 +43,10 @@ vi.mock('../context.js', () => ({
 }));
 
 const {
+  MUTATION_SURVIVOR_RETENTION_DAYS,
   RETENTION_QUEUE,
   decideArtifact,
+  pruneMutationSurvivors,
   retentionDaysForPlan,
   scanMissingObjects,
   scanStrayObjects,
@@ -959,5 +961,147 @@ describe('the queue name is pinned', () => {
     // packages/shared's QUEUE_NAMES. If this ever changes, the API enqueues into
     // a queue nobody drains and every requested sweep sits in Redis forever.
     expect(RETENTION_QUEUE).toBe('qaai.retention');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Mutation survivors
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The survivor prune is the opposite kind of risk from the rest of this file,
+ * and it is worth saying why it is here at all rather than relying on the
+ * cascade.
+ *
+ * `MutationSurvivor` cascades from `TestResult`, and NOTHING in this product
+ * deletes a `TestResult` — this sweep deletes the BYTES a run produced and
+ * leaves every row. So the cascade is a cleanup that never fires, and without
+ * this prune the table is the one place in the schema that grows with the RUN
+ * RATE rather than with the suite.
+ *
+ * What must not happen: pruning the SCORE. The five `TestResult.mutation*`
+ * columns are the trend and are kept for ever; only the per-mutant detail ages
+ * out. Nothing below touches `testResult`, and the stand-in would throw if it
+ * tried.
+ */
+describe('pruning surviving mutants', () => {
+  interface Survivor {
+    id: string;
+    createdAt: Date;
+  }
+
+  interface PruneCalls {
+    /** Every `where` the prune filtered on, so the window cannot be assumed. */
+    wheres: Array<Record<string, unknown>>;
+    /** Ids actually deleted. Empty on a dry run, by construction. */
+    deleted: string[];
+    /** `orderBy` as passed — "oldest first" is the property, not an accident. */
+    orders: unknown[];
+  }
+
+  /**
+   * A stand-in that honours the window, `take` and the ordering, because a fake
+   * that ignored any of the three would let a prune with no window at all pass
+   * every assertion here — and that prune deletes every survivor in the install.
+   */
+  function fakeSurvivors(rows: Survivor[]): PruneCalls {
+    const live = [...rows];
+    const calls: PruneCalls = { wheres: [], deleted: [], orders: [] };
+
+    h.prisma = {
+      mutationSurvivor: {
+        findMany: async (args: {
+          where?: Record<string, unknown>;
+          orderBy?: unknown;
+          take?: number;
+        }) => {
+          const where = args.where ?? {};
+          calls.wheres.push(where);
+          calls.orders.push(args.orderBy);
+          const lt = (where.createdAt as { lt?: Date } | undefined)?.lt;
+          return live
+            .filter((r) => (lt ? r.createdAt < lt : true))
+            .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+            .slice(0, args.take ?? live.length)
+            .map((r) => ({ id: r.id }));
+        },
+        deleteMany: async (args: { where: { id: { in: string[] } } }) => {
+          const ids = args.where.id.in;
+          calls.deleted.push(...ids);
+          for (const id of ids) {
+            const i = live.findIndex((r) => r.id === id);
+            if (i >= 0) live.splice(i, 1);
+          }
+          return { count: ids.length };
+        },
+      },
+    };
+
+    return calls;
+  }
+
+  const ago = (days: number) => new Date(NOW.getTime() - days * DAY);
+
+  it('deletes only the rows past the window, oldest first', async () => {
+    const calls = fakeSurvivors([
+      { id: 'old1', createdAt: ago(200) },
+      { id: 'old2', createdAt: ago(91) },
+      // One day inside the window. The boundary is the only interesting input.
+      { id: 'fresh', createdAt: ago(89) },
+    ]);
+
+    const report = await pruneMutationSurvivors({ now: NOW, apply: true });
+
+    expect(report.deleted).toBe(2);
+    expect(calls.deleted).toEqual(['old1', 'old2']);
+    // Oldest first: a prune that falls behind has to make progress from the far
+    // end rather than nibble at a random slice.
+    expect(calls.orders[0]).toEqual({ createdAt: 'asc' });
+    expect(report.olderThan).toBe('2026-05-03');
+  });
+
+  it('reports what it would delete and deletes nothing on a dry run', async () => {
+    const calls = fakeSurvivors([{ id: 'old1', createdAt: ago(200) }]);
+
+    const report = await pruneMutationSurvivors({ now: NOW, apply: false });
+
+    // The first thing an operator sees is a count, not a gap in the data —
+    // every delete in this module needs the job to ask AND the deployment to
+    // have said yes, and these rows get no weaker gate for being regenerable.
+    expect(report).toMatchObject({ applied: false, examined: 1, deleted: 0 });
+    expect(calls.deleted).toEqual([]);
+  });
+
+  it('is bounded per tick and says there is more to do', async () => {
+    const calls = fakeSurvivors(
+      Array.from({ length: 5 }, (_, i) => ({ id: `old${i}`, createdAt: ago(100 + i) })),
+    );
+
+    const report = await pruneMutationSurvivors({ now: NOW, apply: true, limit: 2 });
+
+    expect(calls.deleted).toHaveLength(2);
+    // `more` is what tells the next tick to come back; without it a prune that
+    // falls behind looks finished.
+    expect(report.more).toBe(true);
+  });
+
+  it('issues no delete at all when nothing is past the window', async () => {
+    const calls = fakeSurvivors([{ id: 'fresh', createdAt: ago(1) }]);
+
+    const report = await pruneMutationSurvivors({ now: NOW, apply: true });
+
+    expect(report).toMatchObject({ examined: 0, deleted: 0, more: false });
+    expect(calls.deleted).toEqual([]);
+  });
+
+  it('keeps the window at 90 days', () => {
+    /*
+     * Pinned, because the number is an argument rather than a preference: it
+     * matches `FLAKE_HISTORY_RETENTION_DAYS` (the other derived per-test history
+     * in this product) and the longest retention any plan buys for the RESULTS
+     * these rows describe, so the detail never outlives the evidence behind it.
+     * Changing it means re-making that argument.
+     */
+    expect(MUTATION_SURVIVOR_RETENTION_DAYS).toBe(90);
   });
 });

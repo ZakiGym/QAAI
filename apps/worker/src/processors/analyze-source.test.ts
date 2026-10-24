@@ -25,6 +25,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { AUTH_SURFACE_KINDS, analyseCodebase, planItemSchema } from '@qaai/shared';
 import type { PlanItem, RepoFile, TestType } from '@qaai/shared';
+import type { AuthProfileChoice } from '@qaai/agent';
 import { canScaffoldWithoutModel, scaffoldSpec, specFilePathFor, specPointerCode } from '@qaai/agent';
 import { pluginFor } from '@qaai/runner';
 
@@ -722,7 +723,169 @@ describe('forms and auth surfaces become E2E items', () => {
     expect(item.steps.join(' ')).toContain('Fill "Display name" with a valid person name value');
     expect(item.steps.join(' ')).toContain('(the source marks it required)');
     expect(item.steps.join(' ')).toContain('Submit with "Save"');
-    expect(item.assertions.join(' ')).toContain('Leaving "Display name" empty is refused');
+  });
+
+  /**
+   * THE DEFECT, SECOND INSTANCE — the one this file carried.
+   *
+   * `formItem` ended on a single negative assertion built from
+   * `required[0]`: `Leaving "<first required field>" empty is refused`. Two
+   * fields, one of them a textarea with no limit of any kind, and the plan
+   * proposed the one negative fact nearly every form in the world already gets
+   * right. Fixing the crawl path in packages/agent would have left this
+   * standing, because the defect is in the mechanism and the mechanism was
+   * copied.
+   */
+  describe('a form item enumerates the classes, not just the first required field', () => {
+    const profileForm = () =>
+      byId(
+        scenariosFromSource(analysis(), allTypes(['E2E'])).items,
+        'source:form:account-update-profile',
+      );
+
+    it('no longer collapses the negative half into one empty-first-field assertion', () => {
+      const assertions = profileForm().assertions.join(' ');
+      // The literal sentence the old code produced. Its absence is the fix.
+      expect(assertions).not.toContain('Leaving "Display name" empty is refused');
+      // Empty is still COVERED — it is now one row of a table rather than the
+      // whole table, and it names the same field.
+      expect(assertions).toContain('[empty] "Display name"');
+    });
+
+    it('covers the classes a static read CAN reach, one representative each', () => {
+      const assertions = profileForm().assertions.join(' ');
+      for (const klass of [
+        'empty',
+        'whitespace-only',
+        'unbounded-length',
+        'injection-like',
+        'unicode-emoji',
+      ]) {
+        expect(assertions, `no case for ${klass}`).toContain(`[${klass}]`);
+      }
+      // One invalid field per row, and "Bio" is not required — so it gets the
+      // length and escaping classes and not the required-ness ones.
+      expect(assertions).toContain('[unbounded-length] "Bio"');
+      expect(assertions).not.toContain('[empty] "Bio"');
+    });
+
+    it('claims NO class that needs an attribute the source never read', () => {
+      /*
+       * The honest half. `detectForms` in packages/shared reads `required`,
+       * `type`, the label and a select's literal options — and no `maxlength`,
+       * `minlength`, `min`, `max`, `step` or `pattern`. So the ten classes that
+       * need one of those cannot be built, and the item must not pretend
+       * otherwise by, say, guessing a limit.
+       */
+      const item = profileForm();
+      const prose = [...item.steps, ...item.assertions].join(' ');
+      for (const klass of [
+        'at-max-length',
+        'over-max-length',
+        'at-min-length',
+        'under-min-length',
+        'at-min',
+        'under-min',
+        'at-max',
+        'over-max',
+        'step-misaligned',
+        'pattern-violating',
+      ]) {
+        expect(prose, `invented a ${klass} case with no attribute to found it on`).not.toContain(
+          `[${klass}]`,
+        );
+      }
+    });
+
+    it('says WHY those ten are missing — for want of input, not for want of a limit', () => {
+      const disclosure = profileForm().assertions.find((a) => a.includes('NOT COVERED'))!;
+      expect(disclosure).toContain('step-misaligned');
+      expect(disclosure).toContain('pattern-violating');
+      // The distinction that matters: the attributes were never captured. The
+      // alternative reading — that the form declares no limits — is a claim
+      // about the customer's markup made without reading it.
+      expect(disclosure).toContain('absent for want of input rather than because the form declares nothing');
+      expect(disclosure).toContain('Do not read a pass here as proof');
+    });
+
+    it('asks for ONE parameterised test over the rows, not one test per row', () => {
+      // Every ecosystem fragment in @qaai/agent's ecosystem-prompts already
+      // tells the model to prefer an input table over a loop; the plan item has
+      // to be shaped like the thing those prompts can write.
+      const steps = profileForm().steps.join(' ');
+      expect(steps).toContain('ONE parameterised test');
+      expect(steps).toContain('not one test per row');
+      expect(steps).toMatch(/changing exactly ONE field each time/);
+    });
+
+    it('reaches not-in-options when the markup writes the options out', () => {
+      /*
+       * `parseField` dropped `options`, which the producer has always written,
+       * and that loss cost a whole class: a value outside a select cannot be
+       * typed and can trivially be POSTed, which is where
+       * authorisation-by-dropdown fails.
+       */
+      const withSelect = parseCodebaseAnalysis({
+        ...rawAnalysis,
+        forms: [
+          {
+            name: 'Membership',
+            route: '/join',
+            file: 'app/join/page.tsx',
+            submitLabel: 'Join',
+            fields: [
+              {
+                name: 'tier',
+                label: 'Tier',
+                inputType: 'select',
+                required: true,
+                semantic: 'unknown',
+                options: ['Basic', 'Premium'],
+              },
+            ],
+          },
+        ],
+      })!;
+      const membership = withSelect.forms.find((f) => f.name === 'Membership')!;
+      expect(membership.fields[0]!.options).toEqual(['Basic', 'Premium']);
+      const item = byId(
+        scenariosFromSource(withSelect, allTypes(['E2E'])).items,
+        'source:form:join-membership',
+      );
+      expect(item.assertions.join(' ')).toContain('[not-in-options] "Tier"');
+    });
+
+    it('stays deterministic, so an unchanged repository proposes the same table', () => {
+      const once = profileForm();
+      const twice = profileForm();
+      expect(twice.steps).toEqual(once.steps);
+      expect(twice.assertions).toEqual(once.assertions);
+    });
+
+    it('stays inside the plan schema it has to survive', () => {
+      // The budget is tight by construction: see MAX_FILL_STEPS. A step list
+      // that overflowed would be silently truncated by the `.slice(0, 40)`,
+      // taking the parameterisation instruction with it.
+      for (const item of everything().items) {
+        expect(item.steps.length, `${item.id} steps`).toBeLessThanOrEqual(40);
+        expect(item.assertions.length, `${item.id} assertions`).toBeLessThanOrEqual(20);
+        expect(planItemSchema.safeParse(item).success, item.id).toBe(true);
+      }
+    });
+  });
+
+  it('expands the credential form too, instead of one wrong password', () => {
+    const item = byId(
+      scenariosFromSource(analysis(), allTypes(['E2E'])).items,
+      'source:auth:login-login',
+    );
+    const assertions = item.assertions.join(' ');
+    // The sign-in form is the one that most deserves the expansion, and it had
+    // exactly one negative step: "Repeat with a deliberately wrong credential".
+    expect(assertions).toContain('[empty] "Email"');
+    expect(assertions).toContain('[wrong-type] "Email"');
+    expect(assertions).toContain('[whitespace-only] "Password"');
+    expect(assertions).toContain('No rejected attempt leaves a session behind');
   });
 
   it('warns that the locators came from source, not from rendered markup', () => {
@@ -806,6 +969,135 @@ describe('bounds and ordering', () => {
     const derived = scenariosFromSource(empty, allTypes(['API', 'E2E']));
     expect(derived.items.map((i) => i.testType)).toEqual(['API']);
     expect(derived.skipped.map((s) => s.what)).toContain('E2E / UI');
+  });
+});
+
+// ─── 4b. The role a guarded item runs as ─────────────────────────────────────
+
+/**
+ * Six producers in this file wrote `authProfileId: null`, unconditionally, and
+ * four of them were RIGHT to. The defect was that all six were the same
+ * literal, so there was no way to tell a considered null from a forgotten one —
+ * and the two that were forgotten proposed a test that said "Sign in" in prose
+ * and then ran as nobody, asserting that a guarded page "answers with a
+ * successful status" against whatever its login redirect returns.
+ *
+ * What the evidence supports here is narrow and worth being precise about.
+ * `chooseAuthProfile`'s strongest rule reads the roles the APPLICATION declared
+ * (`requiresRoles`), and a static pass records that a route is guarded and
+ * never by whom — so rule 1 can never fire on this path and only the weaker
+ * two can: a word shared between the path and a profile name, or there being
+ * exactly one profile to choose.
+ */
+describe('a guarded source item names the role it runs as', () => {
+  const ACCOUNT: AuthProfileChoice = { id: 'prof_account', name: 'Account holder', kind: 'FORM_LOGIN' };
+  const ADMIN: AuthProfileChoice = { id: 'prof_admin', name: 'Admin', kind: 'FORM_LOGIN' };
+
+  const derive = (profiles: AuthProfileChoice[]) =>
+    scenariosFromSource(
+      analysis(),
+      allTypes(['SMOKE', 'API', 'E2E', 'ACCESSIBILITY', 'SECURITY_SMOKE']),
+      profiles,
+    ).items;
+
+  it('binds the only profile there is to the guarded route and the form on it', () => {
+    const items = derive([ACCOUNT]);
+    expect(byId(items, 'source:smoke:account').authProfileId).toBe('prof_account');
+    expect(byId(items, 'source:form:account-update-profile').authProfileId).toBe('prof_account');
+  });
+
+  it('says in the test itself that the runner delivers the session', () => {
+    const steps = byId(derive([ACCOUNT]), 'source:smoke:account').steps.join(' ');
+    expect(steps).toContain('Sign in as the "Account holder" auth profile');
+    // A test that also hand-rolls a login form walks a redirect the item does
+    // not contain, and then asserts against the wrong page.
+    expect(steps).toContain('do NOT write a login form');
+  });
+
+  it('matches on a word the route and a profile name share', () => {
+    // `/account` and "Account holder" — rule 2, the only inference available
+    // without a declared role.
+    const items = derive([ADMIN, ACCOUNT]);
+    expect(byId(items, 'source:smoke:account').authProfileId).toBe('prof_account');
+  });
+
+  it('REFUSES rather than guessing between profiles that match nothing', () => {
+    /*
+     * The case that must stay null. A wrong role does not fail loudly — it
+     * signs in successfully as the wrong person and asserts whatever that
+     * person can see — so picking "the first" would be the original defect in
+     * a better disguise.
+     */
+    const items = derive([
+      { id: 'prof_a', name: 'Alice', kind: 'FORM_LOGIN' },
+      { id: 'prof_b', name: 'Bob', kind: 'FORM_LOGIN' },
+    ]);
+    expect(byId(items, 'source:smoke:account').authProfileId).toBeNull();
+    expect(byId(items, 'source:form:account-update-profile').authProfileId).toBeNull();
+  });
+
+  it('leaves an unguarded route unbound — nothing to sign in as, nothing needed', () => {
+    const items = derive([ACCOUNT]);
+    expect(byId(items, 'source:smoke:products').authProfileId).toBeNull();
+    expect(byId(items, 'source:form:login-sign-in').authProfileId).toBeNull();
+  });
+
+  it('keeps the four anonymous-by-design producers anonymous, profile or not', () => {
+    /*
+     * Each of these asserts something only an UNAUTHENTICATED (or public)
+     * request can establish, so a bound session would make it fail against a
+     * correct application — or pass while proving the opposite:
+     *
+     *   security   — "every guarded path refuses an anonymous request"
+     *   api        — a guarded endpoint's item sends no session on purpose
+     *   auth       — this IS the sign-in test; an injected session skips it
+     *   a11y       — scans only the routes the source says are public
+     */
+    const items = derive([ACCOUNT, ADMIN]);
+    for (const id of [
+      'source:security:guarded-routes',
+      'source:api:post-api-orders',
+      'source:auth:login-login',
+      'source:a11y:declared-routes',
+    ]) {
+      expect(byId(items, id).authProfileId, id).toBeNull();
+    }
+  });
+
+  it('states on the plan that a guarded item is running unbound, and only then', () => {
+    const unbound = scenariosFromSource(analysis(), allTypes(['SMOKE', 'E2E']), []);
+    const bound = scenariosFromSource(analysis(), allTypes(['SMOKE', 'E2E']), [ACCOUNT]);
+    expect(unbound.skipped.map((s) => s.what).join(' ')).toMatch(/Running \d+ item\(s\) as a real user/);
+    expect(unbound.skipped.map((s) => s.why).join(' ')).toContain('no auth profile configured');
+    expect(bound.skipped.map((s) => s.what).join(' ')).not.toMatch(/as a real user/);
+  });
+
+  it('explains the limit honestly when profiles exist but none can be matched', () => {
+    const derived = scenariosFromSource(analysis(), allTypes(['SMOKE', 'E2E']), [
+      { id: 'prof_a', name: 'Alice', kind: 'FORM_LOGIN' },
+      { id: 'prof_b', name: 'Bob', kind: 'FORM_LOGIN' },
+    ]);
+    const why = derived.skipped.map((s) => s.why).join(' ');
+    // The reason has to name the actual limitation of a static pass, not blame
+    // the customer's naming: the analysis records that a route is guarded and
+    // never by whom, so there is no declared role to match against.
+    expect(why).toContain('never by whom');
+    expect(why).toContain('cover the wall rather than the page');
+  });
+
+  it('keeps the signed-out leg, and says it cannot share the bound session', () => {
+    const bound = byId(derive([ACCOUNT]), 'source:smoke:account').assertions.join(' ');
+    expect(bound).toContain('With the session removed');
+    const unbound = byId(derive([]), 'source:smoke:account').assertions.join(' ');
+    expect(unbound).toContain('Signed out, /account refuses or redirects');
+  });
+
+  it('is stable: the same analysis and profiles always bind the same role', () => {
+    const once = derive([ADMIN, ACCOUNT]).map((i) => `${i.id}:${i.authProfileId}`);
+    const twice = derive([ACCOUNT, ADMIN]).map((i) => `${i.id}:${i.authProfileId}`);
+    // Order of the profile list must not change the binding; `chooseAuthProfile`
+    // sorts by name so a gap id and the role behind it stay stable together.
+    expect(twice).toEqual(once);
   });
 });
 
@@ -922,6 +1214,13 @@ function stubPrisma(
    * every existing case still exercises the project-column fallback.
    */
   snapshot: { analysis: unknown } | null = null,
+  /**
+   * Auth profiles on that environment. Defaults to NONE, which is the honest
+   * default for a project that arrived as a repository and has configured no
+   * role — and keeps every case written before the plan could name one
+   * exercising the unbound path.
+   */
+  profiles: Array<{ id: string; name: string; kind: string }> = [],
 ): Recorded {
   const recorded: Recorded = { plans: [], audits: [], flowMaps: [], approvals: [] };
   const tx = {
@@ -950,6 +1249,7 @@ function stubPrisma(
   h.prisma = {
     project: { findFirst: () => Promise.resolve(projectRow) },
     environment: { findFirst: () => Promise.resolve(environment) },
+    authProfile: { findMany: () => Promise.resolve(profiles) },
     codebaseSnapshot: { findFirst: () => Promise.resolve(snapshot) },
     flowMap: {
       findFirst: () => Promise.resolve(null),
@@ -1056,6 +1356,56 @@ describe('processAnalyzeSource', () => {
 
     const plan = recorded.plans[0] as { items: { create: Array<{ testType: string }> } };
     expect(new Set(plan.items.create.map((i) => i.testType))).toEqual(new Set(['API']));
+  });
+
+  it('writes the bound role onto the PlanItem row, not just into the prose', async () => {
+    /*
+     * The end of the wire. `authProfileId` was a hard-coded null in six
+     * producers, so the column existed, the Generator was handed it, and no
+     * source-derived item ever carried a role — the test signed in in prose and
+     * ran as nobody. This asserts the id survives all the way to the row.
+     */
+    const recorded = stubPrisma(
+      { id: 'p1', codebaseAnalysis: rawAnalysis },
+      { id: 'e1', baseUrl: 'https://shop.example' },
+      null,
+      [{ id: 'prof_account', name: 'Account holder', kind: 'FORM_LOGIN' }],
+    );
+    await processAnalyzeSource(job());
+
+    const plan = recorded.plans[0] as {
+      items: { create: Array<{ title: string; authProfileId: string | null }> };
+    };
+    const guarded = plan.items.create.filter((i) => i.title.includes('/account'));
+    expect(guarded.length).toBeGreaterThan(0);
+    for (const item of guarded) expect(item.authProfileId, item.title).toBe('prof_account');
+    /*
+     * And the anonymous-by-design items are untouched by a profile existing.
+     * The guarded API item is the sharpest case: its own step sends the request
+     * with no session, so a bound profile would have the runner inject one, the
+     * endpoint would answer 200, and the test would fail against an application
+     * whose auth is working.
+     */
+    const guardedApi = plan.items.create.find((i) => i.title.includes('POST /api/orders'));
+    expect(guardedApi).toBeDefined();
+    expect(guardedApi!.authProfileId).toBeNull();
+    const signIn = plan.items.create.find((i) => i.title.includes('Sign in with valid credentials'));
+    expect(signIn).toBeDefined();
+    expect(signIn!.authProfileId).toBeNull();
+  });
+
+  it('reads no auth profile at all when the project has no environment', async () => {
+    // The profiles hang off the environment, so there is nothing to read and
+    // the guarded items stay unbound — with the reason on the plan.
+    const recorded = stubPrisma({ id: 'p1', codebaseAnalysis: rawAnalysis }, null);
+    await processAnalyzeSource(job());
+
+    const plan = recorded.plans[0] as {
+      skipped: Array<{ what: string; why: string }>;
+      items: { create: Array<{ authProfileId: string | null }> };
+    };
+    expect(plan.items.create.every((i) => i.authProfileId === null)).toBe(true);
+    expect(plan.skipped.map((s) => s.what).join(' ')).toMatch(/as a real user/);
   });
 
   it('without a key, queues only the items that scaffold and says so', async () => {

@@ -55,8 +55,22 @@
  * all, while E2E and SMOKE stay APPROVED and wait for one.
  */
 
-import { canScaffoldWithoutModel } from '@qaai/agent';
-import { AUTH_SURFACE_KINDS, CREATABLE_TEST_TYPES, TEST_TYPES, TEST_TYPE_LABELS } from '@qaai/shared';
+import {
+  MAX_BOUNDARY_CASES_PER_GAP,
+  canScaffoldWithoutModel,
+  chooseAuthProfile,
+  expandNegativeCases,
+  type AuthProfileChoice,
+  type FormSummary,
+  type GapAuthProfile,
+} from '@qaai/agent';
+import {
+  AUTH_SURFACE_KINDS,
+  CREATABLE_TEST_TYPES,
+  FORM_FIELD_SEMANTICS,
+  TEST_TYPES,
+  TEST_TYPE_LABELS,
+} from '@qaai/shared';
 import type {
   AuthSurfaceKind,
   FlowMap,
@@ -89,7 +103,40 @@ import { enqueueGenerate, type AnalyzeSourceJob } from '../queues.js';
  * Nothing else in this file does.
  */
 
-/** One field of a form, as the SOURCE declares it. No DOM was consulted. */
+/**
+ * One field of a form, as the SOURCE declares it. No DOM was consulted.
+ *
+ * ─── What this shape can and cannot feed into a boundary expansion ───────────
+ *
+ * `expandBoundaries` partitions a field's input space using the constraints the
+ * page declares, and this is the honest inventory of which of them survive a
+ * static read. The producer is `analyseCodebase` in packages/shared/src/codebase.ts
+ * (`detectForms`), and it reads a `<form>` block with regexes: for each control
+ * it takes `name`/`id`, the associated label, `type`, the bare `required`
+ * attribute, and — for a `<select>` — the literal `<option>` text.
+ *
+ * PRESENT, so these classes are reachable: happy-path, empty, whitespace-only
+ * (from `required`), unbounded-length, injection-like, wrong-type,
+ * luhn-invalid, boundary-date (from `semantic`/`inputType`), unicode-emoji
+ * (where the semantic admits it), and not-in-options (from `options`, which
+ * `parseField` used to drop and now keeps — the producer has always written it).
+ *
+ * ABSENT, so these ten classes cannot be built here AT ALL: at-max-length,
+ * over-max-length, at-min-length, under-min-length, at-min, under-min, at-max,
+ * over-max, step-misaligned, pattern-violating. Every one of them needs a
+ * number or a regex off the markup — `maxlength`, `minlength`, `min`, `max`,
+ * `step`, `pattern` — and `detectForms` reads none of those attributes. It is
+ * not a shape problem that could be fixed here by adding fields: the value is
+ * not in the analysis, and inventing a limit would be the product making up a
+ * fact about the customer's page. packages/shared is read-only to this change,
+ * so the fix is a request on that file, recorded here rather than faked.
+ *
+ * The consequence is stated out loud wherever it shows, because absence has two
+ * meanings and only one of them is true here: these constraints are UNCAPTURED,
+ * not declared-as-none. `nothingDeclared` in packages/agent/src/boundaries.ts
+ * is what keeps the two apart, and it is why every constraint below is left
+ * genuinely absent instead of being written as `null`.
+ */
 export interface SourceFormField {
   /** The `name` attribute, or the schema key the handler reads. */
   name: string;
@@ -99,6 +146,17 @@ export interface SourceFormField {
   required: boolean;
   /** Same 16-value vocabulary the crawler uses, so the two agree downstream. */
   semantic: FormField['semantic'];
+  /**
+   * Literal `<option>` text, for a `<select>` the markup spells out.
+   *
+   * The producer has always written this (`SourceFormField.options` in
+   * packages/shared/src/codebase.ts) and `parseField` dropped it. That loss cost
+   * a whole equivalence class: `not-in-options` posts a value outside the
+   * select's set, which a user cannot type and anyone can POST, and it is where
+   * authorisation-by-dropdown fails. Absent when the markup builds the options
+   * from data rather than writing them out.
+   */
+  options?: string[];
 }
 
 export interface SourceForm {
@@ -332,30 +390,24 @@ function dirOf(file: string): string {
   return cut === -1 ? '' : normalised.slice(0, cut);
 }
 
-const SEMANTICS: ReadonlySet<string> = new Set<FormField['semantic']>([
-  'email',
-  'password',
-  'person_name',
-  'phone',
-  'street_address',
-  'city',
-  'postal_code',
-  'country',
-  'credit_card',
-  'card_expiry',
-  'card_cvc',
-  'date',
-  'number',
-  'search',
-  'freeform',
-  'unknown',
-]);
+/*
+ * Narrowed against the shared vocabulary rather than a copy of it. The copy
+ * that used to live here listed sixteen semantics and the union had grown to
+ * nineteen, so a model correctly reporting `url`, `username` or `currency` had
+ * it silently coerced to 'unknown' — the field's meaning thrown away by a list
+ * nobody remembered to update. A hand-maintained duplicate of a union is a
+ * drift bug with a delay fuse.
+ */
+const SEMANTICS: ReadonlySet<string> = new Set<FormField['semantic']>(FORM_FIELD_SEMANTICS);
 
 function parseField(raw: unknown): SourceFormField | null {
   if (!isRecord(raw)) return null;
   const name = str(raw.name).trim();
   if (name === '') return null;
   const semantic = str(raw.semantic);
+  const options = Array.isArray(raw.options)
+    ? raw.options.filter((o): o is string => typeof o === 'string' && o.trim() !== '')
+    : [];
   return {
     name,
     label: typeof raw.label === 'string' && raw.label.trim() !== '' ? raw.label.trim() : null,
@@ -365,6 +417,10 @@ function parseField(raw: unknown): SourceFormField | null {
     // synthetic-data generator switches on this union and a stray value would
     // fall through its cases silently.
     semantic: SEMANTICS.has(semantic) ? (semantic as FormField['semantic']) : 'unknown',
+    // Spread conditionally so "the markup writes no literal options" stays
+    // ABSENT rather than becoming an empty array. An empty array is a claim
+    // that the select offers nothing, which no real select does.
+    ...(options.length > 0 ? { options } : {}),
   };
 }
 
@@ -823,13 +879,167 @@ const isDynamic = (path: string): boolean => path.includes(':');
 
 const WRITE_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
-function smokeItem(route: SourceRoute): PlanItem {
+/**
+ * How many "fill this field" steps a form item spells out, and the arithmetic
+ * behind the number.
+ *
+ * `planItemSchema` caps an item at 40 steps and `formItem` ends on
+ * `.slice(0, 40)`, which SILENTLY drops whatever does not fit — so adding the
+ * boundary table without re-budgeting would have truncated the very rows it
+ * exists to add, and the "write this as one parameterised test" instruction
+ * with them. The worst case now adds up to 39: one sign-in, one navigation,
+ * twenty fills, one line counting the fills not listed, one submit, one locator
+ * note, one table preamble, one positive control, eleven boundary cases (the
+ * cap in @qaai/agent minus that control) and one parameterisation instruction.
+ *
+ * If you add a step to this item, redo that sum.
+ */
+const MAX_FILL_STEPS = 20;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The negative half of a form item
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE DEFECT, SECOND INSTANCE. `formItem` and `authItem` below were a
+ * structurally identical copy of the one in packages/agent/src/coverage.ts: a
+ * list of "Fill X with a valid value" steps, and then a single negative
+ * assertion built from `required[0]` —
+ *
+ *     `Leaving "${required[0]!.label}" empty is refused, and the error names that field`
+ *
+ * — so a twelve-field signup form proposed the one negative fact nearly every
+ * form already gets right, and fixing only the crawl path would have left this
+ * one standing. The register's entry is about the mechanism, not the file.
+ *
+ * `expandNegativeCases` is the same entry point the crawl path uses, so the two
+ * cannot drift: one cap, one ranking, one disclosure format. The only
+ * difference is the INPUT, and that difference is the honest part — see the
+ * inventory on `SourceFormField` for which ten of the twenty equivalence
+ * classes a static read cannot reach, and `negativeDisclosure` below for how
+ * that is said to the person approving the item.
+ *
+ * The seed is the item id, which is derived from the route and the form name
+ * and nothing else. So an unchanged repository proposes identical values for
+ * ever, which is the promise this file already makes about its handles.
+ */
+function negativeExpansionFor(
+  itemHandle: string,
+  form: SourceForm,
+): ReturnType<typeof expandNegativeCases> {
+  /*
+   * A `SourceForm` is projected onto the `FormSummary` the shared expansion
+   * reads. Every constraint is left ABSENT, not null, and that is the whole
+   * point: `boundaries.ts` words its "no case for this class" reason from the
+   * difference, so the plan says "no maxlength was captured" (true — a static
+   * read never looked) instead of "the page declares no maxlength" (a claim
+   * about markup nobody opened).
+   */
+  const summary: FormSummary = {
+    name: form.name,
+    submitLabel: form.submitLabel,
+    fields: form.fields.map((field) => ({
+      label: field.label ?? field.name,
+      required: field.required,
+      semantic: field.semantic,
+      name: field.name,
+      inputType: field.inputType,
+      ...(field.options && field.options.length > 0 ? { options: field.options } : {}),
+    })),
+  };
+  return expandNegativeCases(itemHandle, [summary]);
+}
+
+/** A boundary case as one step of a plan item. */
+function caseStep(testCase: ReturnType<typeof expandNegativeCases>['cases'][number]): string {
+  const value = testCase.value;
+  const printable =
+    value === null
+      ? 'every field valid'
+      : value === ''
+        ? 'the empty string'
+        : value.trim() === ''
+          ? `${value.length} space(s) and nothing else`
+          : value.length > 48
+            ? `a ${value.length}-character value beginning ${JSON.stringify(value.slice(0, 16))}`
+            : JSON.stringify(value);
+  return testCase.field === null
+    ? `[${testCase.equivalenceClass}] submit with ${printable} as the positive control — expect it to be ${testCase.expectation}. Without this row, every case below is equally consistent with a form that refuses all input`
+    : `[${testCase.equivalenceClass}] set "${testCase.fieldLabel ?? testCase.field}" to ${printable}, leaving every other field valid, and submit — expect it to be ${testCase.expectation}`;
+}
+
+/**
+ * The sentence that keeps the table honest on THIS path.
+ *
+ * Two different omissions have to be told apart, and a single "some cases were
+ * dropped" line would let the second hide inside the first:
+ *
+ *   • the cap — this feature has more ranked cases than the item carries, which
+ *     is the same trade-off the crawl path makes and is reported the same way;
+ *   • the INPUT — ten equivalence classes are unreachable because a static read
+ *     captured no `maxlength`, `min`, `max`, `step` or `pattern`. Those classes
+ *     are missing for want of a crawl, not because the application declares
+ *     nothing, and the next action for them is "point the Explorer at a URL",
+ *     not "write the test by hand".
+ *
+ * Left as an assertion rather than a `skipped` entry because `PlanItem` is what
+ * travels to the approval screen, and this is the sentence that stops a reader
+ * taking a green parameterised test as proof the form's limits are enforced.
+ */
+const UNCAPTURED_CLASSES =
+  'at/over-max-length, at/under-min-length, at/under-min, at/over-max, step-misaligned and pattern-violating';
+
+function negativeDisclosure(expansion: ReturnType<typeof expandNegativeCases>): string {
+  const cap = expansion.dropped
+    .filter((d) => d.what.includes('equivalence class(es) with NO case') || d.what.includes('further case(s)'))
+    .map((d) => d.what);
+  return clamp(
+    `NOT COVERED by this test: ${UNCAPTURED_CLASSES} — those ten classes each need a limit, a range, a step or a pattern read off the markup, and reading files captures none of them, so they are absent for want of input rather than because the form declares nothing.${
+      cap.length > 0 ? ` Also, inside what could be built: ${cap.join('; ')}.` : ''
+    } Do not read a pass here as proof that the field limits are enforced.`,
+    400,
+  );
+}
+
+/**
+ * The role a source-derived item will run as, or null.
+ *
+ * `chooseAuthProfile` is the deterministic chooser from @qaai/agent: four
+ * rules, strongest evidence first, and a REFUSAL rather than a guess between
+ * unmatched profiles — because a wrong role does not fail loudly, it signs in
+ * successfully as the wrong person and asserts whatever that person can see.
+ *
+ * Rule 1 (the application's own declared `requiresRoles`) can never fire on
+ * this path: the analysis records that a route is guarded, never by whom, and
+ * `flowMapFromSource` therefore writes `requiresRoles: []` on every node. So
+ * what actually decides here is rule 2 (a word the path and a profile name
+ * share) and rule 3 (there is only one profile). Rule 4 refuses, which leaves
+ * the item unbound and the limitation visible — the same outcome as before this
+ * wiring existed, reached on purpose instead of by a hard-coded `null`.
+ */
+function roleFor(
+  behindAuth: boolean,
+  path: string | null,
+  profiles: readonly AuthProfileChoice[],
+): GapAuthProfile | null {
+  if (!behindAuth || profiles.length === 0) return null;
+  return chooseAuthProfile([...profiles], { route: path, requiresRoles: [] });
+}
+
+function smokeItem(route: SourceRoute, profiles: readonly AuthProfileChoice[]): PlanItem {
   const dynamic = isDynamic(route.path);
   const priority: Priority = dynamic
     ? 'NICE_TO_HAVE'
     : route.path === '/'
       ? 'CRITICAL_PATH'
       : 'IMPORTANT';
+  /*
+   * A guarded route cannot be smoke-tested by a visitor who cannot reach it.
+   * This was a hard-coded `null`, so the item said "Sign in" in a step and then
+   * ran anonymously — asserting that the page "answers with a successful
+   * status" against whatever the login redirect returns.
+   */
+  const profile = roleFor(route.behindAuth, route.path, profiles);
 
   return {
     id: itemId('smoke', route.path),
@@ -849,7 +1059,13 @@ function smokeItem(route: SourceRoute): PlanItem {
     priority,
     testType: 'SMOKE',
     steps: [
-      ...(route.behindAuth ? ['Sign in — the source guards this route'] : []),
+      ...(profile
+        ? [
+            `Sign in as the "${profile.name}" auth profile — the runner injects its stored session before the first navigation, so do NOT write a login form in the test`,
+          ]
+        : route.behindAuth
+          ? ['Sign in — the source guards this route, and no auth profile was bound to this test']
+          : []),
       ...(dynamic
         ? [
             `Obtain a real value for each dynamic segment of ${route.path} — the source names the segment, not any id that exists`,
@@ -858,14 +1074,27 @@ function smokeItem(route: SourceRoute): PlanItem {
       `Open ${route.path}`,
     ],
     assertions: [
-      `${route.path} answers with a successful status rather than a server error`,
+      profile
+        ? `Signed in as "${profile.name}", ${route.path} answers with a successful status rather than a server error or a redirect to a login page`
+        : `${route.path} answers with a successful status rather than a server error`,
       `The response is this page's own content, not a generic error or an empty shell — assert something only ${route.path} can produce`,
+      /*
+       * The signed-out leg needs NO session, so it cannot share a bound
+       * profile: the runner injects one before the first navigation. Said as an
+       * instruction rather than dropped, because the guarded-routes
+       * SECURITY_SMOKE item covers exactly this anonymously and only exists
+       * when the user asked for that type.
+       */
       ...(route.behindAuth
-        ? [`Signed out, ${route.path} refuses or redirects rather than rendering`]
+        ? [
+            profile
+              ? `With the session removed, ${route.path} refuses or redirects rather than rendering — run that leg without the bound profile, or leave it to the guarded-routes security probe`
+              : `Signed out, ${route.path} refuses or redirects rather than rendering`,
+          ]
         : []),
     ],
     journeyId: null,
-    authProfileId: null,
+    authProfileId: profile?.id ?? null,
   };
 }
 
@@ -925,11 +1154,25 @@ function apiItem(endpoint: SourceEndpoint): PlanItem {
         : []),
     ],
     journeyId: null,
+    /*
+     * NULL ON PURPOSE. Read the step above: a guarded endpoint's item sends the
+     * request WITH NO SESSION AND NO CREDENTIALS, because the only expectation
+     * static analysis can defend for a write handler is the refusal (see the
+     * judgement comment above). Binding an auth profile would have the runner
+     * inject a session before the call, the endpoint would answer 200, and the
+     * test would fail — or worse, a POST would succeed against real data. The
+     * authenticated half of this endpoint needs a request body nobody here
+     * knows, so it is not proposed at all rather than proposed with a guess.
+     */
     authProfileId: null,
   };
 }
 
-function formItem(form: SourceForm, behindAuth: boolean): PlanItem {
+function formItem(
+  form: SourceForm,
+  behindAuth: boolean,
+  profiles: readonly AuthProfileChoice[],
+): PlanItem {
   /*
    * A form the analysis could not tie to a route used to be proposed on `/`,
    * which is a claim about where it renders and not one the source makes. The
@@ -939,9 +1182,20 @@ function formItem(form: SourceForm, behindAuth: boolean): PlanItem {
    */
   const route = form.route;
   const required = form.fields.filter((f) => f.required);
+  const id = itemId('form', `${route ?? form.file}-${form.name}`);
+  /*
+   * The role, where the evidence supports one. A form on a guarded route needs
+   * a session to reach at all, and `authProfileId` is how the runner delivers
+   * one — it was a hard-coded `null` here, so every guarded-form item asked a
+   * human to "sign in" in prose and then ran as nobody.
+   */
+  const profile = roleFor(behindAuth, route, profiles);
+  const expansion = negativeExpansionFor(id, form);
+  const controls = expansion.cases.filter((c) => c.field === null);
+  const negativeCases = expansion.cases.filter((c) => c.field !== null);
 
   return {
-    id: itemId('form', `${route ?? form.file}-${form.name}`),
+    id,
     title: clamp(
       route
         ? `Submit the "${form.name}" form on ${route}`
@@ -957,6 +1211,9 @@ function formItem(form: SourceForm, behindAuth: boolean): PlanItem {
         (route
           ? ''
           : ' The source names no route for it — a form is found by reading markup, and which page renders this file needs an import graph this pass does not have.') +
+        (negativeCases.length > 0
+          ? ` Partitioning the fields' input space gives ${expansion.totalCases} case(s); the ${negativeCases.length} highest-ranked, in ${expansion.classes} equivalence class(es), are the input table below.`
+          : '') +
         ` ${STATIC_ONLY}`,
       1000,
     ),
@@ -964,30 +1221,75 @@ function formItem(form: SourceForm, behindAuth: boolean): PlanItem {
     priority: 'IMPORTANT',
     testType: 'E2E',
     steps: [
-      ...(behindAuth ? ['Sign in — the source guards the route this form sits on'] : []),
+      /*
+       * The sign-in step says what the BINDING does, when there is one. The
+       * binding on `authProfileId` is what actually delivers the session; this
+       * sentence is so the written test does not hand-roll a login form on top
+       * of an injected one.
+       */
+      ...(profile
+        ? [
+            `Sign in as the "${profile.name}" auth profile — the runner injects its stored session before the first navigation, so do NOT write a login form in the test`,
+          ]
+        : behindAuth
+          ? ['Sign in — the source guards the route this form sits on, and no auth profile was bound to this test']
+          : []),
       route
         ? `Navigate to ${route}`
         : `Open the page that renders ${form.file} — the source ties this form to no route`,
       ...form.fields
-        .slice(0, 25)
+        .slice(0, MAX_FILL_STEPS)
         .map(
           (f) =>
             `Fill "${f.label ?? f.name}" with a valid ${f.semantic.replace(/_/g, ' ')} value` +
             (f.required ? ' (the source marks it required)' : ''),
         ),
+      ...(form.fields.length > MAX_FILL_STEPS
+        ? [
+            `Fill the remaining ${form.fields.length - MAX_FILL_STEPS} field(s) the source declares on this form with valid values — they are named in the analysis and are not listed individually here`,
+          ]
+        : []),
       form.submitLabel ? `Submit with "${form.submitLabel}"` : 'Submit the form',
       // The locators come out of source, not out of a rendered page, so the
       // first thing the test proves is that they match anything at all.
       'Locate each field by its label or name as the source declares it — this pass never saw the rendered markup',
+      /*
+       * The table. One row per equivalence class, one invalid field per row,
+       * every other field valid — replacing the single "leave the first
+       * required field empty" assertion this item used to end on.
+       */
+      ...(negativeCases.length > 0
+        ? [
+            'Then repeat the submission once per row of the table below, changing exactly ONE field each time and leaving the rest valid — a submission with two bad fields fails for a reason nobody can attribute',
+            ...controls.map(caseStep),
+            ...negativeCases.map(caseStep),
+            'Write those rows as ONE parameterised test (parametrize / test.each / TestCase / DataProvider, whichever this project uses), not one test per row and not a loop inside a single test: a loop reports the first bad row and hides the rest',
+          ]
+        : []),
     ].slice(0, 40),
     assertions: [
       'The submission is accepted and the resulting state reflects what was entered, not merely that a success message appeared',
-      required.length > 0
-        ? `Leaving "${required[0]!.label ?? required[0]!.name}" empty is refused, and the error names that field`
-        : 'Submitting invalid input is refused rather than silently accepted',
-    ],
+      ...(negativeCases.length > 0
+        ? [
+            ...negativeCases
+              .slice(0, MAX_BOUNDARY_CASES_PER_GAP)
+              .map((c) => `[${c.equivalenceClass}] "${c.fieldLabel ?? c.field}": ${c.expected}`),
+            'Every rejection leaves no trace — re-reading afterwards shows the original value, not a partially written record',
+            negativeDisclosure(expansion),
+          ]
+        : [
+            required.length > 0
+              ? `Leaving "${required[0]!.label ?? required[0]!.name}" empty is refused, and the error names that field`
+              : 'Submitting invalid input is refused rather than silently accepted',
+          ]),
+      ...(behindAuth && !profile
+        ? [
+            'NOT COVERED by this test: the page behind the guard as a real user. The source guards this route and no auth profile was available to bind, so a pass here is not coverage of what the form does once you are signed in',
+          ]
+        : []),
+    ].slice(0, 20),
     journeyId: null,
-    authProfileId: null,
+    authProfileId: profile?.id ?? null,
   };
 }
 
@@ -1092,9 +1394,23 @@ function authTitles(surfaces: SourceAuthSurface[]): string[] {
 
 function authItem(surface: SourceAuthSurface, title: string): PlanItem {
   const fields = surface.form?.fields ?? [];
+  const id = itemId('auth', `${surface.kind}-${surface.path}`);
+  /*
+   * The credential form gets the same expansion the ordinary form item gets,
+   * and it is the form that most deserves it: "Repeat with a deliberately wrong
+   * credential" was the WHOLE negative half of a sign-in test, which proves
+   * that one bad password is refused and says nothing about an empty one, a
+   * whitespace-only one, an injection-shaped one, or a 10,000-character one.
+   *
+   * The expectations stay the shared ones. An auth form's rejections are
+   * ordinary input rejections; what makes the sign-in case special is the
+   * message, and that is already asserted separately below.
+   */
+  const expansion = surface.form ? negativeExpansionFor(id, surface.form) : null;
+  const negativeCases = expansion?.cases.filter((c) => c.field !== null) ?? [];
 
   return {
-    id: itemId('auth', `${surface.kind}-${surface.path}`),
+    id,
     title: clamp(title, TITLE_MAX),
     rationale: clamp(
       `\`${surface.file}\` declares a ${surface.kind.toLowerCase().replace(/_/g, ' ')} surface at \`${surface.path}\`` +
@@ -1102,6 +1418,9 @@ function authItem(surface: SourceAuthSurface, title: string): PlanItem {
           ? ` with ${fields.map((f) => `"${f.label ?? f.name}"`).join(', ')}`
           : ', though the source names no fields on it') +
         '. Authentication is the gate every other guarded test has to pass, so it is proposed at critical path.' +
+        (negativeCases.length > 0
+          ? ` The ${negativeCases.length} rejection case(s) below are one representative per equivalence class of the credential fields, ranked — "repeat with a wrong credential" on its own proves only that one bad password is refused.`
+          : '') +
         ` ${STATIC_ONLY}`,
       1000,
     ),
@@ -1112,17 +1431,43 @@ function authItem(surface: SourceAuthSurface, title: string): PlanItem {
       `Navigate to ${surface.path}`,
       ...(fields.length > 0
         ? fields
-            .slice(0, 20)
+            .slice(0, MAX_FILL_STEPS)
             .map((f) => `Fill "${f.label ?? f.name}" with a valid ${f.semantic.replace(/_/g, ' ')} value`)
         : ['Fill the credential fields the page presents — the source names none, so read them off the page']),
       surface.form?.submitLabel ? `Submit with "${surface.form.submitLabel}"` : 'Submit',
       'Repeat with a deliberately wrong credential',
+      ...(negativeCases.length > 0
+        ? [
+            'Then repeat once per row below, changing exactly ONE credential field each time and leaving the rest valid',
+            ...negativeCases.map(caseStep),
+            'Write those rows as ONE parameterised test (parametrize / test.each / TestCase / DataProvider, whichever this project uses), not one test per row and not a loop inside a single test',
+          ]
+        : []),
     ].slice(0, 40),
     assertions: [
       'A valid attempt ends signed in — assert something only a session can reach, not that the form disappeared',
       'A wrong credential is refused, and the message does not reveal which half was wrong',
-    ],
+      ...(expansion
+        ? [
+            ...negativeCases.map(
+              (c) => `[${c.equivalenceClass}] "${c.fieldLabel ?? c.field}": ${c.expected}`,
+            ),
+            'No rejected attempt leaves a session behind — assert signed-out state after each one, not just that an error appeared',
+            negativeDisclosure(expansion),
+          ]
+        : []),
+    ].slice(0, 20),
     journeyId: null,
+    /*
+     * NULL ON PURPOSE, AND THE ONE PLACE WHERE IT IS THE WHOLE POINT.
+     *
+     * This item IS the sign-in test. Binding an auth profile makes the runner
+     * inject a stored session before the first navigation, so the test would
+     * arrive already signed in and "a valid attempt ends signed in" would pass
+     * without the credential form being exercised at all — a green test proving
+     * nothing about the gate every other guarded test depends on. `roleFor` is
+     * deliberately not consulted here.
+     */
     authProfileId: null,
   };
 }
@@ -1147,6 +1492,15 @@ function accessibilityItem(routes: SourceRoute[]): PlanItem {
       'Routes behind a guard are covered separately, with a session — this item scans only what the source says is public',
     ],
     journeyId: null,
+    /*
+     * NULL ON PURPOSE. `scanned` filters to `!r.behindAuth`: this item visits
+     * only the routes the source says are public, so there is nothing for a
+     * session to unlock and no role to assume. Binding a profile would sign the
+     * scan in for no reason and change what the public pages render.
+     *
+     * (Scanning the guarded pages too is a real missing item, and the assertion
+     * above says so in the item's own words rather than this binding implying it.)
+     */
     authProfileId: null,
   };
 }
@@ -1173,6 +1527,14 @@ function securityItem(guarded: Array<{ path: string; evidence: string | null }>)
       'No refusal carries data from behind the guard in its body',
     ],
     journeyId: null,
+    /*
+     * NULL ON PURPOSE, and the most important of the four. The whole assertion
+     * is "every guarded path refuses AN ANONYMOUS REQUEST". A bound profile
+     * makes the runner inject a session before the first request, every guarded
+     * path then answers 200, and the test fails against an application whose
+     * auth is working perfectly — or, if the assertion were ever loosened, it
+     * passes while proving the opposite of what it claims.
+     */
     authProfileId: null,
   };
 }
@@ -1199,6 +1561,16 @@ export interface DerivedPlan {
 export function scenariosFromSource(
   analysis: CodebaseAnalysis,
   choice: TestTypeChoice,
+  /*
+   * The roles this environment can sign in as, or none.
+   *
+   * Optional, and the default is the honest input for a project that has
+   * configured no profile — which is also every existing caller, so nothing
+   * that does not pass them changes behaviour. What a guarded item does with
+   * them (and which items refuse to touch them at all) is on `roleFor` and on
+   * the `authProfileId` of each producer.
+   */
+  authProfiles: readonly AuthProfileChoice[] = [],
 ): DerivedPlan {
   const wants = (type: TestType): boolean => choice.types.includes(type);
   const items: PlanItem[] = [];
@@ -1219,14 +1591,35 @@ export function scenariosFromSource(
     authSurfaces: analysis.authSurfaces.length,
   };
 
-  if (wants('SMOKE')) items.push(...analysis.routes.map(smokeItem));
+  /*
+   * Item ids whose subject sits behind a guard, so a test for it NEEDS a role.
+   *
+   * Collected as the items are built rather than sniffed out of their prose
+   * afterwards. The four producers that are anonymous by design never appear
+   * here, which is what lets "this item wanted a role and has none" be reported
+   * without also nagging about the security probe, whose whole assertion is
+   * that an anonymous request is refused.
+   */
+  const needsRole = new Set<string>();
+
+  if (wants('SMOKE')) {
+    for (const route of analysis.routes) {
+      const item = smokeItem(route, authProfiles);
+      items.push(item);
+      if (route.behindAuth) needsRole.add(item.id);
+    }
+  }
   if (wants('API')) items.push(...analysis.endpoints.map(apiItem));
   if (wants('E2E')) {
     // Titled as a set, not one at a time: whether a title needs the path on it
     // is a fact about the other auth surfaces, not about this one.
     const titles = authTitles(analysis.authSurfaces);
     items.push(...analysis.authSurfaces.map((surface, i) => authItem(surface, titles[i]!)));
-    items.push(...forms.map(({ form, behindAuth }) => formItem(form, behindAuth)));
+    for (const { form, behindAuth } of forms) {
+      const item = formItem(form, behindAuth, authProfiles);
+      items.push(item);
+      if (behindAuth) needsRole.add(item.id);
+    }
   }
   if (wants('ACCESSIBILITY') && analysis.routes.length > 0) {
     items.push(accessibilityItem(analysis.routes));
@@ -1282,6 +1675,27 @@ export function scenariosFromSource(
     skipped.push({
       what: `${deferred.length - MAX_NAMED_SKIPS} further proposals`,
       why: `also below the top ${MAX_PLAN_ITEMS}, and too many to list individually.`,
+    });
+  }
+
+  /*
+   * Said once, on the plan, and only when it BITES — never as a standing nag.
+   *
+   * An item whose subject is behind a guard and which carries no role produces
+   * a test that runs anonymously, and a test that runs anonymously against a
+   * guarded page passes while covering the redirect. That is a ceiling on the
+   * project's coverage that no amount of test writing can lift, so it is a fact
+   * about the setup rather than about any one item — and it is stated beside
+   * the items it limits instead of being left as a silent `null`.
+   */
+  const unbound = chosen.filter((item) => needsRole.has(item.id) && item.authProfileId === null);
+  if (unbound.length > 0) {
+    skipped.push({
+      what: `Running ${unbound.length} item(s) as a real user`,
+      why:
+        authProfiles.length === 0
+          ? 'the source guards the route(s) they cover and this environment has no auth profile configured, so nothing generated for them can sign in. They are proposed anyway and can only assert that a signed-out visitor is refused — add a profile under Setup → Environments and analyse again to bind one.'
+          : `the source guards the route(s) they cover and none of the ${authProfiles.length} configured auth profile(s) could be matched to them. A static read records that a route is guarded, never by whom, so there is no declared role to match a profile name against — name the profile on the item before generating, or the test will cover the wall rather than the page.`,
     });
   }
 
@@ -1494,7 +1908,42 @@ export async function processAnalyzeSource(
         : `No test-type preference stored, so proposing the safe default: ${choice.types.map((t) => TEST_TYPE_LABELS[t]).join(', ')}.`),
   );
 
-  const derived = scenariosFromSource(analysis, choice);
+  /*
+   * The Generator generates against a FlowMap, and a FlowMap row is scoped to an
+   * environment. A project that arrived as a repository may not have one yet —
+   * that is a real and expected state, not an error — so the plan is written
+   * either way and the missing half is stated on it. Approving an item here
+   * still records the human's decision; only the generation waits.
+   *
+   * READ BEFORE THE PLAN IS DERIVED, not after, which is why this moved up: the
+   * auth profiles hang off the environment, and an item for a guarded route has
+   * to NAME the role its test will run as. Deriving first and reading the roles
+   * afterwards is how `authProfileId` came to be a hard-coded `null` on every
+   * producer in this file.
+   */
+  const environment = await prisma.environment.findFirst({
+    where: { orgId, projectId },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true, baseUrl: true },
+  });
+
+  /*
+   * Id, name and kind only — the same three columns explore.ts reads for the
+   * same purpose. Choosing which role a test assumes needs neither the stored
+   * config nor the live session, and both of those would travel into plan text
+   * that people read.
+   */
+  const authProfiles: AuthProfileChoice[] = environment
+    ? (
+        await prisma.authProfile.findMany({
+          where: { orgId, environmentId: environment.id },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true, name: true, kind: true },
+        })
+      ).map((profile) => ({ id: profile.id, name: profile.name, kind: profile.kind }))
+    : [];
+
+  const derived = scenariosFromSource(analysis, choice, authProfiles);
   if (derived.items.length === 0) {
     throw new Error(
       `Nothing could be proposed for project ${projectId}: ${
@@ -1503,19 +1952,8 @@ export async function processAnalyzeSource(
     );
   }
 
-  /*
-   * The Generator generates against a FlowMap, and a FlowMap row is scoped to an
-   * environment. A project that arrived as a repository may not have one yet —
-   * that is a real and expected state, not an error — so the plan is written
-   * either way and the missing half is stated on it. Approving an item here
-   * still records the human's decision; only the generation waits.
-   */
-  const environment = await prisma.environment.findFirst({
-    where: { orgId, projectId },
-    orderBy: { createdAt: 'asc' },
-    select: { id: true, baseUrl: true },
-  });
-
+  // `scenariosFromSource` already records which guarded items ended up unbound,
+  // because that is a judgement about the plan and belongs in the pure function.
   const skipped = [...derived.skipped];
   let flowMapId: string | null = null;
   let flowMapVersion = 0;

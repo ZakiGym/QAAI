@@ -14,14 +14,28 @@
  * must never be reported as a provider failure.
  */
 
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutableTest, RunContext } from '@qaai/shared';
 import { contractPlugin } from './contract.js';
+import { attachRunWorkspace } from '../run-workspace.js';
 
 let server: Server;
 let baseUrl: string;
+/**
+ * The run's materialised repository.
+ *
+ * A contract document named by path used to be read from `process.cwd()` —
+ * QAAI's own checkout — so a customer's `contracts/orders.json` was "not found"
+ * and a path that happened to exist in QAAI's tree was verified against QAAI's
+ * file. These tests put a real pact in a real workspace to pin that it is read
+ * from there.
+ */
+let repoWorkspace = '';
 /** What `/echo` returns, so a matching rule can be pointed at any shape. */
 let echo: unknown = {};
 
@@ -67,14 +81,23 @@ beforeAll(async () => {
   await new Promise<void>((ready) => server.listen(0, '127.0.0.1', ready));
   const address = server.address() as AddressInfo;
   baseUrl = `http://127.0.0.1:${address.port}`;
+
+  // A real checkout holding a real pact, at a path with a directory in it.
+  repoWorkspace = await mkdtemp(join(tmpdir(), 'qaai-contract-repo-'));
+  await mkdir(join(repoWorkspace, 'contracts'), { recursive: true });
+  await writeFile(join(repoWorkspace, 'contracts', 'orders.pact.json'), PACT, 'utf8');
 });
 
 afterAll(async () => {
   await new Promise<void>((closed) => server.close(() => closed()));
+  await rm(repoWorkspace, { recursive: true, force: true });
 });
 
-function context(fixtures: Record<string, string> = {}): RunContext {
-  return {
+function context(
+  fixtures: Record<string, string> = {},
+  workspaceRoot: string | null = repoWorkspace,
+): RunContext {
+  const ctx: RunContext = {
     runId: 'run_1',
     orgId: 'org_1',
     projectId: 'proj_1',
@@ -106,6 +129,12 @@ function context(fixtures: Record<string, string> = {}): RunContext {
       retryOnce: false,
     },
   };
+  return attachRunWorkspace(
+    ctx,
+    workspaceRoot === null
+      ? null
+      : { root: workspaceRoot, source: 'acme/orders@main', fileCount: 9 },
+  );
 }
 
 function test(spec: unknown): ExecutableTest {
@@ -431,6 +460,79 @@ describe('matching rules', () => {
 
     expect(execution.status).toBe('FAILED');
     expect(execution.steps[0]?.error?.message).toContain('could not be reached');
+  });
+});
+
+/**
+ * ── Where a contract document is read from ───────────────────────────────────
+ *
+ * Three cases, three different verdicts, and the difference between them is the
+ * whole point: read it from the customer's repository; SKIP when there is no
+ * repository to read (a configuration gap, with every way out named); FAIL when
+ * the path is not one into the repository at all (a broken spec — a skip would
+ * leave the gate green).
+ */
+describe('a pact named by path', () => {
+  it('is read from the materialised repository, not from QAAI\'s own directory', async () => {
+    const execution = await contractPlugin.execute(
+      context(),
+      test({
+        kind: 'pact',
+        pactPath: 'contracts/orders.pact.json',
+        only: 'a request for orders',
+      }),
+    );
+
+    // The pact in the workspace is the same one the fixture cases use, so a
+    // PASSED verdict here is proof the file was found and replayed — a document
+    // that was not read produces SKIPPED with "no pact file", and one read from
+    // the wrong tree could not match this provider at all.
+    expect(execution.status).toBe('PASSED');
+    expect(execution.steps.filter((s) => s.status === 'PASSED')).toHaveLength(1);
+  });
+
+  it('still prefers a committed fixture over the file on disk', async () => {
+    // Unchanged behaviour, pinned: a pact committed as test data exists in
+    // every run whether or not a repository was materialised.
+    const execution = await contractPlugin.execute(
+      context({ 'contracts/orders.pact.json': PACT }),
+      test({
+        kind: 'pact',
+        pactPath: 'contracts/orders.pact.json',
+        only: 'a request for orders',
+      }),
+    );
+
+    expect(execution.status).toBe('PASSED');
+  });
+
+  it('is not evaluated when there is no repository and no fixture', async () => {
+    const execution = await contractPlugin.execute(
+      context({}, null),
+      test({ kind: 'pact', pactPath: 'contracts/orders.pact.json' }),
+    );
+
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toMatch(/no checkout of your repository/);
+    expect(execution.errorMessage).toMatch(/Connect the project to its repository/);
+    expect(execution.errorMessage).toContain('fixtures/');
+  });
+
+  /*
+   * A drive letter, because `contractDocumentRef` already refuses `..` and a
+   * leading `/` — it splits on separators and finds no `..` here, and on POSIX
+   * `C:\…` is a plain relative name. The runtime guard is what refuses it, so
+   * this is the case proving the guard is not just restating the schema.
+   */
+  it('fails, rather than skips, on a path that is not inside the repository', async () => {
+    const execution = await contractPlugin.execute(
+      context(),
+      test({ kind: 'pact', pactPath: 'C:\\contracts\\orders.json' }),
+    );
+
+    expect(execution.status).toBe('FAILED');
+    expect(execution.errorMessage).toMatch(/not a path inside your repository/);
+    expect(execution.errorMessage).toMatch(/was not verified/);
   });
 });
 

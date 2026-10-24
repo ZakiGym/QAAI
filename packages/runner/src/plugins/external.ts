@@ -19,13 +19,33 @@
  * Security note: the command is spawned WITHOUT a shell, and args are passed as
  * an array. A test spec is org-authored data, and `shell: true` here would turn
  * it into remote code execution via string interpolation.
+ *
+ * ── Where it runs, and the defect that is ───────────────────────────────────
+ *
+ * The workspace used to be `process.cwd()`. On the cloud worker that is QAAI's
+ * own checkout, so `npx vitest run` ran QAAI's suite and reported it as the
+ * customer's, and `cwd: '../..'` walked out of the monorepo entirely. Both
+ * types this plugin serves now execute inside the run's MATERIALISED
+ * REPOSITORY (`runWorkspaceOf(ctx)`, written by the worker — see
+ * apps/worker/src/repo-materialise.ts), and when there is no repository they
+ * report that they were not evaluated instead of producing a verdict about the
+ * wrong tree.
+ *
+ * ── UNIT_GEN: the generated file has to exist ───────────────────────────────
+ *
+ * A UNIT_GEN test is a file QAAI wrote; its command names that file. Nothing
+ * ever put it on disk, so the command pointed at a path that did not exist and
+ * the type could not run at all. {@link writeGeneratedTest} writes `test.code`
+ * to `test.filePath` — repo-root-relative, the same meaning that path has in
+ * the export and in the customer's own tree — before the command is spawned.
  */
 
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { externalTestSpecSchema } from '@qaai/shared';
 import type {
+  ConsoleEntry,
   ExecutableTest,
   ExternalTestSpec,
   RunContext,
@@ -41,6 +61,7 @@ import {
   toStepResults,
 } from '../reports/index.js';
 import { childEnv } from '../child-env.js';
+import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 
 /** Guard: a spec-supplied report path must stay inside the workspace. */
 export function safeReportPath(workspace: string, relPath: string): string {
@@ -50,6 +71,46 @@ export function safeReportPath(workspace: string, relPath: string): string {
     throw new Error('reportPath escapes the workspace');
   }
   return full;
+}
+
+/**
+ * "QAAI could not run this", in the shape the rest of the repo uses for it.
+ *
+ * SKIPPED plus a sentence naming what to configure — the same answer a missing
+ * plugin (`reasonUnsupported`), an uninstalled browser engine and an absent
+ * mutation tool already give. Never a pass, and never a FAILED that reads as a
+ * verdict on the customer's application.
+ */
+function notEvaluated(test: ExecutableTest, startedAt: number, why: string): TestExecution {
+  return {
+    testId: test.id,
+    status: 'SKIPPED',
+    durationMs: Date.now() - startedAt,
+    steps: [],
+    network: [],
+    console: [],
+    videoKey: null,
+    traceKey: null,
+    errorMessage: why,
+    retriedAndPassed: false,
+    findings: [],
+  };
+}
+
+/**
+ * A test that can never run AS WRITTEN, which is a different thing.
+ *
+ * A `filePath` that escapes the workspace is not an environment gap somebody
+ * could install their way out of — it is a broken test, and the only person who
+ * can fix it is the one looking at the suite. A SKIP would hide it behind "not
+ * evaluated" while the gate stayed green, so it fails, loudly, with the path.
+ */
+function unrunnableAsWritten(
+  test: ExecutableTest,
+  startedAt: number,
+  why: string,
+): TestExecution {
+  return { ...notEvaluated(test, startedAt, why), status: 'FAILED' };
 }
 
 export const externalPlugin: RunnerPlugin = {
@@ -65,8 +126,102 @@ export const externalPlugin: RunnerPlugin = {
     }
   },
 
-  execute: (ctx, test) => runExternal(ctx, test, externalTestSpecSchema.parse(test.spec)),
+  async execute(ctx, test) {
+    const startedAt = Date.now();
+    const spec = externalTestSpecSchema.parse(test.spec);
+
+    /*
+     * The run processor already skips a repo-dependent test when no workspace
+     * was materialised, and says precisely why. This is the second lock: the
+     * plugin must not be runnable against the worker's own directory even if a
+     * future caller forgets, because that is the whole defect.
+     */
+    const workspace = runWorkspaceOf(ctx);
+    if (!workspace) {
+      return notEvaluated(
+        test,
+        startedAt,
+        `"${test.name}" runs your own command inside your repository, and this run has no ` +
+          'checkout of it, so nothing was executed. Connect the project to its repository ' +
+          '(Project settings → Repository) and re-run.',
+      );
+    }
+
+    // The generated source for a UNIT_GEN test. INTEGRATION deliberately gets
+    // none: its spec points at the customer's existing suite, and writing a
+    // QAAI-held blob into their tree is a change nobody asked for.
+    if (test.type === 'UNIT_GEN') {
+      const written = await writeGeneratedTest(workspace.root, test);
+      if (!written.ok) return unrunnableAsWritten(test, startedAt, written.why);
+      return runExternal(ctx, test, spec, {
+        workspace: workspace.root,
+        extraConsole: written.console,
+      });
+    }
+
+    return runExternal(ctx, test, spec, { workspace: workspace.root });
+  },
 };
+
+/**
+ * Put the generated test on disk at `test.filePath`, inside the workspace.
+ *
+ * Two hazards, both decided here rather than left to the caller:
+ *
+ *  **Traversal.** `filePath` is model-authored and this write happens as the
+ *  WORKER, which holds VAULT_MASTER_KEY — so an absolute path or one containing
+ *  `..` is refused outright by {@link resolveInsideWorkspace}. It is not
+ *  sanitised into something safe: a path that was wrong should be reported as
+ *  wrong, not quietly relocated.
+ *
+ *  **Clobbering.** The materialised repository very often ALREADY has a file
+ *  here, because committing QAAI's generated tests is the advertised workflow.
+ *  Refusing in that case would make the feature destroy itself the moment it
+ *  succeeded — every UNIT_GEN test would stop running as soon as it was pushed.
+ *  So the version QAAI holds for this test wins (it is the test being run, and
+ *  it is the code the cockpit shows), the workspace is a throwaway copy so the
+ *  customer's real repository is never touched, and when the contents differ it
+ *  is SAID: a console line on the result, which is where someone reading the
+ *  run will see it. Overwritten, never silently.
+ */
+async function writeGeneratedTest(
+  root: string,
+  test: ExecutableTest,
+): Promise<{ ok: true; console: ConsoleEntry[] } | { ok: false; why: string }> {
+  if (!test.filePath.trim()) {
+    return {
+      ok: false,
+      why: `"${test.name}" is a generated unit test with no file path, so there is nowhere to write it and nothing for the command to run.`,
+    };
+  }
+
+  const target = resolveInsideWorkspace(root, test.filePath);
+  if (!target) {
+    return {
+      ok: false,
+      why:
+        `Refusing to write "${test.name}" to ${test.filePath}: a generated test's path must be ` +
+        'relative to the repository root and must not climb out of it. Nothing was executed.',
+    };
+  }
+
+  const existing = await readFile(target, 'utf8').catch(() => null);
+  const notes: ConsoleEntry[] = [];
+  if (existing !== null && existing !== test.code) {
+    notes.push({
+      level: 'warn',
+      text:
+        `${test.filePath} already exists in the checked-out repository and differs from the ` +
+        'version QAAI holds for this test. The run used QAAI\'s version — your repository was ' +
+        'not modified. Push the generated test, or point this test at a different path.',
+      at: new Date().toISOString(),
+    });
+  }
+
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, test.code, 'utf8');
+  return { ok: true, console: notes };
+}
 
 /** Shared by the external plugin and any type that wants to shell out. */
 /**
@@ -114,24 +269,65 @@ export function onlyLoadErrors(parsed: ParsedReport): string | null {
   return (messages[0] ?? 'the suite failed to load').split('\n')[0]!.slice(0, 300);
 }
 
+export interface RunExternalOptions {
+  /**
+   * The directory `spec.cwd` is resolved against — this run's materialised
+   * repository, or a scratch tree a caller made for one test.
+   *
+   * REQUIRED, and deliberately so. It was optional, defaulting to
+   * `process.cwd()`, which on the worker is QAAI's own checkout: a customer's
+   * command then ran against OUR source tree and reported a verdict about the
+   * wrong repository. The last caller that relied on the fallback was the E2E
+   * plugin's in-ecosystem route, which now makes its scratch tree under the
+   * system temp directory and passes it here. A required field means the next
+   * caller that forgets is a compile error rather than a wrong answer.
+   */
+  workspace: string;
+  /** Notes to surface on the result — see {@link writeGeneratedTest}. */
+  extraConsole?: ConsoleEntry[];
+}
+
 export async function runExternal(
   ctx: RunContext,
   test: ExecutableTest,
   spec: ExternalTestSpec,
+  options: RunExternalOptions,
 ): Promise<TestExecution> {
   const startedAt = Date.now();
-  const workspace = process.cwd();
+  const workspace = options.workspace;
 
   const base: Omit<TestExecution, 'status' | 'steps' | 'errorMessage'> = {
     testId: test.id,
     durationMs: 0,
     network: [],
-    console: [],
+    console: options.extraConsole ?? [],
     videoKey: null,
     traceKey: null,
     retriedAndPassed: false,
     findings: [],
   };
+
+  /*
+   * `spec.cwd` is MEMBER-authored and was interpolated straight into
+   * `join(workspace, spec.cwd)`, so `../..` ran the command outside the
+   * workspace — on the old `process.cwd()` base, outside the monorepo. The
+   * schema caps its length and nothing else, so the guard has to be here.
+   */
+  const workDir =
+    spec.cwd === '' || spec.cwd === '.'
+      ? resolve(workspace)
+      : resolveInsideWorkspace(workspace, spec.cwd);
+  if (!workDir) {
+    return {
+      ...base,
+      status: 'FAILED',
+      durationMs: Date.now() - startedAt,
+      steps: [],
+      errorMessage:
+        `This test's working directory ("${spec.cwd}") is not inside the repository, so nothing ` +
+        'was executed. Set `cwd` to a path relative to the repository root.',
+    };
+  }
 
   // Only the secrets the spec asks for, so a test cannot vacuum the whole vault
   // into a third-party process's environment.
@@ -149,7 +345,7 @@ export async function runExternal(
     timedOut?: boolean;
   }>((done) => {
     const child = spawn(spec.command, spec.args, {
-      cwd: join(workspace, spec.cwd),
+      cwd: workDir,
       // Allowlisted, not inherited: `spec.command` is an executable a MEMBER
       // named, so this child is tenant-controlled and must not see the
       // platform's keys. See child-env.ts.
@@ -226,7 +422,7 @@ export async function runExternal(
 
   let report = '';
   try {
-    report = await readFile(safeReportPath(join(workspace, spec.cwd), spec.reportPath), 'utf8');
+    report = await readFile(safeReportPath(workDir, spec.reportPath), 'utf8');
   } catch {
     // A missing report with a clean exit means the tool ran but wrote nowhere we
     // looked — report that honestly rather than inventing a pass.

@@ -37,6 +37,9 @@ import {
   buildCheckOutput,
   chunkAnnotations,
   conclusionFor,
+  gatingFailures,
+  suppressedFailuresIn,
+  BLOCKING_CONCLUSIONS,
   createCheckRun,
   findCheckRun,
   installationToken,
@@ -130,9 +133,9 @@ describe('loadAppConfig', () => {
     // so the one thing this must not do is shrug.
     expect(() => loadAppConfig(unseal, { GITHUB_APP_PRIVATE_KEY: PEM })).toThrow(/GITHUB_APP_ID/);
     expect(() => loadAppConfig(unseal, { GITHUB_APP_ID: '1' })).toThrow(/private key/);
-    expect(() => loadAppConfig(unseal, { GITHUB_APP_ID: 'Iv1.abc', GITHUB_APP_PRIVATE_KEY: PEM })).toThrow(
-      /numeric App ID/,
-    );
+    expect(() =>
+      loadAppConfig(unseal, { GITHUB_APP_ID: 'Iv1.abc', GITHUB_APP_PRIVATE_KEY: PEM }),
+    ).toThrow(/numeric App ID/);
   });
 
   it('prefers the vault, and unseals it under the deployment AAD', () => {
@@ -198,8 +201,9 @@ describe('appJwt', () => {
   });
 
   it('turns an unusable key into a sentence, not an OpenSSL error', () => {
-    expect(() => appJwt('1', '-----BEGIN RSA PRIVATE KEY-----\nnope\n-----END RSA PRIVATE KEY-----'))
-      .toThrow(GithubAppError);
+    expect(() =>
+      appJwt('1', '-----BEGIN RSA PRIVATE KEY-----\nnope\n-----END RSA PRIVATE KEY-----'),
+    ).toThrow(GithubAppError);
   });
 });
 
@@ -219,14 +223,16 @@ describe('installationToken', () => {
     ]);
 
     expect(await installationToken(cfg, '42', { fetchImpl, nowMs: now })).toBe('ghs_first');
-    expect(await installationToken(cfg, '42', { fetchImpl, nowMs: now + 60_000 })).toBe('ghs_first');
+    expect(await installationToken(cfg, '42', { fetchImpl, nowMs: now + 60_000 })).toBe(
+      'ghs_first',
+    );
     expect(fetchImpl.calls).toHaveLength(1);
 
     // 30s before expiry is inside the refresh margin: a token that expires in
     // flight fails a check run that had already passed.
-    expect(
-      await installationToken(cfg, '42', { fetchImpl, nowMs: now + 3_600_000 - 30_000 }),
-    ).toBe('ghs_second');
+    expect(await installationToken(cfg, '42', { fetchImpl, nowMs: now + 3_600_000 - 30_000 })).toBe(
+      'ghs_second',
+    );
     expect(fetchImpl.calls).toHaveLength(2);
   });
 
@@ -311,7 +317,12 @@ describe('host pinning', () => {
     const ref = await createCheckRun(
       'ghs_token',
       'acme/store',
-      { headSha: SHA, externalId: 'run_1', detailsUrl: 'https://qaai/runs/run_1', status: 'in_progress' },
+      {
+        headSha: SHA,
+        externalId: 'run_1',
+        detailsUrl: 'https://qaai/runs/run_1',
+        status: 'in_progress',
+      },
       { fetchImpl },
     );
     expect(ref).toEqual({ id: 5, url: 'https://gh/c/5' });
@@ -557,7 +568,9 @@ describe('conclusionFor', () => {
     expect(
       conclusionFor(
         evidence({
-          failures: [failure({ verdict: { verdict: 'REAL_BUG', confidence: 0.9, explanation: 'x' } })],
+          failures: [
+            failure({ verdict: { verdict: 'REAL_BUG', confidence: 0.9, explanation: 'x' } }),
+          ],
         }),
       ),
     ).toBe('failure');
@@ -583,18 +596,214 @@ describe('conclusionFor', () => {
   });
 });
 
+// ─── Quarantine: the check that used to go red over a suppressed failure ─────
+
+/**
+ * `conclusionFor` read `e.failures.length`, and the producer's failures list
+ * includes quarantined tests — it filters on the RESULT and knows nothing about
+ * the test's quarantine. So a run whose only failing test was quarantined, a
+ * test that had already vanished from every gate rule, still came back
+ * `failure` and still held the merge.
+ *
+ * `neutral` rather than `success` for that run is this file's own existing
+ * doctrine, applied: it does not block a merge, and the failure stays named in
+ * the body. Plain green over a failure somebody switched off is how a team
+ * discovers in production that nothing has been tested for a month.
+ */
+describe('conclusionFor — quarantine', () => {
+  const quarantinedOnly = () =>
+    evidence({
+      run: { ...evidence().run, status: 'PASSED', failedCount: 0, quarantinedFailedCount: 1 },
+      failures: [failure({ quarantined: true })],
+    });
+
+  it('does NOT block the merge when every failure was quarantined', () => {
+    const conclusion = conclusionFor(quarantinedOnly());
+    expect(BLOCKING_CONCLUSIONS).not.toContain(conclusion);
+    expect(conclusion).toBe('neutral');
+  });
+
+  it('reaches the same answer from the counters alone, with no per-failure flag', () => {
+    // The producer (processors/checks.ts) does not select the flag yet, so this
+    // is the path a real run takes today.
+    const conclusion = conclusionFor(
+      evidence({
+        run: { ...evidence().run, status: 'PASSED', failedCount: 0 },
+        failures: [failure()],
+      }),
+    );
+    expect(BLOCKING_CONCLUSIONS).not.toContain(conclusion);
+  });
+
+  it('still blocks when ONE of the failures gates', () => {
+    const conclusion = conclusionFor(
+      evidence({
+        run: { ...evidence().run, failedCount: 1, quarantinedFailedCount: 1 },
+        failures: [
+          failure({ quarantined: true }),
+          failure({ test: { name: 'pay', filePath: 'a.ts', code: null } }),
+        ],
+      }),
+    );
+    expect(conclusion).toBe('failure');
+  });
+
+  it('a quarantined failure cannot stop the gate from blocking', () => {
+    // The gate is the authority, and the budget alarm rides in the gate result.
+    const conclusion = conclusionFor(
+      evidence({
+        run: {
+          ...evidence().run,
+          failedCount: 0,
+          quarantinedFailedCount: 1,
+          gateBlocking: true,
+        },
+        failures: [failure({ quarantined: true })],
+      }),
+    );
+    expect(conclusion).toBe('failure');
+  });
+
+  it('says how many failures were suppressed, preferring the counter it was told', () => {
+    expect(suppressedFailuresIn(quarantinedOnly())).toBe(1);
+  });
+
+  it('infers the suppressed count from the counters when nobody supplied it', () => {
+    expect(
+      suppressedFailuresIn(
+        evidence({
+          run: { ...evidence().run, failedCount: 1 },
+          failures: [failure(), failure(), failure()],
+        }),
+      ),
+    ).toBe(2);
+  });
+
+  it('never infers a negative count from a run an older worker finalised', () => {
+    // Old worker: failedCount still includes quarantined failures, the new
+    // counter is 0, and the subtraction would go negative.
+    expect(
+      suppressedFailuresIn(
+        evidence({ run: { ...evidence().run, failedCount: 4 }, failures: [failure()] }),
+      ),
+    ).toBe(0);
+  });
+
+  it('keeps every failure in the gating set when there is nothing to split on', () => {
+    // A failure dropped from the body because it did not gate is a failure
+    // nobody will ever see again. Visible-and-not-gating is the goal.
+    const e = evidence({
+      run: { ...evidence().run, failedCount: 1 },
+      failures: [failure(), failure()],
+    });
+    expect(gatingFailures(e)).toHaveLength(2);
+  });
+
+  it('splits on the flags when the producer supplies them', () => {
+    const e = evidence({
+      run: { ...evidence().run, failedCount: 1, quarantinedFailedCount: 1 },
+      failures: [failure({ quarantined: true }), failure()],
+    });
+    expect(gatingFailures(e)).toHaveLength(1);
+  });
+});
+
+describe('buildCheckOutput — quarantine is reported, never hidden', () => {
+  const quarantinedOnly = evidence({
+    run: {
+      ...evidence().run,
+      status: 'PASSED',
+      passedCount: 9,
+      failedCount: 0,
+      quarantinedFailedCount: 2,
+    },
+    failures: [failure({ quarantined: true }), failure({ quarantined: true })],
+  });
+
+  it('does not announce "2 failed" in the merge box of a cleared PR', () => {
+    const out = buildCheckOutput(quarantinedOnly);
+    expect(out.title).not.toMatch(/^2 failed/);
+  });
+
+  it('says it in the title anyway, as quarantined rather than as passed', () => {
+    const out = buildCheckOutput(quarantinedOnly);
+    expect(out.title).toContain('9 passed');
+    expect(out.title).toContain('2 quarantined and failing');
+  });
+
+  it('spells it out in the summary as a FAILURE, not as a skip', () => {
+    const out = buildCheckOutput(quarantinedOnly);
+    expect(out.summary).toContain('2 failing test(s) are quarantined');
+    expect(out.summary).toContain('They are still failing');
+    expect(out.summary).toContain('quarantine stops the gate, not the failure');
+  });
+
+  it('puts the suppressed count in the result row beside the others', () => {
+    const out = buildCheckOutput(quarantinedOnly);
+    expect(out.summary).toContain('0 failed');
+    expect(out.summary).toContain('2 quarantined and failing');
+  });
+
+  it('lists every suppressed failure in the body, labelled', () => {
+    const out = buildCheckOutput(quarantinedOnly);
+    expect(out.text).toContain('Checkout completes');
+    expect(out.text).toContain('quarantined, so it did not fail this check');
+  });
+
+  it('counts only the gating failures in a mixed run', () => {
+    const out = buildCheckOutput(
+      evidence({
+        run: { ...evidence().run, failedCount: 1, quarantinedFailedCount: 2 },
+        failures: [
+          failure({ quarantined: true }),
+          failure({ quarantined: true }),
+          failure({ test: { name: 'pay', filePath: 'a.ts', code: null } }),
+        ],
+      }),
+    );
+    expect(out.title).toMatch(/^1 failed/);
+    expect(out.title).toContain('plus 2 quarantined and failing');
+  });
+
+  it('says nothing about quarantine when nothing is suppressed', () => {
+    const out = buildCheckOutput(evidence());
+    expect(out.summary).not.toMatch(/quarantin/i);
+  });
+});
+
+describe('buildAnnotations — quarantine', () => {
+  it('downgrades a suppressed failure to a warning instead of an error marker', () => {
+    const [annotation] = buildAnnotations(evidence({ failures: [failure({ quarantined: true })] }));
+    expect(annotation!.annotation_level).toBe('warning');
+  });
+
+  it('keeps the annotation, and says why it did not count', () => {
+    const [annotation] = buildAnnotations(evidence({ failures: [failure({ quarantined: true })] }));
+    expect(annotation!.title).toContain('quarantined: this did not fail the check');
+  });
+
+  it('leaves an unquarantined untriaged failure at error level', () => {
+    const [annotation] = buildAnnotations(evidence({ failures: [failure()] }));
+    expect(annotation!.annotation_level).toBe('failure');
+  });
+});
+
 describe('buildCheckOutput', () => {
   it('puts the triage sentence in the title a reviewer sees first', () => {
     const out = buildCheckOutput(
       evidence({
         failures: [
-          failure({ verdict: { verdict: 'REAL_BUG', confidence: 0.91, explanation: 'Button gone' } }),
+          failure({
+            verdict: { verdict: 'REAL_BUG', confidence: 0.91, explanation: 'Button gone' },
+          }),
         ],
       }),
     );
     expect(out.title).toBe('1 failed — 1 looks like a real bug.');
     expect(out.summary).toContain('9 passed');
-    expect(out.summary).toContain('[Open the full run in QAAI](https://qaai.example.com/runs/run_1)');
+    expect(out.summary).toContain(
+      '[Open the full run in QAAI](https://qaai.example.com/runs/run_1)',
+    );
     expect(out.text).toContain('Button gone');
   });
 
@@ -611,7 +820,10 @@ describe('buildCheckOutput', () => {
 
   it('stays inside GitHub’s field limits with a pathological run', () => {
     const many = Array.from({ length: 400 }, () =>
-      failure({ errorMessage: 'e'.repeat(2_000), test: { name: 'n'.repeat(300), filePath: 'a/b.ts', code: null } }),
+      failure({
+        errorMessage: 'e'.repeat(2_000),
+        test: { name: 'n'.repeat(300), filePath: 'a/b.ts', code: null },
+      }),
     );
     const out = buildCheckOutput(evidence({ failures: many }));
     expect(out.title.length).toBeLessThanOrEqual(255);
@@ -749,7 +961,9 @@ describe('buildAnnotations', () => {
   it('redacts anything credential-shaped out of provider-bound text', () => {
     const [annotation] = buildAnnotations(
       evidence({
-        failures: [failure({ errorMessage: 'auth failed for ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345' })],
+        failures: [
+          failure({ errorMessage: 'auth failed for ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345' }),
+        ],
       }),
     );
     expect(annotation!.message).not.toContain('ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345');

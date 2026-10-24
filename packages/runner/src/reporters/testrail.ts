@@ -34,6 +34,34 @@
  * A FLAKY result is Passed with a comment saying it needed a retry. It did pass
  * — filing it as Retest would leave a release checklist showing a case that
  * never went green, which is the more expensive wrong answer.
+ *
+ * ── Quarantine: Retest (4), and the three answers that are worse ────────────
+ *
+ * A QUARANTINED result — a test that failed and whose failure the gate has
+ * agreed to ignore — is filed as **Retest**, with a comment that opens by
+ * saying it failed. It used to be filed as Failed, so a team's release
+ * checklist went red over a failure they had deliberately switched off.
+ *
+ *   Failed (5) is not wrong about the test, and it is wrong about the run. A
+ *   TestRail run is a gate in most orgs — the checklist has to go green to
+ *   ship — and leaving a suppressed failure red there means quarantine does
+ *   nothing for anybody who looks at TestRail. The GitHub check reaches the
+ *   same conclusion and answers `neutral`: visible, distinct, not blocking.
+ *   Retest is this format's `neutral`.
+ *
+ *   Blocked (2) is a claim about WHY a case could not run, and this one ran.
+ *   The same reasoning already keeps skipped tests out of Blocked, three
+ *   paragraphs up.
+ *
+ *   Omitting it, the way skipped tests are omitted, is the worst of the four:
+ *   the case keeps whatever status it already had, which on a case that was
+ *   green last week is a suppressed failure reading as a PASS. That is the
+ *   exact reassuring lie this whole change exists to remove, so a quarantined
+ *   test is always sent — and a quarantined test with no case id is named in
+ *   `warnings` like any other unmapped one.
+ *
+ * Retest does mean the case needs a human to look again, which is true: a
+ * quarantine is a loan with a fourteen-day term, not a deletion.
  */
 
 import type {
@@ -44,7 +72,7 @@ import type {
   ReporterStatus,
   RunReport,
 } from './types.js';
-import { durationOf, fullNameOf } from './types.js';
+import { QUARANTINE_NOTE, durationOf, fullNameOf } from './types.js';
 
 /** TestRail's built-in system statuses. 3 (Untested) is deliberately absent. */
 export const TESTRAIL_STATUS = { passed: 1, blocked: 2, retest: 4, failed: 5 } as const;
@@ -91,6 +119,10 @@ const STATUS: Record<ReporterStatus, number | null> = {
   // the comment carries the distinction.
   timedOut: TESTRAIL_STATUS.failed,
   flaky: TESTRAIL_STATUS.passed,
+  // See the header: Retest is this format's "visible, distinct, not blocking".
+  // Never `null` — omitting a suppressed failure leaves the case on its last
+  // status, which is a failure reading as a pass.
+  quarantined: TESTRAIL_STATUS.retest,
   // See the header: not representable, so not sent.
   skipped: null,
 };
@@ -107,6 +139,12 @@ function commentFor(test: ReportedTest): string | undefined {
   const lines: string[] = [];
   if (test.status === 'flaky') lines.push('Passed on retry — QAAI recorded this test as flaky.');
   if (test.status === 'timedOut') lines.push('Timed out.');
+  /*
+   * Retest on its own says "look at this again" and says nothing about why, so
+   * the comment is the entire difference between a case somebody re-runs and a
+   * case somebody understands. It leads, so it survives a truncation.
+   */
+  if (test.status === 'quarantined') lines.push(QUARANTINE_NOTE);
   if (test.message) lines.push(test.message);
   return lines.length > 0 ? lines.join('\n\n') : undefined;
 }
@@ -127,6 +165,8 @@ export const testrailReporter: Reporter = {
     const results: TestRailResult[] = [];
     const unmapped: string[] = [];
     const skipped: string[] = [];
+    /** Sent as Retest. Named, because "which did we switch off" has to have an answer. */
+    const quarantined: string[] = [];
     let untimed = 0;
 
     for (const test of report.tests) {
@@ -141,6 +181,8 @@ export const testrailReporter: Reporter = {
         unmapped.push(fullNameOf(test));
         continue;
       }
+
+      if (test.status === 'quarantined') quarantined.push(fullNameOf(test));
 
       const elapsed = elapsedFor(test);
       if (elapsed === undefined) untimed += 1;
@@ -163,6 +205,17 @@ export const testrailReporter: Reporter = {
     if (skipped.length > 0) {
       warnings.push(
         `${skipped.length} skipped test(s) were left out: TestRail's Untested status cannot be written through add_results, so their cases keep the status they already had.`,
+      );
+    }
+    if (quarantined.length > 0) {
+      /*
+       * Printed even though the upload succeeded. The whole failure mode this
+       * wave is about is a suppression nobody was told about, and "we published
+       * 40 results, 12 of them Retest" is a sentence somebody acts on.
+       */
+      warnings.push(
+        `${quarantined.length} failing test(s) are quarantined and were sent as Retest rather than Failed, so they do not fail this TestRail run — they are still failing. ` +
+          `Quarantined: ${truncate(quarantined.slice(0, 5).join(', '), 300)}${quarantined.length > 5 ? `, and ${quarantined.length - 5} more` : ''}.`,
       );
     }
     if (untimed > 0) {

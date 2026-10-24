@@ -496,6 +496,19 @@ model Project {
   gateRules                Json        @default("[]")
   /// Org-level opt-in to auto-approving SELECTOR_ONLY heals (§3.4).
   autoApproveSelectorHeals Boolean     @default(false)
+  /// How much of this suite may be quarantined, as a percent, before
+  /// quarantining is REFUSED. Null means the documented default in
+  /// packages/runner/src/gates.ts (QUARANTINE_BUDGET_PERCENT_DEFAULT).
+  ///
+  /// A column rather than an environment variable, deliberately. Quarantine is
+  /// the mechanism that switches a signal off, and the brake on it has to be
+  /// something the person running this product can find, read and change — an
+  /// env var nobody deploying this could discover is not a brake, which is why
+  /// scripts/check-wiring.ts refuses one.
+  ///
+  /// Nullable rather than defaulted so "this project never thought about it" and
+  /// "this project chose 5" stay distinguishable; the UI can say which.
+  quarantineBudgetPercent  Int?
   archivedAt               DateTime?
   createdAt                DateTime    @default(now())
   updatedAt                DateTime    @updatedAt
@@ -587,6 +600,9 @@ model AuthProfile {
   updatedAt             DateTime        @updatedAt
 
   environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  /// Tests that execute AS this profile. See Test.authProfileId for why that
+  /// foreign key is SetNull rather than Cascade or Restrict.
+  tests       Test[]
 
   @@unique([environmentId, name])
   @@index([orgId])
@@ -709,6 +725,25 @@ model Test {
   quarantined         Boolean   @default(false)
   quarantinedAt       DateTime?
   quarantineReason    String?
+  /// When this quarantine stops suppressing. A quarantine with no end date is a
+  /// deletion nobody signed, so every quarantine written from now on gets one
+  /// (QUARANTINE_MAX_DAYS in packages/runner/src/gates.ts).
+  ///
+  /// Expiry does NOT clear `quarantined`. Once this date passes the test GATES
+  /// AGAIN while the row keeps saying what was suppressed and why — see
+  /// `quarantineSuppresses`. Clearing the flag instead would erase the reason
+  /// and fight the measured auto-release in processors/flake.ts, which owns
+  /// that column.
+  ///
+  /// Null is honoured as "never expires", which is what every row written
+  /// before this column existed is. Back-filling an expiry onto quarantines a
+  /// customer never agreed to would turn thousands of suppressed failures red
+  /// in one deploy — a migration deciding to break a build. The gate WARNs
+  /// about them instead.
+  quarantineExpiresAt DateTime?
+  /// Current value of the flake rate, kept for sorting and filtering the suite
+  /// tree. OVERWRITTEN on every run: the HISTORY is TestFlakeHistory, and
+  /// anything asking "is this getting worse?" must read that instead of this.
   flakeRate           Float     @default(0)
   lastRunAt           DateTime?
   consecutiveFailures Int       @default(0)
@@ -721,18 +756,150 @@ model Test {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  suite     Suite?           @relation(fields: [suiteId], references: [id], onDelete: SetNull)
-  versions  TestVersion[]
-  results   TestResult[]
-  heals     HealProposal[]
-  baselines VisualBaseline[]
+  /// The ROLE this test executes as (§2): the auth profile whose cached
+  /// storageState the runner injects before the first navigation. Null means
+  /// anonymous, which is a real answer and not a missing one — most tests have
+  /// no business signing in.
+  ///
+  /// Its absence was the defect. The session was chosen per RUN and never per
+  /// test, so an admin test and a member test could not sit in the same suite
+  /// and role-differentiated testing was inexpressible. It also closed a loop
+  /// in coverage: an UNREACHED_AUTH_ROUTE gap asks for a test that signs in,
+  /// the only test that could be generated asserted anonymous denial, and so
+  /// closing the gap re-created the gap, for ever.
+  ///
+  /// `onDelete: SetNull`, deliberately, and neither Cascade nor Restrict.
+  /// Cascade would mean deleting a stale profile silently deletes the
+  /// customer's tests — the code is the asset, the session is only a
+  /// credential. Restrict would turn "delete this profile" into an error no
+  /// customer can clear without hunting down every test by hand. But SetNull
+  /// on its own makes the worse failure SILENT: the binding evaporates, the
+  /// test runs anonymously, passes whatever an anonymous visitor can see, and
+  /// is counted as coverage of a page it never reached. That is what
+  /// `authProfileRequired` below exists to prevent.
+  authProfileId       String?
+  /// "This test is meaningless signed out." The INTENT, where authProfileId is
+  /// the BINDING, and the two are stored separately on purpose: deleting a
+  /// profile nulls the binding and must NOT clear the intent. The pair
+  /// (required = true, id = null) is a state nothing else can produce, and it
+  /// is the state coverage analysis reports out loud — a test with a broken
+  /// auth binding does not count as authenticated coverage, so the gap it was
+  /// written to close correctly re-opens with the reason attached.
+  ///
+  /// Set by whoever asked for the role: a plan item that named a profile, or a
+  /// person in the editor. Never set by the runner.
+  authProfileRequired Boolean @default(false)
+
+  project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  suite       Suite?           @relation(fields: [suiteId], references: [id], onDelete: SetNull)
+  authProfile AuthProfile?     @relation(fields: [authProfileId], references: [id], onDelete: SetNull)
+  versions    TestVersion[]
+  results     TestResult[]
+  heals       HealProposal[]
+  baselines   VisualBaseline[]
 
   ownershipRules OwnershipRule[]
+  flakeHistory   TestFlakeHistory[]
 
   @@index([orgId])
   @@index([projectId, type])
   @@index([suiteId])
+  /// The budget check's own query: "how many tests in this project are
+  /// quarantined right now?", asked before every quarantine and once per run
+  /// finalisation. Without it that is a full scan of the project's tests.
+  @@index([projectId, quarantined])
+  /// Read by the profile-deletion path and by "which tests run as this role?";
+  /// without it both are a full scan of every test in the install.
+  @@index([authProfileId])
+}
+
+/// Flake rate over time: one row per test per UTC day.
+///
+/// ── The defect ──────────────────────────────────────────────────────────────
+/// `Test.flakeRate` is a single Float, overwritten on every run, and the
+/// suite-health score is recomputed per request from whatever is current. So
+/// rot had no DIRECTION: "is this suite getting worse?" was unanswerable, a
+/// test that had been degrading for three weeks looked exactly like one that
+/// flaked once this morning, and there was nothing to diff a release against.
+///
+/// ── The retention rule, and what it loses ───────────────────────────────────
+/// ONE ROW PER TEST PER UTC DAY, kept for `FLAKE_HISTORY_RETENTION_DAYS`
+/// (90, in apps/worker/src/processors/flake.ts). The `(testId, day)` unique
+/// constraint IS the aggregation: the day's row is upserted in place, so the
+/// write volume is bounded by tests x days and not by runs. A 5,000-test suite
+/// running hourly writes 120,000 measurements a day and stores 5,000 rows;
+/// over the full window that is 450,000 rows, which is the point of the rule.
+///
+/// What it loses, stated plainly rather than discovered later:
+///
+///   1. INTRA-DAY RESOLUTION. A test that broke at 10:00 and was fixed by 14:00
+///      shows one value for that day. `peakRatePercent` and `worstAt` keep the
+///      WORST moment so a spike is not erased, but the shape of the day is
+///      gone — you cannot tell one bad hour from a bad afternoon.
+///   2. WHICH run was worst survives (`worstRunId`); the other twenty-three
+///      runs' ids do not. Tracing a specific regression to a specific run needs
+///      TestResult rows, which have their own retention.
+///   3. ANYTHING OLDER THAN 90 DAYS. A year-over-year comparison is not
+///      available from this table and is not meant to be. CoverageSnapshot is
+///      the precedent for keeping a long trend; if a longer flake trend is
+///      wanted it belongs in a monthly rollup, not in a bigger window here.
+///   4. A DAY WITH NO RUNS HAS NO ROW. Absence means "not measured", never
+///      "0% flaky" — a reader that fills gaps with zero will invent a recovery
+///      that never happened.
+model TestFlakeHistory {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  testId    String
+
+  /// Midnight UTC of the day this row aggregates. The bucket key, and the
+  /// reason the table cannot grow with the run rate.
+  day DateTime
+
+  /// The day's LAST measurement, 0-100. "Where it ended up."
+  ratePercent     Float
+  /// The day's WORST measurement. Kept so collapsing a day cannot hide a spike.
+  peakRatePercent Float
+  /// When the peak was measured, and the run that produced it.
+  worstAt         DateTime
+  worstRunId      String?
+
+  /// Results the last measurement was computed from. A 100% rate over 2 samples
+  /// is not the same claim as 100% over 50, and a trend drawn without the
+  /// denominator cannot tell a regression from a small sample.
+  sampleSize Int @default(0)
+  /// Failures inside that window, so the rate is recomputable rather than taken
+  /// on faith.
+  failures   Int @default(0)
+  /// How many measurements landed in this bucket. 1 means no aggregation
+  /// happened and the row is a single reading.
+  samples    Int @default(1)
+
+  /// Whether a quarantine was in force when the day's last measurement was
+  /// taken. Without it a flat 0% reads as a healthy test when it is actually a
+  /// suppressed one nobody is gating on.
+  quarantined Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  /// The aggregation, as a constraint. An upsert on this key is what turns N
+  /// measurements a day into one row, and it is enforced by the database rather
+  /// than by every writer remembering to.
+  /// The aggregation, as a constraint — and ALSO the index for "show me this
+  /// test's trend". There is deliberately no second index on
+  /// (testId, day(sort: Desc)): this one already serves it, because a btree
+  /// scans backwards and a single-direction sort needs no matching index
+  /// direction (the same reasoning as the createdAt indexes in
+  /// migrations/20260824000000_query_plan_indexes). A second index would be
+  /// write amplification on a hot table for nothing.
+  @@unique([testId, day])
+  @@index([orgId])
+  /// "Is this PROJECT getting worse?" — the suite-level trend, and the sweep's
+  /// own retention delete, which scans by day.
+  @@index([projectId, day])
 }
 
 /// Every code change to a test, whether from a human, the Generator, or a Heal.
@@ -779,11 +946,21 @@ model Run {
   startedAt  DateTime?
   finishedAt DateTime?
 
-  totalCount   Int @default(0)
-  passedCount  Int @default(0)
-  failedCount  Int @default(0)
-  flakyCount   Int @default(0)
-  skippedCount Int @default(0)
+  totalCount             Int @default(0)
+  /// Failures that GATE. A quarantined test's failure is NOT counted here —
+  /// that is the whole fix; see packages/runner/src/gates.ts.
+  passedCount            Int @default(0)
+  failedCount            Int @default(0)
+  flakyCount             Int @default(0)
+  skippedCount           Int @default(0)
+  /// Failures a quarantine in force suppressed.
+  ///
+  /// A column of its own, and NOT added to `skippedCount`, because a deliberate
+  /// skip and a failure somebody switched off are different facts. Folding them
+  /// together is how a suite with forty quarantined tests reports a clean green
+  /// board; keeping them apart is what lets every surface say "0 failed, 3
+  /// quarantined and failing" instead of "0 failed".
+  quarantinedFailedCount Int @default(0)
 
   /// GateResult from packages/shared. Null until the run finalises.
   gateResult   Json?
@@ -872,10 +1049,13 @@ model RunShard {
   testCount   Int @default(0)
   estimatedMs Int @default(0)
 
-  passedCount  Int @default(0)
-  failedCount  Int @default(0)
-  flakyCount   Int @default(0)
-  skippedCount Int @default(0)
+  passedCount            Int @default(0)
+  failedCount            Int @default(0)
+  flakyCount             Int @default(0)
+  skippedCount           Int @default(0)
+  /// Mirrors Run.quarantinedFailedCount for this slice, so a shard's own report
+  /// in the cockpit cannot say something the run's total contradicts.
+  quarantinedFailedCount Int @default(0)
 
   queuedAt    DateTime  @default(now())
   startedAt   DateTime?
@@ -915,11 +1095,56 @@ model TestResult {
   /// existing code path reads null and behaves exactly as before.
   shardIndex       Int?
 
-  run      Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
-  test     Test           @relation(fields: [testId], references: [id], onDelete: Cascade)
-  steps    Step[]
-  findings Finding[]
-  verdict  TriageVerdict?
+  /// ── The mutation metric channel (§4 MUTATION) ─────────────────────────────
+  ///
+  /// THE DEFECT: the mutation score lived only inside a Step TITLE ("Mutation
+  /// score 72.4% — 89 of 123 mutants killed"). It is the answer to "do these
+  /// tests actually assert anything?" and the one metric no competitor ships,
+  /// and the only way to read it back was a regex over a string column — so it
+  /// could not be trended, gated on, or alerted on. Once per run it was
+  /// rendered into a sentence and thrown away.
+  ///
+  /// FIVE SCALAR COLUMNS AND NOT ONE JSON BLOB. The entire point is the trend
+  /// query, and `@@index([testId, createdAt])` below already serves "this
+  /// test's last N results in order" — so `SELECT createdAt, mutationScore`
+  /// over that index answers "is this suite's mutation score going up?" from
+  /// the index alone. A `Json` column would make every such read a sequential
+  /// scan plus a per-row document parse, and would let a writer put a string
+  /// where the number goes.
+  ///
+  /// NULL MEANS NOT MEASURED. 0.0 means EVERY MUTANT SURVIVED — the worst
+  /// result a suite can produce — and conflating the two inverts the signal
+  /// completely: the project that has never run mutation testing would look
+  /// identical to the project whose tests assert nothing. There are three
+  /// states here, and they are all reachable and all distinguishable:
+  ///
+  ///   · every column NULL          — no mutation run reported anything.
+  ///   · counts set, score NULL     — a run happened and produced no VALID
+  ///                                  mutant (everything excluded), so there
+  ///                                  was no denominator. `mutationExcluded`
+  ///                                  says how many were thrown out.
+  ///   · score 0.0                  — measured, and nothing was killed.
+  ///
+  /// `valid` is deliberately not a column: it is `mutationDetected +
+  /// mutationUndetected` and a stored copy is one more thing that can disagree
+  /// with its own inputs.
+  mutationScore      Float?
+  mutationDetected   Int?
+  mutationUndetected Int?
+  /// Not buildable, not runnable — excluded from both sides of the score.
+  /// Non-null with a NULL score is the "nothing valid ran" state above.
+  mutationExcluded   Int?
+  /// The threshold this run was judged against, stored because a score means
+  /// nothing without the bar it was held to, and the bar is editable: a trend
+  /// read six months later cannot recover what the gate was at the time.
+  mutationMinScore   Float?
+
+  run               Run                @relation(fields: [runId], references: [id], onDelete: Cascade)
+  test              Test               @relation(fields: [testId], references: [id], onDelete: Cascade)
+  steps             Step[]
+  findings          Finding[]
+  verdict           TriageVerdict?
+  mutationSurvivors MutationSurvivor[]
 
   @@unique([runId, testId])
   @@index([orgId])
@@ -984,6 +1209,97 @@ model Finding {
   /// column it cannot pin destroys the ordering of everything after it. That
   /// index was measured and the planner never used it once.
   @@index([orgId, createdAt])
+}
+
+/// A mutant the suite did not catch — the actionable half of a mutation run.
+///
+/// The score says the suite is weak; a row here says WHERE. "`>` became `>=`
+/// at src/cart.ts:42 and every test still passed" names one missing assertion,
+/// which is a task a person can finish. That detail used to exist only as a
+/// FAILED Step with the location inside its title, so "which mutants keep
+/// surviving across runs?" — the question that tells a team where its suite is
+/// thinnest — had no answer.
+///
+/// ── Volume: why the rows are kept, and why only for a while ────────────────
+///
+/// A 200-mutant run on a 5,000-test suite is a lot of rows, and both obvious
+/// policies are wrong in different directions. "Only the newest run's
+/// survivors" throws away the one thing a survivor list is good for, which is
+/// noticing that the same mutant has survived for six weeks. "Every survivor
+/// forever" grows without bound with the RUN RATE — hourly CI on a big module
+/// is millions of rows a year describing code that has since been rewritten.
+///
+/// So the two halves are kept on different clocks, deliberately:
+///
+///   · THE NUMBERS (the five columns on TestResult) are kept as long as the
+///     result row itself, which nothing deletes. Five scalars on a row that
+///     already exists cost nothing, so the TREND is permanent.
+///   · THE DETAIL (these rows) is pruned at `MUTATION_SURVIVOR_RETENTION_DAYS`
+///     (90, in apps/worker/src/processors/retention.ts) — the same window
+///     `FLAKE_HISTORY_RETENTION_DAYS` uses, and the longest retention any plan
+///     buys for the results it describes, so detail never outlives the
+///     evidence behind it. A survivor list also goes stale the moment the
+///     source moves: a mutant at line 42 of a file that was refactored in
+///     March is not a task anybody can act on in June.
+///
+/// And one bound at WRITE time: at most `MAX_PERSISTED_SURVIVORS` rows per
+/// result (apps/worker/src/processors/run.ts). The COUNTS stay exact — the cap
+/// truncates the list, never the arithmetic — so a capped result still reports
+/// its true `mutationUndetected` and says, honestly, that it is showing the
+/// first N of them.
+///
+/// WHAT THIS LOSES, stated here rather than discovered later: after 90 days a
+/// result keeps its score and loses its survivor names, and a result with no
+/// rows is "detail aged out or never recorded", never "zero survivors" — the
+/// count column is the only thing that may be read as a count.
+model MutationSurvivor {
+  id           String @id @default(cuid())
+  orgId        String
+  testResultId String
+
+  /// Path or class exactly as the tool named it (`src/cart.ts`,
+  /// `com.acme.Cart`). Never normalised: a path we rewrote is a path that no
+  /// longer opens in an editor, and the tools disagree about shape.
+  file    String
+  /// Null when the tool reported no line. NOT 0 — line 0 does not exist, and a
+  /// zero here would send a reader to the top of the file with confidence.
+  line    Int?
+  /// The mutation operator: `ArithmeticOperator`, `ConditionalsBoundary`, …
+  mutator String
+  /// What the tool says it changed, when it says.
+  detail  String?
+  /// `survived` | `no-coverage` — a survivor no test even executed.
+  ///
+  /// A String and not a Prisma enum on purpose. `apps/api/scripts/check-enums.ts`
+  /// enforces schema/TypeScript parity from a HAND-MAINTAINED list (`PAIRS`),
+  /// so a new enum added without an entry there is an enum with no drift guard
+  /// at all — and the drift it would hide is a value the database accepts and
+  /// TypeScript has never heard of. The producer is the typed union
+  /// `SurvivingMutant['reason']` in packages/shared/src/types.ts and the worker
+  /// is its only writer, so the column's domain is enforced where the value is
+  /// made. Promote it to an enum in the same change that adds its PAIRS entry.
+  reason  String
+
+  /// Denormalised on purpose: the retention prune needs a time column it can
+  /// filter and order on without joining TestResult for every row. Same
+  /// reasoning as `Artifact.expiresAt`, which the artifact sweep reads the same
+  /// way.
+  createdAt DateTime @default(now())
+
+  testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+
+  /// "Show me this result's surviving mutants" — the read the run page makes.
+  @@index([testResultId])
+  /// "Which files in this org keep surviving?" — the heat map that turns a
+  /// score into a work queue. `orgId` first because the tenant extension makes
+  /// it an equality on every read, which is also what lets this index serve the
+  /// plain org-scoped scan; a separate @@index([orgId]) would be an identical
+  /// prefix and pure write amplification.
+  @@index([orgId, file])
+  /// The prune's own column, like `Artifact.expiresAt`. Without it the sweep's
+  /// "oldest first, past the window" read is a full scan and a sort of every
+  /// survivor the install has ever recorded.
+  @@index([createdAt])
 }
 
 model Artifact {

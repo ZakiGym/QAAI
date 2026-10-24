@@ -35,7 +35,13 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { DEFAULT_GATE_RULES, evaluateGates } from '@qaai/runner';
+import {
+  DEFAULT_GATE_RULES,
+  evaluateGates,
+  quarantineSuppresses,
+  runOutcome,
+  tallyResult,
+} from '@qaai/runner';
 import { PLAN_LIMITS, QUEUE_NAMES, TEST_TYPES } from '@qaai/shared';
 import type { GateRule, TestType } from '@qaai/shared';
 import { prisma } from './prisma.js';
@@ -1399,17 +1405,33 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
   const results = await prisma.testResult.findMany({
     where: { runId },
     include: {
-      test: { select: { name: true, priority: true, quarantined: true } },
+      test: {
+        select: { name: true, priority: true, quarantined: true, quarantineExpiresAt: true },
+      },
       verdict: { select: { verdict: true, overriddenTo: true, reviewState: true } },
     },
   });
 
-  const counts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
+  /*
+   * This loop used to be a third hand-written copy of the counting rule, and it
+   * had the same defect as the other two: a quarantined test that FAILED landed
+   * in `counts.failed`, so quarantine stopped the signal (the gate excludes it)
+   * without stopping the gate (the counter turns the build red anyway). The
+   * worst of both — nobody sees the failure and nobody can merge.
+   *
+   * `tallyResult` and `runOutcome` in packages/runner/src/gates.ts are now the
+   * only places a result becomes a number and the only place a run becomes a
+   * verdict. On-prem runs finalise HERE rather than in the worker, so a fix
+   * that stopped at the worker would have left every self-hosted-pool customer
+   * with the original bug and no sign of it.
+   */
+  const now = new Date();
+  const counts = { passed: 0, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 0 };
   for (const result of results) {
-    if (result.status === 'PASSED') counts.passed += 1;
-    else if (result.status === 'FLAKY') counts.flaky += 1;
-    else if (result.status === 'SKIPPED') counts.skipped += 1;
-    else counts.failed += 1;
+    tallyResult(counts, {
+      status: result.status,
+      quarantineInForce: quarantineSuppresses(result.test, now),
+    });
   }
 
   const rules = Array.isArray(run.project.gateRules) && run.project.gateRules.length > 0
@@ -1422,7 +1444,7 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
       testName: r.test.name,
       status: r.status,
       priority: r.test.priority,
-      quarantined: r.test.quarantined,
+      quarantined: quarantineSuppresses(r.test, now),
       retriedAndPassed: r.retriedAndPassed,
       verdict:
         r.verdict?.reviewState === 'OVERRIDDEN'
@@ -1449,12 +1471,15 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
   const skipped = jobs.filter((j) => j.status === 'SKIPPED');
   const nothingRan = skipped.length === jobs.length;
 
-  const status =
-    abandoned.length > 0 || nothingRan
-      ? ('ERRORED' as const)
-      : counts.failed > 0 || !gateResult.passed
-        ? ('FAILED' as const)
-        : ('PASSED' as const);
+  const outcome = runOutcome({
+    counts,
+    gatePassed: gateResult.passed,
+    // The two shapes of "nothing was tested" described above outrank the tests'
+    // own verdict, and `runOutcome` takes them as a forced status rather than
+    // letting this file re-derive PASSED/FAILED beside it.
+    forcedStatus: abandoned.length > 0 || nothingRan ? 'ERRORED' : null,
+  });
+  const status = outcome.status;
 
   const errorMessage =
     [...abandoned, ...skipped]
@@ -1472,6 +1497,7 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
       failedCount: counts.failed,
       flakyCount: counts.flaky,
       skippedCount: counts.skipped,
+      quarantinedFailedCount: counts.quarantinedFailed,
       // Prisma Json input needs an index signature; a typed interface has none.
       gateResult: gateResult as unknown as object,
       errorMessage,
@@ -1489,7 +1515,18 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
   publish(orgId, {
     runId,
     type: 'run.finished',
-    data: { status, ...counts, gatePassed: gateResult.passed, onPrem: true },
+    data: {
+      status,
+      ...counts,
+      gatePassed: gateResult.passed,
+      /*
+       * Nested, not spread: `...counts` already carries a `passed` key holding
+       * the PASSING-TEST COUNT, and a top-level `passed: boolean` would quietly
+       * replace it for every subscriber.
+       */
+      verdict: outcome,
+      onPrem: true,
+    },
     at: new Date().toISOString(),
   });
 

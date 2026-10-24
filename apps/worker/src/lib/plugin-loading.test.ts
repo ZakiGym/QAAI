@@ -113,9 +113,17 @@ const firstParty = {
   },
 };
 
-vi.mock('@qaai/runner', () => ({
-  DEFAULT_GATE_RULES: [],
-  evaluateGates: () => ({ passed: true, evaluations: [] }),
+/*
+ * A PARTIAL mock. The barrel pulls in Playwright so it cannot be imported
+ * whole, but `gates.js` depends only on @qaai/shared and is imported for real:
+ * `processRun` (exercised at the bottom of this file) now tallies its counters
+ * through `tallyResult` and writes its verdict through `runOutcome`, both of
+ * which live there. Replacing them with stubs would put the run's pass/fail
+ * decision back outside the reach of any assertion, which is the hole the
+ * quarantine defect lived in.
+ */
+vi.mock('@qaai/runner', async () => ({
+  ...(await import('../../../../packages/runner/src/gates.js')),
   reasonUnsupported: (type: string) => `${type} is not supported`,
   pluginFor: (type: string) => (h.unimplemented.has(type) ? null : firstParty),
 }));
@@ -307,10 +315,7 @@ describe('only plugins enabled for that project, in that org, are loaded', () =>
     ['another org’s enablement row', enabledRow({ orgId: OTHER_ORG })],
     ['another project in the same org', enabledRow({ projectId: 'proj2' })],
     ['a row that says enabled: false', enabledRow({ enabled: false })],
-    [
-      'a row pointing at another org’s plugin',
-      enabledRow({ plugin: { orgId: OTHER_ORG } }),
-    ],
+    ['a row pointing at another org’s plugin', enabledRow({ plugin: { orgId: OTHER_ORG } })],
   ])('does not load %s', async (_label, stranger) => {
     const loaded = await loadProjectPlugins(registryOf([mine, stranger]), {
       orgId: ORG,
@@ -532,7 +537,11 @@ function fakeWorld(rows: Array<EnabledPluginRow & { enabled: boolean }>): {
 
   const resultModel = {
     findMany: async () =>
-      results.map((r) => ({ ...r, test: { name: 'checkout', priority: 'IMPORTANT', quarantined: false }, verdict: null })),
+      results.map((r) => ({
+        ...r,
+        test: { name: 'checkout', priority: 'IMPORTANT', quarantined: false },
+        verdict: null,
+      })),
     groupBy: async () => [{ status: 'PASSED', _count: { _all: 1 } }],
     update: async (args: { where: { id: string }; data: { status?: string } }) => {
       const row = results.find((r) => r.id === args.where.id);
@@ -545,6 +554,18 @@ function fakeWorld(rows: Array<EnabledPluginRow & { enabled: boolean }>): {
     step: { deleteMany: async () => ({ count: 0 }), createMany: async () => ({ count: 0 }) },
     finding: { deleteMany: async () => ({ count: 0 }), createMany: async () => ({ count: 0 }) },
     artifact: { upsert: async () => ({}) },
+    /*
+     * `persistExecution` clears the mutation survivor rows on EVERY result, so
+     * that stale detail cannot outlive the number it describes. That makes this
+     * delegate reachable on every run, not only a mutation one — and without it
+     * the call throws, the outer catch turns it into a run-level error, and a
+     * test about plugin loading fails as `ERRORED` with the real cause nowhere
+     * in the log.
+     */
+    mutationSurvivor: {
+      deleteMany: async () => ({ count: 0 }),
+      createMany: async () => ({ count: 0 }),
+    },
   };
 
   h.prisma = {
@@ -616,8 +637,9 @@ describe('a run reads the registry, and a broken plugin does not break the run',
   it('asks for the manifest and the signature, because that is what it re-checks', async () => {
     const world = fakeWorld([enabledRow()]);
     await processRun(job);
-    const select = (world.enablementQueries[0] as { select: { plugin: { select: Record<string, unknown> } } })
-      .select.plugin.select;
+    const select = (
+      world.enablementQueries[0] as { select: { plugin: { select: Record<string, unknown> } } }
+    ).select.plugin.select;
     expect(select.manifest).toBe(true);
     expect(select.signature).toBe(true);
     expect(select.publisherRow).toBeTruthy();

@@ -35,6 +35,7 @@ import { allureReporter, type AllureResult } from './allure.js';
 import { junitReporter, renderJUnitXml } from './junit.js';
 import { REPORTERS, REPORTER_NAMES, renderReport, resolveReporter } from './index.js';
 import { caseIdsFor, elapsedFor, testrailReporter, type TestRailPayload } from './testrail.js';
+import { QUARANTINE_NOTE } from './types.js';
 import type { ReportedTest, RunReport } from './types.js';
 
 // ─── Fixtures, in the shape the platform stores ──────────────────────────────
@@ -46,12 +47,22 @@ interface PlatformResult {
   status: PlatformStatus;
   durationMs: number;
   errorMessage: string | null;
+  /**
+   * The test's quarantine is IN FORCE for this run — what
+   * `quarantineSuppresses(result.test, now)` answers in the route, not the raw
+   * `Test.quarantined` column. The route asks that question itself; this
+   * fixture holds the answer so the oracle and the reporter are measured on the
+   * same input.
+   */
+  quarantined?: boolean;
 }
 
 interface PlatformRun {
   totalCount: number;
   failedCount: number;
   skippedCount: number;
+  /** `Run.quarantinedFailedCount` — the fourth counter, not a slice of failed. */
+  quarantinedFailedCount?: number;
   results: PlatformResult[];
 }
 
@@ -72,10 +83,15 @@ function toRunReport(run: PlatformRun): RunReport {
       failed: run.failedCount,
       skipped: run.skippedCount,
       flaky: run.results.filter((r) => r.status === 'FLAKY').length,
+      ...(run.quarantinedFailedCount === undefined
+        ? {}
+        : { quarantinedFailed: run.quarantinedFailedCount }),
     },
     tests: run.results.map((r) => ({
       name: r.name,
-      status: REPORTED[r.status],
+      // The route decides this from the two quarantine columns; the model
+      // carries it as a status, so the mapping happens here.
+      status: r.quarantined === true ? ('quarantined' as const) : REPORTED[r.status],
       durationMs: r.durationMs,
       ...(r.errorMessage === null ? {} : { message: r.errorMessage }),
     })),
@@ -96,6 +112,8 @@ function apiRouteJunit(run: PlatformRun): string {
       (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]!,
     );
 
+  let suppressed = 0;
+
   const cases = run.results
     .map((r) => {
       const time = (r.durationMs / 1000).toFixed(3);
@@ -103,13 +121,35 @@ function apiRouteJunit(run: PlatformRun): string {
       if (r.status === 'PASSED') return `    <testcase name="${name}" time="${time}"/>`;
       if (r.status === 'SKIPPED')
         return `    <testcase name="${name}" time="${time}"><skipped/></testcase>`;
+
+      if (r.quarantined === true) {
+        suppressed += 1;
+        const why = escape(
+          `QUARANTINED FAILURE — this test FAILED and its failure is suppressed by quarantine, ` +
+            `so it did not fail the build. It is not a skipped test: it ran, and it failed. ` +
+            `${r.errorMessage ?? 'failed'}`,
+        );
+        return (
+          `    <testcase name="${name}" time="${time}">` +
+          `<skipped message="${why}"/>` +
+          `<system-out>${why}</system-out>` +
+          `</testcase>`
+        );
+      }
+
       return `    <testcase name="${name}" time="${time}"><failure message="${escape(
         r.errorMessage ?? 'failed',
       )}"/></testcase>`;
     })
     .join('\n');
 
-  return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="qaai" tests="${run.totalCount}" failures="${run.failedCount}" skipped="${run.skippedCount}">\n${cases}\n  </testsuite>\n</testsuites>\n`;
+  const properties =
+    `    <properties>\n` +
+    `      <property name="qaai.quarantinedFailures" value="${run.quarantinedFailedCount ?? 0}"/>\n` +
+    `      <property name="qaai.quarantinedFailuresInThisDocument" value="${suppressed}"/>\n` +
+    `    </properties>`;
+
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="qaai" tests="${run.totalCount}" failures="${run.failedCount}" skipped="${run.skippedCount}">\n${properties}\n${cases}\n  </testsuite>\n</testsuites>\n`;
 }
 
 const withFailures: PlatformRun = {
@@ -188,12 +228,46 @@ const hostile: PlatformRun = {
   ],
 };
 
+/**
+ * The fixture the whole quarantine wave turns on.
+ *
+ * One real failure that gates, one failure a quarantine in force suppressed,
+ * one deliberate skip, one pass — so every reporter has to tell four things
+ * apart, and `failedCount` (1) deliberately does NOT count the suppressed one
+ * while `quarantinedFailedCount` (1) does. A reporter that folds quarantine
+ * into `failed` or into `skipped` cannot reproduce these bytes.
+ */
+const withQuarantine: PlatformRun = {
+  totalCount: 4,
+  failedCount: 1,
+  skippedCount: 1,
+  quarantinedFailedCount: 1,
+  results: [
+    { name: 'C300 cart · adds an item', status: 'PASSED', durationMs: 410, errorMessage: null },
+    {
+      name: 'C301 cart · applies a coupon',
+      status: 'FAILED',
+      durationMs: 980,
+      errorMessage: 'expected "10% off" to be visible',
+    },
+    {
+      name: 'C302 cart · recalculates tax',
+      status: 'FAILED',
+      durationMs: 1200,
+      errorMessage: 'expected total 11.00, got 10.00',
+      quarantined: true,
+    },
+    { name: 'C303 cart · saves for later', status: 'SKIPPED', durationMs: 0, errorMessage: null },
+  ],
+};
+
 const PLATFORM_FIXTURES: Array<[string, PlatformRun]> = [
   ['failures', withFailures],
   ['flakes', withFlakes],
   ['skips', withSkips],
   ['zero tests', emptyRun],
   ['xml-hostile names', hostile],
+  ['a quarantined failure', withQuarantine],
 ];
 
 /** The case the platform cannot produce today, and every reporter must survive. */
@@ -279,6 +353,67 @@ describe('junit reporter', () => {
     // Mirrors the worker: TIMED_OUT counts as a failure, FLAKY counts as
     // neither a pass nor a failure.
     expect(xml).toContain('tests="5" failures="2" skipped="1"');
+  });
+
+  /**
+   * JUnit's whole vocabulary for a suppressed failure is `<skipped>` plus a
+   * message, and the message is therefore the entire difference between this
+   * and a deliberate skip. The assertions are about that difference.
+   */
+  it('renders a suppressed failure as a skip that says it failed', () => {
+    const xml = renderJUnitXml(toRunReport(withQuarantine));
+
+    // Not a `<failure>`: the gate cleared this one, and a red build over it is
+    // the defect. Not a bare `<skipped/>` either.
+    expect(xml).not.toContain('expected total 11.00, got 10.00"/></testcase>');
+    expect(xml).toContain('<skipped message="QUARANTINED FAILURE');
+    expect(xml).toContain('It is not a skipped test: it ran, and it failed.');
+    // The real error survives the wrapper, or the report cannot be acted on.
+    expect(xml).toContain('expected total 11.00, got 10.00');
+    // Repeated in system-out: several CIs render that and not the skip reason.
+    expect(xml).toContain('<system-out>QUARANTINED FAILURE');
+
+    // The deliberate skip in the same fixture stays a bare skip, so the two
+    // are distinguishable in the document a human actually opens.
+    expect(xml).toContain('<testcase name="C303 cart · saves for later" time="0.000"><skipped/>');
+
+    // And the counters still disagree in the right direction: one gating
+    // failure, one suppressed, reported separately.
+    expect(xml).toContain('tests="4" failures="1" skipped="1"');
+    expect(xml).toContain('<property name="qaai.quarantinedFailures" value="1"/>');
+  });
+
+  it('never prints a run-level suppression count its own cases contradict', () => {
+    /*
+     * A run finalised by an older worker: totals with no `quarantinedFailed`.
+     * Printing 0 next to a document that visibly contains two suppressed
+     * failures would be a file arguing with itself, so the document's own count
+     * is used for both.
+     */
+    const xml = renderJUnitXml({
+      totals: { tests: 2, passed: 0, failed: 0, skipped: 0, flaky: 0 },
+      tests: [
+        { name: 'a', status: 'quarantined', message: 'boom', durationMs: 1 },
+        { name: 'b', status: 'quarantined', message: 'bang', durationMs: 1 },
+      ],
+    });
+    expect(xml).toContain('<property name="qaai.quarantinedFailures" value="2"/>');
+    expect(xml).toContain('<property name="qaai.quarantinedFailuresInThisDocument" value="2"/>');
+  });
+
+  it('counts a suppressed failure in neither failures nor skipped when it derives totals', () => {
+    const xml = renderJUnitXml({
+      tests: [
+        { name: 'a', status: 'failed', durationMs: 1 },
+        { name: 'b', status: 'quarantined', durationMs: 1 },
+        { name: 'c', status: 'skipped', durationMs: 1 },
+      ],
+    });
+    // The fourth-counter rule, in the one place a reporter derives its own:
+    // folding it into `failures` is the original defect, folding it into
+    // `skipped` is the same defect wearing a kinder word.
+    expect(xml).toContain('tests="3" failures="1" skipped="1"');
+    expect(xml).toContain('<property name="qaai.quarantinedFailures" value="1"/>');
   });
 });
 
@@ -384,6 +519,39 @@ describe('allure reporter', () => {
     expect(allureResults(doc)).toHaveLength(0);
     expect(doc.warnings.join(' ')).toContain('zero tests');
   });
+
+  it('mutes a suppressed failure rather than passing it or skipping it', () => {
+    const results = allureResults(allureReporter.render(toRunReport(withQuarantine)));
+    const [, gating, suppressed, skipped] = results;
+
+    // Still `failed` — it failed. `muted` is Allure's own "not held against
+    // the build", which is what a quarantine IS.
+    expect(suppressed!.status).toBe('failed');
+    expect(suppressed!.statusDetails?.muted).toBe(true);
+    expect(suppressed!.labels).toContainEqual({ name: 'tag', value: 'quarantined' });
+    // The two readings this must never have.
+    expect(suppressed!.status).not.toBe('passed');
+    expect(suppressed!.status).not.toBe('skipped');
+
+    // The message says it failed before it says anything else, and keeps the
+    // real error: `muted` on its own renders as a quiet grey row.
+    expect(suppressed!.statusDetails?.message).toMatch(/^QUARANTINED FAILURE/);
+    expect(suppressed!.statusDetails?.message).toContain('expected total 11.00, got 10.00');
+
+    // The neighbours are untouched, so the four states stay distinguishable.
+    expect(gating!.status).toBe('failed');
+    expect(gating!.statusDetails?.muted).toBeUndefined();
+    expect(skipped!.status).toBe('skipped');
+  });
+
+  it('still says a suppressed failure failed when the run recorded no error text', () => {
+    // `muted` with no message is a grey row nobody can act on, so the note is
+    // written even with nothing to append to it.
+    const results = allureResults(
+      allureReporter.render({ id: 'r', tests: [{ name: 't', status: 'quarantined' }] }),
+    );
+    expect(results[0]!.statusDetails).toEqual({ message: QUARANTINE_NOTE, muted: true });
+  });
 });
 
 // ─── 3. TestRail ─────────────────────────────────────────────────────────────
@@ -461,6 +629,34 @@ describe('testrail reporter', () => {
     expect(warnings).toContain('no TestRail case id');
     expect(warnings).toContain('unmapped test with no case id');
     expect(warnings).toContain('Untested status cannot be written');
+  });
+
+  it('files a suppressed failure as Retest, and never leaves the case on a stale pass', () => {
+    const doc = testrailReporter.render(toRunReport(withQuarantine), { testRailRunId: 77 });
+    const body = payload(doc.files[0]!.contents);
+
+    const suppressed = body.results.find((r) => r.case_id === 302);
+    // 4 = Retest. Not 1 (Passed), not 5 (Failed), not 2 (Blocked), and above
+    // all not absent — an omitted result leaves the case on whatever status it
+    // had, which on a case that was green last week is a failure reading as a
+    // pass. See the reporter's header for all four rejections.
+    expect(suppressed).toBeDefined();
+    expect(suppressed!.status_id).toBe(4);
+    expect(suppressed!.comment).toMatch(/^QUARANTINED FAILURE/);
+    expect(suppressed!.comment).toContain('expected total 11.00, got 10.00');
+
+    // The gating failure beside it is still Failed, so a release checklist can
+    // tell the two apart.
+    expect(body.results.find((r) => r.case_id === 301)!.status_id).toBe(5);
+    // The deliberate skip is still omitted, which is a different fact.
+    expect(body.results.map((r) => r.case_id)).toEqual([300, 301, 302]);
+
+    // And the suppression is PRINTED even though the upload succeeded: a
+    // suppression nobody was told about is the whole failure mode here.
+    const warnings = doc.warnings.join(' ');
+    expect(warnings).toContain('sent as Retest rather than Failed');
+    expect(warnings).toContain('they are still failing');
+    expect(warnings).toContain('C302 cart · recalculates tax');
   });
 
   it('omits elapsed rather than sending a zero TestRail would reject', () => {

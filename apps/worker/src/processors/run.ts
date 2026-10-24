@@ -20,8 +20,35 @@
  * bug cannot reach a run that never asked to be sharded.
  */
 
-import { evaluateGates, reasonUnsupported } from '@qaai/runner';
+import {
+  emptyRunCounts,
+  evaluateGates,
+  quarantineSuppresses,
+  reasonUnsupported,
+  runOutcome,
+  signInWithProfile,
+  tallyResult,
+  QUARANTINE_EXPIRY_WARNING_DAYS,
+  QUARANTINE_MAX_DAYS,
+} from '@qaai/runner';
+import type { QuarantineHealthInput, RunCountsWithQuarantine } from '@qaai/runner';
 import { loadProjectPlugins, resolveTestPlugin } from '../lib/plugin-loading.js';
+import {
+  testNeedsRepository,
+  materialiseRepoWorkspace,
+  repoUnavailableMessage,
+  type MaterialisedWorkspace,
+} from '../repo-materialise.js';
+/*
+ * Imported by path rather than from '@qaai/runner': these live in the runner
+ * package but not on its `index.ts` barrel, which this change does not own.
+ * The worker already reaches into a sibling workspace the same way — see the
+ * GitHub App import in processors/checks.ts.
+ */
+import {
+  attachAuthProfile,
+  attachRunWorkspace,
+} from '../../../../packages/runner/src/run-workspace.js';
 import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS, RUN_SHARD_TERMINAL } from '@qaai/shared';
 import type { GridIntegrationKind, RunShardRef } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
@@ -29,6 +56,7 @@ import { open as openSecret } from '../vault.js';
 import type {
   ExecutableTest,
   GateRule,
+  MutationRunData,
   RunContext,
   ShardedRunJob,
   TestExecution,
@@ -48,6 +76,25 @@ const RETENTION_DAYS: Record<string, number> = {
   BUSINESS: 90,
   ENTERPRISE: 365,
 };
+
+/**
+ * How many quarantined tests the rot alarm names.
+ *
+ * The COUNT behind the budget is exact (a `count`, not a length); this bounds
+ * only the list of names the warning can print. A suite with 4,000 quarantined
+ * tests has a budget problem the first 200 names describe perfectly well, and
+ * nothing that runs inside run finalisation gets to be unbounded.
+ */
+const QUARANTINE_NAMES_SCANNED = 200;
+
+/**
+ * How many recent results one flake-rate measurement is computed over.
+ *
+ * Was a bare `50` inside `updateFlakeStats`. Named because it is now the
+ * DENOMINATOR a stored trend point carries (`TestFlakeHistory.sampleSize`), and
+ * a trend whose window silently changed between two points is not a trend.
+ */
+const FLAKE_WINDOW = 50;
 
 /** How often a running shard stamps `heartbeatAt`. */
 const SHARD_HEARTBEAT_MS = 30_000;
@@ -96,12 +143,16 @@ const STALE_SHARD_MS = 5 * 60_000;
  */
 const STALE_QUEUED_SHARD_MS = 2 * 60 * 60_000;
 
-interface RunCounts {
-  passed: number;
-  failed: number;
-  flaky: number;
-  skipped: number;
-}
+/**
+ * The run's tallies. Owned by `@qaai/runner` rather than declared here, because
+ * this file declaring its own four-field shape is how `counts.failed` came to
+ * mean something different from what the gate meant by a failure.
+ *
+ * `quarantinedFailed` is the fourth category: a failure a quarantine in force
+ * suppressed. It is counted and reported, and it never reaches `failed`, so it
+ * can never reach the run's status, the CLI's exit code or the GitHub check.
+ */
+type RunCounts = RunCountsWithQuarantine;
 
 export async function processRun(job: ShardedRunJob): Promise<void> {
   const { orgId, runId } = job;
@@ -133,7 +184,20 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     where: { id: runId, orgId },
     include: {
       environment: { select: { id: true, baseUrl: true } },
-      project: { select: { id: true, gateRules: true } },
+      project: {
+        select: {
+          id: true,
+          gateRules: true,
+          // The cap on how much of this suite may stop gating. Read with the
+          // gate rules because it IS one: see evaluateQuarantineHealth.
+          quarantineBudgetPercent: true,
+          // The connected repository: what a repo-dependent test executes
+          // inside. See repo-materialise.ts.
+          repoFullName: true,
+          repoInstallationId: true,
+          defaultBranch: true,
+        },
+      },
       // A shard executes only its own slice. An unsharded job passes no filter
       // and gets every result, which is the whole suite.
       results: { where: shard ? { shardIndex: shard.index } : {}, include: { test: true } },
@@ -176,7 +240,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
   if (shard && !(await claimShard(orgId, run.id, shard))) return;
 
   const controller = new AbortController();
-  const counts: RunCounts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
+  const counts: RunCounts = emptyRunCounts();
   let runErrored: string | null = null;
   let cancelled = false;
   /*
@@ -191,6 +255,16 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
    * broken test does and the run finalises ERRORED with the reason on it.
    */
   let heartbeat: ReturnType<typeof setInterval> | null = null;
+  /*
+   * The run's checkout of the customer's repository, and the reason there is
+   * none. Declared out here for the same reason the heartbeat is: the `finally`
+   * must be able to delete the workspace on EVERY exit — a clean finish, a
+   * cancel that breaks out of the loop, and a throw from anywhere in setup or
+   * the suite. A tree left behind on a shared worker is both a disk leak and
+   * one tenant's source code sitting on disk after their run ended.
+   */
+  let repoWorkspace: MaterialisedWorkspace | null = null;
+  let repoGap: string | null = null;
 
   try {
     const org = await prisma.organization.findUniqueOrThrow({
@@ -282,16 +356,152 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       }
     }
 
+    /*
+     * ── The run's DEFAULT identity ───────────────────────────────────────────
+     *
+     * The first auth profile on the environment, exactly as before, and it
+     * still does NOT log in: a test that named no profile claimed no role, so
+     * running it with whatever cached session exists (or none) is honest, and
+     * driving a browser login at the start of every run would be a new cost
+     * every existing run pays. Its id is read now as well as its state, so a
+     * test that explicitly names the default profile is satisfied BY the
+     * default rather than logging in a second time for the same identity.
+     */
     const authProfile = await prisma.authProfile.findFirst({
       where: { orgId, environmentId: run.environment.id },
       orderBy: { createdAt: 'asc' },
-      select: { storageState: true, storageStateExpiresAt: true },
+      select: { id: true, storageState: true, storageStateExpiresAt: true },
     });
-    const storageState =
+    const defaultSession =
       authProfile?.storageState &&
       (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
-        ? authProfile.storageState
+        ? authProfile
         : null;
+    const storageState = defaultSession?.storageState ?? null;
+    const defaultProfileId = defaultSession?.id ?? null;
+
+    /*
+     * ── One session per PROFILE per run ──────────────────────────────────────
+     *
+     * A test can name its own `authProfileId`, so a suite holds an admin test
+     * and a member test and both have to be right. The cache is keyed by
+     * profile id, which gives exactly the two properties that matter: two tests
+     * on the same profile share one session (one login, not one per test), and
+     * two tests on different profiles can never share one.
+     *
+     * FAILURES are cached too, and that is the important half. Thirty tests
+     * behind a profile whose password was rotated must cost ONE browser launch
+     * and thirty identical, instant, honest failures — not thirty logins, each
+     * taking a browser and thirty seconds, against an app that is going to
+     * refuse all of them.
+     */
+    type ResolvedSession = { ok: true; storageState: unknown } | { ok: false; why: string };
+    const sessions = new Map<string, ResolvedSession>();
+    if (defaultProfileId) sessions.set(defaultProfileId, { ok: true, storageState });
+
+    const resolveSession = async (profileId: string): Promise<ResolvedSession> => {
+      const cached = sessions.get(profileId);
+      if (cached) return cached;
+
+      const resolved = await (async (): Promise<ResolvedSession> => {
+        const profile = await prisma.authProfile.findFirst({
+          // Scoped on the org, because a test row's profile id is data: an id
+          // from another tenant must resolve to nothing rather than to their
+          // session.
+          where: { id: profileId, orgId },
+          select: {
+            id: true,
+            name: true,
+            kind: true,
+            config: true,
+            environmentId: true,
+            storageState: true,
+            storageStateExpiresAt: true,
+          },
+        });
+        if (!profile) {
+          return {
+            ok: false,
+            why: `This test runs as auth profile ${profileId}, which no longer exists in this organisation.`,
+          };
+        }
+        if (profile.environmentId !== run.environment.id) {
+          /*
+           * A profile belongs to ONE environment, and its session is cookies
+           * for that environment's host. Using a staging profile against
+           * production would send staging's cookies to production, get a login
+           * redirect, and report whatever the test asserted about the login
+           * page. Refusing is the only honest answer.
+           */
+          return {
+            ok: false,
+            why: `Auth profile "${profile.name}" belongs to a different environment, so it cannot be used for this run.`,
+          };
+        }
+
+        const fresh =
+          profile.storageState &&
+          (!profile.storageStateExpiresAt || profile.storageStateExpiresAt > new Date());
+        if (fresh) return { ok: true, storageState: profile.storageState };
+
+        // No usable session: sign in now. This is the step that never existed —
+        // a run could only ever use a session somebody had captured by hand.
+        let result;
+        try {
+          result = await signInWithProfile(
+            { id: profile.id, name: profile.name, kind: profile.kind, config: profile.config },
+            secrets,
+            baseUrl,
+          );
+        } catch (err) {
+          return {
+            ok: false,
+            why: `Signing in as "${profile.name}" threw: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          };
+        }
+
+        if (!result.ok) {
+          return {
+            ok: false,
+            why: `Could not sign in as auth profile "${profile.name}": ${result.message}`,
+          };
+        }
+        if (!result.storageState) {
+          /*
+           * `ok` with no session is a real case: an SSO bypass TOKEN is a
+           * request header, not a browser session, so there is nothing to hand
+           * a spec. Treating it as success would run a role test logged out and
+           * most assertions would pass, so it is a refusal with the reason.
+           */
+          return {
+            ok: false,
+            why:
+              `Auth profile "${profile.name}" is a ${profile.kind}, which produces a request header ` +
+              'rather than a browser session, so a test cannot be run as that role yet.',
+          };
+        }
+
+        // Persisted so the next run — and the crawler — reuse it instead of
+        // logging in again. A write failure costs a re-login, never the run.
+        await prisma.authProfile
+          .update({
+            where: { id: profile.id },
+            data: {
+              storageState: result.storageState,
+              storageStateExpiresAt: result.expiresAt,
+            },
+          })
+          .catch((err) => logger.warn({ err, profileId }, 'could not cache the captured session'));
+
+        logger.info({ runId: run.id, profileId }, 'signed in for this run');
+        return { ok: true, storageState: result.storageState };
+      })();
+
+      sessions.set(profileId, resolved);
+      return resolved;
+    };
 
     if (shard) {
       /*
@@ -418,6 +628,70 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       });
     }
 
+    /*
+     * ── The customer's repository, once per run ──────────────────────────────
+     *
+     * Only when the suite actually contains a test that needs it: an E2E-only
+     * run must not pay for a download it will never read, and a project with no
+     * connected repository must not be told about it on every run.
+     *
+     * The materialiser never throws for an expected condition — see its header
+     * — so a project with no repo, an unconfigured GitHub App, a 404 or a
+     * hostile archive all come back as a reason, which every repo-dependent
+     * test in the loop then carries as its own SKIPPED message.
+     */
+    /*
+     * Per test, spec included — not a set of three types.
+     *
+     * Reading `REPO_DEPENDENT_TEST_TYPES` alone meant a suite made entirely of
+     * CONTRACT, PROTOCOL, MOBILE or declared-command E2E tests materialised
+     * nothing and then honestly skipped every test in it: safe, and useless.
+     * Those four need a checkout only sometimes — a pact broker URL does not, a
+     * pact path does — which is a question only the spec can answer.
+     */
+    const needsRepo = run.results.some((row) => testNeedsRepository(row.test));
+    if (needsRepo) {
+      const outcome = await materialiseRepoWorkspace({
+        runId: run.id,
+        repo: {
+          repoFullName: run.project.repoFullName,
+          repoInstallationId: run.project.repoInstallationId,
+          defaultBranch: run.project.defaultBranch,
+          // A CI run is about ONE commit, and that is the tree its verdict has
+          // to describe. Without one, the project's default branch is the only
+          // defensible answer.
+          commitSha: run.commitSha,
+        },
+        unseal: openSecret,
+        signal: controller.signal,
+      });
+
+      if (outcome.kind === 'ready') {
+        repoWorkspace = outcome;
+        logger.info(
+          {
+            runId: run.id,
+            source: outcome.workspace.source,
+            files: outcome.workspace.fileCount,
+            bytes: outcome.bytes,
+            skippedLinks: outcome.skippedLinks,
+          },
+          'materialised the project repository for this run',
+        );
+        if (outcome.skippedLinks > 0) {
+          // Not fatal, but a build that needed a symlink will fail oddly and
+          // this is the breadcrumb for it.
+          logger.warn(
+            { runId: run.id, skippedLinks: outcome.skippedLinks },
+            'repository contained link entries, which were not created',
+          );
+        }
+      } else {
+        repoGap = outcome.why;
+        logger.warn({ runId: run.id, why: outcome.why }, 'no repository workspace for this run');
+      }
+    }
+
     for (const [index, result] of run.results.entries()) {
       const test = result.test;
 
@@ -512,7 +786,18 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         timeoutMs: test.timeoutMs,
         quarantined: test.quarantined,
         tags: test.tags,
+        /*
+         * The role this test executes as, and whether it is meaningless
+         * without one. Carried to the plugin rather than resolved there: the
+         * runner has no database, and the harness needs the INTENT to be able
+         * to refuse a test whose binding was deleted instead of running it
+         * signed out. See packages/runner/src/run-workspace.ts.
+         */
+        authProfileId: test.authProfileId,
+        authProfileRequired: test.authProfileRequired ?? false,
       };
+
+      const declaredProfileId = test.authProfileId ?? null;
 
       const uploaded: Array<{ key: string; contentType: string }> = [];
 
@@ -526,6 +811,54 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
               select: { imageKey: true, ignoreRegions: true },
             })
           : null;
+
+      /*
+       * ── The two reasons this test cannot be executed ───────────────────────
+       *
+       * No checkout to run in, and no session to run as. Both are resolved
+       * BEFORE the context is built, because both decide what goes into it, and
+       * both are the same rule in different clothes: a test QAAI cannot run is
+       * reported as not having run. Never as a pass.
+       */
+      const repoMissing =
+        testNeedsRepository(test) && !repoWorkspace
+          ? repoUnavailableMessage(
+              test.type,
+              repoGap ?? 'No repository workspace was prepared for this run.',
+            )
+          : null;
+
+      /*
+       * The session this test runs under. A test that named a profile gets THAT
+       * profile's session or no execution at all; a test that named none gets
+       * the run default, exactly as before.
+       */
+      let session: ResolvedSession;
+      if (repoMissing) {
+        // Nothing is going to execute, so there is nothing to log into an
+        // application for.
+        session = { ok: true, storageState: null };
+      } else if (declaredProfileId) {
+        session = await resolveSession(declaredProfileId);
+      } else if (test.authProfileRequired && !storageState) {
+        /*
+         * A BROKEN BINDING: the test says it is meaningless signed out, and it
+         * has no profile to be signed in as because the profile was deleted out
+         * from under it (`onDelete: SetNull` nulls the binding and deliberately
+         * leaves the intent behind). Falling through to the run default — which
+         * here is nothing at all — would run it anonymously, and an anonymous
+         * browser on a page behind a login passes most assertions.
+         */
+        session = {
+          ok: false,
+          why:
+            'This test is marked as requiring a signed-in role, and the auth profile it was ' +
+            'bound to no longer exists — so it was not run rather than run signed out. ' +
+            'Re-bind it to a profile in the test editor.',
+        };
+      } else {
+        session = { ok: true, storageState };
+      }
 
       const context: RunContext = {
         runId: run.id,
@@ -547,7 +880,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
               }>,
             }
           : null,
-        storageState,
+        storageState: session.ok ? session.storageState : null,
         signal: controller.signal,
         determinism: {
           freezeClockAt: null,
@@ -598,26 +931,54 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         },
       };
 
+      /*
+       * The two channels `RunContext` does not carry yet — the materialised
+       * repository and whose session is in `storageState`. Both are set through
+       * the runner's own accessors so the field names exist in exactly one
+       * place. See packages/runner/src/run-workspace.ts.
+       *
+       * The profile id is attached only when a session was actually resolved: a
+       * context that claims an identity it does not hold is worse than one that
+       * claims none, and it is what the harness's refusal keys on.
+       */
+      attachRunWorkspace(context, repoWorkspace?.workspace ?? null);
+      attachAuthProfile(context, session.ok ? (declaredProfileId ?? defaultProfileId) : null);
+
       let execution: TestExecution;
-      try {
-        plugin.validate(executable);
-        execution = await plugin.execute(context, executable);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error({ err, testId: test.id }, 'plugin threw');
-        execution = {
-          testId: test.id,
-          status: 'FAILED',
-          durationMs: 0,
-          steps: [],
-          network: [],
-          console: [],
-          videoKey: null,
-          traceKey: null,
-          errorMessage: message,
-          retriedAndPassed: false,
-          findings: [],
-        };
+      if (repoMissing) {
+        /*
+         * No checkout: INTEGRATION, UNIT_GEN and MUTATION all run a command
+         * inside the customer's repository, and there is not one. This
+         * is the same answer the run already gives for a missing plugin —
+         * SKIPPED with the reason — because it is the same kind of fact.
+         */
+        execution = syntheticExecution(test.id, 'SKIPPED', repoMissing);
+        logger.warn(
+          { testId: test.id, type: test.type, runId: run.id },
+          'repo-dependent test not evaluated: no repository workspace',
+        );
+      } else if (!session.ok) {
+        /*
+         * FAILED, not SKIPPED, and the distinction is the whole point: a skip
+         * does not block a gate, so a suite whose permission tests quietly
+         * stopped running would keep merging green. The test asked to run as a
+         * role, the role could not be produced, and nothing was executed
+         * anonymously in its place.
+         */
+        execution = syntheticExecution(test.id, 'FAILED', session.why);
+        logger.warn(
+          { testId: test.id, profileId: declaredProfileId, runId: run.id },
+          'test not executed: its auth profile could not be signed in',
+        );
+      } else {
+        try {
+          plugin.validate(executable);
+          execution = await plugin.execute(context, executable);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error({ err, testId: test.id }, 'plugin threw');
+          execution = syntheticExecution(test.id, 'FAILED', message);
+        }
       }
 
       // A first-run visual capture becomes the approved baseline. Recorded here
@@ -656,21 +1017,28 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         expiresAt,
       });
 
-      switch (execution.status) {
-        case 'PASSED':
-          counts.passed += 1;
-          break;
-        case 'FLAKY':
-          counts.flaky += 1;
-          break;
-        case 'SKIPPED':
-          counts.skipped += 1;
-          break;
-        default:
-          counts.failed += 1;
-      }
+      /*
+       * The one line the original defect was missing. A quarantined test's
+       * failure lands in `quarantinedFailed`, never in `failed`, so it cannot
+       * turn the run red through the counters — which is how it used to reach
+       * the CLI's exit code and the GitHub check despite the gate ignoring it.
+       *
+       * `quarantineSuppresses` rather than `test.quarantined`: a quarantine
+       * past its expiry gates again.
+       */
+      tallyResult(counts, {
+        status: execution.status,
+        quarantineInForce: quarantineSuppresses(test, new Date()),
+      });
 
-      await updateFlakeStats(test.id, execution.status);
+      await updateFlakeStats({
+        orgId,
+        projectId: run.projectId,
+        runId: run.id,
+        testId: test.id,
+        status: execution.status,
+        quarantined: test.quarantined,
+      });
 
       publishEvent(orgId, {
         runId: run.id,
@@ -700,6 +1068,16 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     logger.error({ err, runId: run.id, shard: shard?.index }, 'run aborted');
   } finally {
     if (heartbeat) clearInterval(heartbeat);
+    /*
+     * The workspace goes away on every exit: a clean finish, a cancel that
+     * broke out of the loop, and a throw from anywhere above. A tenant's source
+     * tree must not outlive the run that needed it, and a worker that leaks one
+     * temp tree per run fills its disk in a day.
+     */
+    if (repoWorkspace) {
+      await repoWorkspace.cleanup();
+      logger.debug({ runId: run.id }, 'removed the run workspace');
+    }
   }
 
   if (shard) {
@@ -718,6 +1096,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         failedCount: counts.failed,
         flakyCount: counts.flaky,
         skippedCount: counts.skipped,
+        quarantinedFailedCount: counts.quarantinedFailed,
         errorMessage: runErrored,
       },
     });
@@ -733,9 +1112,11 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       orgId,
       run: {
         id: run.id,
+        projectId: run.projectId,
         trigger: run.trigger,
         prNumber: run.prNumber,
         gateRules: run.project.gateRules,
+        quarantineBudgetPercent: run.project.quarantineBudgetPercent,
       },
       shardIndex: shard.index,
     });
@@ -746,9 +1127,11 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     orgId,
     run: {
       id: run.id,
+      projectId: run.projectId,
       trigger: run.trigger,
       prNumber: run.prNumber,
       gateRules: run.project.gateRules,
+      quarantineBudgetPercent: run.project.quarantineBudgetPercent,
     },
     /*
      * A cancelled run stopped part-way, so the in-memory counters describe the
@@ -762,6 +1145,41 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     errorMessage: runErrored,
     forcedStatus: cancelled ? 'CANCELLED' : runErrored ? 'ERRORED' : null,
   });
+}
+
+/**
+ * A result the worker produced itself, without a plugin running anything.
+ *
+ * Two conditions reach for it, and the STATUS is the difference between them:
+ * SKIPPED for "QAAI could not run this" (no repository checked out — the same
+ * answer `reasonUnsupported` gives for a missing plugin), FAILED for "this test
+ * asked for something that could not be produced" (a role whose profile would
+ * not sign in). A skip does not block a gate and a failure does, which is
+ * exactly the right way round: an environment gap is not the application's
+ * fault, and a permission test that silently stopped running is not a pass.
+ *
+ * `durationMs` is zero because nothing was executed. Reporting an invented
+ * duration here would put the test on the slowest-test list for work that never
+ * happened.
+ */
+function syntheticExecution(
+  testId: string,
+  status: 'SKIPPED' | 'FAILED',
+  errorMessage: string,
+): TestExecution {
+  return {
+    testId,
+    status,
+    durationMs: 0,
+    steps: [],
+    network: [],
+    console: [],
+    videoKey: null,
+    traceKey: null,
+    errorMessage,
+    retriedAndPassed: false,
+    findings: [],
+  };
 }
 
 /**
@@ -820,9 +1238,10 @@ export async function failRunFromDeadJob(args: {
     where: { id: runId, orgId },
     select: {
       id: true,
+      projectId: true,
       trigger: true,
       prNumber: true,
-      project: { select: { gateRules: true } },
+      project: { select: { gateRules: true, quarantineBudgetPercent: true } },
     },
   });
   if (!run) return false;
@@ -841,9 +1260,11 @@ export async function failRunFromDeadJob(args: {
     orgId,
     run: {
       id: run.id,
+      projectId: run.projectId,
       trigger: run.trigger,
       prNumber: run.prNumber,
       gateRules: run.project.gateRules,
+      quarantineBudgetPercent: run.project.quarantineBudgetPercent,
     },
     counts,
     errorMessage,
@@ -859,7 +1280,15 @@ export async function failRunFromDeadJob(args: {
  */
 async function finalizeRun(args: {
   orgId: string;
-  run: { id: string; trigger: string; prNumber: number | null; gateRules: unknown };
+  run: {
+    id: string;
+    projectId: string;
+    trigger: string;
+    prNumber: number | null;
+    gateRules: unknown;
+    /** Null means "never configured"; the gate falls back to the documented default. */
+    quarantineBudgetPercent?: number | null;
+  };
   counts: RunCounts;
   errorMessage: string | null;
   /** Overrides the pass/fail verdict: the run was cancelled, or a shard died. */
@@ -867,10 +1296,27 @@ async function finalizeRun(args: {
 }): Promise<void> {
   const { orgId, run, counts, errorMessage, forcedStatus } = args;
 
-  const gateResult = await evaluateRunGates(orgId, run.id, run.gateRules);
+  const gateResult = await evaluateRunGates(
+    orgId,
+    run.id,
+    run.projectId,
+    run.gateRules,
+    run.quarantineBudgetPercent,
+  );
 
-  const status =
-    forcedStatus ?? (counts.failed > 0 || !gateResult.passed ? 'FAILED' : ('PASSED' as const));
+  /*
+   * The verdict is NOT computed here any more.
+   *
+   * It was `counts.failed > 0 || !gateResult.passed`, and four other places in
+   * the product wrote their own version of the same expression off a different
+   * field — the CLI's exit code, the GitHub check's conclusion, the JUnit
+   * XML's `failures` attribute, the on-prem finaliser. Fixing quarantine in one
+   * of them was invisible to the other four, which is exactly how quarantine
+   * came to suppress the signal without stopping the gate. `runOutcome` is the
+   * only function allowed to answer the question; see packages/runner/gates.ts.
+   */
+  const outcome = runOutcome({ counts, gatePassed: gateResult.passed, forcedStatus });
+  const status = outcome.status;
 
   /*
    * A cancel that lands while setup is in flight must still win.
@@ -889,9 +1335,7 @@ async function finalizeRun(args: {
    */
   const wrote = await prisma.run.updateMany({
     where:
-      status === 'CANCELLED'
-        ? { id: run.id }
-        : { id: run.id, status: { notIn: ['CANCELLED'] } },
+      status === 'CANCELLED' ? { id: run.id } : { id: run.id, status: { notIn: ['CANCELLED'] } },
     data: {
       status,
       finishedAt: new Date(),
@@ -899,6 +1343,7 @@ async function finalizeRun(args: {
       failedCount: counts.failed,
       flakyCount: counts.flaky,
       skippedCount: counts.skipped,
+      quarantinedFailedCount: counts.quarantinedFailed,
       gateResult: gateResult as unknown as object,
       errorMessage,
     },
@@ -942,11 +1387,31 @@ async function finalizeRun(args: {
   publishEvent(orgId, {
     runId: run.id,
     type: 'run.finished',
-    data: { status, ...counts, gatePassed: gateResult.passed },
+    data: {
+      status,
+      ...counts,
+      gatePassed: gateResult.passed,
+      /*
+       * Carried on the frame rather than left to the cockpit to re-derive. A
+       * run that passed with suppressed failures must be able to SAY so live,
+       * not only once somebody opens the run page.
+       *
+       * NESTED under `verdict`, and that is not tidiness: `...counts` already
+       * spreads a `passed` key holding the number of PASSING TESTS, and a
+       * top-level `passed: boolean` beside it silently replaced that count with
+       * `false` on every cancelled run. Caught by the cockpit's own test, which
+       * is the reason it has one.
+       */
+      verdict: {
+        passed: outcome.passed,
+        suppressedFailures: outcome.suppressedFailures,
+        reason: outcome.reason,
+      },
+    },
     at: new Date().toISOString(),
   });
 
-  logger.info({ runId: run.id, status, ...counts }, 'run finished');
+  logger.info({ runId: run.id, status, ...counts, reason: outcome.reason }, 'run finished');
 }
 
 /**
@@ -1113,7 +1578,14 @@ async function reapDeadShards(
  */
 async function completeShardedRun(args: {
   orgId: string;
-  run: { id: string; trigger: string; prNumber: number | null; gateRules: unknown };
+  run: {
+    id: string;
+    projectId: string;
+    trigger: string;
+    prNumber: number | null;
+    gateRules: unknown;
+    quarantineBudgetPercent?: number | null;
+  };
   /** The shard that finished, or null when the scheduler sweep is asking. */
   shardIndex: number | null;
 }): Promise<void> {
@@ -1275,9 +1747,10 @@ export async function sweepStalledShardedRuns(): Promise<number> {
     select: {
       id: true,
       orgId: true,
+      projectId: true,
       trigger: true,
       prNumber: true,
-      project: { select: { gateRules: true } },
+      project: { select: { gateRules: true, quarantineBudgetPercent: true } },
     },
     // Oldest first. With the cap below, a pool holding more than 100 live
     // sharded runs would otherwise leave the same unlucky run unswept tick
@@ -1300,9 +1773,11 @@ export async function sweepStalledShardedRuns(): Promise<number> {
         orgId: run.orgId,
         run: {
           id: run.id,
+          projectId: run.projectId,
           trigger: run.trigger,
           prNumber: run.prNumber,
           gateRules: run.project.gateRules,
+          quarantineBudgetPercent: run.project.quarantineBudgetPercent,
         },
         shardIndex: null,
       });
@@ -1335,24 +1810,128 @@ export async function sweepStalledShardedRuns(): Promise<number> {
  * scores, so counting them is counting the thing itself rather than a report
  * of it. Tests that never ran are still at their placeholder SKIPPED and are
  * counted as skipped, which is exactly what happened to them.
+ *
+ * ── Why this is no longer a `groupBy` ───────────────────────────────────────
+ *
+ * It was `groupBy({ by: ['status'] })`, and that is a large part of why the
+ * quarantine defect survived: Prisma cannot group by a RELATION's column, so
+ * this function was structurally incapable of seeing `Test.quarantined`. A
+ * quarantined failure therefore landed in `counts.failed` on every sharded run,
+ * every dead-job rescue and every cancel, and from there in the run's status.
+ *
+ * So it reads the rows and the quarantine state with them. That is the same
+ * read `evaluateRunGates` already made a line later, which is why the two are
+ * one query now (`readRunResults`) instead of two — the recount is cheaper than
+ * the pair it replaces, not more expensive.
  */
 async function aggregateCounts(orgId: string, runId: string): Promise<RunCounts> {
-  const grouped = await prisma.testResult.groupBy({
-    by: ['status'],
-    where: { orgId, runId },
-    _count: { _all: true },
-  });
+  return tallyRows(await readRunResults(orgId, runId));
+}
 
-  const counts: RunCounts = { passed: 0, failed: 0, flaky: 0, skipped: 0 };
-  for (const row of grouped) {
-    const n = row._count._all;
-    if (row.status === 'PASSED') counts.passed += n;
-    else if (row.status === 'FLAKY') counts.flaky += n;
-    else if (row.status === 'SKIPPED') counts.skipped += n;
-    // FAILED and TIMED_OUT both mean the test did not pass.
-    else counts.failed += n;
+/** The shape every verdict in this file is computed from. One read, two uses. */
+type RunResultRow = Awaited<ReturnType<typeof readRunResults>>[number];
+
+async function readRunResults(orgId: string, runId: string) {
+  return prisma.testResult.findMany({
+    where: { runId, orgId },
+    select: {
+      testId: true,
+      status: true,
+      retriedAndPassed: true,
+      durationMs: true,
+      test: {
+        select: {
+          name: true,
+          priority: true,
+          quarantined: true,
+          // The expiry, because an expired quarantine GATES AGAIN. Reading
+          // `quarantined` alone would keep honouring a suppression that ran
+          // out two weeks ago.
+          quarantineExpiresAt: true,
+        },
+      },
+      verdict: { select: { verdict: true, overriddenTo: true, reviewState: true } },
+    },
+  });
+}
+
+function tallyRows(rows: readonly RunResultRow[], now: Date = new Date()): RunCounts {
+  const counts = emptyRunCounts();
+  for (const row of rows) {
+    tallyResult(counts, {
+      status: row.status,
+      quarantineInForce: quarantineSuppresses(row.test, now),
+    });
   }
   return counts;
+}
+
+/**
+ * How many surviving mutants one result may store.
+ *
+ * 500, which is the ceiling `mutationTestSpecSchema.maxSurvivorsReported`
+ * allows a spec to ask for — so the stored detail can never be narrower than
+ * what a customer is able to request on screen. The cap exists because a
+ * whole-module mutation run can report thousands of survivors and one
+ * `createMany` inside the result transaction is not the place to find that out.
+ *
+ * It truncates the LIST and never the ARITHMETIC: `mutationUndetected` on the
+ * result row is the tool's own exact count, written from the same record, so a
+ * capped result still reports how many survived and the rows are honestly the
+ * first N of them. A cap that also reduced the count would be a schema decision
+ * quietly improving a customer's mutation score.
+ */
+export const MAX_PERSISTED_SURVIVORS = 500;
+
+/**
+ * The five mutation columns for one execution — ALL of them, on every write.
+ *
+ * ── The defect this function exists to prevent ─────────────────────────────
+ *
+ * `mutationScore` NULL means "mutation testing did not run here".
+ * `mutationScore` 0 means "every single mutant survived", which is the worst
+ * result a suite can produce. Writing 0 for the first case inverts the signal
+ * completely: a project that has never measured its suite would be
+ * indistinguishable from one whose tests assert nothing, and the number exists
+ * precisely to tell those two apart.
+ *
+ * So this returns an explicit `null` for every column when there is no mutation
+ * data, rather than omitting the keys. That is not cosmetic — Prisma reads an
+ * ABSENT key as "leave the column alone", so omitting them would leave a
+ * re-run's stale score sitting on a result whose plugin reported nothing this
+ * time. Present-and-null is the only spelling that means "not measured", and
+ * being the single place all five columns are computed is what keeps a future
+ * caller from writing four of them.
+ *
+ * `score` is passed through as-is, null included: a run that produced no VALID
+ * mutant has no denominator, and its counts are still facts worth keeping
+ * (`excluded: 12, score: null` says "twelve mutants, none of them buildable").
+ * That is a third state, distinct from both "not measured" and 0, and the
+ * nullability of the score column is what expresses it.
+ */
+export function mutationColumns(data: MutationRunData | null | undefined): {
+  mutationScore: number | null;
+  mutationDetected: number | null;
+  mutationUndetected: number | null;
+  mutationExcluded: number | null;
+  mutationMinScore: number | null;
+} {
+  if (data === null || data === undefined) {
+    return {
+      mutationScore: null,
+      mutationDetected: null,
+      mutationUndetected: null,
+      mutationExcluded: null,
+      mutationMinScore: null,
+    };
+  }
+  return {
+    mutationScore: data.score,
+    mutationDetected: data.detected,
+    mutationUndetected: data.undetected,
+    mutationExcluded: data.excluded,
+    mutationMinScore: data.minScore,
+  };
 }
 
 async function persistExecution(args: {
@@ -1377,6 +1956,13 @@ async function persistExecution(args: {
         consoleLog: execution.console as unknown as object,
         videoKey: execution.videoKey,
         traceKey: execution.traceKey,
+        /*
+         * The mutation metric channel. Every column every time, explicitly null
+         * when nothing measured — see `mutationColumns`, which is also why this
+         * is a spread of a named function rather than five inline fields: the
+         * null-versus-zero rule has one implementation and one place to read it.
+         */
+        ...mutationColumns(execution.mutation),
       },
     });
 
@@ -1418,6 +2004,36 @@ async function persistExecution(args: {
       });
     }
 
+    /*
+     * Surviving mutants — the actionable half of a mutation run, and the reason
+     * the score is worth storing at all: "`>` became `>=` at src/cart.ts:42 and
+     * every test still passed" names one missing assertion.
+     *
+     * Deleted-then-created like the steps and findings above, for the same
+     * reason: a retried run job must not double up the rows. The delete runs
+     * even when there is no mutation data, which is the half that matters —
+     * without it, a result whose MUTATION test was later changed to report
+     * nothing would keep serving the previous run's survivors next to a NULL
+     * score, and the detail would outlive the number it belongs to.
+     */
+    await tx.mutationSurvivor.deleteMany({ where: { testResultId } });
+    const survivors = execution.mutation?.survivors ?? [];
+    if (survivors.length > 0) {
+      await tx.mutationSurvivor.createMany({
+        data: survivors.slice(0, MAX_PERSISTED_SURVIVORS).map((mutant) => ({
+          orgId,
+          testResultId,
+          file: mutant.file.slice(0, 1000),
+          // Null, never 0: line 0 does not exist, and a zero would send a
+          // reader to the top of the file with confidence.
+          line: mutant.line,
+          mutator: mutant.mutator.slice(0, 200),
+          detail: mutant.detail?.slice(0, 2000) ?? null,
+          reason: mutant.reason,
+        })),
+      });
+    }
+
     for (const artifact of uploaded) {
       await tx.artifact.upsert({
         where: { key: artifact.key },
@@ -1445,11 +2061,20 @@ async function persistExecution(args: {
  * the flag in would have counted it twice. The parameter is gone rather than
  * underscore-prefixed so nobody re-plumbs it on the assumption it was needed.
  */
-async function updateFlakeStats(testId: string, status: TestResultStatus): Promise<void> {
+async function updateFlakeStats(args: {
+  orgId: string;
+  projectId: string;
+  runId: string;
+  testId: string;
+  status: TestResultStatus;
+  /** The raw column, recorded alongside the rate so a flat 0% is readable. */
+  quarantined: boolean;
+}): Promise<void> {
+  const { orgId, projectId, runId, testId, status } = args;
   const recent = await prisma.testResult.findMany({
     where: { testId },
     orderBy: { createdAt: 'desc' },
-    take: 50,
+    take: FLAKE_WINDOW,
     select: { status: true, retriedAndPassed: true },
   });
 
@@ -1491,21 +2116,132 @@ async function updateFlakeStats(testId: string, status: TestResultStatus): Promi
     where: { id: testId },
     data: { flakeRate, lastRunAt: new Date(), consecutiveFailures },
   });
+
+  /*
+   * ── And the history, which is the second half of the defect ───────────────
+   *
+   * The line above OVERWRITES `Test.flakeRate`, and until now that was the
+   * only record there was. So rot had no direction: a test that had been
+   * degrading for three weeks looked identical to one that flaked this
+   * morning, the suite-health score was recomputed per request from whatever
+   * happened to be current, and "is this getting worse?" had no answer in the
+   * database at all.
+   *
+   * Fire-and-forget, and last. A trend row that cannot be written must never
+   * fail the run that produced it — the run's own verdict is the product, the
+   * history is the instrument.
+   */
+  await recordFlakeHistory({
+    orgId,
+    projectId,
+    runId,
+    testId,
+    ratePercent: flakeRate,
+    sampleSize: recent.length,
+    failures: flaky,
+    quarantined: args.quarantined,
+  }).catch((err) =>
+    logger.warn({ err, testId }, 'could not record the flake history point for this test'),
+  );
 }
 
-async function evaluateRunGates(orgId: string, runId: string, rawRules: unknown) {
+/**
+ * Append one point to a test's flake trend, collapsed to its UTC day.
+ *
+ * ── The retention rule, and what it loses ───────────────────────────────────
+ *
+ * One row per test per UTC day. The `(testId, day)` unique constraint IS the
+ * aggregation — an upsert either creates the day or folds into it — so a
+ * 5,000-test suite running hourly writes 120,000 measurements a day and stores
+ * 5,000 rows. Without that, the same suite would add 43 million rows a year to
+ * a table the suite tree sorts on.
+ *
+ * The day keeps its LAST rate (where it ended up) and its PEAK (so collapsing a
+ * day cannot hide a spike), with the run that produced the peak. What is lost:
+ * the shape of the day between those two numbers, the other runs' ids, and
+ * everything past the retention window. A day with no runs has NO ROW, and a
+ * reader must treat absence as "not measured" rather than filling it with zero
+ * — a gap filled with 0% invents a recovery that never happened.
+ *
+ * Pruning is NOT done here. A delete on every test of every run is thousands of
+ * pointless statements an hour; the flake sweep does it once per tick, bounded
+ * — see `pruneFlakeHistory` in processors/flake.ts.
+ */
+export async function recordFlakeHistory(point: {
+  orgId: string;
+  projectId: string;
+  runId: string | null;
+  testId: string;
+  ratePercent: number;
+  sampleSize: number;
+  failures: number;
+  quarantined: boolean;
+  at?: Date;
+}): Promise<void> {
+  const at = point.at ?? new Date();
+  const day = utcDay(at);
+
+  const existing = await prisma.testFlakeHistory.findUnique({
+    where: { testId_day: { testId: point.testId, day } },
+    select: { peakRatePercent: true, samples: true },
+  });
+
+  /*
+   * The peak is a MAX across the day, so a read-then-write race between two
+   * workers finishing the same test in the same minute can only ever lose a
+   * peak, never invent one. That is the right direction for a trend line: a
+   * lost peak understates the rot by one reading, while a lost `ratePercent`
+   * would misreport where the day ended up.
+   */
+  const peakSoFar = existing?.peakRatePercent ?? -1;
+  const beatsPeak = point.ratePercent > peakSoFar;
+
+  await prisma.testFlakeHistory.upsert({
+    where: { testId_day: { testId: point.testId, day } },
+    create: {
+      orgId: point.orgId,
+      projectId: point.projectId,
+      testId: point.testId,
+      day,
+      ratePercent: point.ratePercent,
+      peakRatePercent: point.ratePercent,
+      worstAt: at,
+      worstRunId: point.runId,
+      sampleSize: point.sampleSize,
+      failures: point.failures,
+      samples: 1,
+      quarantined: point.quarantined,
+    },
+    update: {
+      ratePercent: point.ratePercent,
+      sampleSize: point.sampleSize,
+      failures: point.failures,
+      quarantined: point.quarantined,
+      samples: { increment: 1 },
+      ...(beatsPeak
+        ? { peakRatePercent: point.ratePercent, worstAt: at, worstRunId: point.runId }
+        : {}),
+    },
+  });
+}
+
+/** Midnight UTC. The bucket key, and the reason this table is bounded. */
+export function utcDay(at: Date): Date {
+  return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
+}
+
+async function evaluateRunGates(
+  orgId: string,
+  runId: string,
+  projectId: string,
+  rawRules: unknown,
+  budgetPercent?: number | null,
+) {
   const rules =
     Array.isArray(rawRules) && rawRules.length > 0 ? (rawRules as GateRule[]) : DEFAULT_GATE_RULES;
 
-  const results = await prisma.testResult.findMany({
-    where: { runId, orgId },
-    include: {
-      test: { select: { name: true, priority: true, quarantined: true } },
-      verdict: {
-        select: { verdict: true, overriddenTo: true, reviewState: true },
-      },
-    },
-  });
+  const results = await readRunResults(orgId, runId);
+  const now = new Date();
 
   return evaluateGates(rules, {
     results: results.map((r) => ({
@@ -1513,7 +2249,8 @@ async function evaluateRunGates(orgId: string, runId: string, rawRules: unknown)
       testName: r.test.name,
       status: r.status,
       priority: r.test.priority,
-      quarantined: r.test.quarantined,
+      // The suppression as it stands NOW, expiry included — not the raw column.
+      quarantined: quarantineSuppresses(r.test, now),
       retriedAndPassed: r.retriedAndPassed,
       // A human override beats the model, always.
       verdict:
@@ -1522,5 +2259,122 @@ async function evaluateRunGates(orgId: string, runId: string, rawRules: unknown)
           : (r.verdict?.verdict ?? null),
       durationMs: r.durationMs,
     })),
+    ...(await quarantineHealthFor(orgId, projectId, budgetPercent, now)),
   });
+}
+
+/**
+ * The quarantine budget and the rot alarm, read once per finalisation.
+ *
+ * Returns `{}` on any failure, which produces no quarantine evaluation at all —
+ * deliberately NOT a passing one. A budget nobody could measure must not look
+ * like a budget that is fine, and a run must never fail to finalise because a
+ * health query threw.
+ *
+ * Scoped to the PROJECT rather than the run: the question is "how much of this
+ * suite has stopped gating", and a run that selected eleven tests says nothing
+ * about the other four thousand.
+ */
+async function quarantineHealthFor(
+  orgId: string,
+  projectId: string,
+  budgetPercent: number | null | undefined,
+  now: Date,
+): Promise<{ quarantine?: QuarantineHealthInput }> {
+  try {
+    const [totalTests, inForce, quarantined] = await Promise.all([
+      // `disabledAt: null` on all three: a disabled test neither gates nor
+      // counts against the budget, and letting it into the denominator alone
+      // would make the budget quietly looser the more dead tests a suite has.
+      prisma.test.count({ where: { orgId, projectId, disabledAt: null } }),
+      /*
+       * The suppressions actually IN FORCE, counted in the database rather than
+       * in the loop below — because the loop reads a CAPPED list.
+       *
+       * Counting from that list would silently stop the budget working at the
+       * exact size it matters most: a project with 4,000 quarantined tests
+       * would report 200, land under its cap, and the alarm built to catch a
+       * suite that has stopped testing anything would go quiet on the worst
+       * suite in the install. The expiry arm is the same rule
+       * `quarantineSuppresses` applies, expressed as SQL.
+       */
+      prisma.test.count({
+        where: {
+          orgId,
+          projectId,
+          disabledAt: null,
+          quarantined: true,
+          OR: [{ quarantineExpiresAt: null }, { quarantineExpiresAt: { gt: now } }],
+        },
+      }),
+      prisma.test.findMany({
+        where: { orgId, projectId, disabledAt: null, quarantined: true },
+        select: { id: true, name: true, quarantinedAt: true, quarantineExpiresAt: true },
+        // Bounded, like every other customer-sized list in this product. The
+        // count above is exact; only the NAMES in the warning are capped.
+        take: QUARANTINE_NAMES_SCANNED,
+        orderBy: { quarantinedAt: 'asc' },
+      }),
+    ]);
+
+    const soonAt = new Date(now.getTime() + QUARANTINE_EXPIRY_WARNING_DAYS * 86_400_000);
+    const unboundedBefore = new Date(now.getTime() - QUARANTINE_MAX_DAYS * 86_400_000);
+
+    const expired: Array<{ testId: string; testName: string }> = [];
+    const expiringSoon: Array<{ testId: string; testName: string; expiresAt: Date }> = [];
+    const unbounded: Array<{ testId: string; testName: string; quarantinedAt: Date | null }> = [];
+
+    for (const test of quarantined) {
+      if (
+        !quarantineSuppresses(
+          { quarantined: true, quarantineExpiresAt: test.quarantineExpiresAt },
+          now,
+        )
+      ) {
+        expired.push({ testId: test.id, testName: test.name });
+        continue;
+      }
+      if (test.quarantineExpiresAt === null) {
+        /*
+         * A quarantine written before expiry existed. Only reported once it is
+         * OLDER than the window it would have had — a quarantine taken out this
+         * morning by a path that has not learned to stamp an expiry yet is not
+         * news, and reporting it would make this warning fire on every run of
+         * every install until every writer is updated.
+         */
+        if (test.quarantinedAt !== null && test.quarantinedAt < unboundedBefore) {
+          unbounded.push({
+            testId: test.id,
+            testName: test.name,
+            quarantinedAt: test.quarantinedAt,
+          });
+        }
+        continue;
+      }
+      if (test.quarantineExpiresAt <= soonAt) {
+        expiringSoon.push({
+          testId: test.id,
+          testName: test.name,
+          expiresAt: test.quarantineExpiresAt,
+        });
+      }
+    }
+
+    return {
+      quarantine: {
+        totalTests,
+        quarantinedCount: inForce,
+        budgetPercent: budgetPercent ?? null,
+        expired,
+        expiringSoon,
+        unbounded,
+      },
+    };
+  } catch (err) {
+    logger.warn(
+      { err, projectId },
+      'could not read the quarantine budget; the run finalises with no quarantine evaluation',
+    );
+    return {};
+  }
 }

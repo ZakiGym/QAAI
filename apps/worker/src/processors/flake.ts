@@ -50,6 +50,21 @@ import {
   resolveFlakePolicy,
 } from '@qaai/shared';
 import type { FlakePolicy, Priority, RunStatus, TestResultStatus } from '@qaai/shared';
+/*
+ * The budget, the expiry and what "quarantine in force" means all live in
+ * packages/runner/src/gates.ts — the module that already owned the one rule
+ * quarantine had. They are imported rather than re-stated here because the
+ * other door to quarantine (apps/api/src/routes/tests.ts, where a person flips
+ * the switch) has to enforce the SAME cap, and two implementations of a budget
+ * is how two doors come to disagree about it.
+ */
+import {
+  checkQuarantineBudget,
+  quarantineExpiryFrom,
+  quarantineSuppresses,
+  QUARANTINE_MAX_DAYS,
+} from '@qaai/runner';
+import type { QuarantineBudgetVerdict } from '@qaai/runner';
 // One toll for every path that creates a Run: the plan gate and the usage
 // counter. It lives in the API workspace and takes its Prisma client as an
 // argument so this file can call the same implementation POST /runs does.
@@ -83,6 +98,32 @@ const INVESTIGATION_SCAN_HOURS = 24;
 
 /** Ceiling on the release scan, which is a plain "what is quarantined" query. */
 const RELEASE_SCAN_LIMIT = 200;
+
+/**
+ * How long a flake-trend point is kept.
+ *
+ * 90 days, which is the longest retention any plan buys for the results the
+ * trend is computed FROM (`RETENTION_DAYS.BUSINESS` in processors/run.ts, with
+ * ENTERPRISE at 365). Keeping trend points past the results behind them would
+ * leave a line nobody can audit — "the rate was 40% that Tuesday" with no rows
+ * to check it against — and a trend you cannot check is a trend you should not
+ * act on.
+ *
+ * WHAT IT LOSES: anything older than a quarter. A year-over-year comparison is
+ * not available from this table and is not meant to be; a longer trend belongs
+ * in a monthly rollup, not in a bigger window here.
+ */
+const FLAKE_HISTORY_RETENTION_DAYS = 90;
+
+/**
+ * Rows deleted per tick by the retention prune.
+ *
+ * Bounded for the same reason every other sweep in this file is: one busy
+ * project must not hold the tick open. Whatever is left over waits for the next
+ * tick — the table is already bounded by (tests x days), so falling behind
+ * costs disk, never correctness.
+ */
+const FLAKE_HISTORY_PRUNE_LIMIT = 5_000;
 
 const TERMINAL: readonly string[] = TERMINAL_RUN_STATUSES;
 
@@ -162,6 +203,13 @@ export interface FlakeDecisionInput {
   priority: Priority;
   /** When a failure of this test was last triaged REAL_BUG, inside the window. */
   realBugTriagedAt: Date | null;
+  /**
+   * Whether the project has room for another quarantine. Absent means the
+   * budget could not be read, and an unreadable budget does NOT block a
+   * quarantine — the measurement is the evidence this file exists to act on,
+   * and refusing on a failed count would be refusing on no information.
+   */
+  budget?: QuarantineBudgetVerdict;
 }
 
 /**
@@ -238,12 +286,37 @@ export function decideFlakeAction(input: FlakeDecisionInput): FlakeDecision {
           `had already quarantined it. Their quarantine stands, and this is the evidence for it.`,
       };
     }
+    /*
+     * ── The budget refusal ────────────────────────────────────────────────
+     *
+     * Checked LAST, after every other reason to leave a test gating, because it
+     * is the only one that is about the SUITE rather than about this test. A
+     * test over the quarantine threshold in a suite that has already spent its
+     * budget keeps gating, and the reason says what clears it: fix one of the
+     * quarantined tests, or delete it.
+     *
+     * The alternative — quarantine anyway and warn — is what this defect was.
+     * An escape hatch that always opens is not a budget, and a suite where a
+     * quarter of the tests have stopped gating is a suite nobody is testing,
+     * however loudly the dashboard says so.
+     */
+    if (input.budget && !input.budget.allowed) {
+      return {
+        action: 'NONE',
+        reason:
+          `It ${measured}, above the ${policy.quarantineRatePercent}% threshold, but this ` +
+          `project is at its quarantine budget. ${input.budget.reason} It keeps gating.`,
+      };
+    }
+
     return {
       action: 'QUARANTINE',
       reason:
         `${AUTO_QUARANTINE_REASON_PREFIX}: it ${measured}, above this project's ` +
-        `${policy.quarantineRatePercent}% threshold. It still runs — it just stops gating. ` +
-        `Disagree? Un-quarantine it and it gates again immediately.`,
+        `${policy.quarantineRatePercent}% threshold. It still runs — it just stops gating, and ` +
+        `only for ${QUARANTINE_MAX_DAYS} days: a quarantine with no end date is a deletion ` +
+        `nobody signed, so it expires and starts gating again unless it is fixed, deleted or ` +
+        `quarantined again on purpose. Disagree? Un-quarantine it and it gates again immediately.`,
     };
   }
 
@@ -414,6 +487,118 @@ export async function processFlakeTick(_job: FlakeTickJob): Promise<void> {
 
   const active = await advanceInvestigations(now, policies);
   await openInvestigations(now, policies, active);
+
+  /*
+   * Retention for the flake trend. Here rather than in the run processor
+   * because that would mean a bounded delete per test per run — thousands of
+   * pointless statements an hour — and never throws into the tick, because a
+   * sweep that stopped measuring flakes in order to tidy up a table would be
+   * trading the product for the housekeeping.
+   */
+  await pruneFlakeHistory(now).catch((err) =>
+    logger.warn({ err }, 'could not prune the flake history; it will be retried next tick'),
+  );
+}
+
+/**
+ * Delete flake-trend points past the retention window.
+ *
+ * Returns how many went, so the sweep's own test can prove the window is
+ * applied rather than assumed.
+ */
+export async function pruneFlakeHistory(now: Date): Promise<number> {
+  const before = new Date(now.getTime() - FLAKE_HISTORY_RETENTION_DAYS * 86_400_000);
+  /*
+   * `deleteMany` cannot take a LIMIT in Prisma, so the bound is applied by
+   * selecting the ids first. Oldest first: a prune that falls behind must make
+   * progress from the far end rather than nibbling at a random slice.
+   */
+  const doomed = await prisma.testFlakeHistory.findMany({
+    where: { day: { lt: before } },
+    orderBy: { day: 'asc' },
+    take: FLAKE_HISTORY_PRUNE_LIMIT,
+    select: { id: true },
+  });
+  if (doomed.length === 0) return 0;
+
+  const gone = await prisma.testFlakeHistory.deleteMany({
+    where: { id: { in: doomed.map((row) => row.id) } },
+  });
+  logger.info(
+    { deleted: gone.count, olderThan: before.toISOString().slice(0, 10) },
+    'pruned flake history past its retention window',
+  );
+  return gone.count;
+}
+
+/**
+ * Has this project got room for another quarantine?
+ *
+ * Returns `undefined` when the count could not be read, and the decision then
+ * proceeds WITHOUT a budget — see `FlakeDecisionInput.budget`. That is the only
+ * uncertainty in this file that does not resolve towards "leave it gating", and
+ * deliberately: every other uncertainty here is about the TEST, where caution
+ * means not suppressing. This one is about a count, and refusing a measured
+ * quarantine because a `count()` failed would be refusing on no information at
+ * all — the measurement is the evidence, and it is already in hand.
+ */
+async function quarantineBudgetFor(
+  orgId: string,
+  projectId: string,
+  testId: string,
+  alreadyQuarantined: boolean,
+  now: Date,
+): Promise<QuarantineBudgetVerdict | undefined> {
+  try {
+    const project = await prisma.project.findFirst({
+      where: { id: projectId, orgId },
+      select: { quarantineBudgetPercent: true },
+    });
+
+    /*
+     * Both counted in the database rather than by reading the rows.
+     *
+     * Expired quarantines do not count against the budget: they are not
+     * suppressing anything any more — the test gates again — so charging the
+     * project for them would make the budget tighten on its own over time and
+     * refuse a quarantine the suite had room for. That is the `OR` arm, and it
+     * is the same rule `quarantineSuppresses` applies, expressed as SQL.
+     *
+     * The test under investigation is excluded, so re-measuring it cannot
+     * charge the budget twice for one suppression.
+     *
+     * A `count` and not a `findMany`: this runs once per investigation on the
+     * sweep's tick, and a project with 4,000 quarantined tests is exactly the
+     * project the budget exists for. Pulling its rows into memory to measure
+     * them would make the check most expensive on the suite it matters most on.
+     */
+    const [totalTests, inForce] = await Promise.all([
+      prisma.test.count({ where: { orgId, projectId, disabledAt: null } }),
+      prisma.test.count({
+        where: {
+          orgId,
+          projectId,
+          disabledAt: null,
+          quarantined: true,
+          id: { not: testId },
+          OR: [{ quarantineExpiresAt: null }, { quarantineExpiresAt: { gt: now } }],
+        },
+      }),
+    ]);
+
+    return checkQuarantineBudget({
+      totalTests,
+      quarantinedCount: inForce,
+      budgetPercent: project?.quarantineBudgetPercent ?? null,
+      alreadyQuarantined,
+    });
+  } catch (err) {
+    logger.warn(
+      { err, projectId, testId },
+      'could not read the quarantine budget; deciding on the measurement alone',
+    );
+    return undefined;
+  }
 }
 
 interface ActiveInvestigations {
@@ -546,6 +731,7 @@ async function advanceOne(
       priority: true,
       quarantined: true,
       quarantineReason: true,
+      quarantineExpiresAt: true,
       disabledAt: true,
       filePath: true,
     },
@@ -627,7 +813,7 @@ async function advanceOne(
   });
   const measurement = measureSamples(samples);
 
-  const [lastQuarantineAudit, realBug] = await Promise.all([
+  const [lastQuarantineAudit, realBug, budget] = await Promise.all([
     prisma.auditLog.findFirst({
       where: {
         orgId,
@@ -645,6 +831,15 @@ async function advanceOne(
       select: { action: true },
     }),
     findRecentRealBugVerdict(orgId, testId, policy, now),
+    /*
+     * "Already quarantined" means the suppression is IN FORCE, not that the
+     * column is true. Renewing a quarantine that EXPIRED is a new suppression —
+     * the test had started gating again — so it is charged to the budget like
+     * any other. Passing the raw column here would have left a hole wide enough
+     * to drive the whole feature through: a project over budget could renew its
+     * expired quarantines forever and never be refused once.
+     */
+    quarantineBudgetFor(orgId, projectId, testId, quarantineSuppresses(test, now), now),
   ]);
 
   const decision = decideFlakeAction({
@@ -657,6 +852,7 @@ async function advanceOne(
     }),
     priority: test.priority,
     realBugTriagedAt: realBug,
+    ...(budget ? { budget } : {}),
   });
 
   await conclude(group, decision, measurement, policy, test.quarantined);
@@ -836,6 +1032,7 @@ async function conclude(
   });
 
   if (decision.action === 'QUARANTINE') {
+    const now = new Date();
     // One transaction: a quarantine whose audit row failed to write is a
     // suppressed signal nobody can explain, and it would also be re-decided on
     // every tick because the audit row is what marks an investigation closed.
@@ -846,8 +1043,16 @@ async function conclude(
           quarantined: true,
           // Preserve the original date if something else quarantined it first;
           // the audit row records when the measurement landed.
-          ...(alreadyQuarantined ? {} : { quarantinedAt: new Date() }),
+          ...(alreadyQuarantined ? {} : { quarantinedAt: now }),
           quarantineReason: decision.reason,
+          /*
+           * The end date, always. Re-stamped even when the test was already
+           * quarantined, and that is the point of re-measuring: a test this
+           * investigation has just confirmed is still flaky has EARNED another
+           * window, where one that is never looked at again runs out. Quarantine
+           * is a loan that can be renewed on evidence, not a one-way door.
+           */
+          quarantineExpiresAt: quarantineExpiryFrom(now),
         },
       }),
       prisma.auditLog.create(auditRow(FLAKE_AUDIT_ACTIONS.quarantined)),
@@ -862,7 +1067,15 @@ async function conclude(
         // The reason is cleared with the quarantine. A stale "why it was
         // quarantined" on a test that is not quarantined is how the next reader
         // gets the story wrong.
-        data: { quarantined: false, quarantinedAt: null, quarantineReason: null },
+        // The expiry goes with the quarantine, for the same reason the reason
+        // does: a stale end date on a test that is not quarantined is how the
+        // next reader gets the story wrong.
+        data: {
+          quarantined: false,
+          quarantinedAt: null,
+          quarantineReason: null,
+          quarantineExpiresAt: null,
+        },
       }),
       prisma.auditLog.create(auditRow(FLAKE_AUDIT_ACTIONS.released)),
     ]);

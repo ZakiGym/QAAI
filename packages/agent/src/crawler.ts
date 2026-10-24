@@ -54,11 +54,71 @@ export function normaliseRoute(pathname: string): string {
     .join('/');
 }
 
-/** Guesses what a field wants so the faker can fill it sensibly (§2). */
-export function semanticFor(name: string, type: string, label: string): FormField['semantic'] {
+/**
+ * `autocomplete` token → semantic. Checked BEFORE any name/label guessing,
+ * because this one is not a guess: the token vocabulary is specified, and a
+ * developer who wrote `autocomplete="cc-number"` has told us what the field is.
+ * Every other signal in `semanticFor` is inference from a string somebody chose
+ * for other reasons.
+ */
+const AUTOCOMPLETE_SEMANTICS: Record<string, FormField['semantic']> = {
+  email: 'email',
+  username: 'username',
+  'new-password': 'password',
+  'current-password': 'password',
+  'cc-number': 'credit_card',
+  'cc-exp': 'card_expiry',
+  'cc-exp-month': 'card_expiry',
+  'cc-exp-year': 'card_expiry',
+  'cc-csc': 'card_cvc',
+  'cc-name': 'person_name',
+  tel: 'phone',
+  'tel-national': 'phone',
+  name: 'person_name',
+  'given-name': 'person_name',
+  'family-name': 'person_name',
+  'additional-name': 'person_name',
+  'street-address': 'street_address',
+  'address-line1': 'street_address',
+  'address-line2': 'street_address',
+  'address-level2': 'city',
+  'postal-code': 'postal_code',
+  country: 'country',
+  'country-name': 'country',
+  url: 'url',
+  bday: 'date',
+  'transaction-amount': 'currency',
+};
+
+/**
+ * Guesses what a field wants so the synthetic factory can fill it sensibly (§2).
+ *
+ * `autocomplete` is an optional fourth argument rather than a new required one:
+ * the signature is exported and this file is not the only possible caller, and
+ * a crawl that predates constraint capture still gets the old answer.
+ */
+export function semanticFor(
+  name: string,
+  type: string,
+  label: string,
+  autocomplete?: string | null,
+): FormField['semantic'] {
+  const declared = (autocomplete ?? '')
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => AUTOCOMPLETE_SEMANTICS[token])
+    .find((semantic): semantic is FormField['semantic'] => semantic !== undefined);
+  if (declared) return declared;
+
   const hay = `${name} ${label} ${type}`.toLowerCase();
   if (type === 'email' || /\bemail\b/.test(hay)) return 'email';
   if (type === 'password' || /\bpassword\b|\bpasswd\b/.test(hay)) return 'password';
+  /*
+   * Before the generic `\bname\b` rule, which "username" does not match (no
+   * word boundary inside the word) — so a username field used to come back as
+   * 'freeform' and got a sentence typed into it.
+   */
+  if (/\busername\b|\buser[-_]?name\b|\bhandle\b|\bnickname\b/.test(hay)) return 'username';
   if (type === 'search' || /\bsearch\b|\bquery\b/.test(hay)) return 'search';
   if (type === 'tel' || /\bphone\b|\btel\b|\bmobile\b/.test(hay)) return 'phone';
   if (/\bcvc\b|\bcvv\b|security ?code/.test(hay)) return 'card_cvc';
@@ -69,7 +129,17 @@ export function semanticFor(name: string, type: string, label: string): FormFiel
   if (/\bcity\b|\btown\b/.test(hay)) return 'city';
   if (/\baddress\b|\bstreet\b/.test(hay)) return 'street_address';
   if (/\bname\b/.test(hay)) return 'person_name';
+  if (type === 'url' || /\bwebsite\b|\burl\b|\bhomepage\b|\blink\b/.test(hay)) return 'url';
   if (type === 'date' || /\bdate\b|\bdob\b/.test(hay)) return 'date';
+  /*
+   * Money before the generic number rule. A price input wants "19.99" and a
+   * quantity input wants "3"; sending two decimal places to a quantity field is
+   * harmless, but sending an integer to a price field tests the one code path
+   * that never breaks. `amount` stays under 'number' where it has always been —
+   * it is as often a count as a sum, and this rule only claims the words that
+   * can only mean money.
+   */
+  if (/\bprice\b|\bcost\b|\bcurrency\b|\bsubtotal\b|\bfee\b/.test(hay)) return 'currency';
   if (type === 'number' || /\bquantity\b|\bqty\b|\bamount\b/.test(hay)) return 'number';
   if (type === 'textarea' || /\bmessage\b|\bcomment\b|\bnotes?\b/.test(hay)) return 'freeform';
   if (type === 'text') return 'freeform';
@@ -139,6 +209,94 @@ async function bestSelector(locator: Locator, fallbackCss: string): Promise<Sele
   return { strategy: 'CSS', value: fallbackCss, confidence: 0.3 };
 }
 
+/**
+ * The constraints the DOM already carries, read in one round trip per control.
+ *
+ * THE DEFECT THIS FIXES: the crawl used to read `required` and nothing else, so
+ * `maxlength="10"` — a number sitting right there in the markup — never reached
+ * the Flow Map. That made a boundary test unreachable BY CONSTRUCTION: no
+ * amount of prompting can ask for "one character over the limit" when nothing
+ * in the model knows there is a limit. Enumerating the negative half of testing
+ * starts here, with reading the page properly.
+ *
+ * Three states per attribute, and the difference matters:
+ *   • `null`  — we looked, the page declares nothing. Interesting: an
+ *     undeclared length limit is the best place to send 10,000 characters.
+ *   • a value — the page declares it.
+ *   • absent from an old FlowMap — nobody looked. A consumer that cannot tell
+ *     this from `null` will cry wolf on every crawl made before today.
+ *
+ * `min`/`max`/`step` stay STRINGS. `min="2024-01-01"` on a date input is not a
+ * number, and parsing here would throw the date cases away before anything
+ * downstream saw them.
+ */
+type FieldConstraints = Pick<
+  FormField,
+  | 'maxLength'
+  | 'minLength'
+  | 'min'
+  | 'max'
+  | 'step'
+  | 'pattern'
+  | 'inputMode'
+  | 'autocomplete'
+  | 'accept'
+  | 'multiple'
+  | 'validationMessage'
+>;
+
+async function readConstraints(control: Locator): Promise<Partial<FieldConstraints>> {
+  const raw = await control
+    .evaluate((el: Element) => {
+      const input = el as HTMLInputElement;
+      const attr = (name: string): string | null => {
+        const value = el.getAttribute(name);
+        return value === null || value.trim() === '' ? null : value;
+      };
+      // maxLength/minLength are -1 when unset on the IDL attribute; the content
+      // attribute is the honest source, so a garbage value reads as absent
+      // rather than as a limit nobody wrote.
+      const length = (name: string): number | null => {
+        const value = attr(name);
+        if (value === null) return null;
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+      };
+      /*
+       * `el.validationMessage` is only the PAGE's message when the page set it
+       * with setCustomValidity() — otherwise it is the browser's own default
+       * ("Please fill out this field"), localised, and asserting on it would be
+       * asserting on Chromium's wording. `validity.customError` is exactly that
+       * distinction, so only a custom message is taken; `title` is the other
+       * place a page states its own rule.
+       */
+      const validity: ValidityState | undefined = input.validity;
+      const custom =
+        validity && validity.customError && input.validationMessage
+          ? input.validationMessage
+          : null;
+      return {
+        maxLength: length('maxlength'),
+        minLength: length('minlength'),
+        min: attr('min'),
+        max: attr('max'),
+        step: attr('step'),
+        pattern: attr('pattern'),
+        inputMode: attr('inputmode'),
+        autocomplete: attr('autocomplete'),
+        accept: attr('accept'),
+        multiple: el.hasAttribute('multiple'),
+        validationMessage: custom ?? attr('title'),
+      };
+    })
+    .catch(() => null);
+
+  // A control that vanished mid-crawl yields nothing rather than a row of
+  // nulls: "we looked and the page declares no maxlength" is a claim, and this
+  // is not the case to make it in.
+  return raw ?? {};
+}
+
 async function extractForms(page: Page): Promise<FormModel[]> {
   const forms: FormModel[] = [];
   const formLocators = await page.locator('form').all();
@@ -177,14 +335,17 @@ async function extractForms(page: Page): Promise<FormModel[]> {
               .catch(() => undefined)
           : undefined;
 
+      const constraints = await readConstraints(control);
+
       fields.push({
         name,
         label,
         inputType: type,
         required: (await control.getAttribute('required')) !== null,
         selector: await bestSelector(control, `${cssPath} [name="${name}"]`),
-        semantic: semanticFor(name, type, label ?? ''),
+        semantic: semanticFor(name, type, label ?? '', constraints.autocomplete),
         ...(options && options.length > 0 ? { options } : {}),
+        ...constraints,
       });
     }
 

@@ -229,17 +229,30 @@ const DIALECTS: Record<DialectId, Dialect> = {
     id: 'JVM',
     label: 'JUnit / AssertJ / Truth / Hamcrest / Kotest',
     assertion: [
+      /*
+       * `(?![^()]*\)\s*\{)` is what keeps these off a method DEFINITION.
+       *
+       * The comment above this record always claimed they did not match
+       * `void assertEquals(String a, String b) {` — they did, because the
+       * `(?<![\w.])` lookbehind only rejects a preceding identifier character
+       * and a space is not one. That is the precise shape of the gaming vector
+       * the comment describes: a model deletes the assertEquals CALL, adds a
+       * method of the same name, and the never-weaken guard sees the count
+       * hold. A definition's parameter list is followed by `{`; a call's never
+       * is, and a call whose arguments contain parentheses (`assertThat(x(y))`,
+       * `assertAll(() -> …)`) cannot match the lookahead at all.
+       */
       // assertThat(x).isEqualTo(y) — AssertJ, Truth, Playwright-Java
-      /\bassert(?:That|ThatCode|ThatThrownBy|ThatObject|WithMessage|ThatNoException)\s*\(/,
+      /\bassert(?:That|ThatCode|ThatThrownBy|ThatObject|WithMessage|ThatNoException)\s*\((?![^()]*\)\s*\{)/,
       // JUnit / TestNG: assertEquals, assertTrue, assertAll, assertThrows…
-      // `(?<![\w.])` keeps it off a method DEFINITION's return type and off
-      // `this.assertEquals`, which is a helper of the test's own.
-      /(?<![\w.])assert(?:Equals|NotEquals|Same|NotSame|True|False|Null|NotNull|Throws|All|DoesNotThrow|Timeout|ArrayEquals|Iterable\w*|Lines\w*)\s*\(/,
+      // `(?<![\w.])` keeps it off `this.assertEquals`, which is a helper of the
+      // test's own.
+      /(?<![\w.])assert(?:Equals|NotEquals|Same|NotSame|True|False|Null|NotNull|Throws|All|DoesNotThrow|Timeout|ArrayEquals|Iterable\w*|Lines\w*)\s*\((?![^()]*\)\s*\{)/,
       // Kotest / Strikt infix and extension forms
       /\bshould(?:Be|NotBe|Contain|NotContain|Throw|HaveSize|StartWith|EndWith|MatchJson)\b/,
       /\bexpectThat\s*\(/,
       // Hamcrest's bare assertThat is covered above; fail() is an assertion too
-      /(?<![\w.])fail\s*\(/,
+      /(?<![\w.])fail\s*\((?![^()]*\)\s*\{)/,
       // Playwright-Java static assertThat(locator)
       /\bPlaywrightAssertions\s*\.\s*assertThat\s*\(/,
     ],
@@ -266,7 +279,7 @@ const DIALECTS: Record<DialectId, Dialect> = {
       // Playwright .NET
       /\bExpect\s*\(/,
     ],
-    testBlock: [/\[(?:Test|Fact|Theory|TestCase|TestMethod)\b/, /\bpublic\s+(?:async\s+)?\w[\w<>,\s\[\]]*\s+\w*Test\w*\s*\(/],
+    testBlock: [/\[(?:Test|Fact|Theory|TestCase|TestMethod)\b/, /\bpublic\s+(?:async\s+)?\w[\w<>,\s[\]]*\s+\w*Test\w*\s*\(/],
     lineComment: ['//'],
     blockComment: [['/*', '*/']],
     quotes: ['"', "'"],
@@ -294,7 +307,15 @@ const DIALECTS: Record<DialectId, Dialect> = {
     id: 'RUBY_MINITEST',
     label: 'Minitest assert_*',
     assertion: [
-      /(?<![\w.])(?:assert|refute)(?:_\w+)?\s*[( ]/,
+      /*
+       * The trailing negative lookahead rejects an ASSIGNMENT. `assert_count =
+       * 3` declares a local, and counting it gives a model a one-line way to
+       * keep the assertion count level while deleting a real assert_equal. The
+       * exclusion is deliberately narrow — a bare or compound `=` only, never
+       * `==` or `=~` — because `assert_equal <<~TEXT, actual` is real Minitest
+       * and starts with `<`.
+       */
+      /(?<![\w.])(?:assert|refute)(?:_\w+)?\s*(?:\(|\s+(?![-+*/|&]?=[^=~]))/,
       /\.\s*must_\w+\b/,
       /\.\s*wont_\w+\b/,
       /\bflunk\b/,
@@ -406,7 +427,9 @@ const DIALECTS: Record<DialectId, Dialect> = {
     id: 'ELIXIR',
     label: 'ExUnit assert / refute',
     assertion: [
-      /(?<![\w.])(?:assert|refute)(?:_\w+)?\s+\S/,
+      // Same assignment exclusion as the Minitest record, for the same reason:
+      // `assert_count = 3` is a local, not an assertion.
+      /(?<![\w.])(?:assert|refute)(?:_\w+)?\s+(?![-+*/|&]?=[^=~])\S/,
       /(?<![\w.])(?:assert|refute)(?:_\w+)?\s*\(/,
       /(?<![\w.])flunk\s*[( ]/,
     ],
@@ -625,7 +648,27 @@ export function resolveDialect(hints: DialectHints): DialectId | null {
  * of those makes it blank slightly more than a parser would, and blanking more
  * can only cost a missed assertion in code no reviewer would defend.
  */
-export function blankStringsAndComments(code: string, id: DialectId): string {
+export interface BlankOptions {
+  /**
+   * Keep string CONTENTS, blank only comments.
+   *
+   * Two kinds of gate need this: a locator's value and an expected value both
+   * live inside a string literal, so blanking them hides the very evidence the
+   * gate is reading. The comments still have to go, and for the opposite
+   * reason — `// assert the total is $42` would otherwise let prose satisfy a
+   * check that nothing was asserted.
+   *
+   * A `//` inside a string is still not a comment either way: the scanner
+   * walks the literal, it just does not overwrite it.
+   */
+  keepStrings?: boolean;
+}
+
+export function blankStringsAndComments(
+  code: string,
+  id: DialectId,
+  options: BlankOptions = {},
+): string {
   const d = DIALECTS[id];
   const out = code.split('');
   let i = 0;
@@ -672,7 +715,9 @@ export function blankStringsAndComments(code: string, id: DialectId): string {
         j += 1;
       }
       const stop = Math.min(j, n);
-      for (let k = i + 1; k < stop; k += 1) if (out[k] !== '\n') out[k] = ' ';
+      if (!options.keepStrings) {
+        for (let k = i + 1; k < stop; k += 1) if (out[k] !== '\n') out[k] = ' ';
+      }
       i = code[stop] === quote ? stop + 1 : stop;
       continue;
     }

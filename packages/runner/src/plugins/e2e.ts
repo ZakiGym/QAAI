@@ -34,12 +34,27 @@
  * whose spec asks for `har.mode` gets the recorder or the replayer installed
  * into its Playwright process, and — the part that matters — every result says
  * whether the run actually was hermetic. See `runWithHar`.
+ *
+ * ── Where a routed test runs ────────────────────────────────────────────────
+ *
+ * Neither non-Playwright route may touch `process.cwd()`, and both used to:
+ *
+ *  - A test with its own command and cwd runs the CUSTOMER'S suite, so it runs
+ *    in the run's materialised repository (`runWorkspaceOf`), and when there is
+ *    no checkout it is SKIPPED with the thing to configure. It used to resolve
+ *    `spec.cwd` against the worker's own directory — QAAI's checkout — which is
+ *    how `npx cypress run` came to run QAAI's files and report them as the
+ *    customer's.
+ *  - A catalogue-routed test holds only the generated file and the run's
+ *    fixtures, so its workspace is a throwaway `mkdtemp` under the OS temp
+ *    directory, removed in a `finally`. It used to be written into
+ *    `.qaai-external/` INSIDE THIS SOURCE TREE.
  */
 
 import { Buffer } from 'node:buffer';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, extname, join, normalize, relative, resolve, sep } from 'node:path';
+import { dirname, extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXTERNAL_REPORT_FORMATS, ecosystemById, externalTestSpecSchema, resolveEcosystemCommand } from '@qaai/shared';
 import type {
@@ -63,6 +78,7 @@ import {
 } from '../har.js';
 import type { HarConfig, HarRunReport, HarRuntimeOptions } from '../har.js';
 import { runPlaywrightSpec } from '../playwright-harness.js';
+import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 import { runExternal } from './external.js';
 
 /** The import that makes a file a Playwright spec, and nothing else does. */
@@ -224,25 +240,29 @@ export function validateE2ETest(test: ExecutableTest): void {
 // ─── Running someone else's runner ───────────────────────────────────────────
 
 /**
- * Where a routed test is materialised.
+ * Where a routed test is materialised: a throwaway directory under the OS temp
+ * directory, named after the run so a leftover can be traced to one.
  *
- * `runExternal` resolves its workspace from `process.cwd()`, so the scratch tree
- * has to live under it — the same trade the Playwright harness makes when it
- * writes specs beside the installed `@playwright/test`. Each run gets its own
- * directory and it is removed afterwards, in a finally, whatever the outcome.
+ * It used to be `join(process.cwd(), '.qaai-external', slug)` — INSIDE THE
+ * WORKER'S OWN SOURCE TREE, as the comment there admitted, because
+ * `runExternal` resolved its workspace from `process.cwd()` and the scratch tree
+ * had to be reachable from it. That is the same defect this change exists to
+ * remove: QAAI wrote a tenant's generated test, and ran a tenant-named command,
+ * inside its own checkout — one `..` in a path, or a runner that writes beside
+ * its input, and the blast radius is QAAI's source.
+ *
+ * The Playwright harness has a real reason to write beside the installed
+ * `@playwright/test` (Node module resolution walks UP from the spec, so a spec
+ * in /tmp cannot import it). Nothing routed here does: only the pip, deno and
+ * bun ecosystems reach this function (see {@link STANDALONE_MANAGERS}), and
+ * none of the three resolves imports through `node_modules`. So the tree goes
+ * where a throwaway belongs, and `runExternal` is told to resolve against it
+ * explicitly rather than against whatever directory the worker was started in.
+ *
+ * The directory is removed on every exit path — a pass, a failure, a throw, a
+ * cancel — in the `finally` at the bottom of {@link runInEcosystem}.
  */
-const SCRATCH_ROOT = '.qaai-external';
-
-/** Refuses a path that escapes the scratch workspace. filePath is model-authored. */
-function safeWorkspacePath(dir: string, filePath: string): string {
-  const cleaned = filePath.replace(/^[/\\]+/, '');
-  const full = resolve(join(dir, cleaned));
-  const root = resolve(dir);
-  if (full !== root && !full.startsWith(root + sep)) {
-    throw new Error(`Refusing to write outside the workspace: ${filePath}`);
-  }
-  return full;
-}
+const SCRATCH_PREFIX = 'qaai-ecosystem-';
 
 /**
  * Runners that can execute a single file with nothing else around it.
@@ -309,6 +329,55 @@ function notEvaluated(test: ExecutableTest, startedAt: number, why: string): Tes
 }
 
 /**
+ * A test that can never run AS WRITTEN, which is a different verdict.
+ *
+ * A path that climbs out of the workspace is not an environment gap anyone can
+ * install their way out of — it is a broken (or hostile) test, and the only
+ * person who can fix it is the one looking at the suite. SKIPPED does not block
+ * a gate, so a skip here would let it merge green forever; this fails, loudly,
+ * with the offending path. Mirrors `unrunnableAsWritten` in external.ts.
+ */
+function unrunnableAsWritten(
+  test: ExecutableTest,
+  startedAt: number,
+  why: string,
+): TestExecution {
+  return { ...notEvaluated(test, startedAt, why), status: 'FAILED' };
+}
+
+/**
+ * A test whose spec carries its own command and cwd — the route for a suite
+ * that lives in the CUSTOMER'S repository.
+ *
+ * This is the one place in this plugin that runs a tenant-named command against
+ * a tenant's own files, and it called `runExternal` with no workspace at all: so
+ * `spec.cwd` resolved against `process.cwd()`, which on the worker is QAAI's own
+ * checkout. `npx cypress run` ran whatever QAAI's directory happened to hold and
+ * filed the result as the customer's; `cwd: '../..'` left the monorepo. It now
+ * runs inside the run's materialised repository, and when there is none it says
+ * so instead of producing a verdict about the wrong tree.
+ *
+ * SKIPPED, not FAILED: no connected repository is a CONFIGURATION gap — nothing
+ * about the application was evaluated, and blaming it would be a lie. The path
+ * guard inside `runExternal` makes the other call, for the other reason.
+ */
+async function runDeclaredExternal(
+  ctx: RunContext,
+  test: ExecutableTest,
+  spec: ExternalTestSpec,
+): Promise<TestExecution> {
+  const workspace = runWorkspaceOf(ctx);
+  if (!workspace) {
+    return notEvaluated(
+      test,
+      Date.now(),
+      `"${test.name}" runs its own command (\`${spec.command}\`) inside your repository, and this run has no checkout of it, so nothing was executed — running it in the worker's own directory would produce a verdict about the wrong tree. Connect the project to its repository (Project settings → Repository) and re-run.`,
+    );
+  }
+  return runExternal(ctx, test, spec, { workspace: workspace.root });
+}
+
+/**
  * Run one generated test through its own ecosystem's command.
  *
  * The workspace holds the test file at its own path plus the run's fixtures, so
@@ -323,11 +392,9 @@ async function runInEcosystem(
   entry: Ecosystem,
 ): Promise<TestExecution> {
   const startedAt = Date.now();
-  const workspace = process.cwd();
   // Ids are database cuids, but they end up as a real directory name, so they
   // are treated as untrusted the same way `test.filePath` is.
   const slug = `${ctx.runId}-${test.id}`.replace(/[^A-Za-z0-9._-]/g, '_');
-  const dir = join(workspace, SCRATCH_ROOT, slug);
 
   if (!STANDALONE_MANAGERS.has(entry.packageManager)) {
     return notEvaluated(
@@ -348,25 +415,49 @@ async function runInEcosystem(
     );
   }
 
+  let dir: string;
   try {
-    await mkdir(dir, { recursive: true });
+    dir = await mkdtemp(join(tmpdir(), `${SCRATCH_PREFIX}${slug}-`));
   } catch (err) {
     return notEvaluated(
       test,
       startedAt,
-      `QAAI could not create a workspace under ${SCRATCH_ROOT}/ to run ${entry.label} (${err instanceof Error ? err.message : String(err)}), so "${test.name}" was not evaluated.`,
+      `QAAI could not create a temporary workspace to run ${entry.label} (${err instanceof Error ? err.message : String(err)}), so "${test.name}" was not evaluated.`,
     );
   }
 
   try {
-    const target = safeWorkspacePath(dir, test.filePath);
+    /*
+     * `test.filePath` is MODEL-AUTHORED and becomes a real path the worker
+     * writes with, so it goes through the shared guard — which REFUSES rather
+     * than sanitises. The old local helper here stripped a leading `/` and
+     * carried on, which turned `/etc/passwd` into a write at
+     * `<scratch>/etc/passwd`: harmless by luck, and it hid the fact that the
+     * path was wrong. A path that cannot run as written is a broken test, so it
+     * is FAILED and named; see {@link unrunnableAsWritten}.
+     */
+    const target = resolveInsideWorkspace(dir, test.filePath);
+    if (!target) {
+      return unrunnableAsWritten(
+        test,
+        startedAt,
+        `Refusing to write "${test.name}" to ${test.filePath}: a test's path must be relative to the workspace root and must not climb out of it. Nothing was executed.`,
+      );
+    }
     await mkdir(dirname(target), { recursive: true });
     await writeFile(target, test.code, 'utf8');
 
     // Test data, so a test can read `fixtures/users.json` off disk — the same
     // contract the Playwright harness gives its specs.
     for (const [fixturePath, content] of Object.entries(ctx.fixtures ?? {})) {
-      const fixture = safeWorkspacePath(dir, fixturePath);
+      const fixture = resolveInsideWorkspace(dir, fixturePath);
+      if (!fixture) {
+        return unrunnableAsWritten(
+          test,
+          startedAt,
+          `Refusing to write the test data at ${fixturePath}: a fixture's path must be relative to the workspace root and must not climb out of it. "${test.name}" was not executed.`,
+        );
+      }
       await mkdir(dirname(fixture), { recursive: true });
       await writeFile(fixture, content, 'utf8');
     }
@@ -385,10 +476,14 @@ async function runInEcosystem(
       reportPath: entry.reportPath || 'report.xml',
       reportFormat: reportFormatFor(entry),
       timeoutSeconds: Math.max(1, Math.min(3600, Math.ceil(test.timeoutMs / 1000))),
-      cwd: relative(workspace, dir),
+      // The scratch tree IS this test's workspace, so there is nothing to
+      // descend into. It used to be a path relative to `process.cwd()`, which
+      // only resolved because `runExternal` defaulted its base to the worker's
+      // own directory.
+      cwd: '.',
     };
 
-    const execution = await runExternal(ctx, test, spec);
+    const execution = await runExternal(ctx, test, spec, { workspace: dir });
 
     // A runner that was told where to write its report, exited non-zero, and
     // wrote nothing did not evaluate the test — it failed to start. A missing
@@ -700,7 +795,7 @@ export async function runE2ETest(ctx: RunContext, test: ExecutableTest): Promise
 
   const execution =
     route.kind === 'declared'
-      ? await runExternal(ctx, test, route.spec)
+      ? await runDeclaredExternal(ctx, test, route.spec)
       : route.kind === 'catalogue'
         ? await runInEcosystem(ctx, test, route.entry)
         : notEvaluated(

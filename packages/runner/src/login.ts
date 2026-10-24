@@ -9,9 +9,28 @@
  * Credentials are read from the vault by name and never appear in a profile, a
  * log, or a stored artifact. What is persisted is the resulting session state,
  * which is what a browser would hold anyway.
+ *
+ * ── Which identity, and the defect that answers ─────────────────────────────
+ *
+ * A run had exactly ONE storage state: the first auth profile on the
+ * environment, applied to every test in the suite. A plan item can name an
+ * `authProfileId` (see `planItemSchema`), so a suite legitimately contains an
+ * admin test and a member test — and under one session at most one of them was
+ * running as the role it claims. The other was testing somebody else's
+ * permissions and could not know it.
+ *
+ * This module owns half of that fix: {@link signInWithProfile} turns a profile
+ * row into a session whatever its kind, which is what lets a RUN sign a profile
+ * in rather than hoping a cached one is lying around. The other half — which
+ * role a test asked for and which one the run actually supplied — lives in
+ * `run-workspace.ts` beside the workspace channel, because it is a property of
+ * the run context rather than of logging in, and because the Playwright harness
+ * needs to compare the two without loading a browser driver to do it.
  */
 
 import { chromium } from 'playwright';
+import { authProfileConfigSchema } from '@qaai/shared';
+import type { AuthProfileKind } from '@qaai/shared';
 
 export interface LoginResult {
   ok: boolean;
@@ -203,3 +222,68 @@ export function performSsoToken(
     expiresAt: expiry(),
   };
 }
+
+// ─── One profile, one session ────────────────────────────────────────────────
+
+/** The columns of an `AuthProfile` row a sign-in actually needs. */
+export interface AuthProfileRef {
+  id: string;
+  name: string;
+  kind: AuthProfileKind;
+  /** Non-secret config; validated per kind before anything is driven. */
+  config: unknown;
+}
+
+/**
+ * Sign in as one profile, whatever its kind.
+ *
+ * The per-kind branch used to exist only in the API's "test this profile"
+ * route, which is why a RUN could not log in at all — it had no way to turn a
+ * profile row into a session and had to hope a cached one was lying around.
+ * Keeping the branch next to the three functions it dispatches to means the
+ * run and the "Sign in" button in the cockpit cannot drift about what a profile
+ * of a given kind does.
+ *
+ * The config is re-validated rather than trusted: a profile may predate the
+ * per-kind schema, and driving a browser with a half-formed config fails in a
+ * way nobody can read. A kind QAAI cannot perform yet comes back `ok: false`
+ * with the thing to use instead — never `ok: true` with no session, which is
+ * how a logged-out browser gets handed to a test that needs a role.
+ */
+export async function signInWithProfile(
+  profile: AuthProfileRef,
+  secrets: Readonly<Record<string, string>>,
+  baseUrl: string,
+): Promise<LoginResult> {
+  const shape = authProfileConfigSchema[profile.kind];
+  const parsed = shape.safeParse(profile.config);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      storageState: null,
+      message: `The "${profile.name}" ${profile.kind} profile is incomplete: ${parsed.error.issues
+        .map((i) => `${i.path.join('.') || '(root)'} ${i.message}`)
+        .join('; ')}`,
+      expiresAt: null,
+    };
+  }
+
+  switch (profile.kind) {
+    case 'FORM_LOGIN':
+      return performFormLogin(parsed.data as FormLoginConfig, secrets, baseUrl);
+    case 'COOKIE_INJECTION':
+      return performCookieInjection(parsed.data as CookieInjectionConfig, secrets);
+    case 'SSO_BYPASS_TOKEN':
+      return performSsoToken(parsed.data as SsoTokenConfig, secrets);
+    default:
+      return {
+        ok: false,
+        storageState: null,
+        message:
+          `${profile.kind} needs the mail catcher / TOTP support that is not built yet, so ` +
+          `"${profile.name}" cannot be signed in — use FORM_LOGIN, COOKIE_INJECTION or SSO_BYPASS_TOKEN.`,
+        expiresAt: null,
+      };
+  }
+}
+

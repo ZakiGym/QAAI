@@ -85,6 +85,14 @@ import {
   type CheckOutput,
   type ChecksJob,
 } from '../../../api/src/lib/github-app.js';
+/*
+ * The one question "is this test's quarantine in force right now" is allowed to
+ * be answered by, from the module that owns the rule (see its header). Reading
+ * `Test.quarantined` raw here would keep honouring a quarantine that ran out —
+ * an expired one suppresses nothing, so its failure has to gate again and has
+ * to read as a plain failure in the merge box.
+ */
+import { quarantineSuppresses } from '@qaai/runner';
 import { connection, logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
 
@@ -215,6 +223,19 @@ async function loadRun(orgId: string, runId: string) {
       passedCount: true,
       failedCount: true,
       flakyCount: true,
+      /*
+       * READ, not inferred.
+       *
+       * `suppressedFailuresIn` can subtract `failedCount` from the number of
+       * FAILED/TIMED_OUT results it was handed, and that subtraction is exact
+       * today — both numbers come off the same row. It is exact only because
+       * the `results.where` below selects precisely the statuses the run
+       * counters call failures. Add a status to that filter, or narrow it to a
+       * shard, and the subtraction starts reporting a suppression count that
+       * nothing suppressed, in a surface whose whole job is to be believed.
+       * The column cannot drift that way, so the column is selected.
+       */
+      quarantinedFailedCount: true,
       totalCount: true,
       errorMessage: true,
       gateResult: true,
@@ -227,7 +248,24 @@ async function loadRun(orgId: string, runId: string) {
         select: {
           status: true,
           errorMessage: true,
-          test: { select: { id: true, name: true, filePath: true, code: true } },
+          /*
+           * `quarantined` AND `quarantineExpiresAt` travel together, always.
+           * The flag alone is not the answer — expiry deliberately does not
+           * clear it, so the reason survives — and a reader that takes the flag
+           * on its own labels a failure "quarantined, so it did not fail this
+           * check" when it did fail the check. Both columns go to
+           * `quarantineSuppresses`, which is the only thing allowed to decide.
+           */
+          test: {
+            select: {
+              id: true,
+              name: true,
+              filePath: true,
+              code: true,
+              quarantined: true,
+              quarantineExpiresAt: true,
+            },
+          },
           verdict: { select: { verdict: true, confidence: true, explanation: true } },
           steps: {
             where: { status: 'FAILED' },
@@ -253,6 +291,12 @@ type LoadedRun = NonNullable<Awaited<ReturnType<typeof loadRun>>>;
 
 async function buildEvidence(orgId: string, run: LoadedRun): Promise<CheckEvidence> {
   const testIds = run.results.map((r) => r.test.id);
+  /*
+   * One instant for the whole check, not one per failure. Two tests whose
+   * quarantines expire inside the same millisecond must be labelled the same
+   * way, and a per-row `new Date()` is a check that can disagree with itself.
+   */
+  const now = new Date();
 
   /*
    * "…with a fix proposed" has to be earned.
@@ -296,6 +340,14 @@ async function buildEvidence(orgId: string, run: LoadedRun): Promise<CheckEviden
           }
         : null,
       fixProposed: healedTestIds.has(r.test.id),
+      /*
+       * Per failure, so the check can name WHICH test was suppressed instead of
+       * printing a count and leaving a reviewer to guess. Always set — `false`
+       * is an answer — because `gatingFailures` only trusts the per-failure
+       * flags when at least one of them is true, and a producer that supplied
+       * them for some rows and not others would hand it a half-truth.
+       */
+      quarantined: quarantineSuppresses(r.test, now),
     };
   });
 
@@ -310,6 +362,7 @@ async function buildEvidence(orgId: string, run: LoadedRun): Promise<CheckEviden
       passedCount: run.passedCount,
       failedCount: run.failedCount,
       flakyCount: run.flakyCount,
+      quarantinedFailedCount: run.quarantinedFailedCount,
       totalCount: run.totalCount,
       errorMessage: run.errorMessage,
       gateBlocking: gate?.passed === false,

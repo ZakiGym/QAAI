@@ -34,6 +34,45 @@ export interface Selector {
   confidence: number;
 }
 
+/**
+ * The data-generation vocabulary, as a VALUE and not only a type.
+ *
+ * It was a bare union inline on `FormField.semantic`, which meant every runtime
+ * consumer that has to validate an incoming hint hand-copied the list —
+ * `apps/worker/src/processors/analyze-source.ts` still holds such a copy, and a
+ * hand-copy of a union is a list that silently stops matching it. Exporting the
+ * array gives those callers something to narrow against instead.
+ *
+ * `url`, `username` and `currency` are the three additions. They are not
+ * cosmetic: a field the crawler could only call 'unknown' or 'freeform' got a
+ * freeform string, so a URL input was tested with "lorem ipsum" and a price
+ * input with prose. Everything else in this list predates this change and keeps
+ * its exact spelling, because the names travel in stored FlowMap JSON.
+ */
+export const FORM_FIELD_SEMANTICS = [
+  'email',
+  'password',
+  'username',
+  'person_name',
+  'phone',
+  'street_address',
+  'city',
+  'postal_code',
+  'country',
+  'credit_card',
+  'card_expiry',
+  'card_cvc',
+  'date',
+  'number',
+  'currency',
+  'url',
+  'search',
+  'freeform',
+  'unknown',
+] as const;
+
+export type FormFieldSemantic = (typeof FORM_FIELD_SEMANTICS)[number];
+
 export interface FormField {
   name: string;
   label: string | null;
@@ -41,26 +80,66 @@ export interface FormField {
   inputType: string;
   required: boolean;
   selector: Selector;
-  /** Hint for the faker-based synthetic data generator (§2). */
-  semantic:
-    | 'email'
-    | 'password'
-    | 'person_name'
-    | 'phone'
-    | 'street_address'
-    | 'city'
-    | 'postal_code'
-    | 'country'
-    | 'credit_card'
-    | 'card_expiry'
-    | 'card_cvc'
-    | 'date'
-    | 'number'
-    | 'search'
-    | 'freeform'
-    | 'unknown';
+  /** Hint for the synthetic data generator (§2); see `synthetic.ts`. */
+  semantic: FormFieldSemantic;
   /** Present for select/radio. */
   options?: string[];
+
+  /*
+   * ─── Real constraints, read off the DOM ────────────────────────────────────
+   *
+   * THE DEFECT THESE PREVENT: without them a boundary test is unreachable *by
+   * construction*. "Submit one character over the limit" is not a judgement the
+   * model can make up — the limit is a number the page already carries in an
+   * attribute, and dropping it on the floor during the crawl is why the whole
+   * negative half of testing had nothing to stand on.
+   *
+   * Every one is OPTIONAL and distinguishes three states, which a plain
+   * `number` could not:
+   *   • absent / undefined → this crawl predates the capture (old FlowMap JSON)
+   *   • null               → the crawl looked and the page declares nothing
+   *   • a value            → the page declares it
+   *
+   * That distinction is load-bearing. "No maxlength declared" is a much more
+   * interesting place to send a 10,000-character string than a field that
+   * declares one, and a consumer that cannot tell "not declared" from "not
+   * captured" will either miss those fields or cry wolf on every old crawl.
+   *
+   * `min`/`max`/`step` are strings, not numbers, because the attributes are not
+   * numbers: `min` is "2024-01-01" on a date input, "08:00" on a time input and
+   * "1" on a number input. Parsing at capture time would throw the date cases
+   * away.
+   */
+
+  /** `maxlength`. The single most useful number on the page for negative tests. */
+  maxLength?: number | null;
+  /** `minlength`. */
+  minLength?: number | null;
+  /** `min` verbatim — numeric, date, time or week, whatever the input type says. */
+  min?: string | null;
+  /** `max` verbatim. */
+  max?: string | null;
+  /** `step` verbatim, including the literal "any". */
+  step?: string | null;
+  /** `pattern` source, verbatim and NOT compiled — an invalid one must not throw. */
+  pattern?: string | null;
+  /** `inputmode`: numeric/tel/email/decimal/… A claim about the keyboard, and a hint. */
+  inputMode?: string | null;
+  /** `autocomplete` token: the most reliable semantic signal a form ever gives. */
+  autocomplete?: string | null;
+  /** `accept` on a file input, e.g. "image/png,.pdf". */
+  accept?: string | null;
+  /** `multiple` on a file input or select. */
+  multiple?: boolean;
+  /**
+   * The message the PAGE says it will show — `title` on a patterned input, or
+   * `validationMessage` when the browser has already computed one.
+   *
+   * Captured because the strongest form of a negative assertion is the app's
+   * own words. A test that asserts "some error appeared" passes when the wrong
+   * error appears; one that asserts this string does not.
+   */
+  validationMessage?: string | null;
 }
 
 export interface FormModel {

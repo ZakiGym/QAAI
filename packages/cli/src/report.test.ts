@@ -30,7 +30,15 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { allureReporter } from '../../runner/src/reporters/allure.js';
 import { testrailReporter } from '../../runner/src/reporters/testrail.js';
+/*
+ * The two things the CLI re-implements because it may not import them, and
+ * which therefore have to be asserted equal to the originals here: the
+ * quarantine sentence, and the expiry rule that decides who gets it.
+ */
+import { QUARANTINE_NOTE as RUNNER_QUARANTINE_NOTE } from '../../runner/src/reporters/types.js';
+import { quarantineSuppresses } from '../../runner/src/gates.js';
 import {
+  QUARANTINE_NOTE,
   ReportError,
   caseIdsFor,
   emitReports,
@@ -130,6 +138,39 @@ const untimed: RunReport = {
   ],
 };
 
+/**
+ * A suppressed failure beside a real one, a deliberate skip and a pass — so the
+ * mirror has to agree about all four, in both formats, including the sentence
+ * and the TestRail status id. One of the quarantined tests has no error text,
+ * which is the case where Allure's `muted` would otherwise render a grey row
+ * with nothing on it.
+ */
+const withQuarantine: RunReport = {
+  id: 'run_7',
+  environment: 'staging',
+  totals: { tests: 4, passed: 1, failed: 1, skipped: 1, flaky: 0, quarantinedFailed: 2 },
+  tests: [
+    { id: 'q1', name: 'C300 cart adds an item', status: 'passed', durationMs: 410 },
+    {
+      id: 'q2',
+      name: 'C301 cart applies a coupon',
+      status: 'failed',
+      durationMs: 980,
+      message: 'expected "10% off" to be visible',
+    },
+    {
+      id: 'q3',
+      suite: 'e2e/cart.spec.ts',
+      name: 'C302 cart recalculates tax',
+      status: 'quarantined',
+      durationMs: 1200,
+      message: 'expected total 11.00, got 10.00',
+      stack: 'at cart.spec.ts:41',
+    },
+    { id: 'q4', name: 'C303 cart saves for later', status: 'quarantined', durationMs: 700 },
+  ],
+};
+
 const FIXTURES: Array<[string, RunReport]> = [
   ['failures', withFailures],
   ['flakes', withFlakes],
@@ -137,6 +178,7 @@ const FIXTURES: Array<[string, RunReport]> = [
   ['zero tests', emptyRun],
   ['xml-hostile names', hostile],
   ['no timings', untimed],
+  ['quarantined failures', withQuarantine],
 ];
 
 // ─── 1. The mirror ───────────────────────────────────────────────────────────
@@ -303,6 +345,157 @@ describe('runReportFromApi', () => {
     expect(runReportFromApi(payload, { url: 'https://app/runs/run_x' }).url).toBe(
       'https://app/runs/run_x',
     );
+  });
+});
+
+// ─── 3b. Quarantine: the mapping, and the rule behind it ─────────────────────
+
+/**
+ * What this section is for.
+ *
+ * `--reporter allure` used to turn a team's dashboard red over a failure the
+ * gate had already cleared, because the mapping above knew only `result.status`
+ * and the platform does not store "quarantined" as a status. It now reads the
+ * test's two quarantine columns, which `GET /runs/:runId` selects.
+ *
+ * Three things have to hold, and the third is the one that will rot:
+ *   • a suppressed FAILURE becomes `quarantined`;
+ *   • a quarantined test that passed or was skipped is left alone;
+ *   • the CLI's local copy of the expiry rule answers exactly what
+ *     `quarantineSuppresses` answers. That copy exists because the published
+ *     CLI may not import across the package boundary; this file may, so the
+ *     agreement is asserted against the real function rather than trusted.
+ */
+describe('runReportFromApi and quarantine', () => {
+  const DAY = 86_400_000;
+  const result = (over: Record<string, unknown> = {}) => ({
+    status: 'FAILED',
+    durationMs: 500,
+    errorMessage: 'boom',
+    createdAt: '2026-01-01T10:00:00.000Z',
+    test: { id: 't1', name: 'a test', quarantined: true, quarantineExpiresAt: null },
+    ...over,
+  });
+
+  it('uses the same sentence the runner reporters use, to the byte', () => {
+    // A mirrored sentence that drifts by a comma is a different claim in a
+    // customer's dashboard, and nothing else in this repo would notice.
+    expect(QUARANTINE_NOTE).toBe(RUNNER_QUARANTINE_NOTE);
+  });
+
+  it('turns a suppressed failure into the quarantined status, and a timeout too', () => {
+    expect(runReportFromApi({ results: [result()] }).tests[0]!.status).toBe('quarantined');
+    expect(
+      runReportFromApi({ results: [result({ status: 'TIMED_OUT' })] }).tests[0]!.status,
+    ).toBe('quarantined');
+  });
+
+  it('leaves a quarantined test that did not fail exactly as it was', () => {
+    /*
+     * A quarantine that had nothing to suppress. Rewriting these would stamp
+     * "QUARANTINED FAILURE" onto a test that passed, which is the same lie
+     * pointing the other way.
+     */
+    expect(runReportFromApi({ results: [result({ status: 'PASSED' })] }).tests[0]!.status).toBe(
+      'passed',
+    );
+    expect(
+      runReportFromApi({ results: [result({ status: 'SKIPPED', durationMs: 0 })] }).tests[0]!.status,
+    ).toBe('skipped');
+    expect(runReportFromApi({ results: [result({ status: 'FLAKY' })] }).tests[0]!.status).toBe(
+      'flaky',
+    );
+  });
+
+  it('agrees with quarantineSuppresses in packages/runner/src/gates.ts on every expiry', () => {
+    const now = new Date();
+    const cases: Array<{ quarantined: boolean; quarantineExpiresAt: string | null }> = [
+      // Not quarantined at all.
+      { quarantined: false, quarantineExpiresAt: null },
+      { quarantined: false, quarantineExpiresAt: new Date(now.getTime() + DAY).toISOString() },
+      // No expiry: written before expiry existed, and HONOURED — back-filling
+      // one would turn thousands of suppressed failures red in a deploy.
+      { quarantined: true, quarantineExpiresAt: null },
+      // In force, and run out.
+      { quarantined: true, quarantineExpiresAt: new Date(now.getTime() + DAY).toISOString() },
+      { quarantined: true, quarantineExpiresAt: new Date(now.getTime() - DAY).toISOString() },
+      // Unparseable: honoured, because a bad date string must not be the thing
+      // that reddens somebody's build.
+      { quarantined: true, quarantineExpiresAt: 'not a date' },
+    ];
+
+    for (const columns of cases) {
+      const report = runReportFromApi({ results: [result({ test: { name: 't', ...columns } })] });
+      const suppressed = quarantineSuppresses(
+        {
+          quarantined: columns.quarantined,
+          quarantineExpiresAt: columns.quarantineExpiresAt,
+        },
+        now,
+      );
+      expect(report.tests[0]!.status).toBe(suppressed ? 'quarantined' : 'failed');
+    }
+  });
+
+  it('carries the fourth counter when the server sends it, and omits it when not', () => {
+    const counters = {
+      totalCount: 3,
+      passedCount: 1,
+      failedCount: 1,
+      flakyCount: 0,
+      skippedCount: 0,
+      results: [],
+    };
+    expect(runReportFromApi({ ...counters, quarantinedFailedCount: 2 }).totals).toEqual({
+      tests: 3,
+      passed: 1,
+      failed: 1,
+      skipped: 0,
+      flaky: 0,
+      quarantinedFailed: 2,
+    });
+    /*
+     * An API older than the quarantine fix. The other five totals must still
+     * arrive — making the new counter part of the presence check would mean
+     * every un-upgraded server produced no totals at all.
+     */
+    const old = runReportFromApi(counters);
+    expect(old.totals).not.toHaveProperty('quarantinedFailed');
+    expect(old.totals?.tests).toBe(3);
+  });
+
+  it('says the right thing in both formats, and never a pass or a plain skip', () => {
+    const report = runReportFromApi({
+      results: [
+        result({
+          test: { id: 't1', name: 'C9 tax', quarantined: true, quarantineExpiresAt: null },
+          errorMessage: 'expected 11.00, got 10.00',
+        }),
+      ],
+    });
+
+    const allure = JSON.parse(renderAllure(report).files[0]!.contents) as {
+      status: string;
+      statusDetails: { message: string; muted?: boolean };
+      labels: Array<{ name: string; value: string }>;
+    };
+    expect(allure.status).toBe('failed');
+    expect(allure.statusDetails.muted).toBe(true);
+    expect(allure.statusDetails.message).toMatch(/^QUARANTINED FAILURE/);
+    expect(allure.statusDetails.message).toContain('expected 11.00, got 10.00');
+    expect(allure.labels).toContainEqual({ name: 'tag', value: 'quarantined' });
+
+    const document = renderTestRail(report, 9);
+    const body = JSON.parse(document.files[0]!.contents) as {
+      results: Array<{ case_id: number; status_id: number; comment?: string }>;
+    };
+    // Retest (4), and SENT: an omitted result leaves the case on its last
+    // status, which on a case that was green last week is a failure reading as
+    // a pass.
+    expect(body.results).toHaveLength(1);
+    expect(body.results[0]!.status_id).toBe(4);
+    expect(body.results[0]!.comment).toMatch(/^QUARANTINED FAILURE/);
+    expect(document.warnings.join(' ')).toContain('sent as Retest rather than Failed');
   });
 });
 

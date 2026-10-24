@@ -36,8 +36,50 @@
  * point of having three reporters: JUnit has no vocabulary for a flake, Allure
  * has a first-class `flaky` marker, and TestRail wants a human-readable comment.
  * Collapsing them here would make all three wrong in the same way.
+ *
+ * ── `quarantined`, and why it is a status rather than a flag ─────────────────
+ *
+ * A quarantined test that failed is a FOURTH thing, exactly as
+ * `Run.quarantinedFailedCount` is a fourth counter (see
+ * packages/runner/src/gates.ts). Before it existed, every reporter here filed
+ * such a test as `failed`, so the one output a team reads in their own
+ * dashboard went red over a failure the gate had already agreed to ignore:
+ * quarantine released the merge and left the dashboard broken, which is the
+ * mirror image of the original defect and just as useless.
+ *
+ * It is a STATUS and not a `quarantined?: boolean` beside the status because
+ * every reporter has to make a positive decision about it — Allure mutes it,
+ * TestRail files it as Retest, JUnit renders it `<skipped>` with a message that
+ * says it failed — and a boolean that each format may or may not consult is how
+ * one of them quietly keeps calling it a plain failure. The cost is real and
+ * worth naming: FAILED and TIMED_OUT both collapse into `quarantined`, so the
+ * reporters cannot say which it was. None of the three formats has a word for
+ * "suppressed timeout" anyway, and all three carry the original message.
+ *
+ * The rule every format below obeys, and the only one that matters: a
+ * suppressed failure must NOT read as a pass, and must NOT read as a plain
+ * skip. Those are the two ways a team finds out in production that nothing has
+ * been tested for a month.
  */
-export type ReporterStatus = 'passed' | 'failed' | 'skipped' | 'flaky' | 'timedOut';
+export type ReporterStatus = 'passed' | 'failed' | 'skipped' | 'flaky' | 'timedOut' | 'quarantined';
+
+/**
+ * The sentence every format uses, verbatim, for a suppressed failure.
+ *
+ * One string so the three reporters cannot disagree about what quarantine
+ * means, and so the CLI's mirror (packages/cli/src/report.ts) has something
+ * exact to be byte-identical to. Transcribed from
+ * `GET /runs/:runId/junit.xml` in apps/api/src/routes/runs.ts, which is the
+ * shipped writer of the one output machines nobody here controls already parse.
+ *
+ * TODO(shared-types): this and `ReporterStatus` belong in
+ * packages/shared/src/types.ts next to `TestResultStatus`, so the API, the
+ * worker and both reporter implementations draw the wording from one place.
+ * That file is another agent's this wave — see the report.
+ */
+export const QUARANTINE_NOTE =
+  'QUARANTINED FAILURE — this test FAILED and its failure is suppressed by quarantine, ' +
+  'so it did not fail the build. It is not a skipped test: it ran, and it failed.';
 
 /** One executed test, as the run recorded it. */
 export interface ReportedTest {
@@ -76,9 +118,22 @@ export interface ReportedTest {
 export interface RunTotals {
   tests: number;
   passed: number;
+  /** Failures that GATE. A suppressed failure is not one of these. */
   failed: number;
   skipped: number;
   flaky: number;
+  /**
+   * Failures a quarantine in force suppressed — `Run.quarantinedFailedCount`.
+   *
+   * A FOURTH number, deliberately not a slice of `failed` and deliberately not
+   * folded into `skipped`: a deliberate skip and a failure somebody switched
+   * off are different facts (see packages/runner/src/gates.ts). Optional only
+   * because a caller holding a run finalised by an older worker genuinely does
+   * not have it; absent means "not measured", never zero. The JUnit reporter,
+   * which is the only reader of `RunTotals`, says what it does when it is
+   * missing.
+   */
+  quarantinedFailed?: number;
 }
 
 /** A finished run, in the only shape the reporters read. */
@@ -165,6 +220,14 @@ export function derivedTotals(tests: readonly ReportedTest[]): RunTotals {
     failed: count('failed') + count('timedOut'),
     skipped: count('skipped'),
     flaky: count('flaky'),
+    /*
+     * Its own column, so the five numbers still add up to `tests`:
+     * `passed + failed + flaky + skipped + quarantinedFailed === tests`, which
+     * is the invariant `tallyResult` maintains in gates.ts. Adding it to
+     * `failed` is the defect this wave closes; adding it to `skipped` is the
+     * same defect wearing a kinder word.
+     */
+    quarantinedFailed: count('quarantined'),
   };
 }
 

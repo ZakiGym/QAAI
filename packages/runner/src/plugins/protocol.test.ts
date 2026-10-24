@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SECRET_MASK } from '@qaai/shared';
 import type { ExecutableTest, RunContext, TestExecution } from '@qaai/shared';
 import { protocolPlugin } from './protocol.js';
+import { attachRunWorkspace } from '../run-workspace.js';
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
 
@@ -62,8 +63,17 @@ function makeTest(spec: unknown, name = 'protocol test'): ExecutableTest {
   };
 }
 
-function makeCtx(baseUrl: string, secrets: Record<string, string> = {}): RunContext {
-  return {
+/**
+ * `workspaceRoot` is the run's materialised repository, and it defaults to
+ * ABSENT: most protocol tests touch no file at all, and that has to keep working
+ * without a checkout. Only the gRPC schema paths need one — see the gRPC block.
+ */
+function makeCtx(
+  baseUrl: string,
+  secrets: Record<string, string> = {},
+  workspaceRoot: string | null = null,
+): RunContext {
+  const ctx: RunContext = {
     runId: 'run_1',
     orgId: 'org_1',
     projectId: 'proj_1',
@@ -92,6 +102,12 @@ function makeCtx(baseUrl: string, secrets: Record<string, string> = {}): RunCont
       retryOnce: false,
     },
   };
+  return attachRunWorkspace(
+    ctx,
+    workspaceRoot === null
+      ? null
+      : { root: workspaceRoot, source: 'acme/svc@main', fileCount: 4 },
+  );
 }
 
 /** Titles + statuses, which is what the cockpit renders. */
@@ -780,6 +796,85 @@ echo '{"status":"SERVING","details":{"uptime":42}}'
         'Expected gRPC status OK, got NOT_FOUND (account not found)',
       );
       expect(execution.network[0]?.status).toBe(5);
+    });
+
+    /*
+     * ── Where a proto comes from ────────────────────────────────────────────
+     *
+     * `-proto` and `-import-path` resolved against `process.cwd()` — QAAI's own
+     * checkout — so the customer's `proto/orders.proto` was unopenable, and a
+     * name that happened to exist in OUR tree got compiled and called against
+     * THEIR service. The stub records its argv, so these assert on the exact
+     * paths the plugin hands grpcurl.
+     */
+    it('resolves -proto and -import-path inside the materialised repository', async () => {
+      const repo = await mkdtemp(join(tmpdir(), 'qaai-grpc-repo-'));
+      try {
+        const execution = await protocolPlugin.execute(
+          makeCtx('http://svc.internal:50051', {}, repo),
+          makeTest({
+            protocol: 'GRPC',
+            plaintext: true,
+            protoPath: 'proto/health.proto',
+            importPaths: ['proto'],
+            calls: [{ name: 'health', method: 'grpc.health.v1.Health/Check' }],
+          }),
+        );
+
+        expect(execution.status).toBe('PASSED');
+        const argv = (await readFile(argsFile, 'utf8')).trimEnd().split('\n');
+        expect(argv).toContain(join(repo, 'proto'));
+        expect(argv).toContain(join(repo, 'proto', 'health.proto'));
+        // The old behaviour, pinned as absent: nothing is resolved against the
+        // worker's own directory any more.
+        expect(argv.some((arg) => arg.startsWith(process.cwd()))).toBe(false);
+      } finally {
+        await rm(repo, { recursive: true, force: true });
+      }
+    });
+
+    it('is not evaluated when a proto is named and there is no checkout', async () => {
+      const execution = await protocolPlugin.execute(
+        makeCtx('http://svc.internal:50051'),
+        makeTest({
+          protocol: 'GRPC',
+          plaintext: true,
+          protoPath: 'proto/health.proto',
+          calls: [{ name: 'health', method: 'grpc.health.v1.Health/Check' }],
+        }),
+      );
+
+      // SKIPPED, with both ways out named, and nothing spawned.
+      expect(execution.status).toBe('SKIPPED');
+      expect(execution.errorMessage).toMatch(/no checkout of it/);
+      expect(execution.errorMessage).toContain('proto/health.proto');
+      expect(execution.errorMessage).toMatch(/reflection/);
+      expect(execution.steps.some((step) => step.status === 'FAILED')).toBe(false);
+    });
+
+    /*
+     * A drive letter, because `relativeFilePath` already refuses `..` and a
+     * leading `/`: on POSIX `C:\…` is a plain relative name, so the schema lets
+     * it through and the runtime guard is what has to catch it.
+     */
+    it('fails, rather than skips, on a proto path outside the repository', async () => {
+      const repo = await mkdtemp(join(tmpdir(), 'qaai-grpc-repo-'));
+      try {
+        const execution = await protocolPlugin.execute(
+          makeCtx('http://svc.internal:50051', {}, repo),
+          makeTest({
+            protocol: 'GRPC',
+            plaintext: true,
+            protoPath: 'C:\\proto\\health.proto',
+            calls: [{ name: 'health', method: 'grpc.health.v1.Health/Check' }],
+          }),
+        );
+
+        expect(execution.status).toBe('FAILED');
+        expect(execution.errorMessage).toMatch(/not a path inside the repository/);
+      } finally {
+        await rm(repo, { recursive: true, force: true });
+      }
     });
 
     it("reads grpcurl's Go-style status names as wire names", async () => {

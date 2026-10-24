@@ -81,6 +81,21 @@ const TEST_SELECT = {
   feature: true,
   priority: true,
   type: true,
+  /*
+   * The role each test runs as. Read here because the analysis cannot see it
+   * any other way: a test bound to an auth profile has NO sign-in anywhere in
+   * its source — the runner injects the profile's storageState before the first
+   * navigation — so the heuristic that reads the code for a login finds nothing
+   * and reports the test as a signed-out visitor.
+   *
+   * Leaving these two columns out of this select is what made the
+   * UNREACHED_AUTH_ROUTE gap a loop: the gap asked for an authenticated test,
+   * the test was written and bound and passed, and the next analysis reported
+   * the same gap because the only evidence that the test signs in was a column
+   * nobody selected.
+   */
+  authProfileId: true,
+  authProfileRequired: true,
 } as const;
 
 type TestRow = {
@@ -93,6 +108,8 @@ type TestRow = {
   feature: string | null;
   priority: string;
   type: string;
+  authProfileId: string | null;
+  authProfileRequired: boolean;
 };
 
 /**
@@ -124,6 +141,8 @@ export function toCoverageInputs(tests: TestRow[]): CoverageTestInput[] {
       routes: [...routes],
       code: test.code,
       coverageTruncated: truncation.truncated,
+      authProfileId: test.authProfileId,
+      authProfileRequired: test.authProfileRequired,
     };
   });
 }
@@ -162,13 +181,39 @@ async function coverageFor(projectId: string, limit?: number): Promise<ProjectCo
     prisma.flowMap.findFirst({
       where: { projectId: project.id },
       orderBy: { version: 'desc' },
-      select: { id: true, graph: true, version: true },
+      select: { id: true, graph: true, version: true, environmentId: true },
     }),
   ]);
+
+  /*
+   * The roles a generated test could assume, read from THE ENVIRONMENT THIS
+   * CRAWL CAME FROM and not from the project.
+   *
+   * That distinction is the whole correctness of it: an auth profile holds a
+   * session minted against one environment's base URL, and a test proposed from
+   * a staging crawl must be offered staging's profiles. Taking every profile in
+   * the project would let a gap found in staging propose a test signed in with
+   * production's session.
+   *
+   * An empty list is an ordinary input, not a failure: the analysis then reports
+   * each auth gap as unclosable and names the missing setup, which is a true
+   * statement the customer can act on. Nothing is invented to fill it.
+   */
+  const authProfiles = flowMap
+    ? await prisma.authProfile.findMany({
+        where: { environmentId: flowMap.environmentId },
+        orderBy: { name: 'asc' },
+        // Id and name only. Choosing which role a test assumes needs neither
+        // the config nor the live storageState, and both of those are
+        // secret-adjacent values that would end up inside gap evidence.
+        select: { id: true, name: true, kind: true },
+      })
+    : [];
 
   const report = analyzeCoverage({
     flowMapGraph: flowMap?.graph ?? null,
     tests: toCoverageInputs(tests),
+    authProfiles,
     ...(limit === undefined ? {} : { limit }),
   });
 

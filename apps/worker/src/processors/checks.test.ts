@@ -145,13 +145,32 @@ function installFetch(): void {
 
 // ─── The run this processor reads ────────────────────────────────────────────
 
+/** The two quarantine columns, as the database holds them for one test. */
+interface QuarantineColumns {
+  quarantined: boolean;
+  /** Null means "never expires" — a quarantine written before expiry existed. */
+  quarantineExpiresAt: Date | null;
+}
+
+const NOT_QUARANTINED: QuarantineColumns = { quarantined: false, quarantineExpiresAt: null };
+
 interface RunOver {
   status?: string;
   passedCount?: number;
   failedCount?: number;
+  /**
+   * `Run.quarantinedFailedCount` — the FOURTH counter, not a slice of
+   * `failedCount`. Defaulted to 0 rather than left absent, because absent is
+   * what an older worker's run looks like and `suppressedFailuresIn` has a
+   * separate fallback for that; a fixture that never sets it would test the
+   * fallback forever and never the column.
+   */
+  quarantinedFailedCount?: number;
   gateResult?: unknown;
   prNumber?: number | null;
   failures?: number;
+  /** Per failing test, index-aligned with the generated failures. */
+  quarantine?: QuarantineColumns[];
 }
 
 function runRow(over: RunOver = {}) {
@@ -164,6 +183,7 @@ function runRow(over: RunOver = {}) {
     passedCount: over.passedCount ?? 9,
     failedCount: over.failedCount ?? failures,
     flakyCount: 0,
+    quarantinedFailedCount: over.quarantinedFailedCount ?? 0,
     totalCount: 10,
     errorMessage: null,
     gateResult: over.gateResult ?? null,
@@ -179,6 +199,7 @@ function runRow(over: RunOver = {}) {
         name: `Checkout completes ${i}`,
         filePath: `tests/checkout-${i}.spec.ts`,
         code: null,
+        ...(over.quarantine?.[i] ?? NOT_QUARANTINED),
       },
       verdict: null,
       steps: [],
@@ -189,13 +210,47 @@ function runRow(over: RunOver = {}) {
 /** Records what the processor asked the database for, so scoping is assertable. */
 const runFindFirstArgs: Array<{ where: { id: string; orgId: string } }> = [];
 
+/**
+ * Project a fixture row through the `select` the processor actually asked for,
+ * recursively, the way Prisma does.
+ *
+ * This is not tidiness. The fake used to hand back the whole fixture whatever
+ * the query said, and a fake that shrugs at a missing `select` cannot fail the
+ * test that proves the `select` is there — which is exactly how the original
+ * defect survived: `quarantinedFailedCount` and the test's two quarantine
+ * columns were simply never read, every consumer silently fell back to
+ * inference, and nothing anywhere went red. Deleting a field from `loadRun`
+ * now makes it `undefined` here, as it would in production.
+ *
+ * The nested `where`/`orderBy`/`take` are deliberately NOT applied: `runRow`
+ * supplies exactly the rows those filters would select, so applying them would
+ * only be a second implementation of the fixture.
+ */
+type Select = Record<string, unknown>;
+
+function applySelect(value: unknown, select: Select | undefined): unknown {
+  if (!select || value === null || value === undefined) return value;
+  if (Array.isArray(value)) return value.map((entry) => applySelect(entry, select));
+
+  const out: Record<string, unknown> = {};
+  for (const [key, want] of Object.entries(select)) {
+    const held = (value as Record<string, unknown>)[key];
+    if (want === true) out[key] = held;
+    else if (want && typeof want === 'object') {
+      out[key] = applySelect(held, (want as { select?: Select }).select);
+    }
+  }
+  return out;
+}
+
 function usePrisma(row: ReturnType<typeof runRow> | null): void {
   h.prisma = {
     run: {
-      findFirst: async (args: { where: { id: string; orgId: string } }) => {
+      findFirst: async (args: { where: { id: string; orgId: string }; select?: Select }) => {
         runFindFirstArgs.push(args);
         if (!row) return null;
-        return args.where.id === row.id && args.where.orgId === ORG ? row : null;
+        if (args.where.id !== row.id || args.where.orgId !== ORG) return null;
+        return applySelect(row, args.select);
       },
     },
     healProposal: { findMany: async () => [] },
@@ -511,5 +566,136 @@ describe('the body', () => {
     expect(body).toContain('too long to fit in a comment');
     expect(body).toContain(PR_COMMENT_MARKER);
     expect(body).not.toContain('<details');
+  });
+});
+
+// ─── Quarantine: the fields are the source, not the arithmetic ───────────────
+
+/**
+ * The producer's half of the quarantine fix.
+ *
+ * `apps/api/src/lib/github-app.ts` already knew how to label a suppressed
+ * failure and how to keep a quarantine-only run out of the red — it just had
+ * nothing to read. This file selected neither `Run.quarantinedFailedCount` nor
+ * the test's two quarantine columns, so every surface fell back to inferring
+ * the suppressed count by subtracting `failedCount` from the number of
+ * FAILED/TIMED_OUT rows it happened to be handed. That subtraction is exact
+ * only while the `results.where` above matches the counters exactly, and it
+ * can say nothing at all about WHICH test was suppressed.
+ *
+ * So these three tests are about provenance, and each one fails in a different
+ * way if a field stops being selected:
+ *
+ *   • per-failure labelling needs `quarantined` on the test row;
+ *   • an expired quarantine needs `quarantineExpiresAt` beside it, and
+ *     `quarantineSuppresses` rather than the raw flag;
+ *   • the run-level count needs the column, which is why the fixture makes the
+ *     column and the subtraction DISAGREE.
+ */
+describe('a check for a run with a quarantined failure', () => {
+  const completedCheck = () =>
+    gh.calls.find((c) => c.path.includes('/check-runs') && c.body?.status === 'completed')?.body ??
+    null;
+
+  it('names the suppressed test rather than reporting a bare count', async () => {
+    /*
+     * Two failures, one of them suppressed: the run's own counters say one
+     * failure gates and one was quarantined. A reviewer has to be able to tell
+     * WHICH, and a count cannot.
+     */
+    usePrisma(
+      runRow({
+        failures: 2,
+        failedCount: 1,
+        quarantinedFailedCount: 1,
+        quarantine: [{ quarantined: true, quarantineExpiresAt: null }, NOT_QUARANTINED],
+      }),
+    );
+
+    await complete();
+    const body = gh.comments[0]!.body;
+
+    // Both are listed — a failure dropped from the body is a failure nobody
+    // sees again — and exactly one carries the label.
+    expect(body).toContain('Checkout completes 0');
+    expect(body).toContain('Checkout completes 1');
+    expect(body.match(/quarantined, so it did not fail this check/g)).toHaveLength(1);
+    const labelled = body.slice(body.indexOf('### Checkout completes 0'));
+    expect(labelled.split('### Checkout completes 1')[0]).toContain('quarantined, so it did not');
+
+    // And it is reported as a FAILURE, never as a pass and never as a skip.
+    expect(body).toContain('1 quarantined and failing');
+    expect(body).toContain('They are still failing');
+  });
+
+  it('does not hold the merge when every failure was suppressed', async () => {
+    usePrisma(
+      runRow({
+        status: 'PASSED',
+        failures: 1,
+        failedCount: 0,
+        quarantinedFailedCount: 1,
+        quarantine: [{ quarantined: true, quarantineExpiresAt: null }],
+      }),
+    );
+
+    await complete();
+
+    // `neutral`, not `success`: GitHub does not block on it, and the failure
+    // stays visible. Green over a failure somebody switched off is the lie.
+    expect(completedCheck()?.conclusion).toBe('neutral');
+    expect(gh.comments[0]!.body).toContain('1 quarantined and failing');
+  });
+
+  it('gates again once the quarantine has run out', async () => {
+    /*
+     * The flag is STILL TRUE — expiry deliberately does not clear it, so the
+     * reason survives — and the expiry is yesterday. Reading the flag raw here
+     * would label this failure as suppressed and let the check go neutral over
+     * a test that is gating again, which is the quietest possible way to lose
+     * a real failure.
+     */
+    usePrisma(
+      runRow({
+        failures: 1,
+        failedCount: 1,
+        quarantinedFailedCount: 0,
+        quarantine: [
+          { quarantined: true, quarantineExpiresAt: new Date(Date.now() - 86_400_000) },
+        ],
+      }),
+    );
+
+    await complete();
+    const body = gh.comments[0]!.body;
+
+    expect(completedCheck()?.conclusion).toBe('failure');
+    expect(body).not.toContain('quarantined, so it did not fail this check');
+    expect(body).not.toContain('quarantined and failing');
+  });
+
+  it('reports the run’s own suppressed count, not one inferred from the rows it read', async () => {
+    /*
+     * The drift, made to happen. The run counted three suppressed failures;
+     * the `results` filter put ONE of them in front of this processor — which
+     * is what a shard-scoped or status-narrowed `where` produces. Subtracting
+     * `failedCount` from the rows in hand would answer 1, and the per-failure
+     * flags would also answer 1. Only the column answers 3, and 3 is the
+     * number that is true about the run.
+     */
+    usePrisma(
+      runRow({
+        status: 'PASSED',
+        failures: 1,
+        failedCount: 0,
+        quarantinedFailedCount: 3,
+        quarantine: [{ quarantined: true, quarantineExpiresAt: null }],
+      }),
+    );
+
+    await complete();
+
+    expect(gh.comments[0]!.body).toContain('3 quarantined and failing');
+    expect(gh.comments[0]!.body).toContain('3 failing test(s) are quarantined');
   });
 });

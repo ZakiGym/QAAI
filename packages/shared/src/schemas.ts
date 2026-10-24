@@ -362,6 +362,22 @@ const relativeFilePath = z
   .max(300)
   .refine((p) => !p.includes('..') && !p.startsWith('/'), 'must be relative and cannot contain ..');
 
+/**
+ * An AuthProfile id, as a test's role binding (§2).
+ *
+ * `null` is a legitimate value and not a missing one: most tests have no
+ * business signing in, and the API must be able to say "this test is
+ * anonymous" as distinctly as it says "this test is the admin". So the field is
+ * NULLABLE everywhere it appears, and on `updateTestSchema` it is additionally
+ * OPTIONAL — omitting it leaves the binding alone, while sending `null`
+ * deliberately clears it. Collapsing those two into one would make every save
+ * from a client that predates this field silently un-bind the test.
+ *
+ * Bounded rather than open: the value is a cuid the API looks up, and a
+ * megabyte of string in a `where` clause is not a lookup.
+ */
+const authProfileId = z.string().min(1).max(64);
+
 export const updateTestSchema = z.object({
   code: z.string().max(500_000),
   name: z.string().min(1).max(160).optional(),
@@ -369,6 +385,19 @@ export const updateTestSchema = z.object({
   spec: z.unknown().optional(),
   /** Shown in the version history. */
   message: z.string().max(300).optional(),
+  /**
+   * Re-bind, or clear, the role this test runs as. Omit to leave it as it is —
+   * see the note on `authProfileId` above.
+   */
+  authProfileId: authProfileId.nullable().optional(),
+  /**
+   * "This test is meaningless signed out." Stored separately from the binding
+   * so that deleting the profile (which nulls `authProfileId` by foreign key)
+   * cannot erase the fact that a role was asked for. A test left with
+   * `authProfileRequired: true` and no profile is reported as a broken binding
+   * rather than quietly running anonymously and passing.
+   */
+  authProfileRequired: z.boolean().optional(),
 });
 
 export const createTestSchema = z.object({
@@ -380,6 +409,10 @@ export const createTestSchema = z.object({
   filePath: relativeFilePath,
   spec: z.unknown().optional(),
   tags: z.array(z.string().max(40)).max(20).default([]),
+  /** The role this test runs as; null (the default) is anonymous. */
+  authProfileId: authProfileId.nullable().default(null),
+  /** See `updateTestSchema.authProfileRequired`. */
+  authProfileRequired: z.boolean().default(false),
 });
 
 /**

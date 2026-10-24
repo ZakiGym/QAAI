@@ -484,7 +484,10 @@ export async function installationToken(
   const token = pick(json, 'token');
   const expiresAt = pick(json, 'expires_at');
   if (typeof token !== 'string' || !token) {
-    throw new GithubAppError('GitHub returned an installation token QAAI could not read.', 'PROVIDER');
+    throw new GithubAppError(
+      'GitHub returned an installation token QAAI could not read.',
+      'PROVIDER',
+    );
   }
 
   const parsedExpiry = typeof expiresAt === 'string' ? Date.parse(expiresAt) : Number.NaN;
@@ -520,6 +523,15 @@ export interface CheckFailure {
   verdict: { verdict: string; confidence: number; explanation: string } | null;
   /** A heal proposal exists for this test — "with a fix proposed" is earned. */
   fixProposed: boolean;
+  /**
+   * Whether a quarantine in force suppressed this failure.
+   *
+   * Optional so the producer (apps/worker/src/processors/checks.ts, which this
+   * change does not own) compiles unchanged; `suppressedFailuresIn` falls back
+   * to the run counters when it is absent. When it IS supplied the check can
+   * label the individual test, which is strictly better than a count.
+   */
+  quarantined?: boolean;
 }
 
 export interface CheckEvidence {
@@ -535,6 +547,13 @@ export interface CheckEvidence {
     errorMessage: string | null;
     /** GateResult.passed === false: the gate is blocking this PR. */
     gateBlocking: boolean;
+    /**
+     * `Run.quarantinedFailedCount` — failures a quarantine suppressed.
+     *
+     * Optional only because the producer does not select it yet. See
+     * `suppressedFailuresIn` for the fallback and why the fallback is exact.
+     */
+    quarantinedFailedCount?: number;
   };
   environment: { name: string; kind: string } | null;
   failures: CheckFailure[];
@@ -604,12 +623,70 @@ export function summarizeTriage(failures: readonly CheckFailure[]): string {
 }
 
 export type CheckConclusion =
-  | 'success'
-  | 'failure'
-  | 'neutral'
-  | 'cancelled'
-  | 'timed_out'
-  | 'action_required';
+  'success' | 'failure' | 'neutral' | 'cancelled' | 'timed_out' | 'action_required';
+
+/**
+ * Which conclusions hold a merge.
+ *
+ * Exported so nothing has to re-derive it — including the tests, which is the
+ * point: the defect this file was part of was invisible precisely because every
+ * consumer decided red/green for itself. `neutral` is NOT here, deliberately:
+ * GitHub does not block on it, and it is what a visible-but-non-gating finding
+ * gets.
+ */
+export const BLOCKING_CONCLUSIONS: readonly CheckConclusion[] = [
+  'failure',
+  'timed_out',
+  'action_required',
+];
+
+/**
+ * How many of this run's failures a quarantine suppressed.
+ *
+ * ── Why the subtraction is exact, not a guess ───────────────────────────────
+ *
+ * `e.failures` is every result the producer found with a status of FAILED or
+ * TIMED_OUT — quarantined ones included, because it filters on the RESULT and
+ * knows nothing about the test's quarantine. `e.run.failedCount` is the run's
+ * own counter, which since this change counts only the failures that GATE.
+ * Both come off the same run row, so the difference is the suppressed set, to
+ * the row.
+ *
+ * `quarantinedFailedCount` is preferred when the producer supplies it, because
+ * a number that is READ cannot drift when somebody changes the producer's
+ * `where` clause, and a number that is INFERRED can. Clamped at zero: on a run
+ * finalised by an older worker the counter is 0 and `failedCount` still
+ * includes quarantined failures, which would make the subtraction negative, and
+ * a negative suppressed count must read as "none" rather than as news.
+ */
+export function suppressedFailuresIn(e: CheckEvidence): number {
+  if (typeof e.run.quarantinedFailedCount === 'number') {
+    return Math.max(0, e.run.quarantinedFailedCount);
+  }
+  const flagged = e.failures.filter((f) => f.quarantined === true).length;
+  if (flagged > 0) return flagged;
+  return Math.max(0, e.failures.length - e.run.failedCount);
+}
+
+/**
+ * The failures that actually gate — the ones a reviewer has to do something
+ * about. A quarantined failure is reported, never gated on.
+ */
+export function gatingFailures(e: CheckEvidence): CheckFailure[] {
+  if (e.failures.some((f) => f.quarantined === true)) {
+    return e.failures.filter((f) => f.quarantined !== true);
+  }
+  /*
+   * Without per-failure flags the only honest split is by count, and the ORDER
+   * matters: the producer sorts nothing, so "the last N are the quarantined
+   * ones" would be arbitrary. Taking the first `failedCount` is equally
+   * arbitrary — so when the counts disagree and no flags are present, the
+   * conclusion below uses the COUNT and this function returns everything, which
+   * keeps every failure visible in the body. A visible failure that does not
+   * gate is the correct outcome; an invisible one is the defect.
+   */
+  return [...e.failures];
+}
 
 /**
  * Which colour the merge box gets.
@@ -625,6 +702,23 @@ export type CheckConclusion =
  * `neutral` rather than `success` is deliberate. A flake is not a pass, and
  * showing green for one teaches people that green means nothing; neutral does
  * not block a merge but does keep the finding visible.
+ *
+ * ── Quarantine, which this function used to get wrong ───────────────────────
+ *
+ * It read `e.failures.length`, and the producer's `failures` list includes
+ * quarantined tests. So a run whose ONLY failing test was quarantined — a test
+ * the gate had already agreed to ignore and which had vanished from every gate
+ * rule — still came back `failure` and still held the merge. Quarantine
+ * suppressed the signal and left the gate in place.
+ *
+ * The gating failures are now counted off the run's own counter, which is the
+ * single source of truth (`runOutcome` in packages/runner/src/gates.ts writes
+ * the status from the same number). A run with nothing but suppressed failures
+ * is `neutral`, NOT `success`: it does not block a merge, and GitHub still
+ * shows the check with the failures named in its body. That is the same
+ * judgement this function already made about a flake, for the same reason —
+ * showing plain green over a failure somebody switched off is how a team
+ * discovers in production that nothing has been tested for a month.
  */
 export function conclusionFor(e: CheckEvidence): CheckConclusion {
   if (e.run.status === 'CANCELLED') return 'cancelled';
@@ -635,11 +729,19 @@ export function conclusionFor(e: CheckEvidence): CheckConclusion {
   if (e.run.gateBlocking) return 'failure';
   if (e.failures.length === 0) return 'success';
 
-  const actionable = e.failures.some(
-    (f) => !f.verdict || BLOCKING_VERDICTS.has(f.verdict.verdict),
-  );
+  const suppressed = suppressedFailuresIn(e);
+  const gating = Math.max(0, e.failures.length - suppressed);
+
+  /*
+   * Every failure there was, suppressed. Not green, not red: visible and
+   * non-blocking, with `summarizeTriage` naming them in the summary.
+   */
+  if (gating === 0) return 'neutral';
+
+  const candidates = gatingFailures(e);
+  const actionable = candidates.some((f) => !f.verdict || BLOCKING_VERDICTS.has(f.verdict.verdict));
   if (actionable) {
-    return e.failures.every((f) => f.status === 'TIMED_OUT') ? 'timed_out' : 'failure';
+    return candidates.every((f) => f.status === 'TIMED_OUT') ? 'timed_out' : 'failure';
   }
   return 'neutral';
 }
@@ -660,10 +762,24 @@ function fence(text: string): string[] {
 /** The check's title, summary and body. Pure, so the wording is testable. */
 export function buildCheckOutput(e: CheckEvidence): CheckOutput {
   const failures = e.failures;
+  /*
+   * The title counted `failures.length`, which includes quarantined tests, so
+   * a run whose only failing test was quarantined announced "1 failed" in the
+   * merge box of a PR the gate had already cleared. It now leads with the
+   * number that gates and says the suppressed ones out loud in the same breath
+   * — never one without the other, because "0 failed" over three suppressed
+   * failures is the reassuring lie this whole change exists to remove.
+   */
+  const suppressed = suppressedFailuresIn(e);
+  const gating = Math.max(0, failures.length - suppressed);
+  const quarantineNote = suppressed > 0 ? `${suppressed} quarantined and failing` : '';
+
   const title = (
-    failures.length === 0
-      ? `${e.run.passedCount} passed`
-      : `${failures.length} failed — ${summarizeTriage(failures)}`
+    gating === 0
+      ? [`${e.run.passedCount} passed`, quarantineNote].filter(Boolean).join(' · ')
+      : `${gating} failed — ${summarizeTriage(gatingFailures(e))}${
+          suppressed > 0 ? ` (plus ${quarantineNote})` : ''
+        }`
   ).slice(0, MAX_OUTPUT_TITLE);
 
   const summaryLines: string[] = [];
@@ -678,16 +794,33 @@ export function buildCheckOutput(e: CheckEvidence): CheckOutput {
     summaryLines.push('> **The quality gate is blocking this PR.**', '');
   }
   summaryLines.push(
-    `**${summarizeTriage(failures)}**`,
+    `**${summarizeTriage(gatingFailures(e))}**`,
     '',
     `| | |`,
     `|---|---|`,
-    `| Result | ${e.run.passedCount} passed · ${e.run.failedCount} failed · ${e.run.flakyCount} flaky · ${e.run.totalCount} total |`,
+    `| Result | ${e.run.passedCount} passed · ${e.run.failedCount} failed · ${e.run.flakyCount} flaky${
+      suppressed > 0 ? ` · ${suppressed} quarantined and failing` : ''
+    } · ${e.run.totalCount} total |`,
   );
   if (e.environment) {
-    summaryLines.push(`| Environment | ${cell(e.environment.name)} (${cell(e.environment.kind)}) |`);
+    summaryLines.push(
+      `| Environment | ${cell(e.environment.name)} (${cell(e.environment.kind)}) |`,
+    );
   }
   summaryLines.push(`| Commit | \`${cell(e.run.commitSha.slice(0, 7))}\` |`, '');
+  /*
+   * Stated in the summary, not only in the title, and stated as a FAILURE
+   * rather than as a skip. A quarantined test that failed is not a test that
+   * did not run; calling it one is the difference between a team that knows
+   * three of its checks are switched off and a team that finds out later.
+   */
+  if (suppressed > 0) {
+    summaryLines.push(
+      `_${suppressed} failing test(s) are quarantined, so they did not fail this check. They are ` +
+        `still failing — quarantine stops the gate, not the failure._`,
+      '',
+    );
+  }
   if (e.run.flakyCount > 0) {
     summaryLines.push(
       `_${e.run.flakyCount} test(s) passed only on retry and are counted as flaky._`,
@@ -698,7 +831,15 @@ export function buildCheckOutput(e: CheckEvidence): CheckOutput {
 
   const textLines: string[] = [];
   for (const f of failures.slice(0, MAX_ANNOTATIONS)) {
-    textLines.push(`### ${cell(f.test.name)}`, `\`${cell(f.test.filePath)}\` — ${cell(f.status)}`);
+    // EVERY failure is listed, suppressed ones included, and the suppressed
+    // ones are labelled. A failure left out of the body because it did not gate
+    // is a failure nobody will ever see again.
+    textLines.push(
+      `### ${cell(f.test.name)}`,
+      `\`${cell(f.test.filePath)}\` — ${cell(f.status)}${
+        f.quarantined === true ? ' · **quarantined, so it did not fail this check**' : ''
+      }`,
+    );
     if (f.verdict) {
       const label = VERDICT_LABEL[f.verdict.verdict] ?? f.verdict.verdict;
       textLines.push(
@@ -795,8 +936,18 @@ export function annotationLine(input: {
   return 1;
 }
 
-/** REAL_BUG and untriaged are failures; an explained failure is a warning. */
+/**
+ * REAL_BUG and untriaged are failures; an explained failure is a warning.
+ *
+ * A QUARANTINED failure is a warning however it was triaged. The annotation is
+ * the inline marker on the diff, and an error marker beside a line the gate has
+ * already agreed to ignore is the same contradiction the conclusion had: it
+ * tells the reviewer to act on something the build does not act on. It stays an
+ * annotation — downgraded, labelled, and never dropped — because a suppressed
+ * failure that is invisible is the defect, and only its SEVERITY is in question.
+ */
 function levelFor(f: CheckFailure): CheckAnnotation['annotation_level'] {
+  if (f.quarantined === true) return 'warning';
   if (!f.verdict) return 'failure';
   return BLOCKING_VERDICTS.has(f.verdict.verdict) ? 'failure' : 'warning';
 }
@@ -849,7 +1000,9 @@ export function buildAnnotations(e: CheckEvidence): CheckAnnotation[] {
         0,
         MAX_ANNOTATION_MESSAGE,
       ),
-      title: `${f.test.name} — ${f.status}`.slice(0, MAX_ANNOTATION_TITLE),
+      title: `${f.test.name} — ${f.status}${
+        f.quarantined === true ? ' (quarantined: this did not fail the check)' : ''
+      }`.slice(0, MAX_ANNOTATION_TITLE),
     });
   }
 
@@ -914,7 +1067,10 @@ export interface CreateParams extends CheckRunBody {
 function checkRunRef(json: unknown, what: string): CheckRunRef {
   const id = pick(json, 'id');
   if (typeof id !== 'number' || !Number.isInteger(id)) {
-    throw new GithubAppError(`GitHub accepted the check run but did not return its id (${what}).`, 'PROVIDER');
+    throw new GithubAppError(
+      `GitHub accepted the check run but did not return its id (${what}).`,
+      'PROVIDER',
+    );
   }
   const url = pick(json, 'html_url');
   return { id, url: typeof url === 'string' ? url : null };

@@ -30,10 +30,25 @@
  *    the whole run.
  *
  * The ONE deliberate difference from the route is documented on XML_ILLEGAL.
+ *
+ * ── Quarantine, which this file had fallen behind the route on ──────────────
+ *
+ * The route was changed to render a suppressed failure as `<skipped>` with a
+ * QUARANTINED FAILURE message, and to carry the run's suppression count in a
+ * `<properties>` block. This reporter was not, so it still rendered such a test
+ * as `<failure>` and emitted no properties at all — the two had silently
+ * stopped being the same bytes, and `reporters.test.ts` could not see it
+ * because its fixture model had no quarantine in it. Both are brought back into
+ * line here, and the oracle in that file is re-transcribed from the route.
+ *
+ * Nothing in production called this reporter while the two disagreed (the CLI's
+ * `--reporter junit` fetches the route; checked: no other caller), so the
+ * divergence cost nobody a build — which is exactly how long a parity test with
+ * a blind spot takes to be noticed.
  */
 
 import type { Reporter, ReportedTest, ReporterDocument, ReporterFile, RunReport } from './types.js';
-import { durationOf, suiteNameOf, totalsOf } from './types.js';
+import { QUARANTINE_NOTE, durationOf, suiteNameOf, totalsOf } from './types.js';
 
 /** Exactly the route's map, applied in exactly its single pass. */
 const ENTITIES: Record<string, string> = {
@@ -84,19 +99,76 @@ function renderCase(test: ReportedTest): string {
   const time = timeAttr(test);
   if (test.status === 'passed') return `    <testcase name="${name}"${time}/>`;
   if (test.status === 'skipped') return `    <testcase name="${name}"${time}><skipped/></testcase>`;
+
+  /*
+   * A suppressed failure, in the only two elements JUnit gives us.
+   *
+   * `<skipped>` is the single element in this format that means "do not fail
+   * the build on this", so it is the only one that can express a quarantine at
+   * all — and on its own it would be indistinguishable from a deliberate skip,
+   * which is the same defect wearing a kinder word. So the MESSAGE carries the
+   * whole truth, opens by saying the test failed, and is repeated in
+   * `<system-out>` because several CIs render the system output and not the
+   * skip reason.
+   *
+   * Transcribed from `GET /runs/:runId/junit.xml` in apps/api/src/routes/runs.ts
+   * — including the `escapeXml` applied to the joined string rather than to the
+   * message alone, which is what the route does — because these bytes are
+   * parsed by builds nobody here controls and there is exactly one writer of
+   * them. `reporters.test.ts` asserts the two agree over every fixture.
+   */
+  if (test.status === 'quarantined') {
+    const why = escapeXml(`${QUARANTINE_NOTE} ${test.message ?? 'failed'}`);
+    return (
+      `    <testcase name="${name}"${time}>` +
+      `<skipped message="${why}"/>` +
+      `<system-out>${why}</system-out>` +
+      `</testcase>`
+    );
+  }
+
   return `    <testcase name="${name}"${time}><failure message="${escapeXml(
     test.message ?? 'failed',
   )}"/></testcase>`;
 }
 
+/**
+ * The run-level suppression count, as a `<properties>` block.
+ *
+ * Properties are part of the format every parser already walks; a non-standard
+ * attribute on `<testsuite>` is the kind of thing a strict reader rejects, and
+ * a JUnit file one CI refuses to parse is worse than one that undercounts. Two
+ * numbers, because they answer different questions and can legitimately differ
+ * on a sharded run: how many the RUN suppressed, and how many are in THIS
+ * document.
+ *
+ * When the caller supplied totals without `quarantinedFailed` — a run finalised
+ * by an older worker — the run-level number falls back to this document's own
+ * count rather than printing a 0 the document directly contradicts.
+ */
+function propertiesBlock(report: RunReport, inDocument: number): string {
+  const totals = totalsOf(report);
+  const run = typeof totals.quarantinedFailed === 'number' ? totals.quarantinedFailed : inDocument;
+  return (
+    `    <properties>\n` +
+    `      <property name="qaai.quarantinedFailures" value="${run}"/>\n` +
+    `      <property name="qaai.quarantinedFailuresInThisDocument" value="${inDocument}"/>\n` +
+    `    </properties>`
+  );
+}
+
 export function renderJUnitXml(report: RunReport): string {
   const totals = totalsOf(report);
   const cases = report.tests.map(renderCase).join('\n');
+  const properties = propertiesBlock(
+    report,
+    report.tests.filter((t) => t.status === 'quarantined').length,
+  );
   return (
     `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="${escapeXml(
       suiteNameOf(report),
     )}" tests="${totals.tests}" failures="${totals.failed}" skipped="${totals.skipped}">\n` +
-    `${cases}\n  </testsuite>\n</testsuites>\n`
+    `${properties}\n${cases}\n  </testsuite>\n</testsuites>\n`
   );
 }
 

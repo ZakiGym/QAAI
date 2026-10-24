@@ -31,12 +31,21 @@
  * per provider (see `deviceFarmHub`) so a spec can never redirect an access key
  * to a host it names. CLI drivers are spawned WITHOUT a shell with args as an
  * array — a spec is org-authored data, and `shell: true` would make it RCE.
+ *
+ * Where the CLI drivers run: the run's MATERIALISED REPOSITORY, never
+ * `process.cwd()`. All four build out of a checkout — a flow file, a Gradle
+ * project, an .xcodeproj — and resolving those against the worker's own
+ * directory meant QAAI's checkout: a flow "not found", `gradlew` hunted for in
+ * our tree, and a `reportPath` matching something of ours read back as the
+ * customer's report. Without a checkout they are SKIPPED, by the same rule as
+ * every other gap here. APPIUM is the exception and needs none: its app is
+ * resolved by the Appium server on its own machine.
  */
 
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { MOBILE_DRIVERS, createMasker, maskDeep, mobileTestSpecSchema } from '@qaai/shared';
 import type {
   AppiumMobileSpec,
@@ -58,6 +67,7 @@ import type {
 } from '@qaai/shared';
 import { parseReport, summariseReport, toStepResults } from '../reports/index.js';
 import { childEnv } from '../child-env.js';
+import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 import type { ParsedReport, ReportTest } from '../reports/index.js';
 
 /** Per-stream capture cap, matching the CLI and external plugins. */
@@ -92,15 +102,40 @@ function errnoOf(err: unknown): string | null {
   return typeof code === 'string' ? code : null;
 }
 
-/** Guard: a spec-supplied path must stay inside the run workspace. */
+/**
+ * Guard: a spec-supplied path must stay inside the run workspace.
+ *
+ * Delegates to the one shared guard rather than repeating it — that version
+ * also refuses Windows separators and drive letters, which this did not. It
+ * still THROWS, because every caller is a plan builder whose throw the plugin
+ * turns into a FAILED result naming the path: a path that leaves the repository
+ * is a broken spec, not an environment gap, and a SKIP would not block a gate.
+ *
+ * The root is checked as well: `resolve('')` is `process.cwd()`, so an empty or
+ * relative workspace root would resolve straight back into QAAI's own checkout,
+ * which is the defect this change exists to remove.
+ */
 function safeWorkspacePath(workspace: string, relPath: string): string {
-  if (isAbsolute(relPath)) throw new Error(`"${relPath}" must be relative to the workspace`);
-  const full = resolve(join(workspace, relPath));
-  const root = resolve(workspace);
-  if (full !== root && !full.startsWith(root + sep)) {
-    throw new Error(`"${relPath}" escapes the workspace`);
-  }
+  const full =
+    workspace && isAbsolute(workspace) ? resolveInsideWorkspace(workspace, relPath) : null;
+  if (full === null) throw new Error(`"${relPath}" is not a path inside the repository`);
   return full;
+}
+
+/**
+ * The directory a tool RUNS in, which is the one path that may legally be the
+ * workspace root itself — `cwd` defaults to `'.'`, and the shared guard refuses
+ * the root because every other caller is naming a file. Separate function so
+ * that exception is stated once, here, instead of being smuggled into the guard.
+ */
+function workDirInside(workspace: string, relPath: string): string {
+  if (relPath === '' || relPath === '.') {
+    if (!workspace || !isAbsolute(workspace)) {
+      throw new Error('the run workspace is not an absolute path');
+    }
+    return resolve(workspace);
+  }
+  return safeWorkspacePath(workspace, relPath);
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -1246,12 +1281,20 @@ function runTool(
  * reason `visual-services.ts` gives: npx hides a missing dependency behind its
  * own exit 1, and on a machine with a network it will install the package
  * mid-run, which is not a thing a test may do.
+ *
+ * The walk STOPS AT THE WORKSPACE ROOT. It used to climb past it, and with the
+ * old `process.cwd()` base that meant it climbed QAAI's own tree and could
+ * return QAAI's `node_modules/.bin/detox` — a binary from our repository,
+ * running as the customer's test tool. Above the root there is nothing that
+ * belongs to this run, so there is nothing up there worth finding.
  */
-function resolveLocalBin(cwd: string, bin: string): string | null {
+function resolveLocalBin(workspace: string, cwd: string, bin: string): string | null {
+  const root = resolve(workspace);
   let dir = resolve(cwd);
   for (;;) {
     const candidate = join(dir, 'node_modules', '.bin', bin);
     if (existsSync(candidate)) return candidate;
+    if (dir === root) return null;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;
@@ -1733,7 +1776,7 @@ function maestroPlan(spec: MaestroMobileSpec, workspace: string): CliPlan {
 function detoxPlan(spec: DetoxMobileSpec, workspace: string, cwd: string): CliPlan {
   const reportPath = spec.reportPath ? safeWorkspacePath(workspace, spec.reportPath) : null;
   return {
-    command: spec.command ?? resolveLocalBin(cwd, 'detox') ?? 'detox',
+    command: spec.command ?? resolveLocalBin(workspace, cwd, 'detox') ?? 'detox',
     args: spec.command
       ? spec.args
       : ['test', '--configuration', spec.configuration, ...spec.extraArgs],
@@ -1774,14 +1817,24 @@ function espressoPlan(spec: EspressoMobileSpec, workspace: string, cwd: string):
 
 function xcuitestPlan(spec: XcuitestMobileSpec, workspace: string): CliPlan {
   const reportPath = spec.reportPath ? safeWorkspacePath(workspace, spec.reportPath) : null;
+  /*
+   * `-workspace` and `-project` are spec-supplied paths that xcodebuild opens,
+   * and they were the two paths in this file that went through NO guard: passed
+   * through verbatim, they resolved against whatever cwd the tool ran in. Now
+   * they resolve against the repository root like every other path here (the
+   * rule stated above `maestroPlan`, which these two quietly broke), and a path
+   * that leaves it throws rather than being handed to xcodebuild.
+   */
+  const project = spec.project ? safeWorkspacePath(workspace, spec.project) : null;
+  const xcworkspace = spec.workspace ? safeWorkspacePath(workspace, spec.workspace) : null;
   return {
     command: spec.command ?? 'xcodebuild',
     args: spec.command
       ? spec.args
       : [
           'test',
-          ...(spec.workspace ? ['-workspace', spec.workspace] : []),
-          ...(spec.project ? ['-project', spec.project] : []),
+          ...(xcworkspace ? ['-workspace', xcworkspace] : []),
+          ...(project ? ['-project', project] : []),
           '-scheme',
           spec.scheme,
           '-destination',
@@ -1825,8 +1878,14 @@ export const mobilePlugin: RunnerPlugin = {
   async execute(ctx: RunContext, test: ExecutableTest): Promise<TestExecution> {
     const startedAt = Date.now();
     const spec = mobileTestSpecSchema.parse(test.spec);
-    const workspace = process.cwd();
 
+    /*
+     * APPIUM first, and deliberately before any workspace is resolved: it drives
+     * a server over HTTP and names its app through `capabilities`, which the
+     * server (or the device farm) resolves on its own machine. It touches no
+     * path on this worker, so requiring a checkout would refuse the one mobile
+     * route that genuinely does not need one.
+     */
     if (spec.driver === 'APPIUM') return runAppium(ctx, test, spec, startedAt);
 
     // XCUITest needs Xcode, and Xcode needs macOS. Answering that here rather
@@ -1841,10 +1900,37 @@ export const mobilePlugin: RunnerPlugin = {
       });
     }
 
+    /*
+     * ── Where the four CLI drivers run, and the defect that was ──────────────
+     *
+     * `const workspace = process.cwd()` — QAAI's own checkout on the worker. So
+     * every spec-supplied path in this plugin resolved against OUR tree:
+     * `flowPath` named a Maestro flow we do not have (file not found, filed as
+     * a mobile test result), `gradlew` was looked for in our repository, and a
+     * `reportPath` that happened to match something of ours was READ AS THE
+     * CUSTOMER'S REPORT. All four of these drivers run a build out of a
+     * checkout — a flow file, a Gradle project, an .xcodeproj — so without one
+     * there is nothing to run.
+     *
+     * SKIPPED, with the thing to configure: no connected repository is a
+     * configuration gap, and this plugin's whole discipline (see the header) is
+     * that an environment gap is never reported as a broken app.
+     */
+    const workspace = runWorkspaceOf(ctx);
+    if (!workspace) {
+      const recorder = new StepRecorder(ctx, test.id);
+      return finish(test, startedAt, recorder, ctx.secrets, [], {
+        status: 'SKIPPED',
+        errorMessage: `${spec.driver} runs your project — a flow file, a Gradle build, an Xcode project — and this run has no checkout of your repository, so "${test.name}" was not evaluated rather than reporting a missing-file error as a test result. Connect the project to its repository (Project settings → Repository) and re-run.`,
+      });
+    }
+
     let cwd: string;
     try {
-      cwd = safeWorkspacePath(workspace, spec.cwd);
+      cwd = workDirInside(workspace.root, spec.cwd);
     } catch (err) {
+      // FAILED, not SKIPPED: a cwd that leaves the repository is a broken spec,
+      // and a skip does not block a gate.
       const recorder = new StepRecorder(ctx, test.id);
       return finish(test, startedAt, recorder, ctx.secrets, [], {
         status: 'FAILED',
@@ -1856,12 +1942,12 @@ export const mobilePlugin: RunnerPlugin = {
     try {
       plan =
         spec.driver === 'MAESTRO'
-          ? maestroPlan(spec, workspace)
+          ? maestroPlan(spec, workspace.root)
           : spec.driver === 'DETOX'
-            ? detoxPlan(spec, workspace, cwd)
+            ? detoxPlan(spec, workspace.root, cwd)
             : spec.driver === 'ESPRESSO'
-              ? espressoPlan(spec, workspace, cwd)
-              : xcuitestPlan(spec, workspace);
+              ? espressoPlan(spec, workspace.root, cwd)
+              : xcuitestPlan(spec, workspace.root);
     } catch (err) {
       // A path that escapes the workspace is a spec bug, and naming it is more
       // use than letting the tool fail on a path it should never have seen.

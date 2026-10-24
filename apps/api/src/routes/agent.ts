@@ -10,7 +10,8 @@
 import { Router } from 'express';
 import { QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
 import type { TestType } from '@qaai/shared';
-import { applyHealDiff, canScaffoldWithoutModel } from '@qaai/agent';
+import { applyHealDiff, canScaffoldWithoutModel, postCheckCode } from '@qaai/agent';
+import type { PostCheck } from '@qaai/agent';
 import { prisma } from '../lib/prisma.js';
 import { env } from '../env.js';
 import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
@@ -276,6 +277,32 @@ agentRouter.post('/verdicts/:verdictId/review', requireRole('MEMBER'), async (re
 // ─── Heals (§3.4) ────────────────────────────────────────────────────────────
 
 /**
+ * The version-history message for an applied heal.
+ *
+ * Capped, because this is a database column and three long gate sentences plus
+ * a model explanation will overrun any sensible display. The ORDER is the
+ * point: what the heal claims to do, then anything nobody could verify, then
+ * what the gates found, then which gates ran at all. A reader scanning history
+ * after a suite quietly stopped asserting anything needs the last two most, and
+ * they are the two that did not exist before.
+ */
+function healVersionMessage(
+  explanation: string,
+  unverified: string | undefined,
+  check: PostCheck,
+): string {
+  return [
+    `Applied heal: ${explanation.slice(0, 200)}`,
+    unverified ? `unverified: ${unverified}` : null,
+    ...check.flags,
+    check.checks,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(' — ')
+    .slice(0, 2_000);
+}
+
+/**
  * Heal proposals for the review screen. Defaults to what needs a decision;
  * `?state=all` includes decided ones so the screen can show what happened.
  * The test's current code ships alongside each diff so the client can render a
@@ -288,7 +315,11 @@ agentRouter.get('/heals', async (req, res) => {
     orderBy: { createdAt: 'desc' },
     take: 50,
     include: {
-      test: { select: { id: true, name: true, filePath: true, code: true } },
+      // `type` and `spec` are here for the post-check gates: a spec-driven test
+      // keeps its assertions in the spec and its `code` is an inert pointer
+      // comment, so a gate handed the code alone would report a perfectly good
+      // API test as asserting nothing.
+      test: { select: { id: true, name: true, filePath: true, code: true, type: true, spec: true } },
     },
   });
 
@@ -296,19 +327,73 @@ agentRouter.get('/heals', async (req, res) => {
    * The patched result is computed here, with the same applier approval uses, so
    * the reviewer sees the real before/after and is told up front when a proposal
    * has gone stale — rather than finding out by clicking Approve.
+   *
+   * And then the SAME gates a generated test passes through are run over the
+   * patched file, because a heal writes code into the customer's repository
+   * exactly as the Generator does. `await Promise.all` rather than the plain
+   * `.map` this used to be: the gates are async. They are also cheap — the one
+   * live toolchain gate is an in-process TypeScript parse (single-digit
+   * milliseconds), and the rest are pure string analysis — so a page of 50
+   * heals is not materially slower than it was.
    */
-  const heals = rows.map((heal) => {
-    const applied = applyHealDiff(heal.test.code, heal.diff);
-    return {
-      ...heal,
-      preview: {
-        applies: applied.ok,
-        code: applied.code ?? null,
-        reason: applied.reason ?? null,
-        fuzz: applied.fuzz ?? null,
-      },
-    };
-  });
+  const heals = await Promise.all(
+    rows.map(async (heal) => {
+      // The file path is what resolves the assertion dialect, and the dialect is
+      // what makes the never-weaken guard bite outside JavaScript. Called without
+      // it, the guard falls back to a JS-only count — 0 before and 0 after in a Go
+      // or pytest repo, which is a guard that passes everything.
+      const applied = applyHealDiff(heal.test.code, heal.diff, { filePath: heal.test.filePath });
+      const check =
+        applied.ok && applied.code !== undefined
+          ? await postCheckCode({
+              code: applied.code,
+              filePath: heal.test.filePath,
+              testType: heal.test.type,
+              spec: heal.test.spec,
+            })
+          : null;
+
+      return {
+        ...heal,
+        preview: {
+          /*
+           * `applies` drives the Approve button, so a heal the gates refuse has
+           * to read as not-applicable here rather than as applicable-with-a-note.
+           * The only gate that refuses is SYNTAX: a patched file that does not
+           * parse would replace a test failing with a readable error by a file
+           * the runner cannot load, taking its siblings down with it. The decide
+           * route re-runs this check and 422s, so a client that ignores the flag
+           * still cannot apply it.
+           */
+          applies: applied.ok && (check === null || check.allowed),
+          code: applied.code ?? null,
+          reason: (check !== null && !check.allowed ? check.refusal : applied.reason) ?? null,
+          fuzz: applied.fuzz ?? null,
+          /**
+           * Present when the guard could not verify that the heal keeps the
+           * assertions — an unreadable file type. It is not a refusal, so the
+           * reviewer is the check; dropping it here would be the one case where
+           * "this heal applies cleanly" is shown to a human with no mention that
+           * nothing checked whether it still asserts anything.
+           */
+          review: applied.review ?? null,
+          /**
+           * What the gates found in the patched file: a fixed sleep, a brittle
+           * locator, a QAAI import, a test that now asserts nothing. These are
+           * flags and not refusals because a heal fixes a test that is currently
+           * red — and this reviewer is the human the flag is addressed to.
+           */
+          flags: check?.flags ?? [],
+          /**
+           * …and which checks ran, so the screen can never imply a check that
+           * did not happen. This path has no repository checkout, so typecheck,
+           * formatting and lint are among the ones that did not.
+           */
+          checks: check?.checks ?? null,
+        },
+      };
+    }),
+  );
 
   res.json({ heals });
 });
@@ -319,7 +404,8 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
 
   const heal = await prisma.healProposal.findUnique({
     where: { id: String(req.params.healId) },
-    include: { test: { select: { id: true, code: true } } },
+    // `type` and `spec` for the post-check gates; see the list route above.
+    include: { test: { select: { id: true, code: true, filePath: true, type: true, spec: true } } },
   });
   if (!heal) throw notFound('Heal proposal');
   if (heal.state !== 'PROPOSED') throw conflict(`This heal was already ${heal.state}`);
@@ -343,9 +429,32 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
    * refused with a 422 rather than force-fitted; the proposal stays PROPOSED so
    * it can be re-run.
    */
-  const applied = applyHealDiff(heal.test.code, heal.diff);
+  // With the path, so the never-weaken guard runs in the test's own dialect
+  // rather than a JavaScript one. See the list route above.
+  const applied = applyHealDiff(heal.test.code, heal.diff, { filePath: heal.test.filePath });
   if (!applied.ok || !applied.code) {
     throw unprocessable(applied.reason ?? 'The diff could not be applied');
+  }
+
+  /*
+   * The same gates a generated test passes through, over the patched file.
+   *
+   * Only one of them refuses: a file that does not parse. A human clicking
+   * Approve is a check on whether the FIX is right, not on whether the file
+   * loads — nobody reads a diff and notices a missing brace — so this is not a
+   * decision to defer to them. Everything else (a fixed sleep, a brittle
+   * locator, a QAAI import, a test that now asserts nothing) is recorded and
+   * applied, because a heal fixes a test that is currently red and refusing it
+   * would leave the customer with a broken test and no proposal.
+   */
+  const check = await postCheckCode({
+    code: applied.code,
+    filePath: heal.test.filePath,
+    testType: heal.test.type,
+    spec: heal.test.spec,
+  });
+  if (!check.allowed) {
+    throw unprocessable(check.refusal ?? 'The patched file did not pass the post-heal checks');
   }
 
   const latest = await prisma.testVersion.findFirst({
@@ -359,8 +468,14 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
       where: { id: heal.testId },
       data: {
         code: applied.code,
-        // The Generator's review flags describe code a human has now signed off on.
-        reviewFlags: [],
+        /*
+         * The Generator's review flags described the code this heal just
+         * replaced, so they are stale — but clearing them to `[]` would also
+         * erase what the gates just found in the NEW code, and the badge would
+         * say "nothing to review" about a test that now contains a fixed sleep.
+         * So the row carries the current findings instead of none.
+         */
+        reviewFlags: check.flags,
         versions: {
           create: {
             orgId: actor.orgId,
@@ -368,7 +483,15 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
             code: applied.code,
             source: 'HEALER',
             authorId: actor.userId,
-            message: `Applied heal: ${heal.explanation.slice(0, 200)}`,
+            /**
+             * The review note rides along when the guard could not verify the
+             * assertion count, and so does the list of checks that ran. A human
+             * approved this, so neither is a refusal — but the version history
+             * is the only place those facts survive, and "who approved a heal
+             * nobody could check" is exactly the question asked after a suite
+             * quietly stops asserting anything.
+             */
+            message: healVersionMessage(heal.explanation, applied.review, check),
           },
         },
       },
@@ -384,15 +507,26 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
     action: 'heal.apply',
     targetType: 'HealProposal',
     targetId: heal.id,
-    metadata: { riskLevel: heal.riskLevel, testId: heal.testId, fuzz: applied.fuzz },
+    metadata: {
+      riskLevel: heal.riskLevel,
+      testId: heal.testId,
+      fuzz: applied.fuzz,
+      // Which gates ran and what they found, on the record. An audit row saying
+      // only "heal.apply" cannot answer "was this checked".
+      checks: check.checks,
+      flags: check.flags,
+    },
   });
 
   res.json({
     heal: updatedHeal,
-    note:
+    note: [
       applied.fuzz && applied.fuzz > 0
         ? `Applied, but the patch needed ${applied.fuzz} line(s) of fuzz — worth a glance in the editor.`
         : 'Applied to the test. Push it from Source control when you are ready.',
+      ...check.flags,
+      check.checks,
+    ].join(' '),
   });
 });
 

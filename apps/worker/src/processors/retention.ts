@@ -152,6 +152,41 @@ export const DEFAULT_GRACE_MS = envNumber('QAAI_RETENTION_GRACE_HOURS', 24) * 3_
  */
 export const DEFAULT_ACTIVE_TRIAGE_MS = envNumber('QAAI_RETENTION_TRIAGE_WINDOW_DAYS', 30) * 86_400_000;
 
+/**
+ * How long a surviving mutant's DETAIL is kept.
+ *
+ * A documented constant and deliberately NOT an env var: `scripts/check-wiring.ts`
+ * fails an undocumented one, and more to the point a retention window that
+ * differs per deployment is a window nobody can answer "when is it gone?" from.
+ * 90 days, chosen to match two things it must not outlive:
+ *
+ *   · `FLAKE_HISTORY_RETENTION_DAYS` (apps/worker/src/processors/flake.ts), the
+ *     other derived per-test history in this product.
+ *   · the longest retention any plan buys for the RESULTS these rows describe
+ *     (`RETENTION_DAYS.BUSINESS` in processors/run.ts; ENTERPRISE's 365 applies
+ *     to artifacts, which are the bytes rather than the measurement).
+ *
+ * WHAT THIS DOES NOT PRUNE, and the reason the number is defensible: the five
+ * `TestResult.mutation*` columns, which are the SCORE. Those live on a row
+ * nothing deletes, so the trend is permanent and only the per-mutant list ages
+ * out — and a survivor list is the half that goes stale on its own anyway, since
+ * "line 42 of src/cart.ts" stops being a task the moment that file is
+ * refactored. "Every survivor forever" would grow with the RUN RATE rather than
+ * with the suite: hourly CI over a 200-mutant module is millions of rows a year
+ * describing code that no longer exists.
+ */
+export const MUTATION_SURVIVOR_RETENTION_DAYS = 90;
+
+/**
+ * Rows deleted per tick by the survivor prune.
+ *
+ * Bounded like every other sweep here, and the same 5,000 `pruneFlakeHistory`
+ * uses. Whatever is left waits for the next tick: the table is already bounded
+ * by the per-result cap in processors/run.ts, so falling behind costs disk and
+ * never correctness.
+ */
+const MUTATION_SURVIVOR_PRUNE_LIMIT = 5_000;
+
 export const DEFAULT_BATCH_SIZE = envNumber('QAAI_RETENTION_BATCH_SIZE', 500);
 export const DEFAULT_MAX_BATCHES = envNumber('QAAI_RETENTION_MAX_BATCHES', 20);
 
@@ -997,6 +1032,96 @@ function summarise(r: SweepReport): string {
   return parts.join('; ');
 }
 
+// ─── Mutation survivors ──────────────────────────────────────────────────────
+
+export interface SurvivorPruneReport {
+  /** True only when the job asked AND `QAAI_RETENTION_APPLY` allows. */
+  applied: boolean;
+  requestedApply: boolean;
+  /** The cutoff, as a date, so a log line says what the window resolved to. */
+  olderThan: string;
+  /** Rows past the window this tick identified, capped by the prune limit. */
+  examined: number;
+  /** Rows actually deleted. Zero on a dry run, by construction. */
+  deleted: number;
+  /** The cap was reached, so there is more to do on the next tick. */
+  more: boolean;
+}
+
+/**
+ * Delete surviving-mutant rows past `MUTATION_SURVIVOR_RETENTION_DAYS`.
+ *
+ * ── Why this exists at all ──────────────────────────────────────────────────
+ *
+ * `MutationSurvivor` cascades from `TestResult`, and NOTHING in this product
+ * deletes a `TestResult` — the artifact sweep above deletes the bytes a run
+ * produced and leaves every row. So the cascade is not a retention policy, it
+ * is a cleanup that never fires, and without this the table is the one place in
+ * the schema that grows with the run rate for ever.
+ *
+ * ── Shaped like `pruneFlakeHistory`, deliberately ───────────────────────────
+ *
+ * Select the ids first, OLDEST FIRST, then `deleteMany` over that explicit list
+ * — `deleteMany` takes no LIMIT in Prisma, and a prune that falls behind has to
+ * make progress from the far end rather than nibble at a random slice. The same
+ * two moves the flake-trend prune makes, and the same reason the artifact sweep
+ * deletes over an id list rather than over a predicate.
+ *
+ * ── Dry run is still the default ────────────────────────────────────────────
+ *
+ * BOTH gates, like everything else in this module: the job has to ask and the
+ * deployment has to have said yes. A dry run reports what it WOULD delete and
+ * deletes nothing, so the first thing an operator sees is a count rather than a
+ * gap in the data. These rows are regenerable — the next mutation run rebuilds
+ * them — which is exactly why they do NOT get a weaker gate than the artifacts:
+ * one switch for "this worker may destroy customer data" is easier to reason
+ * about than two.
+ */
+export async function pruneMutationSurvivors(
+  opts: { now?: Date; apply?: boolean; limit?: number } = {},
+): Promise<SurvivorPruneReport> {
+  const now = opts.now ?? new Date();
+  const requestedApply = opts.apply === true;
+  const applied = requestedApply && APPLY_ENABLED;
+  const limit = Math.max(1, Math.min(opts.limit ?? MUTATION_SURVIVOR_PRUNE_LIMIT, 50_000));
+  const before = new Date(now.getTime() - MUTATION_SURVIVOR_RETENTION_DAYS * 86_400_000);
+
+  const doomed = await prisma.mutationSurvivor.findMany({
+    where: { createdAt: { lt: before } },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+    select: { id: true },
+  });
+
+  const report: SurvivorPruneReport = {
+    applied,
+    requestedApply,
+    olderThan: before.toISOString().slice(0, 10),
+    examined: doomed.length,
+    deleted: 0,
+    more: doomed.length === limit,
+  };
+  if (doomed.length === 0) return report;
+
+  if (!applied) {
+    logger.info(
+      { examined: report.examined, olderThan: report.olderThan, requestedApply },
+      'retention: would prune mutation survivors past their window (dry run)',
+    );
+    return report;
+  }
+
+  const gone = await prisma.mutationSurvivor.deleteMany({
+    where: { id: { in: doomed.map((row) => row.id) } },
+  });
+  report.deleted = gone.count;
+  logger.info(
+    { deleted: gone.count, olderThan: report.olderThan },
+    'retention: pruned mutation survivors past their window',
+  );
+  return report;
+}
+
 // ─── Queue wiring ────────────────────────────────────────────────────────────
 
 /**
@@ -1015,6 +1140,22 @@ export async function processRetentionTick(job: RetentionJob): Promise<void> {
     scanStray: job.scanStray === true,
     requestedBy: job.requestedBy ?? null,
   });
+
+  /*
+   * The survivor prune rides along, and NEVER throws into the tick: the
+   * artifact sweep is the expensive, irreversible part of this job and it has
+   * already finished by the time this runs. A housekeeping delete that failed
+   * must not turn a completed sweep into a failed job, which would re-run the
+   * whole thing. Same discipline as `pruneFlakeHistory` inside the flake tick.
+   *
+   * It is not org-scoped by `job.orgId`: the window is global and the rows carry
+   * no plan-dependent expiry, so a per-org sweep would prune a per-org slice of
+   * a global policy and leave every other org's rows for whenever someone next
+   * asks about them. The one thing it does honour is the apply gate.
+   */
+  await pruneMutationSurvivors({ apply: job.apply === true }).catch((err: unknown) =>
+    logger.warn({ err }, 'retention: could not prune mutation survivors; it will retry next tick'),
+  );
 }
 
 let retentionQueue: Queue | null = null;

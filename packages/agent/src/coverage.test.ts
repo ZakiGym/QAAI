@@ -20,13 +20,17 @@ import { describe, expect, it } from 'vitest';
 import { planItemSchema } from '@qaai/shared';
 import type { Selector } from '@qaai/shared';
 import {
+  MAX_BOUNDARY_CASES_PER_GAP,
   analyzeCoverage,
   assertsAFailure,
+  chooseAuthProfile,
+  expandNegativeCases,
   signsIn,
   canonicalRoute,
   planItemForGap,
   readCrawl,
   routeVisits,
+  type AuthProfileChoice,
   type CoverageGap,
   type CoverageTestInput,
 } from './coverage.js';
@@ -52,6 +56,8 @@ interface NodeOver {
   route: string;
   title?: string;
   behindAuth?: boolean;
+  /** The application's own word on who may see this state. */
+  requiresRoles?: string[];
   forms?: unknown[];
   affordances?: unknown[];
 }
@@ -63,7 +69,7 @@ function node(over: NodeOver): Record<string, unknown> {
     url: `https://shop.test${over.route}`,
     title: over.title ?? over.route,
     stateKey: 'default',
-    requiresRoles: [],
+    requiresRoles: over.requiresRoles ?? [],
     behindAuth: over.behindAuth ?? false,
     forms: over.forms ?? [],
     affordances: over.affordances ?? [],
@@ -219,6 +225,13 @@ function test_(over: Partial<CoverageTestInput> & { id: string }): CoverageTestI
 
 const run = (tests: CoverageTestInput[], graph: unknown = shopGraph()) =>
   analyzeCoverage({ flowMapGraph: graph, tests });
+
+/** The same analysis, with roles on offer. */
+const runAs = (
+  tests: CoverageTestInput[],
+  authProfiles: AuthProfileChoice[],
+  graph: unknown = shopGraph(),
+) => analyzeCoverage({ flowMapGraph: graph, tests, authProfiles });
 
 const kinds = (gaps: CoverageGap[], route: string) =>
   gaps.filter((g) => g.route === route).map((g) => g.kind);
@@ -582,6 +595,428 @@ describe('the happy-path-only check', () => {
   });
 });
 
+// ─── The negative half, enumerated ───────────────────────────────────────────
+
+/**
+ * THE DEFECT, VERBATIM FROM THE REGISTER: "Boundary and equivalence-class
+ * expansion per field — one whole feature becomes ONE negative item, built from
+ * the FIRST required field. Nothing enumerates empty / too-long / wrong-type /
+ * off-by-one / Luhn-invalid / future-date."
+ *
+ * What stood in `planItemForGap` was literally
+ * `subject.forms.flatMap((f) => f.fields).find((f) => f.required)`, one step and
+ * two assertions. The fixture below is a form that DECLARES real constraints —
+ * a maxlength, a min/max/step triple, a pattern, a select's options — because
+ * that is the input the crawler now captures and the input the old
+ * `FormSummary` projection threw away before anything could read it.
+ */
+function constrainedCheckout(): Record<string, unknown> {
+  const field = (over: Record<string, unknown>) => ({
+    inputType: 'text',
+    required: false,
+    selector: { strategy: 'LABEL', value: String(over.label), confidence: 0.9 },
+    ...over,
+  });
+  return {
+    version: 9,
+    baseUrl: 'https://shop.test',
+    nodes: [
+      node({
+        id: 'n-pay',
+        route: '/pay',
+        title: 'Pay',
+        forms: [
+          {
+            id: 'form-pay',
+            name: 'Payment',
+            selector: { strategy: 'CSS', value: 'form', confidence: 0.7 },
+            submit: role('Place order'),
+            fields: [
+              field({
+                name: 'email',
+                label: 'Email',
+                inputType: 'email',
+                semantic: 'email',
+                required: true,
+                maxLength: 64,
+                validationMessage: 'Enter a valid email address',
+              }),
+              field({
+                name: 'cardNumber',
+                label: 'Card number',
+                semantic: 'credit_card',
+                required: true,
+                maxLength: null,
+              }),
+              field({
+                name: 'quantity',
+                label: 'Quantity',
+                inputType: 'number',
+                semantic: 'number',
+                required: true,
+                min: '1',
+                max: '10',
+                step: '1',
+                maxLength: null,
+              }),
+              field({
+                name: 'promo',
+                label: 'Promo code',
+                semantic: 'freeform',
+                pattern: '[A-Z]{4}[0-9]{2}',
+                maxLength: 6,
+              }),
+              field({
+                name: 'country',
+                label: 'Country',
+                inputType: 'select',
+                semantic: 'country',
+                required: true,
+                options: ['Portugal', 'Japan'],
+                maxLength: null,
+              }),
+              field({ name: 'notes', label: 'Notes', inputType: 'textarea', semantic: 'freeform', maxLength: null }),
+            ],
+          },
+        ],
+      }),
+    ],
+    edges: [],
+    journeys: [],
+    features: [{ name: 'Payment', nodeIds: ['n-pay'] }],
+  };
+}
+
+const payGap = (): CoverageGap => {
+  const report = analyzeCoverage({
+    flowMapGraph: constrainedCheckout(),
+    tests: [
+      test_({
+        id: 'happy-pay',
+        name: 'pays with a valid card',
+        routes: ['/pay'],
+        code: "await page.getByLabel('Email').fill('a@b.co'); await page.getByRole('button', { name: 'Place order' }).click();",
+      }),
+    ],
+  });
+  return report.gaps.find((g) => g.kind === 'NO_NEGATIVE_CASE' && g.feature === 'Payment')!;
+};
+
+describe('the crawled constraints survive the projection onto a gap', () => {
+  /*
+   * `readForms` used to read three members off each raw field — label, required,
+   * semantic — and drop the other eight, `name` among them. That projection is
+   * where the negative half of testing died: the limit is a number the page
+   * already carries in an attribute, and "submit one character over it" was
+   * unreachable BY CONSTRUCTION once the number was gone.
+   */
+  const fields = () => {
+    const subject = payGap().subject;
+    if (subject.kind !== 'negative') throw new Error('expected a negative subject');
+    return subject.forms.flatMap((f) => f.fields);
+  };
+
+  it('carries the name, which is the key the expansion writes values under', () => {
+    expect(fields().map((f) => f.name)).toEqual([
+      'email',
+      'cardNumber',
+      'quantity',
+      'promo',
+      'country',
+      'notes',
+    ]);
+  });
+
+  it('carries each declared constraint, verbatim', () => {
+    const byName = new Map(fields().map((f) => [f.name, f]));
+    expect(byName.get('email')!.maxLength).toBe(64);
+    expect(byName.get('email')!.validationMessage).toBe('Enter a valid email address');
+    expect(byName.get('quantity')!.min).toBe('1');
+    expect(byName.get('quantity')!.max).toBe('10');
+    expect(byName.get('quantity')!.step).toBe('1');
+    expect(byName.get('promo')!.pattern).toBe('[A-Z]{4}[0-9]{2}');
+    expect(byName.get('country')!.options).toEqual(['Portugal', 'Japan']);
+    expect(byName.get('notes')!.inputType).toBe('textarea');
+  });
+
+  it('keeps "nobody looked" and "the page declares nothing" apart', () => {
+    /*
+     * Three states, not two — the distinction `FormField` is optional in order
+     * to preserve. Collapsing absent onto null would make every crawl written
+     * before the capture claim the application declares no limits anywhere, and
+     * boundaries.ts prints that claim in the justification of every case.
+     */
+    const byName = new Map(fields().map((f) => [f.name, f]));
+    // The crawl looked at Notes and the page declares no limit.
+    expect(byName.get('notes')!.maxLength).toBeNull();
+    // Nothing looked at Email's pattern, so the key is not there at all.
+    expect('pattern' in byName.get('email')!).toBe(false);
+    expect(byName.get('email')!.pattern).toBeUndefined();
+  });
+
+  it('falls back to the label as the key when a crawl captured no name', () => {
+    // An old-shape crawl. Two nameless fields keyed on '' would collide, and
+    // every case for the second would silently perturb the first.
+    const graph = constrainedCheckout();
+    const forms = (graph.nodes as Array<{ forms: Array<{ fields: Array<Record<string, unknown>> }> }>)[0]!.forms[0]!;
+    for (const f of forms.fields) delete f.name;
+    const crawl = readCrawl(graph);
+    const names = crawl.nodes[0]!.forms[0]!.fields.map((f) => f.name);
+    expect(names).toEqual(['Email', 'Card number', 'Quantity', 'Promo code', 'Country', 'Notes']);
+    expect(new Set(names).size).toBe(names.length);
+  });
+});
+
+describe('a NO_NEGATIVE_CASE gap becomes a table of cases, not one case', () => {
+  it('enumerates the classes the register says nothing enumerated', () => {
+    const item = planItemForGap(payGap());
+    const prose = [...item.steps, ...item.assertions].join(' ');
+    /*
+     * The register's own list, each one now a row with its own expectation.
+     * `empty` and `whitespace-only` are present in the expansion and fall below
+     * the rank cap on this six-field form — which the disclosure says out loud,
+     * and which the "cap is stated" test below holds it to.
+     */
+    for (const klass of [
+      'over-max-length', // too long
+      'at-max-length', // and the limit itself, which must be ACCEPTED
+      'wrong-type',
+      'over-max', // off-by-one, upper
+      'under-min', // off-by-one, lower
+      'luhn-invalid',
+      'step-misaligned',
+      'pattern-violating',
+      'unbounded-length',
+      'injection-like',
+    ]) {
+      expect(prose, `no case for ${klass}`).toContain(`[${klass}]`);
+    }
+  });
+
+  it('is nothing like the one case it replaces', () => {
+    const item = planItemForGap(payGap());
+    // The literal sentence the old arm produced, from `find(f => f.required)`.
+    expect(item.steps.join(' ')).not.toMatch(/left empty or set to an invalid value/);
+    // And it is a table, not a sentence.
+    expect(item.steps.filter((s) => /^\[[a-z-]+\]/.test(s)).length).toBeGreaterThan(8);
+  });
+
+  it('carries the real values the page\'s own attributes imply', () => {
+    const steps = planItemForGap(payGap()).steps.join('\n');
+    // One over maxlength=64, the inclusive limit itself, and the off-by-ones
+    // either side of min="1" max="10" with step="1".
+    expect(steps).toMatch(/\[over-max-length\] set "Email" to a 65-character value/);
+    expect(steps).toMatch(/\[at-max-length\] set "Email" to a 64-character value/);
+    expect(steps).toMatch(/\[over-max\] set "Quantity" to "11"/);
+    expect(steps).toMatch(/\[under-min\] set "Quantity" to "0"/);
+    expect(steps).toMatch(/\[step-misaligned\] set "Quantity" to "1\.5"/);
+  });
+
+  it('does NOT invent a class the page gives it nothing to found on', () => {
+    /*
+     * The other half of honesty. Only `promo` declares a pattern, only
+     * `quantity` a range, only `country` a set of options — so no case may
+     * appear for a field whose attributes could not produce one.
+     */
+    const steps = planItemForGap(payGap()).steps.join('\n');
+    expect(steps).not.toMatch(/\[pattern-violating\] set "(Email|Notes|Quantity)"/);
+    expect(steps).not.toMatch(/\[over-max\] set "(Email|Notes|Promo code)"/);
+    expect(steps).not.toMatch(/\[not-in-options\] set "(Email|Notes|Quantity)"/);
+    // A card number has a fixed format, so "emoji must round-trip" is not an
+    // expectation this can defend — asserting it would fail a correct app.
+    expect(steps).not.toMatch(/\[unicode-emoji\] set "Card number"/);
+  });
+
+  it('keeps the positive control, which the rank cap would otherwise cut', () => {
+    // `happy-path` is ranked 25, near the bottom, so a plain top-N slice loses
+    // it every time — and without it every negative row is equally consistent
+    // with a form that refuses ALL input.
+    const item = planItemForGap(payGap());
+    expect(item.steps.join(' ')).toContain('[happy-path] submit "Payment" with every field valid');
+    expect(item.assertions[0]).toMatch(/^Positive control \("Payment"\)/);
+  });
+
+  it('asks for ONE parameterised test over the rows, not one test per row', () => {
+    // `ecosystem-prompts.ts` already tells the model to prefer an input table
+    // over a loop in every ecosystem; the item has to be shaped like that.
+    const steps = planItemForGap(payGap()).steps.join(' ');
+    expect(steps).toContain('ONE parameterised test');
+    expect(steps).toContain('not one test per row');
+    expect(steps).toContain('not a loop inside a single test');
+  });
+
+  it('perturbs exactly one field per row, and says why that matters', () => {
+    const steps = planItemForGap(payGap()).steps;
+    expect(steps.join(' ')).toContain('change exactly ONE field per case');
+    for (const step of steps.filter((s) => /^\[/.test(s) && !s.includes('happy-path'))) {
+      expect(step).toContain('leaving every other field valid');
+    }
+  });
+
+  it('gives every row its own expectation, in the application\'s terms', () => {
+    const item = planItemForGap(payGap());
+    const rows = item.assertions.filter((a) => /^\[[a-z-]+\]/.test(a));
+    expect(rows.length).toBeGreaterThan(8);
+    for (const row of rows) {
+      // Not "something was refused" — the whole point is that each row says
+      // what the application should do, specifically enough to fail on.
+      expect(row.length, row).toBeGreaterThan(60);
+    }
+  });
+
+  it('stays inside the bounds the plan endpoint enforces', () => {
+    const item = planItemForGap(payGap());
+    expect(item.steps.length).toBeLessThanOrEqual(40);
+    expect(item.assertions.length).toBeLessThanOrEqual(20);
+    expect(planItemSchema.safeParse(item).success).toBe(true);
+  });
+});
+
+describe('the cap is STATED, never silent', () => {
+  /*
+   * Split in two on purpose. The cap has to be stated in BOTH places, for
+   * different readers: the gap is what a human looks at on the coverage screen
+   * and decides to act on, and the plan item is what travels to the approval
+   * screen and then into the generated test's own assertions. Breaking either
+   * one has to be able to go red on its own, or a mutation that silences one of
+   * them hides behind the other still passing.
+   */
+  it('names the classes that did not fit IN THE PLAN ITEM a human approves', () => {
+    const disclosure = planItemForGap(payGap()).assertions.find((a) =>
+      a.startsWith('NOT COVERED by this test:'),
+    );
+    expect(disclosure, 'the item does not disclose its cap at all').toBeDefined();
+    expect(disclosure).toMatch(/equivalence class\(es\) with NO case in this table/);
+  });
+
+  it('names them IN THE GAP too, which is what a human reads first', () => {
+    const evidence = payGap().evidence.join(' ');
+    expect(evidence).toMatch(/NOT enumerated:/);
+    expect(evidence).toMatch(/equivalence class\(es\) with NO case in this table/);
+  });
+
+  it('reports the top-N honestly: the count kept AND the count there were', () => {
+    const evidence = payGap().evidence.join(' ');
+    expect(evidence).toMatch(
+      new RegExp(`gives \\d+ boundary case\\(s\\) over 6 field\\(s\\); the top ${MAX_BOUNDARY_CASES_PER_GAP} by rank`),
+    );
+  });
+
+  it('spends the slots on breadth across classes, not depth within one', () => {
+    /*
+     * Measured regression. A plain top-12-by-rank slice gave four
+     * `injection-like` rows (one per text field) and no off-by-one case at all,
+     * on a form declaring min="1" max="10" step="1". That is one idea tested on
+     * four fields, not a partition of the input space.
+     */
+    const classes = planItemForGap(payGap())
+      .steps.map((s) => /^\[([a-z-]+)\]/.exec(s)?.[1])
+      .filter((c): c is string => Boolean(c));
+    expect(classes.length).toBe(MAX_BOUNDARY_CASES_PER_GAP);
+    expect(new Set(classes).size).toBe(classes.length);
+  });
+
+  it('counts the two-field combinations it refuses to generate', () => {
+    const expansion = expandNegativeCases('seed', [
+      {
+        name: 'Payment',
+        submitLabel: 'Pay',
+        fields: [
+          { name: 'a', label: 'A', inputType: 'text', required: true, semantic: 'freeform' },
+          { name: 'b', label: 'B', inputType: 'text', required: true, semantic: 'freeform' },
+        ],
+      },
+    ]);
+    const pairs = expansion.dropped.find((d) => d.what.includes('two-field'));
+    expect(pairs).toBeDefined();
+    expect(pairs!.why).toMatch(/cannot be attributed to either one/);
+  });
+
+  it('expands the same form once when the crawl met it on several pages', () => {
+    // A dynamic route is crawled once per real URL, so the group arrives
+    // carrying five copies of one form. Expanding each would fill the table
+    // with the same case five times over.
+    const form = {
+      name: 'Add to cart',
+      submitLabel: 'Add',
+      fields: [
+        { name: 'qty', label: 'Quantity', inputType: 'number', required: true, semantic: 'number' as const },
+      ],
+    };
+    const one = expandNegativeCases('seed', [form]);
+    const five = expandNegativeCases('seed', [form, form, form, form, form]);
+    expect(five.cases.map((c) => c.id)).toEqual(one.cases.map((c) => c.id));
+    expect(five.dropped.find((d) => d.what.includes('duplicate copies'))!.count).toBe(4);
+  });
+
+  it('does not sum apples and oranges into one alarming number', () => {
+    // `dropped` holds cases, two-field combinations and inapplicable classes.
+    // Summing them produced 605 on a six-field form, of which 528 were
+    // combinations nobody would ever generate — a number nobody can act on.
+    const evidence = payGap().evidence.join(' ');
+    expect(evidence).toMatch(/\d+ group\(s\) of case\(s\), combination\(s\) and class\(es\)/);
+  });
+});
+
+describe('the expansion needs no model, and never changes its mind', () => {
+  it('produces an identical table on a second call', () => {
+    // The seed is the gap id, which is itself a stable hash of the subject. So
+    // a gap that travels out through GET /coverage and back in through POST
+    // /propose expands to the same table on both sides.
+    const a = planItemForGap(payGap());
+    const b = planItemForGap(payGap());
+    expect(b.steps).toEqual(a.steps);
+    expect(b.assertions).toEqual(a.assertions);
+  });
+
+  it('does not change the type that decides the no-key path', () => {
+    /*
+     * `canScaffoldWithoutModel` is what gates the first-run path on a
+     * deployment with no key, and it keys on the TEST TYPE. The expansion must
+     * not move it: a form-bearing negative gap stays E2E, and a
+     * permission-boundary one stays SECURITY_SMOKE.
+     */
+    expect(planItemForGap(payGap()).testType).toBe('E2E');
+    const boundary = run([
+      test_({ id: 'admin', name: 'admin page loads', routes: ['/admin/users'], code: 'await login(page);' }),
+    ]).gaps.find((g) => g.kind === 'NO_NEGATIVE_CASE' && g.feature === 'Admin');
+    expect(boundary).toBeDefined();
+    expect(planItemForGap(boundary!).testType).toBe('SECURITY_SMOKE');
+  });
+
+  it('falls back to the permission wording when there is no form to expand', () => {
+    const boundary = run([
+      test_({ id: 'admin', name: 'admin page loads', routes: ['/admin/users'], code: 'await login(page);' }),
+    ]).gaps.find((g) => g.kind === 'NO_NEGATIVE_CASE' && g.feature === 'Admin')!;
+    const item = planItemForGap(boundary);
+    expect(item.steps.join(' ')).toContain('without the permission or precondition it requires');
+    expect(boundary.evidence.join(' ')).toContain('No form on this feature could be expanded');
+  });
+
+  it('survives a form from a crawl that predates constraint capture', () => {
+    // Every constraint absent. The expansion degrades to the classes that need
+    // no declared constraint rather than producing nothing.
+    const legacy = expandNegativeCases('seed', [
+      {
+        name: 'Contact',
+        submitLabel: 'Send',
+        fields: [
+          { name: 'email', label: 'Email', inputType: 'email', required: true, semantic: 'email' },
+          { name: 'body', label: 'Message', inputType: 'textarea', required: false, semantic: 'freeform' },
+        ],
+      },
+    ]);
+    const classes = legacy.cases.map((c) => c.equivalenceClass);
+    expect(classes).toContain('empty');
+    expect(classes).toContain('wrong-type');
+    expect(classes).toContain('unbounded-length');
+    expect(classes).not.toContain('over-max-length');
+    // And it says the attributes were NOT CAPTURED, rather than claiming the
+    // page declares no limits — a claim about markup nobody read.
+    expect(legacy.dropped.map((d) => d.what).join(' | ')).toMatch(/was captured on this field/);
+  });
+});
+
 describe('the failure-marker heuristic itself', () => {
   it('counts the things you only write when testing a failure', () => {
     for (const sample of [
@@ -856,5 +1291,215 @@ describe('planItemForGap', () => {
     expect(planItemSchema.safeParse(item).success).toBe(true);
     expect(item.rationale.length).toBeLessThanOrEqual(1000);
     expect(item.feature.length).toBeLessThanOrEqual(80);
+  });
+});
+
+// ─── Binding a role to the test that closes an auth gap ──────────────────────
+
+/**
+ * The defect this section exists for was a LOOP, not a wrong answer.
+ *
+ * `UNREACHED_AUTH_ROUTE` says "no authenticated test reaches /admin/users". The
+ * only test the planner could propose for it was a SECURITY_SMOKE, whose schema
+ * can assert anonymous denial and nothing else — so the test was written, it
+ * passed, it never reached the page, and the next analysis reported the same
+ * gap. Closing the gap re-created the gap, for ever, and no amount of work by
+ * the customer could make it converge.
+ *
+ * Two things had to be true to break it, and both are asserted below:
+ *
+ *   1. The plan item must carry an AUTH PROFILE, so the test that gets written
+ *      signs in instead of asserting a redirect.
+ *   2. A test bound to a profile must COUNT AS AUTHENTICATED even though its
+ *      source contains no sign-in at all — the runner injects the session, so
+ *      `signsIn()` is false for exactly the tests that are most certainly
+ *      signed in. This is the half that is easy to miss and the half that makes
+ *      the loop a loop.
+ *
+ * And one thing must stay true: with no profile to name, the planner must NOT
+ * quietly propose the signed-in test anyway. A test that runs as nobody and
+ * passes is worse than an open gap, because it reports coverage of a page it
+ * never saw.
+ */
+
+const ADMIN: AuthProfileChoice = { id: 'prof_admin', name: 'Admin', kind: 'FORM_LOGIN' };
+const SHOPPER: AuthProfileChoice = { id: 'prof_shopper', name: 'Shopper', kind: 'FORM_LOGIN' };
+
+const adminGap = (report: { gaps: CoverageGap[] }): CoverageGap =>
+  report.gaps.find((g) => g.route === '/admin/users' && g.kind === 'UNREACHED_AUTH_ROUTE')!;
+
+describe('an UNREACHED_AUTH_ROUTE gap names the role its test must assume', () => {
+  it('carries the profile on the gap and on the plan item', () => {
+    const gap = adminGap(runAs([], [ADMIN]));
+    expect(gap.requiresAuth).toBe(true);
+    expect(gap.authProfile?.id).toBe('prof_admin');
+
+    const item = planItemForGap(gap);
+    expect(item.authProfileId).toBe('prof_admin');
+    expect(planItemSchema.safeParse(item).success).toBe(true);
+  });
+
+  it('proposes a test that SIGNS IN rather than one that asserts the redirect', () => {
+    const item = planItemForGap(adminGap(runAs([], [ADMIN])));
+    // SECURITY_SMOKE is the type whose schema can only express anonymous
+    // denial. Staying on it is what made the loop impossible to exit.
+    expect(item.testType).toBe('E2E');
+    expect(item.steps.join(' ')).toMatch(/sign in as the "Admin" auth profile/i);
+    // The runner injects the session; a login form written into the test would
+    // be a second, different sign-in that the profile does not describe.
+    expect(item.steps.join(' ')).toMatch(/do NOT write a login form/i);
+    expect(item.assertions.join(' ')).toMatch(/Signed in as "Admin"/);
+    expect(item.assertions.join(' ')).toMatch(/not a redirect to a login page/i);
+  });
+
+  it('says in the evidence which role was chosen and why', () => {
+    const gap = adminGap(runAs([], [ADMIN]));
+    // The choice is deterministic, which means it is sometimes wrong, which
+    // means it has to be arguable. /admin/users and "Admin" share a word.
+    expect(gap.evidence.join(' ')).toMatch(/will run as the auth profile "Admin"/);
+    expect(gap.evidence.join(' ')).toMatch(/share the word "admin"/);
+  });
+
+  it('CONVERGES: a test bound to that profile closes the gap it came from', () => {
+    const closing = test_({
+      id: 'admin-users',
+      name: 'admin can manage users',
+      routes: ['/admin/users'],
+      // Exactly what the generated test looks like: no sign-in anywhere in it,
+      // because the session arrives from the profile. `signsIn` is false here.
+      code: "await page.goto('/admin/users');\nawait expect(page.getByRole('table')).toBeVisible();",
+      authProfileId: 'prof_admin',
+      authProfileRequired: true,
+    });
+    expect(signsIn(closing.code!.toLowerCase())).toBe(false);
+
+    expect(kinds(runAs([closing], [ADMIN]).gaps, '/admin/users')).not.toContain(
+      'UNREACHED_AUTH_ROUTE',
+    );
+    // And the same test WITHOUT the binding does not close it — which is the
+    // proof that the binding is what closed it, not the route literal.
+    const unbound = test_({ ...closing, authProfileId: null, authProfileRequired: false });
+    expect(kinds(run([unbound]).gaps, '/admin/users')).toContain('UNREACHED_AUTH_ROUTE');
+  });
+
+  it('re-opens the gap, by name, when the profile was deleted under the test', () => {
+    // The foreign key is SetNull: deleting a profile leaves the test with
+    // `authProfileRequired` true and nothing bound. It now runs anonymously and
+    // passes whatever a signed-out visitor sees — so this must not read as
+    // coverage, and the report must name the test rather than telling a team
+    // that wrote exactly this test that nothing reaches /admin/users.
+    const orphan = test_({
+      id: 'admin-users',
+      name: 'admin can manage users',
+      routes: ['/admin/users'],
+      code: "await page.goto('/admin/users');",
+      authProfileId: null,
+      authProfileRequired: true,
+    });
+
+    const gap = adminGap(runAs([orphan], [ADMIN]));
+    expect(gap).toBeDefined();
+    expect(gap.title).toMatch(/has a test that needs a role and has no auth profile bound/i);
+    expect(gap.evidence.join(' ')).toMatch(/"admin can manage users" declare they need/i);
+    expect(gap.evidence.join(' ')).toMatch(/re-bind them rather than writing another test/i);
+  });
+});
+
+describe('with no role to name, the planner refuses to pretend', () => {
+  it('leaves the plan item unbound and says the page stays uncovered', () => {
+    const gap = adminGap(run([]));
+    expect(gap.requiresAuth).toBe(true);
+    expect(gap.authProfile).toBeNull();
+
+    const item = planItemForGap(gap);
+    expect(item.authProfileId).toBeNull();
+    // Still a real, useful test — of the wall. What it must not do is read as
+    // coverage of the page behind it.
+    expect(item.testType).toBe('SECURITY_SMOKE');
+    expect(item.assertions.join(' ')).toMatch(/NOT COVERED by this test/);
+    expect(item.assertions.join(' ')).toMatch(/do not read a pass here as coverage/i);
+    expect(planItemSchema.safeParse(item).success).toBe(true);
+  });
+
+  it('names the missing setup in the evidence and once at the top of the report', () => {
+    const report = run([]);
+    expect(adminGap(report).evidence.join(' ')).toMatch(/NO auth profile configured/);
+    expect(report.caveats.join(' ')).toMatch(
+      /behind an auth wall and this environment has no auth profile configured/i,
+    );
+  });
+
+  it('does not close the gap just because a profile exists but could not be matched', () => {
+    // Two profiles, neither named for anything in the crawl. Picking one would
+    // sign the test in as the wrong person, which fails by succeeding.
+    const report = runAs([], [SHOPPER, { id: 'prof_eu', name: 'EU customer' }]);
+    const gap = adminGap(report);
+    expect(gap.authProfile).toBeNull();
+    expect(gap.evidence.join(' ')).toMatch(/2 auth profiles are configured/);
+    expect(gap.evidence.join(' ')).toMatch(/"Shopper"/);
+    expect(report.caveats.join(' ')).toMatch(/none of the 2 configured auth profile\(s\) could be matched/i);
+  });
+
+  it('leaves public routes alone — nothing to sign in as, nothing needed', () => {
+    const report = runAs([], [ADMIN]);
+    const about = report.gaps.find((g) => g.route === '/about')!;
+    expect(about.requiresAuth).toBe(false);
+    expect(about.authProfile).toBeNull();
+    expect(planItemForGap(about).authProfileId).toBeNull();
+    expect(planItemForGap(about).assertions.join(' ')).not.toMatch(/NOT COVERED/);
+  });
+});
+
+describe('chooseAuthProfile, the rule itself', () => {
+  it('prefers the role the application declared over anything inferred', () => {
+    // The route says "admin"; the app says the node needs "staff". The app wins
+    // — it is a statement, not an inference from a URL.
+    const chosen = chooseAuthProfile([ADMIN, { id: 'prof_staff', name: 'Staff member' }], {
+      route: '/admin/users',
+      requiresRoles: ['staff'],
+    });
+    expect(chosen?.id).toBe('prof_staff');
+    expect(chosen?.why).toMatch(/declares it requires the role "staff"/);
+  });
+
+  it('falls back to a word the route and a profile name share', () => {
+    const chosen = chooseAuthProfile([SHOPPER, ADMIN], { route: '/admin/users' });
+    expect(chosen?.id).toBe('prof_admin');
+  });
+
+  it('uses the only profile there is, since there is nothing to choose between', () => {
+    const chosen = chooseAuthProfile([SHOPPER], { route: '/admin/users' });
+    expect(chosen?.id).toBe('prof_shopper');
+    expect(chosen?.why).toMatch(/only auth profile configured/);
+  });
+
+  it('refuses rather than guessing between several unmatched profiles', () => {
+    expect(chooseAuthProfile([SHOPPER, { id: 'prof_eu', name: 'EU customer' }], {
+      route: '/admin/users',
+    })).toBeNull();
+  });
+
+  it('is stable: the same crawl and profiles always bind the same role', () => {
+    const roles = { route: '/admin/users', requiresRoles: ['admin'] };
+    const forwards = chooseAuthProfile([ADMIN, { id: 'prof_admin2', name: 'Admin backup' }], roles);
+    const backwards = chooseAuthProfile([{ id: 'prof_admin2', name: 'Admin backup' }, ADMIN], roles);
+    // A gap id is stable across recomputation; the profile behind it has to be
+    // too, or two reads of one report propose two different tests.
+    expect(forwards?.id).toBe(backwards?.id);
+  });
+
+  it('has nothing to offer when there are no profiles, and says so by returning null', () => {
+    expect(chooseAuthProfile([], { route: '/admin/users', requiresRoles: ['admin'] })).toBeNull();
+  });
+});
+
+describe('the fingerprint notices a role change', () => {
+  it('changes when a test is re-bound to a different profile', () => {
+    const base = test_({ id: 't', routes: ['/admin/users'], code: "page.goto('/admin/users')" });
+    const anonymous = runAs([base], [ADMIN]).fingerprint;
+    const bound = runAs([{ ...base, authProfileId: 'prof_admin' }], [ADMIN]).fingerprint;
+    // Without this, a re-bind would pass the staleness check on /propose and a
+    // human could generate a test for a gap they had just closed.
+    expect(bound).not.toBe(anonymous);
   });
 });

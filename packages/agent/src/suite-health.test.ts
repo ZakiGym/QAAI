@@ -760,10 +760,274 @@ describe('assertion strengthening', () => {
   it('classifies spec assertions the same way the finding does', () => {
     expect(specAssertions({ expectStatus: 200 }).statusOnly).toBe(true);
     expect(specAssertions({ expectStatus: 200 }).count).toBe(1);
-    expect(specAssertions({ expectStatus: 200, expectBody: {} }).statusOnly).toBe(false);
+    /*
+     * CHANGED, deliberately. This used to expect `false` — a present
+     * `expectBody` key was enough to mean the body was checked. It is not: the
+     * API plugin iterates `Object.entries(a.bodyMatches ?? {})`, so an EMPTY
+     * matcher object asserts nothing at all, and a spec that checks a status
+     * and carries an empty body matcher is exactly what TRANSPORT_ONLY is for.
+     * The old expectation let a key with nothing in it buy a test an
+     * "it checks the body" verdict.
+     */
+    expect(specAssertions({ expectStatus: 200, expectBody: {} }).statusOnly).toBe(true);
+    expect(specAssertions({ expectStatus: 200, expectBody: { total: 42 } }).statusOnly).toBe(false);
     // A k6 threshold is an assertion; missing it made every LOAD test look empty.
     expect(specAssertions({ thresholds: { http_req_duration: ['p(95)<500'] } }).count).toBe(1);
     expect(specAssertions(null)).toEqual({ statusOnly: false, count: 0, statusQuote: null });
+  });
+
+  it('counts a performance budget, and refuses to count one that gates nothing', () => {
+    /*
+     * A PERFORMANCE test's assertion IS its budgets object. `budget` was in
+     * neither of this file's two spec-assertion vocabularies, so every correct
+     * PERFORMANCE spec — the deterministic scaffold a key-less deployment
+     * depends on included — was reported as declaring nothing to check, and
+     * once generation started running these gates that refused it outright.
+     */
+    expect(specAssertions({ path: '/checkout', budgets: { lcpMs: 2500 } }).count).toBe(1);
+    /*
+     * And the other half: every budget is nullable, and null means "measure it,
+     * do not gate on it". A budgets object of nothing but nulls asserts exactly
+     * nothing while carrying the key that claims otherwise.
+     */
+    expect(
+      specAssertions({ path: '/checkout', budgets: { lcpMs: null, clsScore: null } }).count,
+    ).toBe(0);
+    // A status of null is the same mistake in the other branch.
+    expect(specAssertions({ expectStatus: null }).count).toBe(0);
+    // `0` and `false` ARE expectations, and must not be mistaken for absence.
+    expect(specAssertions({ thresholds: { errorRate: 0 } }).count).toBe(1);
+  });
+});
+
+// ─── Tests that are not JavaScript ───────────────────────────────────────────
+
+/**
+ * Everything above this line uses the default `tests/<id>.spec.ts` path, so it
+ * describes the JavaScript analysis — which is unchanged, deliberately: not one
+ * of those assertions was rewritten for this work, because none of them pinned
+ * the JS-only behaviour as if it were universal. They pinned it on `.spec.ts`
+ * files, where it is correct.
+ *
+ * The defect was everything ELSE. `expect(` is not how a pytest, Go, JUnit or
+ * RSpec test asserts, so every such test read as asserting nothing, and the
+ * report said so at HIGH severity. One obviously-wrong finding is enough for a
+ * customer to close the page, which makes a false NO_ASSERTIONS more expensive
+ * than a missed one.
+ */
+describe('other languages', () => {
+  it('does not accuse a correct pytest test of having no assertions', () => {
+    // THE regression test for this module. Before the dialect lexicon this was
+    // a HIGH-severity finding on a test that asserts twice.
+    const code = `def test_checkout_charges_the_right_total(page: Page):
+    page.goto("/checkout")
+    page.get_by_label("Card number").fill("4242424242424242")
+    page.get_by_role("button", name="Pay now").click()
+    assert page.get_by_test_id("order-total").inner_text() == "$42.00"
+    assert "Order confirmed" in page.content()`;
+
+    expect(
+      kinds([makeTest({ id: 'a', filePath: 'tests/test_checkout.py', code })]),
+    ).not.toContain('NO_ASSERTIONS');
+  });
+
+  it('still accuses a pytest test that really asserts nothing, in Python', () => {
+    const code = `def test_user_can_open_settings(page: Page):
+    page.goto("/settings")
+    page.get_by_role("button", name="Save").click()
+    print("saved")`;
+    const finding = findingsFor([
+      makeTest({ id: 'a', filePath: 'tests/test_settings.py', code }),
+    ]).find((f) => f.kind === 'NO_ASSERTIONS');
+
+    expect(finding).toBeDefined();
+    // Same severity as the JavaScript finding — the defect is just as bad.
+    expect(finding!.severity).toBe('HIGH');
+    // …but the suggested fix is in the language the author is writing in.
+    // Telling a Python author to write `await expect(page.getByRole(...))` is
+    // how a correct report still loses the reader.
+    expect(finding!.assertInstead).toContain('assert order.total');
+    expect(finding!.assertInstead).not.toContain('toHaveText');
+  });
+
+  it('does not accuse a Go test whose assertion is a t.Fatalf', () => {
+    // Go's standard library has no assertions: failing the test IS asserting.
+    const code = `func TestCheckoutTotal(t *testing.T) {
+	page.Goto("/checkout")
+	got := page.GetByTestId("order-total").InnerText()
+	if got != "$42.00" {
+		t.Fatalf("order total = %q, want $42.00", got)
+	}
+}`;
+
+    expect(kinds([makeTest({ id: 'a', filePath: 'checkout_test.go', code })])).not.toContain(
+      'NO_ASSERTIONS',
+    );
+  });
+
+  it('accuses a Go test that only drives the browser, and suggests Go', () => {
+    const code = `func TestCheckoutTotal(t *testing.T) {
+	page.Goto("/checkout")
+	page.GetByRole("button").Click()
+	t.Log("clicked pay")
+}`;
+    const finding = findingsFor([
+      makeTest({ id: 'a', filePath: 'checkout_test.go', code }),
+    ]).find((f) => f.kind === 'NO_ASSERTIONS');
+
+    expect(finding).toBeDefined();
+    expect(finding!.assertInstead).toContain('t.Fatalf');
+  });
+
+  it('counts a JUnit assertThat and an RSpec expect().to', () => {
+    const jvm = makeTest({
+      id: 'a',
+      filePath: 'src/test/java/CheckoutTest.java',
+      code: `  @Test
+  void totalIsShown() {
+    page.navigate("/checkout");
+    assertThat(page.getByTestId("order-total")).hasText("$42.00");
+  }`,
+    });
+    const rspec = makeTest({
+      id: 'b',
+      filePath: 'spec/features/checkout_spec.rb',
+      code: `  it "shows the total" do
+    visit "/checkout"
+    expect(page).to have_text("Order confirmed")
+  end`,
+    });
+
+    expect(kinds([jvm])).not.toContain('NO_ASSERTIONS');
+    expect(kinds([rspec])).not.toContain('NO_ASSERTIONS');
+  });
+
+  it('counts a Gherkin Then step, and flags a scenario that only acts', () => {
+    const asserts = makeTest({
+      id: 'a',
+      filePath: 'features/checkout.feature',
+      code: `Scenario: a customer pays
+    Given a cart with one item
+    When I submit the payment form
+    Then the confirmation heading says "Order confirmed"`,
+    });
+    const acts = makeTest({
+      id: 'b',
+      filePath: 'features/browse.feature',
+      code: `Scenario: a customer browses
+    Given a cart with one item
+    When I open the cart
+    And I scroll the list`,
+    });
+
+    expect(kinds([asserts])).not.toContain('NO_ASSERTIONS');
+    expect(kinds([acts])).toContain('NO_ASSERTIONS');
+  });
+
+  it('does not run the JavaScript-only sub-analyses on a Python test', () => {
+    /*
+     * playwright-python also spells it `expect(`, so the JS extractor DOES find
+     * assertion sites in this file — and then reads them with a JavaScript
+     * matcher vocabulary and a JavaScript try/catch. Both findings below fired
+     * on this exact snippet before the dialect gate:
+     *
+     *   - SWALLOWED_ASSERTION, because `except` is not `catch` and
+     *     `swallowingTryRanges` cannot tell whether this one re-raises;
+     *   - VOLATILE_ASSERTION, which happens to be a fair observation about the
+     *     date — but it arrives with Playwright advice ("pass a regex",
+     *     "page.clock") that does not exist in this language.
+     *
+     * A guess wearing the clothes of a finding is worse than no finding.
+     */
+    const code = `def test_order_shows_when_it_was_placed(page: Page):
+    try:
+        expect(page.get_by_test_id("placed-at")).to_have_text("2026-01-15")
+    except AssertionError:
+        logging.info("probably fine")
+    assert page.get_by_test_id("order-total").inner_text() == "$42.00"`;
+    const result = kinds([makeTest({ id: 'a', filePath: 'tests/test_orders.py', code })]);
+
+    expect(result).not.toContain('SWALLOWED_ASSERTION');
+    expect(result).not.toContain('VOLATILE_ASSERTION');
+    expect(result).not.toContain('NO_ASSERTIONS');
+  });
+
+  it('still exempts a plugin-asserted type when its path is not JavaScript', () => {
+    const a11y = makeTest({
+      id: 'a',
+      filePath: 'tests/accessibility/storefront.py',
+      type: 'ACCESSIBILITY',
+      code: `def test_storefront_is_accessible(page: Page):\n    page.goto("/")`,
+      spec: { routes: ['/'], standard: 'wcag2aa' },
+    });
+
+    expect(kinds([a11y])).not.toContain('NO_ASSERTIONS');
+  });
+
+  it('calls a test in a language it cannot read UNREAD, not assertion-free', () => {
+    /*
+     * The honest third answer. A `.bats` suite is a real thing a customer can
+     * import, and QAAI has no lexicon for it — so the only truthful statements
+     * are "we did not read this" and "no absence-based finding was made". The
+     * two wrong answers are symmetrical and both have shipped in this codebase:
+     * accuse it (a false HIGH on a test that asserts), or score it as healthy
+     * (a suite that looks better the less of it we can read).
+     */
+    const test = makeTest({
+      id: 'a',
+      filePath: 'tests/checkout.bats',
+      code: `@test "checkout charges the right total" {
+  run curl -s "$BASE_URL/checkout"
+  [ "$status" -eq 0 ]
+}`,
+    });
+    const report = analyzeSuiteHealth({ tests: [test] });
+
+    expect(report.weakAssertions.map((f) => f.kind)).not.toContain('NO_ASSERTIONS');
+    expect(report.unanalyzed).toHaveLength(1);
+    expect(report.unanalyzed[0]!.reason).toMatch(/lexicon/);
+    expect(report.unanalyzed[0]!.reason).toMatch(/unread, not assertion-free/);
+    // Unmeasured, never silently scored: with nothing readable the assertion
+    // component refuses to produce a number at all.
+    const strength = report.components.find((c) => c.key === 'assertionStrength');
+    expect(strength!.available).toBe(false);
+  });
+
+  it('reads a spec-driven test whose path has no dialect at all', () => {
+    /*
+     * The counter-case to the one above, and the reason the "unread" verdict is
+     * gated on there being source to read. A generated API test's path is
+     * `<slug>.api.json` — no dialect — and its `code` column is a one-line
+     * pointer comment. Its assertions are in `spec`, which is language-neutral.
+     * Marking these unread would have moved every API, load and a11y test in
+     * every project into `unanalyzed` overnight.
+     */
+    const test = makeTest({
+      id: 'a',
+      type: 'API',
+      filePath: 'generated/the-root-responds.api.json',
+      code: '// API tests are driven by `spec`, not source code.\n',
+      spec: { steps: [{ path: '/api/orders', expectStatus: 200 }] },
+    });
+    const report = analyzeSuiteHealth({ tests: [test] });
+
+    expect(report.unanalyzed).toEqual([]);
+    expect(report.weakAssertions.map((f) => f.kind)).toContain('TRANSPORT_ONLY');
+  });
+
+  it('records the dialect it read each test with', () => {
+    // On the behaviour, so the weak-assertion pass and the per-test endpoint
+    // cannot disagree about what language a file is in.
+    expect(extractBehavior(makeTest({ id: 'a' })).dialect).toBe('JS_EXPECT');
+    expect(
+      extractBehavior(makeTest({ id: 'b', filePath: 'cypress/e2e/checkout.cy.ts' })).dialect,
+    ).toBe('JS_CHAI');
+    expect(extractBehavior(makeTest({ id: 'c', filePath: 'checkout_test.go' })).dialect).toBe(
+      'GO_TESTING',
+    );
+    expect(
+      extractBehavior(makeTest({ id: 'd', filePath: 'tests/checkout.bats' })).dialect,
+    ).toBeNull();
   });
 });
 

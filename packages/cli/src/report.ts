@@ -40,6 +40,21 @@
  * Allure result with no `start`/`stop` and a TestRail result with no `elapsed`,
  * not a document full of confident zeroes. TestRail happens to agree — it
  * rejects an elapsed of 0 outright.
+ *
+ * ── And the one it gained with quarantine ───────────────────────────────────
+ *
+ * A suppressed failure must not read as a PASS and must not read as a plain
+ * SKIP. Both are how a team finds out in production that nothing has been
+ * tested for a month, and both were previously reachable from here: a
+ * quarantined failing test arrived as `FAILED` and every format filed it as a
+ * plain failure, so `--reporter allure` turned a dashboard red over a failure
+ * nobody could merge against. `runReportFromApi` now maps such a result to the
+ * `quarantined` status, and the two renderers below say what that means in each
+ * format's own vocabulary — Allure's `muted`, TestRail's Retest.
+ *
+ * JUnit is untouched here on purpose: `--reporter junit` fetches the server's
+ * bytes, and the server already renders a suppressed failure as `<skipped>`
+ * with a QUARANTINED FAILURE message. One writer of those bytes, as before.
  */
 
 import { mkdir, readdir, writeFile } from 'node:fs/promises';
@@ -48,7 +63,21 @@ import { createHash } from 'node:crypto';
 
 // ─── The model, mirrored from packages/runner/src/reporters/types.ts ─────────
 
-export type ReporterStatus = 'passed' | 'failed' | 'skipped' | 'flaky' | 'timedOut';
+export type ReporterStatus = 'passed' | 'failed' | 'skipped' | 'flaky' | 'timedOut' | 'quarantined';
+
+/**
+ * The sentence every format uses, verbatim, for a suppressed failure.
+ *
+ * Byte-identical to `QUARANTINE_NOTE` in
+ * packages/runner/src/reporters/types.ts, which is in turn transcribed from
+ * `GET /runs/:runId/junit.xml` — the shipped writer of the one output machines
+ * nobody here controls already parse. `report.test.ts` asserts the equality
+ * against the real constant, because a mirror of a sentence is exactly the kind
+ * of thing that drifts by a comma and then reads as a different claim.
+ */
+export const QUARANTINE_NOTE =
+  'QUARANTINED FAILURE — this test FAILED and its failure is suppressed by quarantine, ' +
+  'so it did not fail the build. It is not a skipped test: it ran, and it failed.';
 
 export interface ReportedTest {
   name: string;
@@ -67,9 +96,17 @@ export interface ReportedTest {
 export interface RunTotals {
   tests: number;
   passed: number;
+  /** Failures that GATE. A suppressed failure is not one of these. */
   failed: number;
   skipped: number;
   flaky: number;
+  /**
+   * `Run.quarantinedFailedCount` — failures a quarantine in force suppressed.
+   * A FOURTH number, not a slice of `failed` and not folded into `skipped`.
+   * Absent when the API did not send it, which is a run finalised by an older
+   * worker; absent means "not measured", never zero.
+   */
+  quarantinedFailed?: number;
 }
 
 export interface RunReport {
@@ -196,14 +233,60 @@ export interface ApiRunPayload {
   failedCount?: number;
   flakyCount?: number;
   skippedCount?: number;
+  /**
+   * The fourth counter. Optional because an API older than the quarantine fix
+   * does not send it — and because `--reporter` has to keep working against
+   * whatever version of the server a customer's CI is pointed at.
+   */
+  quarantinedFailedCount?: number;
   environment?: { name?: string | null } | null;
   results?: Array<{
     status?: string;
     durationMs?: number;
     errorMessage?: string | null;
     createdAt?: string | null;
-    test?: { id?: string; name?: string; filePath?: string | null } | null;
+    test?: {
+      id?: string;
+      name?: string;
+      filePath?: string | null;
+      /**
+       * Both quarantine columns, because the flag alone is not the answer: an
+       * expired quarantine suppresses nothing and its failure gates again.
+       * `GET /runs/:runId` selects both for exactly this reason.
+       */
+      quarantined?: boolean | null;
+      quarantineExpiresAt?: string | null;
+    } | null;
   }> | null;
+}
+
+/**
+ * Is this test's quarantine in force right now?
+ *
+ * A THIRD implementation of `quarantineSuppresses`, and it is here for the same
+ * reason the Allure and TestRail renderers below are: the published CLI may not
+ * import across the package boundary (see the header), so it cannot call
+ * `quarantineSuppresses` in packages/runner/src/gates.ts. The two are asserted
+ * equal over a table of cases in `report.test.ts`, which may cross that
+ * boundary — that assertion is the only thing standing between "two
+ * implementations" and "two answers".
+ *
+ * Every branch is the gates.ts branch, including the two that look like
+ * mistakes and are not: a NULL expiry is HONOURED (it is a quarantine written
+ * before expiry existed, and back-filling one would turn thousands of
+ * suppressed failures red in a single deploy), and an UNPARSEABLE expiry is
+ * honoured too (a bad date string must not be the thing that reddens a build).
+ */
+function quarantineInForce(
+  test: { quarantined?: boolean | null; quarantineExpiresAt?: string | null },
+  now: number,
+): boolean {
+  if (test.quarantined !== true) return false;
+  const expires = test.quarantineExpiresAt;
+  if (expires === null || expires === undefined) return true;
+  const at = Date.parse(expires);
+  if (Number.isNaN(at)) return true;
+  return at > now;
 }
 
 const STATUS_FROM_API: Record<string, ReporterStatus> = {
@@ -236,8 +319,29 @@ function epoch(value: string | null | undefined): number | undefined {
  *    nothing at all) are not. Allure derives `start` from it and the duration.
  */
 export function runReportFromApi(run: ApiRunPayload, options: { url?: string } = {}): RunReport {
+  /*
+   * One instant for the whole report, not one per result. Two tests whose
+   * quarantines expire inside the same millisecond have to be reported the same
+   * way, and a per-row `Date.now()` is a document that can disagree with
+   * itself.
+   */
+  const now = Date.now();
+
   const tests: ReportedTest[] = (run.results ?? []).map((result) => {
-    const status = STATUS_FROM_API[String(result.status ?? '')] ?? 'failed';
+    const reported = STATUS_FROM_API[String(result.status ?? '')] ?? 'failed';
+    /*
+     * A quarantine in force turns a FAILURE into a suppressed failure, and
+     * touches nothing else. A quarantined test that PASSED is a pass — the
+     * suppression had nothing to suppress — and a quarantined test that was
+     * SKIPPED is a skip. Rewriting those would put "QUARANTINED FAILURE" on a
+     * test that did not fail, which is the same class of lie in the other
+     * direction.
+     */
+    const suppressible = reported === 'failed' || reported === 'timedOut';
+    const status: ReporterStatus =
+      suppressible && result.test && quarantineInForce(result.test, now)
+        ? 'quarantined'
+        : reported;
     const raw = result.durationMs;
     const timed =
       typeof raw === 'number' &&
@@ -285,6 +389,16 @@ export function runReportFromApi(run: ApiRunPayload, options: { url?: string } =
       failed: run.failedCount,
       skipped: run.skippedCount,
       flaky: run.flakyCount,
+      /*
+       * Carried only when the server actually sent it, and NOT added to the
+       * five-way presence check above: making it required would mean an API
+       * older than the quarantine fix produced no totals at all, which is a
+       * regression for every customer who has not upgraded. Absent here means
+       * "the server did not measure it", which is what the reporters then say.
+       */
+      ...(typeof run.quarantinedFailedCount === 'number'
+        ? { quarantinedFailed: run.quarantinedFailedCount }
+        : {}),
     };
   }
 
@@ -315,6 +429,10 @@ const ALLURE_STATUS: Record<ReporterStatus, string> = {
   skipped: 'skipped',
   flaky: 'passed',
   timedOut: 'broken',
+  // `failed` plus `statusDetails.muted`, which is Allure's own "known about,
+  // not held against the build". NOT `skipped` — that reads as a deliberate
+  // skip — and NOT `broken`, which already means a timeout here.
+  quarantined: 'failed',
 };
 
 function allureWindow(test: ReportedTest): { start?: number; stop?: number } {
@@ -341,11 +459,22 @@ export function renderAllure(report: RunReport): ReporterDocument {
       labels.push({ name: 'parentSuite', value: report.environment.trim() });
     if (report.branch?.trim()) labels.push({ name: 'tag', value: report.branch.trim() });
     if (test.status === 'flaky') labels.push({ name: 'tag', value: 'flaky' });
+    // A tag as well as the flag, so "what have we switched off" is a filter in
+    // the report rather than a boolean buried in statusDetails.
+    if (test.status === 'quarantined') labels.push({ name: 'tag', value: 'quarantined' });
 
-    const details: { message?: string; trace?: string; flaky?: boolean } = {};
-    if (test.message) details.message = test.message;
+    const details: { message?: string; trace?: string; flaky?: boolean; muted?: boolean } = {};
+    // A suppressed failure ALWAYS carries a message, even with no error text:
+    // `muted` on its own renders as a quiet grey row, and the note leads so it
+    // survives a report that truncates.
+    const message =
+      test.status === 'quarantined'
+        ? [QUARANTINE_NOTE, test.message].filter(Boolean).join('\n\n')
+        : test.message;
+    if (message) details.message = message;
     if (test.stack) details.trace = test.stack;
     if (test.status === 'flaky') details.flaky = true;
+    if (test.status === 'quarantined') details.muted = true;
 
     const result: Record<string, unknown> = {
       uuid: stableId(report.id ?? '', test.id ?? '', fullName, String(index)),
@@ -469,6 +598,10 @@ const TESTRAIL_STATUS: Record<ReporterStatus, number | null> = {
   failed: 5,
   timedOut: 5,
   flaky: 1,
+  // 4 = Retest: visible, distinct, and not the red that gates a release
+  // checklist. Never `null` — omitting it leaves the case on its last status,
+  // which on a case that was green last week is a failure reading as a pass.
+  quarantined: 4,
   skipped: null,
 };
 
@@ -489,6 +622,8 @@ export function renderTestRail(report: RunReport, testRailRunId?: number): Repor
     [];
   const unmapped: string[] = [];
   const skipped: string[] = [];
+  /** Sent as Retest. Named, because "which did we switch off" has to have an answer. */
+  const quarantined: string[] = [];
   let untimed = 0;
 
   for (const test of report.tests) {
@@ -503,12 +638,18 @@ export function renderTestRail(report: RunReport, testRailRunId?: number): Repor
       continue;
     }
 
+    if (test.status === 'quarantined') quarantined.push(fullNameOf(test));
+
     const elapsed = elapsedFor(test);
     if (elapsed === undefined) untimed += 1;
 
     const lines: string[] = [];
     if (test.status === 'flaky') lines.push('Passed on retry — QAAI recorded this test as flaky.');
     if (test.status === 'timedOut') lines.push('Timed out.');
+    // Retest on its own says "look again" and nothing about why, so the comment
+    // is the whole difference between a case somebody re-runs and one somebody
+    // understands. It leads, so it survives a truncation.
+    if (test.status === 'quarantined') lines.push(QUARANTINE_NOTE);
     if (test.message) lines.push(test.message);
     const comment = lines.length > 0 ? lines.join('\n\n') : undefined;
 
@@ -532,6 +673,14 @@ export function renderTestRail(report: RunReport, testRailRunId?: number): Repor
   if (skipped.length > 0) {
     warnings.push(
       `${skipped.length} skipped test(s) were left out: TestRail's Untested status cannot be written through add_results, so their cases keep the status they already had.`,
+    );
+  }
+  if (quarantined.length > 0) {
+    // Printed even though the upload succeeded: a suppression nobody was told
+    // about is the entire failure mode this wave is about.
+    warnings.push(
+      `${quarantined.length} failing test(s) are quarantined and were sent as Retest rather than Failed, so they do not fail this TestRail run — they are still failing. ` +
+        `Quarantined: ${truncate(quarantined.slice(0, 5).join(', '), 300)}${quarantined.length > 5 ? `, and ${quarantined.length - 5} more` : ''}.`,
     );
   }
   if (untimed > 0) {

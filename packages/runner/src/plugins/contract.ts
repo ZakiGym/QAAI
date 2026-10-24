@@ -47,6 +47,13 @@
  * where it may go lives in contract-broker.ts and is enforced before the token
  * is unsealed. Publishing is never the reason a contract test fails.
  *
+ * Where a document named by path comes from: the run's MATERIALISED REPOSITORY,
+ * never `process.cwd()`. That was the bug — on the worker, cwd is QAAI's own
+ * checkout, so a customer's `contracts/orders.json` was "not found" and a name
+ * that happened to exist in our tree was verified against OUR file, which
+ * destroys the one property a contract test has. A URL and a committed fixture
+ * still need no checkout; see `loadDocument`.
+ *
  * Honest boundaries, all of them visible in the results rather than hidden:
  *   - The `pact` mode replays HTTP only; a pact's message interactions are
  *     reported as skipped steps naming the mode that verifies them.
@@ -57,7 +64,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { FIXTURE_PREFIX, contractTestSpecSchema, maskDeep, maskUrl } from '@qaai/shared';
 import type {
   ContractTestSpec,
@@ -100,6 +107,22 @@ import type {
 } from '../contract-events.js';
 import { publishVerification } from '../contract-broker.js';
 import type { PublishOutcome, VerificationResult } from '../contract-broker.js';
+import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
+
+/**
+ * A spec-supplied path that is not a path into the repository at all.
+ *
+ * Separate from {@link ContractConfigError} because the two produce DIFFERENT
+ * verdicts, and conflating them is how a broken test merges green:
+ *
+ *  - A missing document, an absent YAML parser, a missing secret — all
+ *    ContractConfigError — are gaps someone can close. Nothing was verified, so
+ *    they are SKIPPED.
+ *  - A `pactPath` of `../../etc/shadow` can never work and is not an
+ *    environment gap. It is a broken (or hostile) spec, and SKIPPED does not
+ *    block a gate, so this one is FAILED with the offending path named.
+ */
+class ContractPathError extends Error {}
 
 /** Enough to fix the break; not so much that a step becomes a body dump. */
 const MAX_PROBLEMS_PER_STEP = 12;
@@ -167,15 +190,30 @@ function authHeaders(
 
 // ─── Loading the contract document ───────────────────────────────────────────
 
-/** A spec-supplied path must stay inside the workspace. */
-function safeWorkspacePath(ref: string): string {
-  if (isAbsolute(ref)) {
-    throw new ContractConfigError(`${ref} must be relative to the workspace`);
-  }
-  const workspace = resolve(process.cwd());
-  const full = resolve(join(workspace, ref));
-  if (full !== workspace && !full.startsWith(workspace + sep)) {
-    throw new ContractConfigError(`${ref} escapes the workspace`);
+/**
+ * A spec-supplied path, resolved inside the run's materialised repository.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * The workspace here was `process.cwd()`, which on the worker is QAAI'S OWN
+ * CHECKOUT. So a spec naming `contracts/orders.json` — a real file in the
+ * customer's repository — got "No pact file at …" and, far worse, a spec naming
+ * a path that happens to exist in QAAI's tree got QAAI'S FILE and verified a
+ * provider against it. A contract test's whole value is that the document came
+ * from the consumer; reading some other repository's file silently destroys it.
+ *
+ * The `isAbsolute` guard the previous version opened with is kept by the shared
+ * guard, which additionally refuses Windows separators and drive letters. The
+ * one precondition it cannot check for itself is the root: `resolve('')` is
+ * `process.cwd()`, so an empty or relative root would quietly reinstate exactly
+ * the bug above, and is refused here.
+ */
+function safeWorkspacePath(root: string, ref: string): string {
+  const full = root && isAbsolute(root) ? resolveInsideWorkspace(root, ref) : null;
+  if (full === null) {
+    throw new ContractPathError(
+      `"${ref}" is not a path inside your repository, so nothing was read and the contract was not verified. Use a path relative to the repository root, or an http(s) URL.`,
+    );
   }
   return full;
 }
@@ -228,12 +266,28 @@ async function loadDocument(
     if (content !== undefined) return content;
   }
 
-  try {
-    return await readFile(safeWorkspacePath(ref), 'utf8');
-  } catch (err) {
-    if (err instanceof ContractConfigError) throw err;
+  /*
+   * The workspace is the LAST resort and the only one that needs a checkout —
+   * a URL and a committed fixture both work without one, which is why this
+   * refusal lives here and not at the top of the plugin.
+   *
+   * SKIPPED (ContractConfigError): no connected repository is a configuration
+   * gap, and there are three ways out of it, so all three are named.
+   */
+  const workspace = runWorkspaceOf(ctx);
+  if (!workspace) {
     throw new ContractConfigError(
-      `No ${what} at "${ref}". Point it at an http(s) URL, or commit the file as test data under ${FIXTURE_PREFIX} — the contract was not verified.`,
+      `No ${what} at "${ref}": it is not an http(s) URL, it is not committed as test data under ${FIXTURE_PREFIX}, and this run has no checkout of your repository to read it from — so the contract was not verified. Connect the project to its repository (Project settings → Repository), commit the file under ${FIXTURE_PREFIX}, or point it at a URL.`,
+    );
+  }
+
+  try {
+    // Throws ContractPathError for a path that escapes — FAILED, not SKIPPED.
+    return await readFile(safeWorkspacePath(workspace.root, ref), 'utf8');
+  } catch (err) {
+    if (err instanceof ContractConfigError || err instanceof ContractPathError) throw err;
+    throw new ContractConfigError(
+      `No ${what} at "${ref}" in ${workspace.source}. Point it at an http(s) URL, or commit the file as test data under ${FIXTURE_PREFIX} — the contract was not verified.`,
     );
   }
 }
@@ -2692,6 +2746,15 @@ export const contractPlugin: RunnerPlugin = {
         `${result.summary}. First: ${failed[0]?.error?.message ?? ''}`.slice(0, 2000),
       );
     } catch (err) {
+      /*
+       * A path that escapes the repository is a broken spec, not an environment
+       * gap: nobody can install their way out of `../../etc/shadow`, and a SKIP
+       * would hide it behind "not evaluated" while the gate stayed green. It is
+       * checked FIRST so it can never be swallowed by the skip below.
+       */
+      if (err instanceof ContractPathError) {
+        return finish('FAILED', [], [], err.message);
+      }
       // A configuration gap or a missing dependency is never the application's
       // fault, so it is reported as "not evaluated" rather than as a break.
       if (err instanceof ContractConfigError || err instanceof MissingToolError) {

@@ -6,8 +6,14 @@
  * into auto-approving selector-only fixes and the diff genuinely is one.
  */
 
-import { applyHealDiff, isAutoApprovable, proposeHeal, triageFailure } from '@qaai/agent';
-import type { FlowMap, StepResult, TestExecution, TriageJob } from '@qaai/shared';
+import {
+  applyHealDiff,
+  isAutoApprovable,
+  postCheckCode,
+  proposeHeal,
+  triageFailure,
+} from '@qaai/agent';
+import type { FlowMap, StepResult, TestExecution, TestType, TriageJob } from '@qaai/shared';
 import { llm, logger, prisma, publishEvent } from '../context.js';
 
 export async function processTriage(job: TriageJob): Promise<void> {
@@ -144,7 +150,22 @@ export async function processTriage(job: TriageJob): Promise<void> {
 
 async function proposeHealFor(
   orgId: string,
-  test: { id: string; projectId: string; name: string; filePath: string; code: string },
+  /*
+   * `type` and `spec` widen this structural parameter for the post-check gates.
+   * A spec-driven test keeps its assertions in the spec and its `code` is an
+   * inert pointer comment, so a gate handed the code alone would report a
+   * perfectly good API test as asserting nothing — and, this being the
+   * unattended path, would then decline to auto-apply every heal on one.
+   */
+  test: {
+    id: string;
+    projectId: string;
+    name: string;
+    filePath: string;
+    code: string;
+    type: TestType;
+    spec: unknown;
+  },
   verdictId: string,
   verdict: Awaited<ReturnType<typeof triageFailure>>,
   steps: StepResult[],
@@ -196,31 +217,85 @@ async function proposeHealFor(
     let applyNote: string | null = null;
 
     if (auto.allowed) {
-      const applied = applyHealDiff(test.code, proposal.diff);
-      if (applied.ok && applied.code) {
-        const latest = await prisma.testVersion.findFirst({
-          where: { testId: test.id },
-          orderBy: { version: 'desc' },
-          select: { version: true },
+      /*
+       * The path matters more here than anywhere else: this is the one site that
+       * writes a model's patch into the customer's test with no human in the
+       * loop, and the only thing standing between it and a silently weakened
+       * suite is the never-weaken guard. Called without a path that guard runs a
+       * JavaScript assertion count, which is 0 before and 0 after in a Go,
+       * pytest or JUnit repo — it would have approved the deletion of every
+       * assertion in the file.
+       */
+      const applied = applyHealDiff(test.code, proposal.diff, { filePath: test.filePath });
+      if (applied.review) {
+        /*
+         * Auto-apply is premised on the guard having checked. When the guard
+         * says it could not read this file type, that premise is gone, so the
+         * proposal goes to a human instead — with the reason, rather than a
+         * mysterious refusal.
+         */
+        applyNote = applied.review;
+      } else if (!applied.ok || !applied.code) {
+        applyNote = applied.reason ?? 'The diff could not be applied';
+      } else {
+        /*
+         * The same gates a generated test passes through, over the patched file
+         * — and held to a HIGHER bar here than anywhere else, because this is
+         * the one path that writes a model's code into the customer's
+         * repository with nobody reading it.
+         *
+         * On the two reviewed paths a fixed sleep or a brittle locator is a
+         * flag, and a flag is a message to a human. There is no human here, so
+         * `autoApplyAllowed` requires every gate that could run to have
+         * actually PASSED — no failure, no warning, and no "nobody checked".
+         * Auto-apply is premised on the output having been checked; when it was
+         * not, the premise is gone and the proposal goes to a person, which is
+         * exactly what this path already did for `applied.review` above.
+         *
+         * `check.allowed` is the stronger refusal — the patched file does not
+         * parse — and that one holds on every path, reviewed or not.
+         */
+        const check = await postCheckCode({
+          code: applied.code,
+          filePath: test.filePath,
+          testType: test.type,
+          spec: test.spec,
         });
-        await prisma.test.update({
-          where: { id: test.id },
-          data: {
-            code: applied.code,
-            versions: {
-              create: {
-                orgId,
-                version: (latest?.version ?? 0) + 1,
-                code: applied.code,
-                source: 'HEALER',
-                message: `Auto-applied selector heal: ${proposal.explanation.slice(0, 200)}`,
+
+        if (!check.allowed) {
+          applyNote = check.refusal ?? 'The patched file did not pass the post-heal checks';
+        } else if (!check.autoApplyAllowed) {
+          applyNote = `${check.autoApplyDeclined ?? 'A post-heal check did not pass.'} ${check.checks}`;
+        } else {
+          const latest = await prisma.testVersion.findFirst({
+            where: { testId: test.id },
+            orderBy: { version: 'desc' },
+            select: { version: true },
+          });
+          await prisma.test.update({
+            where: { id: test.id },
+            data: {
+              code: applied.code,
+              versions: {
+                create: {
+                  orgId,
+                  version: (latest?.version ?? 0) + 1,
+                  code: applied.code,
+                  source: 'HEALER',
+                  /*
+                   * The checks ride into the version history. Nobody saw this
+                   * change happen, so the history is the only place the fact
+                   * that it WAS checked — and what was not checked — survives.
+                   * An unattended write with no record of its gates is the
+                   * defect this work exists to close.
+                   */
+                  message: `Auto-applied selector heal: ${proposal.explanation.slice(0, 200)} — ${check.checks}`,
+                },
               },
             },
-          },
-        });
-        state = 'AUTO_APPLIED';
-      } else {
-        applyNote = applied.reason ?? 'The diff could not be applied';
+          });
+          state = 'AUTO_APPLIED';
+        }
       }
     }
 

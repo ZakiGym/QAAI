@@ -35,3 +35,14 @@ export * from './jobs';
  */
 export * from './action-events';
 export * from './dialect';
+/*
+ * The synthetic data factory and the third-party test-value catalogue (§2).
+ *
+ * Public API on purpose: the agent generates values with the first, the runner
+ * and the generated specs quote the second, and the web app renders the
+ * catalogue's confidence note so a reader can see which card numbers this repo
+ * actually vouches for. Both are pure data and arithmetic — no node: builtins —
+ * so the web bundler can eat them, which is the test this barrel applies.
+ */
+export * from './synthetic';
+export * from './test-values';

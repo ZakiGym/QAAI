@@ -16,12 +16,27 @@
  * The `execute` cases drive the real code path — spawn, parse, gate — using
  * `node -e` as a stand-in tool, so no mutation tool needs to be installed for
  * the suite to run.
+ *
+ *  3. **WHERE it runs.** This plugin resolved its workspace from
+ *     `process.cwd()`, so on the worker it mutated QAAI's own checkout and
+ *     filed the score as the customer's. Every context below now carries a real
+ *     materialised workspace, one case proves the tool actually ran inside it,
+ *     and two more pin the refusals: no repository is SKIPPED (a configuration
+ *     gap), a path that escapes is FAILED (a broken test — a skip does not block
+ *     a gate).
  */
 
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ArtifactSink, ExecutableTest, RunContext, StepStatus } from '@qaai/shared';
+import { attachRunWorkspace } from '../run-workspace.js';
 import {
+  applyMutantToText,
   mutationPlugin,
+  mutationRunData,
   mutationScore,
   parseElementsJson,
   parseGoMutestingStdout,
@@ -30,7 +45,11 @@ import {
   parseMutmutResults,
   parseMutmutStdout,
   parsePitXml,
+  runFocusedMutantTrial,
+  runSingleTest,
+  trialDidNotRun,
 } from './mutation.js';
+import type { MutantEdit } from './mutation.js';
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
 
@@ -41,9 +60,28 @@ const artifacts: ArtifactSink = {
   putPersistent: async () => 'key',
 };
 
-function makeContext(): RunContext & { logged: Array<{ title: string; status: StepStatus }> } {
+/**
+ * The run's materialised repository, fresh per test.
+ *
+ * A real directory rather than a string: the plugin spawns its tool with this
+ * as the cwd, so a fake root would turn every `execute` case into a spawn
+ * failure and hide whatever it was testing.
+ */
+let repoWorkspace = '';
+
+beforeEach(async () => {
+  repoWorkspace = await mkdtemp(join(tmpdir(), 'qaai-mutation-repo-'));
+});
+
+afterEach(async () => {
+  await rm(repoWorkspace, { recursive: true, force: true });
+});
+
+function makeContext(
+  workspaceRoot: string | null = repoWorkspace,
+): RunContext & { logged: Array<{ title: string; status: StepStatus }> } {
   const logged: Array<{ title: string; status: StepStatus }> = [];
-  return {
+  const ctx: RunContext & { logged: Array<{ title: string; status: StepStatus }> } = {
     runId: 'run_1',
     orgId: 'org_1',
     projectId: 'proj_1',
@@ -68,6 +106,12 @@ function makeContext(): RunContext & { logged: Array<{ title: string; status: St
     },
     logged,
   };
+  return attachRunWorkspace(
+    ctx,
+    workspaceRoot === null
+      ? null
+      : { root: workspaceRoot, source: 'acme/pricing@main', fileCount: 12 },
+  );
 }
 
 function makeTest(spec: unknown): ExecutableTest {
@@ -512,5 +556,479 @@ describe('execute', () => {
 
     expect(execution.status).toBe('PASSED');
     expect(execution.steps.at(-1)?.title).toContain('reported the count without naming them');
+  });
+
+  /*
+   * ── Where the tool ran ─────────────────────────────────────────────────────
+   *
+   * The marker file is written by the fake tool into its own cwd, so finding it
+   * in the materialised workspace — and not in the worker's directory — is
+   * proof of where the run happened. Before the fix it landed in QAAI's own
+   * checkout.
+   */
+  it('runs the tool inside the materialised repository, not the worker directory', async () => {
+    const execution = await mutationPlugin.execute(
+      makeContext(),
+      makeTest({
+        tool: 'go-mutesting',
+        minScore: 0,
+        ...fakeScript(
+          `require("fs").writeFileSync("qaai-cwd-marker","");` +
+            `console.log('The mutation score is 0.500000 (1 passed, 1 failed, 0 duplicated, 0 skipped, total is 2)')`,
+        ),
+      }),
+    );
+
+    expect(execution.status).toBe('PASSED');
+    expect(existsSync(join(repoWorkspace, 'qaai-cwd-marker'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'qaai-cwd-marker'))).toBe(false);
+  });
+
+  it('is not evaluated when the run has no checkout of the repository', async () => {
+    const execution = await mutationPlugin.execute(
+      makeContext(null),
+      makeTest({ tool: 'go-mutesting', minScore: 0, ...fakeTool(['anything']) }),
+    );
+
+    // SKIPPED: a missing repository is a configuration gap, and a FAILED here
+    // would read as a verdict on the customer's suite.
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toMatch(/no checkout of your repository/);
+    expect(execution.errorMessage).toMatch(/Connect the project to its repository/);
+    expect(execution.steps).toEqual([]);
+  });
+
+  /*
+   * `cwd` is schema-bounded against `..` and a leading `/`, which is why this
+   * uses a drive letter: the schema lets `C:\…` through (it splits on
+   * separators and finds no `..`), and on POSIX it is a plain relative name. The
+   * runtime guard is what refuses it, and this is the case that proves the
+   * guard is not just restating the schema.
+   */
+  it('fails, rather than skips, on a cwd the workspace guard refuses', async () => {
+    const execution = await mutationPlugin.execute(
+      makeContext(),
+      makeTest({ tool: 'go-mutesting', cwd: 'C:\\Windows', ...fakeTool(['anything']) }),
+    );
+
+    expect(execution.status).toBe('FAILED');
+    expect(execution.errorMessage).toMatch(/not inside the repository/);
+    expect(execution.errorMessage).toContain('acme/pricing@main');
+  });
+});
+
+// ─── mutationRunData ─────────────────────────────────────────────────────────
+
+describe('mutationRunData', () => {
+  it('reports the score as data, with the denominator it was computed over', () => {
+    const data = mutationRunData({ detected: 8, undetected: 2, excluded: 90, survivors: [] }, 60);
+    expect(data).toMatchObject({ score: 80, valid: 10, excluded: 90, minScore: 60, passed: true });
+  });
+
+  it('does not report an unevaluated suite as passing', () => {
+    const data = mutationRunData({ detected: 0, undetected: 0, excluded: 3, survivors: [] }, 0);
+    expect(data.score).toBeNull();
+    // minScore 0 and score null: a suite nothing ran against has not cleared
+    // any bar, and `score >= 0` would have said it had.
+    expect(data.passed).toBe(false);
+  });
+});
+
+// ─── The focused single-test trial ───────────────────────────────────────────
+
+describe('applyMutantToText', () => {
+  const code = 'if (total > 100) {\n  throw new Error("too big");\n}\n';
+  const edit: MutantEdit = {
+    id: 'SWAP_BOUNDARY#1',
+    operator: 'SWAP_BOUNDARY',
+    filePath: 'src/calc.ts',
+    line: 1,
+    start: code.indexOf('>'),
+    end: code.indexOf('>') + 1,
+    original: '>',
+    replacement: '>=',
+  };
+
+  it('replaces exactly the span it was given', () => {
+    expect(applyMutantToText(code, edit)).toContain('if (total >= 100)');
+  });
+
+  /**
+   * The offsets come from a different process, computed against a copy of the
+   * file. If they have drifted, applying the edit anyway writes a corrupted
+   * file into a tree a human owns — the one failure here that loses work rather
+   * than merely reporting wrongly.
+   */
+  it('refuses when the expected text is not at the offsets', () => {
+    expect(() => applyMutantToText(code, { ...edit, original: '<' })).toThrow(/expected/);
+    expect(() => applyMutantToText('tiny', edit)).toThrow(/outside the source/);
+    expect(() => applyMutantToText(code, { ...edit, start: -1 })).toThrow(/outside the source/);
+  });
+});
+
+describe('trialDidNotRun', () => {
+  it.each([
+    'src/calc.ts(7,5): error TS2345: Argument of type string is not assignable',
+    'SyntaxError: Unexpected token )',
+    "Error: Cannot find module './calc.js'",
+    'Error: No tests found',
+    'ERROR: error during collection',
+  ])('spots that the test never executed: %s', (line) => {
+    expect(trialDidNotRun(`running\n${line}\ndone`)).not.toBeNull();
+  });
+
+  /**
+   * The other direction is the one that matters: a real assertion failure must
+   * NOT be mistaken for "never ran", or every genuine kill would be discarded.
+   */
+  it.each([
+    'Expected: "90"\nReceived: "100"',
+    '1) cart.spec.ts:8 › shows the discounted total ─ expect(locator).toHaveText',
+    'AssertionError: expected 100 to be 90',
+    'FAIL src/cart.test.ts > applies the discount',
+  ])('does not mistake a real failure for a load error: %s', (output) => {
+    expect(trialDidNotRun(output)).toBeNull();
+  });
+});
+
+describe('runSingleTest', () => {
+  it('reports a pass on exit 0 and a failure on anything else', async () => {
+    const pass = await runSingleTest({
+      test: { command: process.execPath, args: ['-e', 'process.exit(0)'], timeoutSeconds: 30 },
+      workspace: repoWorkspace,
+    });
+    expect(pass.passed).toBe(true);
+    expect(pass.didNotRun).toBeNull();
+
+    const fail = await runSingleTest({
+      test: {
+        command: process.execPath,
+        args: ['-e', 'console.error("AssertionError: expected 100 to be 90");process.exit(1)'],
+        timeoutSeconds: 30,
+      },
+      workspace: repoWorkspace,
+    });
+    expect(fail.passed).toBe(false);
+    expect(fail.exitCode).toBe(1);
+    expect(fail.didNotRun).toBeNull();
+  });
+
+  it('separates "the test failed" from "the test never ran"', async () => {
+    const run = await runSingleTest({
+      test: {
+        command: process.execPath,
+        args: ['-e', 'console.error("x.ts(1,1): error TS2322: nope");process.exit(1)'],
+        timeoutSeconds: 30,
+      },
+      workspace: repoWorkspace,
+    });
+    expect(run.passed).toBe(false);
+    expect(run.didNotRun).toContain('TS2322');
+  });
+
+  it('reports a missing binary rather than a failing test', async () => {
+    const run = await runSingleTest({
+      test: { command: 'qaai-no-such-test-runner', args: [], timeoutSeconds: 30 },
+      workspace: repoWorkspace,
+    });
+    expect(run.spawnError).toBe('ENOENT');
+    expect(run.passed).toBe(false);
+  });
+
+  it('passes the tenant their own secret and masks it out of the report', async () => {
+    const run = await runSingleTest({
+      test: {
+        command: process.execPath,
+        args: ['-e', 'console.log("token=" + process.env.APP_PASSWORD)'],
+        secretNames: ['APP_PASSWORD'],
+        timeoutSeconds: 30,
+      },
+      workspace: repoWorkspace,
+      secrets: { APP_PASSWORD: 'hunter2-tenant-password' },
+    });
+    expect(run.passed).toBe(true);
+    expect(run.output).toContain('token=');
+    expect(run.output).not.toContain('hunter2-tenant-password');
+  });
+
+  it('runs in the workspace it was given', async () => {
+    const run = await runSingleTest({
+      test: {
+        command: process.execPath,
+        args: ['-e', 'require("fs").writeFileSync("qaai-single-marker","")'],
+        timeoutSeconds: 30,
+      },
+      workspace: repoWorkspace,
+    });
+
+    expect(run.passed).toBe(true);
+    expect(existsSync(join(repoWorkspace, 'qaai-single-marker'))).toBe(true);
+    expect(existsSync(join(process.cwd(), 'qaai-single-marker'))).toBe(false);
+  });
+
+  /*
+   * `SingleTestCommand.cwd` has no schema behind it — it arrives from the
+   * agent — so `join(workspace, cwd)` was the whole guard, and `../..` ran the
+   * command outside the workspace. A refusal must never read as a pass: a
+   * mutation gate takes a pass here as "the suite asserts this behaviour".
+   */
+  it('refuses a cwd that escapes the workspace, and spawns nothing', async () => {
+    const run = await runSingleTest({
+      test: {
+        command: process.execPath,
+        args: ['-e', 'require("fs").writeFileSync("qaai-escaped-marker","")'],
+        cwd: '../..',
+        timeoutSeconds: 30,
+      },
+      workspace: repoWorkspace,
+    });
+
+    expect(run.passed).toBe(false);
+    expect(run.didNotRun).toMatch(/not inside the run workspace/);
+    expect(run.exitCode).toBeNull();
+    expect(existsSync(join(repoWorkspace, '..', '..', 'qaai-escaped-marker'))).toBe(false);
+  });
+});
+
+describe('runFocusedMutantTrial', () => {
+  const SOURCE = `export function total(items: Array<{ price: number }>): number {
+  let sum = 0;
+  for (const item of items) {
+    sum = sum + item.price;
+  }
+  return sum;
+}
+`;
+
+  let workspace = '';
+  const REL = join('src', 'calc.ts');
+  let file = '';
+
+  /** The arithmetic swap: `sum + item.price` becomes `sum - item.price`. */
+  function edit(over: Partial<MutantEdit> = {}): MutantEdit {
+    const at = SOURCE.indexOf('sum + item.price') + 4;
+    return {
+      id: 'SWAP_ARITHMETIC#1',
+      operator: 'SWAP_ARITHMETIC',
+      filePath: REL,
+      line: 4,
+      start: at,
+      end: at + 1,
+      original: '+',
+      replacement: '-',
+      ...over,
+    };
+  }
+
+  /** A "test" that fails when the source no longer adds — i.e. one that asserts. */
+  const asserting = {
+    command: process.execPath,
+    args: [
+      '-e',
+      'const s=require("fs").readFileSync(process.argv[1],"utf8");' +
+        'if(!s.includes("sum + item.price")){console.error("AssertionError: expected 30 to be 10");process.exit(1)}',
+    ],
+    timeoutSeconds: 30,
+  };
+
+  beforeEach(async () => {
+    workspace = await mkdtemp(join(tmpdir(), 'qaai-mutation-trial-'));
+    await mkdir(join(workspace, 'src'), { recursive: true });
+    file = join(workspace, REL);
+    await writeFile(file, SOURCE, 'utf8');
+  });
+
+  afterEach(async () => {
+    await rm(workspace, { recursive: true, force: true });
+  });
+
+  it('kills a mutant the test notices, and always puts the file back', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: { ...asserting, args: [...asserting.args, file] },
+      workspace,
+    });
+
+    expect(result.outcome).toBe('KILLED');
+    expect(result.reverted).toBe(true);
+    // The revert is the part that touches a human's working tree.
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  it('reports a survivor when the test passes with the behaviour broken', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: { command: process.execPath, args: ['-e', 'process.exit(0)'], timeoutSeconds: 30 },
+      workspace,
+    });
+
+    expect(result.outcome).toBe('SURVIVED');
+    expect(result.why).toContain('still passed');
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  /**
+   * The false kill, which is the defect this whole section exists to prevent: a
+   * mutant that does not compile makes the command exit non-zero, and reading
+   * that as a kill would certify a test that asserts nothing.
+   */
+  it('does not call a compile error a kill', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: {
+        command: process.execPath,
+        args: [
+          '-e',
+          'console.error("src/calc.ts(4,11): error TS2365: operator - cannot be applied");process.exit(2)',
+        ],
+        timeoutSeconds: 30,
+      },
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.outcome).not.toBe('KILLED');
+    expect(result.why).toContain('never ran');
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  it('is inconclusive and writes nothing when the expected text has moved', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit({ original: '*' }),
+      code: SOURCE,
+      test: asserting,
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.why).toContain('expected');
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  it('is inconclusive when the file on disk is not the source the mutant came from', async () => {
+    await writeFile(file, `// someone edited this file\n${SOURCE}`, 'utf8');
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: asserting,
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.why).toContain('no longer matches');
+  });
+
+  it('refuses a path that escapes the workspace', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit({ filePath: join('..', 'outside.ts') }),
+      code: SOURCE,
+      test: asserting,
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.why).toContain('inside the workspace');
+  });
+
+  it('treats a hang as no evidence, and still reverts', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: {
+        command: process.execPath,
+        args: ['-e', 'setTimeout(() => {}, 30000)'],
+        timeoutSeconds: 1,
+      },
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.timedOut).toBe(true);
+    expect(result.reverted).toBe(true);
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  it('does not run anything once the run has been cancelled', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const result = await runFocusedMutantTrial({
+      mutant: edit(),
+      code: SOURCE,
+      test: asserting,
+      workspace,
+      signal: controller.signal,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.why).toContain('cancelled');
+    expect(await readFile(file, 'utf8')).toBe(SOURCE);
+  });
+
+  it('refuses a mutant that changes nothing instead of calling it a survivor', async () => {
+    const result = await runFocusedMutantTrial({
+      mutant: edit({ replacement: '+' }),
+      code: SOURCE,
+      test: asserting,
+      workspace,
+    });
+
+    expect(result.outcome).toBe('INCONCLUSIVE');
+    expect(result.why).toContain('changes nothing');
+  });
+});
+
+/*
+ * THE LAST HOP. The score used to exist only inside a step title — a string, so
+ * nothing could trend it or gate on it. `TestResult` now has five scalar
+ * columns and a survivor table waiting for `execution.mutation`, and a plugin
+ * that computes the score without attaching it leaves all of them null for
+ * ever. These two tests are what notices if that line is ever dropped.
+ */
+describe('the metric channel', () => {
+  it('attaches the score, the counts and the survivors as DATA, not just prose', async () => {
+    const execution = await mutationPlugin.execute(
+      makeContext(),
+      makeTest({
+        tool: 'go-mutesting',
+        minScore: 50,
+        ...fakeScript(
+          `for(let i=0;i<3;i++)console.log('FAIL "/w/p.go.'+i+'" x');` +
+            `console.log('The mutation score is 0.7 (7 passed, 3 failed, 0 duplicated, 1 skipped, total is 11)')`,
+        ),
+      }),
+    );
+
+    expect(execution.mutation).toBeDefined();
+    expect(execution.mutation?.score).toBeCloseTo(70, 5);
+    expect(execution.mutation?.detected).toBe(7);
+    expect(execution.mutation?.undetected).toBe(3);
+    expect(execution.mutation?.valid).toBe(10);
+    expect(execution.mutation?.minScore).toBe(50);
+    expect(execution.mutation?.passed).toBe(true);
+    expect(execution.mutation?.survivors).toHaveLength(3);
+
+    // And the prose still agrees with the number, because both are read off the
+    // same record — which is the whole reason `mutationRunData` exists.
+    expect(execution.steps[0]?.title).toContain('70.0%');
+  });
+
+  it('leaves it absent when nothing was measured, so null never becomes 0', async () => {
+    // No valid mutant to judge. A 0 here would read as "every mutant survived"
+    // — the worst possible result — rather than the absence of a result.
+    const execution = await mutationPlugin.execute(
+      makeContext(),
+      makeTest({
+        tool: 'go-mutesting',
+        ...fakeTool([
+          'The mutation score is 0.000000 (0 passed, 0 failed, 0 duplicated, 0 skipped, total is 0)',
+        ]),
+      }),
+    );
+
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.mutation).toBeUndefined();
   });
 });

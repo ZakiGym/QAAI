@@ -13,6 +13,13 @@
 
 import { writeFile } from 'node:fs/promises';
 import { argv, env, exit, stderr, stdout } from 'node:process';
+/*
+ * The exit code is NOT computed in this file any more. `./verdict.js` reads the
+ * server's answer, and the header of that module explains why five places each
+ * deciding red/green for themselves is what let quarantine suppress a signal
+ * without stopping the gate.
+ */
+import { summaryLine, verdictOf } from './verdict.js';
 
 interface GlobalOptions {
   apiUrl: string;
@@ -100,7 +107,20 @@ interface RunView {
   failedCount: number;
   flakyCount: number;
   skippedCount: number;
+  /** Failures a quarantine suppressed. Absent on a server older than the field. */
+  quarantinedFailedCount?: number;
   gateResult: { passed: boolean; evaluations: Array<{ action: string; detail: string }> } | null;
+  /**
+   * The server's verdict — the single source of truth for "did this run pass".
+   * Optional because a customer's CI will point an updated CLI at an older
+   * QAAI; `verdictOf` degrades for exactly that case and says so.
+   */
+  verdict?: {
+    passed: boolean;
+    status?: string;
+    suppressedFailures?: number;
+    reason?: string;
+  } | null;
 }
 
 // ─── qaai run ────────────────────────────────────────────────────────────────
@@ -173,7 +193,14 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
     const result = await apiCall<{ run: RunView }>(opts, `/runs/${run.id}`);
     view = result.run;
     if (!opts.json && !TERMINAL.has(view.status)) {
-      stderr.write(`  ${view.status}  ${view.passedCount} passed, ${view.failedCount} failed\r`);
+      // The suppressed count rides along live. A progress line that says "0
+      // failed" while three quarantined tests are failing is the small version
+      // of the lie this whole change removes.
+      const quarantined = view.quarantinedFailedCount ?? 0;
+      stderr.write(
+        `  ${view.status}  ${view.passedCount} passed, ${view.failedCount} failed` +
+          `${quarantined > 0 ? `, ${quarantined} quarantined and failing` : ''}\r`,
+      );
     }
     if (TERMINAL.has(view.status)) break;
   }
@@ -227,28 +254,50 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
     }
   }
 
-  const gateBlocked = view.gateResult ? !view.gateResult.passed : false;
-  // Exit nonzero on any failure OR a blocking gate — the build must go red.
-  const failed =
-    view.failedCount > 0 || view.status === 'FAILED' || view.status === 'ERRORED' || gateBlocked;
+  /*
+   * One call, and no expression of this file's own. See ./verdict.ts for what
+   * the five competing expressions cost.
+   */
+  const verdict = verdictOf(view);
+  const failed = !verdict.passed;
 
   if (opts.json) {
     stdout.write(
       JSON.stringify({
         ...view,
-        ci: { failed, reportingFailed: reports.failures.length > 0 },
+        ci: {
+          failed,
+          reportingFailed: reports.failures.length > 0,
+          // Carried so a pipeline can gate on suppression itself — "fail my
+          // build if anything is quarantined and failing" is a policy a team
+          // should be able to write, and it needs the number.
+          suppressedFailures: verdict.suppressedFailures,
+          verdictSource: verdict.source,
+          reason: verdict.reason,
+        },
         ...(reporterRequests.length > 0 ? { reports } : {}),
       }) + '\n',
     );
   } else {
     stderr.write('\n');
-    stdout.write(
-      `${failed ? '✗' : '✓'} ${view.status}  ` +
-        `${view.passedCount} passed · ${view.failedCount} failed · ` +
-        `${view.flakyCount} flaky · ${view.skippedCount} skipped\n`,
-    );
+    stdout.write(`${summaryLine(view, verdict)}\n`);
+    /*
+     * Printed on a GREEN run too, which is the point. A run that passed because
+     * its failures were quarantined has to say so in the build log, or the log
+     * is the thing that teaches the team the suite is fine.
+     */
+    if (verdict.suppressedFailures > 0) {
+      stdout.write(
+        `  ${verdict.suppressedFailures} failing test(s) are quarantined, so they did not fail ` +
+          `this build. They are still failing — quarantine stops the gate, not the failure.\n`,
+      );
+    }
     for (const evaluation of view.gateResult?.evaluations ?? []) {
       if (evaluation.action === 'BLOCK') stdout.write(`  gate BLOCK — ${evaluation.detail}\n`);
+      // WARN evaluations used to be dropped on the floor, and the quarantine
+      // budget's "near the cap" and "a quarantine expired" alarms are WARNs.
+      // An alarm nobody prints is not an alarm.
+      else if (evaluation.action === 'WARN') stdout.write(`  gate warn — ${evaluation.detail}\n`);
     }
   }
 
@@ -304,14 +353,29 @@ async function cmdStatus(opts: GlobalOptions, args: string[]): Promise<number> {
   if (!runId) throw new CliError('Usage: qaai status <runId>');
 
   const { run } = await apiCall<{ run: RunView }>(opts, `/runs/${runId}`);
+  const verdict = verdictOf(run);
   if (opts.json) {
-    stdout.write(JSON.stringify(run) + '\n');
+    stdout.write(JSON.stringify({ ...run, ci: { failed: !verdict.passed, ...verdict } }) + '\n');
   } else {
-    stdout.write(
-      `${run.status}  ${run.passedCount} passed · ${run.failedCount} failed · ${run.flakyCount} flaky\n`,
-    );
+    stdout.write(`${summaryLine(run, verdict)}\n`);
+    if (verdict.suppressedFailures > 0) {
+      stdout.write(
+        `  ${verdict.suppressedFailures} failing test(s) are quarantined and did not fail the build.\n`,
+      );
+    }
   }
-  return run.failedCount > 0 ? 1 : 0;
+  /*
+   * Was `run.failedCount > 0`, which is the same defect in miniature: a
+   * quarantined failure exited 1 here too, and a gate that blocked a run with
+   * every test green exited 0. One verdict, both answers.
+   *
+   * A run that has not FINISHED exits 0 regardless. `status` is a query, not a
+   * gate — `runOutcome` reports an unfinished run as `passed: false` because it
+   * has no verdict yet, and turning "still running" into a failed step would
+   * break every pipeline that polls this command.
+   */
+  if (!TERMINAL.has(run.status)) return 0;
+  return verdict.passed ? 0 : 1;
 }
 
 async function fetchJunit(opts: GlobalOptions, runId: string): Promise<string> {
@@ -384,10 +448,12 @@ TestRail credentials are read from the environment and there is deliberately no
 flag for them: anything in argv shows up in the CI log, in \`ps\` on a shared
 build host, and in the shell history of whoever ran it once by hand.
 
-Exit code is nonzero when any test failed or a quality gate blocked, so your
-build goes red without any extra scripting. Exit 2 means the run itself passed
-but a reporter could not publish — a step that never delivered its results is
-not a green step.`;
+Exit code is nonzero when a test that GATES failed or a quality gate blocked,
+so your build goes red without any extra scripting. A quarantined test's failure
+does NOT fail the build — it is reported on its own line and counted in
+\`ci.suppressedFailures\` under --json, because quarantine stops the gate and
+never the failure. Exit 2 means the run itself passed but a reporter could not
+publish — a step that never delivered its results is not a green step.`;
 
 /*
  * `backup` and `runner` live in their own modules because each is substantial,

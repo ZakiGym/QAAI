@@ -21,9 +21,10 @@
  */
 
 import { spawn } from 'node:child_process';
-import { isAbsolute, join, resolve, sep } from 'node:path';
+import { isAbsolute } from 'node:path';
 import { PROTOCOL_KINDS, maskDeep, protocolTestSpecSchema } from '@qaai/shared';
 import { childEnv } from '../child-env.js';
+import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 import type {
   ConsoleEntry,
   ExecutableTest,
@@ -118,14 +119,24 @@ function headerBag(
   return out;
 }
 
-/** Guard: a spec-supplied path must stay inside the run workspace. */
+/**
+ * Guard: a spec-supplied path must stay inside the run workspace.
+ *
+ * Delegates to the one shared guard (`resolveInsideWorkspace`) rather than
+ * repeating its logic — that version also refuses Windows separators and drive
+ * letters, which this one did not. Still THROWS, because the gRPC caller below
+ * turns the throw into a FAILED step naming the path, which is the right
+ * verdict: a proto path that leaves the repository is a broken spec, not an
+ * environment gap.
+ *
+ * The root is checked too: `resolve('')` is `process.cwd()`, so an empty or
+ * relative workspace root would silently resolve back into QAAI's own checkout,
+ * which is the defect this whole change removes.
+ */
 function safeWorkspacePath(workspace: string, relPath: string): string {
-  if (isAbsolute(relPath)) throw new Error(`"${relPath}" must be relative to the workspace`);
-  const full = resolve(join(workspace, relPath));
-  const root = resolve(workspace);
-  if (full !== root && !full.startsWith(root + sep)) {
-    throw new Error(`"${relPath}" escapes the workspace`);
-  }
+  const full =
+    workspace && isAbsolute(workspace) ? resolveInsideWorkspace(workspace, relPath) : null;
+  if (full === null) throw new Error(`"${relPath}" is not a path inside the repository`);
   return full;
 }
 
@@ -1430,13 +1441,20 @@ function runGrpcurl(
   args: string[],
   signal: AbortSignal,
   timeoutSeconds: number,
+  cwd?: string,
 ): Promise<GrpcurlResult> {
   return new Promise<GrpcurlResult>((done) => {
     // Never a shell: a spec is org-authored data, and string interpolation into
     // a shell here would turn a test definition into remote code execution.
     // `env` is explicit because omitting it inherits the worker's entire
     // environment, which is the same leak by default. See child-env.ts.
+    //
+    // `cwd` is the run's repository when there is one. Every path QAAI passes
+    // on the command line is already absolute, so this changes nothing for a
+    // legal spec — but without it the child runs in the WORKER'S OWN directory,
+    // and any relative path grpcurl resolves for itself would resolve there.
     const child = spawn('grpcurl', args, {
+      ...(cwd === undefined ? {} : { cwd }),
       env: childEnv(),
       shell: false,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1477,19 +1495,56 @@ async function runGrpc(
   const vars: Record<string, string> = { ...ctx.secrets, ...spec.variables };
   const recorder = new StepRecorder(ctx, test.id);
   const network: NetworkEntry[] = [];
-  const workspace = process.cwd();
+
+  /*
+   * ── Where a proto path points, and the defect that was ─────────────────────
+   *
+   * `const workspace = process.cwd()` — QAAI's own checkout on the worker. A
+   * spec naming `proto/orders.proto`, a real file in the CUSTOMER'S repository,
+   * resolved to a path in OURS: so either grpcurl reported a file it could not
+   * open, or — if the name happened to exist in our tree — it compiled QAAI'S
+   * PROTO and called the customer's service with it. The second is worse, and
+   * silent.
+   *
+   * Only `-proto` and `-import-path` touch the filesystem, and both are
+   * optional: with neither, grpcurl uses the service's own reflection and needs
+   * no checkout at all. So the refusal is conditional on the spec actually
+   * naming a file — refusing every gRPC test for a missing repository would
+   * break the reflection case, which is the common one.
+   *
+   * SKIPPED, because no connected repository is a configuration gap: nothing
+   * about the service was evaluated, and the message names both ways out.
+   */
+  const workspace = runWorkspaceOf(ctx);
+  const schemaRefs = [...spec.importPaths, ...(spec.protoPath ? [spec.protoPath] : [])];
+  if (schemaRefs.length > 0 && !workspace) {
+    return finish(test, startedAt, recorder, network, ctx.secrets, {
+      status: 'SKIPPED',
+      errorMessage: `"${test.name}" compiles its protobuf schema from your repository (${schemaRefs.join(', ')}), and this run has no checkout of it, so no call was made. Connect the project to its repository (Project settings → Repository) and re-run — or remove \`protoPath\` and \`importPaths\` to use the service's own reflection instead.`,
+    });
+  }
 
   let target: string;
   const schemaArgs: string[] = [];
   try {
     target = spec.target ? interpolate(spec.target, vars) : new URL(ctx.baseUrl).host;
-    for (const importPath of spec.importPaths) {
-      schemaArgs.push('-import-path', safeWorkspacePath(workspace, importPath));
+    // Unreachable with a schema path and no workspace: the refusal above
+    // returned. Written as a narrowing check rather than an assertion so the
+    // reflection case needs no workspace and no cast.
+    if (workspace) {
+      for (const importPath of spec.importPaths) {
+        schemaArgs.push('-import-path', safeWorkspacePath(workspace.root, importPath));
+      }
+      // With no -proto, grpcurl uses server reflection. That is the default on
+      // purpose: reflection is what a running service already exposes.
+      if (spec.protoPath) {
+        schemaArgs.push('-proto', safeWorkspacePath(workspace.root, spec.protoPath));
+      }
     }
-    // With no -proto, grpcurl uses server reflection. That is the default on
-    // purpose: reflection is what a running service already exposes.
-    if (spec.protoPath) schemaArgs.push('-proto', safeWorkspacePath(workspace, spec.protoPath));
   } catch (err) {
+    // FAILED, not SKIPPED: a path that leaves the repository is a broken spec,
+    // and a skip does not block a gate. `record` with problems marks the run
+    // broken, which `finish` renders as FAILED.
     recorder.record('Resolve gRPC target', Date.now(), [errorText(err)]);
     return finish(test, startedAt, recorder, network, ctx.secrets);
   }
@@ -1512,7 +1567,7 @@ async function runGrpc(
     args.push('-d', request, target, call.method);
 
     recorder.log('↑', `${call.method} ${request}`);
-    const result = await runGrpcurl(args, ctx.signal, spec.timeoutSeconds);
+    const result = await runGrpcurl(args, ctx.signal, spec.timeoutSeconds, workspace?.root);
 
     if (result.spawnError === 'ENOENT') {
       return skippedForMissingTool(test, startedAt, recorder, ctx.secrets, GRPCURL_INSTALL_HINT);

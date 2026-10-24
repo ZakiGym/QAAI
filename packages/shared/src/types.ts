@@ -130,6 +130,94 @@ export interface TestExecution {
    * cannot, because the runner has no database access by design.
    */
   newBaseline?: { imageKey: string; viewport: string; browser: string } | null;
+  /**
+   * The numbers a MUTATION run produced, as DATA rather than as prose.
+   *
+   * ── The defect this field exists to prevent ─────────────────────────────
+   *
+   * The mutation score — the only honest answer to "do these tests actually
+   * assert anything?" — existed ONLY interpolated into a step's title
+   * ("Mutation score 72.4% — 89 of 123 mutants killed"). Nothing outside
+   * `packages/runner/src/plugins/mutation.ts` could read it. "Is this project's
+   * mutation score going up?" could not be asked without a regex over a string
+   * column, so the number could not be trended, gated on, or alerted on, and
+   * the one metric no competitor ships was thrown away once per run.
+   *
+   * Optional and nullable, exactly like `newBaseline` above and for the same
+   * reason: it is a plugin-produced extra the WORKER persists, because the
+   * runner has no database access by design. Every plugin that is not MUTATION
+   * leaves it undefined and every existing construction site keeps compiling.
+   *
+   * ABSENT IS NOT ZERO. Undefined/null means "mutation testing did not run
+   * here"; `score: 0` means every single mutant survived, which is the worst
+   * result a suite can produce. The worker writes the columns NULL for the
+   * first and 0 for the second — see `mutationColumns` in
+   * apps/worker/src/processors/run.ts.
+   */
+  mutation?: MutationRunData | null;
+}
+
+/**
+ * A mutant the suite did not catch — the actionable half of a mutation run.
+ *
+ * "We changed `>` to `>=` on line 42 and every test still passed" names one
+ * missing assertion, which is why the survivors travel with the score instead
+ * of being summarised into it.
+ *
+ * Structurally identical to `SurvivingMutant` in
+ * packages/runner/src/plugins/mutation.ts, which is where these are produced.
+ * Restated here rather than imported because @qaai/shared must not depend on
+ * @qaai/runner (the dependency runs the other way); the plugin should import
+ * THIS declaration and delete its own, which is a one-line change to a file
+ * this change does not own.
+ */
+export interface SurvivingMutant {
+  /** Path or class the tool named, as the tool named it. */
+  file: string;
+  line: number | null;
+  /** The mutation operator: `ArithmeticOperator`, `ConditionalsBoundary`, … */
+  mutator: string;
+  /** What the tool says it changed, when it says. */
+  detail: string | null;
+  /** `no-coverage` is a survivor no test even executed. */
+  reason: 'survived' | 'no-coverage';
+}
+
+/**
+ * One mutation run's numbers, built from the tool's report by
+ * `mutationRunData` in packages/runner/src/plugins/mutation.ts — the same
+ * record the plugin renders its headline FROM, so the stored number and the
+ * printed sentence cannot drift apart.
+ */
+export interface MutationRunData {
+  /**
+   * Percentage killed, 0-100 — or null when no valid mutant ran, so there was
+   * no denominator to divide by. NEVER 0 as a stand-in for "unknown": 0 means
+   * every mutant survived.
+   */
+  score: number | null;
+  /** Mutants the suite killed, including ones it killed by timing out. */
+  detected: number;
+  /** Mutants that lived: survived outright, or were never covered. */
+  undetected: number;
+  /**
+   * Mutants that never really ran — compile errors, non-viable mutations.
+   * Excluded from BOTH sides of the score, because an inflated mutation score
+   * is worse than no score.
+   */
+  excluded: number;
+  /** The denominator the score was computed over: detected + undetected. */
+  valid: number;
+  /** The threshold this run was judged against. */
+  minScore: number;
+  /** False when the score is null: an unevaluated suite has not passed anything. */
+  passed: boolean;
+  /**
+   * Every survivor the tool named, uncapped. The worker caps what it STORES
+   * (see `MAX_PERSISTED_SURVIVORS`) while keeping the counts above exact, so a
+   * truncated list can never falsify the number.
+   */
+  survivors: SurvivingMutant[];
 }
 
 export interface Finding {
@@ -144,12 +232,49 @@ export interface Finding {
 }
 
 /** Everything a plugin needs to execute. Assembled by the worker, never by the plugin. */
+/**
+ * A materialised repository, as a plugin sees it.
+ *
+ * `source` is a human sentence naming where the tree came from
+ * (`owner/name@abc1234`), because a verdict that cannot name the checkout it
+ * was produced against is a verdict nobody can reproduce.
+ *
+ * Declared here rather than in packages/runner so that `RunContext` can carry
+ * it as a field. It was a cast through a side-channel interface for exactly as
+ * long as this type lived in the runner, and a context field that only exists
+ * at a cast is a field the next caller does not know about.
+ */
+export interface RunWorkspace {
+  /** Absolute path to the repository root inside this run's temp directory. */
+  readonly root: string;
+  /** `owner/name@ref`, for messages and logs. Never credential-bearing. */
+  readonly source: string;
+  /** Files written, after the materialiser's caps were applied. */
+  readonly fileCount: number;
+}
+
 export interface RunContext {
   runId: string;
   orgId: string;
   projectId: string;
   environmentId: string;
   baseUrl: string;
+  /**
+   * The customer's repository on disk for this run, or null when none was
+   * materialised. INTEGRATION, UNIT_GEN and MUTATION cannot run without it, and
+   * CONTRACT, PROTOCOL, MOBILE and declared-command E2E need it whenever their
+   * spec names a path — see `testNeedsRepository`. A plugin that resolves a
+   * spec-supplied path against `process.cwd()` instead is resolving it against
+   * QAAI's own checkout and reporting a verdict about the wrong tree.
+   */
+  workspace?: RunWorkspace | null;
+  /**
+   * Whose session this test executes under, when it named one. The worker
+   * resolves the profile to a storageState before building the context; this id
+   * is here so the harness can say WHICH identity failed to sign in rather than
+   * falling back to anonymous and reporting a pass.
+   */
+  authProfileId?: string | null;
   /**
    * Decrypted secrets for this environment, keyed by name. Plugins may use these
    * freely; the artifact writer and log serialiser mask any value that appears here.
@@ -231,6 +356,29 @@ export interface ExecutableTest {
   /** Quarantined tests run but never gate (§5). */
   quarantined: boolean;
   tags: string[];
+  /**
+   * The role this test executes as (§2) — the AuthProfile whose cached
+   * storageState the runner injects before the first navigation. Null or absent
+   * means anonymous, which is the right answer for most tests.
+   *
+   * `RunContext.storageState` is per-RUN and stays what it is; this is per-TEST
+   * and is what lets an admin test and a member test sit in the same suite.
+   * When both are present the test's own profile wins, because a value set on
+   * the test is a more specific statement than a default set on the run.
+   *
+   * Optional rather than required so that every existing construction site
+   * keeps compiling and keeps meaning what it meant: a caller that has never
+   * heard of auth profiles produces anonymous tests, exactly as before.
+   */
+  authProfileId?: string | null;
+  /**
+   * "This test is meaningless signed out." Carried to the runner so that a test
+   * which asked for a role and arrived without one FAILS with that sentence
+   * rather than running anonymously and passing — the quiet pass is the defect,
+   * not the missing session. Set when a profile was deleted out from under the
+   * test (the foreign key nulls the binding and leaves this true).
+   */
+  authProfileRequired?: boolean;
 }
 
 /**
@@ -255,10 +403,46 @@ export interface RunSummary {
   trigger: 'MANUAL' | 'SCHEDULE' | 'CI' | 'WEBHOOK' | 'MONITOR';
   startedAt: string | null;
   finishedAt: string | null;
-  counts: { total: number; passed: number; failed: number; flaky: number; skipped: number };
+  counts: {
+    total: number;
+    passed: number;
+    failed: number;
+    flaky: number;
+    skipped: number;
+    /**
+     * Failures that a quarantine suppressed. A FOURTH counter, not a slice of
+     * `failed` and deliberately not folded into `skipped`: a suppressed failure
+     * and a deliberate skip are different facts, and this one still failed.
+     * `passed + failed + flaky + skipped + quarantinedFailed === total`.
+     *
+     * Optional only so that a client talking to an older server can tell "zero
+     * suppressed" from "this server does not know about suppression".
+     */
+    quarantinedFailed?: number;
+  };
   /** Populated once triage completes. */
   verdictCounts: Record<Verdict, number>;
   gateResult: GateResult | null;
+  /**
+   * The answer to "did this run pass", computed server-side by the one function
+   * allowed to answer it (`runOutcome` in packages/runner/src/gates.ts).
+   *
+   * It is a field rather than something each client derives because it WAS
+   * derived five independent times — the worker, the on-prem finaliser, the
+   * CLI's exit code, `qaai status`, and the GitHub check — and four of the five
+   * were wrong about quarantine. The CLI in particular cannot import the rule:
+   * it ships with zero dependencies by design, so the server has to hand it the
+   * verdict.
+   *
+   * Absent from an older server's response, and a client that finds it absent
+   * must say so rather than guessing.
+   */
+  verdict?: {
+    passed: boolean;
+    /** Printable verbatim: a run that passed WITH suppressed failures says so. */
+    reason: string;
+    suppressedFailures: number;
+  };
   commitSha: string | null;
   prNumber: number | null;
 }
@@ -368,7 +552,18 @@ export type GateRule =
   | { kind: 'BLOCK_ON_VERDICT'; verdict: Verdict; onlyPriorities: Priority[] }
   | { kind: 'MAX_FLAKE_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' }
   | { kind: 'MAX_P95_LATENCY_MS'; ms: number; action: 'WARN' | 'BLOCK' }
-  | { kind: 'MIN_PASS_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' };
+  | { kind: 'MIN_PASS_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' }
+  /**
+   * How much of a suite may be quarantined. Appended by the gate evaluator
+   * itself, after the project's configured rules, and NOT removable by a
+   * project writing its own rule list — quarantine is the mechanism that
+   * switches a signal off, and a brake a project can delete is not a brake.
+   *
+   * Declared here rather than in packages/runner/src/gates.ts because a second
+   * declaration of a union member is how two parts of a system quietly
+   * disagree about what a rule is.
+   */
+  | { kind: 'MAX_QUARANTINE_PERCENT'; percent: number; action: 'WARN' | 'BLOCK' };
 
 export interface GateResult {
   passed: boolean;

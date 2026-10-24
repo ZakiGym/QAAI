@@ -57,6 +57,17 @@ const TEST_SELECT = {
   feature: true,
   priority: true,
   type: true,
+  /*
+   * The role each test runs as. Required by `toCoverageInputs`, which is shared
+   * with routes/coverage.ts on purpose — the denominator and the gap report must
+   * read a test the same way or they will disagree about the same suite.
+   *
+   * A test bound to an auth profile carries no sign-in in its source (the runner
+   * injects the session), so without these two columns every signed-in test in
+   * the install looks like a signed-out visitor to both analyses.
+   */
+  authProfileId: true,
+  authProfileRequired: true,
 } as const;
 
 export interface ComputeOptions {

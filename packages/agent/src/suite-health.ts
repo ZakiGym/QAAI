@@ -39,6 +39,12 @@
  * later narrate a report it did not produce.
  */
 
+import {
+  assertionExampleFor,
+  countAssertions as countDialectAssertions,
+  resolveDialect,
+  type DialectId,
+} from '@qaai/shared';
 import type { Priority, TestType } from '@qaai/shared';
 
 // ─── Caps ────────────────────────────────────────────────────────────────────
@@ -552,9 +558,23 @@ export interface TestBehavior {
   actionSites: ActionSite[];
   assertionSites: AssertionSite[];
   /**
-   * True when we did not read the whole test: oversized code, a cap tripped, or
-   * comment stripping that ended mid-string. No absence-based finding may be
-   * emitted for such a test, and it is not eligible for duplicate comparison.
+   * Which assertion lexicon this test's source is read with, or null when the
+   * path and the project language together could not say.
+   *
+   * Everything below this line in the module — swallowed assertions, volatile
+   * expected values, the matcher classification, the locator chains — is
+   * JavaScript. That was invisible while `expect(` was assumed to be what an
+   * assertion looks like, and the cost was a correct pytest test reported as
+   * NO_ASSERTIONS at HIGH severity. One obviously-wrong finding is enough for a
+   * customer to stop reading the page, so the analysis now has to know what
+   * language it is looking at before it accuses anything.
+   */
+  dialect: DialectId | null;
+  /**
+   * True when we did not read the whole test: oversized code, a cap tripped,
+   * comment stripping that ended mid-string, or source in a language we have no
+   * lexicon for. No absence-based finding may be emitted for such a test, and
+   * it is not eligible for duplicate comparison.
    */
   incomplete: boolean;
   incompleteReason: string | null;
@@ -798,6 +818,25 @@ export function routesFromSpec(spec: unknown, depth = 0, out = new Set<string>()
 }
 
 /**
+ * True when this value actually gates something.
+ *
+ * A primitive (including `0` and `false`, which are real expectations) does. An
+ * object or array does only if some leaf inside it is non-null — see the
+ * comment at the `budgets` check below.
+ */
+function hasAssertingLeaf(value: unknown, depth = 0): boolean {
+  if (value === null || value === undefined) return false;
+  if (depth > 6) return false;
+  if (Array.isArray(value)) return value.some((entry) => hasAssertingLeaf(entry, depth + 1));
+  if (typeof value === 'object') {
+    return Object.values(value as Record<string, unknown>).some((entry) =>
+      hasAssertingLeaf(entry, depth + 1),
+    );
+  }
+  return true;
+}
+
+/**
  * Assertions declared in `spec` rather than in code. An API test whose spec
  * says `expectStatus: 200` and nothing else is exactly the "asserts only a
  * status code" case, and it has to be visible even though its `code` is inert.
@@ -820,17 +859,38 @@ export function specAssertions(spec: unknown): {
     }
     for (const [key, value] of Object.entries(node)) {
       const k = key.toLowerCase();
+      /*
+       * `budget` belongs in this list and was missing from it. A PERFORMANCE
+       * test's assertion IS its budgets object, so every correct PERFORMANCE
+       * spec — including the deterministic scaffold the key-less deployment
+       * relies on — was reported as declaring nothing to check, which refused
+       * it outright once generation started running these gates.
+       *
+       * This is the SECOND spec-assertion vocabulary in this file; the other is
+       * `ASSERTION_KEY`, used by `specBehaviorTokens` for duplicate detection.
+       * They answer different questions (is there an expectation at all, versus
+       * which expectations can two tests be compared on), but they must agree
+       * about what an expectation IS — they did not, and this is where that
+       * cost something. Add a field to one, look at the other.
+       *
+       * `hasAssertingLeaf` is why a key alone is not enough: every performance
+       * budget is nullable and null means "measure it, do not gate on it", so
+       * `budgets: { lcpMs: null, clsScore: null }` asserts exactly nothing
+       * while carrying the key that claims otherwise.
+       */
       if (/status/.test(k)) {
-        status += 1;
-        if (statusQuote === null) {
-          statusQuote = `spec: ${JSON.stringify(node).slice(0, MAX_QUOTE_CHARS)}`;
+        if (hasAssertingLeaf(value)) {
+          status += 1;
+          if (statusQuote === null) {
+            statusQuote = `spec: ${JSON.stringify(node).slice(0, MAX_QUOTE_CHARS)}`;
+          }
         }
       } else if (
-        /(expect|assert|schema|jsonpath|contains|match|equals|bodyincludes|threshold|violation)/.test(
+        /(expect|assert|schema|jsonpath|contains|match|equals|bodyincludes|threshold|budget|violation)/.test(
           k,
         )
       ) {
-        body += 1;
+        if (hasAssertingLeaf(value)) body += 1;
       }
       walk(value, depth + 1);
     }
@@ -856,7 +916,8 @@ export function specAssertions(spec: unknown): {
  * keys, because `status: 200` and `status: 404` are different behaviour and
  * collapsing them to "asserts status" would call them duplicates.
  */
-const ASSERTION_KEY = /^(expect|expected|assert|status|statusCode|expectStatus|body|bodyMatches|bodyContains|contains|matches|equals|maxLatencyMs|threshold|thresholds|maxDiffRatio|minScore|rules|severity)$/i;
+const ASSERTION_KEY =
+  /^(expect|expected|assert|status|statusCode|expectStatus|body|bodyMatches|bodyContains|contains|matches|equals|maxLatencyMs|threshold|thresholds|budget|budgets|maxDiffRatio|minScore|rules|severity)$/i;
 
 export function specBehaviorTokens(spec: unknown): string[] {
   const out = new Set<string>();
@@ -871,7 +932,20 @@ export function specBehaviorTokens(spec: unknown): string[] {
     if (typeof node !== 'object') return;
 
     for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-      if (ASSERTION_KEY.test(key)) {
+      /*
+       * `budgets` was missing from this list, and the cost was specific: a
+       * PERFORMANCE test's whole assertion IS its budgets object
+       * (`{ lcpMs: 2500, clsScore: 0.1 }`), so every correct PERFORMANCE spec
+       * — the deterministic scaffold included — was reported as declaring
+       * nothing to check.
+       *
+       * `hasAssertingLeaf` is the other half. Those budgets are all nullable
+       * and null means "measure it, do not gate on it", so a `budgets` object
+       * of nothing but nulls genuinely asserts nothing and must not be counted
+       * just because the key is present. Counting a container by its name
+       * rather than its contents is how a key allow-list starts lying.
+       */
+      if (ASSERTION_KEY.test(key) && hasAssertingLeaf(value)) {
         const rendered =
           value === null || typeof value === 'object'
             ? Array.isArray(value)
@@ -910,6 +984,40 @@ export function extractBehavior(test: SuiteHealthTestInput): TestBehavior {
   if (stripped.unreliable) {
     incomplete = true;
     reasons.push('source ends inside an unterminated string or comment, so it was not fully parsed');
+  }
+
+  /*
+   * The test's own path, and nothing else. The project's language would be a
+   * useful second hint for a path with no extension, but `extractBehavior` is
+   * handed straight to `Array.prototype.map` by admission.ts, so a second
+   * positional parameter here is a type error there — and every ecosystem QAAI
+   * generates for writes a file whose extension or name settles this anyway.
+   */
+  const dialect = resolveDialect({ filePath: test.filePath });
+
+  /*
+   * Source we have no lexicon for is source we did not read — rule TWO, not a
+   * new rule. `incomplete` already means "no absence-based finding may be made
+   * about this test", which is exactly the right treatment: it lands in
+   * `unanalyzed` with a reason a human can act on, it is excluded from the
+   * score rather than scored 0, and if most of a suite is unreadable the
+   * assertion-strength component reports itself unavailable instead of
+   * flattering the readable half.
+   *
+   * The `stripped.text.trim()` guard is what keeps this off the spec-driven
+   * types. Their `filePath` ends in `.api.json` / `.a11y.json`, which resolves
+   * to no dialect, and their `code` column holds a one-line pointer comment —
+   * so after comment stripping there is no code to read and no dialect needed.
+   * Their assertions live in `spec`, which `specAssertions` reads in any
+   * language. Without this guard every API and load test in every project would
+   * have become "unanalyzed" overnight, which is the loud half of the same
+   * dishonesty.
+   */
+  if (dialect === null && stripped.text.trim().length > 0) {
+    incomplete = true;
+    reasons.push(
+      `QAAI has no assertion lexicon for "${test.filePath}", so its assertions could not be counted — this test is unread, not assertion-free`,
+    );
   }
 
   const src = stripped.text;
@@ -1109,6 +1217,7 @@ export function extractBehavior(test: SuiteHealthTestInput): TestBehavior {
     navigationSites,
     actionSites,
     assertionSites,
+    dialect,
     incomplete,
     incompleteReason: incomplete ? reasons.join('; ') : null,
   };
@@ -1548,12 +1657,47 @@ const NO_NEGATIVE_PATH_TYPES = new Set<TestType>(['VISUAL', 'LOAD', 'ACCESSIBILI
  * one of the a11y and security rows in the seeded project was accused of it
  * before this set existed, which is enough noise to get the whole page ignored.
  */
-const PLUGIN_ASSERTED_TYPES = new Set<TestType>([
+export const PLUGIN_ASSERTED_TYPES = new Set<TestType>([
   'ACCESSIBILITY',
   'VISUAL',
   'SECURITY_SMOKE',
   'MUTATION',
 ]);
+
+/**
+ * How much of this module's analysis a given test's source can bear.
+ *
+ * `JS` is everything: the matcher classification, swallowed assertions,
+ * volatile expected values, transport-only and existence-only. All of it is
+ * built on `EXPECT_CALL` and a JavaScript understanding of locator chains and
+ * try/catch, and none of it generalises — Python's `try/except`, Go's explicit
+ * error returns and Robot's keyword table are different languages, not
+ * different spellings. Running it anyway is how a correct pytest test came to
+ * be reported as NO_ASSERTIONS at HIGH severity.
+ *
+ * `DIALECT` is the one question that CAN be answered in every language: are
+ * there any assertions at all? Counted with the dialect's own lexicon, and
+ * nothing else is claimed.
+ *
+ * `SPEC_ONLY` is a test with no source code to read — a spec-driven API, load
+ * or a11y test whose `code` column holds a pointer comment. Its assertions live
+ * in `spec`, which is language-neutral, so the dialect never comes up.
+ *
+ * There is no fourth case: a test with real source and no lexicon is marked
+ * `incomplete` in `extractBehavior` and never reaches an absence-based finding
+ * at all. That is why `dialect === null` here means SPEC_ONLY and not "unknown".
+ */
+type AssertionReading =
+  | { mode: 'JS' }
+  | { mode: 'DIALECT'; dialect: DialectId }
+  | { mode: 'SPEC_ONLY' };
+
+function readingFor(behavior: TestBehavior): AssertionReading {
+  const id = behavior.dialect;
+  if (id === null) return { mode: 'SPEC_ONLY' };
+  if (id === 'JS_EXPECT' || id === 'JS_CHAI') return { mode: 'JS' };
+  return { mode: 'DIALECT', dialect: id };
+}
 
 /**
  * True when the locator itself pins the content, so `toBeVisible()` on it is a
@@ -1627,6 +1771,127 @@ function groupKeyFor(test: SuiteHealthTestInput): string {
   return dir === '' ? '(ungrouped)' : dir;
 }
 
+/**
+ * The two findings that come from something we POSITIVELY SAW rather than from
+ * absence — and the two most JavaScript-specific in the module.
+ *
+ * Both are read out of `assertionSites`, which exists only because `EXPECT_CALL`
+ * matched, and both then interpret what they found with a JavaScript matcher
+ * vocabulary and a JavaScript try/catch. playwright-python spells its
+ * assertions `expect(` too, so the sites are populated for a `.py` file — but
+ * its matchers are snake_case and its `try` has an `except`, which
+ * `swallowingTryRanges` cannot read. A HIGH-severity "your catch swallows this"
+ * about a Python file is a guess wearing the clothes of a finding, so the
+ * caller runs this for JavaScript only.
+ */
+function jsSiteFindings(test: SuiteHealthTestInput, behavior: TestBehavior): WeakAssertion[] {
+  const findings: WeakAssertion[] = [];
+
+  for (const site of behavior.assertionSites) {
+    if (!site.swallowed) continue;
+    findings.push({
+      kind: 'SWALLOWED_ASSERTION',
+      severity: 'HIGH',
+      testId: test.id,
+      testName: test.name,
+      filePath: test.filePath,
+      feature: test.feature,
+      line: site.line,
+      quote: site.quote,
+      why: `This assertion is inside a try whose catch (line ${site.swallowLine ?? '?'}) neither re-throws nor fails the test. When it fails, the failure is caught and discarded and the test still passes — the app can break here and the suite stays green.`,
+      assertInstead:
+        'Delete the try/catch and let the assertion throw. If the block genuinely has to tolerate one specific error, catch that error by name and re-throw everything else, or assert on it directly with `await expect(promise).rejects.toThrow(/…/)`.',
+    });
+  }
+
+  for (const site of behavior.assertionSites) {
+    if (!site.volatile) continue;
+    findings.push({
+      kind: 'VOLATILE_ASSERTION',
+      severity: 'MEDIUM',
+      testId: test.id,
+      testName: test.name,
+      filePath: test.filePath,
+      feature: test.feature,
+      line: site.line,
+      quote: site.quote,
+      why: `The expected value is ${site.volatileReason}. It changes on its own between runs, so this assertion fails on a day nothing was deployed — and once it has cried wolf twice, the next real failure gets ignored.`,
+      assertInstead:
+        site.argKind === 'string'
+          ? 'Assert the shape, not the instance: pass a regex (`toHaveText(/Order #\\d+/)`), or read the value the app generated and compare it to the one it should have derived. If the exact value matters, freeze the clock or the ids with a fixture or a route mock.'
+          : 'Compute the expected value from the same fixed input the app used, or freeze the clock (`page.clock`) instead of comparing against a value generated at assert time.',
+    });
+  }
+
+  return findings;
+}
+
+/**
+ * What to assert instead, when the test is a Playwright test or we have no
+ * dialect to suggest syntax for. Named because it is now one of two.
+ */
+const PLAYWRIGHT_ASSERT_INSTEAD =
+  'Assert the outcome the user came for: the specific text, value or count that proves the action worked — e.g. `await expect(page.getByRole("heading")).toHaveText("Order confirmed")` rather than merely reaching the page.';
+
+/**
+ * "Nothing in the code asserts anything" — now check the spec before saying so.
+ *
+ * Shared by the JavaScript path and by every other dialect, because the spec is
+ * language-neutral and because two copies of this reasoning would drift. The
+ * caller has already established that the CODE is silent; this decides between
+ * "silent everywhere" (NO_ASSERTIONS) and "the spec checks a status code and
+ * nothing else" (TRANSPORT_ONLY), and emits nothing at all when the spec
+ * carries real expectations.
+ */
+function specSideFindings(
+  test: SuiteHealthTestInput,
+  behavior: TestBehavior,
+  code: string,
+  assertInstead: string,
+): WeakAssertion[] {
+  const spec = specAssertions(test.spec);
+  const anchor = anchorSite(behavior, code);
+
+  if (spec.count === 0) {
+    return [
+      {
+        kind: 'NO_ASSERTIONS',
+        severity: 'HIGH',
+        testId: test.id,
+        testName: test.name,
+        filePath: test.filePath,
+        feature: test.feature,
+        line: anchor.line,
+        quote: anchor.quote,
+        why: 'This test makes no assertion anywhere. It passes as long as nothing throws, which means it reports green on a page that rendered an error state, an empty list, or a spinner that never resolved.',
+        assertInstead,
+      },
+    ];
+  }
+
+  if (spec.statusOnly) {
+    return [
+      {
+        kind: 'TRANSPORT_ONLY',
+        severity: 'HIGH',
+        testId: test.id,
+        testName: test.name,
+        filePath: test.filePath,
+        feature: test.feature,
+        // There is no source line to point at — the assertion is a spec key —
+        // so the spec fragment is quoted instead of a comment in a dead file.
+        line: null,
+        quote: spec.statusQuote ?? anchor.quote,
+        why: "The spec for this test checks a status code and nothing about the response body. A handler that returns 200 with an empty object, a stale cache, or someone else's data passes it.",
+        assertInstead:
+          'Add body assertions to the spec: the fields that must be present, their types, and at least one value the caller actually depends on (the id echoed back, the total, the status field).',
+      },
+    ];
+  }
+
+  return [];
+}
+
 export function findWeakAssertions(
   tests: SuiteHealthTestInput[],
   behaviors: Map<string, TestBehavior>,
@@ -1637,90 +1902,57 @@ export function findWeakAssertions(
     const behavior = behaviors.get(test.id);
     if (!behavior) continue;
     const code = (test.code ?? '').slice(0, MAX_CODE_CHARS);
+    const reading = readingFor(behavior);
 
-    /*
-     * Swallowed assertions and volatile expected values are things we POSITIVELY
-     * SAW, not conclusions drawn from absence, so they are emitted even for a
-     * test we could not read to the end.
-     */
-    for (const site of behavior.assertionSites) {
-      if (!site.swallowed) continue;
-      findings.push({
-        kind: 'SWALLOWED_ASSERTION',
-        severity: 'HIGH',
-        testId: test.id,
-        testName: test.name,
-        filePath: test.filePath,
-        feature: test.feature,
-        line: site.line,
-        quote: site.quote,
-        why: `This assertion is inside a try whose catch (line ${site.swallowLine ?? '?'}) neither re-throws nor fails the test. When it fails, the failure is caught and discarded and the test still passes — the app can break here and the suite stays green.`,
-        assertInstead:
-          'Delete the try/catch and let the assertion throw. If the block genuinely has to tolerate one specific error, catch that error by name and re-throw everything else, or assert on it directly with `await expect(promise).rejects.toThrow(/…/)`.',
-      });
-    }
-
-    for (const site of behavior.assertionSites) {
-      if (!site.volatile) continue;
-      findings.push({
-        kind: 'VOLATILE_ASSERTION',
-        severity: 'MEDIUM',
-        testId: test.id,
-        testName: test.name,
-        filePath: test.filePath,
-        feature: test.feature,
-        line: site.line,
-        quote: site.quote,
-        why: `The expected value is ${site.volatileReason}. It changes on its own between runs, so this assertion fails on a day nothing was deployed — and once it has cried wolf twice, the next real failure gets ignored.`,
-        assertInstead:
-          site.argKind === 'string'
-            ? 'Assert the shape, not the instance: pass a regex (`toHaveText(/Order #\\d+/)`), or read the value the app generated and compare it to the one it should have derived. If the exact value matters, freeze the clock or the ids with a fixture or a route mock.'
-            : 'Compute the expected value from the same fixed input the app used, or freeze the clock (`page.clock`) instead of comparing against a value generated at assert time.',
-      });
-    }
+    // Swallowed assertions and volatile expected values are things we
+    // POSITIVELY SAW, not conclusions drawn from absence, so they are emitted
+    // even for a test we could not read to the end — and only for JavaScript,
+    // for the reason on `jsSiteFindings`.
+    if (reading.mode === 'JS') findings.push(...jsSiteFindings(test, behavior));
 
     // Everything past this point argues from ABSENCE, and absence is only
     // admissible when the whole test was read. Rule TWO at the top of the file.
     if (behavior.incomplete) continue;
+
+    if (reading.mode !== 'JS') {
+      /*
+       * Every dialect other than JavaScript, and every test whose assertions
+       * live in `spec`: ONE question, asked three ways, and an accusation only
+       * if all three come back empty.
+       *
+       *   1. the code, read with the dialect's own lexicon — `assert`,
+       *      `t.Fatalf`, `XCTAssertEqual`, `Page Should Contain`, a Then step;
+       *   2. the spec, where a plugin-driven test's expectations live;
+       *   3. the test type, because an a11y or visual test never authors an
+       *      assertion and never will.
+       *
+       * Nothing else is claimed. "Every assertion here is transport-only" and
+       * "this locator is only asserted to exist" need a matcher vocabulary and
+       * a locator grammar, and this module has one of each — JavaScript's. A
+       * Go test is not a badly-written Playwright test.
+       */
+      const inCode =
+        reading.mode === 'DIALECT' ? countDialectAssertions(code, reading.dialect) : 0;
+      if (inCode > 0 || PLUGIN_ASSERTED_TYPES.has(test.type)) continue;
+      findings.push(
+        ...specSideFindings(
+          test,
+          behavior,
+          code,
+          reading.mode === 'DIALECT'
+            ? `Assert the outcome the user came for: the specific text, value or count that proves the action worked — e.g. \`${assertionExampleFor(reading.dialect)}\` — rather than merely reaching the page.`
+            : PLAYWRIGHT_ASSERT_INSTEAD,
+        ),
+      );
+      continue;
+    }
 
     const substantive = behavior.assertionSites.filter((s) => !s.swallowed);
 
     if (behavior.assertionSites.length === 0 && !PLUGIN_ASSERTED_TYPES.has(test.type)) {
       // Nothing in `code`. For spec-driven types the assertions live in `spec`,
       // so the accusation has to be checked there before it is made.
-      const spec = specAssertions(test.spec);
-      const anchor = anchorSite(behavior, code);
-      if (spec.count === 0) {
-        findings.push({
-          kind: 'NO_ASSERTIONS',
-          severity: 'HIGH',
-          testId: test.id,
-          testName: test.name,
-          filePath: test.filePath,
-          feature: test.feature,
-          line: anchor.line,
-          quote: anchor.quote,
-          why: 'This test makes no assertion anywhere. It passes as long as nothing throws, which means it reports green on a page that rendered an error state, an empty list, or a spinner that never resolved.',
-          assertInstead:
-            'Assert the outcome the user came for: the specific text, value or count that proves the action worked — e.g. `await expect(page.getByRole("heading")).toHaveText("Order confirmed")` rather than merely reaching the page.',
-        });
-      } else if (spec.statusOnly) {
-        findings.push({
-          kind: 'TRANSPORT_ONLY',
-          severity: 'HIGH',
-          testId: test.id,
-          testName: test.name,
-          filePath: test.filePath,
-          feature: test.feature,
-          // There is no source line to point at — the assertion is a spec key —
-          // so the spec fragment is quoted instead of a comment in a dead file.
-          line: null,
-          quote: spec.statusQuote ?? anchor.quote,
-          why: "The spec for this test checks a status code and nothing about the response body. A handler that returns 200 with an empty object, a stale cache, or someone else's data passes it.",
-          assertInstead:
-            'Add body assertions to the spec: the fields that must be present, their types, and at least one value the caller actually depends on (the id echoed back, the total, the status field).',
-        });
-      }
+      findings.push(...specSideFindings(test, behavior, code, PLAYWRIGHT_ASSERT_INSTEAD));
     } else if (substantive.length > 0 && substantive.every((s) => s.kind === 'transport')) {
       const site = substantive[0]!;
       findings.push({
@@ -2291,6 +2523,9 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
         navigationSites: [],
         actionSites: [],
         assertionSites: [],
+        // Resolution is pure string work and cannot be what threw, so the
+        // dialect is still reported honestly on a row whose analysis failed.
+        dialect: resolveDialect({ filePath: test.filePath }),
         incomplete: true,
         incompleteReason: `analysis failed: ${error instanceof Error ? error.message : String(error)}`,
       };

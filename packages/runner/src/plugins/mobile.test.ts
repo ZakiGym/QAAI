@@ -28,10 +28,11 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SECRET_MASK, appiumMobileSpecSchema } from '@qaai/shared';
 import type { ExecutableTest, RunContext, TestExecution } from '@qaai/shared';
+import { attachRunWorkspace } from '../run-workspace.js';
 import {
   W3C_ELEMENT_KEY,
   appiumServerBase,
@@ -74,12 +75,19 @@ function makeTest(spec: unknown, name = 'checkout on a phone'): ExecutableTest {
   };
 }
 
+/**
+ * `workspaceRoot` is the run's materialised repository, and it defaults to
+ * ABSENT because the Appium route needs none: it drives a server over HTTP and
+ * the app is resolved on that server's machine. The four CLI drivers do need
+ * one — see the CLI block, which supplies it.
+ */
 function makeCtx(
   secrets: Record<string, string> = {},
+  workspaceRoot: string | null = null,
 ): RunContext & { puts: Put[]; logged: string[] } {
   const puts: Put[] = [];
   const logged: string[] = [];
-  return {
+  const ctx: RunContext & { puts: Put[]; logged: string[] } = {
     runId: 'run_1',
     orgId: 'org_1',
     projectId: 'proj_1',
@@ -113,6 +121,12 @@ function makeCtx(
     puts,
     logged,
   };
+  return attachRunWorkspace(
+    ctx,
+    workspaceRoot === null
+      ? null
+      : { root: workspaceRoot, source: 'acme/app@main', fileCount: 7 },
+  );
 }
 
 /** Titles + statuses, which is what the cockpit renders. */
@@ -1016,20 +1030,26 @@ describe('mobile plugin — APPIUM', () => {
  */
 describe('mobile plugin — CLI drivers', () => {
   const originalPath = process.env.PATH;
-  const originalCwd = process.cwd();
   let binDir = '';
+  /** The run's materialised repository: a temp directory, like the real one. */
   let workDir = '';
-  let workName = '';
   let argsFile = '';
+
+  /**
+   * A context carrying that workspace.
+   *
+   * Every spec path below is a PLAIN repo-relative path now. It used to be
+   * prefixed with the basename of a scratch directory created INSIDE QAAI's own
+   * checkout, because the plugin resolved everything against `process.cwd()` —
+   * the test had to accommodate the defect to exercise anything at all.
+   */
+  const cliCtx = (secrets: Record<string, string> = {}) => makeCtx(secrets, workDir);
 
   beforeEach(async () => {
     binDir = await mkdtemp(join(tmpdir(), 'qaai-mobile-bin-'));
     argsFile = join(binDir, 'argv.txt');
 
-    // The scratch workspace lives under the run's cwd because every spec path is
-    // workspace-relative and may not escape it — which is the rule under test.
-    workDir = await mkdtemp(join(originalCwd, '.qaai-mobile-test-'));
-    workName = basename(workDir);
+    workDir = await mkdtemp(join(tmpdir(), 'qaai-mobile-repo-'));
 
     const stub = `#!/bin/sh
 printf '%s\\n' "$@" > "$QAAI_STUB_ARGS"
@@ -1072,11 +1092,11 @@ exit "\${QAAI_STUB_EXIT:-0}"
     await writeFile(join(workDir, 'checkout.yaml'), 'appId: com.acme\n---\n- launchApp\n');
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'MAESTRO',
-        flowPath: `${workName}/checkout.yaml`,
-        reportPath: `${workName}/report.xml`,
+        flowPath: 'checkout.yaml',
+        reportPath: 'report.xml',
         deviceId: 'emulator-5554',
         flowEnv: { USERNAME: 'ada' },
       }),
@@ -1108,8 +1128,8 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_EXIT = '1';
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
-      makeTest({ driver: 'ESPRESSO', reportPath: `${workName}/results` }),
+      cliCtx(),
+      makeTest({ driver: 'ESPRESSO', reportPath: 'results' }),
     );
 
     expect(execution.status).toBe('SKIPPED');
@@ -1129,12 +1149,12 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_EXIT = '1';
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'ESPRESSO',
         module: ':app',
         testClass: 'com.acme.CheckoutTest',
-        reportPath: `${workName}/results`,
+        reportPath: 'results',
       }),
     );
 
@@ -1162,7 +1182,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_EXIT = '65';
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'XCUITEST',
         scheme: 'Checkout',
@@ -1180,8 +1200,11 @@ exit "\${QAAI_STUB_EXIT:-0}"
     const argv = (await readFile(argsFile, 'utf8')).trimEnd().split('\n');
     expect(argv).toEqual([
       'test',
+      // Absolute, and inside the repository: `-workspace` and `-project` were
+      // the two spec paths in this plugin that went through no guard at all and
+      // were handed to xcodebuild verbatim.
       '-workspace',
-      'Checkout.xcworkspace',
+      join(workDir, 'Checkout.xcworkspace'),
       '-scheme',
       'Checkout',
       '-destination',
@@ -1196,7 +1219,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_EXIT = '70';
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({ driver: 'XCUITEST', scheme: 'Checkout' }),
     );
 
@@ -1209,7 +1232,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_EXIT = '1';
 
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({ driver: 'DETOX', configuration: 'ios.sim.release' }),
     );
 
@@ -1219,7 +1242,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
 
   it('takes Detox’s exit code as the verdict when the project writes no report', async () => {
     const passed = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({ driver: 'DETOX', configuration: 'ios.sim.debug' }),
     );
     expect(passed.status).toBe('PASSED');
@@ -1229,7 +1252,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
     process.env.QAAI_STUB_OUT = '2 failing\n  1) checkout adds to cart: expected true to be false';
     process.env.QAAI_STUB_EXIT = '1';
     const failed = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({ driver: 'DETOX', configuration: 'ios.sim.debug' }),
     );
     expect(failed.status).toBe('FAILED');
@@ -1238,11 +1261,11 @@ exit "\${QAAI_STUB_EXIT:-0}"
 
   it('skips an uninstalled CLI with the command that installs it', async () => {
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'MAESTRO',
-        flowPath: `${workName}/checkout.yaml`,
-        reportPath: `${workName}/report.xml`,
+        flowPath: 'checkout.yaml',
+        reportPath: 'report.xml',
         command: 'qaai-maestro-that-is-not-installed',
       }),
     );
@@ -1255,7 +1278,7 @@ exit "\${QAAI_STUB_EXIT:-0}"
 
   it('skips when a secret the tool needs is not on the environment', async () => {
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'DETOX',
         configuration: 'ios.sim.debug',
@@ -1269,10 +1292,10 @@ exit "\${QAAI_STUB_EXIT:-0}"
 
   it('refuses a report path that climbs out of the workspace', async () => {
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'ESPRESSO',
-        reportPath: `${workName}/results`,
+        reportPath: 'results',
         cwd: '.',
       }),
     );
@@ -1284,13 +1307,71 @@ exit "\${QAAI_STUB_EXIT:-0}"
     ).toThrow(/relative path inside the workspace/);
   });
 
+  /*
+   * ── Where these four drivers run ──────────────────────────────────────────
+   *
+   * Every path above is resolved against the materialised repository. Before
+   * the fix the base was `process.cwd()` — QAAI's own checkout — so a flow file
+   * was "not found", `gradlew` was looked for in our tree, and a `reportPath`
+   * that matched something of ours was read as the customer's report.
+   */
+  it('is not evaluated when the run has no checkout of the repository', async () => {
+    const execution = await mobilePlugin.execute(
+      makeCtx({}, null),
+      makeTest({ driver: 'MAESTRO', flowPath: 'checkout.yaml' }),
+    );
+
+    // SKIPPED with the thing to configure, and nothing spawned: this plugin
+    // never reports an environment gap as a broken app.
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toMatch(/no checkout of your repository/);
+    expect(execution.errorMessage).toMatch(/Connect the project to its repository/);
+    expect(execution.steps.some((step) => step.status === 'FAILED')).toBe(false);
+  });
+
+  it('resolves nothing against the worker’s own directory', async () => {
+    await writeFile(join(workDir, 'report.xml'), junit([{ name: 'buy a bike' }]));
+    await writeFile(join(workDir, 'checkout.yaml'), 'appId: com.acme\n---\n- launchApp\n');
+
+    const execution = await mobilePlugin.execute(
+      cliCtx(),
+      makeTest({ driver: 'MAESTRO', flowPath: 'checkout.yaml', reportPath: 'report.xml' }),
+    );
+
+    expect(execution.status).toBe('PASSED');
+    const argv = (await readFile(argsFile, 'utf8')).trimEnd().split('\n');
+    expect(argv.every((arg) => !arg.startsWith(process.cwd()))).toBe(true);
+    expect(argv).toContain(join(workDir, 'checkout.yaml'));
+  });
+
+  /*
+   * A drive letter, because `workspaceRelativePath` already refuses `..` and a
+   * leading `/`: on POSIX `C:\…` is a plain relative name, so the schema admits
+   * it and the runtime guard is what has to catch it. FAILED, not SKIPPED — a
+   * path that is not in the repository is a broken spec, and a skip would not
+   * block a gate.
+   */
+  it('fails on an Xcode project path that is not inside the repository', async () => {
+    const execution = await mobilePlugin.execute(
+      cliCtx(),
+      makeTest({
+        driver: 'XCUITEST',
+        scheme: 'Checkout',
+        project: 'C:\\Checkout.xcodeproj',
+      }),
+    );
+
+    expect(execution.status).toBe('FAILED');
+    expect(execution.errorMessage).toMatch(/not a path inside the repository/);
+  });
+
   it('says so honestly when a tool exits clean and writes no report', async () => {
     const execution = await mobilePlugin.execute(
-      makeCtx(),
+      cliCtx(),
       makeTest({
         driver: 'MAESTRO',
-        flowPath: `${workName}/checkout.yaml`,
-        reportPath: `${workName}/nothing-here.xml`,
+        flowPath: 'checkout.yaml',
+        reportPath: 'nothing-here.xml',
       }),
     );
 

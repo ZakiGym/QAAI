@@ -28,7 +28,14 @@ export type {
   RunReport,
   RunTotals,
 } from './types.js';
-export { derivedTotals, durationOf, fullNameOf, suiteNameOf, totalsOf } from './types.js';
+export {
+  QUARANTINE_NOTE,
+  derivedTotals,
+  durationOf,
+  fullNameOf,
+  suiteNameOf,
+  totalsOf,
+} from './types.js';
 export { escapeXml, junitReporter, renderJUnitXml } from './junit.js';
 export { allureReporter, allureResultFor } from './allure.js';
 export type { AllureResult, AllureStatus } from './allure.js';

@@ -42,7 +42,12 @@ import type {
   TestResultStatus,
   UiFramework,
 } from '@qaai/shared';
-import { DEFAULT_GATE_RULES } from '@qaai/runner';
+import {
+  DEFAULT_GATE_RULES,
+  checkQuarantineBudget,
+  quarantineExpiryFrom,
+  quarantineSuppresses,
+} from '@qaai/runner';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
@@ -688,6 +693,43 @@ async function lastResultStatuses(testIds: string[]): Promise<Map<string, TestRe
   return statuses;
 }
 
+/**
+ * Resolve the auth profile a test is being bound to, inside THIS project.
+ *
+ * `prisma` is the tenant-scoped client, so the org boundary is already closed:
+ * a profile belonging to another organisation matches no row. This closes the
+ * narrower one that scoping cannot — an AuthProfile hangs off an Environment,
+ * an Environment off a Project, and two projects in the SAME org have separate
+ * environments with separate sessions. Binding project A's test to project B's
+ * profile would hand A's suite a session minted against B's application, and
+ * nothing downstream would notice: the storageState is valid, the sign-in
+ * succeeds, and the test asserts a page in the wrong deployment.
+ *
+ * So the join is explicit, and a miss is a 400 that NAMES the problem rather
+ * than a silent drop to null. Dropping it would be the worse failure: the
+ * caller is told the save worked, the test runs anonymously, and the role it
+ * asked for is nowhere — which is precisely the quiet anonymous pass this whole
+ * column exists to make impossible. 400 rather than 404 because the request is
+ * malformed (an id that cannot belong here), and the message says which id and
+ * why, since the caller is a person in the editor or a script holding a list.
+ */
+async function requireAuthProfileInProject(
+  authProfileId: string,
+  projectId: string,
+): Promise<{ id: string; name: string }> {
+  const profile = await prisma.authProfile.findFirst({
+    where: { id: authProfileId, environment: { projectId } },
+    select: { id: true, name: true },
+  });
+  if (!profile) {
+    throw badRequest(
+      `Auth profile ${authProfileId} does not belong to this project. A test can only run as a profile configured on one of its own environments — binding it to another project's profile would run the test with a session minted against a different application.`,
+      { authProfileId, projectId },
+    );
+  }
+  return profile;
+}
+
 projectsRouter.get('/:projectId/tests', async (req, res) => {
   const tests = await prisma.test.findMany({
     where: { projectId: String(req.params.projectId), disabledAt: null },
@@ -705,6 +747,18 @@ projectsRouter.get('/:projectId/tests', async (req, res) => {
       lastRunAt: true,
       reviewFlags: true,
       suiteId: true,
+      /*
+       * The role each test runs as, on the LIST and not only on the detail
+       * page. A suite where an admin test and a member test sit side by side is
+       * unreadable if the tree cannot say which is which — that readability is
+       * half of what "bind a role to a test" was asking for. `authProfile` is
+       * joined for the name because an id is not something a person recognises;
+       * it is null when the test is anonymous, and also when the binding broke,
+       * which is why `authProfileRequired` comes along to tell those apart.
+       */
+      authProfileId: true,
+      authProfileRequired: true,
+      authProfile: { select: { id: true, name: true } },
     },
   });
 
@@ -959,7 +1013,12 @@ projectsRouter.get('/:projectId/search', async (req, res) => {
 });
 
 projectsRouter.get('/:projectId/tests/:testId', async (req, res) => {
-  const test = await prisma.test.findUnique({ where: { id: String(req.params.testId) } });
+  const test = await prisma.test.findUnique({
+    where: { id: String(req.params.testId) },
+    // Every scalar, as before, plus the bound profile's name. The editor has to
+    // show WHICH role this test assumes, and an id is not a name.
+    include: { authProfile: { select: { id: true, name: true } } },
+  });
   if (!test || test.projectId !== req.params.projectId) throw notFound('Test');
   res.json({ test });
 });
@@ -979,10 +1038,31 @@ projectsRouter.put('/:projectId/tests/:testId', requireRole('MEMBER'), async (re
   const actor = actorOf(req);
   const input = updateTestSchema.parse(req.body);
 
+  const projectId = String(req.params.projectId);
   const test = await prisma.test.findUnique({ where: { id: String(req.params.testId) } });
-  if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
+  if (!test || test.projectId !== projectId) throw notFound('Test');
 
-  if (input.code === test.code && input.name === undefined && input.spec === undefined) {
+  /*
+   * Validated BEFORE the no-op check and before the write, so a save carrying a
+   * profile from another project is refused outright rather than being half
+   * applied: the code lands, the binding does not, and nothing says so.
+   *
+   * `undefined` means the client did not mention the field and the binding is
+   * left alone; `null` means clear it. A client that predates this field sends
+   * neither and keeps its test bound, which is why `updateTestSchema` makes the
+   * field optional AND nullable instead of merging the two.
+   */
+  if (typeof input.authProfileId === 'string') {
+    await requireAuthProfileInProject(input.authProfileId, projectId);
+  }
+
+  if (
+    input.code === test.code &&
+    input.name === undefined &&
+    input.spec === undefined &&
+    input.authProfileId === undefined &&
+    input.authProfileRequired === undefined
+  ) {
     res.json({ test, saved: false });
     return;
   }
@@ -999,6 +1079,20 @@ projectsRouter.put('/:projectId/tests/:testId', requireRole('MEMBER'), async (re
       code: input.code,
       ...(input.name ? { name: input.name } : {}),
       ...(input.spec !== undefined ? { spec: input.spec as object } : {}),
+      ...(input.authProfileId !== undefined ? { authProfileId: input.authProfileId } : {}),
+      /*
+       * Binding a profile implies the test needs one — saying "run as admin"
+       * and "it does not matter whether you are signed in" in the same breath
+       * is not a state worth storing. Clearing the binding does NOT clear the
+       * requirement, because that is the pair the coverage report reads to say
+       * "this test asked for a role and is running as nobody"; dropping the
+       * requirement there would make the orphan silent again.
+       */
+      ...(input.authProfileRequired !== undefined
+        ? { authProfileRequired: input.authProfileRequired }
+        : typeof input.authProfileId === 'string'
+          ? { authProfileRequired: true }
+          : {}),
       reviewFlags: [],
       versions: {
         create: {
@@ -1018,7 +1112,14 @@ projectsRouter.put('/:projectId/tests/:testId', requireRole('MEMBER'), async (re
     action: 'test.update',
     targetType: 'Test',
     targetId: test.id,
-    metadata: { name: updated.name, bytes: input.code.length },
+    metadata: {
+      name: updated.name,
+      bytes: input.code.length,
+      // Re-binding a test to a different role changes what it can see, which is
+      // exactly the kind of change an audit log exists to be able to answer
+      // questions about later.
+      ...(input.authProfileId !== undefined ? { authProfileId: input.authProfileId } : {}),
+    },
   });
 
   res.json({ test: updated, saved: true });
@@ -1078,6 +1179,12 @@ projectsRouter.post('/:projectId/tests', requireRole('MEMBER'), async (req, res)
   });
   if (!project) throw notFound('Project');
 
+  // Before the suite upsert, so a rejected binding does not leave a
+  // "Hand-written" suite behind for a test that was never created.
+  if (input.authProfileId !== null) {
+    await requireAuthProfileInProject(input.authProfileId, project.id);
+  }
+
   const suite = await prisma.suite.upsert({
     where: { projectId_name: { projectId: project.id, name: 'Hand-written' } },
     create: {
@@ -1102,6 +1209,10 @@ projectsRouter.post('/:projectId/tests', requireRole('MEMBER'), async (req, res)
       filePath: input.filePath,
       spec: (input.spec as object) ?? undefined,
       tags: input.tags,
+      authProfileId: input.authProfileId,
+      // Naming a profile IS the statement that the test needs one; see the same
+      // rule on PUT above.
+      authProfileRequired: input.authProfileRequired || input.authProfileId !== null,
       versions: {
         create: {
           orgId: actor.orgId,
@@ -1120,7 +1231,7 @@ projectsRouter.post('/:projectId/tests', requireRole('MEMBER'), async (req, res)
     action: 'test.create',
     targetType: 'Test',
     targetId: test.id,
-    metadata: { name: test.name, type: test.type },
+    metadata: { name: test.name, type: test.type, authProfileId: test.authProfileId },
   });
 
   res.status(201).json({ test });
@@ -1882,20 +1993,91 @@ projectsRouter.get('/:projectId/flaky', async (req, res) => {
 });
 
 /** Quarantine a flaky test: it still runs, but it stops gating a deploy (§5). */
+/**
+ * Quarantine a test by hand — THE OTHER DOOR.
+ *
+ * The auto-quarantine in apps/worker/src/processors/flake.ts goes through the
+ * budget, the expiry and `quarantineSuppresses`. This endpoint did not, and a
+ * brake that only one of two doors respects is not a brake: a team that hits
+ * the automatic refusal can quarantine the same test from the screen, and the
+ * fortieth quarantine nobody is allowed to take automatically goes through here
+ * instead. Both doors now share one rule, imported from the module that owns it.
+ */
 projectsRouter.post('/:projectId/tests/:testId/quarantine', requireRole('MEMBER'), async (req, res) => {
   const actor = actorOf(req);
   const quarantined = String(req.body?.quarantined ?? 'true') !== 'false';
+  const now = new Date();
 
   const test = await prisma.test.findUnique({
     where: { id: String(req.params.testId) },
-    select: { id: true, projectId: true, name: true },
+    select: {
+      id: true,
+      orgId: true,
+      projectId: true,
+      name: true,
+      quarantined: true,
+      quarantineExpiresAt: true,
+    },
   });
   if (!test || test.projectId !== String(req.params.projectId)) throw notFound('Test');
 
+  /*
+   * Counted in SQL, and the expiry arm matters: an expired quarantine
+   * suppresses nothing, so charging the project for it would make the budget
+   * tighten on its own and refuse a quarantine the suite had room for. Counting
+   * rather than reading rows keeps the check cheapest on the 4,000-quarantine
+   * suite it exists for.
+   */
+  let budget: ReturnType<typeof checkQuarantineBudget> | null = null;
+  if (quarantined) {
+    const [project, totalTests, inForce] = await Promise.all([
+      prisma.project.findUnique({
+        where: { id: test.projectId },
+        select: { quarantineBudgetPercent: true },
+      }),
+      prisma.test.count({ where: { projectId: test.projectId, disabledAt: null } }),
+      prisma.test.count({
+        where: {
+          projectId: test.projectId,
+          disabledAt: null,
+          quarantined: true,
+          id: { not: test.id },
+          OR: [{ quarantineExpiresAt: null }, { quarantineExpiresAt: { gt: now } }],
+        },
+      }),
+    ]);
+
+    budget = checkQuarantineBudget({
+      totalTests,
+      quarantinedCount: inForce,
+      budgetPercent: project?.quarantineBudgetPercent ?? null,
+      /*
+       * Re-deciding a suppression that is ALREADY in force is never refused —
+       * that would hide the state rather than change it. An EXPIRED quarantine
+       * is a new suppression being taken out again, and is charged, or an
+       * over-budget project could renew forever and never be refused.
+       */
+      alreadyQuarantined: quarantineSuppresses(test, now),
+    });
+
+    if (!budget.allowed) {
+      throw conflict(budget.reason);
+    }
+  }
+
   const updated = await prisma.test.update({
     where: { id: test.id },
-    data: { quarantined, quarantinedAt: quarantined ? new Date() : null },
-    select: { id: true, quarantined: true, quarantinedAt: true },
+    data: {
+      quarantined,
+      quarantinedAt: quarantined ? now : null,
+      /*
+       * A quarantine with no end date is a deletion nobody signed. Expiry does
+       * not clear the flag when it arrives — that would erase the reason — it
+       * stops being HONOURED, so the test gates again and the gate says why.
+       */
+      quarantineExpiresAt: quarantined ? quarantineExpiryFrom(now) : null,
+    },
+    select: { id: true, quarantined: true, quarantinedAt: true, quarantineExpiresAt: true },
   });
 
   await audit({
@@ -1903,10 +2085,25 @@ projectsRouter.post('/:projectId/tests/:testId/quarantine', requireRole('MEMBER'
     action: quarantined ? 'test.quarantine' : 'test.unquarantine',
     targetType: 'Test',
     targetId: test.id,
-    metadata: { name: test.name },
+    metadata: {
+      name: test.name,
+      ...(budget
+        ? {
+            quarantinedNow: budget.current + 1,
+            quarantineLimit: budget.limit,
+            quarantinePercent: budget.wouldBePercent,
+            nearLimit: budget.nearLimit,
+          }
+        : {}),
+      ...(updated.quarantineExpiresAt
+        ? { expiresAt: updated.quarantineExpiresAt.toISOString() }
+        : {}),
+    },
   });
 
-  res.json({ test: updated });
+  // The near-limit warning rides the response, so the person who just switched
+  // a signal off is told how much of the suite is now switched off.
+  res.json({ test: updated, budget });
 });
 
 /** Approved visual baselines, for the review screen. */
@@ -2397,6 +2594,17 @@ projectsRouter.post(
         filePath,
         spec: (source.spec as object) ?? undefined,
         tags: source.tags,
+        /*
+         * The copy inherits the role. A duplicate exists to be edited into a
+         * near-identical test, and a copy of an admin test that silently runs
+         * anonymously is the surprise this column was added to end — it would
+         * reach a login page instead of the feature and the diff against the
+         * original would explain nothing. The source is in this project by the
+         * check above, so its profile is in this project too; no second
+         * tenancy check is owed.
+         */
+        authProfileId: source.authProfileId,
+        authProfileRequired: source.authProfileRequired,
         versions: {
           create: {
             orgId: actor.orgId,
@@ -2408,7 +2616,16 @@ projectsRouter.post(
           },
         },
       },
-      select: { id: true, name: true, filePath: true },
+      // The inherited role is returned, not just stored. A duplicate is the one
+      // place a test's role changes hands without anybody typing it, so the
+      // copy has to be able to say which role it came away with.
+      select: {
+        id: true,
+        name: true,
+        filePath: true,
+        authProfileId: true,
+        authProfileRequired: true,
+      },
     });
 
     await audit({

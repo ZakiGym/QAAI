@@ -9,6 +9,7 @@
  */
 
 import { analyzeCoverage, canScaffoldWithoutModel, planItemForGap, proposePlan, crawl } from '@qaai/agent';
+import type { AuthProfileChoice } from '@qaai/agent';
 import type { TestPlan, TestType } from '@qaai/shared';
 import type { ExploreJob, FlowMap } from '@qaai/shared';
 import { config, llm, logger, prisma, publishEvent } from '../context.js';
@@ -34,8 +35,19 @@ const MAX_PLAN_ITEMS = 12;
  * on a spinner for five minutes before claiming "the crawl did not finish" —
  * about a crawl that had in fact finished and was sitting in the database.
  */
-function planFromCrawl(flowMap: FlowMap, reason: string): TestPlan {
-  const report = analyzeCoverage({ flowMapGraph: flowMap, tests: [] });
+function planFromCrawl(
+  flowMap: FlowMap,
+  reason: string,
+  authProfiles: AuthProfileChoice[],
+): TestPlan {
+  /*
+   * The roles are passed even here — ESPECIALLY here. This is the no-key path,
+   * the one every new customer takes on their first run, so it is where a gap
+   * behind an auth wall is most likely to be turned into a test. Without the
+   * profiles every such item would come out unbound and assert nothing but the
+   * redirect, which is the loop this change exists to break.
+   */
+  const report = analyzeCoverage({ flowMapGraph: flowMap, tests: [], authProfiles });
   const chosen = report.gaps.slice(0, MAX_PLAN_ITEMS);
 
   return {
@@ -76,13 +88,32 @@ export async function processExplore(job: ExploreJob): Promise<void> {
   });
   const version = (previous?.version ?? 0) + 1;
 
-  // An auth profile's cached storageState lets the crawler get past the login
-  // wall and see the half of the app that actually matters (§2).
-  const authProfile = await prisma.authProfile.findFirst({
+  /*
+   * The environment's auth profiles, read once and used for two different
+   * things.
+   *
+   * The FIRST is the crawl: a cached storageState lets the crawler get past the
+   * login wall and see the half of the app that actually matters (§2), and the
+   * oldest profile is the one used, as it always has been.
+   *
+   * The SECOND is new and is the point of this read being a findMany rather
+   * than a findFirst: the plan. An item for a page behind the wall has to name
+   * the role its test will assume, and it can only name a role it has been
+   * shown. Id, name and kind only — choosing which role a test runs as needs
+   * neither the config nor the live session, and both of those travel into plan
+   * text that people read.
+   */
+  const profiles = await prisma.authProfile.findMany({
     where: { orgId, environmentId },
     orderBy: { createdAt: 'asc' },
-    select: { storageState: true, storageStateExpiresAt: true },
+    select: { id: true, name: true, kind: true, storageState: true, storageStateExpiresAt: true },
   });
+  const authProfileChoices: AuthProfileChoice[] = profiles.map((profile) => ({
+    id: profile.id,
+    name: profile.name,
+    kind: profile.kind,
+  }));
+  const authProfile = profiles[0] ?? null;
   const storageState =
     authProfile?.storageState &&
     (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
@@ -167,7 +198,7 @@ export async function processExplore(job: ExploreJob): Promise<void> {
       data: { message: `Crawl complete. ${reason}` },
       at: new Date().toISOString(),
     });
-    plan = planFromCrawl(flowMap, reason);
+    plan = planFromCrawl(flowMap, reason, authProfileChoices);
     writtenByModel = false;
   } else {
     try {
@@ -176,6 +207,7 @@ export async function processExplore(job: ExploreJob): Promise<void> {
           llm,
           { orgId, projectId, agent: 'EXPLORER', subjectId: stored.id },
           flowMap,
+          { authProfiles: authProfileChoices },
         )
       ).plan;
       writtenByModel = true;
@@ -189,7 +221,7 @@ export async function processExplore(job: ExploreJob): Promise<void> {
         data: { message: reason },
         at: new Date().toISOString(),
       });
-      plan = planFromCrawl(flowMap, reason);
+      plan = planFromCrawl(flowMap, reason, authProfileChoices);
       writtenByModel = false;
     }
   }

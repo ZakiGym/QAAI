@@ -23,6 +23,13 @@
 
 import { Router } from 'express';
 import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
+/*
+ * The one definition of "did this run pass" (packages/runner/src/gates.ts).
+ * This route is the CLI's only source for it: the CLI ships zero dependencies
+ * on purpose and cannot import the module, so it reads the answer off the
+ * response instead of computing a copy of it. See `runVerdict` below.
+ */
+import { quarantineSuppresses, runOutcome } from '@qaai/runner';
 import type { ShardAssignment, ShardPlan, ShardedRunJob, TestType } from '@qaai/shared';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, notFound, planLimit } from '../lib/errors.js';
@@ -378,26 +385,24 @@ async function evaluateResultCache(args: {
   // this wrong once in a way that silently emptied the map and turned the whole
   // cache into a no-op, so the loop now lives next to its test.
   const priorsByTest = groupPriorsByTest(
-    priorRows.map(
-      (row): PriorPass => ({
-        resultId: row.id,
-        runId: row.run.id,
-        testId: row.testId,
-        status: row.status,
-        retriedAndPassed: row.retriedAndPassed,
-        durationMs: row.durationMs,
-        createdAt: row.createdAt,
-        runStatus: row.run.status,
-        runFinishedAt: row.run.finishedAt,
-        environmentId: row.run.environmentId,
-        // A preview-deploy run pointed somewhere else entirely; its passes belong
-        // to that URL, not to this environment's.
-        effectiveBaseUrl: row.run.baseUrlOverride ?? args.environment.baseUrl,
-        // No column to read it from yet — the reconstruction in run-selection.ts
-        // takes over, and is treated as the weaker evidence it is.
-        cacheKey: null,
-      }),
-    ),
+    priorRows.map((row): PriorPass => ({
+      resultId: row.id,
+      runId: row.run.id,
+      testId: row.testId,
+      status: row.status,
+      retriedAndPassed: row.retriedAndPassed,
+      durationMs: row.durationMs,
+      createdAt: row.createdAt,
+      runStatus: row.run.status,
+      runFinishedAt: row.run.finishedAt,
+      environmentId: row.run.environmentId,
+      // A preview-deploy run pointed somewhere else entirely; its passes belong
+      // to that URL, not to this environment's.
+      effectiveBaseUrl: row.run.baseUrlOverride ?? args.environment.baseUrl,
+      // No column to read it from yet — the reconstruction in run-selection.ts
+      // takes over, and is treated as the weaker evidence it is.
+      cacheKey: null,
+    })),
   );
 
   /*
@@ -555,11 +560,8 @@ async function dispatchOnPrem(args: {
   return {
     pool: args.pool,
     jobs,
-    runnersOnline: assessPool(
-      { testTypes: [], browsers: [], toolchains: [] },
-      args.pool,
-      fleet,
-    ).online,
+    runnersOnline: assessPool({ testTypes: [], browsers: [], toolchains: [] }, args.pool, fleet)
+      .online,
     warning,
   };
 }
@@ -1068,6 +1070,82 @@ runsRouter.post(
   },
 );
 
+/**
+ * The run's verdict, computed server-side and returned WITH the run.
+ *
+ * ── Why this field exists ───────────────────────────────────────────────────
+ *
+ * The CLI used to derive its exit code itself:
+ *
+ *     failedCount > 0 || status === 'FAILED' || status === 'ERRORED' || gateBlocked
+ *
+ * and so did the GitHub check, and the JUnit XML, and the worker, and the
+ * on-prem finaliser — five expressions over four different fields. Quarantine
+ * was honoured by exactly one of them (the gate), which is how a quarantined
+ * test's failure went on failing builds through the counters while being
+ * invisible in every gate rule.
+ *
+ * So the server answers the question and the CLI reads the answer. A new
+ * consumer that needs red/green reads `run.verdict.passed`; nothing needs to
+ * learn the rule again, and a change to the rule reaches every consumer at
+ * once. `verdict` rather than a bare boolean because the REASON travels with
+ * it: a run that passed with suppressed failures has to be able to say so.
+ */
+function runVerdict(run: {
+  status: string;
+  passedCount: number;
+  failedCount: number;
+  flakyCount: number;
+  skippedCount: number;
+  quarantinedFailedCount: number;
+  gateResult: unknown;
+}): { passed: boolean; status: string; suppressedFailures: number; reason: string } {
+  const gate = run.gateResult as { passed?: boolean } | null | undefined;
+  /*
+   * A run still in flight has no verdict and must not be given one. `null`
+   * `gateResult` means "the gate has not been evaluated", and reading that as
+   * `passed: false` would have the CLI's progress line report a failing build
+   * halfway through a green run.
+   */
+  const terminal =
+    run.status === 'PASSED' ||
+    run.status === 'FAILED' ||
+    run.status === 'CANCELLED' ||
+    run.status === 'ERRORED';
+
+  if (!terminal) {
+    return {
+      passed: false,
+      status: run.status,
+      suppressedFailures: run.quarantinedFailedCount,
+      reason: 'The run has not finished, so it has no verdict yet.',
+    };
+  }
+
+  const outcome = runOutcome({
+    counts: {
+      passed: run.passedCount,
+      failed: run.failedCount,
+      flaky: run.flakyCount,
+      skipped: run.skippedCount,
+      quarantinedFailed: run.quarantinedFailedCount,
+    },
+    // A terminal run with no gate result was finalised by something that did
+    // not evaluate one. Treated as "nothing blocked", which is what the stored
+    // status already reflects.
+    gatePassed: gate?.passed !== false,
+    forcedStatus:
+      run.status === 'CANCELLED' ? 'CANCELLED' : run.status === 'ERRORED' ? 'ERRORED' : null,
+  });
+
+  return {
+    passed: outcome.passed,
+    status: outcome.status,
+    suppressedFailures: outcome.suppressedFailures,
+    reason: outcome.reason,
+  };
+}
+
 runsRouter.get('/:runId', async (req, res) => {
   const run = await prisma.run.findUnique({
     where: { id: String(req.params.runId) },
@@ -1085,6 +1163,10 @@ runsRouter.get('/:runId', async (req, res) => {
               priority: true,
               filePath: true,
               quarantined: true,
+              // The expiry travels with the flag everywhere, because an
+              // expired quarantine GATES AGAIN and a surface showing only the
+              // flag would label a gating test as suppressed.
+              quarantineExpiresAt: true,
             },
           },
           steps: { orderBy: { index: 'asc' } },
@@ -1095,7 +1177,7 @@ runsRouter.get('/:runId', async (req, res) => {
     },
   });
   if (!run) throw notFound('Run');
-  res.json({ run });
+  res.json({ run: { ...run, verdict: runVerdict(run) } });
 });
 
 /** Live run events for the cockpit's right pane (§8). */
@@ -1135,11 +1217,39 @@ runsRouter.get('/:runId/artifacts/{*key}', async (req, res) => {
   res.redirect(302, await storage.signedUrl(key, 3600));
 });
 
-/** JUnit XML for any CI's native reporting (§6). */
+/**
+ * JUnit XML for any CI's native reporting (§6).
+ *
+ * ── Quarantine, which this document used to contradict itself about ─────────
+ *
+ * Every non-passing, non-skipped result got a `<failure>`, so a quarantined
+ * test's failure went red in Jenkins, GitLab, CircleCI, Azure and every other
+ * build that parses this — a build the gate had already cleared. These bytes
+ * are the one output read by machines nobody here controls, so there is exactly
+ * one writer of them (the CLI's `--reporter junit` fetches this endpoint rather
+ * than rendering its own) and the rule has to be right here.
+ *
+ * A suppressed failure is rendered `<skipped>` — the only element in JUnit that
+ * means "do not fail the build on this" — and the MESSAGE is what keeps it from
+ * being mistaken for a deliberate skip. It opens with QUARANTINED FAILURE and
+ * carries the real error, and the run-level count appears as a property, so a
+ * human reading the test report in their CI sees the failure and the reason it
+ * did not count. A `<skipped/>` with no message would have been the same defect
+ * wearing a kinder word.
+ *
+ * `failures` on the testsuite is `failedCount`, which no longer counts
+ * suppressed failures, so the attribute and the elements finally agree.
+ */
 runsRouter.get('/:runId/junit.xml', async (req, res) => {
   const run = await prisma.run.findUnique({
     where: { id: String(req.params.runId) },
-    include: { results: { include: { test: { select: { name: true } } } } },
+    include: {
+      results: {
+        include: {
+          test: { select: { name: true, quarantined: true, quarantineExpiresAt: true } },
+        },
+      },
+    },
   });
   if (!run) throw notFound('Run');
 
@@ -1149,6 +1259,9 @@ runsRouter.get('/:runId/junit.xml', async (req, res) => {
       (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]!,
     );
 
+  const now = new Date();
+  let suppressed = 0;
+
   const cases = run.results
     .map((r) => {
       const time = (r.durationMs / 1000).toFixed(3);
@@ -1156,15 +1269,43 @@ runsRouter.get('/:runId/junit.xml', async (req, res) => {
       if (r.status === 'PASSED') return `    <testcase name="${name}" time="${time}"/>`;
       if (r.status === 'SKIPPED')
         return `    <testcase name="${name}" time="${time}"><skipped/></testcase>`;
+
+      if (quarantineSuppresses(r.test, now)) {
+        suppressed += 1;
+        const why = escape(
+          `QUARANTINED FAILURE — this test FAILED and its failure is suppressed by quarantine, ` +
+            `so it did not fail the build. It is not a skipped test: it ran, and it failed. ` +
+            `${r.errorMessage ?? 'failed'}`,
+        );
+        return (
+          `    <testcase name="${name}" time="${time}">` +
+          `<skipped message="${why}"/>` +
+          `<system-out>${why}</system-out>` +
+          `</testcase>`
+        );
+      }
+
       return `    <testcase name="${name}" time="${time}"><failure message="${escape(
         r.errorMessage ?? 'failed',
       )}"/></testcase>`;
     })
     .join('\n');
 
+  /*
+   * A `<properties>` block rather than an extra attribute on `<testsuite>`.
+   * Properties are part of the format every parser already walks; a
+   * non-standard attribute is the kind of thing a strict reader rejects, and a
+   * JUnit file one CI refuses to parse is worse than one that undercounts.
+   */
+  const properties =
+    `    <properties>\n` +
+    `      <property name="qaai.quarantinedFailures" value="${run.quarantinedFailedCount}"/>\n` +
+    `      <property name="qaai.quarantinedFailuresInThisDocument" value="${suppressed}"/>\n` +
+    `    </properties>`;
+
   res
     .type('application/xml')
     .send(
-      `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="qaai" tests="${run.totalCount}" failures="${run.failedCount}" skipped="${run.skippedCount}">\n${cases}\n  </testsuite>\n</testsuites>\n`,
+      `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites>\n  <testsuite name="qaai" tests="${run.totalCount}" failures="${run.failedCount}" skipped="${run.skippedCount}">\n${properties}\n${cases}\n  </testsuite>\n</testsuites>\n`,
     );
 });

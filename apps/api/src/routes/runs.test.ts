@@ -57,15 +57,13 @@ interface Hoisted {
   audits: Row[];
 }
 
-const h = vi.hoisted(
-  (): Hoisted => ({
-    db: {},
-    currentOrg: () => null,
-    actor: { userId: 'user_1', orgId: 'org_1', role: 'MEMBER', ip: null },
-    enqueued: [],
-    audits: [],
-  }),
-);
+const h = vi.hoisted((): Hoisted => ({
+  db: {},
+  currentOrg: () => null,
+  actor: { userId: 'user_1', orgId: 'org_1', role: 'MEMBER', ip: null },
+  enqueued: [],
+  audits: [],
+}));
 
 vi.mock('../env.js', () => ({
   env: {
@@ -92,7 +90,7 @@ vi.mock('../lib/logger.js', () => ({
   },
   currentRequestId: () => 'req_test',
   setRequestActor: () => {},
-  runWithRequestContext: <T,>(_ctx: unknown, fn: () => T) => fn(),
+  runWithRequestContext: <T>(_ctx: unknown, fn: () => T) => fn(),
   registerRequestSecrets: () => {},
 }));
 
@@ -103,9 +101,9 @@ vi.mock('../lib/prisma.js', async () => {
 
   return {
     prisma: new Proxy({}, { get: (_t, key: string) => h.db[key] }),
-    withTenant: <T,>(orgId: string, fn: () => T | Promise<T>) =>
+    withTenant: <T>(orgId: string, fn: () => T | Promise<T>) =>
       store.run({ orgId }, async () => fn()),
-    unscoped: <T,>(fn: () => T | Promise<T>) => store.run({ orgId: null }, async () => fn()),
+    unscoped: <T>(fn: () => T | Promise<T>) => store.run({ orgId: null }, async () => fn()),
     currentTenant: () => store.getStore()?.orgId ?? null,
     disconnectPrisma: async () => {},
   };
@@ -135,14 +133,13 @@ vi.mock('../middleware/auth.js', async () => {
       req.actor = { ...h.actor };
       void withTenant(h.actor.orgId, () => next());
     },
-    requireRole:
-      (minimum: keyof typeof ROLE_RANK) => (req: Row, res: Row, next: () => void) => {
-        if (ROLE_RANK[req.actor.role as keyof typeof ROLE_RANK] < ROLE_RANK[minimum]) {
-          res.status(403).json({ error: { code: 'FORBIDDEN', message: `Requires ${minimum}` } });
-          return;
-        }
-        next();
-      },
+    requireRole: (minimum: keyof typeof ROLE_RANK) => (req: Row, res: Row, next: () => void) => {
+      if (ROLE_RANK[req.actor.role as keyof typeof ROLE_RANK] < ROLE_RANK[minimum]) {
+        res.status(403).json({ error: { code: 'FORBIDDEN', message: `Requires ${minimum}` } });
+        return;
+      }
+      next();
+    },
     requireScope: () => (_req: Row, _res: Row, next: () => void) => next(),
     actorOf: (req: Row) => req.actor,
   };
@@ -263,6 +260,38 @@ function makeDb(): Record<string, unknown> {
     },
 
     run: {
+      /*
+       * The GET routes. `include` is honoured loosely — enough to assemble the
+       * relations the two readers below actually walk — because the point of
+       * these tests is the NUMBERS the routes compute, not Prisma's shape.
+       */
+      findUnique: async ({ where }: Row) => {
+        const run = ownedByCaller(store.runs.find((r) => r.id === where.id));
+        if (!run) return null;
+        return {
+          ...run,
+          environment: {
+            name: 'staging',
+            kind: 'STAGING',
+            baseUrl: 'https://staging.example.test',
+          },
+          shards: [],
+          results: store.results
+            .filter((r) => r.runId === run.id)
+            .map((r) => ({
+              ...r,
+              steps: [],
+              findings: [],
+              verdict: null,
+              test: store.tests.find((t) => t.id === r.testId) ?? {
+                id: r.testId,
+                name: r.testId,
+                quarantined: false,
+                quarantineExpiresAt: null,
+              },
+            })),
+        };
+      },
       create: async ({ data }: Row) => {
         const orgId = h.currentOrg();
         const { results, shards, ...rest } = data as Row;
@@ -274,7 +303,8 @@ function makeDb(): Record<string, unknown> {
           ...(orgId ? { orgId } : {}),
         };
         store.runs.push(run);
-        for (const result of results?.create ?? []) store.results.push({ ...result, runId: run.id });
+        for (const result of results?.create ?? [])
+          store.results.push({ ...result, runId: run.id });
         void shards;
         return run;
       },
@@ -600,7 +630,7 @@ describe('org scoping', () => {
    * agent claims the job — which, if the environment names a pool, is a machine
    * in someone else's network.
    */
-  it('cannot start a run against another org\'s environment', async () => {
+  it("cannot start a run against another org's environment", async () => {
     seed();
     store.environments[0]!.orgId = 'org_2';
     store.environments[0]!.runnerPool = 'eu';
@@ -620,7 +650,7 @@ describe('org scoping', () => {
    * runners must not silence the warning — a warning that can be suppressed by
    * a stranger's infrastructure is worse than none.
    */
-  it('judges the pool against this org\'s runners only', async () => {
+  it("judges the pool against this org's runners only", async () => {
     seed();
     store.environments[0]!.runnerPool = 'eu';
     store.runners.push(runner({ name: 'theirs', orgId: 'org_2', pools: ['eu'] }));
@@ -629,5 +659,263 @@ describe('org scoping', () => {
 
     expect(body.dispatch.runnersOnline).toBe(0);
     expect(body.dispatch.warning).toContain('no runner is registered');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Quarantine: the two readers the defect reached the outside world through.
+//
+// `GET /runs/:runId` is the CLI's only source for "did this run pass" — the CLI
+// ships zero dependencies and cannot import the rule — and `junit.xml` is the
+// one output parsed by builds nobody here controls. Both used to report a
+// quarantined test's failure as a plain failure, so a run the quality gate had
+// already cleared went red in the CLI's exit code and in every CI's own test
+// report.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A finished run with results, in whatever shape a test needs. */
+function seedFinishedRun(
+  over: {
+    status?: string;
+    passedCount?: number;
+    failedCount?: number;
+    flakyCount?: number;
+    skippedCount?: number;
+    quarantinedFailedCount?: number;
+    gateResult?: unknown;
+    results?: Row[];
+    tests?: Row[];
+  } = {},
+): string {
+  if (over.tests) store.tests = over.tests;
+  store.runs.push({
+    id: 'run_fin',
+    orgId: 'org_1',
+    projectId: 'proj_1',
+    environmentId: 'env_1',
+    status: over.status ?? 'PASSED',
+    totalCount: 10,
+    passedCount: over.passedCount ?? 9,
+    failedCount: over.failedCount ?? 0,
+    flakyCount: over.flakyCount ?? 0,
+    skippedCount: over.skippedCount ?? 0,
+    quarantinedFailedCount: over.quarantinedFailedCount ?? 0,
+    gateResult: over.gateResult ?? { passed: true, evaluations: [] },
+    errorMessage: null,
+    queuedAt: new Date(NOW),
+  });
+  for (const result of over.results ?? []) store.results.push({ runId: 'run_fin', ...result });
+  return 'run_fin';
+}
+
+async function getRun(runId: string): Promise<{ status: number; body: Row }> {
+  const res = await fetch(`${baseUrl}/runs/${runId}`);
+  const text = await res.text();
+  return { status: res.status, body: text ? (JSON.parse(text) as Row) : {} };
+}
+
+async function getJunit(runId: string): Promise<string> {
+  const res = await fetch(`${baseUrl}/runs/${runId}/junit.xml`);
+  return res.text();
+}
+
+describe('GET /runs/:runId — the verdict the CLI reads', () => {
+  it('reports PASSED for a run whose only failures were quarantined', async () => {
+    // THE DEFECT, at the boundary the CLI consumes.
+    const id = seedFinishedRun({ quarantinedFailedCount: 3 });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict).toMatchObject({ passed: true, status: 'PASSED' });
+  });
+
+  it('still reports the suppressed failures, so no consumer can print a clean green', async () => {
+    const id = seedFinishedRun({ quarantinedFailedCount: 3 });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict.suppressedFailures).toBe(3);
+    expect(body.run.verdict.reason).toContain('quarantined');
+    expect(body.run.verdict.reason).toContain('still failing');
+  });
+
+  it('reports FAILED when a failure actually gates', async () => {
+    const id = seedFinishedRun({ status: 'FAILED', failedCount: 1 });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict).toMatchObject({ passed: false, status: 'FAILED' });
+  });
+
+  it('reports FAILED when the gate blocked with every test green', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      gateResult: { passed: false, evaluations: [{ action: 'BLOCK', detail: 'budget' }] },
+    });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict.passed).toBe(false);
+  });
+
+  it('gives a run still in flight no verdict at all rather than a passing one', async () => {
+    const id = seedFinishedRun({ status: 'RUNNING', gateResult: null });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict.passed).toBe(false);
+    expect(body.run.verdict.reason).toContain('has not finished');
+  });
+
+  it('never reports a cancelled run as a pass', async () => {
+    const id = seedFinishedRun({ status: 'CANCELLED' });
+    const { body } = await getRun(id);
+
+    expect(body.run.verdict).toMatchObject({ passed: false, status: 'CANCELLED' });
+  });
+
+  it('carries the expiry alongside the flag, so a surface cannot mislabel a gating test', async () => {
+    const id = seedFinishedRun({
+      tests: [
+        {
+          id: 'test_1',
+          orgId: 'org_1',
+          projectId: 'proj_1',
+          name: 'login',
+          quarantined: true,
+          quarantineExpiresAt: new Date(NOW - 86_400_000),
+        },
+      ],
+      results: [
+        { id: 'res_1', testId: 'test_1', status: 'FAILED', durationMs: 10, errorMessage: 'boom' },
+      ],
+    });
+    const { body } = await getRun(id);
+
+    expect(body.run.results[0].test.quarantineExpiresAt).toBeDefined();
+  });
+});
+
+describe('GET /runs/:runId/junit.xml — a suppressed failure must not go red in a CI', () => {
+  const quarantinedTest = {
+    id: 'test_1',
+    orgId: 'org_1',
+    projectId: 'proj_1',
+    name: 'flaky upload',
+    quarantined: true,
+    quarantineExpiresAt: new Date(NOW + 86_400_000),
+  };
+
+  function seedOneQuarantinedFailure(): string {
+    return seedFinishedRun({
+      quarantinedFailedCount: 1,
+      tests: [quarantinedTest],
+      results: [
+        {
+          id: 'res_1',
+          testId: 'test_1',
+          status: 'FAILED',
+          durationMs: 1_500,
+          errorMessage: 'upload timed out',
+        },
+      ],
+    });
+  }
+
+  it('emits no <failure> element for it', async () => {
+    const xml = await getJunit(seedOneQuarantinedFailure());
+    expect(xml).not.toContain('<failure');
+  });
+
+  it('and the testsuite agrees — failures="0"', async () => {
+    const xml = await getJunit(seedOneQuarantinedFailure());
+    expect(xml).toContain('failures="0"');
+  });
+
+  it('is DISTINGUISHABLE from a deliberate skip, not just quiet', async () => {
+    // `<skipped/>` with no message would be the same defect in a kinder word.
+    const xml = await getJunit(seedOneQuarantinedFailure());
+    expect(xml).toContain('QUARANTINED FAILURE');
+    expect(xml).toContain('it ran, and it failed');
+    expect(xml).toContain('upload timed out');
+  });
+
+  it('counts the suppressed failures as a property any parser can read', async () => {
+    const xml = await getJunit(seedOneQuarantinedFailure());
+    expect(xml).toContain('<property name="qaai.quarantinedFailures" value="1"/>');
+    expect(xml).toContain('<property name="qaai.quarantinedFailuresInThisDocument" value="1"/>');
+  });
+
+  it('leaves a deliberate skip as a bare <skipped/> with nothing added', async () => {
+    const id = seedFinishedRun({
+      skippedCount: 1,
+      tests: [
+        {
+          id: 'test_1',
+          orgId: 'org_1',
+          projectId: 'proj_1',
+          name: 'unsupported',
+          quarantined: false,
+          quarantineExpiresAt: null,
+        },
+      ],
+      results: [
+        { id: 'res_1', testId: 'test_1', status: 'SKIPPED', durationMs: 0, errorMessage: null },
+      ],
+    });
+    const xml = await getJunit(id);
+    expect(xml).toContain('<skipped/>');
+    expect(xml).not.toContain('QUARANTINED');
+  });
+
+  it('still emits <failure> for a test whose quarantine EXPIRED', async () => {
+    // An expired quarantine gates again, and the XML has to agree.
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      failedCount: 1,
+      tests: [{ ...quarantinedTest, quarantineExpiresAt: new Date(NOW - 86_400_000) }],
+      results: [
+        { id: 'res_1', testId: 'test_1', status: 'FAILED', durationMs: 10, errorMessage: 'boom' },
+      ],
+    });
+    const xml = await getJunit(id);
+    expect(xml).toContain('<failure');
+    expect(xml).toContain('failures="1"');
+  });
+
+  it('still emits <failure> for an unquarantined failure', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      failedCount: 1,
+      tests: [
+        {
+          id: 'test_1',
+          orgId: 'org_1',
+          projectId: 'proj_1',
+          name: 'pay',
+          quarantined: false,
+          quarantineExpiresAt: null,
+        },
+      ],
+      results: [
+        { id: 'res_1', testId: 'test_1', status: 'FAILED', durationMs: 10, errorMessage: 'boom' },
+      ],
+    });
+    const xml = await getJunit(id);
+    expect(xml).toContain('<failure message="boom"/>');
+  });
+
+  it('escapes the quarantine message, so an error cannot break the document', async () => {
+    const id = seedFinishedRun({
+      quarantinedFailedCount: 1,
+      tests: [quarantinedTest],
+      results: [
+        {
+          id: 'res_1',
+          testId: 'test_1',
+          status: 'FAILED',
+          durationMs: 10,
+          errorMessage: '</skipped><failure message="injected"/>',
+        },
+      ],
+    });
+    const xml = await getJunit(id);
+    expect(xml).not.toContain('<failure message="injected"/>');
+    expect(xml).toContain('&lt;/skipped&gt;');
   });
 });

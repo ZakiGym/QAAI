@@ -26,6 +26,12 @@
  */
 
 import { createHash } from 'node:crypto';
+/*
+ * The one definition of "does this result count as a failure". `isRealFailure`
+ * below used to be a second one; see its doc comment for what delegating buys
+ * and for the single half of the rule that could not be delegated.
+ */
+import { emptyRunCounts, tallyResult } from '@qaai/runner';
 import { analyzeImpact } from './impact.js';
 import type { Confidence, ImpactAnalysis, ImpactTestInput, TestDecision } from './impact.js';
 
@@ -564,7 +570,27 @@ export function planCacheReuse(
 
 export interface FailFastCandidate {
   status: string;
+  /**
+   * The test failed and a retry passed. NOT something `tallyResult` knows
+   * about — see `isRealFailure` for why this stays the caller's to supply.
+   */
   retriedAndPassed: boolean;
+  /**
+   * Whether the quarantine is IN FORCE for this result — not whether
+   * `Test.quarantined` is set. The same contract `GateInput.results[].quarantined`
+   * states in packages/runner/src/gates.ts, and for the same reason: an expired
+   * quarantine suppresses nothing, so the caller answers
+   * `quarantineSuppresses(test, now)` rather than handing over the raw column.
+   *
+   * KNOWN GAP, reported rather than fixed here: both callers in
+   * `apps/worker/src/processors/digest.ts` pass `row.test.quarantined` raw, and
+   * their queries do not select `quarantineExpiresAt`, so they cannot yet
+   * answer the question this field asks. That file is not this change's to
+   * edit. The consequence is bounded and in the safe direction for the digest —
+   * an expired quarantine keeps a failure out of the weekly email — but it is a
+   * disagreement with every other consumer and it is written down here so the
+   * next person to open digest.ts finds it.
+   */
   quarantined: boolean;
 }
 
@@ -574,13 +600,57 @@ export interface FailFastCandidate {
  * Narrow on purpose. A fail-fast that trips on a flake, or on a test the org has
  * already quarantined precisely so it stops gating deploys, kills a run that had
  * real answers left to give — and the second time that happens the flag gets
- * turned off and never comes back. FAILED and TIMED_OUT are the two statuses
- * that mean "this build is broken"; everything else keeps the run going.
+ * turned off and never comes back.
+ *
+ * ── Why this delegates instead of deciding ──────────────────────────────────
+ *
+ * This was a SECOND implementation of "does this failure count", written before
+ * `packages/runner/src/gates.ts` owned that rule. It happened to agree —
+ * FAILED/TIMED_OUT count, a quarantined one does not — which is the most
+ * dangerous state a duplicate can be in: nothing is wrong today, nothing goes
+ * red when the two drift tomorrow, and the drift is invisible because each side
+ * reads correct on its own. That shape is exactly what the original defect was:
+ * five places each deciding red/green off a different field.
+ *
+ * So the status-and-quarantine half is now answered by `tallyResult`, the only
+ * function allowed to turn a result into a number. `counts.failed > 0` is the
+ * question "would this failure have gated" asked of the authority: add a status
+ * to the platform, or change which column a suppressed failure lands in, and
+ * this moves with it instead of needing to be remembered.
+ *
+ * ── The half that could not be delegated, and why ───────────────────────────
+ *
+ * `retriedAndPassed` stays here. `tallyResult` takes a status and nothing else,
+ * because by the time the worker tallies a result a pass-on-retry has ALREADY
+ * been written as `FLAKY` — the status carries it. `isRealFailure` is handed
+ * rows straight out of Postgres, where `status` and `retriedAndPassed` are
+ * separate columns and a row can say FAILED with `retriedAndPassed: true`
+ * (§5: a test that passed only on retry counts as flaky, not as a pass, and
+ * certainly not as a build-breaking failure). `evaluateGates` has the same
+ * problem and solves it the same way, in its MAX_FLAKE_RATE arm:
+ * `r.status === 'FLAKY' || r.retriedAndPassed`. Widening `tallyResult` to take
+ * a second field would change the signature of the one function every finaliser
+ * calls, in a file this change does not own — so the pre-filter is local, and
+ * named, rather than forced.
  */
 export function isRealFailure(result: FailFastCandidate): boolean {
-  if (result.quarantined) return false;
+  /*
+   * Checked BEFORE the tally, not after: a FAILED row that was retried into a
+   * pass must not reach `tallyResult` at all, or it would be counted as a
+   * failure — which is right for the run's counters and wrong for this
+   * question. See the note above.
+   */
   if (result.retriedAndPassed) return false;
-  return result.status === 'FAILED' || result.status === 'TIMED_OUT';
+
+  const counts = emptyRunCounts();
+  tallyResult(counts, { status: result.status, quarantineInForce: result.quarantined });
+  /*
+   * `failed`, specifically. A quarantined failure lands in
+   * `quarantinedFailed` instead, which is the whole point of that fourth
+   * counter — and reading `failed` here means this function cannot start
+   * stopping runs on suppressed failures without `tallyResult` changing first.
+   */
+  return counts.failed > 0;
 }
 
 export interface FailFastPlan {

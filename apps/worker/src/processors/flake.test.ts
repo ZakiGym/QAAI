@@ -52,6 +52,7 @@ const {
   measureSamples,
   parseInvestigationTag,
   processFlakeTick,
+  pruneFlakeHistory,
 } = await import('./flake.js');
 
 type Measurement = ReturnType<typeof measureSamples>;
@@ -431,7 +432,22 @@ function fakePrisma(scenario: {
   tests?: Record<string, Record<string, unknown>>;
   audits?: AuditRow[];
   suspectRows?: unknown[];
-  quarantinedTests?: Array<{ id: string; orgId: string; projectId: string }>;
+  quarantinedTests?: Array<{
+    id: string;
+    orgId: string;
+    projectId: string;
+    quarantineExpiresAt?: Date | null;
+  }>;
+  /**
+   * Live tests in the project — the denominator the quarantine budget divides
+   * by. Defaults to a suite big enough that the default 5% cap leaves room, so
+   * every pre-existing test in this file keeps the behaviour it asserted.
+   */
+  projectTestCount?: number;
+  /** The project's own cap. Null means the documented default. */
+  quarantineBudgetPercent?: number | null;
+  /** Flake-trend rows, for the retention prune. */
+  flakeHistory?: Array<{ id: string; day: Date }>;
   queuedRuns?: number;
   /** Queued runs to filter for real, so the yield check is tested semantically. */
   queuedRunTriggers?: Array<string | null>;
@@ -454,6 +470,8 @@ function fakePrisma(scenario: {
     updated: [] as Array<{ testId: string; data: Record<string, unknown> }>,
     transactions: [] as number[],
     cancelled: [] as unknown[],
+    /** Flake-history ids the retention prune deleted. */
+    pruned: [] as string[],
   };
 
   const matchesAudit = (row: AuditRow, where: Record<string, unknown>): boolean => {
@@ -512,9 +530,50 @@ function fakePrisma(scenario: {
     test: {
       findFirst: async ({ where }: { where: { id: string } }) => scenario.tests?.[where.id] ?? null,
       findMany: async () => scenario.quarantinedTests ?? [],
+      /*
+       * The budget's denominator. Modelled rather than left off: a stand-in
+       * that threw here would make `quarantineBudgetFor` fall into its catch
+       * and decide with NO budget, which is exactly the state in which the
+       * refusal is unobservable — the shape of hole the original defect lived
+       * in.
+       */
+      count: async ({ where }: { where?: Record<string, any> } = {}) => {
+        // The denominator, or the suppressions in force — two queries, one
+        // model. The in-force count excludes an EXPIRED quarantine and the test
+        // under investigation, both in SQL, so the fake applies both here.
+        if (where?.quarantined !== true) return scenario.projectTestCount ?? 1_000;
+        const now = Date.now();
+        const excluded = where.id?.not as string | undefined;
+        return (scenario.quarantinedTests ?? []).filter((t) => {
+          if (excluded && t.id === excluded) return false;
+          const expires = t.quarantineExpiresAt;
+          return expires === null || expires === undefined || expires.getTime() > now;
+        }).length;
+      },
       update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         calls.updated.push({ testId: where.id, data });
         return {};
+      },
+    },
+    project: {
+      findFirst: async () => ({
+        quarantineBudgetPercent: scenario.quarantineBudgetPercent ?? null,
+      }),
+    },
+    testFlakeHistory: {
+      findMany: async ({ where, take }: { where: Record<string, any>; take?: number }) => {
+        const before = where.day?.lt as Date | undefined;
+        return (scenario.flakeHistory ?? [])
+          .filter((row) => !before || row.day < before)
+          .sort((a, b) => a.day.getTime() - b.day.getTime())
+          .slice(0, take ?? undefined)
+          .map((row) => ({ id: row.id }));
+      },
+      deleteMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+        const ids = new Set(where.id.in);
+        calls.pruned.push(...where.id.in);
+        scenario.flakeHistory = (scenario.flakeHistory ?? []).filter((row) => !ids.has(row.id));
+        return { count: ids.size };
       },
     },
     testResult: {
@@ -576,6 +635,8 @@ const testRow = (over: Record<string, unknown> = {}) => ({
   priority: 'IMPORTANT',
   quarantined: false,
   quarantineReason: null,
+  /** Null means "never expires", which every pre-expiry quarantine is. */
+  quarantineExpiresAt: null,
   disabledAt: null,
   filePath: 'specs/checkout.spec.ts',
   ...over,
@@ -861,5 +922,291 @@ describe('the sweep', () => {
     await processFlakeTick({ at: new Date().toISOString() });
 
     expect(calls.created).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The budget: an escape hatch that always opens is not a safety feature.
+//
+// Quarantine was unbounded. Nothing refused the 40th quarantine and nobody was
+// paged, so a quarter of a suite could stop gating while the board stayed
+// green. The budget is checked LAST, after every other reason to leave a test
+// gating, because it is the only one that is about the SUITE rather than about
+// this test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the quarantine budget, as a decision', () => {
+  const overBudget = {
+    allowed: false,
+    current: 5,
+    limit: 5,
+    percent: 5,
+    wouldBePercent: 6,
+    nearLimit: true,
+    reason: 'Refused: 5 of 100 test(s) are already quarantined. Fix one or delete it.',
+  };
+
+  it('REFUSES a quarantine the suite has no budget for', () => {
+    const d = decide({ measurement: measured(4, 10), budget: overBudget });
+    expect(d.action).toBe('NONE');
+  });
+
+  it('says why, with the budget reason carried verbatim', () => {
+    const d = decide({ measurement: measured(4, 10), budget: overBudget });
+    expect(d.reason).toContain('at its quarantine budget');
+    expect(d.reason).toContain('Fix one or delete it');
+    expect(d.reason).toContain('It keeps gating');
+  });
+
+  it('still reports the measurement, so the evidence is not lost with the refusal', () => {
+    const d = decide({ measurement: measured(4, 10), budget: overBudget });
+    expect(d.reason).toContain('failed 4 of 10');
+  });
+
+  it('quarantines when the suite has room', () => {
+    const d = decide({
+      measurement: measured(4, 10),
+      budget: { ...overBudget, allowed: true, current: 1, reason: 'Allowed: 2 of a cap of 5.' },
+    });
+    expect(d.action).toBe('QUARANTINE');
+  });
+
+  it('decides on the measurement alone when the budget could not be read', () => {
+    // Every other uncertainty in this module resolves towards "leave it
+    // gating" because it is about the TEST. This one is about a count, and
+    // refusing a measured quarantine because a count() failed would be refusing
+    // on no information at all.
+    const d = decide({ measurement: measured(4, 10) });
+    expect(d.action).toBe('QUARANTINE');
+  });
+
+  it('is checked after every other reason to leave a test gating', () => {
+    // A critical-path test over the threshold is refused for being
+    // critical-path, not for the budget — the more specific reason is the one a
+    // human needs.
+    const d = decide({
+      measurement: measured(4, 10),
+      priority: 'CRITICAL_PATH',
+      budget: overBudget,
+    });
+    expect(d.action).toBe('NONE');
+    expect(d.reason).toContain('critical-path');
+    expect(d.reason).not.toContain('quarantine budget');
+  });
+
+  it('cannot refuse a RELEASE — restoring a gate is always allowed', () => {
+    const d = decide({
+      measurement: measured(0, 10),
+      quarantined: true,
+      machineQuarantined: true,
+      budget: overBudget,
+    });
+    expect(d.action).toBe('RELEASE');
+  });
+});
+
+describe('expiry: a quarantine with no end date is a deletion nobody signed', () => {
+  it('stamps an expiry when it quarantines', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    const write = calls.updated.find((u) => u.data.quarantined === true);
+    expect(write!.data.quarantineExpiresAt).toBeInstanceOf(Date);
+    expect((write!.data.quarantineExpiresAt as Date).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('says in the reason that it will run out', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    const write = calls.updated.find((u) => u.data.quarantined === true)!;
+    expect(String(write.data.quarantineReason)).toContain('14 days');
+    expect(String(write.data.quarantineReason)).toContain('expires');
+  });
+
+  it('renews the expiry on a test it re-confirms, so quarantine is a loan on evidence', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: {
+        'test-1': testRow({
+          quarantined: true,
+          quarantineReason: `${AUTO_QUARANTINE_REASON_PREFIX}: an earlier measurement`,
+          quarantinedAt: new Date(Date.now() - 20 * 86_400_000),
+          quarantineExpiresAt: new Date(Date.now() - 6 * 86_400_000),
+        }),
+      },
+      audits: [
+        {
+          orgId: 'org-1',
+          action: FLAKE_AUDIT_ACTIONS.quarantined,
+          targetType: 'Test',
+          targetId: 'test-1',
+          metadata: {},
+          createdAt: new Date(Date.now() - 20 * 86_400_000),
+        },
+      ],
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    const write = calls.updated.find((u) => u.data.quarantined === true)!;
+    expect((write.data.quarantineExpiresAt as Date).getTime()).toBeGreaterThan(Date.now());
+    // The ORIGINAL date is preserved — the audit row records when the
+    // measurement landed, not the row.
+    expect(write.data.quarantinedAt).toBeUndefined();
+  });
+
+  it('clears the expiry with the quarantine on release', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(0),
+      tests: {
+        'test-1': testRow({
+          quarantined: true,
+          quarantineReason: `${AUTO_QUARANTINE_REASON_PREFIX}: an earlier measurement`,
+          quarantineExpiresAt: new Date(Date.now() + 86_400_000),
+        }),
+      },
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    const write = calls.updated.find((u) => u.data.quarantined === false)!;
+    // A stale end date on a test that is not quarantined is how the next reader
+    // gets the story wrong.
+    expect(write.data).toMatchObject({
+      quarantined: false,
+      quarantinedAt: null,
+      quarantineReason: null,
+      quarantineExpiresAt: null,
+    });
+  });
+});
+
+describe('the budget, end to end through the sweep', () => {
+  it('refuses the quarantine and audits the refusal as a measurement', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+      // Ten live tests, three already suppressed: over a default cap of 5%
+      // (floor 2).
+      projectTestCount: 10,
+      quarantinedTests: [
+        { id: 'q1', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+        { id: 'q2', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+        { id: 'q3', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+      ],
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    // Nothing was suppressed.
+    expect(calls.updated.filter((u) => u.data.quarantined === true)).toEqual([]);
+    // And the decision is on the record. `measured` is the existing vocabulary
+    // for "a decision to do nothing", and it does not change who owns a
+    // quarantine the way a `quarantined` row would.
+    const audit = calls.audits.find((a) => a.action === FLAKE_AUDIT_ACTIONS.measured);
+    expect(String((audit!.metadata as { reason: string }).reason)).toContain('quarantine budget');
+  });
+
+  it('quarantines the same test once the project raises its cap on purpose', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+      projectTestCount: 10,
+      quarantineBudgetPercent: 60,
+      quarantinedTests: [
+        { id: 'q1', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+        { id: 'q2', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+        { id: 'q3', orgId: 'org-1', projectId: 'proj-1', quarantineExpiresAt: null },
+      ],
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    expect(calls.updated.some((u) => u.data.quarantined === true)).toBe(true);
+  });
+
+  it('does not charge the budget for a quarantine that has EXPIRED', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+      projectTestCount: 10,
+      // Three quarantines, all run out. They are not suppressing anything any
+      // more, so charging the project for them would make the budget tighten on
+      // its own over time.
+      quarantinedTests: ['q1', 'q2', 'q3'].map((id) => ({
+        id,
+        orgId: 'org-1',
+        projectId: 'proj-1',
+        quarantineExpiresAt: new Date(Date.now() - 86_400_000),
+      })),
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    expect(calls.updated.some((u) => u.data.quarantined === true)).toBe(true);
+  });
+});
+
+describe('flake-history retention', () => {
+  const day = (n: number) => new Date(Date.now() - n * 86_400_000);
+
+  it('deletes points past the window and keeps the rest', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeHistory: [
+        { id: 'old-1', day: day(200) },
+        { id: 'old-2', day: day(120) },
+        { id: 'keep-1', day: day(30) },
+        { id: 'keep-2', day: day(1) },
+      ],
+    });
+    h.prisma = prisma;
+
+    const deleted = await pruneFlakeHistory(new Date());
+
+    expect(deleted).toBe(2);
+    expect(calls.pruned.sort()).toEqual(['old-1', 'old-2']);
+  });
+
+  it('does nothing when there is nothing past the window', async () => {
+    const { prisma, calls } = fakePrisma({ flakeHistory: [{ id: 'keep', day: day(1) }] });
+    h.prisma = prisma;
+
+    expect(await pruneFlakeHistory(new Date())).toBe(0);
+    expect(calls.pruned).toEqual([]);
+  });
+
+  it('runs on the tick, and a failure there does not stop the sweep', async () => {
+    const { prisma, calls } = fakePrisma({
+      flakeRuns: tenSamples(4),
+      tests: { 'test-1': testRow() },
+    });
+    (prisma.testFlakeHistory as unknown as { findMany: () => Promise<unknown> }).findMany =
+      async () => {
+        throw new Error('table missing');
+      };
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    // The quarantine decision still landed: a sweep that stopped measuring
+    // flakes in order to tidy up a table would be trading the product for the
+    // housekeeping.
+    expect(calls.updated.some((u) => u.data.quarantined === true)).toBe(true);
   });
 });

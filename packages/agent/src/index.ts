@@ -22,3 +22,17 @@ export * from './traffic.js';
 export * from './coverage.js';
 export * from './surface-inventory.js';
 export * from './surface-coverage.js';
+
+/*
+ * The generation gates. Each of these was flagged `package-exports` by
+ * check:wiring the moment it landed — built, tested, and reachable from
+ * nothing but its own test file, which is this codebase's signature defect.
+ *
+ * `admission.js` owns the gate vocabulary (GateId/GateStatus/GateOutcome);
+ * `toolchain.js` imports those types type-only and deliberately does not
+ * re-export them, so there is exactly one of each name in this barrel.
+ */
+export * from './admission.js';
+export * from './toolchain.js';
+export * from './mutation-gate.js';
+export * from './boundaries.js';

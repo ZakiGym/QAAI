@@ -33,6 +33,7 @@ import {
   type DeterminismPlan,
 } from './determinism.js';
 import { childEnv } from './child-env.js';
+import { authProfileRequired, declaredAuthProfileId, suppliedAuthProfileId } from './run-workspace.js';
 
 /** Hard ceiling for a whole spec file, independent of per-test timeouts. */
 const PROCESS_TIMEOUT_MS = 10 * 60_000;
@@ -164,6 +165,12 @@ interface Workspace {
   specPath: string;
   outputDir: string;
   reportPath: string;
+  /**
+   * Where this spec's session was written, or null when the test runs
+   * anonymously. Named after the auth profile that produced it — see
+   * {@link createWorkspace}.
+   */
+  storageStatePath: string | null;
   cleanup: () => Promise<void>;
 }
 
@@ -195,6 +202,23 @@ function safeFixturePath(dir: string, filePath: string): string {
     throw new Error(`Refusing to write fixture outside the workspace: ${filePath}`);
   }
   return full;
+}
+
+/**
+ * The file one profile's session is written to.
+ *
+ * Keyed by profile id so the mapping is a function of the identity and nothing
+ * else: two tests on the same profile name the same file, two tests on
+ * different profiles can never name the same one, and the identity behind a
+ * verdict is visible in the workspace instead of being implied. A profile id is
+ * a cuid, but it becomes a real filename, so it is sanitised like any other
+ * untrusted path component.
+ *
+ * Exported for the test that pins exactly those three properties.
+ */
+export function storageStateFileName(profileId: string | null): string {
+  if (!profileId) return 'storage-state.json';
+  return `storage-state-${profileId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`;
 }
 
 /** Playwright's device preset for a browser engine. */
@@ -332,9 +356,23 @@ async function createWorkspace(
     await writeFile(target, content, 'utf8');
   }
 
-  // Storage state from the environment's auth profile, when one applies (§2).
+  /*
+   * The session this spec runs under (§2), named after the auth profile that
+   * produced it.
+   *
+   * There used to be one file called `storage-state.json` holding the one
+   * session a run had. Tests now carry their own `authProfileId` and the worker
+   * resolves a session per profile, so the file is keyed by profile id: two
+   * tests on the same profile write identical bytes under the same name, two
+   * tests on different profiles can never write the same name, and the identity
+   * a verdict was produced under is visible in the workspace and in the child's
+   * environment rather than being implied. The id is a cuid, but it becomes a
+   * real filename, so it is sanitised like any other untrusted path component.
+   */
+  let storageStatePath: string | null = null;
   if (ctx.storageState) {
-    await writeFile(join(dir, 'storage-state.json'), JSON.stringify(ctx.storageState), 'utf8');
+    storageStatePath = join(dir, storageStateFileName(suppliedAuthProfileId(ctx)));
+    await writeFile(storageStatePath, JSON.stringify(ctx.storageState), 'utf8');
   }
 
   return {
@@ -342,6 +380,7 @@ async function createWorkspace(
     specPath,
     outputDir,
     reportPath: join(dir, 'report.json'),
+    storageStatePath,
     cleanup: () => rm(dir, { recursive: true, force: true }),
   };
 }
@@ -368,7 +407,12 @@ function runPlaywright(ws: Workspace, ctx: RunContext, plan: DeterminismPlan): P
         extra: {
           QAAI_BASE_URL: ctx.baseUrl,
           QAAI_RUN_ID: ctx.runId,
-          QAAI_STORAGE_STATE: ctx.storageState ? join(ws.dir, 'storage-state.json') : '',
+          QAAI_STORAGE_STATE: ws.storageStatePath ?? '',
+          // Which identity this spec is running as. A spec does not need it,
+          // but a failure that reads "403 Forbidden" is a different bug
+          // depending on the answer, and it is otherwise unrecoverable from the
+          // artifacts.
+          QAAI_AUTH_PROFILE: suppliedAuthProfileId(ctx) ?? '',
           // The seed the run actually used, so a spec that generates its own data
           // reads the same number that decided the test order.
           QAAI_SEED: String(d.seed),
@@ -617,12 +661,84 @@ async function recordDeterminism(
   }
 }
 
+/**
+ * The one condition this harness refuses to execute under.
+ *
+ * A test that names an `authProfileId` is a test about a ROLE: "an admin can
+ * delete a member", "a member cannot". If the run could not produce that
+ * profile's session — the login failed, the credentials are gone, the profile
+ * is a header token no browser can carry — then running the spec anyway runs it
+ * ANONYMOUSLY, and an anonymous browser hitting an admin page gets a login
+ * redirect that an assertion on "no error banner" cheerfully passes. That green
+ * tick is the defect the per-test profile was added to remove, wearing a
+ * different costume, so it is refused here instead.
+ *
+ * FAILED rather than SKIPPED on purpose: a skip does not block a gate, and a
+ * suite whose permission tests quietly stopped running is exactly the thing
+ * nobody notices. The worker resolves sessions before it gets here and fails
+ * the test with the login's own message; this is the backstop for every other
+ * route into the harness.
+ *
+ * Exported so all four combinations can be pinned without launching a browser.
+ */
+export function missingRoleSession(
+  ctx: RunContext,
+  test: ExecutableTest,
+): { declared: string | null; supplied: string | null } | null {
+  const declared = declaredAuthProfileId(test);
+  const supplied = suppliedAuthProfileId(ctx);
+
+  if (declared) {
+    // The profile has to be THIS profile, and it has to have produced a
+    // session — an SSO bypass token signs in "successfully" and produces none.
+    if (supplied === declared && ctx.storageState) return null;
+    return { declared, supplied };
+  }
+
+  /*
+   * No binding, but the test still says it is meaningless signed out: its
+   * profile was deleted (`onDelete: SetNull` nulls the binding and leaves the
+   * intent). There is nothing to check against, so the session itself is the
+   * question, and an absent one is a refusal.
+   */
+  if (authProfileRequired(test) && !ctx.storageState) return { declared: null, supplied };
+  return null;
+}
+
 /** Runs one generated spec file and maps the result into QAAI's shape. */
 export async function runPlaywrightSpec(
   ctx: RunContext,
   test: ExecutableTest,
   options: HarnessOptions = {},
 ): Promise<TestExecution> {
+  const startedWithoutRole = Date.now();
+  const roleGap = missingRoleSession(ctx, test);
+  if (roleGap) {
+    return {
+      testId: test.id,
+      status: 'FAILED',
+      durationMs: Date.now() - startedWithoutRole,
+      steps: [],
+      network: options.network ?? [],
+      console: [],
+      videoKey: null,
+      traceKey: null,
+      errorMessage:
+        (roleGap.declared
+          ? `"${test.name}" runs as auth profile ${roleGap.declared}, and this run has no session ` +
+            `for it${roleGap.supplied ? ` (it supplied ${roleGap.supplied} instead)` : ''}. `
+          : `"${test.name}" is marked as requiring a signed-in role, and the profile it was ` +
+            'bound to no longer exists. ') +
+        'The spec was NOT executed anonymously: a logged-out browser would have been redirected ' +
+        'to the login page and most assertions would have passed, which is worse than a failure. ' +
+        (roleGap.declared
+          ? 'Sign the profile in from Project settings → Environments → Auth profiles and re-run.'
+          : 'Re-bind the test to an auth profile in the test editor and re-run.'),
+      retriedAndPassed: false,
+      findings: [],
+    };
+  }
+
   const plan = planDeterminism(
     test.code,
     resolveDeterminism(ctx.determinism, options.determinism),

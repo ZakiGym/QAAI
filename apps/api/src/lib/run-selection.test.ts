@@ -13,6 +13,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
+/*
+ * The authority `isRealFailure` now delegates to, imported so the agreement is
+ * asserted against the real thing rather than against a transcription of it.
+ */
+import { emptyRunCounts, tallyResult } from '@qaai/runner';
+import { TEST_RESULT_STATUSES } from '@qaai/shared';
 import {
   DEFAULT_CACHE_WINDOW_HOURS,
   MAX_CACHE_WINDOW_HOURS,
@@ -508,6 +514,49 @@ describe('what counts as a real failure', () => {
     // Quarantine exists so a flaky test stops gating deploys. Letting one end
     // the whole run would give it more power than an ordinary test, not less.
     expect(isRealFailure(result({ quarantined: true }))).toBe(false);
+  });
+
+  /**
+   * The lockstep, and the reason this suite is worth more than the four cases
+   * above it.
+   *
+   * `isRealFailure` was a SECOND implementation of "does this failure count",
+   * written before gates.ts owned that rule. It agreed — which is the state a
+   * duplicate is most dangerous in, because nothing is wrong today and nothing
+   * goes red the day the two drift. It now delegates to `tallyResult`, and this
+   * asserts the agreement directly against the authority rather than against a
+   * list of statuses somebody remembered to keep up to date.
+   *
+   * A status the enum does not hold is included on purpose: that is where the
+   * two implementations actually differed, and the delegation CHANGED the
+   * answer — see the case below.
+   */
+  it('agrees with tallyResult in packages/runner/src/gates.ts, status for status', () => {
+    for (const status of [...TEST_RESULT_STATUSES, 'SOMETHING_NEW']) {
+      for (const quarantined of [false, true]) {
+        const counts = emptyRunCounts();
+        tallyResult(counts, { status, quarantineInForce: quarantined });
+        // The authority's own arithmetic: a quarantined failure lands in
+        // `quarantinedFailed`, so `failed > 0` is exactly "would this gate".
+        expect(isRealFailure(result({ status, quarantined }))).toBe(counts.failed > 0);
+      }
+    }
+  });
+
+  it('stops on a status it does not recognise, rather than running on', () => {
+    /*
+     * A DELIBERATE behaviour change from the hand-written version, which
+     * answered only to FAILED and TIMED_OUT and therefore treated anything else
+     * — a status added to the platform, a row written by an older worker — as
+     * "keep going". `tallyResult`'s default arm counts any non-pass as a
+     * failure, and that is the direction this file's own rule points: any doubt
+     * resolves to the answer that keeps a signal on. Unreachable through
+     * `TestResultStatus` today; reachable the day somebody adds a sixth status
+     * and forgets this function exists, which is the whole point.
+     */
+    expect(isRealFailure(result({ status: 'ERRORED' }))).toBe(true);
+    // And quarantine still outranks it: suppressed is suppressed.
+    expect(isRealFailure(result({ status: 'ERRORED', quarantined: true }))).toBe(false);
   });
 });
 
