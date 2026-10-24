@@ -145,17 +145,13 @@ describe('childEnv', () => {
       }
     });
 
-    it('passes nothing when no test runner is present', () => {
-      const vitest = process.env.VITEST;
+    it('passes nothing when NODE_ENV is not test', () => {
       const nodeEnv = process.env.NODE_ENV;
       process.env.QAAI_STUB_MODE = 'ok';
-      delete process.env.VITEST;
       process.env.NODE_ENV = 'production';
       try {
         expect(childEnv()).not.toHaveProperty('QAAI_STUB_MODE');
       } finally {
-        if (vitest === undefined) delete process.env.VITEST;
-        else process.env.VITEST = vitest;
         if (nodeEnv === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = nodeEnv;
         delete process.env.QAAI_STUB_MODE;

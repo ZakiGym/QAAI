@@ -40,20 +40,13 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { FIXTURE_PREFIX, QUEUE_NAMES } from '@qaai/shared';
 import type { Priority, TestType } from '@qaai/shared';
-/*
- * A relative path rather than `@qaai/agent`, because the package's export map
- * is `{ ".": "./src/index.ts" }` and its barrel is owned by another change in
- * flight. Swap this for a bare `@qaai/agent` import the moment
- * `export * from './coverage.js'` lands in packages/agent/src/index.ts — the
- * named imports are identical and nothing else has to move.
- */
 import {
   analyzeCoverage,
   planItemForGap,
   type CoverageGap,
   type CoverageReport,
   type CoverageTestInput,
-} from '../../../../packages/agent/src/coverage.js';
+} from '@qaai/agent';
 import {
   routeLiteralsFromCode,
   routesFromSpec,

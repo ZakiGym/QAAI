@@ -49,6 +49,7 @@ import { issuesRouter } from './routes/issues.js';
 import { testsRouter } from './routes/tests.js';
 import { bisectRouter } from './routes/bisect.js';
 import { coverageRouter } from './routes/coverage.js';
+import { surfaceRouter } from './routes/surface.js';
 import { domDiffRouter } from './routes/dom-diff.js';
 import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
@@ -207,6 +208,8 @@ app.use('/issues', issuesRouter);
 app.use('/tests', testsRouter);
 app.use('/bisect', bisectRouter);
 app.use('/coverage', coverageRouter);
+// Mounted at the root: surfaceRouter declares its own `/surface/...` paths.
+app.use(surfaceRouter);
 app.use('/dom-diff', domDiffRouter);
 app.use('/repro', reproRouter);
 app.use('/suite-health', suiteHealthRouter);

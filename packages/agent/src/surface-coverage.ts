@@ -40,6 +40,7 @@ import {
   type SurfaceSnapshotTotals,
   type SurfaceStatus,
   type SurfaceWaiver,
+  type TestResultStatus,
 } from '@qaai/shared';
 import { canonicalRoute, routeVisits, type CoverageTestInput } from './coverage.js';
 
@@ -49,7 +50,8 @@ import { canonicalRoute, routeVisits, type CoverageTestInput } from './coverage.
 export interface TestExecutionFact {
   testId: string;
   runId: string;
-  status: 'PASSED' | 'FAILED' | 'FLAKED' | 'SKIPPED';
+  /** The runner's own vocabulary; see TEST_RESULT_STATUSES in shared. */
+  status: TestResultStatus;
   /** Null when no mutation run has had an opinion about this test. */
   mutationKilled?: boolean | null;
 }
@@ -322,7 +324,7 @@ export function analyseSurfaceCoverage(input: SurfaceCoverageInput): SurfaceCove
     // Rule 3: a match is not an execution. `executed` is true only when a
     // matched test was actually seen to run and pass.
     let lastRunId: string | null = null;
-    let lastStatus: TestExecutionFact['status'] | null = null;
+    let lastStatus: TestResultStatus | null = null;
     let executed = false;
     let mutationKilled: boolean | null = null;
     for (const match of matches) {

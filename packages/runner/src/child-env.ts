@@ -156,7 +156,10 @@ export function isForbiddenChildEnvKey(key: string): boolean {
 const TEST_STUB_PREFIX = 'QAAI_STUB_';
 
 function underTestRunner(): boolean {
-  return process.env.VITEST !== undefined || process.env.NODE_ENV === 'test';
+  // NODE_ENV only. Vitest sets it to 'test', and keying off VITEST as well
+  // would add an environment variable nobody deploying this could discover —
+  // which `check:wiring` correctly refuses.
+  return process.env.NODE_ENV === 'test';
 }
 
 export interface ChildEnvOptions {

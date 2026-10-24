@@ -58,6 +58,8 @@
  * is a true and useful sentence, and a customer comparing us to a vendor who
  * quietly measures only frontend lines deserves to hear it.
  */
+import type { TestResultStatus } from './constants';
+
 export const SURFACE_KINDS = [
   /** A page the source declares a URL for. */
   'ROUTE',
@@ -239,8 +241,11 @@ export interface SurfaceMatch {
 export interface SurfaceVerification {
   /** The most recent run that executed a test matched to this item. */
   lastRunId: string | null;
-  /** The status that run reported for it. */
-  lastStatus: 'PASSED' | 'FAILED' | 'FLAKED' | 'SKIPPED' | null;
+  /**
+   * The status that run reported for it, in the vocabulary the database and the
+   * runner already use — never a parallel spelling invented here.
+   */
+  lastStatus: TestResultStatus | null;
   /**
    * True when a matched test ran and passed. The difference between this and
    * `matches.length > 0` is the difference between a coverage number and a
