@@ -34,3 +34,4 @@ export * from './jobs';
  * would choke on. The dispatcher that does have those lives in the worker.
  */
 export * from './action-events';
+export * from './dialect';
