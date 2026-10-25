@@ -15,9 +15,20 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { implementedTypes, pluginFor, runnabilityFor, runnabilityReport } from './registry.js';
+import {
+  implementedTypes,
+  pendingTypes,
+  pluginFor,
+  promotePendingPlugins,
+  reasonUnsupported,
+  runnabilityFor,
+  runnabilityReport,
+} from './registry.js';
 import type { RunnabilityProbes } from './preflight.js';
 import { TEST_TYPES } from '@qaai/shared';
+import type { RunnerPlugin } from '@qaai/shared';
+import { desktopPlugin } from './plugins/desktop.js';
+import { jobsPlugin } from './plugins/jobs.js';
 
 /** A healthy image: every tool present, every browser installed. */
 const everything: RunnabilityProbes = {
@@ -119,5 +130,96 @@ describe('the deployment-wide runnability report', () => {
     for (const type of TEST_TYPES) {
       expect(pluginFor(type), type).not.toBeNull();
     }
+  });
+});
+
+/*
+ * ── Plugins waiting on a TestType ───────────────────────────────────────────
+ *
+ * The usual gap in this registry is a type with no plugin. DESKTOP and JOBS
+ * are the mirror image — a complete plugin for a type `TEST_TYPES` does not
+ * contain yet — and the risk is the one this repo keeps producing: a module
+ * that only its own test calls, which `check:wiring` cannot see here because
+ * an unminted type is not in the list that gate iterates.
+ *
+ * So these assertions are about the SEAM: the plugins are reachable from the
+ * registry today, the gap is sayable, and the promotion is what makes the
+ * shared edit sufficient on its own.
+ */
+describe('a plugin whose TestType is not minted yet', () => {
+  it('names both pending types, so the gap is sayable rather than silent', () => {
+    // "QAAI cannot test your Electron app" and "QAAI can, but you cannot create
+    // the test yet" are different sentences with different remedies.
+    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS']);
+  });
+
+  it('keeps every pending type genuinely absent from TEST_TYPES', () => {
+    /*
+     * The guard on the guard. If a sibling change mints DESKTOP without this
+     * registry being re-read, the promotion below must have fired — so a
+     * pending type that IS in TEST_TYPES means the promotion silently failed
+     * and `pluginFor` is returning null for a type the product offers.
+     */
+    for (const type of pendingTypes()) {
+      expect((TEST_TYPES as readonly string[]).includes(type), type).toBe(false);
+      expect(pluginFor(type as never), type).toBeNull();
+    }
+  });
+
+  it('promotes a pending plugin the moment its type is minted, with no edit here', () => {
+    /*
+     * The property that makes the shared edit sufficient — and it is asserted
+     * by RUNNING the promotion, not by re-deriving its condition.
+     *
+     * An earlier version of this test rebuilt the predicate itself
+     * (`['DESKTOP'].filter((n) => minted.includes(n))`) and a mutation that
+     * disabled the real loop entirely left it green. The promotion would have
+     * been dead on the day the vocabulary landed and this suite would have said
+     * nothing. Hence `promotePendingPlugins` takes the minted list: the test
+     * hands it a widened one and watches the plugins arrive in a real table.
+     */
+    const table: Record<string, RunnerPlugin> = {};
+    const moved = promotePendingPlugins(table, [...TEST_TYPES, 'DESKTOP', 'JOBS']);
+
+    expect(moved.sort()).toEqual(['DESKTOP', 'JOBS']);
+    expect(table.DESKTOP).toBe(desktopPlugin);
+    expect(table.JOBS).toBe(jobsPlugin);
+    expect(typeof table.DESKTOP?.validate).toBe('function');
+    expect(typeof table.DESKTOP?.execute).toBe('function');
+    expect(typeof table.JOBS?.validate).toBe('function');
+    expect(typeof table.JOBS?.execute).toBe('function');
+  });
+
+  it('promotes nothing while the vocabulary does not name them', () => {
+    // The other half: promotion must not smuggle a type into the table that
+    // `TEST_TYPES` does not contain, or `implementedTypes()` would claim a
+    // type the database cannot store.
+    const table: Record<string, RunnerPlugin> = {};
+    expect(promotePendingPlugins(table, TEST_TYPES)).toEqual([]);
+    expect(Object.keys(table)).toEqual([]);
+  });
+
+  it('does not tell a reader to write a plugin that already exists', () => {
+    /*
+     * The defect this branch removes. "No runner plugin registered for
+     * DESKTOP" is FALSE — the plugin is in this build and this table imports
+     * it — and it would send the reader to write one. The remedy is minting
+     * the type, so that is what the sentence says.
+     */
+    for (const type of ['DESKTOP', 'JOBS'] as const) {
+      const reason = reasonUnsupported(type as never);
+      expect(reason, type).toMatch(/has a runner plugin in this build/);
+      expect(reason, type).toMatch(/not a member of TEST_TYPES yet/);
+      expect(reason, type).toMatch(/constants\.ts/);
+      expect(reason, type).not.toMatch(/No runner plugin registered/);
+    }
+  });
+
+  it('still says "no plugin" for a type that genuinely has none', () => {
+    // The counter-test: the pending branch must not swallow the real gap it
+    // sits next to.
+    expect(reasonUnsupported('SOMETHING_ELSE' as never)).toMatch(
+      /No runner plugin registered for SOMETHING_ELSE/,
+    );
   });
 });

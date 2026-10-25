@@ -359,7 +359,14 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
   const run = await prisma.run.findFirst({
     where: { id: runId, orgId },
     include: {
-      environment: { select: { id: true, baseUrl: true } },
+      /*
+       * `kind` is read for `SignInContext.environmentKind`, which is required
+       * with no default: `signInWithProfile` refuses MOCK_IDP on PRODUCTION —
+       * minting an assertion against a real system is forging a real identity
+       * — and a refusal that depends on a caller remembering an argument is not
+       * a refusal. Same reason explore.ts selects it.
+       */
+      environment: { select: { id: true, baseUrl: true, kind: true } },
       project: {
         select: {
           id: true,
@@ -671,7 +678,11 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           result = await signInWithProfile(
             { id: profile.id, name: profile.name, kind: profile.kind, config: profile.config },
             secrets,
-            baseUrl,
+            // `environmentKind` is required with no default, because MOCK_IDP
+            // is refused on PRODUCTION and a refusal that depends on a caller
+            // remembering an argument is not a refusal. `baseUrl` is the run's,
+            // so a `baseUrlOverride` still decides where the login happens.
+            { environmentKind: run.environment.kind, baseUrl },
           );
         } catch (err) {
           return {

@@ -341,14 +341,173 @@ export const FIXTURE_PREFIX = 'fixtures/';
  */
 export const INLINE_EDIT_PREFIX = 'inline:';
 
+/**
+ * How QAAI signs in (§2 auth profiles).
+ *
+ * ── The three that were missing, and the class of customer each one is ──────
+ *
+ * Five of these existed and `signInWithProfile` in packages/runner/src/login.ts
+ * honoured three of them, answering the other two with "needs the mail catcher
+ * / TOTP support that is not built yet". So the list was already longer than
+ * the login module, and an application whose only way in is harder than a form
+ * had ZERO enumerable authenticated surface — not a small number, zero, and
+ * reported as an application with very little behind the wall.
+ *
+ *   PASSKEY     a WebAuthn-only login. There is no password to type at all, so
+ *               no amount of FORM_LOGIN configuration reaches it.
+ *   PHONE_OTP   a code sent to a phone. Reachable only through a sink the
+ *               customer owns, which is why the config names one.
+ *   MOCK_IDP    an SSO-fronted application. Also the only kind that can choose
+ *               a ROLE — the claims it mints are what makes an admin crawl and
+ *               a member crawl two different crawls.
+ *
+ * ── Why TOTP_MFA is not renamed to TOTP ─────────────────────────────────────
+ *
+ * It is a stored Postgres enum member. Renaming it is a data migration over
+ * every profile row and a rename in every switch that reads one, bought for
+ * four characters. MAGIC_LINK is left alone for the same reason. The defect was
+ * never the spelling — it was that both kinds were storable and unperformable.
+ *
+ * ── What a new member obliges you to do ─────────────────────────────────────
+ *
+ * Adding one here breaks three lines in `auth-profiles.ts` on purpose:
+ * `AUTH_PROFILE_CONFIG_SCHEMAS` (so it cannot be stored unvalidated),
+ * `AUTH_PROFILE_CAPABILITIES` (so it cannot be attempted with no adapter) and
+ * `AUTH_PROFILE_KIND_LABELS` (so it cannot be offered unnamed). That is
+ * deliberate: eight `GateRule` kinds shipped unsaveable for two slices because
+ * a union grew and its write path did not, and `check:wiring` cannot see that
+ * class of break.
+ */
 export const AUTH_PROFILE_KINDS = [
   'FORM_LOGIN',
   'MAGIC_LINK',
   'SSO_BYPASS_TOKEN',
   'COOKIE_INJECTION',
   'TOTP_MFA',
+  'PASSKEY',
+  'PHONE_OTP',
+  'MOCK_IDP',
 ] as const;
 export type AuthProfileKind = (typeof AUTH_PROFILE_KINDS)[number];
+
+// ─── Re-enumerating, and noticing that the application changed ──────────────
+
+/**
+ * What can cause the surface to be enumerated again.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * The only crawl trigger in this product is a human clicking a button. A
+ * `Schedule` and a `Monitor` both exist and both can only run a SUITE, so the
+ * DENOMINATOR goes stale on its own: the application grows four routes, nothing
+ * re-enumerates, and the coverage percentage RISES because the numerator is
+ * unchanged and the denominator is the one we measured in March. That is the
+ * worst possible failure for a product whose entire claim is the denominator,
+ * because it fails silently and in the flattering direction.
+ *
+ *   SCHEDULE  a cron expression, on the environment's clock.
+ *   CI        a build asked, so the enumeration is of the commit under test.
+ *   DEPLOY    a webhook from whatever actually ships the application. The one
+ *             trigger that fires at the moment the surface changes.
+ *   MANUAL    a person clicked. Kept as a member rather than left implicit, so
+ *             "nothing is scheduled" and "somebody ran it by hand in March" are
+ *             different rows rather than the same absence.
+ */
+export const RE_ENUMERATION_TRIGGER_KINDS = ['SCHEDULE', 'CI', 'DEPLOY', 'MANUAL'] as const;
+export type ReEnumerationTriggerKind = (typeof RE_ENUMERATION_TRIGGER_KINDS)[number];
+
+/**
+ * How a trigger's last run went.
+ *
+ * NEVER_RUN is the default on insert and the reason this is an enum rather than
+ * a nullable timestamp. A trigger that has never fired must read as NEVER_RUN,
+ * never as "no drift" — those are opposite claims, and a dashboard that renders
+ * a null `lastRunAt` as a clean bill of health is the exact lie. SKIPPED is
+ * separate from SUCCEEDED because a run the policy or a lock declined is not a
+ * run that enumerated anything.
+ */
+export const RE_ENUMERATION_RUN_STATES = [
+  'NEVER_RUN',
+  'RUNNING',
+  'SUCCEEDED',
+  'FAILED',
+  'SKIPPED',
+] as const;
+export type ReEnumerationRunState = (typeof RE_ENUMERATION_RUN_STATES)[number];
+
+/** Whether this trigger has ever actually produced an enumeration. */
+export function triggerHasRun(state: ReEnumerationRunState): boolean {
+  return state !== 'NEVER_RUN';
+}
+
+/**
+ * Whether two crawls could be compared at all.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * `FlowMap.version` exists, the cockpit offers to show what changed, and NO
+ * DIFF CODE EXISTS anywhere in the repo. So four new routes with zero tests
+ * produce no event at all — the one number anyone acts on is not computed, and
+ * the screen that implies it was is a doc comment contradicting the code under
+ * it.
+ *
+ * ── Why "no drift" needs three different ways of being unsayable ────────────
+ *
+ *   COMPARABLE                        two accepted maps, diffed. The counts
+ *                                     mean what they say.
+ *   UNCOMPARABLE_NO_BASELINE          the first crawl of an environment. Every
+ *                                     route is "new", which is true and
+ *                                     useless, so the counts are NULL rather
+ *                                     than a number that would be reported as
+ *                                     a drift event on day one.
+ *   UNCOMPARABLE_BASELINE_NOT_ACCEPTED the previous map is a CANDIDATE or
+ *                                     REJECTED crawl. Diffing against a
+ *                                     degraded crawl invents routes that were
+ *                                     merely missed, which would page somebody
+ *                                     about an outage they already had.
+ *   NOT_COMPARED                      the comparison did not run. The state
+ *                                     that stops "no drift since the last
+ *                                     crawl" from being claimed by a code path
+ *                                     that never looked.
+ *
+ * Only the first makes the counts meaningful, which is what
+ * {@link driftCountsAreMeaningful} is for; the other three are each a reason,
+ * and a reader renders the reason instead of a zero.
+ */
+export const SURFACE_DRIFT_COMPARABILITIES = [
+  'COMPARABLE',
+  'UNCOMPARABLE_NO_BASELINE',
+  'UNCOMPARABLE_BASELINE_NOT_ACCEPTED',
+  'NOT_COMPARED',
+] as const;
+export type SurfaceDriftComparability = (typeof SURFACE_DRIFT_COMPARABILITIES)[number];
+
+/** Whether a drift record's counts are a measurement rather than an absence. */
+export function driftCountsAreMeaningful(state: SurfaceDriftComparability): boolean {
+  return state === 'COMPARABLE';
+}
+
+/**
+ * The only drift number anyone acts on, or null when it was not measured.
+ *
+ * NULL AND NOT ZERO, in every case where the diff did not run or could not.
+ * Zero is the most expensive possible wrong answer here: it is the value that
+ * means "nothing new is untested", it is what a dashboard renders as a green
+ * tick, and it is indistinguishable from "we never looked" once it has been
+ * written to a column. A null forces the caller to render the comparability
+ * reason, which is the sentence the customer needed.
+ *
+ * It also refuses a row that claims COMPARABLE and carries no count, because
+ * that row is a bug in the writer and reporting it as 0 would hide the bug
+ * behind a green tick.
+ */
+export function newSurfaceWithoutTests(record: {
+  comparability: SurfaceDriftComparability;
+  newSurfaceWithoutTests: number | null;
+}): number | null {
+  if (!driftCountsAreMeaningful(record.comparability)) return null;
+  return record.newSurfaceWithoutTests;
+}
 
 // ─── Plans & limits (§9) ─────────────────────────────────────────────────────
 

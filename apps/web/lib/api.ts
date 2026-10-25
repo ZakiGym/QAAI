@@ -1477,3 +1477,173 @@ export interface TestBehavior {
   incomplete: boolean;
   incompleteReason: string | null;
 }
+
+// ─── Authorization coverage, reachability and crawl-to-crawl drift ───────────
+
+/**
+ * These four shapes exist because four tables landed with a writer and nothing
+ * that could show them. Every one of them carries a NULL that must never be
+ * rendered as a zero, and the field names say which:
+ *
+ *   `newSurfaceWithoutTests: number | null`  null means the comparison did not
+ *                                            happen, or happened and the writer
+ *                                            left the count out. Not 0.
+ *   `hadNoExtraSurface: boolean | null`      null means the question cannot be
+ *                                            answered — a login that failed is
+ *                                            not a role with nothing behind it.
+ *   `reachability: 'NOT_PROBED'`             nobody has looked. Not "reachable".
+ *   `unavailable: {...} | null`              a kind the UI offers that the login
+ *                                            module cannot perform here.
+ */
+
+export type RouteAccessOutcome =
+  | 'ALLOWED'
+  | 'FORBIDDEN'
+  | 'REDIRECTED_TO_LOGIN'
+  | 'REDIRECTED_ELSEWHERE'
+  | 'NOT_FOUND'
+  | 'ERRORED'
+  | 'NOT_PROBED';
+
+export interface AccessCell {
+  routeTemplate: string;
+  /** A role name, or the reserved `<anonymous>` spelling for a logged-out visitor. */
+  role: string;
+  outcome: RouteAccessOutcome;
+  basis: 'OBSERVED' | 'DECLARED';
+  /** NULL for a DECLARED cell or an unprobed one. Never 0. */
+  status: number | null;
+  finalUrl: string | null;
+  probedAt: string | null;
+}
+
+export interface RoleAttempt {
+  role: string;
+  authProfileId: string | null;
+  outcome:
+    | 'NEVER_ATTEMPTED'
+    | 'LOGIN_UNAVAILABLE'
+    | 'LOGIN_FAILED'
+    | 'UNREACHABLE_BEHIND_BOT_PROTECTION'
+    | 'SKIPPED_BY_POLICY'
+    | 'CRAWLED_PARTIAL'
+    | 'CRAWLED';
+  detail: string | null;
+  remedy: string | null;
+  attemptedAt: string | null;
+  /** Both NULL unless the crawl ran. A 0 here would be a measurement nobody made. */
+  routesReached: number | null;
+  routesNewToThisRole: number | null;
+  /** The disclosure pair: a budget that bit, as a reason AND as a count. */
+  cappedBy: string | null;
+  atLeastMoreRoutes: number | null;
+  /** Whose problem this outcome is. */
+  fault: 'OURS' | 'THEIRS' | 'NOBODY';
+  /** NULL whenever "does this role have extra surface" cannot be answered. */
+  hadNoExtraSurface: boolean | null;
+}
+
+export interface EnvironmentAccessRow {
+  provider: 'NONE' | 'RECAPTCHA' | 'HCAPTCHA' | 'TURNSTILE' | 'WAF' | 'OTHER' | 'UNKNOWN';
+  bypassMode:
+    | 'NOT_CONFIGURED'
+    | 'PROVIDER_TEST_KEYS'
+    | 'SIGNED_BYPASS_HEADER'
+    | 'ALLOWLISTED_BY_CUSTOMER';
+  bypassHeaderName: string | null;
+  /** A vault entry's NAME. The API never returns the value. */
+  bypassSecretName: string | null;
+  reachability: 'REACHABLE' | 'UNREACHABLE_BEHIND_BOT_PROTECTION' | 'NOT_PROBED';
+  remedy: string | null;
+  observedSignal: string | null;
+  observedAt: string | null;
+  /** Names only, for the same reason. */
+  extraHeaderNames: string[];
+}
+
+export interface AccessReport {
+  /** NULL means NO ROW, which is NOT_PROBED — never "nothing is blocking us". */
+  access: EnvironmentAccessRow | null;
+  reachability: EnvironmentAccessRow['reachability'];
+  reachabilityWhy: string | null;
+  roles: RoleAttempt[];
+  cells: AccessCell[];
+  counts: { total: number; shown: number; measured: number; notMeasured: number };
+  cappedBy: string | null;
+  atLeastMoreCells: number | null;
+  /** Set when nothing has probed the axis at all. */
+  why: string | null;
+}
+
+export interface SurfaceDriftRecordView {
+  id: string;
+  currentFlowMapId: string;
+  baselineFlowMapId: string | null;
+  comparability:
+    | 'COMPARABLE'
+    | 'UNCOMPARABLE_NO_BASELINE'
+    | 'UNCOMPARABLE_BASELINE_NOT_ACCEPTED'
+    | 'NOT_COMPARED';
+  /** THE number anyone acts on, already read through the shared predicate. */
+  newSurfaceWithoutTests: number | null;
+  counts: {
+    routesAdded: number | null;
+    routesRemoved: number | null;
+    routesChanged: number | null;
+    controlsAdded: number | null;
+    controlsRemoved: number | null;
+  } | null;
+  why: string | null;
+  testednessUnmeasuredBecause: string | null;
+  /** A null removal count means REFUSED, not none. This is the reason. */
+  removalsRefusedBecause: string | null;
+  detail: Record<string, unknown> | null;
+  comparedAt: string | null;
+  createdAt: string;
+  trigger: { id: string; name: string; kind: string } | null;
+}
+
+export interface SurfaceDriftFeed {
+  records: SurfaceDriftRecordView[];
+  /** Set when nothing has ever been compared. NOT "no drift". */
+  why: string | null;
+  cappedBy: string | null;
+}
+
+export interface ReEnumerationTriggerView {
+  id: string;
+  name: string;
+  kind: 'SCHEDULE' | 'CI' | 'DEPLOY' | 'MANUAL';
+  enabled: boolean;
+  cron: string | null;
+  timezone: string | null;
+  webhookSecretName: string | null;
+  lastRunState: 'NEVER_RUN' | 'RUNNING' | 'SUCCEEDED' | 'FAILED';
+  lastRunAt: string | null;
+  lastFailureMessage: string | null;
+  consecutiveFailures: number;
+  createdAt: string;
+  /** From the shared `triggerHasRun`, so the banner cannot invent its own rule. */
+  hasRun: boolean;
+  staleness: string | null;
+}
+
+export interface ReEnumerationReport {
+  triggers: ReEnumerationTriggerView[];
+  /** Set when no trigger exists, i.e. nothing is watching for drift. */
+  why: string | null;
+}
+
+export interface AuthProfileKindReport {
+  capabilitiesPresent: string[];
+  kinds: Array<{
+    kind: string;
+    label: string;
+    requires: string[];
+    /** Non-null means the UI offers a kind this install cannot perform. */
+    unavailable: { kind: string; missing: string[]; remedy: string } | null;
+    refusedHere: string | null;
+    storedCount: number;
+  }>;
+  note: string;
+}

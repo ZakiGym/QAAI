@@ -101,3 +101,79 @@ export * from './api-surface.js';
 export * from './route-manifest.js';
 export * from './surface-catalog.js';
 export * from './reconcile.js';
+
+/*
+ * Crawl-to-crawl drift. The schema and the cockpit both CLAIMED versions were
+ * diffed and no diff code existed anywhere in the repo, so four new routes with
+ * zero tests produced no event at all. `flow-diff.ts` is that computation, and
+ * `apps/worker/src/processors/schedule.ts` reaches it by relative path with a
+ * comment asking for exactly this line.
+ *
+ * ── ONE NAME DOES COLLIDE, AND IT IS NOT RE-EXPORTED ───────────────────────
+ *
+ * NOT a star export, because `flow-diff.ts` exports `controlIdentity` and so
+ * does `crawl/interact.ts` above — a star here is TS2308 on this file, which is
+ * how the collision was found rather than claimed. There are in fact THREE
+ * functions of that name in the repo, all with different signatures and all
+ * correct for their own question:
+ *
+ *   packages/shared/src/locators.ts       (route, expression)  "has any test
+ *                                         asserted on this locator"
+ *   packages/agent/src/crawl/interact.ts  ({route, landmark, role, label, nth})
+ *                                         the five-part crawl identity, which
+ *                                         is what this barrel already publishes
+ *   packages/agent/src/flow-diff.ts       (route, kind, label)  keyed on the
+ *                                         accessible LABEL rather than the
+ *                                         selector, so a restyle that renumbers
+ *                                         `.nth(3)` is not an add plus a remove
+ *
+ * The diff's one stays module-private: it has callers inside flow-diff.ts and
+ * nothing outside it needs it, and publishing a fourth meaning of the name
+ * through the package's front door would be a trap for whoever imports it next.
+ * Everything else flow-diff.ts exports is listed explicitly below, so a new
+ * export there is a deliberate decision here rather than a surprise.
+ */
+export {
+  FlowDiffRefused,
+  MAX_NAMED_CHANGES,
+  baselineIsMeasurable,
+  diffFlowMaps,
+  driftWorthAnnouncing,
+} from './flow-diff.js';
+export type {
+  FlowDiff,
+  FlowDiffCounts,
+  FlowDiffDetail,
+  FlowDiffFormChange,
+  FlowDiffRouteChange,
+  FlowDiffSample,
+  FlowDiffSide,
+  FlowDiffTruncation,
+  TestedRoutes,
+} from './flow-diff.js';
+
+/*
+ * The authorization axis. `authProfile.findFirst(orderBy createdAt asc)` picked
+ * ONE identity for the whole crawl and `requiresRoles` was hardcoded `[]`, so
+ * authorization coverage had no denominator and "a member gets 403 on /admin"
+ * could not be said. `access-matrix.ts` is the route x role matrix behind that
+ * sentence, including the NOT_PROBED cells that keep it honest.
+ *
+ * It is already reached by a real call path — the explore processor imports it —
+ * so this line is what makes the SHAPES public for the API's read path.
+ */
+export * from './access-matrix.js';
+
+/*
+ * Mobile screen enumeration. A MOBILE plugin already EXECUTES mobile tests and
+ * nothing counted mobile screens, so mobile coverage had no denominator at all:
+ * QAAI could run a test on a surface it could not count. `apps/worker` needs
+ * `enumerateMobileScreens`, `appiumMobileDevice`, `mobileScreenSurfaceItems`
+ * and `mobileReconcileSource` to persist the graph and feed the reconciled
+ * surface, and until this line existed the module was tested, unreachable code
+ * by this codebase's own definition.
+ *
+ * It imports `./crawl/interact.js` for values and `./reconcile.js` for types
+ * only, both already in this barrel's graph, so it adds no cycle.
+ */
+export * from './mobile-crawler.js';

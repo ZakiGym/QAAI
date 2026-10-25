@@ -68,3 +68,19 @@ export * from './test-values';
  */
 export * from './requirements';
 export * from './api-surface';
+/*
+ * The auth-profile vocabulary: the three new profile kinds and their config
+ * shapes, the capability gaps that make a kind UNAVAILABLE rather than failed,
+ * the route x role access outcomes, and the bot-protection reachability states.
+ *
+ * Public API for the same reason as the two above, and more sharply: the write
+ * path lives in apps/api, the adapters in packages/runner, the matrix builder
+ * in packages/agent, and the profile editor in apps/web. Until this line
+ * existed, login.ts and playwright-harness.ts reached the module by relative
+ * path across the package boundary — which compiles, and quietly means the
+ * parity guard's compiler half is enforced on a file nobody imports as a
+ * package.
+ *
+ * Passes this barrel's standing test: zod, local modules, no `node:` builtin.
+ */
+export * from './auth-profiles';

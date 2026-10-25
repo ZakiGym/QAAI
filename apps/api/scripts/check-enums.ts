@@ -60,6 +60,20 @@ const REQUIREMENTS = fileURLToPath(
 const API_SURFACE = fileURLToPath(
   new URL('../../../packages/shared/src/api-surface.ts', import.meta.url),
 );
+/*
+ * The auth-gated enumeration vocabulary: who QAAI can be, whether it can reach
+ * the door, and what each identity was allowed to see. In @qaai/shared and NOT
+ * in constants.ts for the same reason as the four above — `auth-profiles.ts`
+ * holds the write-path schemas for its own kinds beside the vocabulary, which
+ * is the arrangement that stops a member existing with no way to save it, and
+ * it is also the only one of these files that may import `flow-map.ts` (the
+ * route-access basis is pinned to the in-memory union by a presence record
+ * there; constants.ts cannot import it, because flow-map.ts imports
+ * constants.ts).
+ */
+const AUTH_PROFILES = fileURLToPath(
+  new URL('../../../packages/shared/src/auth-profiles.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -82,7 +96,8 @@ const PAIRS: Array<{
     | 'surface'
     | 'flowMap'
     | 'requirements'
-    | 'apiSurface';
+    | 'apiSurface'
+    | 'authProfiles';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -260,6 +275,95 @@ const PAIRS: Array<{
   // so a state in the database that TypeScript cannot name is a state excluded
   // from the one count that makes "not just the happy path" checkable.
   { prismaEnum: 'ComponentStateKind', tsConst: 'COMPONENT_STATE_KINDS', source: 'apiSurface' },
+  /*
+   * ── The wall at the edge of the map (§ coverage) ──────────────────────────
+   *
+   * Nine. `AuthProfileKind` belongs here too and is held back for one specific
+   * reason — see the deliberate-omission note below the list, which names it.
+   */
+  // What one role got when it asked for one route. THE security half of
+  // enumeration. `MEASURED_ROUTE_ACCESS_OUTCOMES` is derived by EXCLUDING
+  // NOT_PROBED and ERRORED from this list, so an eighth outcome the database
+  // accepts and TypeScript cannot name would be an outcome that silently
+  // enters the authorization denominator as a measurement — and NOT_PROBED
+  // reading as anything other than "nobody asked" is the single rendering
+  // mistake this enum exists to prevent.
+  { prismaEnum: 'RouteAccessOutcome', tsConst: 'ROUTE_ACCESS_OUTCOMES', source: 'authProfiles' },
+  // Whether we asked or a source told us. Doubly pinned: this entry guards the
+  // Prisma enum against the shared list, and a `Record<RouteAccess['basis'],
+  // true>` in auth-profiles.ts guards the shared list against flow-map.ts's
+  // in-memory union. A declaration counted as a measurement is how "we
+  // checked" gets said about a check nobody ran.
+  { prismaEnum: 'RouteAccessBasis', tsConst: 'ROUTE_ACCESS_BASES', source: 'authProfiles' },
+  // What became of the attempt to enumerate as one role. `CRAWLED_ROLE_OUTCOMES`
+  // is what `roleHadNoExtraSurface` tests membership of before it will answer
+  // at all, so an outcome TypeScript cannot name falls into the "did not
+  // succeed" arm — safe — while an outcome MISSING from the Prisma enum is an
+  // attempt that cannot be recorded, and an unrecorded attempt is
+  // indistinguishable from a role with no extra surface. That is the lie the
+  // whole table exists to prevent.
+  { prismaEnum: 'RoleCrawlOutcome', tsConst: 'ROLE_CRAWL_OUTCOMES', source: 'authProfiles' },
+  // What is standing in front of the login form. `botProtectionRemedy`
+  // switches exhaustively on it to produce the sentence a customer acts on, so
+  // a provider in the database that TypeScript cannot name is an environment
+  // reported as unreachable with no remedy beside it — which is the half of
+  // this feature that makes it worth having.
+  {
+    prismaEnum: 'BotProtectionProvider',
+    tsConst: 'BOT_PROTECTION_PROVIDERS',
+    source: 'authProfiles',
+  },
+  // The three legitimate ways past a challenge. `reachabilityFromPolicy` reads
+  // NOT_CONFIGURED as "unreachable" and every other member as "configured", so
+  // a fifth mode the database accepts and TypeScript cannot name would be read
+  // as a working bypass — an environment reported as reachable that is not.
+  { prismaEnum: 'BotBypassMode', tsConst: 'BOT_BYPASS_MODES', source: 'authProfiles' },
+  // Whether an environment can be reached at all. Three members and the third
+  // is the point: NOT_PROBED rendering as REACHABLE makes zero coverage look
+  // like a testing failure instead of an access problem.
+  {
+    prismaEnum: 'EnvironmentReachability',
+    tsConst: 'ENVIRONMENT_REACHABILITIES',
+    source: 'authProfiles',
+  },
+  /*
+   * The re-enumeration lifecycle, in constants.ts rather than auth-profiles.ts:
+   * neither vocabulary has anything to do with identity, and both are read by
+   * the scheduler and the drift feed. constants.ts is this script's default
+   * home for exactly that kind of cross-cutting enum — NotRunKind lives there
+   * on the same argument.
+   */
+  // What can cause the surface to be enumerated again. A kind the scheduler
+  // cannot name is a trigger row that will never fire, which presents as a
+  // denominator that silently stops being refreshed — the failure that makes
+  // the coverage percentage rise when the application grows.
+  {
+    prismaEnum: 'ReEnumerationTriggerKind',
+    tsConst: 'RE_ENUMERATION_TRIGGER_KINDS',
+    source: 'constants',
+  },
+  // How a trigger's last run went. `triggerHasRun` is the only predicate that
+  // separates NEVER_RUN from "ran and found no drift", and those are opposite
+  // claims; a state TypeScript cannot name falls into the `!== 'NEVER_RUN'`
+  // arm and would be reported as a trigger that has run.
+  {
+    prismaEnum: 'ReEnumerationRunState',
+    tsConst: 'RE_ENUMERATION_RUN_STATES',
+    source: 'constants',
+  },
+  // Whether two crawls could be compared at all. THE highest-stakes member of
+  // the ten: `driftCountsAreMeaningful` returns true for COMPARABLE and
+  // nothing else, and `newSurfaceWithoutTests` returns null on the strength of
+  // it. A comparability the database accepts and TypeScript cannot name would
+  // fall through to the null arm — honest — but one MISSING from the Prisma
+  // enum is a diff that cannot record why it was not a diff, and the only
+  // remaining way to render it is a zero. Zero here means "nothing new is
+  // untested" and is a green tick over a comparison that never ran.
+  {
+    prismaEnum: 'SurfaceDriftComparability',
+    tsConst: 'SURFACE_DRIFT_COMPARABILITIES',
+    source: 'constants',
+  },
 ];
 
 /*
@@ -282,6 +386,51 @@ const PAIRS: Array<{
  * reason no code change can fix, and a red check with no available remedy is a
  * check people start skipping. Run `prisma migrate deploy`, then add the line
  * above; it should pass immediately.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * SECOND ENTRY, same shape, and the first half of it is a finding:
+ *
+ *   { prismaEnum: 'AuthProfileKind', tsConst: 'AUTH_PROFILE_KINDS' }
+ *
+ * `AuthProfileKind` has existed since the beginning, has always been mirrored
+ * by `AUTH_PROFILE_KINDS`, and HAS NEVER BEEN IN THE LIST ABOVE. So the one
+ * enum that decides whether a customer's application can be logged into at all
+ * has had no drift guard for the whole life of the repo — exactly the hole this
+ * script was written to close, sitting in the script itself.
+ *
+ * Its two STATIC halves agree today: migration
+ * 20261024100000_auth_kinds_role_access_and_reenumeration adds PASSKEY,
+ * PHONE_OTP and MOCK_IDP to schema.prisma and constants.ts names the same
+ * eight, in the same order, and `check-enums.auth-and-access.test.ts` asserts
+ * that directly rather than through this list. What fails is the third source,
+ * the live one, for the same reason as `HealState`: the migration is written
+ * and NOT DEPLOYED, so the database still has five labels and this entry would
+ * report three missing — truthfully, and with no code change able to fix it.
+ *
+ * The nine NEW types in the list above do not have that problem: their
+ * `CREATE TYPE` has not run either, so `checkLiveDatabase` finds no such type
+ * and skips them. Only an enum that already EXISTS in the database can be
+ * behind.
+ *
+ * ── HOW FAR BEHIND THE DATABASE ACTUALLY IS, MEASURED ──────────────────────
+ *
+ * An earlier draft of this note said "the nine new types" as though nine were
+ * all that went unchecked. RUN THE SCRIPT: it reports 8 of 32 pairs compared
+ * against the live database and TWENTY-FOUR types absent from it. The other
+ * fifteen belong to the two migrations that landed before this one and have not
+ * been deployed either, so the live half of this check has been covering a
+ * quarter of the list while its success line claimed all three sources agreed.
+ * That overclaim is fixed at the bottom of this file; the number is left here
+ * because "nine" would send the next reader looking for a discrepancy of nine.
+ *
+ * None of this is drift and none of it is red: an undeployed migration is a
+ * deploy step. What it was, until the success line was corrected, is a tick
+ * standing in for a comparison nobody ran.
+ *
+ * Run `prisma migrate deploy`, then add the line above. Both entries clear
+ * together, and the test file named earlier fails the moment this note stops
+ * being true.
  */
 
 function prismaEnumMembers(source: string, name: string): string[] | null {
@@ -317,6 +466,7 @@ const surface = readFileSync(SURFACE, 'utf8');
 const flowMap = readFileSync(FLOW_MAP, 'utf8');
 const requirements = readFileSync(REQUIREMENTS, 'utf8');
 const apiSurface = readFileSync(API_SURFACE, 'utf8');
+const authProfiles = readFileSync(AUTH_PROFILES, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -325,7 +475,8 @@ const SOURCES: Record<
   | 'surface'
   | 'flowMap'
   | 'requirements'
-  | 'apiSurface',
+  | 'apiSurface'
+  | 'authProfiles',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -336,6 +487,7 @@ const SOURCES: Record<
   flowMap: { text: flowMap, label: 'shared/flow-map.ts' },
   requirements: { text: requirements, label: 'shared/requirements.ts' },
   apiSurface: { text: apiSurface, label: 'shared/api-surface.ts' },
+  authProfiles: { text: authProfiles, label: 'shared/auth-profiles.ts' },
 };
 const problems: string[] = [];
 
@@ -373,28 +525,62 @@ for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIR
  * and the only symptom is an insert failing at run time. Checked only when a
  * database is reachable, so this stays useful on a machine with no Postgres.
  */
-async function checkLiveDatabase(): Promise<void> {
+/**
+ * What the live half actually managed to compare.
+ *
+ * ── WHY THIS IS A RETURN VALUE AND NOT A `void` ────────────────────────────
+ *
+ * Because the success line at the bottom of this file used to read
+ * "✓ N enum(s) match across schema.prisma, constants.ts and the database" for
+ * every N, including the Ns this function never looked at. A type that does not
+ * exist in the database is SKIPPED by the loop below — correctly, there is
+ * nothing to compare — and the skip was silent, so the script reported a
+ * three-source agreement it had measured on two sources.
+ *
+ * That is the product's own cardinal rule applied to the product's own tooling:
+ * a thing reported as measured that was not measured. Concretely, running this
+ * today prints a tick while NINE of the types in `PAIRS` are absent from the
+ * deployed database and `AuthProfileKind` is three labels behind it — which is
+ * exactly the drift this script exists to catch, in the window where catching
+ * it matters most. So the count that was compared is now carried out and
+ * printed beside the count that was declared, with the names and the remedy.
+ */
+interface LiveEnumCheck {
+  state: 'CHECKED' | 'SKIPPED';
+  /** Why nothing was compared. Non-null exactly when `state` is SKIPPED. */
+  why: string | null;
+  /** Pairs actually compared against pg_enum. */
+  compared: number;
+  /** Declared types that do not exist in the database yet, by name. */
+  absent: string[];
+}
+
+async function checkLiveDatabase(): Promise<LiveEnumCheck> {
+  const skipped = (why: string): LiveEnumCheck => ({
+    state: 'SKIPPED',
+    why,
+    compared: 0,
+    absent: [],
+  });
+
   const url = process.env.DATABASE_URL;
-  if (!url) {
-    console.log('· DATABASE_URL not set — skipped the live enum check.');
-    return;
-  }
+  if (!url) return skipped('DATABASE_URL is not set');
   let Client: typeof import('pg').Client;
   try {
     ({ Client } = await import('pg'));
   } catch {
-    console.log('· pg not installed — skipped the live enum check.');
-    return;
+    return skipped('pg is not installed');
   }
 
   const client = new Client({ connectionString: url, connectionTimeoutMillis: 3000 });
   try {
     await client.connect();
   } catch {
-    console.log('· database unreachable — skipped the live enum check.');
-    return;
+    return skipped('the database was unreachable');
   }
 
+  let compared = 0;
+  const absent: string[] = [];
   try {
     for (const { prismaEnum } of PAIRS) {
       const declared = prismaEnumMembers(schema, prismaEnum) ?? [];
@@ -404,7 +590,17 @@ async function checkLiveDatabase(): Promise<void> {
           where t.typname = $1`,
         [prismaEnum],
       );
-      if (rows.length === 0) continue; // the type does not exist here yet
+      if (rows.length === 0) {
+        /*
+         * The type does not exist here yet, so there is nothing to compare and
+         * this is NOT a failure — a migration that has not been deployed is a
+         * deploy step, not drift. It is counted and named instead, because the
+         * alternative is the tick above claiming it was checked.
+         */
+        absent.push(prismaEnum);
+        continue;
+      }
+      compared += 1;
       const live = rows.map((r) => r.enumlabel);
       const missing = declared.filter((v) => !live.includes(v));
       if (missing.length > 0) {
@@ -418,13 +614,40 @@ async function checkLiveDatabase(): Promise<void> {
   } finally {
     await client.end().catch(() => {});
   }
+  return { state: 'CHECKED', why: null, compared, absent };
 }
 
-await checkLiveDatabase();
+const live = await checkLiveDatabase();
 
 if (problems.length > 0) {
   console.error('Enum drift:\n' + problems.map((p) => `  ✗ ${p}`).join('\n'));
   process.exit(1);
 }
 
-console.log(`✓ ${PAIRS.length} enum(s) match across schema.prisma, constants.ts and the database.`);
+/*
+ * THE SUCCESS LINE, AND WHY IT IS THREE SENTENCES INSTEAD OF ONE.
+ *
+ * It used to name all three sources unconditionally. The two STATIC sources are
+ * always compared for every pair, so that half can be stated flatly. The LIVE
+ * source cannot: it is skipped wholesale on a machine with no Postgres, and
+ * skipped per-type for any type whose `CREATE TYPE` has not been deployed. The
+ * number of pairs actually compared against it is therefore the only honest
+ * thing to print, and the gap between that and `PAIRS.length` is a count with a
+ * remedy attached rather than an absence a reader fills in with a tick.
+ */
+console.log(`✓ ${PAIRS.length} enum(s) match across schema.prisma and constants.ts.`);
+if (live.state === 'SKIPPED') {
+  console.log(
+    `· the live database was NOT checked (${live.why}), so 0 of ${PAIRS.length} pair(s) were ` +
+      `compared against a deployed enum. This is not a report that the database agrees.`,
+  );
+} else {
+  console.log(`✓ ${live.compared} of ${PAIRS.length} also match the live database.`);
+  if (live.absent.length > 0) {
+    console.log(
+      `· ${live.absent.length} declared type(s) DO NOT EXIST in the database yet and were not ` +
+        `compared: ${live.absent.join(', ')}. Run \`prisma migrate deploy\`. Until then nothing ` +
+        `here has checked them, and inserting one of their values fails at run time.`,
+    );
+  }
+}

@@ -22,8 +22,24 @@
  */
 
 import { CronExpressionParser } from 'cron-parser';
-import { PLAN_LIMITS } from '@qaai/shared';
-import type { ScheduleTickJob, ShardAssignment } from '@qaai/shared';
+import { PLAN_LIMITS, parseSurfaceKey } from '@qaai/shared';
+import type {
+  CrawlAcceptanceState,
+  ExploreJob,
+  FlowMap,
+  ReEnumerationRunState,
+  ReEnumerationTriggerKind,
+  ScheduleTickJob,
+  ShardAssignment,
+} from '@qaai/shared';
+import {
+  FlowDiffRefused,
+  diffFlowMaps,
+  driftWorthAnnouncing,
+  type FlowDiff,
+  type FlowDiffSide,
+  type TestedRoutes,
+} from '@qaai/agent';
 /*
  * The ONE definition of "is this test's quarantine in force right now"
  * (packages/runner/src/gates.ts). Imported rather than restated because the
@@ -38,15 +54,13 @@ import { quarantineSuppresses } from '@qaai/runner';
 // can call it; nothing in it touches the API's env or its tenancy layer.
 import { effectivePlan, startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
-import { enqueueRun, enqueueNotify } from '../queues.js';
+import { enqueueRun, enqueueNotify, enqueueExplore } from '../queues.js';
 import { advanceClosureCampaigns } from './close-loop.js';
 
 /** Next fire time for a cron expression, or null when it is unparseable. */
 function nextFireTime(cron: string, timezone: string, after: Date): Date | null {
   try {
-    return CronExpressionParser.parse(cron, { currentDate: after, tz: timezone })
-      .next()
-      .toDate();
+    return CronExpressionParser.parse(cron, { currentDate: after, tz: timezone }).next().toDate();
   } catch {
     return null;
   }
@@ -224,7 +238,10 @@ async function planScheduledShards(
   // made better by four browsers — and why nightlies almost always will.
   if (desired < 2) return null;
 
-  const granted = Math.max(1, Math.min(desired, await maxParallelWorkersFor(orgId), testIds.length));
+  const granted = Math.max(
+    1,
+    Math.min(desired, await maxParallelWorkersFor(orgId), testIds.length),
+  );
   if (granted < 2) return null;
 
   return packShards(testIds, costs, granted, fallback);
@@ -408,7 +425,6 @@ async function queueRun(args: {
 
   return { id: run.id, shards: shardCount };
 }
-
 
 // ─── Fail-fast and the stop request (§5) ─────────────────────────────────────
 //
@@ -666,6 +682,901 @@ async function sweepFailFastStops(now: Date): Promise<FailFastSweep> {
   return sweep;
 }
 
+// ─── Re-enumeration: keeping the denominator fresh (§3.1) ────────────────────
+//
+// THE DEFECT: THE ONLY CRAWL TRIGGER IN THIS PRODUCT IS A HUMAN CLICKING A
+// BUTTON.
+//
+// Everything above this line can only run a SUITE. `Schedule` runs one on a
+// cron, `Monitor` runs one on an interval, and neither has ever been able to
+// ask for an enumeration. So the surface we measure against is whatever the
+// last person to press Explore happened to reach: the application grows four
+// routes, the denominator does not move, the numerator does not move, and
+// THE COVERAGE PERCENTAGE RISES. It fails silently and in the flattering
+// direction, which for a product whose entire claim is the denominator is the
+// worst available failure — and the staleness itself is invisible, because a
+// trigger that has never fired and a trigger that found nothing look identical
+// from the outside unless somebody stores the difference. `ReEnumerationTrigger
+// .lastRunState` defaults to NEVER_RUN for exactly that reason, and nothing in
+// this section ever infers "no drift" from a null timestamp.
+//
+// ── WHAT THIS FILE DOES AND WHAT IT DOES NOT ────────────────────────────────
+//
+// It is TWO HALVES, a tick apart, because a crawl is not synchronous: it holds
+// a browser for minutes and lands on another queue.
+//
+//   FIRE    `fireReEnumeration` claims the trigger (RUNNING, before enqueuing,
+//           the same claim-first order the cron schedules above use) and asks
+//           for a crawl.
+//   SETTLE  `settleReEnumerations` finds the map that landed, diffs it against
+//           the previous one, writes the `SurfaceDriftRecord`, and raises the
+//           new-surface event.
+//
+// THE FOUR TRIGGER KINDS ARE NOT ALL REACHABLE FROM HERE, and this is stated
+// rather than discovered. SCHEDULE is driven by this tick, from its own cron.
+// CI, DEPLOY and MANUAL are PUSHED — somebody else's build, webhook or click
+// has to call in — so `fireReEnumeration` is exported and takes its producer as
+// an argument, and the three inbound HTTP doors are named in this change's
+// handover. Until they land, a CI or DEPLOY trigger sits at NEVER_RUN, which is
+// the honest reading of a door that has not been built: it is NOT "no drift".
+//
+// ── WHY IT RIDES THIS TICK ──────────────────────────────────────────────────
+//
+// Same reason the two sweeps below do, and the same 60-second ceiling: a job
+// whose own result decides whether it re-queues is the shape of a worker that
+// never idles. Both halves are bounded, both disclose their bounds, and both
+// are written so they cannot throw — a drift diff that blew up must not take a
+// customer's uptime monitor down with it.
+
+/**
+ * How many SCHEDULE triggers one tick may consider.
+ *
+ * Bounded for the reason FAIL_FAST_SWEEP_LIMIT gives, and disclosed the way it
+ * is: one row past the limit is fetched, so `ReEnumerationSweep.deferredByCap`
+ * can say "at least one more was due and was not looked at" instead of
+ * returning a silence that reads like "nothing was due".
+ */
+export const RE_ENUMERATION_SWEEP_LIMIT = 100;
+
+/**
+ * How many RUNNING triggers one tick may settle.
+ *
+ * Much smaller than the sweep limit, and the asymmetry is the cost: settling
+ * reads TWO WHOLE `FlowMap.graph` blobs — a 400-route crawl with its forms and
+ * affordances — and diffs them in process. Twenty is a few megabytes and a few
+ * hundred milliseconds inside a tick that also owes a customer's nightly suite
+ * its 3am slot. A trigger not settled this tick is settled next tick; it stays
+ * RUNNING, which is true, and the deferral is counted.
+ */
+export const RE_ENUMERATION_SETTLE_LIMIT = 20;
+
+/**
+ * How long a trigger may sit RUNNING before its run is recorded as FAILED.
+ *
+ * There has to be a bound, because `enqueueExplore` pins ONE crawl per project
+ * by job id: a trigger that fires while another crawl of the same project is in
+ * flight has its job silently deduplicated by BullMQ, and without a timeout it
+ * would sit RUNNING for ever — which reads on screen as "re-enumerating" and is
+ * the staleness lie wearing a progress spinner.
+ *
+ * An hour, against a default crawl wall clock of fifteen minutes plus queue
+ * wait. Generous on purpose: a FAILED run is a notice to a human, and crying
+ * wolf at twenty minutes on a large application would train people to ignore it.
+ */
+export const RE_ENUMERATION_RUN_TIMEOUT_MS = 60 * 60_000;
+
+/**
+ * How many `CoverageItem` ROUTE rows are read to establish which routes have a
+ * test.
+ *
+ * AND WHAT HAPPENS WHEN IT BITES, which is the only interesting part. A
+ * TRUNCATED tested-route set under-states testedness, which OVER-states
+ * `newSurfaceWithoutTests` — it would invent untested new surface out of routes
+ * that are tested by a spec sitting at row 5,001. So hitting this limit does
+ * not produce a partial answer: testedness comes back NULL, the count comes back
+ * NULL, and the reason is on the row. A floor in the alarming direction is the
+ * same sin as one in the flattering direction.
+ */
+export const RE_ENUMERATION_TESTED_ROUTE_LIMIT = 5_000;
+
+/**
+ * The audit actions this sweep writes, which is how the event reaches a human
+ * today.
+ *
+ * DECLARED HERE AND NOT IN @qaai/shared, which is where `FLAKE_AUDIT_ACTIONS`
+ * and `HEAL_AUDIT_ACTIONS` live and where these belong — that file is owned by
+ * another change this round. Same shape of borrowing as `ANALYZE_SOURCE_QUEUE`
+ * in queues.ts, and the same handover: move these two strings into
+ * packages/shared/src/constants.ts beside the other audit-action maps, so the
+ * API's audit-log reader can name what it renders without importing a worker
+ * processor.
+ */
+export const RE_ENUMERATION_AUDIT_ACTIONS = {
+  /** New surface with no test against it. THE event — see `driftWorthAnnouncing`. */
+  newSurface: 'surface.drift.new_surface_untested',
+  /**
+   * A comparison that RAN and found no new untested surface.
+   *
+   * Its own action, and not a silence. "No drift" is only worth reading when
+   * somebody can see that the comparison happened, and this is the row that
+   * makes a quiet drift feed mean something other than "nobody looked".
+   */
+  compared: 'surface.drift.compared',
+  /** A comparison that could not be made. Recorded so "no drift" is never inferred. */
+  uncomparable: 'surface.drift.uncomparable',
+} as const;
+
+/** What one tick's re-enumeration work did, including the parts it could not do. */
+export interface ReEnumerationSweep {
+  /** Crawls asked for. */
+  fired: number;
+  /** Diffs written, comparable or not. */
+  diffed: number;
+  /**
+   * Diffs whose counts are NULL because the comparison could not be made.
+   * Counted SEPARATELY from `diffed` so a tick cannot report twelve diffs and
+   * have eleven of them be "we could not tell" — which is the reading a single
+   * number would give.
+   */
+  uncomparable: number;
+  /** Diffs that found new surface with no tests, and raised the event. */
+  announced: number;
+  /** Runs recorded FAILED: the crawl never landed, or the diff could not run. */
+  failed: number;
+  /**
+   * Runs whose crawl is still going. Left RUNNING, which is the true state.
+   *
+   * NOT folded into `deferredByCap`: a crawl in progress is work happening, and
+   * a cap that bit is work refused. Reporting them as one number would make a
+   * healthy install look capped and a capped one look busy.
+   */
+  inFlight: number;
+  /**
+   * Triggers a cap or a lock kept this tick from firing or settling.
+   *
+   * The disclosure half of every bound in this section. A trigger deferred is a
+   * trigger whose denominator is still stale, so "0 fired" and "0 fired, 14
+   * deferred" are completely different facts about an install.
+   */
+  deferredByCap: number;
+  /** Why, named, so the number above is a measurement and not an adjective. */
+  capsThatBit: string[];
+}
+
+const EMPTY_SWEEP: ReEnumerationSweep = {
+  fired: 0,
+  diffed: 0,
+  uncomparable: 0,
+  announced: 0,
+  failed: 0,
+  inFlight: 0,
+  deferredByCap: 0,
+  capsThatBit: [],
+};
+
+/** A trigger row, in the exact shape the rules below are entitled to read. */
+export interface TriggerRow {
+  id: string;
+  orgId: string;
+  projectId: string;
+  environmentId: string;
+  name: string;
+  kind: ReEnumerationTriggerKind;
+  enabled: boolean;
+  cron: string | null;
+  timezone: string | null;
+  lastRunState: ReEnumerationRunState;
+  lastRunAt: Date | null;
+  createdAt: Date;
+}
+
+/**
+ * Is this SCHEDULE trigger due?
+ *
+ * ── THE ANCHOR, WHICH IS THE WHOLE RULE ─────────────────────────────────────
+ *
+ * `Schedule` above carries a `nextRunAt` column and a two-step arming dance:
+ * first sight writes `nextRunAt` and fires nothing, so creating a nightly at 2pm
+ * does not run it at 2pm. `ReEnumerationTrigger` HAS NO SUCH COLUMN, so dueness
+ * is computed from the cron and an anchor, and the choice of anchor IS the
+ * arming rule:
+ *
+ *   lastRunAt   once it has run. The next fire after the last one.
+ *   createdAt   before it ever has. A trigger created at 2pm with an `0 3 * * *`
+ *               cron is next due at 3am — which is the arming behaviour, for
+ *               free and without a column.
+ *
+ * `new Date(0)` was the obvious alternative and is wrong: every cron's next
+ * fire after 1970 is in the deep past, so every trigger would be due the
+ * instant it was created and a crawl would start while somebody was still
+ * typing the form.
+ *
+ * RUNNING is NOT due. One crawl per trigger at a time; the settle half owns a
+ * RUNNING trigger until it resolves or times out. Without this a trigger with a
+ * minutely cron would fire sixty crawls an hour at an application that is
+ * answering one.
+ */
+export function reEnumerationIsDue(
+  trigger: Pick<
+    TriggerRow,
+    'kind' | 'enabled' | 'cron' | 'timezone' | 'lastRunState' | 'lastRunAt' | 'createdAt'
+  >,
+  now: Date,
+): { due: boolean; why: string } {
+  if (!trigger.enabled) return { due: false, why: 'the trigger is disabled' };
+  if (trigger.kind !== 'SCHEDULE') {
+    // CI, DEPLOY and MANUAL are pushed, not polled. Returning false here is not
+    // "nothing to do" — it is "this tick is not the thing that fires it".
+    return { due: false, why: `a ${trigger.kind} trigger is fired by its caller, not by the tick` };
+  }
+  if (trigger.lastRunState === 'RUNNING') {
+    return { due: false, why: 'a crawl for this trigger is already in flight' };
+  }
+  if (!trigger.cron) {
+    return { due: false, why: 'a SCHEDULE trigger with no cron expression cannot be due' };
+  }
+
+  const next = nextFireTime(
+    trigger.cron,
+    trigger.timezone ?? 'UTC',
+    trigger.lastRunAt ?? trigger.createdAt,
+  );
+  if (!next) return { due: false, why: `the cron expression "${trigger.cron}" is unparseable` };
+  return next <= now
+    ? { due: true, why: `due since ${next.toISOString()}` }
+    : { due: false, why: `next due ${next.toISOString()}` };
+}
+
+/**
+ * Claim a trigger and ask for a crawl.
+ *
+ * EXPORTED AND TAKING ITS PRODUCER AS AN ARGUMENT, because the three pushed
+ * kinds come in somewhere this file cannot see: a CI step, a deploy webhook, a
+ * person pressing a button. All four kinds must claim the trigger the same way
+ * or two of them will race and the row will tell two stories.
+ *
+ * ── THERE ARE TWO IMPLEMENTATIONS OF THAT CLAIM, NOT ONE ────────────────────
+ *
+ * This comment used to say there was one, and that was wrong about its own
+ * repository. `apps/api/src/routes/agent.ts` has its own copy — same `where`,
+ * same `data`, same release-on-enqueue-failure — because apps/api does not
+ * depend on apps/worker and cannot import a worker processor. So the reason
+ * given above for exporting this function with an injectable producer describes
+ * a caller that STRUCTURALLY CANNOT EXIST, and the `enqueue` parameter has no
+ * caller outside this file's tests.
+ *
+ * The two copies agree today. They are free to stop agreeing, and the failure
+ * is the one the comment was worried about: a deploy webhook and this tick
+ * claiming the same row by two slightly different conditions, two crawls fired,
+ * two drift records written for one change. Nothing in the build would catch
+ * it, because neither copy can see the other.
+ *
+ * The honest home for the claim is `@qaai/shared`, which both apps already
+ * depend on, taking a Prisma delegate and a producer. That edit spans two files
+ * this change does not own and is in the handover; until it lands, a change to
+ * the claim here is only half a change.
+ *
+ * ── THE CLAIM ───────────────────────────────────────────────────────────────
+ *
+ * CONDITIONAL AND BEFORE THE ENQUEUE, which is the same order and the same
+ * first-writer-wins `updateMany` the cron schedules above use and the fail-fast
+ * sweep uses. The condition is the `lastRunAt` that was read, so two ticks — or
+ * a tick and a deploy webhook — that see the same row produce ONE crawl. Losing
+ * one cycle to a lost race is far better than firing two browsers at the
+ * customer's application and writing two drift records for one change.
+ *
+ * ── maxPages: 0, maxDepth: 0, AND THEY ARE NOT PLACEHOLDERS ─────────────────
+ *
+ * The explore processor treats a non-positive `maxPages`/`maxDepth` as NO
+ * CALLER OVERRIDE and lets `Environment.crawlPolicy` decide, clamped by the
+ * plan. That is exactly what a re-enumeration wants: its whole job is to
+ * refresh the denominator at the width the customer configured, and a
+ * hard-coded 60 here would re-enumerate a 412-route application as 60 routes
+ * every night and call the result drift.
+ *
+ * `autoApprove: false`, always. An unattended crawl that also generated and
+ * approved tests is an autopilot nobody asked for.
+ */
+export async function fireReEnumeration(args: {
+  trigger: TriggerRow;
+  now: Date;
+  /** Injected so the API's producer can drive the same claim. */
+  enqueue?: (job: ExploreJob) => Promise<void>;
+}): Promise<{ fired: true } | { fired: false; why: string }> {
+  const { trigger, now } = args;
+  const enqueue = args.enqueue ?? enqueueExplore;
+
+  const claimed = await prisma.reEnumerationTrigger.updateMany({
+    where: { id: trigger.id, lastRunAt: trigger.lastRunAt, lastRunState: { not: 'RUNNING' } },
+    data: { lastRunState: 'RUNNING', lastRunAt: now },
+  });
+  if (claimed.count === 0) {
+    return { fired: false, why: 'another caller claimed this trigger first' };
+  }
+
+  try {
+    await enqueue({
+      orgId: trigger.orgId,
+      projectId: trigger.projectId,
+      environmentId: trigger.environmentId,
+      requestedBy: `re-enumeration:${trigger.id}`,
+      maxPages: 0,
+      maxDepth: 0,
+      autoApprove: false,
+    });
+    return { fired: true };
+  } catch (err) {
+    /*
+     * The claim is RELEASED, and this is the one place in this section where a
+     * failure rolls back rather than being recorded. A trigger left RUNNING on
+     * a crawl that was never queued would wait out
+     * RE_ENUMERATION_RUN_TIMEOUT_MS and then be reported as a crawl that failed
+     * — which is a fact about the customer's application. A queue that would
+     * not take the job is a fact about US, so the row goes back to where it
+     * was and the next tick tries again.
+     */
+    await prisma.reEnumerationTrigger
+      .updateMany({
+        where: { id: trigger.id, lastRunState: 'RUNNING' },
+        data: { lastRunState: trigger.lastRunState, lastRunAt: trigger.lastRunAt },
+      })
+      .catch(() => {});
+    logger.error(
+      { err, triggerId: trigger.id, projectId: trigger.projectId },
+      'could not queue a re-enumeration crawl; the trigger stays due',
+    );
+    return { fired: false, why: 'the crawl could not be queued' };
+  }
+}
+
+/**
+ * Which routes in this project have a test written against them, or NULL.
+ *
+ * Read off `CoverageItem`, which is the registry the rest of the product
+ * already measures with, rather than re-extracting routes out of spec files:
+ * a second answer to "does this route have a test" is a second number that will
+ * eventually disagree with the one on the coverage screen.
+ *
+ * ── UNCOVERED IS THE ONLY STATUS THAT SUPPORTS THE SENTENCE ─────────────────
+ *
+ * The sentence being built is "this new route has NO test". Of the five
+ * statuses only UNCOVERED asserts that. COVERED and ASSERTED_NOT_RUN have one;
+ * WAIVED was deliberately taken out of the denominator by a human; and UNKNOWN
+ * means a test navigates to a URL built at run time and MIGHT be the only test
+ * covering this route — surface-coverage.ts's rule 2, which this function is a
+ * reader of rather than a second opinion about. So anything that is not
+ * UNCOVERED is treated as "do not claim this one is untested".
+ *
+ * ── TWO WAYS IT RETURNS NULL, BOTH OF THEM HONEST ───────────────────────────
+ *
+ *   NO ROUTE ITEMS AT ALL  coverage has never been computed for this project,
+ *                          so there is no testedness to read. Returning an
+ *                          empty list instead would report every route in the
+ *                          application as untested new surface — true-sounding,
+ *                          unfounded, and the loudest possible first
+ *                          impression.
+ *   THE LIMIT BIT          the set would be partial, which over-states the
+ *                          count. See RE_ENUMERATION_TESTED_ROUTE_LIMIT.
+ */
+async function testedRoutesFor(args: {
+  orgId: string;
+  projectId: string;
+}): Promise<{ tested: TestedRoutes; why: string | null }> {
+  const rows = await prisma.coverageItem.findMany({
+    where: { orgId: args.orgId, projectId: args.projectId, kind: 'ROUTE' },
+    take: RE_ENUMERATION_TESTED_ROUTE_LIMIT + 1,
+    select: { key: true, status: true },
+  });
+
+  if (rows.length > RE_ENUMERATION_TESTED_ROUTE_LIMIT) {
+    return {
+      tested: null,
+      why:
+        `this project has more than ${RE_ENUMERATION_TESTED_ROUTE_LIMIT} route items, so which ` +
+        'routes have tests was not established for this diff — the count is NOT zero',
+    };
+  }
+  if (rows.length === 0) {
+    return {
+      tested: null,
+      why:
+        'coverage has never been computed for this project, so which routes have tests could ' +
+        'not be read — the count is NOT zero',
+    };
+  }
+
+  const tested: string[] = [];
+  for (const row of rows) {
+    if (row.status === 'UNCOVERED') continue;
+    // `parseSurfaceKey` and not `key.slice(6)`: the `KIND:identity` format has
+    // exactly one parser and a route containing a colon must not be shortened
+    // by a second one.
+    const parsed = parseSurfaceKey(row.key);
+    if (parsed?.kind === 'ROUTE') tested.push(parsed.identity);
+  }
+  return { tested, why: null };
+}
+
+/** A stored FlowMap row, read as one side of a diff. */
+interface MapRow {
+  id: string;
+  version: number;
+  environmentId: string;
+  acceptance: CrawlAcceptanceState | null;
+  graph: unknown;
+}
+
+function sideOf(row: MapRow): FlowDiffSide {
+  return {
+    flowMapId: row.id,
+    version: row.version,
+    environmentId: row.environmentId,
+    acceptance: row.acceptance,
+    // The graph is a JSON column. `diffFlowMaps` reads it defensively — every
+    // array on it is optional on the way in — precisely so a map written by an
+    // older crawler narrows the comparison instead of throwing inside this tick.
+    map: (row.graph ?? { nodes: [] }) as FlowMap,
+  };
+}
+
+/**
+ * Settle one RUNNING trigger: find the crawl, diff it, record it, raise it.
+ *
+ * Returns the deltas this one trigger contributed, so the caller's accounting is
+ * a sum and not a set of mutations.
+ */
+async function settleOneTrigger(
+  trigger: TriggerRow,
+  now: Date,
+): Promise<Partial<ReEnumerationSweep>> {
+  const firedAt = trigger.lastRunAt;
+  if (!firedAt) {
+    // RUNNING with no `lastRunAt` cannot happen through `fireReEnumeration`,
+    // which writes both in one statement. If it is in the database anyway, the
+    // row is corrupt rather than the crawl being slow, and guessing an anchor
+    // would diff against whatever map happened to be newest.
+    await prisma.reEnumerationTrigger.update({
+      where: { id: trigger.id },
+      data: {
+        lastRunState: 'FAILED',
+        lastFailureMessage:
+          'This run was recorded as in flight with no start time, so the crawl it asked for cannot be identified.',
+        consecutiveFailures: { increment: 1 },
+      },
+    });
+    return { failed: 1 };
+  }
+
+  /*
+   * THE MAP THIS RUN PRODUCED: the newest one for this environment that landed
+   * after we asked.
+   *
+   * "After we asked" and not "the one our job wrote", because there is no link
+   * from an ExploreJob back to a FlowMap row and `enqueueExplore` pins one crawl
+   * per project — so if a human pressed Explore in the same minute, BullMQ gave
+   * us THEIR crawl and it is, as far as this trigger is concerned, the crawl it
+   * asked for. Attributing it is correct; inventing a second crawl would not be.
+   *
+   * NO `acceptance` FILTER, deliberately, and the reason is worth stating
+   * because its absence looks like an oversight. A crawl held as CANDIDATE or
+   * REJECTED still RAN: it is the crawl this trigger asked for, and skipping
+   * past it to an older accepted map would attribute somebody else's
+   * enumeration to this run. Whether it may be COMPARED FROM is a different
+   * question and not this query's to answer — `diffFlowMaps` adjudicates both
+   * sides and returns NOT_COMPARED for a held current crawl, so the columns
+   * below stay NULL and the reason reaches the row. Filtering here instead would
+   * make a held crawl look like a crawl that never landed, and this function
+   * would then report a timeout that did not happen.
+   */
+  const current = await prisma.flowMap.findFirst({
+    where: { environmentId: trigger.environmentId, createdAt: { gte: firedAt } },
+    orderBy: { version: 'desc' },
+    select: { id: true, version: true, environmentId: true, acceptance: true, graph: true },
+  });
+
+  if (!current) {
+    if (now.getTime() - firedAt.getTime() < RE_ENUMERATION_RUN_TIMEOUT_MS) {
+      // Still crawling. Left RUNNING, which is the true state, and counted so
+      // a tick that settled nothing can say whether it was waiting or stuck.
+      return { inFlight: 1 };
+    }
+    await prisma.reEnumerationTrigger.update({
+      where: { id: trigger.id },
+      data: {
+        lastRunState: 'FAILED',
+        /*
+         * A CURATED SENTENCE AND NEVER `String(err)`. This column is rendered
+         * to the customer, and a crawl failure's message can carry the base URL
+         * it was reaching — which on an environment configured with a bypass
+         * token or a session in the query string would put a credential on
+         * screen. The diagnostic detail goes to the log; the row gets a
+         * sentence somebody can act on.
+         */
+        lastFailureMessage:
+          `No crawl of this environment completed within ${Math.round(
+            RE_ENUMERATION_RUN_TIMEOUT_MS / 60_000,
+          )} minutes of this trigger firing, so the surface was NOT re-enumerated and the ` +
+          'denominator is still the previous crawl’s.',
+        consecutiveFailures: { increment: 1 },
+      },
+    });
+    logger.warn(
+      { triggerId: trigger.id, environmentId: trigger.environmentId, firedAt },
+      're-enumeration timed out: no crawl landed, so the denominator is still stale',
+    );
+    return { failed: 1 };
+  }
+
+  /*
+   * THE BASELINE: the version immediately before this one.
+   *
+   * IMMEDIATELY BEFORE, and deliberately not "the newest ACCEPTED one". If the
+   * previous crawl was held as a CANDIDATE, the honest answer is
+   * UNCOMPARABLE_BASELINE_NOT_ACCEPTED — and `diffFlowMaps` says exactly that.
+   * Skipping back to an older accepted map would quietly make the diff span two
+   * crawls and report the candidate's additions as this crawl's drift, which is
+   * a real number attached to the wrong event.
+   */
+  const baseline = await prisma.flowMap.findFirst({
+    where: { environmentId: trigger.environmentId, version: { lt: current.version } },
+    orderBy: { version: 'desc' },
+    select: { id: true, version: true, environmentId: true, acceptance: true, graph: true },
+  });
+
+  const { tested, why: testedWhy } = await testedRoutesFor(trigger);
+
+  let diff: FlowDiff;
+  try {
+    diff = diffFlowMaps({
+      current: sideOf(current),
+      baseline: baseline ? sideOf(baseline) : null,
+      tested,
+    });
+  } catch (err) {
+    if (!(err instanceof FlowDiffRefused)) throw err;
+    /*
+     * Two environments. This cannot happen through the queries above — both
+     * filter on `trigger.environmentId` — so reaching here means a FlowMap row
+     * carries an environmentId its own index disagrees with. Recorded as FAILED
+     * and NOT as a drift record: there is no honest row to write, which is the
+     * entire reason `diffFlowMaps` throws instead of returning one.
+     */
+    await prisma.reEnumerationTrigger.update({
+      where: { id: trigger.id },
+      data: {
+        lastRunState: 'FAILED',
+        lastFailureMessage:
+          'The two crawls this diff was given belong to different environments, so no ' +
+          'comparison was made. Nothing about drift is being claimed.',
+        consecutiveFailures: { increment: 1 },
+      },
+    });
+    logger.error({ err, triggerId: trigger.id }, 'refused a cross-environment drift diff');
+    return { failed: 1 };
+  }
+
+  /*
+   * IDEMPOTENT BY (map, trigger). A tick that dies between writing the record
+   * and updating the trigger leaves the trigger RUNNING, and the next tick
+   * would otherwise write a second identical drift record and raise the event
+   * twice. Keyed on the TRIGGER too, because two triggers on one environment —
+   * a nightly SCHEDULE and a DEPLOY webhook — may each legitimately record that
+   * THEIR run found this change.
+   */
+  const already = await prisma.surfaceDriftRecord.findFirst({
+    where: { currentFlowMapId: current.id, triggerId: trigger.id },
+    select: { id: true },
+  });
+
+  const counts = diff.counts;
+  const comparable = counts !== null;
+  /*
+   * `as unknown as object`, the same cast explore.ts uses to put a FlowMap in
+   * `graph`: Prisma's `InputJsonValue` forbids a NULL MEMBER, and half the point
+   * of this payload is that `routesRemoved` is null when removals were refused.
+   * The cast carries a deliberate null into a JSONB column rather than papering
+   * over a type that does not fit.
+   *
+   * `testednessUnmeasuredBecause` rides along rather than only being logged:
+   * without it, `newSurfaceWithoutTests: null` is a null with no explanation,
+   * which a reader has no choice but to render as a blank.
+   */
+  const detailPayload = diff.detail
+    ? ({
+        ...diff.detail,
+        testednessUnmeasuredBecause: testedWhy,
+        why: diff.why,
+      } as unknown as object)
+    : null;
+  if (!already) {
+    await prisma.surfaceDriftRecord.create({
+      data: {
+        orgId: trigger.orgId,
+        projectId: trigger.projectId,
+        environmentId: trigger.environmentId,
+        currentFlowMapId: current.id,
+        baselineFlowMapId: diff.baselineFlowMapId,
+        comparability: diff.comparability,
+        /*
+         * SPREAD AND NOT SIX `?? 0`s. Every count on this row is nullable
+         * because 0 is the value that means "nothing new is untested", and once
+         * written it is indistinguishable from "we never looked". When the diff
+         * reports no counts the columns stay NULL and `comparability` carries
+         * the reason.
+         */
+        ...(counts
+          ? {
+              routesAdded: counts.routesAdded,
+              routesRemoved: counts.routesRemoved,
+              routesChanged: counts.routesChanged,
+              controlsAdded: counts.controlsAdded,
+              controlsRemoved: counts.controlsRemoved,
+              newSurfaceWithoutTests: counts.newSurfaceWithoutTests,
+            }
+          : {}),
+        /*
+         * SPREAD, for the same reason the counts are, and with the same
+         * consequence: an omitted `detail` leaves the column NULL, where `{}`
+         * would claim an empty diff was computed. The column is nullable with no
+         * default precisely so that distinction survives the write.
+         */
+        ...(detailPayload ? { detail: detailPayload } : {}),
+        triggerId: trigger.id,
+        // NULL when nothing was compared. A timestamp on a comparison that did
+        // not run is how "no drift since the last crawl" gets claimed by a code
+        // path that never looked.
+        comparedAt: comparable ? now : null,
+      },
+    });
+  }
+
+  await prisma.reEnumerationTrigger.update({
+    where: { id: trigger.id },
+    data: {
+      lastRunState: 'SUCCEEDED',
+      lastFlowMapId: current.id,
+      lastFailureMessage: null,
+      // 0 is honest here, unlike every count on the drift row: this is a tally
+      // of events we caused, not a measurement of the customer's application.
+      consecutiveFailures: 0,
+    },
+  });
+
+  /*
+   * ── RAISING IT ─────────────────────────────────────────────────────────────
+   *
+   * An `AuditLog` row, which the API's audit reader already renders, so the
+   * event reaches a human on a surface that exists today. The chat and webhook
+   * fan-out does NOT happen and nothing here pretends it does: `processNotify`
+   * switches on 'monitor.down' and 'run.finished' and returns for anything
+   * else, so enqueuing a 'surface.drifted' job would be a job dropped on the
+   * floor — theatre, and exactly the class of defect this round is repairing.
+   * The handover names the dispatcher case and the `ACTION_EVENT_TYPES` entry
+   * that would make it a subscribable event.
+   *
+   * TWO ACTIONS AND NOT ONE. An uncomparable diff is recorded as its own action
+   * rather than as a quiet absence, because "we could not compare these two
+   * crawls" is the sentence that stops somebody reading a blank drift feed as a
+   * clean bill of health.
+   */
+  const announce = driftWorthAnnouncing(diff);
+  await prisma.auditLog
+    .create({
+      data: {
+        orgId: trigger.orgId,
+        action: announce
+          ? RE_ENUMERATION_AUDIT_ACTIONS.newSurface
+          : comparable
+            ? RE_ENUMERATION_AUDIT_ACTIONS.compared
+            : RE_ENUMERATION_AUDIT_ACTIONS.uncomparable,
+        targetType: 'Environment',
+        targetId: trigger.environmentId,
+        metadata: {
+          triggerId: trigger.id,
+          triggerName: trigger.name,
+          triggerKind: trigger.kind,
+          flowMapId: current.id,
+          flowMapVersion: current.version,
+          baselineFlowMapId: diff.baselineFlowMapId,
+          comparability: diff.comparability,
+          newSurfaceWithoutTests: counts?.newSurfaceWithoutTests ?? null,
+          why: diff.why,
+          testednessUnmeasuredBecause: testedWhy,
+        },
+      },
+    })
+    .catch((err: unknown) => {
+      // The drift record is already stored, so the measurement survives. A
+      // missing audit row costs the notice, not the fact.
+      logger.error({ err, triggerId: trigger.id }, 'could not write the drift audit row');
+    });
+
+  if (announce) {
+    logger.warn(
+      {
+        triggerId: trigger.id,
+        environmentId: trigger.environmentId,
+        version: current.version,
+        newSurfaceWithoutTests: counts?.newSurfaceWithoutTests ?? null,
+      },
+      're-enumeration found new surface with no tests',
+    );
+  }
+
+  return {
+    diffed: 1,
+    uncomparable: comparable ? 0 : 1,
+    announced: announce ? 1 : 0,
+  };
+}
+
+/**
+ * Fire every due SCHEDULE trigger, then settle every RUNNING one.
+ *
+ * Never throws, for the reason the fail-fast sweep gives: this rides the tick
+ * that owes a customer's nightly suite its 3am slot, and a drift diff that blew
+ * up must not take that down with it.
+ */
+export async function sweepReEnumeration(now: Date): Promise<ReEnumerationSweep> {
+  const sweep: ReEnumerationSweep = { ...EMPTY_SWEEP, capsThatBit: [] };
+
+  const columns = {
+    id: true,
+    orgId: true,
+    projectId: true,
+    environmentId: true,
+    name: true,
+    kind: true,
+    enabled: true,
+    cron: true,
+    timezone: true,
+    lastRunState: true,
+    lastRunAt: true,
+    createdAt: true,
+  } as const;
+
+  // ── Fire ──────────────────────────────────────────────────────────────────
+  let candidates: TriggerRow[] = [];
+  try {
+    candidates = await prisma.reEnumerationTrigger.findMany({
+      where: { enabled: true, kind: 'SCHEDULE', lastRunState: { not: 'RUNNING' } },
+      // ONE PAST THE LIMIT, which is what makes the cap disclosed rather than
+      // merely applied. See RE_ENUMERATION_SWEEP_LIMIT.
+      take: RE_ENUMERATION_SWEEP_LIMIT + 1,
+      orderBy: { createdAt: 'asc' },
+      select: columns,
+    });
+  } catch (err) {
+    logger.error({ err }, 'could not read re-enumeration triggers this tick');
+    return sweep;
+  }
+
+  if (candidates.length > RE_ENUMERATION_SWEEP_LIMIT) {
+    const over = candidates.length - RE_ENUMERATION_SWEEP_LIMIT;
+    candidates = candidates.slice(0, RE_ENUMERATION_SWEEP_LIMIT);
+    sweep.deferredByCap += over;
+    sweep.capsThatBit.push(
+      `the re-enumeration sweep limit of ${RE_ENUMERATION_SWEEP_LIMIT} bit; at least ${over} ` +
+        'more trigger(s) were not even examined this tick',
+    );
+  }
+
+  /*
+   * ONE CRAWL PER PROJECT PER TICK, and this is a real constraint rather than
+   * caution. `enqueueExplore` pins the job id to the project, so a second crawl
+   * of the same project in the same tick is silently deduplicated by BullMQ —
+   * the trigger would be claimed RUNNING against a job that does not exist and
+   * would sit there until it timed out and reported a crawl failure that never
+   * happened. Deferring it is the honest alternative: it stays due and fires
+   * next tick.
+   */
+  const projectsFiring = new Set<string>();
+  let projectsLocked = 0;
+
+  for (const trigger of candidates) {
+    try {
+      const { due } = reEnumerationIsDue(trigger, now);
+      if (!due) continue;
+
+      if (projectsFiring.has(trigger.projectId)) {
+        projectsLocked += 1;
+        continue;
+      }
+
+      // A crawl of this project already in flight for ANOTHER trigger, from a
+      // previous tick. Same deduplication, same deferral.
+      const inFlight = await prisma.reEnumerationTrigger.findFirst({
+        where: { projectId: trigger.projectId, lastRunState: 'RUNNING' },
+        select: { id: true },
+      });
+      if (inFlight) {
+        projectsLocked += 1;
+        continue;
+      }
+
+      const fired = await fireReEnumeration({ trigger, now });
+      if (fired.fired) {
+        projectsFiring.add(trigger.projectId);
+        sweep.fired += 1;
+        logger.info(
+          { triggerId: trigger.id, projectId: trigger.projectId, name: trigger.name },
+          're-enumeration fired',
+        );
+      }
+    } catch (err) {
+      // Per trigger, so one unreadable row does not cost the others theirs.
+      logger.error({ err, triggerId: trigger.id }, 'could not fire this re-enumeration trigger');
+    }
+  }
+
+  if (projectsLocked > 0) {
+    sweep.deferredByCap += projectsLocked;
+    sweep.capsThatBit.push(
+      `${projectsLocked} due trigger(s) were deferred because a crawl of the same project was ` +
+        'already in flight — one crawl per project is a queue constraint, not a schedule',
+    );
+  }
+
+  // ── Settle ────────────────────────────────────────────────────────────────
+  let running: TriggerRow[] = [];
+  try {
+    running = await prisma.reEnumerationTrigger.findMany({
+      where: { lastRunState: 'RUNNING' },
+      take: RE_ENUMERATION_SETTLE_LIMIT + 1,
+      orderBy: { lastRunAt: 'asc' },
+      select: columns,
+    });
+  } catch (err) {
+    logger.error({ err }, 'could not read in-flight re-enumerations this tick');
+    return sweep;
+  }
+
+  if (running.length > RE_ENUMERATION_SETTLE_LIMIT) {
+    const over = running.length - RE_ENUMERATION_SETTLE_LIMIT;
+    running = running.slice(0, RE_ENUMERATION_SETTLE_LIMIT);
+    sweep.deferredByCap += over;
+    sweep.capsThatBit.push(
+      `the settle limit of ${RE_ENUMERATION_SETTLE_LIMIT} bit; at least ${over} more in-flight ` +
+        'run(s) were not diffed this tick',
+    );
+  }
+
+  for (const trigger of running) {
+    try {
+      const delta = await settleOneTrigger(trigger, now);
+      sweep.fired += delta.fired ?? 0;
+      sweep.diffed += delta.diffed ?? 0;
+      sweep.uncomparable += delta.uncomparable ?? 0;
+      sweep.announced += delta.announced ?? 0;
+      sweep.failed += delta.failed ?? 0;
+      sweep.inFlight += delta.inFlight ?? 0;
+    } catch (err) {
+      /*
+       * Recorded on the row and not only in the log. A diff that threw is a run
+       * that FAILED, and leaving it RUNNING would make it wait out the timeout
+       * and then be reported as a crawl that never landed — a different and
+       * wrong fact about the customer's application.
+       */
+      logger.error({ err, triggerId: trigger.id }, 'could not settle this re-enumeration');
+      await prisma.reEnumerationTrigger
+        .update({
+          where: { id: trigger.id },
+          data: {
+            lastRunState: 'FAILED',
+            lastFailureMessage:
+              'The crawl completed and the comparison against the previous crawl could not be ' +
+              'made, so no drift is being claimed either way.',
+            consecutiveFailures: { increment: 1 },
+          },
+        })
+        .catch(() => {});
+      sweep.failed += 1;
+    }
+  }
+
+  return sweep;
+}
+
 export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> {
   const now = new Date();
 
@@ -765,22 +1676,36 @@ export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> 
   }
 
   /*
-   * ── The two sweeps that ride this tick ────────────────────────────────────
+   * ── The three sweeps that ride this tick ──────────────────────────────────
    *
-   * LAST, and after the cron schedules and the monitors, deliberately. Both are
+   * LAST, and after the cron schedules and the monitors, deliberately. All are
    * work nobody is waiting on, and a nightly suite that fired four seconds late
    * because a closure campaign was measuring is a worse trade than a campaign
-   * that measures four seconds later. Both are also written so they cannot
-   * throw — a stop request that could not be written, or a campaign that blew
-   * up, must not take a customer's uptime check down with it.
+   * that measures four seconds later. All are also written so they cannot
+   * throw — a stop request that could not be written, a campaign that blew up,
+   * or a drift diff that threw, must not take a customer's uptime check down
+   * with it.
    *
    * They ride THIS tick rather than getting queues of their own for the reason
    * `ClosureCampaign` spells out: a job whose own result decides whether it
    * re-queues is the shape of a worker that never idles, and this sweep's fixed
    * 60-second cadence is a ceiling that no bug in the stop rules can raise.
+   *
+   * RE-ENUMERATION IS THE THIRD, and it is the one that moves the DENOMINATOR
+   * rather than the numerator: until it existed, nothing in this product
+   * re-enumerated without a human, so the surface we measure against went stale
+   * and the coverage percentage drifted upwards with nobody told.
    */
   const failFast = await sweepFailFastStops(now);
   const campaigns = await advanceClosureCampaigns(now);
+  const reEnumeration = await sweepReEnumeration(now).catch((err: unknown) => {
+    // Belt as well as braces: `sweepReEnumeration` catches per trigger and per
+    // query, and a throw escaping it anyway must still not cost this install
+    // its monitors. Reported as an empty sweep, which is the truth — this tick
+    // re-enumerated nothing — and never as a sweep that found no drift.
+    logger.error({ err }, 'the re-enumeration sweep failed; nothing was re-enumerated this tick');
+    return { ...EMPTY_SWEEP, capsThatBit: [] };
+  });
 
   if (
     failFast.requested > 0 ||
@@ -790,11 +1715,30 @@ export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> 
     failFast.undecided > 0 ||
     campaigns.armed > 0 ||
     campaigns.advanced > 0 ||
-    campaigns.failed > 0
+    campaigns.failed > 0 ||
+    reEnumeration.fired > 0 ||
+    reEnumeration.diffed > 0 ||
+    reEnumeration.failed > 0 ||
+    // On the same line as the rest, for the same reason `undecided` is: a cap
+    // that deferred fourteen due triggers is an install whose denominators are
+    // going stale, and it must be visible without going looking for a warning.
+    reEnumeration.deferredByCap > 0
   ) {
     logger.info(
-      { stopsRequested: failFast.requested, stopsUndecided: failFast.undecided, ...campaigns },
-      'schedule tick: fail-fast stops requested and closure campaigns advanced',
+      {
+        stopsRequested: failFast.requested,
+        stopsUndecided: failFast.undecided,
+        ...campaigns,
+        reEnumerationFired: reEnumeration.fired,
+        reEnumerationDiffed: reEnumeration.diffed,
+        reEnumerationUncomparable: reEnumeration.uncomparable,
+        reEnumerationAnnounced: reEnumeration.announced,
+        reEnumerationFailed: reEnumeration.failed,
+        reEnumerationInFlight: reEnumeration.inFlight,
+        reEnumerationDeferred: reEnumeration.deferredByCap,
+        reEnumerationCaps: reEnumeration.capsThatBit,
+      },
+      'schedule tick: fail-fast stops requested, closure campaigns advanced, surface re-enumerated',
     );
   }
 }

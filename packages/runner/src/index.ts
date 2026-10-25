@@ -15,6 +15,23 @@ export { contractPlugin } from './plugins/contract.js';
 export { protocolPlugin } from './plugins/protocol.js';
 export { mutationPlugin } from './plugins/mutation.js';
 export { mobilePlugin } from './plugins/mobile.js';
+/*
+ * The two surfaces QAAI could neither count nor execute against: a desktop
+ * shell (multi-window, native menu bar, tray, main-process IPC) and the
+ * BACKGROUND_JOB axis, which `SURFACE_KINDS` has had a member for all along
+ * with nothing able to cover it.
+ *
+ * Listed here for the same reason as the eleven lines above it and not because
+ * anything was unreachable: `registry.ts` already imports both into
+ * `PENDING_PLUGINS`, and `export * from './registry.js'` already publishes
+ * `pendingTypes` and `promotePendingPlugins`. Both plugins stay PENDING — no
+ * run can resolve to either — until `TEST_TYPES` in packages/shared/src/
+ * constants.ts and the Prisma `TestType` enum name DESKTOP and JOBS. That pair
+ * of edits is in this round's handover; `pendingTypes()` is the read path that
+ * reports the gap honestly in the meantime.
+ */
+export { desktopPlugin } from './plugins/desktop.js';
+export { jobsPlugin } from './plugins/jobs.js';
 export * from './record.js';
 export * from './login.js';
 export * from './visual-services.js';

@@ -103,11 +103,48 @@ export async function enqueueGenerate(job: GenerateJob): Promise<void> {
  * The job id is per PROJECT and not per request, which also means a loop that
  * asks twice gets one crawl — the belt to close-loop's own `recrawlQueuedAt`
  * brace.
+ *
+ * ── WHY THE TWO REMOVE OPTIONS ARE LOAD-BEARING AND NOT HOUSEKEEPING ────────
+ *
+ * MEASURED, against this repo's own Redis and this repo's own BullMQ, because a
+ * claim about a queue's semantics is worth nothing asserted from memory:
+ *
+ *   jobId 'fixed', no remove options → add, drain to completed, add again
+ *     → counts {completed: 1, waiting: 0}, and the SECOND add returns a Job
+ *       object carrying the new data. Nothing was enqueued. The caller cannot
+ *       tell.
+ *   the same with removeOnComplete
+ *     → counts {completed: 0, waiting: 1}, and the waiting job holds the new
+ *       data.
+ *
+ * So a retained terminal job with this id SILENTLY SWALLOWS every later crawl
+ * of that project, for as long as the key lives in Redis. The lock the comment
+ * above describes is meant to be "one crawl per project IN FLIGHT"; without
+ * these two lines it is "one crawl per project EVER", which was survivable
+ * while the only producer was a human pressing a button and is not survivable
+ * now. `fireReEnumeration` in processors/schedule.ts claims the trigger RUNNING
+ * and then enqueues through here: the first nightly re-enumeration would run,
+ * every one after it would be dropped with no error, each trigger would sit
+ * RUNNING until RE_ENUMERATION_RUN_TIMEOUT_MS and then be recorded FAILED — a
+ * crawl that never landed, reported as a fact about the customer's
+ * application. "The denominator goes stale and nobody is told" is the defect
+ * this whole round exists to remove, and this was a new way to produce it.
+ *
+ * The cost is that an explore job's own failure leaves Redis rather than
+ * sitting in the failed set. That is the right trade here and only here: the
+ * explore processor records its outcome in the DATABASE — the Run row, the
+ * FlowMap, and the trigger's `lastRunState`/`lastFailureMessage` — so the
+ * failure is still readable, whereas a swallowed enqueue is readable nowhere.
+ * No other producer in this file is changed: `run-<id>`, `triage-<resultId>`,
+ * `bisect-<id>-<step>` and `deliver-<id>` are ids of a one-shot-per-entity
+ * thing, where permanent de-duplication is exactly what is wanted.
  */
 export async function enqueueExplore(job: ExploreJob): Promise<void> {
   await exploreQueue.add(QUEUE_NAMES.explore, job, {
     jobId: `explore-${job.projectId}`,
     attempts: 1,
+    removeOnComplete: true,
+    removeOnFail: true,
   });
 }
 

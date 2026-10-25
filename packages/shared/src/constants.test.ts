@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  AUTH_PROFILE_KINDS,
   AUTO_QUARANTINE_REASON_PREFIX,
   ENVIRONMENT_UNAVAILABLE_PREFIX,
   FLAKE_AUDIT_ACTIONS,
@@ -7,12 +8,18 @@ import {
   HEAL_AUDIT_ACTIONS,
   HEAL_VERIFY_RUN_PREFIX,
   NOT_RUN_KINDS,
+  RE_ENUMERATION_RUN_STATES,
+  RE_ENUMERATION_TRIGGER_KINDS,
+  SURFACE_DRIFT_COMPARABILITIES,
+  driftCountsAreMeaningful,
   environmentUnavailableMessage,
   environmentUnavailableReason,
   isFlakeConfirmationRun,
   isNotRunKind,
+  newSurfaceWithoutTests,
   notRunMessage,
   parseNotRun,
+  triggerHasRun,
 } from './constants';
 
 /**
@@ -203,5 +210,114 @@ describe('the run and quarantine markers', () => {
     for (const action of actions) {
       expect(action).toMatch(/^[a-z]+(\.[a-z]+)+$/);
     }
+  });
+});
+
+/**
+ * The re-enumeration lifecycle, and the two numbers it must refuse to invent.
+ *
+ * Both vocabularies below describe a measurement that has never been taken in
+ * this product: nothing re-enumerates on its own, and no code diffs two crawl
+ * versions even though the schema and the cockpit both imply it does. So every
+ * assertion here is about the state a reader sees BEFORE the feature works —
+ * which is the state most installs will be in for a while, and the state in
+ * which a flattering default would do the most damage.
+ */
+describe('the re-enumeration triggers', () => {
+  it('names the four ways a surface can be enumerated again', () => {
+    // DEPLOY is the one that fires at the moment the surface changes, and MANUAL
+    // is kept explicit so "nothing is scheduled" and "a person ran it in March"
+    // are different rows rather than the same absence.
+    expect([...RE_ENUMERATION_TRIGGER_KINDS].sort()).toEqual([
+      'CI',
+      'DEPLOY',
+      'MANUAL',
+      'SCHEDULE',
+    ]);
+  });
+
+  it('separates "never fired" from "ran and found nothing"', () => {
+    // THE assertion. A trigger that has never run must not read as a clean bill
+    // of health, which is what a null `lastRunAt` renders as. Goes red if
+    // `triggerHasRun` is ever written as a truthiness check on a timestamp.
+    expect(triggerHasRun('NEVER_RUN')).toBe(false);
+    for (const state of RE_ENUMERATION_RUN_STATES) {
+      if (state === 'NEVER_RUN') continue;
+      expect(triggerHasRun(state), `${state} has run`).toBe(true);
+    }
+  });
+
+  it('keeps SKIPPED out of SUCCEEDED', () => {
+    // A run the policy or a lock declined enumerated nothing. Folding it into
+    // SUCCEEDED would make a permanently-skipped trigger look healthy.
+    expect(RE_ENUMERATION_RUN_STATES).toContain('SKIPPED');
+    expect(RE_ENUMERATION_RUN_STATES).toContain('SUCCEEDED');
+  });
+
+  it('has no duplicate member in either vocabulary', () => {
+    for (const vocabulary of [
+      RE_ENUMERATION_TRIGGER_KINDS,
+      RE_ENUMERATION_RUN_STATES,
+      SURFACE_DRIFT_COMPARABILITIES,
+      AUTH_PROFILE_KINDS,
+    ]) {
+      expect(new Set(vocabulary).size).toBe(vocabulary.length);
+    }
+  });
+});
+
+describe('the drift record refuses to turn a non-comparison into a zero', () => {
+  it('names three distinct ways for "no drift" to be unsayable', () => {
+    expect([...SURFACE_DRIFT_COMPARABILITIES].sort()).toEqual([
+      'COMPARABLE',
+      'NOT_COMPARED',
+      'UNCOMPARABLE_BASELINE_NOT_ACCEPTED',
+      'UNCOMPARABLE_NO_BASELINE',
+    ]);
+  });
+
+  it('calls the counts meaningful only for a real comparison', () => {
+    expect(driftCountsAreMeaningful('COMPARABLE')).toBe(true);
+    for (const state of SURFACE_DRIFT_COMPARABILITIES) {
+      if (state === 'COMPARABLE') continue;
+      expect(driftCountsAreMeaningful(state), `${state} is not a comparison`).toBe(false);
+    }
+  });
+
+  it('returns the number when, and only when, it was measured', () => {
+    expect(
+      newSurfaceWithoutTests({ comparability: 'COMPARABLE', newSurfaceWithoutTests: 4 }),
+    ).toBe(4);
+    // Zero is a real measurement here and must survive: "we compared and nothing
+    // new is untested" is the answer this feature exists to be able to give.
+    expect(
+      newSurfaceWithoutTests({ comparability: 'COMPARABLE', newSurfaceWithoutTests: 0 }),
+    ).toBe(0);
+  });
+
+  it('refuses to report 0 for a comparison that could not happen', () => {
+    /*
+     * The lie this function exists to prevent. Zero means "nothing new is
+     * untested", it renders as a green tick, and once written to a column it is
+     * indistinguishable from "we never looked". Each of these three is a
+     * different reason there is no number, and every one of them must come back
+     * null even when the column holds a 0 a writer left behind.
+     */
+    for (const comparability of [
+      'NOT_COMPARED',
+      'UNCOMPARABLE_NO_BASELINE',
+      'UNCOMPARABLE_BASELINE_NOT_ACCEPTED',
+    ] as const) {
+      expect(newSurfaceWithoutTests({ comparability, newSurfaceWithoutTests: 0 })).toBeNull();
+      expect(newSurfaceWithoutTests({ comparability, newSurfaceWithoutTests: 7 })).toBeNull();
+    }
+  });
+
+  it('refuses to invent a 0 for a COMPARABLE row that carries no count', () => {
+    // That row is a bug in the writer. Reporting it as 0 would hide the bug
+    // behind a green tick, which is strictly worse than reporting nothing.
+    expect(
+      newSurfaceWithoutTests({ comparability: 'COMPARABLE', newSurfaceWithoutTests: null }),
+    ).toBeNull();
   });
 });

@@ -8,6 +8,7 @@
  */
 
 import type { RunnerPlugin, TestType } from '@qaai/shared';
+import { TEST_TYPES } from '@qaai/shared';
 import { ALL_TEST_TYPES, checkRunnability } from './preflight.js';
 import type { RunnabilityProbes, TypeRunnability } from './preflight.js';
 import { e2ePlugin } from './plugins/e2e.js';
@@ -27,6 +28,8 @@ import { contractPlugin } from './plugins/contract.js';
 import { protocolPlugin } from './plugins/protocol.js';
 import { mobilePlugin } from './plugins/mobile.js';
 import { performancePlugin } from './plugins/performance.js';
+import { desktopPlugin } from './plugins/desktop.js';
+import { jobsPlugin } from './plugins/jobs.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -58,6 +61,82 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   PERFORMANCE: performancePlugin,
 };
 
+/*
+ * ── Plugins whose TestType is not minted yet ────────────────────────────────
+ *
+ * The usual gap in this table is a type with no plugin. These two are the
+ * mirror image: a complete, tested plugin for a type `TEST_TYPES` does not
+ * contain. Both cover a whole class of customer that scores zero today —
+ * desktop shells (Electron/Tauri/WebView), and the `BACKGROUND_JOB` surface
+ * kind the inventory has counted since it was built while nothing could
+ * execute one.
+ *
+ * `TestType` is the union behind a Postgres enum, `createTestSchema`, the
+ * cockpit's filter chips and `NEW_TEST_TEMPLATES`, and minting a member means
+ * editing `packages/shared/src/constants.ts` and migrating the enum — files
+ * this change does not own. So the plugins land here, and the registry
+ * PROMOTES them the moment the vocabulary arrives.
+ *
+ * Why promotion rather than a second edit later: the alternative is a plugin
+ * sitting in the tree with no entry in this table, which is precisely the
+ * "module with no caller" defect `check:wiring` exists to catch — and it would
+ * be invisible to that gate, because an unminted type is not in the list it
+ * iterates. Promotion means the shared edit alone is sufficient: `pluginFor`
+ * answers, `implementedTypes()` stays equal to `TEST_TYPES`, and nobody has to
+ * remember this file.
+ *
+ * The cast is narrow and load-bearing. `jobsPlugin.type` is the literal
+ * `'JOBS'`, which is not assignable to `TestType` until the union contains it;
+ * the KEY is checked against `TEST_TYPES` at run time immediately below, so
+ * nothing is ever promoted under a name the union does not have.
+ */
+type PendingPlugin = Omit<RunnerPlugin, 'type'> & { readonly type: string };
+
+const PENDING_PLUGINS: Readonly<Record<string, PendingPlugin>> = {
+  DESKTOP: desktopPlugin,
+  JOBS: jobsPlugin,
+};
+
+/**
+ * Move every pending plugin whose type `mintedTypes` now contains into `into`.
+ *
+ * A function taking both sides rather than a loop closing over `PLUGINS` and
+ * `TEST_TYPES`, and that is not tidiness: as a bare loop this code was
+ * UNTESTABLE in this build. `TEST_TYPES` does not contain DESKTOP or JOBS, so
+ * the body never ran, and a mutation that disabled the whole loop left every
+ * test green — the promotion would have been dead on the day the vocabulary
+ * landed and nothing would have said so. Passing the minted list in means a
+ * test can hand it a widened one and watch the plugin actually arrive.
+ */
+export function promotePendingPlugins(
+  into: Record<string, RunnerPlugin>,
+  mintedTypes: readonly string[],
+): string[] {
+  const moved: string[] = [];
+  for (const [name, plugin] of Object.entries(PENDING_PLUGINS)) {
+    if (mintedTypes.includes(name)) {
+      into[name] = plugin as RunnerPlugin;
+      moved.push(name);
+    }
+  }
+  return moved;
+}
+
+const promoted = promotePendingPlugins(PLUGINS, TEST_TYPES);
+
+/**
+ * Types with a built plugin that `TEST_TYPES` cannot name yet.
+ *
+ * Exported because the gap has to be SAYABLE. "QAAI cannot test your Electron
+ * app" and "QAAI can test your Electron app but you cannot create the test
+ * yet" are different sentences with different remedies, and without this the
+ * second one reads as the first — which would understate what the product can
+ * do while overstating what the customer can reach.
+ */
+export function pendingTypes(): string[] {
+  return Object.keys(PENDING_PLUGINS).filter((name) => !promoted.includes(name));
+}
+
 /**
  * Types the spec calls for that do not have a plugin in this build. Listed
  * explicitly so the gap is visible in code and in the UI, rather than showing
@@ -72,8 +151,28 @@ export function pluginFor(type: TestType): RunnerPlugin | null {
   return PLUGINS[type] ?? null;
 }
 
+/**
+ * Why a type cannot run here, in a sentence.
+ *
+ * The pending branch is not decoration. A caller asking about DESKTOP would
+ * otherwise be told "no runner plugin registered", which is false — the plugin
+ * is in this build and this table imports it — and would send the reader to
+ * write a plugin that already exists. The remedy for these two is minting the
+ * TestType, so that is what it says.
+ */
 export function reasonUnsupported(type: TestType): string {
-  return UNIMPLEMENTED_TYPES[type] ?? `No runner plugin registered for ${type}`;
+  const explicit = UNIMPLEMENTED_TYPES[type];
+  if (explicit !== undefined) return explicit;
+
+  if (pendingTypes().includes(type)) {
+    return (
+      `${type} has a runner plugin in this build, but "${type}" is not a member of TEST_TYPES ` +
+      'yet — so no test of this type can be stored or created. Add it to TEST_TYPES in ' +
+      'packages/shared/src/constants.ts and to the Prisma TestType enum; the registry picks the ' +
+      'plugin up with no further change'
+    );
+  }
+  return `No runner plugin registered for ${type}`;
 }
 
 export function implementedTypes(): TestType[] {

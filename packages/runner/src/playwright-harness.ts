@@ -34,6 +34,13 @@ import {
 } from './determinism.js';
 import { childEnv } from './child-env.js';
 import { authProfileRequired, declaredAuthProfileId, suppliedAuthProfileId } from './run-workspace.js';
+import {
+  botProtectionRemedy,
+  environmentExtraHeaderSchema,
+  reachabilityFromPolicy,
+  SECRET_BEARING_HEADER_NAMES,
+} from '@qaai/shared';
+import type { BotBypassMode, BotProtectionProvider } from '@qaai/shared';
 
 /** Hard ceiling for a whole spec file, independent of per-test timeouts. */
 const PROCESS_TIMEOUT_MS = 10 * 60_000;
@@ -233,6 +240,496 @@ function deviceFor(browserName: string): string {
   }
 }
 
+// ─── Bot protection, and the only legitimate ways past it ────────────────────
+
+/**
+ * An application behind reCAPTCHA, hCaptcha, Turnstile or a WAF cannot be
+ * signed into by ANY auth profile kind, so its whole authenticated surface is
+ * unenumerable — and the zero that produces reads as a testing failure instead
+ * of an access problem. This section is the half of that defect this harness
+ * owns: carrying the customer's own way in, and refusing to execute when there
+ * is not one.
+ *
+ * ── WHAT IS DELIBERATELY NOT HERE ───────────────────────────────────────────
+ *
+ * No solver. No challenge-token replay. No fingerprint shim, no stealth flags,
+ * no retry-until-it-lets-us-through. A challenge is a system owner saying "not
+ * automated traffic", and the right answer is to ask the owner, not to look
+ * less automated. Every route below is something the OWNER of the environment
+ * did on their own system:
+ *
+ *   PROVIDER_TEST_KEYS       they configured their own NON-PRODUCTION site with
+ *                            the provider's published test keys, so the widget
+ *                            self-resolves. Nothing is sent from here — this
+ *                            harness does not even learn the keys, which is
+ *                            exactly right.
+ *   SIGNED_BYPASS_HEADER     they issue a header their own edge accepts. We
+ *                            send it. We do not mint it and could not: the
+ *                            value is a vault REFERENCE resolved out of their
+ *                            own environment secrets.
+ *   ALLOWLISTED_BY_CUSTOMER  they allowlisted us at the edge. Nothing is sent.
+ *
+ * With none of them configured the answer is UNREACHABLE_BEHIND_BOT_PROTECTION
+ * plus the remedy. That decision is `reachabilityFromPolicy`'s in @qaai/shared
+ * and is READ here rather than re-made, so the API, the cockpit and the runner
+ * cannot disagree about whether an environment is reachable.
+ */
+export interface EnvironmentAccessPolicy {
+  provider: BotProtectionProvider;
+  bypassMode: BotBypassMode;
+  /** The header name the customer's edge accepts. SIGNED_BYPASS_HEADER only. */
+  bypassHeaderName?: string | null;
+  /** A `Secret.name` reference into `ctx.secrets`. NEVER a value. */
+  bypassSecretName?: string | null;
+  /**
+   * `EnvironmentAccess.extraHeaders` verbatim, straight off the Json column.
+   *
+   * `unknown` on purpose: parsing happens HERE, per entry, so a row written by
+   * an older shape cannot throw inside a run and cannot cost the entries beside
+   * it. A caller that pre-parsed would be a second parser of the same column.
+   */
+  extraHeaders?: unknown;
+}
+
+/**
+ * Why one configured header was not sent.
+ *
+ * Every one of these is DISCLOSED rather than dropped. A header that silently
+ * went missing is the worst available outcome: every request is then challenged
+ * or unauthorised, the spec fails on an assertion, and the failure is reported
+ * as a defect in the customer's application.
+ */
+export const HEADER_REFUSAL_REASONS = [
+  /** The vault entry the header names is not in this environment. */
+  'MISSING_SECRET',
+  /** A credential-bearing header name carried an inline value. */
+  'INLINE_CREDENTIAL',
+  /** Two configured headers claim the same name, case-insensitively. */
+  'DUPLICATE_NAME',
+  /** SIGNED_BYPASS_HEADER with no header name or no secret name. */
+  'BYPASS_INCOMPLETE',
+  /** The stored shape did not parse, or the name is not a legal header name. */
+  'UNREADABLE',
+] as const;
+export type HeaderRefusalReason = (typeof HEADER_REFUSAL_REASONS)[number];
+
+/** One refused header. Carries NAMES only — never a value, not even truncated. */
+export interface HeaderRefusal {
+  reason: HeaderRefusalReason;
+  /** The header name, or `(all)` when the whole list was unreadable. */
+  header: string;
+  /** The vault entry that was named, when one was. A name, never a value. */
+  secretName: string | null;
+  /** The sentence shown to a customer. Safe by construction: no values reach it. */
+  detail: string;
+  /**
+   * True when this refusal removed the ONLY configured way past a challenge.
+   *
+   * The field exists because the two cases are opposite facts. A missing
+   * `X-Environment: staging` header is a nuisance; a missing bypass credential
+   * means the run is about to measure a challenge page and call it the
+   * application, so it is promoted to a refusal to execute at all.
+   */
+  removesTheBypass: boolean;
+}
+
+export interface ResolvedEnvironmentHeaders {
+  /** Name → value, for a caller that needs the resolved map. */
+  headers: Record<string, string>;
+  refusals: HeaderRefusal[];
+  /** The names that will be sent, for the disclosure line. Never the values. */
+  names: string[];
+  /**
+   * WHERE each header's value comes from, which is what the generated config is
+   * built out of.
+   *
+   * A `literal` is a value `environmentExtraHeaderSchema` has already
+   * guaranteed carries no credential — it refuses an inline value for every
+   * name that holds one by definition — so inlining it in the config is safe.
+   * A `secretName` is a vault reference, and the generated config reads it out
+   * of the CHILD'S OWN ENVIRONMENT, which `childEnv` already fills with
+   * `ctx.secrets` for every run. So a bypass credential is never written to a
+   * file, and no new environment variable exists: the only name read is the
+   * customer's own vault entry, which was already there.
+   */
+  entries: Array<{ name: string; literal: string | null; secretName: string | null }>;
+}
+
+/**
+ * HTTP header names are a restricted token grammar, and these names end up
+ * inside a GENERATED TypeScript file and a child process's environment. The
+ * same regex `environmentExtraHeaderSchema` applies on write is applied here on
+ * read, because `EnvironmentAccess.bypassHeaderName` is a plain column that a
+ * row written outside that schema could hold anything in — and a name with a
+ * newline or a quote in it would either break the generated config or, worse,
+ * not break it.
+ */
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+
+/**
+ * Turn a stored access policy into the headers a run may actually send.
+ *
+ * ── ORDER MATTERS: THE BYPASS IS CLAIMED FIRST ──────────────────────────────
+ *
+ * The bypass header takes its name before the customer's own extra headers are
+ * considered, so an extra header spelled the same way is REFUSED rather than
+ * overwriting it. The other order compiles and is a disaster: a stray
+ * `Authorization: ...` entry would shadow the bypass, every request would be
+ * challenged, and the report would blame the customer's login form.
+ */
+export function resolveEnvironmentHeaders(
+  policy: EnvironmentAccessPolicy,
+  secrets: Readonly<Record<string, string>>,
+): ResolvedEnvironmentHeaders {
+  const headers: Record<string, string> = {};
+  const refusals: HeaderRefusal[] = [];
+  const entries: ResolvedEnvironmentHeaders['entries'] = [];
+  const claimed = new Set<string>();
+
+  const put = (
+    name: string,
+    value: string,
+    from: { literal: string | null; secretName: string | null },
+  ): void => {
+    headers[name] = value;
+    entries.push({ name, ...from });
+    claimed.add(name.toLowerCase());
+  };
+
+  if (policy.bypassMode === 'SIGNED_BYPASS_HEADER') {
+    const name = (policy.bypassHeaderName ?? '').trim();
+    const secretName = (policy.bypassSecretName ?? '').trim();
+    if (!name || !secretName) {
+      refusals.push({
+        reason: 'BYPASS_INCOMPLETE',
+        header: name || '(all)',
+        secretName: secretName || null,
+        detail:
+          'This environment claims a signed bypass header and does not say ' +
+          (name
+            ? 'which vault entry holds its value'
+            : 'which header name your edge accepts') +
+          ', so there is nothing to send.',
+        removesTheBypass: true,
+      });
+    } else if (!HEADER_NAME_RE.test(name)) {
+      refusals.push({
+        reason: 'UNREADABLE',
+        header: name,
+        secretName,
+        detail: `"${name}" is not a legal HTTP header name, so the signed bypass could not be sent.`,
+        removesTheBypass: true,
+      });
+    } else {
+      const value = secrets[secretName];
+      if (value === undefined || value === '') {
+        refusals.push({
+          reason: 'MISSING_SECRET',
+          header: name,
+          secretName,
+          detail:
+            `The signed bypass header ${name} names the vault entry "${secretName}", ` +
+            'which this environment does not hold.',
+          removesTheBypass: true,
+        });
+      } else {
+        put(name, value, { literal: null, secretName });
+      }
+    }
+  }
+
+  const stored = policy.extraHeaders ?? [];
+  if (!Array.isArray(stored)) {
+    refusals.push({
+      reason: 'UNREADABLE',
+      header: '(all)',
+      secretName: null,
+      detail:
+        "This environment's stored extra headers are not a list, so none of them were sent. " +
+        'Re-save them under Environment → Access.',
+      removesTheBypass: false,
+    });
+    return { headers, refusals, names: Object.keys(headers), entries };
+  }
+
+  /*
+   * PER ENTRY, and not one parse of the whole array. `environmentExtraHeaders
+   * Schema` is an array schema and one bad entry fails all of them, which would
+   * cost a customer every working header because of one typo — and the
+   * disclosure would name none of them.
+   */
+  for (const entry of stored) {
+    const parsed = environmentExtraHeaderSchema.safeParse(entry);
+    if (!parsed.success) {
+      const name = typeof (entry as { name?: unknown })?.name === 'string'
+        ? (entry as { name: string }).name
+        : '(all)';
+      /*
+       * The schema's own refinement already refuses an inline value on a
+       * credential-bearing name, so this branch is where that refusal is TOLD
+       * APART from a shape error. Two reasons rather than one because the
+       * remedies differ: one is "move it to the vault", the other is "this row
+       * is malformed".
+       */
+      const inlineCredential =
+        typeof (entry as { value?: unknown })?.value === 'string' &&
+        (SECRET_BEARING_HEADER_NAMES as readonly string[]).includes(name.toLowerCase());
+      refusals.push({
+        reason: inlineCredential ? 'INLINE_CREDENTIAL' : 'UNREADABLE',
+        header: name,
+        secretName: null,
+        detail: inlineCredential
+          ? `${name} carries a credential by definition, so an inline value is refused. ` +
+            'Store it in this environment’s vault and name it in secretName.'
+          : `The stored header ${name === '(all)' ? 'entry' : name} does not parse, so it was not sent.`,
+        removesTheBypass: false,
+      });
+      continue;
+    }
+
+    const header = parsed.data;
+    const lower = header.name.toLowerCase();
+    if (claimed.has(lower)) {
+      refusals.push({
+        reason: 'DUPLICATE_NAME',
+        header: header.name,
+        secretName: header.secretName ?? null,
+        detail:
+          `${header.name} is configured twice on this environment (header names are ` +
+          'case-insensitive). The first one was sent and this one was not.',
+        removesTheBypass: false,
+      });
+      continue;
+    }
+
+    if (header.secretName !== undefined) {
+      const value = secrets[header.secretName];
+      if (value === undefined || value === '') {
+        refusals.push({
+          reason: 'MISSING_SECRET',
+          header: header.name,
+          secretName: header.secretName,
+          detail:
+            `${header.name} names the vault entry "${header.secretName}", which this ` +
+            'environment does not hold.',
+          removesTheBypass: false,
+        });
+        continue;
+      }
+      put(header.name, value, { literal: null, secretName: header.secretName });
+      continue;
+    }
+
+    /*
+     * The second half of the credential guard. `environmentExtraHeaderSchema`
+     * already rejects this combination, so reaching here means the schema was
+     * loosened — and the thing it was guarding is a bearer token written into a
+     * generated file. Kept as a live check rather than a comment for exactly
+     * that reason; `header.value` is defined because the schema's refinement
+     * requires exactly one of the two.
+     */
+    if ((SECRET_BEARING_HEADER_NAMES as readonly string[]).includes(lower)) {
+      refusals.push({
+        reason: 'INLINE_CREDENTIAL',
+        header: header.name,
+        secretName: null,
+        detail:
+          `${header.name} carries a credential by definition, so an inline value is ` +
+          'refused. Store it in this environment’s vault and name it in secretName.',
+        removesTheBypass: false,
+      });
+      continue;
+    }
+    put(header.name, header.value ?? '', { literal: header.value ?? '', secretName: null });
+  }
+
+  return { headers, refusals, names: Object.keys(headers), entries };
+}
+
+/**
+ * The `extraHTTPHeaders` object literal, as TypeScript source for the generated
+ * config.
+ *
+ * ── WHY A CREDENTIAL IS NOT IN THE STRING THIS RETURNS ──────────────────────
+ *
+ * A literal is inlined; a vault-backed value becomes
+ * `process.env[<the vault entry's name>]`, read in the child process that
+ * `childEnv` has already filled with `ctx.secrets`. Two things follow, and both
+ * are the point:
+ *
+ *   · no bypass credential is ever written to a file, so it cannot survive in a
+ *     crash dump, a copied workspace or anything that reads the run directory
+ *     before `cleanup()`;
+ *   · NO NEW ENVIRONMENT VARIABLE EXISTS. The only name read is the customer's
+ *     own vault entry, which the child already received. An extra header
+ *     belongs on a customer-owned row, and this is the whole way down from that
+ *     row to the request.
+ *
+ * Every name goes through `JSON.stringify`, because a header name and a vault
+ * entry name are both customer-controlled strings that become source code here.
+ * The header name is additionally validated against `HEADER_NAME_RE` upstream;
+ * a vault entry name is not constrained at all, which is exactly why it is
+ * quoted rather than interpolated bare.
+ */
+export function extraHttpHeadersSource(
+  entries: ResolvedEnvironmentHeaders['entries'],
+): string {
+  const pairs = entries.map((entry) => {
+    const key = JSON.stringify(entry.name);
+    if (entry.secretName !== null) {
+      return `${key}: process.env[${JSON.stringify(entry.secretName)}]`;
+    }
+    return `${key}: ${JSON.stringify(entry.literal ?? '')}`;
+  });
+  return `{ ${pairs.join(', ')} }`;
+}
+
+/** A run that will not be executed because the environment cannot be reached. */
+export interface BotProtectionRefusal {
+  provider: BotProtectionProvider;
+  /** What the environment's owner has to do, from @qaai/shared. */
+  remedy: string;
+  /** The whole sentence, for `TestExecution.errorMessage`. */
+  message: string;
+}
+
+/**
+ * Should this run be refused before a browser is launched?
+ *
+ * TWO WAYS TO GET HERE, and they are not the same fact:
+ *
+ *   NOTHING CONFIGURED   `reachabilityFromPolicy` says
+ *                        UNREACHABLE_BEHIND_BOT_PROTECTION. The customer has
+ *                        named a provider and no legitimate route past it.
+ *   CONFIGURED, UNUSABLE a bypass mode is set and the header could not be
+ *                        assembled — a missing vault entry, an illegal name.
+ *                        The same wall, with a different remedy, and the one
+ *                        case a naive implementation turns into "we ran it and
+ *                        your app failed".
+ *
+ * NULL when the run may proceed. Null is not a claim that the environment is
+ * reachable: `reachabilityFromPolicy` never returns REACHABLE from
+ * configuration alone, and neither does this.
+ */
+export function botProtectionRefusal(
+  policy: EnvironmentAccessPolicy,
+  refusals: readonly HeaderRefusal[] = [],
+): BotProtectionRefusal | null {
+  const lostBypass = refusals.find((refusal) => refusal.removesTheBypass);
+  if (lostBypass) {
+    const remedy = botProtectionRemedy(policy.provider);
+    return {
+      provider: policy.provider,
+      remedy,
+      /*
+       * Phrased without naming the provider, deliberately. A row can say
+       * SIGNED_BYPASS_HEADER with provider NONE — an inconsistent row a customer
+       * can save — and "sitting behind no bot protection with a signed bypass"
+       * is a sentence that contradicts itself. What is true for every provider
+       * is that a header this environment asked us to send could not be
+       * assembled.
+       */
+      message:
+        `${lostBypass.detail} This environment is configured to send a signed bypass header ` +
+        'and that header could not be assembled, so the spec was NOT executed: every request ' +
+        'would have gone out without it, and the failure would have been reported as a defect ' +
+        'in your application. Nothing was measured. ' +
+        remedy,
+    };
+  }
+
+  const { reachability, remedy } = reachabilityFromPolicy({
+    provider: policy.provider,
+    bypassMode: policy.bypassMode,
+  });
+  if (reachability !== 'UNREACHABLE_BEHIND_BOT_PROTECTION' || !remedy) return null;
+
+  return {
+    provider: policy.provider,
+    remedy,
+    message:
+      `This environment is behind ${policy.provider === 'UNKNOWN' ? 'a bot defence we could not attribute' : policy.provider} ` +
+      'and no test keys, signed bypass header or allowlist is configured for it, so the ' +
+      'spec was NOT executed. Nothing was measured — this is an access problem, not a ' +
+      'result about your application, and it is NOT a statement that the surface behind ' +
+      'the wall is empty. ' +
+      remedy,
+  };
+}
+
+/**
+ * Challenge markers, for ATTRIBUTION ONLY.
+ *
+ * Each entry is a string the provider itself puts on the wire or in its widget
+ * URL, documented by that provider. The list exists so a run that was actually
+ * measuring a challenge page says so with evidence, instead of reporting
+ * REJECTED and blaming our credentials — which is the wrong fault on the wrong
+ * party, the exact attribution error `LOGIN_FAILURE_FAULT` was written for.
+ *
+ * NOTHING HERE DEFEATS A CHALLENGE. There is no entry that is a solver
+ * endpoint, a token format or a cookie to forge; recognising a wall is not
+ * climbing it. The markers are deliberately narrow and literal — a generic
+ * phrase like "access denied" would attribute a WAF to every 403 in the world
+ * and a false attribution is worse than an unattributed one.
+ */
+export const CHALLENGE_SIGNALS: ReadonlyArray<{
+  provider: BotProtectionProvider;
+  /** The literal shown as evidence. */
+  signal: string;
+}> = [
+  { provider: 'TURNSTILE', signal: 'challenges.cloudflare.com' },
+  { provider: 'TURNSTILE', signal: 'cf-mitigated' },
+  { provider: 'RECAPTCHA', signal: 'recaptcha/api2' },
+  { provider: 'RECAPTCHA', signal: 'www.google.com/recaptcha' },
+  { provider: 'HCAPTCHA', signal: 'js.hcaptcha.com' },
+  { provider: 'HCAPTCHA', signal: 'hcaptcha.com/captcha' },
+  { provider: 'WAF', signal: 'x-amzn-waf-action' },
+  { provider: 'WAF', signal: 'awswaf.com' },
+];
+
+/**
+ * The first documented challenge marker in some run output, or null.
+ *
+ * Null means NO MARKER WAS SEEN — not "there was no challenge". The function
+ * reads a failure message and a process's stdout, which is a narrow keyhole: a
+ * challenge that renders without naming its provider leaves nothing to match,
+ * and a detector that guessed in that case would be the lie this is written to
+ * avoid. Challenge CLASSIFICATION proper belongs to the crawl's observer, which
+ * can see response headers; this is the harness reporting what it happened to
+ * have in front of it.
+ */
+export function challengeSignalIn(
+  text: string,
+): { provider: BotProtectionProvider; signal: string } | null {
+  const haystack = text.toLowerCase();
+  for (const candidate of CHALLENGE_SIGNALS) {
+    if (haystack.includes(candidate.signal.toLowerCase())) {
+      return { provider: candidate.provider, signal: candidate.signal };
+    }
+  }
+  return null;
+}
+
+/**
+ * The disclosure appended to a failure whose output carried a challenge marker.
+ *
+ * APPENDED, never substituted: the test really did fail, and the assertion that
+ * failed is still the most useful line in the report. What this adds is that
+ * the thing being asserted on may have been a challenge page rather than the
+ * application — with the marker quoted, so a reader can check the claim.
+ */
+export function challengeNote(seen: {
+  provider: BotProtectionProvider;
+  signal: string;
+}): string {
+  return (
+    `A ${seen.provider} challenge marker ("${seen.signal}") appeared in this run's output, so ` +
+    'the assertions above may have been evaluated against a challenge page rather than ' +
+    'your application. Treat this result as UNDETERMINED until the environment is ' +
+    `reachable. ${botProtectionRemedy(seen.provider)}`
+  );
+}
+
 const CONFIG_TEMPLATE = (opts: {
   baseUrl: string;
   timeoutMs: number;
@@ -255,6 +752,12 @@ const CONFIG_TEMPLATE = (opts: {
    */
   timezoneId?: string | null;
   locale?: string | null;
+  /**
+   * The per-environment headers, as the source {@link extraHttpHeadersSource}
+   * built. A vault-backed value is a `process.env[...]` reference in it and
+   * never the value, so no credential reaches this file.
+   */
+  extraHttpHeaders?: string | null;
 }) => `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
@@ -306,6 +809,16 @@ ${opts.projects
     connectOptions: { wsEndpoint: ${JSON.stringify(opts.gridWsEndpoint)} },`
         : ''
     }
+${
+      opts.extraHttpHeaders
+        ? `
+    // Per-environment headers — the customer's own, plus the signed bypass
+    // header their own edge issues. A credential-bearing value is read from
+    // this process's environment by the name of the vault entry holding it;
+    // nothing about a challenge is solved, replayed or evaded here.
+    extraHTTPHeaders: ${opts.extraHttpHeaders},`
+        : ''
+    }
     trace: 'retain-on-failure',
     video: 'retain-on-failure',
     screenshot: 'only-on-failure',
@@ -320,6 +833,7 @@ async function createWorkspace(
   test: ExecutableTest,
   plan: DeterminismPlan,
   projects?: HarnessOptions['projects'],
+  extraHttpHeaders: string | null = null,
 ): Promise<Workspace> {
   await mkdir(runsRoot, { recursive: true });
   const dir = await mkdtemp(join(runsRoot, 'run-'));
@@ -343,6 +857,7 @@ async function createWorkspace(
       projects,
       timezoneId: plan.determinism.timezoneId,
       locale: plan.determinism.locale,
+      extraHttpHeaders,
     }),
     'utf8',
   );
@@ -394,7 +909,11 @@ interface SpawnOutcome {
   timedOut: boolean;
 }
 
-function runPlaywright(ws: Workspace, ctx: RunContext, plan: DeterminismPlan): Promise<SpawnOutcome> {
+function runPlaywright(
+  ws: Workspace,
+  ctx: RunContext,
+  plan: DeterminismPlan,
+): Promise<SpawnOutcome> {
   return new Promise((resolvePromise) => {
     const d = plan.determinism;
     const child = spawn(cliPath, ['test', '--config', 'playwright.config.ts'], {
@@ -632,6 +1151,17 @@ export interface HarnessOptions {
    * changes what the suite exercises and that is the run owner's decision.
    */
   determinism?: DeterminismOptions;
+  /**
+   * This environment's access row — bot protection, and the headers every
+   * request carries.
+   *
+   * Absent means NOT PROBED, never "nothing is in the way": an environment with
+   * no `EnvironmentAccess` row is one nobody has looked at, and the harness
+   * behaves exactly as it did before this field existed. Passing a policy is
+   * what makes UNREACHABLE_BEHIND_BOT_PROTECTION reachable, and the worker is
+   * the only caller positioned to read the row.
+   */
+  access?: EnvironmentAccessPolicy | null;
 }
 
 /**
@@ -705,6 +1235,34 @@ export function missingRoleSession(
   return null;
 }
 
+/**
+ * Every configured header, said out loud on the result.
+ *
+ * Both halves are reported: the names that WERE sent, and every one that was
+ * not with the reason. A header that quietly went missing is the worst outcome
+ * available here — the run then fails on an assertion and the failure is read
+ * as a defect in the customer's application — so the absence is a line in the
+ * report rather than nothing at all.
+ *
+ * NAMES ONLY. No value, no vault contents, not even truncated: this text is
+ * stored on the TestExecution, exported, and rendered in the cockpit.
+ */
+function headerDisclosures(resolved: ResolvedEnvironmentHeaders): ConsoleEntry[] {
+  const at = new Date().toISOString();
+  const out: ConsoleEntry[] = [];
+  if (resolved.names.length > 0) {
+    out.push({
+      level: 'log',
+      text: `Environment headers sent with every request: ${resolved.names.join(', ')} (values withheld).`,
+      at,
+    });
+  }
+  for (const refusal of resolved.refusals) {
+    out.push({ level: 'warn', text: `Header refused (${refusal.reason}): ${refusal.detail}`, at });
+  }
+  return out;
+}
+
 /** Runs one generated spec file and maps the result into QAAI's shape. */
 export async function runPlaywrightSpec(
   ctx: RunContext,
@@ -739,6 +1297,45 @@ export async function runPlaywrightSpec(
     };
   }
 
+  /*
+   * ── THE ENVIRONMENT'S OWN WALL, BEFORE A BROWSER IS LAUNCHED ──────────────
+   *
+   * Resolved first so a missing bypass credential is known BEFORE the refusal
+   * is decided: a bypass that is configured and unusable is the same wall as
+   * one that was never configured, and the naive implementation runs the spec
+   * anyway and reports the challenge page as a defect in the application.
+   *
+   * No policy at all is NOT_PROBED and changes nothing — `access` absent is the
+   * behaviour this harness had before the field existed.
+   */
+  const access = options.access ?? null;
+  const resolvedHeaders: ResolvedEnvironmentHeaders = access
+    ? resolveEnvironmentHeaders(access, ctx.secrets)
+    : { headers: {}, refusals: [], names: [], entries: [] };
+  const blocked = access ? botProtectionRefusal(access, resolvedHeaders.refusals) : null;
+  if (blocked) {
+    return {
+      testId: test.id,
+      /*
+       * SKIPPED, with the reason — the same call the missing-browser branch
+       * below makes, and for the same reason. FAILED would say the customer's
+       * application is broken; what is true is that we never reached it. A
+       * SKIPPED result does not count as a pass anywhere, so nothing is
+       * inflated by it.
+       */
+      status: 'SKIPPED',
+      durationMs: Date.now() - startedWithoutRole,
+      steps: [],
+      network: options.network ?? [],
+      console: headerDisclosures(resolvedHeaders),
+      videoKey: null,
+      traceKey: null,
+      errorMessage: blocked.message,
+      retriedAndPassed: false,
+      findings: [],
+    };
+  }
+
   const plan = planDeterminism(
     test.code,
     resolveDeterminism(ctx.determinism, options.determinism),
@@ -763,7 +1360,16 @@ export async function runPlaywrightSpec(
       ]
     : [];
 
-  const ws = await createWorkspace(ctx, test, plan, options.projects);
+  const accessConsole = headerDisclosures(resolvedHeaders);
+  const ws = await createWorkspace(
+    ctx,
+    test,
+    plan,
+    options.projects,
+    resolvedHeaders.entries.length > 0
+      ? extraHttpHeadersSource(resolvedHeaders.entries)
+      : null,
+  );
   const startedAt = Date.now();
 
   /** Appends the seed to whatever the failure already said, never replacing it. */
@@ -801,7 +1407,7 @@ export async function runPlaywrightSpec(
         durationMs: Date.now() - startedAt,
         steps: [],
         network: options.network ?? [],
-        console: determinismConsole,
+        console: [...accessConsole, ...determinismConsole],
         videoKey,
         traceKey,
         // No determinism hint here on purpose: nothing was evaluated, so a seed
@@ -823,7 +1429,7 @@ export async function runPlaywrightSpec(
         durationMs: Date.now() - startedAt,
         steps: [],
         network: options.network ?? [],
-        console: determinismConsole,
+        console: [...accessConsole, ...determinismConsole],
         videoKey,
         traceKey,
         errorMessage: withHint(
@@ -869,18 +1475,38 @@ export async function runPlaywrightSpec(
 
     const errorMessage = topLevelError ? stripAnsi(topLevelError) : null;
 
+    /*
+     * Did we spend this run asserting on a challenge page?
+     *
+     * Only asked of a run that did NOT pass, and only ever APPENDED: the
+     * assertion that failed is still the most useful line in the report, and a
+     * marker is evidence about what was on screen rather than a replacement
+     * verdict. `challengeSignalIn` returns null when it saw no documented
+     * marker, which is "we did not see one" and not "there was no challenge" —
+     * the keyhole here is a failure message and a process's stdout.
+     */
+    const seenChallenge =
+      status === 'PASSED'
+        ? null
+        : challengeSignalIn(`${errorMessage ?? ''}\n${combinedOutput}`);
+    const withChallenge = (message: string | null): string | null => {
+      if (!seenChallenge) return message;
+      const note = challengeNote(seenChallenge);
+      return message ? `${message}\n\n${note}` : note;
+    };
+
     return {
       testId: test.id,
       status,
       durationMs: Date.now() - startedAt,
       steps: toStepResults(userSteps, screenshotKeys, failingIndex === -1 ? null : failingIndex),
       network: options.network ?? [],
-      console: [...determinismConsole, ...toConsoleEntries(last)],
+      console: [...accessConsole, ...determinismConsole, ...toConsoleEntries(last)],
       videoKey,
       traceKey,
       // "Your suite fails in THIS order, here is the seed" is the whole feature.
       // A green run does not need it; a red one is useless without it.
-      errorMessage: status === 'PASSED' ? errorMessage : withHint(errorMessage),
+      errorMessage: status === 'PASSED' ? errorMessage : withChallenge(withHint(errorMessage)),
       retriedAndPassed,
       findings: [],
     };

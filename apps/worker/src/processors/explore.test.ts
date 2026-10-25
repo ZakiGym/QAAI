@@ -2,6 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CrawlOutcome, InterstitialFinding } from '@qaai/agent';
 import { EMPTY_FRONTIER, lowerBoundMoreUrls } from '@qaai/shared';
 import type { FlowMap, FlowNode, Frontier } from '@qaai/shared';
+/*
+ * TYPE-ONLY, and that is why it sits with the other static imports rather than
+ * in the dynamic block below: a type import is erased, so it cannot load
+ * ./explore.js before `vi.mock` has replaced the worker context the way a value
+ * import would.
+ */
+import type { RolePassResult } from './explore.js';
 
 /*
  * The worker's context opens Postgres, Redis and the LLM at import time and
@@ -563,5 +570,560 @@ describe('the acceptance chain — a degraded crawl must not move the number', (
     // so it is not entitled to say the route is gone. The denominator comes out
     // too LOW rather than too high, which is the conservative direction.
     expect(result.nodeCount).toBe(3);
+  });
+});
+
+/**
+ * ── HALF THE APP, PER ROLE ──────────────────────────────────────────────────
+ *
+ * Three register items land below, and the tests are shaped around the lies
+ * each one could tell instead of around its happy path:
+ *
+ *   PER-ROLE ENUMERATION      a role whose login failed counted as a role with
+ *                             no extra surface; a role's cost hidden; a
+ *                             degraded role pass allowed into the denominator.
+ *   THE TWO-PASS CRAWL        `behindAuth` false everywhere because a session
+ *                             was supplied, and `requiresRoles` empty because
+ *                             nothing ever wrote it.
+ *   THE ACCESS MATRIX         covered by packages/agent/src/access-matrix.test
+ *                             .ts; what is asserted here is the processor's
+ *                             side of it — which passes may contribute cells at
+ *                             all.
+ *
+ * `processExplore` is still not called: it is a Prisma upsert loop and a queue
+ * enqueue around these decisions. The decisions are where the lies live and
+ * they are all reachable directly, which is why they were extracted.
+ */
+const {
+  MAX_ROLE_PASSES,
+  ROLE_OUTCOME_FOR_LOGIN_FAILURE,
+  adjudicateUnion,
+  loginRoutesFrom,
+  mergeRolePasses,
+  planRolePasses,
+  roleAttemptReport,
+  routesNewToRole,
+  staleRoleAttempts,
+} = await import('./explore.js');
+const { LOGIN_FAILURES } = await import('@qaai/runner');
+const { ANONYMOUS_ROLE } = await import('@qaai/shared');
+
+/** One finished pass, as `runRolePasses` would have produced it. */
+function pass(input: {
+  role: string;
+  routes?: string[];
+  contributed?: boolean;
+  outcome?: string;
+  detail?: string | null;
+  authWallBounces?: number;
+  behindAuthRoutes?: string[];
+  anonymousAllowed?: string[];
+  /**
+   * The state digest this pass's nodes carry. DISTINCT PER PASS is the real
+   * shape: an admin sees different content on /dashboard than a member, so the
+   * two passes produce two STATES of one route and the merge keeps both. With
+   * one shared key the anonymous node always wins the identity slot and the
+   * per-route wall evidence is never exercised — which is exactly how a
+   * mutation that deleted that evidence survived.
+   */
+  stateKey?: string;
+}): RolePassResult {
+  const crawl =
+    input.routes === undefined
+      ? null
+      : (() => {
+          const built = outcomeFor({
+            routes: input.routes,
+            authWallBounces: input.authWallBounces ?? 0,
+          });
+          for (const node of built.flowMap.nodes) {
+            if (input.stateKey !== undefined) node.stateKey = input.stateKey;
+            const walled = (input.behindAuthRoutes ?? []).includes(node.route);
+            const allowed = (input.anonymousAllowed ?? []).includes(node.route);
+            node.behindAuth = walled;
+            node.access = [
+              {
+                role: input.role === ANONYMOUS_ROLE ? null : input.role,
+                outcome: walled ? 'REDIRECTED' : 'ALLOWED',
+                status: walled ? 302 : 200,
+                destinationRoute: walled ? '/login' : null,
+                basis: 'OBSERVED',
+                observedAtIso: '2026-10-24T10:00:00.000Z',
+              },
+            ];
+            if (allowed) node.behindAuth = false;
+          }
+          return built;
+        })();
+  return {
+    identity:
+      input.role === ANONYMOUS_ROLE
+        ? null
+        : {
+            authProfileId: `profile-${input.role}`,
+            profileName: input.role,
+            role: input.role,
+            roleFromName: false,
+            kind: 'FORM_LOGIN',
+          },
+    role: input.role,
+    outcome: input.outcome ?? (crawl === null ? 'LOGIN_FAILED' : 'CRAWLED'),
+    detail: input.detail ?? null,
+    remedy: null,
+    acceptance: null,
+    crawl,
+    contributed: input.contributed ?? crawl !== null,
+    routesReached: (input.contributed ?? crawl !== null) ? (input.routes?.length ?? 0) : null,
+    cappedBy: null,
+    atLeastMoreRoutes: null,
+  } as unknown as RolePassResult;
+}
+
+describe('planRolePasses — the role axis, and what it refuses to claim', () => {
+  const profile = (
+    id: string,
+    name: string,
+    role: string | null,
+    kind: 'FORM_LOGIN' | 'MOCK_IDP' = 'FORM_LOGIN',
+  ) => ({ id, name, kind, role });
+
+  it('plans one pass per declared role', () => {
+    const plan = planRolePasses({
+      profiles: [profile('a', 'Admin login', 'admin'), profile('b', 'Member login', 'member')],
+    });
+
+    expect(plan.identities.map((identity) => identity.role)).toEqual(['admin', 'member']);
+    expect(plan.identities.every((identity) => !identity.roleFromName)).toBe(true);
+  });
+
+  it('falls back to the profile NAME when no role is declared, and says it did', () => {
+    // A null role means "nobody said what this is" and must NOT become the
+    // anonymous visitor. The name is what the crawler has always passed.
+    const plan = planRolePasses({ profiles: [profile('a', 'Ahmad test login', null)] });
+
+    expect(plan.identities[0]?.role).toBe('Ahmad test login');
+    expect(plan.identities[0]?.roleFromName).toBe(true);
+  });
+
+  it('refuses a profile that cannot be attributed to a role at all', () => {
+    // `roleKey('')` is the reserved `<anonymous>` spelling, which is a claim
+    // about a logged-OUT visitor — the opposite of an unlabelled logged-in one.
+    const plan = planRolePasses({ profiles: [profile('a', '   ', null)] });
+
+    expect(plan.identities).toHaveLength(0);
+    expect(plan.skipped[0]?.outcome).toBe('NEVER_ATTEMPTED');
+    expect(plan.skipped[0]?.detail).toContain('claiming it is the anonymous visitor');
+  });
+
+  it('crawls a role ONCE when two profiles are the same role, and discloses the other', () => {
+    const plan = planRolePasses({
+      profiles: [profile('a', 'Admin one', 'admin'), profile('b', 'Admin two', 'admin')],
+    });
+
+    expect(plan.identities).toHaveLength(1);
+    expect(plan.identities[0]?.profileName).toBe('Admin one');
+    // Not a skipped ROLE: the role IS crawled. Recording an attempt for it
+    // would also collide with RoleCrawlAttempt's unique (environment, role).
+    expect(plan.skipped).toHaveLength(0);
+    expect(plan.duplicates[0]).toEqual({
+      role: 'admin',
+      profileName: 'Admin two',
+      keptProfileName: 'Admin one',
+    });
+  });
+
+  it('discloses the cap as a COUNT and a REASON, never as a shorter list', () => {
+    const plan = planRolePasses({
+      profiles: Array.from({ length: 7 }, (_, i) => profile(`p${i}`, `P${i}`, `role-${i}`)),
+      maxRolePasses: 2,
+    });
+
+    expect(plan.identities).toHaveLength(2);
+    expect(plan.disclosure.atLeastMoreRoles).toBe(5);
+    expect(plan.disclosure.cappedBy).toBe('MAX_ROLE_PASSES=2');
+    expect(plan.disclosure.why).toContain('at least 5 more role(s) exist');
+    // Every capped role is still an attempt row with a reason, so none of them
+    // reads as a role with no extra surface.
+    expect(plan.skipped.filter((skip) => skip.outcome === 'SKIPPED_BY_POLICY')).toHaveLength(5);
+  });
+
+  it('states the budget strategy rather than leaving the multiplier to be inferred', () => {
+    const plan = planRolePasses({
+      profiles: [profile('a', 'A', 'admin'), profile('b', 'B', 'member')],
+    });
+
+    expect(plan.disclosure.strategy).toBe('MULTIPLIED');
+    expect(plan.disclosure.passes).toBe(3);
+    expect(plan.disclosure.atLeastMoreRoles).toBeNull();
+    expect(plan.disclosure.why).toContain('FULL page budget');
+    expect(plan.disclosure.why).toContain('3× one crawl');
+  });
+
+  it('does not decide what the login module decides', () => {
+    // MOCK_IDP on production, and a kind with no adapter, are both refused by
+    // `signInWithProfile` — which reports WHICH stage refused with the remedy.
+    // A second opinion here is the duplicate source of truth that made eight
+    // GateRule kinds unsaveable for two slices.
+    const plan = planRolePasses({ profiles: [profile('a', 'SSO', 'admin', 'MOCK_IDP')] });
+    expect(plan.identities.map((identity) => identity.kind)).toEqual(['MOCK_IDP']);
+  });
+
+  it('defaults the cap to MAX_ROLE_PASSES', () => {
+    const plan = planRolePasses({
+      profiles: Array.from({ length: MAX_ROLE_PASSES + 1 }, (_, i) =>
+        profile(`p${i}`, `P${i}`, `role-${i}`),
+      ),
+    });
+    expect(plan.identities).toHaveLength(MAX_ROLE_PASSES);
+    expect(plan.disclosure.atLeastMoreRoles).toBe(1);
+  });
+});
+
+describe('the login verdict becomes the attempt outcome, unmodified', () => {
+  it('maps every LoginFailure, so a tenth kind cannot ship as a bad password', () => {
+    expect(Object.keys(ROLE_OUTCOME_FOR_LOGIN_FAILURE).sort()).toEqual([...LOGIN_FAILURES].sort());
+  });
+
+  it('keeps OURS and THEIRS apart: UNAVAILABLE is not a failed login', () => {
+    expect(ROLE_OUTCOME_FOR_LOGIN_FAILURE.UNAVAILABLE).toBe('LOGIN_UNAVAILABLE');
+    expect(ROLE_OUTCOME_FOR_LOGIN_FAILURE.REJECTED).toBe('LOGIN_FAILED');
+    expect(ROLE_OUTCOME_FOR_LOGIN_FAILURE.BLOCKED).toBe('UNREACHABLE_BEHIND_BOT_PROTECTION');
+    expect(ROLE_OUTCOME_FOR_LOGIN_FAILURE.REFUSED_BY_POLICY).toBe('SKIPPED_BY_POLICY');
+  });
+});
+
+describe('mergeRolePasses — the two facts every node now carries', () => {
+  it('writes requiresRoles for a route no anonymous visitor reached', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/', '/admin'] }),
+    ];
+    const { merged } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    const admin = merged.nodes.find((node) => node.route === '/admin');
+    // The field the crawler has written `[]` into unconditionally since the
+    // beginning, which is why the admin area was ABSENT rather than uncovered.
+    expect(admin?.requiresRoles).toEqual(['admin']);
+    // Empty is the field's documented meaning: reachable logged out.
+    expect(merged.nodes.find((node) => node.route === '/')?.requiresRoles).toEqual([]);
+  });
+
+  it('labels the auth wall from the ANONYMOUS pass, not from the authenticated one', () => {
+    /*
+     * THE DEFECT, exactly. With a valid storageState the crawler is never
+     * bounced, so the authenticated pass's /admin node has `behindAuth: false`
+     * — and before this merge that was the only node there was, which is why
+     * `behindAuth` was false everywhere a profile existed and the product could
+     * not tell a customer where their own wall is.
+     *
+     * The two passes carry DIFFERENT state keys, because an admin sees
+     * different content, so BOTH nodes are in the union and the authenticated
+     * one is the node a test would be generated against.
+     */
+    const passes = [
+      pass({
+        role: ANONYMOUS_ROLE,
+        routes: ['/', '/admin'],
+        behindAuthRoutes: ['/admin'],
+        stateKey: 'logged-out',
+      }),
+      pass({ role: 'admin', routes: ['/', '/admin'], stateKey: 'admin-shell' }),
+    ];
+    const { merged, report } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    const admin = merged.nodes.filter((node) => node.route === '/admin');
+    expect(admin).toHaveLength(2);
+    // The authenticated node — the one that was NOT bounced — is marked from
+    // the anonymous pass's evidence about the same route.
+    const authenticated = admin.find((node) => node.stateKey.includes('admin-shell'));
+    expect(authenticated).toBeDefined();
+    expect(authenticated?.behindAuth).toBe(true);
+    expect(admin.every((node) => node.behindAuth)).toBe(true);
+    expect(report.nodesBehindAuth).toBe(2);
+  });
+
+  it('does NOT assert a route is public when the anonymous pass never probed it', () => {
+    // False is the field's DEFAULT, not a measurement. A route only the admin
+    // pass reached keeps its own pass's value rather than being flipped either
+    // way on evidence nobody gathered.
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'], stateKey: 'logged-out' }),
+      pass({
+        role: 'admin',
+        routes: ['/', '/admin/billing'],
+        behindAuthRoutes: ['/admin/billing'],
+        stateKey: 'admin-shell',
+      }),
+    ];
+    const { merged } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    const billing = merged.nodes.find((node) => node.route === '/admin/billing');
+    expect(billing?.behindAuth).toBe(true);
+    // And the honest half: it is attributed to the role that reached it, which
+    // is what puts it in the denominator at all.
+    expect(billing?.requiresRoles).toEqual(['admin']);
+  });
+
+  it('carries BOTH cells for a node two identities reached', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/'] }),
+    ];
+    const { merged } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    // ONE node, two access cells: was it reachable anonymously, and was it
+    // reachable authenticated. Two nodes would double the denominator for
+    // every shared page, which on a real application is most of them.
+    expect(merged.nodes.filter((node) => node.route === '/')).toHaveLength(1);
+    expect(merged.nodes[0]?.access?.map((cell) => cell.role)).toEqual([null, 'admin']);
+  });
+
+  it('lets NO node or cell in from a pass that did not contribute', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({
+        role: 'admin',
+        routes: ['/', '/admin', '/admin/billing'],
+        contributed: false,
+        outcome: 'CRAWLED',
+        detail: 'held as REJECTED: a bot challenge was classified',
+      }),
+    ];
+    const { merged, report, probes } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    expect(merged.nodes.map((node) => node.route)).toEqual(['/']);
+    expect(report.rolesRefused).toBe(1);
+    const admin = probes.find((probe) => probe.role === 'admin');
+    expect(admin?.contributed).toBe(false);
+    expect(admin?.observations).toEqual([]);
+    expect(admin?.detail).toContain('bot challenge');
+  });
+
+  it('counts the surface that was previously absent', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/', '/pricing'] }),
+      pass({ role: 'admin', routes: ['/', '/admin', '/admin/billing'] }),
+    ];
+    const { report } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+
+    expect(report.routesOnlyAuthenticated).toBe(2);
+    expect(report.routesOnlyAnonymous).toBe(1);
+    expect(report.rolesContributing).toBe(2);
+  });
+
+  it('gives a journey the role it was walked as', () => {
+    const passes = [pass({ role: 'admin', routes: ['/'] })];
+    const { merged } = mergeRolePasses(passes, passes[0]!.crawl!.flowMap);
+    for (const journey of merged.journeys) expect(journey.roles).toEqual(['admin']);
+  });
+});
+
+describe('routesNewToRole — the number that must be NULL rather than 0', () => {
+  it('counts the routes only this role reached', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/', '/admin', '/admin/billing'] }),
+    ];
+    expect(routesNewToRole(passes[1]!, passes)).toBe(2);
+    expect(routesNewToRole(passes[0]!, passes)).toBe(0);
+  });
+
+  it('is NULL for a role whose crawl never ran, not 0', () => {
+    // 0 would license "this role sees nothing extra", which is the fabrication
+    // the attempt table exists to prevent.
+    const passes = [pass({ role: ANONYMOUS_ROLE, routes: ['/'] }), pass({ role: 'admin' })];
+    expect(routesNewToRole(passes[1]!, passes)).toBeNull();
+  });
+
+  it('ignores a held pass when deciding what is shared', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/admin'] }),
+      pass({ role: 'ghost', routes: ['/admin'], contributed: false, outcome: 'CRAWLED' }),
+    ];
+    // Without the filter the bot wall's page would make /admin look shared and
+    // the admin pass would report 0 new routes.
+    expect(routesNewToRole(passes[1]!, passes)).toBe(1);
+  });
+});
+
+describe('adjudicateUnion — the shrink test belongs to the union', () => {
+  it('does not hold an anonymous pass against an authenticated baseline', () => {
+    // 412 routes behind a login means the anonymous pass SHOULD be a fraction
+    // of the accepted map. Adjudicating each pass against the baseline would
+    // report the one pass that finds the wall as a collapse, every time.
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/', '/a', '/b', '/c', '/d', '/e', '/f', '/g', '/h', '/i'] }),
+    ];
+    const acceptance = adjudicateUnion({
+      passes,
+      nodeCount: 11,
+      previous: { version: 4, nodeCount: 11 },
+    });
+    expect(acceptance.state).toBe('ACCEPTED');
+  });
+
+  it('holds the union when it collapsed against the last accepted map', () => {
+    const passes = [pass({ role: ANONYMOUS_ROLE, routes: ['/'] })];
+    const acceptance = adjudicateUnion({
+      passes,
+      nodeCount: 1,
+      previous: { version: 9, nodeCount: 412 },
+    });
+    expect(acceptance.state).not.toBe('ACCEPTED');
+    expect(acceptance.degradations.map((entry) => entry.kind)).toContain('SHRANK');
+  });
+
+  it('sums the degradation counts across contributing passes', () => {
+    const throttled = pass({ role: 'admin', routes: ['/'] });
+    throttled.crawl!.degradationCounts.throttledCount = 3;
+    const passes = [pass({ role: ANONYMOUS_ROLE, routes: ['/'] }), throttled];
+
+    const acceptance = adjudicateUnion({ passes, nodeCount: 1, previous: null });
+    expect(acceptance.degradations.find((entry) => entry.kind === 'RATE_LIMITED')?.count).toBe(3);
+  });
+
+  it('is NOT tainted by a pass that contributed nothing', () => {
+    const held = pass({ role: 'ghost', routes: ['/'], contributed: false, outcome: 'CRAWLED' });
+    held.crawl!.interstitial = {
+      kind: 'BOT_CHALLENGE',
+      signals: [],
+      blocksEnumeration: true,
+      reason: 'a challenge answered',
+      degradation: null,
+    } as unknown as InterstitialFinding;
+    const passes = [pass({ role: ANONYMOUS_ROLE, routes: ['/', '/pricing'] }), held];
+
+    // The wall never got into the union, so it has nothing to taint. A
+    // conservative hold here would let one bad profile block a good
+    // denominator.
+    expect(adjudicateUnion({ passes, nodeCount: 2, previous: null }).state).toBe('ACCEPTED');
+  });
+
+  it('IS held when a CONTRIBUTING pass met a blocking wall', () => {
+    const contributing = pass({ role: ANONYMOUS_ROLE, routes: ['/'] });
+    contributing.crawl!.interstitial = {
+      kind: 'BOT_CHALLENGE',
+      signals: [],
+      blocksEnumeration: true,
+      reason: 'a challenge answered every URL',
+      degradation: null,
+    } as unknown as InterstitialFinding;
+
+    expect(
+      adjudicateUnion({ passes: [contributing], nodeCount: 1, previous: null }).state,
+    ).not.toBe('ACCEPTED');
+  });
+});
+
+describe('loginRoutesFrom — the wall is measured, not configured', () => {
+  it('reads the wall off the anonymous pass’s bounces', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/', '/admin'], behindAuthRoutes: ['/admin'] }),
+    ];
+    expect(loginRoutesFrom(passes)).toContain('/login');
+  });
+
+  it('ignores an authenticated pass, which by definition is not bounced', () => {
+    const passes = [
+      pass({ role: 'admin', routes: ['/admin'], behindAuthRoutes: ['/admin'] }),
+    ];
+    expect(loginRoutesFrom(passes)).toEqual([]);
+  });
+
+  it('ignores a held anonymous pass, whose bounces are evidence about the crawl', () => {
+    const passes = [
+      pass({
+        role: ANONYMOUS_ROLE,
+        routes: ['/admin'],
+        behindAuthRoutes: ['/admin'],
+        contributed: false,
+        outcome: 'CRAWLED',
+      }),
+    ];
+    expect(loginRoutesFrom(passes)).toEqual([]);
+  });
+});
+
+describe('staleRoleAttempts — a row for a deleted profile describes the past', () => {
+  const row = (role: string, outcome: string, at: string | null) => ({
+    role,
+    outcome: outcome as Parameters<typeof staleRoleAttempts>[0][number]['outcome'],
+    attemptedAt: at === null ? null : new Date(at),
+  });
+
+  it('names a stored role this environment can no longer be', () => {
+    // The table is upserted per (environment, role), so deleting the profile
+    // leaves a CRAWLED row with route counts on it rendering as current.
+    const stale = staleRoleAttempts(
+      [row('admin', 'CRAWLED', '2026-03-01T00:00:00.000Z'), row('member', 'CRAWLED', null)],
+      [ANONYMOUS_ROLE, 'member'],
+    );
+
+    expect(stale.map((entry) => entry.role)).toEqual(['admin']);
+    expect(stale[0]?.why).toContain('no longer has');
+    expect(stale[0]?.why).toContain('2026-03-01');
+  });
+
+  it('says nothing about a role that was crawled this round', () => {
+    expect(
+      staleRoleAttempts([row('admin', 'CRAWLED', null)], [ANONYMOUS_ROLE, 'admin']),
+    ).toEqual([]);
+  });
+
+  it('includes a role whose pass FAILED this round only if it is gone entirely', () => {
+    // A role that failed is still a role we have an identity for, and its fresh
+    // attempt row is the current truth. Calling that stale would bury the
+    // failure under a staleness note about itself.
+    expect(staleRoleAttempts([row('admin', 'LOGIN_FAILED', null)], ['admin'])).toEqual([]);
+  });
+});
+
+describe('roleAttemptReport — the one answer that must be allowed to be NULL', () => {
+  it('answers NO-extra-surface only for a crawl that actually finished', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/'] }),
+    ];
+    const report = roleAttemptReport(passes[1]!, passes);
+
+    expect(report.routesNewToThisRole).toBe(0);
+    expect(report.hadNoExtraSurface).toBe(true);
+  });
+
+  it('REFUSES to answer for a capped crawl that found nothing new', () => {
+    /*
+     * The tempting local version — `routesNewToThisRole === 0` — says TRUE
+     * here, and the routes this pass did not reach are exactly the ones in
+     * question. "We could not finish crawling as admin" and "admin sees nothing
+     * extra" are opposite sentences.
+     */
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/'], outcome: 'CRAWLED_PARTIAL' }),
+    ];
+    const report = roleAttemptReport(passes[1]!, passes);
+
+    expect(report.routesNewToThisRole).toBe(0);
+    expect(report.hadNoExtraSurface).toBeNull();
+  });
+
+  it('still answers YES-it-found-extra for a capped crawl, because finding is positive', () => {
+    const passes = [
+      pass({ role: ANONYMOUS_ROLE, routes: ['/'] }),
+      pass({ role: 'admin', routes: ['/', '/admin'], outcome: 'CRAWLED_PARTIAL' }),
+    ];
+    expect(roleAttemptReport(passes[1]!, passes).hadNoExtraSurface).toBe(false);
+  });
+
+  it('REFUSES to answer for a role whose login failed', () => {
+    const passes = [pass({ role: ANONYMOUS_ROLE, routes: ['/'] }), pass({ role: 'admin' })];
+    const report = roleAttemptReport(passes[1]!, passes);
+
+    expect(report.hadNoExtraSurface).toBeNull();
+    expect(report.routesNewToThisRole).toBeNull();
+    expect(report.routesReached).toBeNull();
+    expect(report.outcome).toBe('LOGIN_FAILED');
   });
 });

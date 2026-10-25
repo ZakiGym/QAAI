@@ -8,13 +8,39 @@
  */
 
 import { Router } from 'express';
+import { CronExpressionParser } from 'cron-parser';
+import { z } from 'zod';
 import {
+  AUTH_PROFILE_KINDS,
   FIXTURE_PREFIX,
   QUEUE_NAMES,
+  RE_ENUMERATION_TRIGGER_KINDS,
   SURFACE_DIMENSION_KINDS,
   approvePlanSchema,
+  driftCountsAreMeaningful,
+  newSurfaceWithoutTests,
+  triggerHasRun,
 } from '@qaai/shared';
-import type { FlowMap, SurfaceDimensionKind, TestType } from '@qaai/shared';
+import type {
+  EnvironmentKind,
+  FlowMap,
+  ReEnumerationRunState,
+  SurfaceDimensionKind,
+  TestType,
+} from '@qaai/shared';
+import {
+  AUTH_PROFILE_CAPABILITIES,
+  AUTH_PROFILE_KIND_LABELS,
+  ROLE_CRAWL_FAULT,
+  authAdapterUnavailable,
+  authProfileKindRefusedOn,
+  botProtectionSchema,
+  environmentExtraHeadersSchema,
+  isRouteAccessMeasured,
+  reachabilityFromPolicy,
+  roleHadNoExtraSurface,
+} from '@qaai/shared';
+import { loginCapabilities } from '@qaai/runner';
 import {
   applyHealDiff,
   auditTestsAgainstCrawl,
@@ -43,13 +69,348 @@ import {
 } from '../lib/crawl-store.js';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { env } from '../env.js';
-import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
+import { badRequest, conflict, notFound, unauthorized, unprocessable } from '../lib/errors.js';
+import { webhookSignatureMatches } from '../lib/github-app.js';
+import { logger } from '../lib/logger.js';
+import { open as openSecret } from '../lib/vault.js';
 import { enqueue } from '../lib/queues.js';
 import { audit } from '../lib/audit.js';
 import { subscribe } from '../lib/events.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
 
 export const agentRouter: Router = Router();
+
+/**
+ * One re-enumeration trigger, as a client may send it.
+ *
+ * Declared HERE and not in packages/shared/src/schemas.ts, which is where
+ * `approvePlanSchema` and its neighbours live and where this belongs — that
+ * file is owned by another change this round. Same shape of borrowing as
+ * `ANALYZE_SOURCE_QUEUE` in apps/worker/src/queues.ts, and the same handover:
+ * move it beside the other request schemas so the cockpit can validate a
+ * trigger form against the same shape the route parses.
+ */
+const reEnumerationTriggerSchema = z.object({
+  name: z.string().min(1).max(100),
+  kind: z.enum(RE_ENUMERATION_TRIGGER_KINDS),
+  enabled: z.boolean().default(true),
+  /** SCHEDULE only. Validated against the real parser by the route. */
+  cron: z.string().min(1).max(200).optional(),
+  timezone: z.string().min(1).max(100).optional(),
+  /** DEPLOY only. A `Secret.name` REFERENCE — never a value. */
+  webhookSecretName: z.string().min(1).max(200).optional(),
+});
+
+// ─── Re-enumeration, drift, and the authorization axis ───────────────────────
+
+/**
+ * THE DEFECT THIS SECTION CLOSES.
+ *
+ * Four tables landed in this round with a worker that writes them and no
+ * request path that could reach them:
+ *
+ *   ReEnumerationTrigger  only SCHEDULE could fire. A CI step and a deploy
+ *                         webhook had nowhere to POST, so a CI or DEPLOY
+ *                         trigger sat at NEVER_RUN forever — and there was no
+ *                         endpoint to CREATE a trigger with either, so on a
+ *                         real install the nightly sweep correctly found
+ *                         nothing and reported nothing.
+ *   SurfaceDriftRecord    computed, stored, auditable, and on no screen.
+ *   RouteAccessCell       the route x role matrix, visible only inside one
+ *   RoleCrawlAttempt      run-finished event payload.
+ *   EnvironmentAccess     nothing read or wrote it at all, so an application
+ *                         behind reCAPTCHA or a WAF had no way to tell us how
+ *                         to get in and no way to be told why its coverage was
+ *                         zero.
+ *
+ * "A trigger that exists in the schema and cannot be fired from any request
+ * path" is this codebase's signature defect, and every read below is written so
+ * an EMPTY table reports as "nobody has looked" rather than as a clean result.
+ */
+
+/**
+ * How many access cells one read returns, and the ceiling is disclosed.
+ *
+ * routes x roles is multiplicative: 412 routes and 5 roles is ~2,000 rows, and
+ * a large environment with declared roles can be several times that. One row
+ * past the limit is fetched so the response can say "at least N more existed"
+ * instead of presenting a truncated matrix as the whole one — the same shape
+ * `FlowMap.truncatedReason`/`atLeastMoreUrls` and `RoleCrawlAttempt.cappedBy`/
+ * `atLeastMoreRoutes` use, because it is the same obligation.
+ */
+export const ACCESS_CELL_LIMIT = 2_000;
+
+/** Drift records per read. The feed is "most recent first", not a full history. */
+export const SURFACE_DRIFT_LIMIT = 50;
+
+/**
+ * How long an inbound deploy-webhook signature is accepted for.
+ *
+ * Five minutes. Long enough for a CI runner with a slow clock, short enough
+ * that a captured request is not a standing key. Replay INSIDE the window is
+ * bounded by the trigger claim below rather than by this: a second delivery of
+ * the same signed request finds `lastRunState` already RUNNING and is refused
+ * with `another caller claimed this trigger first`, so the worst a replay
+ * achieves is one crawl the customer's own deploy asked for anyway.
+ */
+export const RE_ENUMERATION_WEBHOOK_SKEW_MS = 5 * 60_000;
+
+/**
+ * The exact bytes a deploy webhook's signature is computed over.
+ *
+ * ── WHY THE BODY IS NOT IN IT, AND WHY THAT IS SAFE HERE ────────────────────
+ *
+ * An HMAC must cover the exact bytes the sender hashed, and `express.raw()` is
+ * mounted only under `/webhooks` (see apps/api/src/index.ts) — this router is
+ * mounted at `/`, so by the time a handler here runs the body has been parsed
+ * and the original bytes are gone. Re-serialising the parsed object and hashing
+ * THAT is the tempting move and it is a forgery waiting to happen: key order,
+ * number formatting and unicode escaping all differ, so the check would either
+ * fail on honest callers or be loosened until it passed.
+ *
+ * So this route takes NO BODY. Everything that decides what happens is in the
+ * path and the headers, and all of it is signed: the project, the environment,
+ * the trigger name and the timestamp. There is no unsigned input, which is a
+ * stronger property than "the body was signed too" and is the reason the
+ * endpoint is shaped this way rather than the shape being a compromise.
+ */
+export function reEnumerationWebhookMessage(input: {
+  projectId: string;
+  environmentId: string;
+  triggerName: string;
+  timestamp: string;
+}): string {
+  return [
+    'qaai.re-enumerate.v1',
+    input.projectId,
+    input.environmentId,
+    input.triggerName,
+    input.timestamp,
+  ].join('\n');
+}
+
+/**
+ * Claim a trigger and ask for a crawl — the API's half of
+ * `fireReEnumeration` in apps/worker/src/processors/schedule.ts.
+ *
+ * ── WHY THIS IS A SECOND COPY AND NOT AN IMPORT ─────────────────────────────
+ *
+ * `fireReEnumeration` is exported and takes its producer as an argument
+ * precisely so every caller claims identically. It still cannot be imported
+ * here: `processors/schedule.ts` imports `../context.js` and `../queues.js`,
+ * both of which run at module load — the worker's own Prisma client, and ten
+ * `new Queue(...)` handles on the worker's Redis connection. Importing it into
+ * an Express route would stand all of that up inside the API process. The
+ * house precedent for exactly this is in apps/worker/src/queues.ts, which
+ * states that `apps/api/src/lib/plan.ts` and `vault.ts` are DUPLICATED into the
+ * worker "precisely because they are not" pure modules. Same call, other
+ * direction.
+ *
+ * What makes the duplication safe is that the race is arbitrated by POSTGRES,
+ * not by sharing a function: the `where` clause below pins `lastRunAt` and
+ * `lastRunState` to the row as it was read, so two callers that saw the same
+ * row produce exactly one crawl however many processes they live in. The
+ * extraction that would remove the copy is named in this round's handover.
+ *
+ * ── NO jobId, DELIBERATELY ──────────────────────────────────────────────────
+ *
+ * `POST /explore` above enqueues with no job id either, and here it matters
+ * more: this API's `enqueue` retains completed jobs for 24 hours, and BullMQ
+ * SILENTLY DROPS an `add` whose job id matches a retained job — measured, see
+ * the note on `enqueueExplore` in apps/worker/src/queues.ts. A per-project job
+ * id here would make a CI trigger fire once a day at most while reporting
+ * success every time. The trigger claim IS the lock, and it is a better one: it
+ * is per trigger, it is in the same database as the row that records the
+ * outcome, and it cannot be swallowed.
+ */
+async function claimTriggerAndCrawl(
+  trigger: {
+    id: string;
+    orgId: string;
+    projectId: string;
+    environmentId: string;
+    lastRunAt: Date | null;
+    lastRunState: ReEnumerationRunState;
+  },
+  now: Date,
+): Promise<{ fired: true } | { fired: false; why: string }> {
+  /*
+   * CAPTURED BEFORE THE CLAIM, because these two values are what the release
+   * path below restores. Reading them off `trigger` afterwards works only as
+   * long as nothing aliases the row the claim just wrote, and a release that
+   * "restores" RUNNING leaves the trigger stuck forever — which then reports as
+   * a crawl that failed, which reads as a fact about the customer's
+   * application. Two locals cost nothing and make the rollback independent of
+   * where the caller's object came from.
+   */
+  const previousState = trigger.lastRunState;
+  const previousRunAt = trigger.lastRunAt;
+
+  const claimed = await prisma.reEnumerationTrigger.updateMany({
+    where: { id: trigger.id, lastRunAt: previousRunAt, lastRunState: { not: 'RUNNING' } },
+    data: { lastRunState: 'RUNNING', lastRunAt: now },
+  });
+  if (claimed.count === 0) return { fired: false, why: 'another caller claimed this trigger first' };
+
+  try {
+    await enqueue(
+      QUEUE_NAMES.explore,
+      {
+        orgId: trigger.orgId,
+        projectId: trigger.projectId,
+        environmentId: trigger.environmentId,
+        requestedBy: `re-enumeration:${trigger.id}`,
+        /*
+         * ZERO IS NOT A PLACEHOLDER. The explore processor reads a non-positive
+         * budget as "no caller override" and lets `Environment.crawlPolicy`
+         * decide, clamped by the plan. A re-enumeration's whole job is to
+         * refresh the denominator at the width the customer configured; a
+         * hard-coded 60 here would re-enumerate a 412-route application as 60
+         * routes and call the difference drift.
+         */
+        maxPages: 0,
+        maxDepth: 0,
+        /* An unattended crawl that also approved tests is an autopilot nobody asked for. */
+        autoApprove: false,
+      },
+      { attempts: 1 },
+    );
+    return { fired: true };
+  } catch {
+    /*
+     * RELEASE the claim. A trigger left RUNNING against a crawl that was never
+     * queued waits out the worker's run timeout and is then recorded FAILED —
+     * which reads as a fact about the customer's application. A queue that
+     * would not take the job is a fact about US.
+     */
+    await prisma.reEnumerationTrigger
+      .updateMany({
+        where: { id: trigger.id, lastRunState: 'RUNNING' },
+        data: { lastRunState: previousState, lastRunAt: previousRunAt },
+      })
+      .catch(() => {});
+    return { fired: false, why: 'the crawl could not be queued' };
+  }
+}
+
+/**
+ * Fire a deploy trigger from the customer's own CD pipeline.
+ *
+ * REGISTERED BEFORE `agentRouter.use(requireAuth)` — a deploy hook carries no
+ * session cookie, and its authentication is the signature over
+ * {@link reEnumerationWebhookMessage}, checked against the `Secret` row the
+ * trigger NAMES. A name and never a value, and deliberately not an environment
+ * variable: one env var would arm one answer for every environment in the
+ * install at once.
+ *
+ * Nothing is logged from here but the trigger id and the outcome. Not the
+ * signature, not the secret, not the header.
+ */
+agentRouter.post(
+  '/projects/:projectId/environments/:environmentId/re-enumerate/webhook',
+  async (req, res) => {
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    const triggerName = String(req.header('x-qaai-trigger') ?? '').trim();
+    const timestamp = String(req.header('x-qaai-timestamp') ?? '').trim();
+    const signature = req.header('x-qaai-signature');
+    if (!triggerName || !timestamp) {
+      throw badRequest('x-qaai-trigger and x-qaai-timestamp are required');
+    }
+
+    const sentAt = Number.isFinite(Date.parse(timestamp)) ? Date.parse(timestamp) : null;
+    if (sentAt === null) throw badRequest('x-qaai-timestamp must be an ISO-8601 instant');
+    const now = new Date();
+    if (Math.abs(now.getTime() - sentAt) > RE_ENUMERATION_WEBHOOK_SKEW_MS) {
+      // Not 401: the caller is probably right and their clock is wrong, and a
+      // skew error that reads as a bad secret sends them to the wrong fix.
+      throw badRequest(
+        `This request is signed for ${timestamp}, which is more than ` +
+          `${RE_ENUMERATION_WEBHOOK_SKEW_MS / 60_000} minutes from now. Check the clock on the ` +
+          'machine that sent it.',
+      );
+    }
+
+    /*
+     * Unscoped, like POST /webhooks/github: the caller has no session, so there
+     * is no tenant scope to read the row under. Ownership is then re-checked
+     * against the path, and nothing is acted on before the signature verifies.
+     */
+    const trigger = await unscoped(() =>
+      prisma.reEnumerationTrigger.findUnique({
+        where: { environmentId_name: { environmentId, name: triggerName } },
+        select: {
+          id: true,
+          orgId: true,
+          projectId: true,
+          environmentId: true,
+          kind: true,
+          enabled: true,
+          webhookSecretName: true,
+          lastRunAt: true,
+          lastRunState: true,
+        },
+      }),
+    );
+    if (!trigger || trigger.projectId !== projectId) throw notFound('Re-enumeration trigger');
+    if (trigger.kind !== 'DEPLOY') {
+      throw unprocessable(
+        `"${triggerName}" is a ${trigger.kind} trigger. Only a DEPLOY trigger is fired by this webhook.`,
+      );
+    }
+    if (!trigger.webhookSecretName) {
+      throw unprocessable(
+        `"${triggerName}" has no webhook secret, so an inbound request cannot be authenticated. ` +
+          "Store the shared secret in this environment's vault and name it on the trigger.",
+      );
+    }
+
+    const secretRow = await unscoped(() =>
+      prisma.secret.findUnique({
+        where: { environmentId_name: { environmentId, name: trigger.webhookSecretName as string } },
+        select: { name: true, valueEnc: true, keyVersion: true },
+      }),
+    );
+    let secret: string | null = null;
+    if (secretRow) {
+      try {
+        secret = openSecret(secretRow.valueEnc, secretRow.keyVersion, trigger.orgId, secretRow.name);
+      } catch {
+        /* sealed under a retired key: unavailable, and treated as absent below */
+      }
+    }
+    if (!secret) {
+      throw unprocessable(
+        `The vault entry "${trigger.webhookSecretName}" named by "${triggerName}" is not readable ` +
+          'on this environment, so the request could not be authenticated.',
+      );
+    }
+
+    const message = reEnumerationWebhookMessage({
+      projectId,
+      environmentId,
+      triggerName,
+      timestamp,
+    });
+    if (!webhookSignatureMatches(Buffer.from(message, 'utf8'), signature, secret)) {
+      // Refuse rather than accept an unverified write, exactly as the GitHub
+      // App webhook does. No detail: a signature error that explains itself is
+      // an oracle.
+      throw unauthorized('Bad webhook signature');
+    }
+    if (!trigger.enabled) {
+      res.json({ fired: false, why: 'the trigger is disabled' });
+      return;
+    }
+
+    const outcome = await claimTriggerAndCrawl(trigger, now);
+    logger.info(
+      { triggerId: trigger.id, projectId, fired: outcome.fired },
+      're-enumeration deploy webhook',
+    );
+    res.status(outcome.fired ? 202 : 200).json(outcome);
+  },
+);
 
 agentRouter.use(requireAuth);
 
@@ -1257,3 +1618,657 @@ agentRouter.get('/projects/:projectId/drift', async (req, res) => {
 
 // Chat lives in routes/copilot.ts — it outgrew this file the moment it
 // gained tools and an approval gate.
+
+// ─── Re-enumeration triggers, drift and the access matrix (authenticated) ────
+
+/** Resolves an environment inside a project, or 404s. Four endpoints below need it. */
+async function environmentInProject(
+  projectId: string,
+  environmentId: string,
+): Promise<{ id: string; orgId: string; projectId: string; kind: EnvironmentKind; baseUrl: string }> {
+  const environment = await prisma.environment.findUnique({
+    where: { id: environmentId },
+    select: { id: true, orgId: true, projectId: true, kind: true, baseUrl: true },
+  });
+  if (!environment || environment.projectId !== projectId) throw notFound('Environment');
+  return environment;
+}
+
+/**
+ * The re-enumeration triggers on an environment, and whether each has ever run.
+ *
+ * `hasRun` comes from `triggerHasRun` and not from `lastRunAt != null`, because
+ * the two can disagree and only one of them is the question being asked. A
+ * NEVER_RUN trigger must render as "this environment has never been
+ * re-enumerated on a schedule" — never as "no drift", which is what a blank
+ * lastRunAt invites.
+ */
+agentRouter.get(
+  '/projects/:projectId/environments/:environmentId/re-enumeration',
+  async (req, res) => {
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    await environmentInProject(projectId, environmentId);
+
+    const rows = await prisma.reEnumerationTrigger.findMany({
+      where: { environmentId },
+      orderBy: [{ kind: 'asc' }, { name: 'asc' }],
+      select: {
+        id: true,
+        name: true,
+        kind: true,
+        enabled: true,
+        cron: true,
+        timezone: true,
+        /* The NAME of the vault entry. Never the value, and never the value's length. */
+        webhookSecretName: true,
+        lastRunState: true,
+        lastRunAt: true,
+        lastFailureMessage: true,
+        consecutiveFailures: true,
+        createdAt: true,
+      },
+    });
+
+    res.json({
+      triggers: rows.map((row) => ({
+        ...row,
+        hasRun: triggerHasRun(row.lastRunState),
+        /*
+         * The sentence, computed once here so three screens cannot each invent
+         * their own. "No drift" is not among the possible answers: this endpoint
+         * reports whether a comparison has EVER been made, and the comparison's
+         * result lives on SurfaceDriftRecord.
+         */
+        staleness: triggerHasRun(row.lastRunState)
+          ? row.consecutiveFailures > 0
+            ? `This trigger has failed ${row.consecutiveFailures} run(s) in a row, so the surface may not have been re-enumerated since before then.`
+            : null
+          : 'This environment has never been re-enumerated by this trigger. That is not a statement that nothing has changed — no comparison has been made.',
+      })),
+      /*
+       * An empty list is NOT "nothing is stale". It is "nobody has set up
+       * re-enumeration", which is the state of every install before this
+       * endpoint existed, and the only crawl trigger was a human pressing a
+       * button.
+       */
+      why: rows.length === 0
+        ? 'No re-enumeration trigger exists for this environment, so the only thing that refreshes its denominator is somebody pressing Crawl. Nothing is watching for drift.'
+        : null,
+    });
+  },
+);
+
+/**
+ * Create or update one trigger.
+ *
+ * Upserted on `@@unique([environmentId, name])`, which is also what the deploy
+ * webhook resolves by — so a customer who re-saves a trigger keeps the URL
+ * their CD pipeline already posts to.
+ *
+ * ── THE FIELDS THAT ARE REFUSED RATHER THAN DEFAULTED ───────────────────────
+ *
+ * `cron`/`timezone` are SCHEDULE-only and are stored NULL for every other kind.
+ * The tempting default is `* * * * *`, and a scheduler would obey it. A CI
+ * trigger with a cron is a trigger that fires on a timer the customer did not
+ * ask for.
+ *
+ * `webhookSecretName` is DEPLOY-only and is a `Secret.name` reference. The
+ * endpoint refuses a name with no matching vault entry: a DEPLOY trigger whose
+ * secret does not exist is a webhook that will reject every delivery, and
+ * finding that out at deploy time is worse than finding it out here.
+ */
+agentRouter.put(
+  '/projects/:projectId/environments/:environmentId/re-enumeration',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    const environment = await environmentInProject(projectId, environmentId);
+    const input = reEnumerationTriggerSchema.parse(req.body);
+
+    if (input.kind === 'SCHEDULE' && !input.cron) {
+      throw unprocessable('A SCHEDULE trigger needs a cron expression; nothing would ever fire it.');
+    }
+    if (input.cron) {
+      try {
+        CronExpressionParser.parse(input.cron, { tz: input.timezone ?? 'UTC' });
+      } catch {
+        throw badRequest(`"${input.cron}" is not a cron expression this scheduler can read.`);
+      }
+    }
+    if (input.kind === 'DEPLOY' && !input.webhookSecretName) {
+      throw unprocessable(
+        'A DEPLOY trigger is fired by an inbound request, so it needs a shared secret to ' +
+          "authenticate it. Store one in this environment's vault and name it here.",
+      );
+    }
+    if (input.webhookSecretName) {
+      const exists = await prisma.secret.findUnique({
+        where: { environmentId_name: { environmentId, name: input.webhookSecretName } },
+        select: { id: true },
+      });
+      if (!exists) {
+        throw unprocessable(
+          `This environment has no vault entry called "${input.webhookSecretName}", so every ` +
+            'inbound delivery would be rejected. Add the secret first.',
+        );
+      }
+    }
+
+    const scheduled = input.kind === 'SCHEDULE';
+    const trigger = await prisma.reEnumerationTrigger.upsert({
+      where: { environmentId_name: { environmentId, name: input.name } },
+      create: {
+        orgId: environment.orgId,
+        projectId,
+        environmentId,
+        name: input.name,
+        kind: input.kind,
+        enabled: input.enabled,
+        cron: scheduled ? (input.cron ?? null) : null,
+        timezone: scheduled ? (input.timezone ?? 'UTC') : null,
+        webhookSecretName: input.kind === 'DEPLOY' ? (input.webhookSecretName ?? null) : null,
+      },
+      update: {
+        kind: input.kind,
+        enabled: input.enabled,
+        cron: scheduled ? (input.cron ?? null) : null,
+        timezone: scheduled ? (input.timezone ?? 'UTC') : null,
+        webhookSecretName: input.kind === 'DEPLOY' ? (input.webhookSecretName ?? null) : null,
+      },
+      select: { id: true, name: true, kind: true, enabled: true, lastRunState: true },
+    });
+
+    await audit({
+      actor,
+      action: 'surface.re_enumeration.configured',
+      targetType: 'Environment',
+      targetId: environmentId,
+      /* The secret's NAME is metadata; its value is never read here at all. */
+      metadata: { triggerId: trigger.id, name: trigger.name, kind: trigger.kind, enabled: trigger.enabled },
+    });
+    res.json({ trigger });
+  },
+);
+
+/**
+ * Fire a CI or MANUAL trigger now.
+ *
+ * A CI step POSTs this with the session of a machine user; a person pressing
+ * "Re-enumerate" hits the same route. SCHEDULE and DEPLOY are refused here on
+ * purpose — each has exactly one way in, and a trigger that can be fired by two
+ * mechanisms has a `lastRunAt` that answers "when did the schedule last run"
+ * incorrectly forever.
+ */
+agentRouter.post(
+  '/projects/:projectId/environments/:environmentId/re-enumerate',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    await environmentInProject(projectId, environmentId);
+    const triggerName = String(req.body?.triggerName ?? '').trim();
+    if (!triggerName) throw badRequest('triggerName is required');
+
+    const trigger = await prisma.reEnumerationTrigger.findUnique({
+      where: { environmentId_name: { environmentId, name: triggerName } },
+      select: {
+        id: true,
+        orgId: true,
+        projectId: true,
+        environmentId: true,
+        kind: true,
+        enabled: true,
+        lastRunAt: true,
+        lastRunState: true,
+      },
+    });
+    if (!trigger) throw notFound('Re-enumeration trigger');
+    if (trigger.kind !== 'CI' && trigger.kind !== 'MANUAL') {
+      throw unprocessable(
+        `"${triggerName}" is a ${trigger.kind} trigger. A SCHEDULE trigger is fired by the ` +
+          "worker's tick and a DEPLOY trigger by its signed webhook; firing it from here as " +
+          'well would make its last-run time mean two different things.',
+      );
+    }
+    if (!trigger.enabled) {
+      res.json({ fired: false, why: 'the trigger is disabled' });
+      return;
+    }
+
+    const outcome = await claimTriggerAndCrawl(trigger, new Date());
+    await audit({
+      actor,
+      action: 'surface.re_enumeration.fired',
+      targetType: 'Environment',
+      targetId: environmentId,
+      metadata: {
+        triggerId: trigger.id,
+        kind: trigger.kind,
+        fired: outcome.fired,
+        /* Countable. A message is not. */
+        why: outcome.fired ? null : outcome.why,
+      },
+    });
+    res.status(outcome.fired ? 202 : 200).json(outcome);
+  },
+);
+
+/**
+ * What changed between the last two crawls of this environment.
+ *
+ * ── THE HEADLINE NUMBER IS READ THROUGH THE PREDICATE, NEVER OFF THE COLUMN ──
+ *
+ * `newSurfaceWithoutTests(record)` returns NULL for every non-comparison AND
+ * for a COMPARABLE row whose column is null — that row is a writer bug, and a 0
+ * there would hide it behind a green tick. So the response carries the
+ * predicate's answer under `newSurfaceWithoutTests` and the raw column is not
+ * sent at all: a client cannot read a number this endpoint refused to report.
+ *
+ * `detail.routesRemoved === null` means removals were REFUSED because the crawl
+ * disclosed truncation — not that there were none — which is why
+ * `removalsRefusedBecause` is lifted out of `detail` into its own field.
+ */
+agentRouter.get(
+  '/projects/:projectId/environments/:environmentId/surface-drift',
+  async (req, res) => {
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    await environmentInProject(projectId, environmentId);
+
+    const rows = await prisma.surfaceDriftRecord.findMany({
+      where: { environmentId },
+      orderBy: [{ comparedAt: 'desc' }, { createdAt: 'desc' }],
+      take: SURFACE_DRIFT_LIMIT,
+      select: {
+        id: true,
+        currentFlowMapId: true,
+        baselineFlowMapId: true,
+        comparability: true,
+        routesAdded: true,
+        routesRemoved: true,
+        routesChanged: true,
+        controlsAdded: true,
+        controlsRemoved: true,
+        newSurfaceWithoutTests: true,
+        detail: true,
+        comparedAt: true,
+        createdAt: true,
+        producedByTrigger: { select: { id: true, name: true, kind: true } },
+      },
+    });
+
+    const records = rows.map((row) => {
+      const detail = (row.detail ?? null) as Record<string, unknown> | null;
+      const truncation = (detail?.truncation ?? null) as Record<string, unknown> | null;
+      const comparable = driftCountsAreMeaningful(row.comparability);
+      return {
+        id: row.id,
+        currentFlowMapId: row.currentFlowMapId,
+        baselineFlowMapId: row.baselineFlowMapId,
+        comparability: row.comparability,
+        /* The only number anyone acts on, and only when it was measured. */
+        newSurfaceWithoutTests: newSurfaceWithoutTests(row),
+        /*
+         * The rest of the counts, each NULL unless the comparison happened.
+         * Passed through the same gate rather than spread off the row, so a
+         * writer that filled a count on an uncomparable record cannot publish
+         * it.
+         */
+        counts: comparable
+          ? {
+              routesAdded: row.routesAdded,
+              routesRemoved: row.routesRemoved,
+              routesChanged: row.routesChanged,
+              controlsAdded: row.controlsAdded,
+              controlsRemoved: row.controlsRemoved,
+            }
+          : null,
+        /* Why the counts are null, in the customer's terms. */
+        why: (detail?.why ?? null) as string | null,
+        testednessUnmeasuredBecause: (detail?.testednessUnmeasuredBecause ?? null) as string | null,
+        /* A null removal count means REFUSED, not zero. */
+        removalsRefusedBecause: (truncation?.removalsRefusedBecause ?? null) as string | null,
+        detail,
+        comparedAt: row.comparedAt,
+        createdAt: row.createdAt,
+        trigger: row.producedByTrigger,
+      };
+    });
+
+    res.json({
+      records,
+      /*
+       * EMPTY IS NOT "NO DRIFT". Nothing has compared two crawls of this
+       * environment — which is the state the cockpit already implied was
+       * impossible, because the schema and the UI both claimed versions were
+       * diffed and no diff code existed.
+       */
+      why: records.length === 0
+        ? 'No crawl of this environment has ever been compared to another one, so nothing is known about drift. This is NOT a report that nothing changed.'
+        : null,
+      cappedBy: rows.length === SURFACE_DRIFT_LIMIT ? `the newest ${SURFACE_DRIFT_LIMIT} comparisons` : null,
+    });
+  },
+);
+
+/**
+ * The authorization axis, and whether this environment can be reached at all.
+ *
+ * Three facts that only make sense together:
+ *
+ *   reachability   from `EnvironmentAccess`. The ABSENCE of the row is
+ *                  NOT_PROBED — nobody has looked — and is reported as such
+ *                  rather than as "nothing is blocking us".
+ *   roles          one `RoleCrawlAttempt` per role. A role whose login FAILED
+ *                  and a role with no extra surface are opposite facts, and
+ *                  `roleHadNoExtraSurface` returns null rather than letting the
+ *                  second be inferred from the first.
+ *   cells          route x role. NOT_PROBED cells are returned WITH the rest
+ *                  and counted separately, because the measured fraction of the
+ *                  authorization denominator is the number that makes the rest
+ *                  of it readable.
+ *
+ * An empty matrix means NOBODY HAS PROBED THE AUTHORIZATION AXIS. It never
+ * means this application has no role restrictions.
+ */
+agentRouter.get('/projects/:projectId/environments/:environmentId/access', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const environmentId = String(req.params.environmentId);
+  await environmentInProject(projectId, environmentId);
+
+  const [access, attempts, cells, cellCount] = await Promise.all([
+    prisma.environmentAccess.findUnique({
+      where: { environmentId },
+      select: {
+        provider: true,
+        bypassMode: true,
+        bypassHeaderName: true,
+        /* The NAME of the vault entry, never its value. */
+        bypassSecretName: true,
+        extraHeaders: true,
+        reachability: true,
+        remedy: true,
+        observedSignal: true,
+        observedAt: true,
+      },
+    }),
+    prisma.roleCrawlAttempt.findMany({
+      where: { environmentId },
+      orderBy: { role: 'asc' },
+      select: {
+        role: true,
+        authProfileId: true,
+        outcome: true,
+        detail: true,
+        remedy: true,
+        attemptedAt: true,
+        routesReached: true,
+        routesNewToThisRole: true,
+        cappedBy: true,
+        atLeastMoreRoutes: true,
+      },
+    }),
+    prisma.routeAccessCell.findMany({
+      where: { environmentId },
+      orderBy: [{ routeTemplate: 'asc' }, { role: 'asc' }],
+      /* One past the limit, so the response can say "at least N more existed". */
+      take: ACCESS_CELL_LIMIT + 1,
+      select: {
+        routeTemplate: true,
+        role: true,
+        outcome: true,
+        basis: true,
+        status: true,
+        finalUrl: true,
+        probedAt: true,
+      },
+    }),
+    prisma.routeAccessCell.count({ where: { environmentId } }),
+  ]);
+
+  const shown = cells.slice(0, ACCESS_CELL_LIMIT);
+  const measured = shown.filter((cell) => isRouteAccessMeasured(cell)).length;
+
+  res.json({
+    /*
+     * NO ROW IS NOT_PROBED. A row with provider NONE would be a CLAIM that
+     * nothing is in the way; the absence of a row is the honest "nobody has
+     * looked", and `reachabilityFromPolicy` never returns REACHABLE from
+     * configuration alone either.
+     */
+    access: access
+      ? { ...access, extraHeaderNames: extraHeaderNamesOf(access.extraHeaders) }
+      : null,
+    reachability: access?.reachability ?? 'NOT_PROBED',
+    reachabilityWhy: access
+      ? access.remedy
+      : 'Nobody has probed this environment for bot protection. That is not a report that nothing is blocking us.',
+    roles: attempts.map((attempt) => ({
+      ...attempt,
+      fault: ROLE_CRAWL_FAULT[attempt.outcome],
+      /*
+       * NULL whenever the question cannot be answered — a login that failed, a
+       * crawl that never ran, or a capped crawl that happened to find nothing
+       * new. A reader that gets null must render the outcome instead; "admin
+       * sees nothing extra" is the dangerous sentence this prevents.
+       */
+      hadNoExtraSurface: roleHadNoExtraSurface(attempt),
+    })),
+    cells: shown,
+    counts: {
+      total: cellCount,
+      shown: shown.length,
+      /* Only OBSERVED, non-NOT_PROBED, non-ERRORED cells are a measurement. */
+      measured,
+      notMeasured: shown.length - measured,
+    },
+    cappedBy:
+      cellCount > ACCESS_CELL_LIMIT
+        ? `the ${ACCESS_CELL_LIMIT}-cell page size for this read`
+        : null,
+    atLeastMoreCells: cellCount > ACCESS_CELL_LIMIT ? cellCount - ACCESS_CELL_LIMIT : null,
+    why:
+      cellCount === 0
+        ? 'Nobody has probed the authorization axis on this environment. This is NOT a report that the application has no role restrictions.'
+        : null,
+  });
+});
+
+/**
+ * Tell QAAI how to reach an environment that sits behind a bot defence.
+ *
+ * ── RULE 9, IN CODE ─────────────────────────────────────────────────────────
+ *
+ * Every value this endpoint accepts describes something the OWNER of the
+ * environment did on their OWN system: they configured their non-production
+ * site with the provider's published test keys, they issue a header their own
+ * edge accepts, or they allowlisted us. There is no field for a solver, a
+ * challenge token or a captured response, and `reachabilityFromPolicy` is the
+ * only thing that decides reachability — it never returns REACHABLE from
+ * configuration alone, so saving this form cannot make an environment claim to
+ * be reachable.
+ *
+ * A bypass value is stored ONLY as `bypassSecretName`, a `Secret.name`
+ * reference, and `environmentExtraHeadersSchema` refuses an inline value for
+ * any header that carries a credential by definition. Nothing in the request is
+ * logged.
+ */
+agentRouter.put(
+  '/projects/:projectId/environments/:environmentId/access',
+  requireRole('ADMIN'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+    const environment = await environmentInProject(projectId, environmentId);
+
+    const policy = botProtectionSchema.parse(req.body?.botProtection ?? {});
+    const extraHeaders =
+      req.body?.extraHeaders === undefined
+        ? undefined
+        : environmentExtraHeadersSchema.parse(req.body.extraHeaders);
+
+    /* Every named vault entry must exist, or the header silently never sends. */
+    for (const name of [
+      policy.bypassSecretName,
+      ...(extraHeaders ?? []).map((header) => header.secretName),
+    ]) {
+      if (!name) continue;
+      const exists = await prisma.secret.findUnique({
+        where: { environmentId_name: { environmentId, name } },
+        select: { id: true },
+      });
+      if (!exists) {
+        throw unprocessable(
+          `This environment has no vault entry called "${name}". A header that names a missing ` +
+            'secret is not sent at all, and the run then fails on an assertion and reports it ' +
+            "as a defect in your application. Add the secret first.",
+        );
+      }
+    }
+
+    const { reachability, remedy } = reachabilityFromPolicy(policy);
+    const row = {
+      provider: policy.provider,
+      bypassMode: policy.bypassMode,
+      bypassHeaderName: policy.bypassHeaderName ?? null,
+      bypassSecretName: policy.bypassSecretName ?? null,
+      /*
+       * `undefined` LEAVES THE COLUMN ALONE, and that is not the same as `[]`.
+       * Null means nobody configured headers; `[]` means somebody looked and
+       * chose none. Defaulting to `[]` here would erase a decision.
+       */
+      ...(extraHeaders === undefined ? {} : { extraHeaders }),
+      reachability,
+      remedy,
+      observedSignal: policy.observedSignal ?? null,
+    };
+
+    const saved = await prisma.environmentAccess.upsert({
+      where: { environmentId },
+      create: { orgId: environment.orgId, environmentId, ...row },
+      update: row,
+      select: {
+        provider: true,
+        bypassMode: true,
+        bypassHeaderName: true,
+        bypassSecretName: true,
+        extraHeaders: true,
+        reachability: true,
+        remedy: true,
+      },
+    });
+
+    await audit({
+      actor,
+      action: 'environment.access.configured',
+      targetType: 'Environment',
+      targetId: environmentId,
+      /* Provider, mode and header NAMES. No value, and no secret contents. */
+      metadata: {
+        provider: saved.provider,
+        bypassMode: saved.bypassMode,
+        bypassHeaderName: saved.bypassHeaderName,
+        bypassSecretName: saved.bypassSecretName,
+        extraHeaderNames: extraHeaderNamesOf(saved.extraHeaders),
+        reachability: saved.reachability,
+      },
+    });
+    res.json({
+      access: { ...saved, extraHeaderNames: extraHeaderNamesOf(saved.extraHeaders) },
+      /*
+       * Said out loud on the write, because the thing a customer expects after
+       * saving this form is "we can get in now" and that is NOT what was
+       * recorded. Configuration is not a measurement.
+       */
+      note: 'Saved. Reachability is still a configuration, not a measurement: the next crawl is what probes it.',
+    });
+  },
+);
+
+/** The header NAMES on a stored access row. Never the values, for any caller. */
+function extraHeaderNamesOf(stored: unknown): string[] {
+  if (!Array.isArray(stored)) return [];
+  return stored
+    .map((entry) => (typeof (entry as { name?: unknown })?.name === 'string' ? (entry as { name: string }).name : null))
+    .filter((name): name is string => name !== null);
+}
+
+/**
+ * Which auth profile kinds this install can actually honour.
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * `AUTH_PROFILE_KINDS` grew from five members to eight, so the cockpit offers
+ * PASSKEY, PHONE_OTP and MOCK_IDP. A kind the UI offers and the login module
+ * cannot perform is the same defect as eight GateRule kinds that shipped
+ * unsaveable — the customer configures it, stores it, and gets nothing with no
+ * explanation. This endpoint is the explanation, in advance.
+ *
+ * ── WHERE THE CAPABILITY ANSWER COMES FROM, AND WHY IT IS A FLOOR ───────────
+ *
+ * `loginCapabilities(surfaces)` turns the surfaces a caller supplies into the
+ * capability set `authAdapterUnavailable` answers from. Both call sites of
+ * `signInWithProfile` in this repo — apps/worker/src/processors/run.ts and
+ * .../explore.ts — supply NO surfaces, so `loginCapabilities({})` is the set
+ * the worker genuinely has today, not an assumption. It is reported as a FLOOR
+ * rather than a measurement anyway: the API does not run logins, and a worker
+ * image that later injects a mailbox or a CDP session would have more. A floor
+ * can only under-promise, which is the safe direction for this particular
+ * sentence.
+ */
+agentRouter.get('/auth-profile-kinds', async (req, res) => {
+  const environmentId = typeof req.query.environmentId === 'string' ? req.query.environmentId : null;
+  const environment = environmentId
+    ? await prisma.environment.findUnique({
+        where: { id: environmentId },
+        select: { id: true, kind: true },
+      })
+    : null;
+  if (environmentId && !environment) throw notFound('Environment');
+
+  const stored = environment
+    ? await prisma.authProfile.groupBy({
+        by: ['kind'],
+        where: { environmentId: environment.id },
+        _count: { _all: true },
+      })
+    : [];
+  const counts = new Map(stored.map((row) => [row.kind, row._count._all]));
+  const capabilities = loginCapabilities({});
+
+  res.json({
+    capabilitiesPresent: capabilities,
+    kinds: AUTH_PROFILE_KINDS.map((kind) => {
+      const unavailable = authAdapterUnavailable(kind, capabilities);
+      return {
+        kind,
+        label: AUTH_PROFILE_KIND_LABELS[kind],
+        requires: AUTH_PROFILE_CAPABILITIES[kind],
+        /*
+         * UNAVAILABLE with every missing capability and a remedy, or null. Null
+         * is "nothing is missing", not "this definitely works" — the login
+         * itself can still be MISCONFIGURED or REJECTED, which are different
+         * failures with different faults.
+         */
+        unavailable,
+        /*
+         * MOCK_IDP on PRODUCTION mints an assertion, which is forging a real
+         * identity. Reported here so the form can refuse before a credential is
+         * typed, and refused again in the login module itself.
+         */
+        refusedHere: environment ? authProfileKindRefusedOn(kind, environment.kind) : null,
+        storedCount: counts.get(kind) ?? 0,
+      };
+    }),
+    /*
+     * The honest caveat on the whole answer. A kind reported available here can
+     * still be unavailable on the runner that picks the job up.
+     */
+    note: 'This is the capability FLOOR for this install, read from the sign-in path as it is configured today. A runner with a mailbox, an OTP sink, a CDP session or a mock issuer attached can honour more.',
+  });
+});

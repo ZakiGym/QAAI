@@ -14,7 +14,7 @@ import {
   PLAN_LIMITS,
   SECRET_MASK,
   SPEC_DRIVEN_TEST_TYPES,
-  authProfileConfigSchema,
+  AUTH_PROFILE_CONFIG_SCHEMAS,
   authProfileSchema,
   createEnvironmentSchema,
   createProjectSchema,
@@ -57,7 +57,7 @@ import { open as openSecret, seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
 import { pushRepo, repoHttpsUrl } from '../lib/git.js';
-import { performCookieInjection, performFormLogin, performSsoToken } from '@qaai/runner';
+import { signInWithProfile } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { canCreateProject, planFor } from '../lib/plan.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
@@ -1578,7 +1578,7 @@ projectsRouter.post(
 
     // Validate the config against its kind, so a FORM_LOGIN missing its
     // password selector fails here rather than halfway through a browser run.
-    const perKind = authProfileConfigSchema[input.kind];
+    const perKind = AUTH_PROFILE_CONFIG_SCHEMAS[input.kind];
     const parsed = perKind.safeParse(input.config);
     if (!parsed.success) {
       throw badRequest(
@@ -1659,7 +1659,14 @@ projectsRouter.post(
 
     const environment = await prisma.environment.findUnique({
       where: { id: profile.environmentId },
-      select: { id: true, baseUrl: true },
+      /*
+       * `kind` is read for `SignInContext.environmentKind`, which is required
+       * with no default: `signInWithProfile` refuses MOCK_IDP on PRODUCTION —
+       * minting an assertion against a real system is forging a real identity
+       * — and a refusal that depends on a caller remembering an argument is not
+       * a refusal.
+       */
+      select: { id: true, baseUrl: true, kind: true },
     });
     if (!environment) throw notFound('Environment');
 
@@ -1682,7 +1689,7 @@ projectsRouter.post(
      * per-kind validation, and driving a browser with a half-formed config
      * fails in a way nobody can read.
      */
-    const shape = authProfileConfigSchema[profile.kind];
+    const shape = AUTH_PROFILE_CONFIG_SCHEMAS[profile.kind];
     const parsedConfig = shape.safeParse(profile.config);
     if (!parsedConfig.success) {
       throw unprocessable(
@@ -1692,29 +1699,28 @@ projectsRouter.post(
       );
     }
 
-    const result =
-      profile.kind === 'FORM_LOGIN'
-        ? await performFormLogin(
-            parsedConfig.data as Parameters<typeof performFormLogin>[0],
-            secrets,
-            environment.baseUrl,
-          )
-        : profile.kind === 'COOKIE_INJECTION'
-          ? performCookieInjection(
-              parsedConfig.data as Parameters<typeof performCookieInjection>[0],
-              secrets,
-            )
-          : profile.kind === 'SSO_BYPASS_TOKEN'
-            ? performSsoToken(
-                parsedConfig.data as Parameters<typeof performSsoToken>[0],
-                secrets,
-              )
-            : {
-                ok: false,
-                storageState: null,
-                message: `${profile.kind} needs the mail catcher / TOTP support that is not built yet — use FORM_LOGIN, COOKIE_INJECTION or SSO_BYPASS_TOKEN.`,
-                expiresAt: null,
-              };
+    /*
+     * ── ONE DISPATCH, NOT A THIRD COPY OF IT ─────────────────────────────────
+     *
+     * This route used to hold its own `kind ===` ladder over three of the
+     * kinds, with a fallback sentence naming "the mail catcher / TOTP support
+     * that is not built yet". Both halves had gone false: TOTP_MFA and
+     * MAGIC_LINK have adapters, and three further kinds now exist that the
+     * ladder had never heard of and would have answered for anyway. A branch
+     * that answers for a kind it does not know is exactly the defect the
+     * capability vocabulary was built to end.
+     *
+     * `signInWithProfile` refuses in three ordered stages — policy, then
+     * capability, then config — so a kind this PROCESS cannot drive comes back
+     * UNAVAILABLE with the remedy for the surface that is missing, rather than
+     * as a claim about the customer's application. The per-kind branch now
+     * exists once, next to the functions it dispatches to.
+     */
+    const result = await signInWithProfile(
+      { id: profile.id, name: profile.name, kind: profile.kind, config: parsedConfig.data },
+      secrets,
+      { environmentKind: environment.kind, baseUrl: environment.baseUrl },
+    );
 
     if (result.ok) {
       await prisma.authProfile.update({

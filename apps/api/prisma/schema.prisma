@@ -62,12 +62,186 @@ enum SsoProtocol {
   OIDC
 }
 
+/// How QAAI signs in. Mirrors AUTH_PROFILE_KINDS in
+/// packages/shared/src/constants.ts; `check:enums` diffs them.
+///
+/// The last three are this round's. Five existed and
+/// `signInWithProfile` honoured THREE — MAGIC_LINK and TOTP_MFA were storable
+/// and unperformable, and the endpoint answered "not built yet" — so an
+/// application whose only way in is harder than a form had zero enumerable
+/// authenticated surface. `AUTH_PROFILE_CONFIG_SCHEMAS`,
+/// `AUTH_PROFILE_CAPABILITIES` and `AUTH_PROFILE_KIND_LABELS` in
+/// packages/shared/src/auth-profiles.ts are each keyed on this union, so a
+/// ninth member cannot ship storable-but-unperformable again.
+///
+/// TOTP_MFA is deliberately NOT renamed to TOTP: renaming a stored enum member
+/// is a data migration over every profile row, bought for four characters.
 enum AuthProfileKind {
   FORM_LOGIN
   MAGIC_LINK
   SSO_BYPASS_TOKEN
   COOKIE_INJECTION
   TOTP_MFA
+  PASSKEY
+  PHONE_OTP
+  MOCK_IDP
+}
+
+/// What one role got when it asked for one route. Mirrors
+/// ROUTE_ACCESS_OUTCOMES in packages/shared/src/auth-profiles.ts.
+///
+/// A REFINEMENT of `ACCESS_OUTCOMES` in flow-map.ts and not a restatement of
+/// it: four coarse outcomes are the right grain for walking a graph and the
+/// wrong grain for a row somebody queries, because "which routes 403 for a
+/// member" and "which routes 404 for a member" are both DENIED there and are
+/// different facts here — a 404 hides a resource, a 403 confirms it exists.
+/// `ACCESS_OUTCOME_TO_ROUTE_ACCESS` states the correspondence under the
+/// compiler's supervision.
+///
+/// NOT_PROBED is the honesty value: nobody asked. The column carrying it has
+/// NO DEFAULT for that reason — see RouteAccessCell.outcome.
+enum RouteAccessOutcome {
+  ALLOWED
+  FORBIDDEN
+  REDIRECTED_TO_LOGIN
+  REDIRECTED_ELSEWHERE
+  NOT_FOUND
+  ERRORED
+  NOT_PROBED
+}
+
+/// Whether we asked, or a source told us. Mirrors ROUTE_ACCESS_BASES, which is
+/// in turn pinned to `RouteAccess['basis']` in flow-map.ts by a presence
+/// record the compiler enforces.
+///
+/// Not interchangeable, and the difference is the product: a DECLARED
+/// restriction the application does not actually enforce is the defect, and
+/// counting a declaration as a measurement is how "we checked" gets said about
+/// a check nobody ran.
+enum RouteAccessBasis {
+  OBSERVED
+  DECLARED
+}
+
+/// What became of the attempt to enumerate as one role. Mirrors
+/// ROLE_CRAWL_OUTCOMES in packages/shared/src/auth-profiles.ts.
+///
+/// This enum exists to stop one sentence: "the admin crawl found no routes a
+/// member cannot see." That is a finding if the admin crawl RAN and a
+/// fabrication if the admin login FAILED, and both produce zero rows. Zero
+/// rows is the most dangerous output this product has, so the attempt is
+/// stored and `roleHadNoExtraSurface` returns NULL unless it succeeded.
+///
+/// LOGIN_UNAVAILABLE is ours to fix (no adapter for the kind); LOGIN_FAILED is
+/// theirs (wrong credential, stale success locator). Opposite facts.
+enum RoleCrawlOutcome {
+  NEVER_ATTEMPTED
+  LOGIN_UNAVAILABLE
+  LOGIN_FAILED
+  UNREACHABLE_BEHIND_BOT_PROTECTION
+  SKIPPED_BY_POLICY
+  CRAWLED_PARTIAL
+  CRAWLED
+}
+
+/// What is standing in front of the login form. Mirrors
+/// BOT_PROTECTION_PROVIDERS in packages/shared/src/auth-profiles.ts.
+///
+/// Named providers and not a boolean, because the legitimate route in differs
+/// per provider — reCAPTCHA and Turnstile publish a test-key mode, a WAF wants
+/// an allowlist instead — and a customer who picks theirs gets the exact
+/// remedy. UNKNOWN means a challenge was observed and not attributed, which is
+/// emphatically NOT `NONE`: NONE is a claim that nothing is in the way.
+enum BotProtectionProvider {
+  NONE
+  RECAPTCHA
+  HCAPTCHA
+  TURNSTILE
+  WAF
+  OTHER
+  UNKNOWN
+}
+
+/// The three legitimate ways past a challenge, and the fourth state that is
+/// not one. Mirrors BOT_BYPASS_MODES in packages/shared/src/auth-profiles.ts.
+///
+/// Every member is an action the OWNER of the environment took on their own
+/// system: their test keys on their own non-production site, their signed
+/// header accepted by their own edge, their allowlist. There is no solver and
+/// there must never be a fifth member that is one.
+///
+/// NOT_CONFIGURED is the default and is what produces
+/// UNREACHABLE_BEHIND_BOT_PROTECTION — a state rather than an absence, because
+/// a null here would render as "no bot protection", which is the opposite of
+/// true and leaves a customer staring at zero coverage with no reason beside
+/// it.
+enum BotBypassMode {
+  NOT_CONFIGURED
+  PROVIDER_TEST_KEYS
+  SIGNED_BYPASS_HEADER
+  ALLOWLISTED_BY_CUSTOMER
+}
+
+/// Whether an environment can be reached at all. Mirrors
+/// ENVIRONMENT_REACHABILITIES in packages/shared/src/auth-profiles.ts.
+///
+/// NOT_PROBED must never render as REACHABLE: an environment presumed
+/// reachable is an environment whose zero coverage looks like a testing failure
+/// instead of an access problem. Deliberately narrow — a box that is simply
+/// down is `ENVIRONMENT_UNAVAILABLE_PREFIX` on Run.errorMessage, and folding
+/// the two would make "your WAF blocked us" and "your staging server is off"
+/// the same sentence.
+enum EnvironmentReachability {
+  REACHABLE
+  UNREACHABLE_BEHIND_BOT_PROTECTION
+  NOT_PROBED
+}
+
+/// What can cause the surface to be enumerated again. Mirrors
+/// RE_ENUMERATION_TRIGGER_KINDS in packages/shared/src/constants.ts.
+///
+/// The only trigger that exists today is a human clicking a button. Schedule
+/// and Monitor can each only run a SUITE, so the denominator goes stale on its
+/// own and the coverage percentage RISES when the application grows — the
+/// numerator is unchanged and the denominator is the one we measured in March.
+/// It fails silently and in the flattering direction, which is the worst
+/// failure available to a product whose claim is the denominator.
+enum ReEnumerationTriggerKind {
+  SCHEDULE
+  CI
+  DEPLOY
+  MANUAL
+}
+
+/// How a trigger's last run went. Mirrors RE_ENUMERATION_RUN_STATES in
+/// packages/shared/src/constants.ts.
+///
+/// NEVER_RUN is the default on insert, and that is the whole reason this is an
+/// enum and not a nullable timestamp: a trigger that has never fired must read
+/// as NEVER_RUN and never as "no drift". A dashboard that renders a null
+/// `lastRunAt` as a clean bill of health is the exact lie.
+enum ReEnumerationRunState {
+  NEVER_RUN
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+}
+
+/// Whether two crawls could be compared at all. Mirrors
+/// SURFACE_DRIFT_COMPARABILITIES in packages/shared/src/constants.ts.
+///
+/// `FlowMap.version` exists, the cockpit implies versions are diffed, and no
+/// diff code exists anywhere in the repo — so four new routes with zero tests
+/// produce no event at all. Three of these four members are ways for "no
+/// drift" to be UNSAYABLE, and only COMPARABLE makes the counts mean anything
+/// (`driftCountsAreMeaningful`). Everything else reports the reason instead of
+/// a zero.
+enum SurfaceDriftComparability {
+  COMPARABLE
+  UNCOMPARABLE_NO_BASELINE
+  UNCOMPARABLE_BASELINE_NOT_ACCEPTED
+  NOT_COMPARED
 }
 
 enum TestType {
@@ -633,13 +807,18 @@ model Project {
   /// apps/api/src/routes/runners.ts and reported THIS table as "read by
   /// runners.ts", which would have made the check go quiet about a Requirement
   /// write path with no read path at all.
-  specRequirements Requirement[]
-  requirementLinks RequirementLink[]
-  manualTestCases  ManualTestCase[]
-  apiOperations    ApiOperation[]
-  componentItems   ComponentItem[]
-  trafficIngests   TrafficIngest[]
-  observedJourneys ObservedJourney[]
+  specRequirements      Requirement[]
+  requirementLinks      RequirementLink[]
+  manualTestCases       ManualTestCase[]
+  apiOperations         ApiOperation[]
+  componentItems        ComponentItem[]
+  trafficIngests        TrafficIngest[]
+  observedJourneys      ObservedJourney[]
+  /// The authorization axis and the re-enumeration lifecycle.
+  accessCells           RouteAccessCell[]
+  roleCrawlAttempts     RoleCrawlAttempt[]
+  reEnumerationTriggers ReEnumerationTrigger[]
+  surfaceDrifts         SurfaceDriftRecord[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -697,13 +876,19 @@ model Environment {
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
-  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  secrets      Secret[]
-  authProfiles AuthProfile[]
-  runs         Run[]
-  flowMaps     FlowMap[]
-  schedules    Schedule[]
-  monitors     Monitor[]
+  project               Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  secrets               Secret[]
+  authProfiles          AuthProfile[]
+  runs                  Run[]
+  flowMaps              FlowMap[]
+  schedules             Schedule[]
+  monitors              Monitor[]
+  /// What makes this environment reachable at all, and what each role saw.
+  access                EnvironmentAccess?
+  accessCells           RouteAccessCell[]
+  roleCrawlAttempts     RoleCrawlAttempt[]
+  reEnumerationTriggers ReEnumerationTrigger[]
+  surfaceDrifts         SurfaceDriftRecord[]
 
   @@unique([projectId, name])
   @@index([orgId])
@@ -736,18 +921,45 @@ model AuthProfile {
   environmentId         String
   name                  String
   kind                  AuthProfileKind
-  /// Non-secret config; secret-bearing fields reference Secret.name.
+  /// Non-secret config; secret-bearing fields reference Secret.name. Validated
+  /// per kind by AUTH_PROFILE_CONFIG_SCHEMAS in
+  /// packages/shared/src/auth-profiles.ts, which is the only complete map and
+  /// the only thing a caller should index — a kind with no arm there breaks the
+  /// compiler rather than storing an unvalidatable config.
   config                Json
+  /// THE ROLE THIS IDENTITY IS, as the application spells it.
+  ///
+  /// ── The defect ───────────────────────────────────────────────────────────
+  ///
+  /// `authProfile.findFirst({ orderBy: { createdAt: 'asc' } })` picks ONE
+  /// identity for an entire crawl and `FlowNode.requiresRoles` is set to `[]`
+  /// unconditionally, so admin, member and viewer surfaces are structurally
+  /// absent: there is no axis to enumerate along and "a member gets 403 on
+  /// /admin" has never been expressible. This column is the axis. A crawl
+  /// iterates the profiles that declare a role, and RouteAccessCell is the
+  /// result.
+  ///
+  /// NULLABLE WITH NO DEFAULT, and the three states are the contract: null
+  /// means this profile predates the column and nobody said what it is, which
+  /// must NOT be read as anonymous — `roleKey(null)` returns the reserved
+  /// `<anonymous>` spelling and that is a claim about a logged-OUT visitor,
+  /// the opposite of an unlabelled logged-in one. A reader that needs the
+  /// difference asks whether the column is null.
+  role                  String?
   /// Cached Playwright storageState, refreshed on expiry (§2).
   storageState          Json?
   storageStateExpiresAt DateTime?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
 
-  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  environment   Environment        @relation(fields: [environmentId], references: [id], onDelete: Cascade)
   /// Tests that execute AS this profile. See Test.authProfileId for why that
   /// foreign key is SetNull rather than Cascade or Restrict.
-  tests       Test[]
+  tests         Test[]
+  /// What happened when we tried to enumerate as this identity, and what each
+  /// route gave it.
+  crawlAttempts RoleCrawlAttempt[]
+  accessCells   RouteAccessCell[]
 
   @@unique([environmentId, name])
   @@index([orgId])
@@ -860,9 +1072,15 @@ model FlowMap {
   policyApplied    Json?
   createdAt        DateTime              @default(now())
 
-  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
-  testPlans   TestPlan[]
+  project           Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment       Environment            @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  testPlans         TestPlan[]
+  /// The per-role attempts that produced this map, the triggers whose last run
+  /// produced it, and the diffs it is either side of.
+  roleCrawlAttempts RoleCrawlAttempt[]
+  triggerLastRuns   ReEnumerationTrigger[]
+  driftBaselines    SurfaceDriftRecord[]   @relation("SurfaceDriftBaseline")
+  driftCurrents     SurfaceDriftRecord[]   @relation("SurfaceDriftCurrent")
 
   @@unique([projectId, environmentId, version])
   @@index([orgId])
@@ -3417,6 +3635,10 @@ model CoverageItem {
   /// route and a route the source declares are the same thing seen twice, and
   /// until this row existed there was nothing to say so.
   requirementLinks RequirementLink[]
+  /// The route x role cells measured against this item. The join that lets the
+  /// authorization axis be reported against the ONE reconciled inventory rather
+  /// than against a second list of route strings nobody reconciled.
+  accessCells      RouteAccessCell[]
 
   @@unique([projectId, key])
   @@index([orgId])
@@ -4657,4 +4879,412 @@ model ObservedJourney {
   /// filtered by status. The one read this table exists for.
   @@index([projectId, coverageStatus, sessionShare])
   @@index([ingestId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The wall at the edge of the map (§ coverage)
+//
+// Five tables, for five sentences that could not be said. Every one of them is
+// a whole class of customer whose authenticated surface was reported as small
+// when it was actually UNMEASURED:
+//
+//   · RouteAccessCell      "a member gets 403 on /admin". The security half of
+//                          enumeration, which had no denominator at all.
+//   · RoleCrawlAttempt     "we could not sign in as admin" — as opposed to
+//                          "admin sees nothing extra". Opposite facts, and both
+//                          produce zero cells.
+//   · EnvironmentAccess    "your coverage is zero because a WAF refuses us",
+//                          instead of a confident 100% of nothing.
+//   · ReEnumerationTrigger "the denominator is four months old and nothing is
+//                          scheduled to refresh it".
+//   · SurfaceDriftRecord   "four routes appeared and none has a test" — the one
+//                          number anyone acts on, which nothing computed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One cell of the route x role access matrix: what one identity got when it
+/// asked for one route, durably, so it can be queried.
+///
+/// ── Why a table and not `FlowNode.access` alone ──────────────────────────────
+///
+/// `FlowNode.access` holds the same fact in the serialised graph, and that is
+/// the right place for the crawl to assemble it. It is the wrong place to ask
+/// the question from: "every route an authenticated member is forbidden from,
+/// across this environment" is a filter and an order over tens of thousands of
+/// cells, and against a JSON blob it means deserialising every map version to
+/// find out. A security answer that cannot be indexed is an answer nobody runs.
+///
+/// ── The honesty rules this table enforces ───────────────────────────────────
+///
+///   · `outcome` HAS NO DEFAULT. A default of ALLOWED would be the lie; a
+///     default of NOT_PROBED would let a real probe's result be dropped by a
+///     buggy writer and read as "we did not ask", which hides the bug. With no
+///     default the insert fails and somebody finds out.
+///   · `status` is NULL and never 0. Zero is not an HTTP status; it is what a
+///     null becomes when somebody reaches for a non-null column.
+///   · `basis` DECLARED means a source said so and nothing asked. It is not a
+///     measurement — `isRouteAccessMeasured` requires OBSERVED — because a
+///     declared restriction the application does not enforce is the defect
+///     itself.
+model RouteAccessCell {
+  id             String             @id @default(cuid())
+  orgId          String
+  projectId      String
+  environmentId  String
+  /// The normalised route template, spelled exactly as the surface registry
+  /// spells the identity half of `CoverageItem.key` — `/orders/:id`, not a
+  /// concrete URL. A second spelling of the same route would make the
+  /// authorization axis unjoinable to the denominator it is supposed to be an
+  /// axis of.
+  routeTemplate  String
+  /// The role, or the reserved `<anonymous>` spelling for a logged-out visitor.
+  ///
+  /// NOT NULL, and `roleKey()` in packages/shared/src/auth-profiles.ts is the
+  /// only writer. A nullable role would break the unique index below in the
+  /// quietest possible way: PostgreSQL treats every NULL as distinct, so the
+  /// one cell that matters most — what a logged-out visitor gets on /admin —
+  /// would be re-inserted on every crawl and counted once per crawl. The angle
+  /// brackets are what make the sentinel safe; no role system spells an
+  /// identifier that way.
+  role           String
+  /// What happened. See the enum: NOT_PROBED is the honesty value, ERRORED is
+  /// "we asked and learned nothing about authorization".
+  outcome        RouteAccessOutcome
+  /// Whether we asked or a source told us. Default OBSERVED is wrong often
+  /// enough to be worth refusing, so there is no default here either.
+  basis          RouteAccessBasis
+  /// The HTTP status observed. NULL when `basis` is DECLARED or `outcome` is
+  /// NOT_PROBED — there is no status to report, and writing 403 there would be
+  /// inventing a measurement.
+  status         Int?
+  /// Where the browser ended up. The only evidence of a SOFT redirect: a
+  /// single-page application answers 200 and renders the login form, so the
+  /// navigation "succeeded" and `status` alone would read as ALLOWED.
+  finalUrl       String?
+  /// NULL when nothing asked. A timestamp on an unprobed cell would make it
+  /// look measured.
+  probedAt       DateTime?
+  /// Which identity did the asking, and which attempt produced this. The
+  /// second is the link that distinguishes "no cells because the login failed"
+  /// from "no cells because the route does not exist" — without it a reader
+  /// sees an absence and cannot tell which.
+  authProfileId  String?
+  attemptId      String?
+  /// The registry item this route is, when it could be resolved. NULL is a
+  /// DANGLING REFERENCE in our own enumeration and must be reported as one
+  /// rather than dropped: a cell about a route we failed to enumerate is
+  /// evidence about us.
+  coverageItemId String?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  project           Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment       Environment       @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  authProfile       AuthProfile?      @relation(fields: [authProfileId], references: [id], onDelete: SetNull)
+  /// Named `producedByAttempt` and not `attempt`: `scripts/check-wiring.ts`
+  /// treats `<relationField>: true` anywhere in the repo as a nested READ of
+  /// this model, and `attempt: true` occurs in unrelated selects — so the short
+  /// name made an unwired table report "read by runners.ts, written by
+  /// nothing", which sends the next person hunting a missing writer when what
+  /// is missing is both doors.
+  producedByAttempt RoleCrawlAttempt? @relation(fields: [attemptId], references: [id], onDelete: SetNull)
+  coverageItem      CoverageItem?     @relation(fields: [coverageItemId], references: [id], onDelete: SetNull)
+
+  /// One cell per (environment, route, role). The crawl UPSERTS on it, so a
+  /// re-crawl replaces the observation instead of appending a second opinion.
+  @@unique([environmentId, routeTemplate, role])
+  @@index([orgId])
+  /// "Everything this role was refused", and "every route nobody has probed as
+  /// this role" — the two reads the report is made of.
+  @@index([environmentId, role, outcome])
+  /// "Every FORBIDDEN cell in the environment", across roles, for the security
+  /// section. Small slice of a large table.
+  @@index([environmentId, outcome])
+  @@index([attemptId])
+  @@index([coverageItemId])
+}
+
+/// What became of the attempt to enumerate as one role.
+///
+/// ── The lie this table exists to prevent ────────────────────────────────────
+///
+/// "The admin crawl found no routes a member cannot see." That is a finding if
+/// the admin crawl RAN and a fabrication if the admin login FAILED, and with no
+/// record of the attempt the two are indistinguishable, because both produce
+/// zero RouteAccessCell rows. `roleHadNoExtraSurface` in
+/// packages/shared/src/auth-profiles.ts reads this row and returns NULL rather
+/// than answering when the attempt did not succeed.
+///
+/// ── Why every count here is nullable ────────────────────────────────────────
+///
+/// Because a failed login has NO count, and 0 is the answer "we got in and
+/// found nothing", which is the single most misleading value this table could
+/// hold. A PARTIAL crawl may still say it found extra surface — finding a route
+/// is positive evidence and a budget cannot take it away — but it can never say
+/// it found none, because the routes it did not reach are the ones in question.
+model RoleCrawlAttempt {
+  id                  String           @id @default(cuid())
+  orgId               String
+  projectId           String
+  environmentId       String
+  /// `roleKey()`-spelled, the same as RouteAccessCell.role, so the two join.
+  role                String
+  /// The identity used. NULL for the anonymous attempt, which needs no profile
+  /// and is the one attempt that always can be made.
+  authProfileId       String?
+  outcome             RoleCrawlOutcome
+  /// The safe sentence: what happened, in words a customer can act on. NEVER a
+  /// credential, a selector value that embeds one, or a session cookie — this
+  /// column is rendered on screen and included in exports.
+  detail              String?
+  /// What to do about it, when the outcome is ours or theirs to fix. The
+  /// difference between a report and an accusation.
+  remedy              String?
+  /// NULL when `outcome` is NEVER_ATTEMPTED. A timestamp on an attempt that
+  /// never happened is the same lie as a status on an unprobed cell.
+  attemptedAt         DateTime?
+  /// The map this attempt contributed to, when it got that far.
+  flowMapId           String?
+  /// How much surface this identity reached, and how much of it NO other role
+  /// reached. Both NULL unless the crawl ran: see the note above.
+  routesReached       Int?
+  routesNewToThisRole Int?
+  /// THE DISCLOSURE PAIR, named after `FlowMap.truncatedReason` /
+  /// `atLeastMoreUrls` because it is the same obligation: a budget that BIT
+  /// must be reported as a reason AND as a count, so the report can say "at
+  /// least 240 more routes existed for this role" instead of presenting a
+  /// truncated crawl as a complete one. Both NULL when nothing was capped;
+  /// `cappedBy` set with `atLeastMoreRoutes` null means a cap bit and its size
+  /// is unknown, which is still better than silence.
+  cappedBy            String?
+  atLeastMoreRoutes   Int?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  project     Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment Environment       @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  authProfile AuthProfile?      @relation(fields: [authProfileId], references: [id], onDelete: SetNull)
+  flowMap     FlowMap?          @relation(fields: [flowMapId], references: [id], onDelete: SetNull)
+  /// The cells this attempt produced. Zero of them is meaningful ONLY together
+  /// with `outcome`, which is the whole point of the table.
+  cells       RouteAccessCell[]
+
+  /// The CURRENT state per role per environment, upserted. History lives in
+  /// SurfaceDriftRecord; a log here would make "what is the admin situation
+  /// right now" a windowed query over a growing table for no benefit.
+  @@unique([environmentId, role])
+  @@index([orgId])
+  /// "Which roles could we not get into" — the first question when a coverage
+  /// number looks too small.
+  @@index([environmentId, outcome])
+  @@index([flowMapId])
+}
+
+/// What makes an environment reachable at all: the bot defence in front of it,
+/// the legitimate way past, and the headers every request carries.
+///
+/// ── The defect ──────────────────────────────────────────────────────────────
+///
+/// An application behind reCAPTCHA, Turnstile or a WAF cannot be logged into by
+/// ANY profile kind, and QAAI reported it as an application with nothing in it.
+/// A customer whose coverage is zero because their edge refuses us has a
+/// completely different problem from one whose tests are bad, and only one of
+/// the two is theirs to fix.
+///
+/// ── Nothing here defeats a challenge ────────────────────────────────────────
+///
+/// Every `bypassMode` is an action the OWNER of the environment took on their
+/// own system: their test keys on their own non-production site, their signed
+/// header accepted by their own edge, or their allowlist. There is no solver,
+/// no token forger and no replay. When none of the three is configured the
+/// honest answer is UNREACHABLE_BEHIND_BOT_PROTECTION with `remedy` set, which
+/// is what `reachabilityFromPolicy` returns.
+///
+/// ── Why 1:1 with Environment and not columns on it ─────────────────────────
+///
+/// Because an environment with no row has made no claim, and a column set would
+/// have to encode that as `provider = NONE` — a positive assertion that nothing
+/// is in the way, which is the one thing we must not say on a customer's
+/// behalf. The absence of the row is NOT_PROBED.
+model EnvironmentAccess {
+  id               String                  @id @default(cuid())
+  orgId            String
+  environmentId    String                  @unique
+  provider         BotProtectionProvider   @default(UNKNOWN)
+  bypassMode       BotBypassMode           @default(NOT_CONFIGURED)
+  /// The header name the customer's edge accepts. Required in spirit when
+  /// `bypassMode` is SIGNED_BYPASS_HEADER — `botProtectionSchema` refuses the
+  /// combination, because a row claiming a bypass with nothing to send would
+  /// read as reachable and then fail on every request.
+  bypassHeaderName String?
+  /// A `Secret.name` REFERENCE, never the value. A bypass token is a credential
+  /// and this row is rendered on an environment settings screen.
+  bypassSecretName String?
+  /// EnvironmentExtraHeader[] — validated by `environmentExtraHeadersSchema`.
+  /// A header that carries a credential by definition (Authorization, Cookie,
+  /// X-Api-Key, ...) is REFUSED with an inline value and must name a secret
+  /// instead, so the settings screen cannot end up rendering a bearer token.
+  ///
+  /// NULLABLE WITH NO DEFAULT: null means nobody configured headers, `[]` means
+  /// somebody looked and chose none. `[]` as a default would erase a decision.
+  extraHeaders     Json?
+  reachability     EnvironmentReachability @default(NOT_PROBED)
+  /// Why coverage is zero, in the customer's terms, with what to do about it.
+  /// Set whenever `reachability` is UNREACHABLE_BEHIND_BOT_PROTECTION — the
+  /// state without the sentence is the confident 100%-of-nothing this table
+  /// exists to replace.
+  remedy           String?
+  /// What was actually seen — `cf-mitigated: challenge`, or the selector of the
+  /// challenge iframe. Evidence, so "we think a WAF blocked us" is auditable.
+  /// NEVER a challenge token: that is a credential.
+  observedSignal   String?
+  /// NULL while `reachability` is NOT_PROBED.
+  observedAt       DateTime?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+}
+
+/// A reason the surface gets enumerated again, and what its last run found.
+///
+/// ── The defect ──────────────────────────────────────────────────────────────
+///
+/// The only crawl trigger is a human clicking a button. `Schedule` and `Monitor`
+/// both exist and both can only run a SUITE, so nothing re-enumerates on its
+/// own: the application grows four routes, the denominator does not, and the
+/// coverage percentage RISES. It fails silently and in the flattering
+/// direction, which for a product whose whole claim is the denominator is the
+/// worst available failure.
+///
+/// ── Why NEVER_RUN is a stored state ────────────────────────────────────────
+///
+/// Because the alternative is a null `lastRunAt` that a dashboard renders as a
+/// clean bill of health. "This has never run" and "this ran and found no drift"
+/// are opposite facts. `triggerHasRun` is the only predicate that separates
+/// them, and there is no code path that may skip it.
+model ReEnumerationTrigger {
+  id                  String                   @id @default(cuid())
+  orgId               String
+  projectId           String
+  environmentId       String
+  name                String
+  kind                ReEnumerationTriggerKind
+  enabled             Boolean                  @default(true)
+  /// SCHEDULE only: the cron expression and the zone it is read in. NULL for
+  /// every other kind, rather than a `* * * * *` placeholder that a scheduler
+  /// would happily obey.
+  cron                String?
+  timezone            String?
+  /// DEPLOY only: a `Secret.name` REFERENCE to the shared secret that
+  /// authenticates the inbound webhook. Never the value, and deliberately not
+  /// an environment variable — a webhook secret is per-environment customer
+  /// data, and one env var would arm one answer for every environment in the
+  /// install at once.
+  webhookSecretName   String?
+  lastRunState        ReEnumerationRunState    @default(NEVER_RUN)
+  /// NULL while NEVER_RUN. Together with the state above, this is the pair a
+  /// staleness banner reads.
+  lastRunAt           DateTime?
+  /// The map the last run produced, when it produced one.
+  lastFlowMapId       String?
+  /// The safe sentence for a FAILED run. Never a credential.
+  lastFailureMessage  String?
+  /// Consecutive failures since the last success. 0 is honest here — it is a
+  /// count of events, not a measurement of the application — and it is what a
+  /// "this has been broken for six days" notice reads.
+  consecutiveFailures Int                      @default(0)
+  createdAt           DateTime                 @default(now())
+  updatedAt           DateTime                 @updatedAt
+
+  project     Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment Environment          @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  lastFlowMap FlowMap?             @relation(fields: [lastFlowMapId], references: [id], onDelete: SetNull)
+  /// Every diff this trigger produced. The latest one is "the drift it found";
+  /// a denormalised `lastDriftRecordId` was deliberately not added, because two
+  /// pointers at the same fact are two things that can disagree and only one of
+  /// them would be on screen.
+  drifts      SurfaceDriftRecord[]
+
+  @@unique([environmentId, name])
+  @@index([orgId])
+  /// "Which triggers are due" and "which have never run" — the scheduler's read
+  /// and the staleness banner's read.
+  @@index([environmentId, kind, enabled])
+  @@index([lastFlowMapId])
+}
+
+/// What changed between two crawls of one environment.
+///
+/// ── The defect ──────────────────────────────────────────────────────────────
+///
+/// `FlowMap.version` has existed since the beginning and the cockpit implies
+/// versions are diffed. NO DIFF CODE EXISTS anywhere in the repo, so four new
+/// routes with zero tests produce no event at all — a doc comment and a screen
+/// both claiming a computation that was never written.
+///
+/// ── UNCOMPARABLE is not "no drift" ─────────────────────────────────────────
+///
+/// Every count below is NULLABLE, and that is the entire design. Zero is the
+/// value that means "nothing new is untested"; it is what a dashboard renders
+/// as a green tick; and once written it is indistinguishable from "we never
+/// looked". So a diff with no baseline, a diff against a degraded crawl, and a
+/// diff that did not run all store NULL and report their reason
+/// (`driftCountsAreMeaningful`, `newSurfaceWithoutTests`).
+model SurfaceDriftRecord {
+  id                     String                    @id @default(cuid())
+  orgId                  String
+  projectId              String
+  environmentId          String
+  /// The map being compared, and what it was compared against. The baseline is
+  /// NULL for UNCOMPARABLE_NO_BASELINE — the first crawl of an environment, in
+  /// which every route is "new", which is true and useless.
+  currentFlowMapId       String
+  baselineFlowMapId      String?
+  comparability          SurfaceDriftComparability
+  /// The counts. All NULL unless `comparability` is COMPARABLE.
+  routesAdded            Int?
+  routesRemoved          Int?
+  routesChanged          Int?
+  controlsAdded          Int?
+  controlsRemoved        Int?
+  /// THE NUMBER ANYONE ACTS ON: new surface with no test against it. Read
+  /// through `newSurfaceWithoutTests`, which returns null rather than this
+  /// column whenever the comparison was not a comparison — including when a
+  /// writer claims COMPARABLE and leaves this null, because that row is a bug
+  /// and reporting it as 0 would hide the bug behind a green tick.
+  newSurfaceWithoutTests Int?
+  /// The named lists — which route templates were added, removed and changed,
+  /// and which controls. The part a customer forwards; a bare count of four is
+  /// not actionable and is not checkable either.
+  ///
+  /// NULLABLE WITH NO DEFAULT for the same reason as the counts: `{}` would
+  /// claim an empty diff was computed.
+  detail                 Json?
+  /// Which trigger produced it. NULL for a diff somebody asked for by hand.
+  triggerId              String?
+  /// NULL when `comparability` is NOT_COMPARED. A timestamp on a comparison
+  /// that did not run is how "no drift since the last crawl" gets claimed by a
+  /// code path that never looked.
+  comparedAt             DateTime?
+  createdAt              DateTime                  @default(now())
+
+  project           Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  environment       Environment           @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  currentFlowMap    FlowMap               @relation("SurfaceDriftCurrent", fields: [currentFlowMapId], references: [id], onDelete: Cascade)
+  baselineFlowMap   FlowMap?              @relation("SurfaceDriftBaseline", fields: [baselineFlowMapId], references: [id], onDelete: SetNull)
+  /// `producedByTrigger` for the same reason as
+  /// RouteAccessCell.producedByAttempt: `trigger: true` appears in unrelated
+  /// selects, and a false "this model has a reader" signal is the wrong
+  /// remediation on the one check that exists to notice an unwired table.
+  producedByTrigger ReEnumerationTrigger? @relation(fields: [triggerId], references: [id], onDelete: SetNull)
+
+  @@index([orgId])
+  /// "What changed, most recent first" — the drift feed. `comparedAt` is
+  /// nullable and a btree indexes nulls, so a NOT_COMPARED row still sorts.
+  @@index([environmentId, comparedAt])
+  @@index([currentFlowMapId])
+  @@index([baselineFlowMapId])
+  @@index([triggerId])
 }

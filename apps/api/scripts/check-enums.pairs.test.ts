@@ -196,12 +196,43 @@ describe('schema.prisma ⇄ the TypeScript mirrors', () => {
 });
 
 describe('the hand-written migration', () => {
-  it('carries a timestamp later than every existing migration', () => {
+  /*
+   * ── WHY THIS IS NOT "IT IS THE NEWEST DIRECTORY" ───────────────────────────
+   *
+   * It was, for one round. Then the next slice added a later migration and this
+   * test went red on a file it does not own — an assertion that every future
+   * round must break is not a guard, it is a tripwire aimed at the wrong leg.
+   *
+   * The fact actually worth protecting is the one that breaks a deploy: a
+   * migration written with a timestamp at or BEFORE one already applied never
+   * runs, and Prisma reports nothing. So: this directory exists, its timestamp
+   * is unique, and it sorts after the migration that was newest when it was
+   * written — PINNED BY NAME, because that predecessor is a historical fact
+   * about this file and not a moving target.
+   */
+  const PREDECESSOR = '20261024070000_enumeration_denominator';
+
+  it('sorts after the migration that was newest when it was written', () => {
     const dirs = readdirSync(MIGRATIONS, { withFileTypes: true })
       .filter((entry) => entry.isDirectory())
       .map((entry) => entry.name)
       .sort();
-    expect(dirs.at(-1)).toBe(MIGRATION_DIR);
+    expect(dirs).toContain(PREDECESSOR);
+    expect(dirs).toContain(MIGRATION_DIR);
+    expect(MIGRATION_DIR > PREDECESSOR).toBe(true);
+  });
+
+  it('is the only migration carrying its timestamp', () => {
+    // Two directories with the same 14-digit prefix is the one failure mode
+    // that cannot be recovered by adding another migration: whichever applies
+    // second is recorded under a name the first already claimed.
+    const stamp = (name: string): string => name.slice(0, 14);
+    const mine = stamp(MIGRATION_DIR);
+    const clashes = readdirSync(MIGRATIONS, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .filter((name) => name !== MIGRATION_DIR && stamp(name) === mine);
+    expect(clashes).toEqual([]);
   });
 
   for (const { prismaEnum } of NEW_PAIRS) {
