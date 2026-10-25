@@ -45,6 +45,21 @@ const SSO = fileURLToPath(new URL('../src/lib/sso.ts', import.meta.url));
  */
 const SURFACE = fileURLToPath(new URL('../../../packages/shared/src/surface.ts', import.meta.url));
 const FLOW_MAP = fileURLToPath(new URL('../../../packages/shared/src/flow-map.ts', import.meta.url));
+/*
+ * The non-crawl enumeration vocabularies, in @qaai/shared for the same reason
+ * and NOT in constants.ts either. `requirements.ts` is the spec side (what a
+ * human declared) and `api-surface.ts` the machine-read side (what a document,
+ * a module tree or a week of traffic declares); each sits beside the readers
+ * that consume it, and each also holds the write-path schema for its own
+ * vocabulary, which is the arrangement that stops a member existing with no
+ * way to save it.
+ */
+const REQUIREMENTS = fileURLToPath(
+  new URL('../../../packages/shared/src/requirements.ts', import.meta.url),
+);
+const API_SURFACE = fileURLToPath(
+  new URL('../../../packages/shared/src/api-surface.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -59,7 +74,15 @@ const FLOW_MAP = fileURLToPath(new URL('../../../packages/shared/src/flow-map.ts
 const PAIRS: Array<{
   prismaEnum: string;
   tsConst: string;
-  source?: 'constants' | 'types' | 'runners' | 'sso' | 'surface' | 'flowMap';
+  source?:
+    | 'constants'
+    | 'types'
+    | 'runners'
+    | 'sso'
+    | 'surface'
+    | 'flowMap'
+    | 'requirements'
+    | 'apiSurface';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -145,6 +168,98 @@ const PAIRS: Array<{
     tsConst: 'CRAWL_ACCEPTANCE_STATES',
     source: 'flowMap',
   },
+  /*
+   * ── The non-crawl enumeration sources (§ coverage) ────────────────────────
+   *
+   * Ten, and every one is a closed vocabulary a reader FILTERS on — which is
+   * what earned it a database type in the first place, and is therefore
+   * exactly what makes it a value a row may hold and TypeScript may not know
+   * about. Five TestType members once sat un-migrated and invisible until an
+   * insert failed at run time; these ten are the same hazard, in a feature
+   * whose whole output is a number a customer is asked to believe.
+   *
+   * The spec side first. `requirements.ts` is their home for the same reason
+   * `surface.ts` is the home of the four above: the readers that consume them
+   * live beside them, and dragging ten more lists into constants.ts purely to
+   * be reachable from this script would be the tail wagging the dog.
+   */
+  // Where a requirement or a manual test case was read from. Filtered on by
+  // every re-import: the importer asks "which rows did THIS connector own?"
+  // before retiring anything, and a system the database accepts that TypeScript
+  // cannot name would be rows no re-import can ever reconcile.
+  { prismaEnum: 'SpecSourceSystem', tsConst: 'SPEC_SOURCE_SYSTEMS', source: 'requirements' },
+  // A requirement's normalised status. The highest-stakes of the ten:
+  // `OBSOLETE_STATUSES` takes a requirement OUT of the coverage denominator and
+  // `requirementTestability` decides whether a generated test is expected to
+  // pass, so a status value TypeScript cannot name falls through both switches
+  // — and a requirement that silently leaves the denominator raises the
+  // percentage with nothing anywhere to explain it.
+  { prismaEnum: 'RequirementStatus', tsConst: 'REQUIREMENT_STATUSES', source: 'requirements' },
+  // How much structure survived the import of one acceptance criterion.
+  // `STRUCTURED_CRITERION_FORMATS` is what generation selects on, so an unknown
+  // format is a criterion no generator will ever pick up and nothing will report
+  // as skipped.
+  {
+    prismaEnum: 'AcceptanceCriterionFormat',
+    tsConst: 'ACCEPTANCE_CRITERION_FORMATS',
+    source: 'requirements',
+  },
+  // HOW a requirement→test link was made. THE honesty column:
+  // `LINK_METHOD_CONFIDENCE_CEILING` is a `Record` keyed on this union, so a
+  // fifth method in the database that TypeScript does not know about would be a
+  // link with NO CEILING — a regex able to claim 1.0 and read as traceability.
+  {
+    prismaEnum: 'RequirementLinkMethod',
+    tsConst: 'REQUIREMENT_LINK_METHODS',
+    source: 'requirements',
+  },
+  // Whether anything is linked, and how strongly. `linkStateFrom` is the only
+  // derivation and `UNLINKED_STATES` is what the report pages through; a state
+  // the database accepts and TypeScript cannot name is a requirement that
+  // appears in neither the covered list nor the gap list.
+  {
+    prismaEnum: 'RequirementLinkState',
+    tsConst: 'REQUIREMENT_LINK_STATES',
+    source: 'requirements',
+  },
+  // Whether a manual case is automated. `AUTOMATION_BACKLOG_STATUSES` is the
+  // backlog number quoted at the customer, and NOT_STATED is deliberately
+  // outside it — an unknown member would land in neither bucket and the
+  // `total` would stop equalling the parts.
+  {
+    prismaEnum: 'ManualTestAutomationStatus',
+    tsConst: 'MANUAL_TEST_AUTOMATION_STATUSES',
+    source: 'requirements',
+  },
+  /*
+   * The API and component side, in `api-surface.ts` for the same reason.
+   */
+  // What the DOCUMENT says about auth. `ANONYMOUS_ACCESS_DECLARED` gates
+  // negative-auth generation, and a value that falls outside it is read as "do
+  // not generate" — safe — while a value TypeScript cannot name at all cannot
+  // be rendered, so the reader would show nothing where the document's position
+  // belongs. UNSTATED and NOT_READ are the two members an omission would hide.
+  { prismaEnum: 'ApiAuthDeclaration', tsConst: 'API_AUTH_DECLARATIONS', source: 'apiSurface' },
+  // Whether an operation has been CONFIRMED to exist. A value the database
+  // accepts and the reader cannot name is an operation that is neither declared
+  // nor confirmed nor unprobed on screen — and NOT_PROBED rendering as
+  // anything other than "we did not ask" is the single rendering mistake this
+  // enum exists to prevent.
+  {
+    prismaEnum: 'ApiOperationVerification',
+    tsConst: 'API_OPERATION_VERIFICATIONS',
+    source: 'apiSurface',
+  },
+  // What kind of exported thing a component row is. `COMPONENT_KINDS_WITH_OWN_AXIS`
+  // is a `Record` keyed on this union, so a seventh kind in the database that
+  // TypeScript does not know about would be a row with no answer to "is this
+  // already counted on the ROUTE axis?" — which is how the same page gets
+  // counted twice and the denominator grows without the application doing so.
+  { prismaEnum: 'ComponentItemKind', tsConst: 'COMPONENT_ITEM_KINDS', source: 'apiSurface' },
+  // The named states. `NON_HAPPY_PATH_STATES` is derived by filtering this list,
+  // so a state in the database that TypeScript cannot name is a state excluded
+  // from the one count that makes "not just the happy path" checkable.
+  { prismaEnum: 'ComponentStateKind', tsConst: 'COMPONENT_STATE_KINDS', source: 'apiSurface' },
 ];
 
 /*
@@ -200,8 +315,17 @@ const runners = readFileSync(RUNNERS, 'utf8');
 const sso = readFileSync(SSO, 'utf8');
 const surface = readFileSync(SURFACE, 'utf8');
 const flowMap = readFileSync(FLOW_MAP, 'utf8');
+const requirements = readFileSync(REQUIREMENTS, 'utf8');
+const apiSurface = readFileSync(API_SURFACE, 'utf8');
 const SOURCES: Record<
-  'constants' | 'types' | 'runners' | 'sso' | 'surface' | 'flowMap',
+  | 'constants'
+  | 'types'
+  | 'runners'
+  | 'sso'
+  | 'surface'
+  | 'flowMap'
+  | 'requirements'
+  | 'apiSurface',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -210,6 +334,8 @@ const SOURCES: Record<
   sso: { text: sso, label: 'lib/sso.ts' },
   surface: { text: surface, label: 'shared/surface.ts' },
   flowMap: { text: flowMap, label: 'shared/flow-map.ts' },
+  requirements: { text: requirements, label: 'shared/requirements.ts' },
+  apiSurface: { text: apiSurface, label: 'shared/api-surface.ts' },
 };
 const problems: string[] = [];
 

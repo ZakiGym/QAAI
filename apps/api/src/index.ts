@@ -51,6 +51,9 @@ import { testsRouter } from './routes/tests.js';
 import { bisectRouter } from './routes/bisect.js';
 import { coverageRouter } from './routes/coverage.js';
 import { surfaceRouter } from './routes/surface.js';
+import { apiSurfaceRouter } from './routes/api-surface.js';
+import { requirementsRouter } from './routes/requirements.js';
+import { manualCasesRouter } from './routes/manual-cases.js';
 import { domDiffRouter } from './routes/dom-diff.js';
 import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
@@ -212,6 +215,16 @@ app.use('/bisect', bisectRouter);
 app.use('/coverage', coverageRouter);
 // Mounted at the root: surfaceRouter declares its own `/surface/...` paths.
 app.use(surfaceRouter);
+/*
+ * The three newest halves of the surface denominator, mounted at the ROOT for
+ * the same reason surfaceRouter is: each declares its own full paths
+ * (`/api-surface/:projectId`, `/requirements/:projectId`,
+ * `/manual-cases/:projectId`), so a prefix here would serve them at
+ * `/api-surface/api-surface/:projectId`.
+ */
+app.use(apiSurfaceRouter);
+app.use(requirementsRouter);
+app.use(manualCasesRouter);
 app.use('/dom-diff', domDiffRouter);
 app.use('/repro', reproRouter);
 app.use('/suite-health', suiteHealthRouter);

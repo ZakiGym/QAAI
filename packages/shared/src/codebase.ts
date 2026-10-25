@@ -52,6 +52,21 @@
 
 import type { FormField } from './flow-map';
 import type { RepoFile } from './detect';
+import type { SurfaceSource } from './surface';
+/*
+ * TYPE-ONLY, and it has to stay that way: api-surface.ts imports the VALUE
+ * `HTTP_METHODS` from this file, so a value import back would be a runtime
+ * import cycle. Every name below is erased at compile time, which is why this
+ * file can borrow the vocabulary without owning it — the same bargain the
+ * header strikes with `FieldSemantic`.
+ */
+import type {
+  BackgroundSurfaceFact,
+  ComponentItemKind,
+  ComponentStateKind,
+  FlagProvider,
+  LocaleCatalogueReader,
+} from './api-surface';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
@@ -91,6 +106,35 @@ export const SOURCE_DETECTORS = [
   'flask-fastapi',
   'html-forms',
   'auth-surfaces',
+  /*
+   * ─── The five surfaces nothing in this file could see ──────────────────────
+   *
+   * Everything above answers "what URL does this app serve?". These five answer
+   * questions that were not merely unanswered but UNASKED, and an unasked
+   * question does not lower a coverage percentage — it raises it, because the
+   * surface is absent from the denominator rather than uncovered. Each one is
+   * here because something downstream already reads a field nothing writes:
+   *
+   *  · route-guards       `SourceRoute.behindAuth` is read throughout
+   *                       apps/worker/src/processors/analyze-source.ts and set
+   *                       from real analysis nowhere, so a source-derived plan
+   *                       can never propose an authenticated scenario.
+   *  · component-inventory UNIT_GEN has no denominator at all.
+   *  · background-surfaces the PROTOCOL and EMAIL_OTP runners EXECUTE crons,
+   *                       queues, webhooks and mail today. QAAI can test these
+   *                       and cannot count them.
+   *  · feature-flags      the crawl saw ONE of two applications and cannot say
+   *                       which. The most insidious of the five, because the
+   *                       number looks fine.
+   *  · locales            the LOCALIZATION runner takes its locale list from a
+   *                       hand-written spec, so the denominator is whatever a
+   *                       human typed.
+   */
+  'route-guards',
+  'component-inventory',
+  'background-surfaces',
+  'feature-flags',
+  'locales',
 ] as const;
 export type SourceDetectorId = (typeof SOURCE_DETECTORS)[number];
 
@@ -145,6 +189,31 @@ const DETECTOR_META: Record<SourceDetectorId, { label: string; looksFor: string 
     looksFor:
       'login / signup / logout / password / SSO shaped routes and endpoints, and forms with a password field',
   },
+  'route-guards': {
+    label: 'Route guards',
+    looksFor:
+      'Next.js middleware matchers and auth route groups, layouts that redirect, Express/Koa middleware chains, @UseGuards / @Roles decorators, React Router loaders that redirect, and withAuth / requireAuth wrappers',
+  },
+  'component-inventory': {
+    label: 'Components and their states',
+    looksFor:
+      'exported components, pages, layouts, hooks, providers and helpers, their render branches on loading / empty / error / forbidden, and *.stories.* catalogue entries',
+  },
+  'background-surfaces': {
+    label: 'Surfaces off the request path',
+    looksFor:
+      'cron declarations (vercel.json, node-cron, @nestjs/schedule, GitHub Actions), queue consumers (BullMQ, SQS, Pub/Sub, Kafka), webhook receivers that verify a signature, outbound email, upload handlers, websocket/SSE endpoints, server actions and tRPC procedures',
+  },
+  'feature-flags': {
+    label: "The application's feature flags",
+    looksFor:
+      'LaunchDarkly, Unleash, OpenFeature, GrowthBook, Flagsmith and Statsig call sites, process.env feature gates, and checked-in flag config files',
+  },
+  locales: {
+    label: 'Locales the application claims to support',
+    looksFor:
+      'locales/ and messages/ catalogues, next-intl / i18next / vue-i18n config, Next.js i18n routing config, and hreflang alternates in static markup',
+  },
 };
 
 // ─── Results ─────────────────────────────────────────────────────────────────
@@ -159,6 +228,15 @@ export interface PageRoute {
   evidence: string;
   /** True when the route has at least one parameter segment. */
   dynamic: boolean;
+  /**
+   * What the source says about who may reach this route. See {@link RouteGuard}.
+   *
+   * ABSENT means the guard pass did not run over this analysis at all — which
+   * every analysis stored before this slice is. `{ access: 'UNKNOWN' }` means it
+   * ran and could not tell. Those are different facts and a reader that merged
+   * them would report an un-analysed repo as a repo with no guards.
+   */
+  guard?: RouteGuard;
 }
 
 export interface HttpEndpoint {
@@ -173,6 +251,8 @@ export interface HttpEndpoint {
   file: string;
   evidence: string;
   dynamic: boolean;
+  /** Same contract as {@link PageRoute.guard}: absent, UNKNOWN and a verdict differ. */
+  guard?: RouteGuard;
 }
 
 export interface SourceFormField {
@@ -222,6 +302,396 @@ export interface AuthSurface {
   evidence: string;
 }
 
+// ─── 1. Guards: who is allowed to reach this route ───────────────────────────
+
+/**
+ * Whether the source says a route is behind a login — and the third answer.
+ *
+ * ── Why this is not a boolean ───────────────────────────────────────────────
+ *
+ * Because `SourceRoute.behindAuth` (apps/worker/src/processors/analyze-source.ts)
+ * IS a boolean, it is read all over that file, and no producer has ever set it.
+ * Its own doc comment admits as much: "Always false for anything @qaai/shared
+ * produces today". A boolean has nowhere to put "we did not analyse this", so
+ * every route in every repo QAAI has ever ingested arrived as `false` — and
+ * `false` on that field is not an absence of information, it is the positive
+ * claim THIS ROUTE IS PUBLIC.
+ *
+ * The consequences are concrete and all in the flattering direction. `roleFor`
+ * hands the route no auth profile. `accessibilityItem` filters to
+ * `!r.behindAuth` and so sweeps the guarded half of the app as though it were
+ * public. Every form on a guarded route is proposed signed-out. The plan's
+ * own list of guarded paths — `routes.filter(r => r.behindAuth)` — comes back
+ * empty for every customer. An admin route is reported as
+ * uncovered-and-public, a plan proposes an anonymous smoke test for it, the
+ * test gets a redirect to /login, and the redirect is recorded as the page.
+ *
+ * So three values, and the two negative ones are NOT the same:
+ *
+ *   GUARDED    a guard was found. Something in the source demands a session
+ *              before this route renders or this handler runs.
+ *   UNGUARDED  the guard pass read this route's own declaration sites and
+ *              found no guard. The strongest negative a STATIC read can make,
+ *              and still not a proof of public access — a parent layout whose
+ *              body was never uploaded may guard it. `evidence` says what was
+ *              looked at, so the claim can be disagreed with.
+ *   UNKNOWN    we could not analyse it: no file body, a matcher written as an
+ *              expression, a guard behind an import a static pass cannot
+ *              follow. Nothing is claimed in either direction.
+ *
+ * UNKNOWN must never be flattened into UNGUARDED on the way to storage. That
+ * is the "source's silence read as a source's answer" lie, and on this field it
+ * is the one that gets an authorization hole shipped.
+ *
+ * ── Not to be confused with `RouteAccess` in flow-map.ts ────────────────────
+ *
+ * That type is the OBSERVED half of the same question: one role asked for one
+ * route and this is what came back. This type is the DECLARED half — the
+ * source says a guard exists and nobody asked. They meet at
+ * `RouteAccess.basis`, whose two values are exactly OBSERVED and DECLARED, so a
+ * GUARDED verdict here is what finally gives that `'DECLARED'` branch
+ * something to be derived from. The two disagreeing — declared GUARDED,
+ * observed ALLOWED for an anonymous visitor — is the most valuable finding
+ * either of them can produce, which is why they stay separate types.
+ */
+export const GUARD_VERDICTS = ['GUARDED', 'UNGUARDED', 'UNKNOWN'] as const;
+export type GuardVerdict = (typeof GUARD_VERDICTS)[number];
+
+export const GUARD_VERDICT_LABELS: Record<GuardVerdict, string> = {
+  GUARDED: 'the source declares a guard on it',
+  UNGUARDED: 'no guard was found at any declaration site we could read',
+  UNKNOWN: 'we could not analyse the guards on it',
+};
+
+/**
+ * The shapes a guard is written in, in the ecosystems QAAI is pointed at.
+ *
+ * Named rather than merged into one "a guard" so that a systematically wrong
+ * reader can be found — the same argument `SurfaceItem.detector` makes. A
+ * customer who sees every `NEXT_ROUTE_GROUP` verdict disputed knows which
+ * reader to distrust without distrusting the number.
+ */
+export const GUARD_KINDS = [
+  /** `middleware.ts` with a matcher, Next.js's one real request interceptor. */
+  'NEXT_MIDDLEWARE',
+  /** An `app/(authenticated)/…` route group whose name declares the guard. */
+  'NEXT_ROUTE_GROUP',
+  /** A `layout.tsx` / `+layout.server.ts` that redirects when there is no session. */
+  'LAYOUT_REDIRECT',
+  /** `app.get('/x', requireAuth, handler)` or `router.use(requireAuth)`. */
+  'MIDDLEWARE_CHAIN',
+  /** `@UseGuards(JwtAuthGuard)` / `@Roles('ADMIN')` — Nest and Spring. */
+  'DECORATOR',
+  /** A React Router loader that redirects to a login route. */
+  'ROUTER_LOADER',
+  /** `withAuth(Page)`, `requireAuth(handler)`, `protectedProcedure`. */
+  'AUTH_WRAPPER',
+] as const;
+export type GuardKind = (typeof GUARD_KINDS)[number];
+
+/**
+ * Every member of {@link GuardKind}, as a run-time value the compiler maintains.
+ *
+ * The pattern this codebase enforces for a vocabulary with a write path, and
+ * the first of its two halves: a `Record` keyed on the union, which the
+ * compiler refuses to let drift. The second half is the parity test in
+ * codebase.test.ts that compares this list against `GUARD_READERS`' own keys.
+ * Eight `GateRule` kinds shipped unsaveable for two slices because only one of
+ * the two existed, and `check:wiring` cannot see that class of defect.
+ */
+const GUARD_KIND_PRESENT: Record<GuardKind, true> = {
+  NEXT_MIDDLEWARE: true,
+  NEXT_ROUTE_GROUP: true,
+  LAYOUT_REDIRECT: true,
+  MIDDLEWARE_CHAIN: true,
+  DECORATOR: true,
+  ROUTER_LOADER: true,
+  AUTH_WRAPPER: true,
+};
+
+/** `GUARD_KINDS`, derived from the record the compiler checks. */
+export const GUARD_KIND_LIST = Object.keys(GUARD_KIND_PRESENT) as ReadonlyArray<GuardKind>;
+
+/** One guard declaration, as read out of one file. */
+export interface GuardDeclaration {
+  kind: GuardKind;
+  /** The file the declaration is in. Evidence, never optional. */
+  file: string;
+  line: number | null;
+  /**
+   * The URL patterns this declaration covers, in this file's own route
+   * spelling (`/admin/:id`, `/admin/*`). Empty when the declaration guards
+   * whatever it wraps rather than a path it names — a layout, a decorator.
+   */
+  patterns: string[];
+  /**
+   * The roles the declaration demands.
+   *
+   * NULL IS NOT `[]`. Null means the declaration guards access and names no
+   * role we could read; `[]` would say "it demands the empty set of roles",
+   * which is what "anyone logged in" would be if we had read that positively.
+   * `requiresRoles: []` set unconditionally is the existing defect on
+   * `FlowNode` (flow-map.ts names it), and reproducing it here would make the
+   * route × role matrix a table of empty sets.
+   */
+  roles: string[] | null;
+  /** The sentence that justifies the verdict, in the customer's terms. */
+  evidence: string;
+}
+
+/**
+ * What the source says about who may reach one route or endpoint.
+ *
+ * `declaredBy` carries every declaration that applied, because two can: a
+ * middleware matcher AND a `@Roles` decorator on the same handler is the normal
+ * case in a Nest app behind a gateway, and reporting one would make the other
+ * invisible.
+ */
+export interface RouteGuard {
+  access: GuardVerdict;
+  /**
+   * The union of every applying declaration's roles, or null.
+   *
+   * Null under GUARDED means "guarded, and no declaration named a role" — a
+   * perfectly common and useful fact. Null under UNGUARDED and UNKNOWN is the
+   * only possible value: a route with no guard demands no role, and a route we
+   * could not analyse has no readable role list.
+   */
+  roles: string[] | null;
+  declaredBy: GuardDeclaration[];
+  /** The sentence shown next to the verdict. Always written, never defaulted to ''. */
+  evidence: string;
+}
+
+// ─── 2. The component inventory ──────────────────────────────────────────────
+
+/**
+ * One named state of one component, as read out of the source or a catalogue.
+ *
+ * `source` is `SurfaceSource` and not a local union, because a state found by
+ * reading a branch on `isLoading` is SOURCE, one found in a Storybook entry is
+ * CATALOGUE, and those are the same two distinctions the surface registry
+ * already draws. A third spelling of them would be a second vocabulary.
+ */
+export interface SourceComponentState {
+  kind: ComponentStateKind;
+  /** 'SOURCE' for a render branch, 'CATALOGUE' for a story. Never anything else here. */
+  source: SurfaceSource;
+  /** "renders <Spinner/> when `isLoading`" — the branch, not the conclusion. */
+  evidence: string;
+}
+
+/**
+ * One exported component, hook, page, layout, provider or helper.
+ *
+ * Shaped to `componentItemSchema` in api-surface.ts, which is the only write
+ * path into `ComponentItem`, plus the two fields that schema has no column for:
+ * `line`, which is navigation rather than identity, and `states`, which become
+ * `ComponentState` rows.
+ *
+ * ── The denominator trap this shape exists to avoid ─────────────────────────
+ *
+ * `hasCatalogueEntry` is `boolean | null` and the null is load-bearing: null
+ * means NO CATALOGUE WAS READ, false means one was read and this component is
+ * not in it. A component with no story is STILL A COMPONENT and still in the
+ * inventory — letting "we found no story" shrink the denominator is the
+ * undisclosed cap that makes a coverage percentage go up, and it would do it on
+ * the one axis (UNIT_GEN) that has had no denominator at all.
+ */
+export interface SourceComponent {
+  /** Repo-relative module path. Identity, with `exportName`. */
+  modulePath: string;
+  /** The exported name. `default` is a legal and common value. */
+  exportName: string;
+  kind: ComponentItemKind;
+  /** A one-line summary of the props — never the full type. Null when it takes none. */
+  propsSummary: string | null;
+  /** Three states. See the note above; null means no catalogue was read. */
+  hasCatalogueEntry: boolean | null;
+  /** The catalogue entry's id (`Button` in `Components/Button`), when there is one. */
+  catalogueRef: string | null;
+  evidence: string;
+  line: number | null;
+  states: SourceComponentState[];
+}
+
+// ─── 3. Surfaces off the HTTP request path ───────────────────────────────────
+
+/**
+ * One background surface: a cron, a queue consumer, a webhook receiver, an
+ * outbound email, an upload, a socket, a server action, a tRPC procedure.
+ *
+ * `fact` is `BackgroundSurfaceFact` from api-surface.ts — the nine-member
+ * discriminated union the Model agent defined, stored in `CoverageItem.meta` on
+ * the axis `backgroundSurfaceAxis` gives. This file does not restate it and
+ * must not: the whole point of that union is that a cron's expression and a
+ * queue's name are different facts, and a tenth spelling of them here would be
+ * the second registry this round exists to prevent.
+ *
+ * ── The one overlap a writer has to resolve, named here so it cannot be
+ *    discovered by a customer instead ──────────────────────────────────────
+ *
+ * A Next.js server action is BOTH an export of a module (so the component
+ * reader lists it, kind UTILITY) and a surface off the request path (so this
+ * reader lists it, kind SERVER_ACTION). Both lists are the honest answer to
+ * their own question and neither should be trimmed. But a writer that puts
+ * both into `CoverageItem` without joining them counts one surface in two
+ * denominators — the defect `componentHasOwnAxis` exists to prevent, arriving
+ * from two readers that agree rather than from one that is wrong.
+ *
+ * They join on `(module, exportName)` here and `(modulePath, exportName)` on
+ * {@link SourceComponent}, which are deliberately the same two values.
+ */
+export interface SourceBackgroundSurface {
+  fact: BackgroundSurfaceFact;
+  file: string;
+  line: number | null;
+  evidence: string;
+}
+
+// ─── 4. The application's feature flags ──────────────────────────────────────
+
+/*
+ * THESE ARE THE CUSTOMER'S FLAGS. QAAI'S OWN `model FeatureFlag` IS NOT ONE.
+ *
+ * `model FeatureFlag` in apps/api/prisma/schema.prisma is QAAI's own flag
+ * store: four rows written by prisma/seed.ts, read by nothing, and one of the
+ * four gaps `scripts/check-wiring.ts` records. Nothing in this section has
+ * anything to do with it. The flags below belong to the APPLICATION UNDER TEST
+ * and are stored as `SurfaceDimension` rows with `kind: 'FLAG'` — never in
+ * `FeatureFlag`, because the same primary key would then mean both "QAAI's
+ * visual-regression feature is off" and "the customer's checkout-v2 flag
+ * exists" and no reader could tell which.
+ */
+
+/**
+ * One feature flag the application reads.
+ *
+ * ── Why this is the most insidious of the five ──────────────────────────────
+ *
+ * A flag the crawl did not set means the crawl saw ONE of two applications and
+ * reported a coverage number for it without saying which one. Nothing looks
+ * wrong: the percentage is plausible, the route list is plausible, and an
+ * entire second application — the one behind `checkout-v2` — is absent from the
+ * denominator rather than uncovered. Absent flatters; uncovered lowers.
+ */
+export interface SourceFeatureFlag {
+  /** The flag's key as the application spells it. Never normalised: see below. */
+  key: string;
+  provider: FlagProvider;
+  /**
+   * Every value this flag can take, or NULL when the call site did not name
+   * them.
+   *
+   * Null and `[]` are different and the difference decides whether a flag
+   * sweep is possible. `['on','off']` is a boolean gate, enumerable from the
+   * shape of the call. Null is a multivariate flag whose variants live in the
+   * provider's dashboard and not in the repo — a thing to go and fetch from a
+   * CATALOGUE reader, not a flag with no variants. `DimensionDetail.FLAG`
+   * types this field as `string[]`, so a writer persisting a null must record
+   * the shortfall rather than writing `[]`.
+   */
+  variants: string[] | null;
+  /** The variant served when nothing overrides it, read off the SDK fallback. */
+  defaultVariant: string | null;
+  file: string;
+  line: number | null;
+  evidence: string;
+}
+
+// ─── 5. Locales ──────────────────────────────────────────────────────────────
+
+/**
+ * One locale the application claims to support.
+ *
+ * The LOCALIZATION runner's locale list is hand-written in a spec today, so the
+ * locale denominator is whatever a human typed — which means a locale the app
+ * ships and nobody typed is not under-tested, it is invisible.
+ */
+export interface SourceLocale {
+  /** BCP-47 as the APP spells it: `pt-BR`, never `pt_br` and never `pt-br`. */
+  tag: string;
+  reader: LocaleCatalogueReader;
+  /**
+   * True for the locale served when nothing selects one.
+   *
+   * Only ever set from a config that NAMES a default (`defaultLocale`,
+   * `fallbackLng`, `fallbackLocale`). A catalogue directory declares no default
+   * and gets `false` on every tag — guessing that `en` is the default because
+   * it is first alphabetically would invent the one fact the sweep's arithmetic
+   * turns on.
+   */
+  isDefault: boolean;
+  /**
+   * True for a right-to-left locale. Derived from the language subtag against
+   * the closed list of RTL scripts, which is a fact rather than a guess, and it
+   * matters because an RTL locale re-lays-out the page instead of swapping
+   * strings.
+   */
+  rtl: boolean;
+  file: string;
+  evidence: string;
+}
+
+// ─── What could not be analysed ──────────────────────────────────────────────
+
+/**
+ * Why a detector could not turn a file it found into a fact.
+ *
+ * ── The lie this exists to prevent ──────────────────────────────────────────
+ *
+ * An ingest that quietly skips 10% of the repo makes the coverage percentage go
+ * UP, because the surfaces in the skipped tenth are absent from the denominator
+ * rather than uncovered. So every cap, take, limit and failed parse that BIT
+ * is reported here as a count AND a reason, which is what lets the report say
+ * "at least N more existed". `DetectorReport.blocked` is one sentence per
+ * detector and cannot carry a count per cause; this can.
+ */
+export const SHORTFALL_REASONS = [
+  /** The caller sent the path and not the body. Nothing is wrong with the repo. */
+  'NO_CONTENT',
+  /** The body was longer than the per-file scan cap and was read to that point. */
+  'FILE_TRUNCATED',
+  /** One of OUR caps bit. The count is how many facts we declined to report. */
+  'CAP_REACHED',
+  /** The value was an expression, not a literal: a static read cannot follow it. */
+  'EXPRESSION_NOT_LITERAL',
+  /** The thing is behind an import or a dynamic require we cannot resolve. */
+  'UNRESOLVED_IMPORT',
+  /** We matched the shape and the body did not parse — our error, reported as ours. */
+  'UNPARSEABLE',
+] as const;
+export type ShortfallReason = (typeof SHORTFALL_REASONS)[number];
+
+export const SHORTFALL_REASON_LABELS: Record<ShortfallReason, string> = {
+  NO_CONTENT: 'the file body was not uploaded',
+  FILE_TRUNCATED: 'the file was longer than the scan cap and was read only up to it',
+  CAP_REACHED: 'one of this analysis’s own caps was reached',
+  EXPRESSION_NOT_LITERAL: 'the value was written as an expression, not a literal',
+  UNRESOLVED_IMPORT: 'it is behind an import a static pass cannot follow',
+  UNPARSEABLE: 'the file matched the shape and could not be read',
+};
+
+/** One cause, counted, for one detector. */
+export interface AnalysisShortfall {
+  /**
+   * The detector that lost the fact, or NULL when the cause is the input and
+   * every detector lost by it.
+   *
+   * Null is not a missing value. A repo truncated at the file cap costs the
+   * guard reader, the component reader and the locale reader alike, and
+   * attributing that to one of them would say the other two read the whole
+   * repo — which is the kind of near-miss that makes a customer stop checking
+   * the rest of the numbers.
+   */
+  detector: SourceDetectorId | null;
+  reason: ShortfallReason;
+  /** How many things went unreported because of this cause. Never 0. */
+  count: number;
+  /** What was skipped and what it would have taken, in the customer's terms. */
+  detail: string;
+}
+
 /**
  * One detector's own account of itself.
  *
@@ -257,6 +727,45 @@ export interface CodebaseAnalysis {
   endpoints: HttpEndpoint[];
   forms: SourceForm[];
   authSurfaces: AuthSurface[];
+  /*
+   * ─── The five non-crawl inventories, and why every one is OPTIONAL ─────────
+   *
+   * `analyseCodebase` ALWAYS sets all five, so a fresh analysis always has
+   * them. They are optional because an analysis is also a STORED value: the
+   * `analysis` Json column is read back and cast straight to this interface
+   * (`apps/api/src/lib/coverage-store.ts`), and every row written before this
+   * slice has none of these keys.
+   *
+   * Declaring them required would make the compiler promise an array that is
+   * `undefined` at run time — so `analysis.components.length` on a
+   * three-month-old snapshot throws, and `analysis.locales` read as `[]`
+   * reports "this application supports no locales" about an application nobody
+   * looked at. That is the absent-versus-measured distinction `SurfaceItem`'s
+   * own optional members are declared for, and it applies here for exactly the
+   * same reason.
+   *
+   *   • absent → this analysis predates the reader. Nothing looked.
+   *   • []     → the reader ran and the application declares none.
+   */
+
+  /**
+   * Every guard declaration found, whether or not a route matched it.
+   *
+   * The ones that matched nothing are the finding: a middleware matcher for
+   * `/admin/:path*` with no `/admin` route in the inventory means either dead
+   * configuration or — far more likely — a whole admin area our route detectors
+   * failed to read. That is evidence about OUR extractor, and suppressing it
+   * would be hiding our own error rate, the same argument `CRAWL_ONLY` makes.
+   */
+  guards?: GuardDeclaration[];
+  /** Exported components, hooks, pages, layouts and providers. The UNIT_GEN denominator. */
+  components?: SourceComponent[];
+  /** Crons, queues, webhook receivers, mail, uploads, sockets, actions, procedures. */
+  backgroundSurfaces?: SourceBackgroundSurface[];
+  /** The application's own feature flags. NOT QAAI's `model FeatureFlag`. */
+  featureFlags?: SourceFeatureFlag[];
+  /** The locales the app claims to support, instead of the ones a human typed. */
+  locales?: SourceLocale[];
   /** Application frameworks the source names. Never a test runner — that is detect.ts. */
   frameworks: AppFrameworkSignal[];
   /** Every detector, run or not. The empty-array-is-ambiguous fix. */
@@ -274,6 +783,15 @@ export interface CodebaseAnalysis {
     /** True when a result list hit its cap and the real repo has more. */
     truncated: boolean;
   };
+  /**
+   * Every cause that cost this analysis a fact, counted.
+   *
+   * `coverage.truncated` is one boolean for the whole run and `notes` is prose;
+   * neither can answer "how many, and why". This can, which is what lets a
+   * report say "at least N more existed" instead of printing a percentage over
+   * a denominator it quietly shrank.
+   */
+  shortfalls?: AnalysisShortfall[];
   /** Sentences a user can act on: what was resolved, what was left declared-as-written. */
   notes: string[];
   /** Gaps in the input. A missing file body is a gap, not a finding. */
@@ -298,6 +816,21 @@ const MAX_FORMS = 500;
 const MAX_FIELDS_PER_FORM = 60;
 /** Forms are scanned with a bounded window so one huge template cannot dominate. */
 const MAX_FORMS_PER_FILE = 20;
+
+/*
+ * The five new readers' caps. Every one of them is reported through
+ * `Shortfalls` when it bites, with a count — a cap that silently truncates an
+ * ingest raises the coverage percentage, because the surfaces past it are
+ * absent from the denominator rather than uncovered.
+ */
+const MAX_GUARD_DECLARATIONS = 2000;
+const MAX_COMPONENTS = 5000;
+/** Six state kinds, each reachable from source and from a catalogue. */
+const MAX_STATES_PER_COMPONENT = 12;
+const MAX_EXPORTS_PER_FILE = 200;
+const MAX_BACKGROUND_SURFACES = 1000;
+const MAX_FLAGS = 500;
+const MAX_LOCALES = 200;
 
 // ─── Paths ───────────────────────────────────────────────────────────────────
 
@@ -469,6 +1002,71 @@ class Ledger {
       };
     });
   }
+}
+
+/**
+ * The counted account of what went unread, which `Ledger` cannot give.
+ *
+ * `Ledger.blocked` is one sentence per detector, so a detector that lost nine
+ * facts to a missing body and one to its own cap reports a single string and no
+ * numbers. The difference matters because only one of those two is OUR fault,
+ * and only a count supports the sentence "at least N more existed".
+ */
+class Shortfalls {
+  private readonly rows = new Map<string, AnalysisShortfall>();
+
+  /**
+   * Record one more thing lost to `reason`.
+   *
+   * `detail` is taken from the FIRST occurrence and never rewritten, so the
+   * sentence stays about a concrete file a reader can go and look at rather
+   * than drifting to whichever file happened to be last.
+   */
+  note(
+    detector: SourceDetectorId | null,
+    reason: ShortfallReason,
+    detail: string,
+    n = 1,
+  ): void {
+    if (n <= 0) return;
+    const key = `${detector ?? '*'}|${reason}`;
+    const existing = this.rows.get(key);
+    if (existing) {
+      existing.count += n;
+      return;
+    }
+    this.rows.set(key, { detector, reason, count: n, detail });
+  }
+
+  /**
+   * Ordered with the input-wide causes first, then by detector declaration
+   * order, then by reason. Stable, so a reader diffing two analyses sees only
+   * what changed about the repo.
+   */
+  report(): AnalysisShortfall[] {
+    const rank = (detector: SourceDetectorId | null): number =>
+      detector === null ? -1 : SOURCE_DETECTORS.indexOf(detector);
+    return [...this.rows.values()].sort(
+      (a, b) =>
+        rank(a.detector) - rank(b.detector) ||
+        SHORTFALL_REASONS.indexOf(a.reason) - SHORTFALL_REASONS.indexOf(b.reason),
+    );
+  }
+}
+
+/**
+ * The 1-based line a character offset falls on.
+ *
+ * For the editor link only, which is why it is never part of any identity: a
+ * line number moves when an import is added above it, and an identity derived
+ * from one would retire every item in a file somebody reformatted.
+ */
+function lineAt(content: string, index: number): number {
+  let line = 1;
+  for (let i = 0; i < index && i < content.length; i++) {
+    if (content.charCodeAt(i) === 10) line++;
+  }
+  return line;
 }
 
 // ─── Is the filesystem this app's routing table? ─────────────────────────────
@@ -1268,6 +1866,65 @@ function skipBalanced(src: string, i: number): number {
     j += 1;
   }
   return src.length;
+}
+
+/**
+ * The TOP-LEVEL arguments of a call whose `(` is at `openAt`, as source slices.
+ *
+ * Splitting the text on commas attributes the wrong things to the wrong
+ * positions the moment an argument has a comma or a paren of its own —
+ * `app.post('/x', requireRole('ADMIN', 'OWNER'), handler)` is three arguments
+ * and four commas. The guard pass needs the POSITIONS and not just the text,
+ * because "this registration has a middleware between the path and the
+ * handler" is a different fact from "the word requireAuth appears on this
+ * line", and only the first one can be used to say we did not read something.
+ *
+ * NULL when the call does not close inside the window. A truncated argument
+ * list read as a complete one would report a two-argument registration — no
+ * middleware, nothing unread — for a chain we simply stopped looking at.
+ */
+function callArguments(src: string, openAt: number, window = 4000): string[] | null {
+  if (src[openAt] !== '(') return null;
+  const limit = Math.min(src.length, openAt + window);
+  const args: string[] = [];
+  let depth = 0;
+  let start = openAt + 1;
+  let i = openAt;
+  while (i < limit) {
+    const ch = src[i]!;
+    if (ch === '"' || ch === "'" || ch === '`') {
+      i = skipQuoted(src, i);
+      continue;
+    }
+    const past = skipComment(src, i);
+    if (past !== i) {
+      i = past;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        args.push(src.slice(start, i));
+        const trimmed = args.map((arg) => arg.trim());
+        return trimmed.length === 1 && trimmed[0] === '' ? [] : trimmed;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === ',' && depth === 1) {
+      args.push(src.slice(start, i));
+      start = i + 1;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return null;
 }
 
 const JSX_ATTR_NAME = /[A-Za-z_$][\w$.:-]*/y;
@@ -2768,6 +3425,2394 @@ function detectFrameworks(files: AnalysedFile[]): AppFrameworkSignal[] {
   return out;
 }
 
+// ─── Route guards ────────────────────────────────────────────────────────────
+
+/**
+ * Words that make a route group a GUARD rather than a filing decision.
+ *
+ * Deliberately short, and the omissions are the design. `(dashboard)`, `(app)`,
+ * `(shop)` and `(main)` are organisational names: they sit behind a login in
+ * some applications and in front of one in others, and there is nothing in the
+ * name to tell us which. Reading them as guards would mark a public marketing
+ * tree GUARDED, and reading GUARDED as a fact is how a crawl stops trying a
+ * page it was always allowed to see. Every word below, by contrast, says the
+ * access rule out loud.
+ */
+const AUTH_GROUP_WORD =
+  /^(?:auth|authed|authenticated|protected|private|secure|secured|signed-?in|logged-?in|members?|members-only|internal)$/i;
+
+/** A group whose name is also a ROLE claim. `(admin)` says who, not just that. */
+const ROLE_GROUP_WORD = /^(?:admin|administrator|superadmin|staff|owner)$/i;
+
+/**
+ * Names a guard middleware, decorator or wrapper is written under.
+ *
+ * One list for all of Express, Koa, Nest, Passport and the hand-rolled
+ * `requireAuth` every application eventually grows, because the question each
+ * of them answers is the same one and a per-framework list would drift apart.
+ */
+const GUARD_NAME_BODY =
+  'requireAuth|requiresAuth|requireUser|requireLogin|requireSession|requireAdmin|requireRole|requireRoles|requirePermission|ensureAuth|ensureAuthenticated|ensureLoggedIn|isAuthenticated|isAuthorized|authenticate|authGuard|authMiddleware|authorize|authorized|checkAuth|checkRole|verifyToken|verifyJwt|jwtAuth|protect|protected|adminOnly|withAuth|withPageAuthRequired|withApiAuthRequired|withAuthenticationRequired|AuthGuard|JwtAuthGuard|JwtGuard|SessionGuard|RolesGuard|PoliciesGuard|PermissionsGuard';
+
+/**
+ * One list, two regexes, built from one string.
+ *
+ * The blanket-`use()` check below needs the same names embedded in a larger
+ * pattern. Building it by slicing `GUARD_NAME.source` is how the two come to
+ * disagree the first time somebody adds a name with a different shape, so the
+ * names live in a string and both regexes are compiled from it.
+ */
+const GUARD_NAME = new RegExp(`\\b(?:${GUARD_NAME_BODY})\\b`);
+
+/** The session-shaped reads that make a redirect an AUTH redirect and not a 404. */
+const SESSION_READ =
+  /\b(?:getServerSession|getSession|getToken|unstable_getServerSession|currentUser|auth\(\)|useUser|requireUser|getUser|session|accessToken|refreshToken|jwt|cookies\(\)\s*\.\s*get)\b/;
+
+/** A path a guard redirects an anonymous visitor to. */
+const LOGIN_TARGET = /['"`]\/(?:[\w-]+\/)*(?:login|signin|sign-in|auth|sso|unauthorized|403)\b/i;
+
+/**
+ * `@Public()` and friends: an explicit opt-OUT written next to a class-level
+ * guard.
+ *
+ * Its presence is why a file-level decorator verdict becomes UNKNOWN rather
+ * than GUARDED. A Nest controller with `@UseGuards` on the class and `@Public()`
+ * on one method is a MIXTURE, and this static pass cannot say which method is
+ * which — so it says so. Claiming GUARDED for the whole file would hide a
+ * public endpoint inside an inventory of protected ones, which is the exact
+ * surface an authorization test is written to find.
+ */
+const PUBLIC_MARKER = /@(?:Public|SkipAuth|NoAuth|AllowAnonymous|Unprotected)\s*\(/;
+
+/**
+ * An argument whose body is RIGHT HERE: an inline arrow or function expression.
+ *
+ * The distinction this draws is the one that keeps the unresolved-middleware
+ * verdict from becoming UNKNOWN everywhere. A middleware written inline has
+ * already been read — `GUARD_NAME` and `SESSION_READ` scanned the whole file —
+ * so a route in front of one is a route we are entitled to call UNGUARDED. A
+ * bare identifier, a member access or a call is a definition somewhere else,
+ * and following it needs the import graph rule 4 of this module's header
+ * forbids inventing.
+ */
+const INLINE_FUNCTION = /^(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)/;
+
+/** Nest/Spring role declarations, with the app's own spelling preserved. */
+const ROLE_DECLARATIONS: RegExp[] = [
+  /@Roles\s*\(([^)]*)\)/g,
+  /@PreAuthorize\s*\(\s*["'`][^"'`]*?hasR(?:ole|oles|ny)\w*\s*\(([^)]*)\)/g,
+  /@Secured\s*\(([^)]*)\)/g,
+  /\brequireRoles?\s*\(([^)]*)\)/g,
+  /\bauthorize\s*\(([^)]*)\)/g,
+  /\bhasRole\s*\(([^)]*)\)/g,
+  /\ballowedRoles\s*:\s*(\[[^\]]*\])/g,
+  /\brequiredRoles\s*:\s*(\[[^\]]*\])/g,
+];
+
+/**
+ * Role names out of a declaration's argument list.
+ *
+ * Case is preserved deliberately. surface.ts is explicit that a role the app
+ * calls `Admin` and one it calls `admin` are two roles until the customer says
+ * otherwise — normalising them here would merge two cells of the route × role
+ * matrix and shrink that denominator silently, which is the one direction a
+ * denominator must never move on its own.
+ */
+function rolesIn(args: string): string[] {
+  const out: string[] = [];
+  for (const m of args.matchAll(/['"`]([^'"`\n]{1,60})['"`]/g)) {
+    const name = (m[1] ?? '').trim();
+    if (name.length > 0 && !out.includes(name)) out.push(name);
+  }
+  // `@Roles(Role.ADMIN)` — an enum member reference, which names the role just
+  // as plainly as a string does and is the idiomatic Nest spelling.
+  for (const m of args.matchAll(/\b[A-Z]\w*\s*\.\s*([A-Z][A-Z0-9_]{1,40})\b/g)) {
+    const name = m[1] ?? '';
+    if (name.length > 0 && !out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/** Every role any declaration in `text` demands, or null when none names one. */
+function rolesDeclaredIn(text: string): string[] | null {
+  const found: string[] = [];
+  for (const pattern of ROLE_DECLARATIONS) {
+    pattern.lastIndex = 0;
+    for (const m of text.matchAll(pattern)) {
+      for (const role of rolesIn(m[1] ?? '')) {
+        if (!found.includes(role)) found.push(role);
+      }
+    }
+  }
+  return found.length > 0 ? found : null;
+}
+
+/**
+ * A matcher pattern as a test against a route, or null when it is unreadable.
+ *
+ * Null is the important return. A Next.js matcher may be a full regular
+ * expression — `'/((?!api|_next).*)'` is the documented idiom — and a pattern
+ * this function cannot faithfully convert must make the routes it might cover
+ * UNKNOWN, not UNGUARDED. Approximating it would decide an access question with
+ * a guess, and the guess that falls out of a half-converted negative lookahead
+ * is "public".
+ */
+function matcherToTest(pattern: string): RegExp | null {
+  if (pattern.length === 0 || !pattern.startsWith('/')) return null;
+  // A lookahead, an alternation or a character class is a real regex, not a
+  // path pattern. We do not translate those; we admit we did not.
+  if (/[(){}|[\]+^$\\]/.test(pattern)) return null;
+  /*
+   * Built by appending, not by joining on '/', and that is the whole point.
+   *
+   * `:path*` means ZERO OR MORE segments, so the slash in front of it is part
+   * of the optional group: `/admin/:path*` matches `/admin` as well as
+   * `/admin/users`. Joining the translated segments with '/' produced
+   * `^/admin/.*$`, which does NOT match `/admin` — so a middleware matcher
+   * covering an entire admin area left `/admin` itself UNGUARDED, and
+   * UNGUARDED is spent downstream as a positive claim that the route is
+   * public. That is this file's worst available defect, arriving from one
+   * misplaced slash.
+   */
+  let body = '';
+  for (const segment of pattern.split('/')) {
+    if (segment.length === 0) continue;
+    if (/^:[\w-]+\*$/.test(segment) || segment === '**') {
+      body += '(?:/.*)?';
+      continue;
+    }
+    if (/^:[\w-]+$/.test(segment) || segment === '*') {
+      body += '/[^/]+';
+      continue;
+    }
+    body += `/${segment.replace(/[.*?]/g, (char) => `\\${char}`)}`;
+  }
+  if (body.length === 0) body = '/';
+  try {
+    return new RegExp(`^${body}/?$`);
+  } catch {
+    return null;
+  }
+}
+
+/** Does any of this declaration's patterns cover `route`? */
+function patternsCover(patterns: readonly string[], route: string): boolean {
+  for (const pattern of patterns) {
+    const test = matcherToTest(pattern);
+    if (test?.test(route)) return true;
+  }
+  return false;
+}
+
+/**
+ * String literals out of an array or scalar property: `matcher: ['/a', '/b']`.
+ *
+ * Bounded by the ARRAY'S OWN BRACKETS, not by a heuristic about where the next
+ * property starts. The heuristic version looked for a newline before the next
+ * key, so `{ matcher: ['/admin'], regions: ['/iad1'] }` written on one line
+ * donated `/iad1` to the matcher — and `/iad1`, a perfectly public route, came
+ * out GUARDED. An invented guard is as damaging as a missed one: it tells the
+ * crawl not to bother with a page it was always allowed to see.
+ *
+ * `sawValue` distinguishes "the property is not there" from "it is there and
+ * holds nothing we could read", which is the same distinction every other
+ * reader in this file draws.
+ */
+function literalList(source: string, property: string): { values: string[]; sawValue: boolean } {
+  const at = new RegExp(`\\b${property}\\s*:`).exec(source);
+  if (!at) return { values: [], sawValue: false };
+  const from = at.index + at[0].length;
+  const rest = source.slice(from, from + 4000);
+  const open = rest.search(/\S/);
+  if (open === -1) return { values: [], sawValue: true };
+
+  const strings = (text: string): string[] =>
+    [...text.matchAll(/['"`]([^'"`\n]{1,200})['"`]/g)]
+      .map((m) => m[1] ?? '')
+      .filter((value) => value.length > 0);
+
+  if (rest[open] === '[') {
+    const close = rest.indexOf(']', open);
+    // An array that does not close inside the window is read as far as the
+    // window goes. The caller's unreadable-pattern path then reports it.
+    return {
+      values: strings(close === -1 ? rest.slice(open + 1) : rest.slice(open + 1, close)),
+      sawValue: true,
+    };
+  }
+  // A scalar property: exactly one literal, and only if it is the next thing.
+  const scalar = /^\s*['"`]([^'"`\n]{1,200})['"`]/.exec(rest);
+  return { values: scalar && scalar[1] ? [scalar[1]] : [], sawValue: true };
+}
+
+/** The directory a layout guards, as a route prefix pattern. */
+function layoutPrefix(path: string): string {
+  const dir = dirname(path);
+  const segments = dir.split('/');
+  const anchor = segments.findIndex((s) => s === 'app' || s === 'routes' || s === 'pages');
+  const rest = anchor === -1 ? [] : segments.slice(anchor + 1);
+  const base = joinSegments(rest.map(appSegment));
+  return base === '/' ? '/*' : `${base}/*`;
+}
+
+/**
+ * Guard sites we FOUND and could not read, and what each one could cover.
+ *
+ * This is the machinery behind "UNKNOWN, never false". A `middleware.ts` whose
+ * body was never uploaded is proof that an interceptor exists and no evidence
+ * at all about what it intercepts, so every route it might cover has to come
+ * out UNKNOWN. Without this list those routes would fall through to UNGUARDED
+ * — a positive claim of public access derived from our own missing input.
+ */
+interface BlindGuardSite {
+  file: string;
+  /** Null when the site could cover anything (a middleware with no readable matcher). */
+  coversPrefix: string | null;
+  why: string;
+  /**
+   * Restrict the site to routes declared in `file`, not every route whose path
+   * the prefix happens to match.
+   *
+   * Set for a site whose scope is ONE registration — an Express handler with a
+   * middleware we could not resolve. Without it, `app.get('/', cors(), home)`
+   * in a server file clouded the Next.js page route `/` declared in
+   * app/page.tsx, because `blindFor` matches a prefix against a path and the
+   * two files share nothing but the string. A layout's prefix is genuinely
+   * cross-file and keeps the default.
+   */
+  inFileOnly?: true;
+}
+
+interface GuardFindings {
+  declarations: GuardDeclaration[];
+  blind: BlindGuardSite[];
+  /** Paths a Clerk-style `publicRoutes` list declares anonymous. A positive negative. */
+  publicPatterns: string[];
+}
+
+/**
+ * Read every guard declaration in the repo.
+ *
+ * Phase one of two. It does not decide anything about a route: it collects what
+ * the source SAYS, and `resolveGuards` applies it. Splitting them is what lets
+ * a declaration that matched no route still be reported — a middleware matcher
+ * for `/admin/:path*` in a repo whose inventory has no `/admin` is evidence
+ * that our route detectors missed an admin area, and that is a fact about OUR
+ * error rate rather than about the customer's app.
+ */
+function collectGuards(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): GuardFindings {
+  const declarations: GuardDeclaration[] = [];
+  const blind: BlindGuardSite[] = [];
+  const publicPatterns: string[] = [];
+  let capped = 0;
+
+  const declare = (declaration: GuardDeclaration): void => {
+    if (declarations.length >= MAX_GUARD_DECLARATIONS) {
+      capped++;
+      return;
+    }
+    declarations.push(declaration);
+    ledger.hit('route-guards');
+  };
+
+  for (const file of files) {
+    const base = basename(file.path);
+    const stem = base.replace(/\.[^.]+$/, '');
+    const isMiddleware = /^middleware$/.test(stem) && SERVER_EXT.test(base);
+    const isLayout = /^(?:layout|\+layout(?:\.server|\.ts)?|_app)$/.test(stem);
+    const guardShaped = isMiddleware || isLayout;
+
+    // ── Route groups: readable from the PATH alone, so no body is needed ──
+    for (const segment of file.path.split('/')) {
+      const group = /^\((.+)\)$/.exec(segment);
+      if (!group) continue;
+      const word = group[1] ?? '';
+      const isAuthWord = AUTH_GROUP_WORD.test(word);
+      const isRoleWord = ROLE_GROUP_WORD.test(word);
+      if (!isAuthWord && !isRoleWord) continue;
+      if (!PAGE_EXT.test(base)) continue;
+      if (stem !== 'page' && stem !== 'route') continue;
+      ledger.examine('route-guards');
+      declare({
+        kind: 'NEXT_ROUTE_GROUP',
+        file: file.path,
+        line: null,
+        patterns: [],
+        roles: isRoleWord ? [word] : null,
+        evidence: isRoleWord
+          ? `${file.path} sits in the route group (${word}), whose name is the only basis for the role claim`
+          : `${file.path} sits in the route group (${word}), which names the access rule`,
+      });
+      break;
+    }
+
+    if (!guardShaped && file.content === undefined) continue;
+
+    if (guardShaped && file.content === undefined) {
+      ledger.examine('route-guards');
+      ledger.starve('route-guards');
+      blind.push({
+        file: file.path,
+        coversPrefix: isMiddleware ? null : layoutPrefix(file.path),
+        why: isMiddleware
+          ? 'a middleware file whose body was not uploaded, so what it intercepts is unknown'
+          : 'a layout whose body was not uploaded, so whether it redirects anonymous visitors is unknown',
+      });
+      shortfalls.note(
+        'route-guards',
+        'NO_CONTENT',
+        `${file.path} is a guard site (${isMiddleware ? 'middleware' : 'layout'}) and no body was uploaded, so every route it could cover is UNKNOWN rather than public`,
+      );
+      continue;
+    }
+
+    const content = file.content;
+    if (content === undefined) continue;
+
+    // ── Next.js middleware ──
+    if (isMiddleware) {
+      ledger.examine('route-guards');
+      const guards = GUARD_NAME.test(content) || SESSION_READ.test(content);
+      const redirectsToLogin = LOGIN_TARGET.test(content) && /\bredirect\b/.test(content);
+      if (!guards && !redirectsToLogin) {
+        // Read, and it is not a guard — an i18n rewrite, a header shim. Saying
+        // nothing here is correct: the routes stay eligible for UNGUARDED
+        // because we DID read the one file that could have guarded them.
+        continue;
+      }
+      const matcher = literalList(content, 'matcher');
+      const publics = literalList(content, 'publicRoutes');
+      for (const pattern of publics.values) {
+        if (!publicPatterns.includes(pattern)) publicPatterns.push(pattern);
+      }
+
+      const unreadable = matcher.values.filter((p) => matcherToTest(p) === null);
+      const readable = matcher.values.filter((p) => matcherToTest(p) !== null);
+
+      if (!matcher.sawValue || matcher.values.length === 0) {
+        /*
+         * A guard middleware with no matcher runs on EVERY request — that is
+         * Next's documented default — so it covers everything. We know that,
+         * and we also cannot read which requests its own body lets through, so
+         * the honest coverage is "could be anything" rather than "all guarded".
+         */
+        blind.push({
+          file: file.path,
+          coversPrefix: null,
+          why: 'a guard middleware that declares no matcher, so it runs on every request and we cannot read which ones it lets through',
+        });
+        shortfalls.note(
+          'route-guards',
+          'EXPRESSION_NOT_LITERAL',
+          `${file.path} guards requests and declares no literal matcher, so which routes it covers was not read`,
+        );
+        continue;
+      }
+      if (unreadable.length > 0) {
+        blind.push({
+          file: file.path,
+          coversPrefix: null,
+          why: `a middleware matcher written as a regular expression (${unreadable[0]}), which this static pass does not translate`,
+        });
+        shortfalls.note(
+          'route-guards',
+          'EXPRESSION_NOT_LITERAL',
+          `${file.path} declares ${unreadable.length} matcher pattern(s) written as regular expressions; they were not translated, so the routes they could cover are UNKNOWN`,
+          unreadable.length,
+        );
+      }
+      if (readable.length > 0) {
+        const at = content.indexOf('matcher');
+        declare({
+          kind: 'NEXT_MIDDLEWARE',
+          file: file.path,
+          line: at === -1 ? null : lineAt(content, at),
+          patterns: readable,
+          roles: rolesDeclaredIn(content),
+          evidence: `${file.path} is Next.js middleware whose matcher covers ${readable.join(', ')}, and its body reads a session`,
+        });
+      }
+      continue;
+    }
+
+    // ── A layout that redirects an anonymous visitor ──
+    if (isLayout) {
+      ledger.examine('route-guards');
+      const redirects = /\bredirect\s*\(|\bthrow\s+redirect\b|\bnavigate\s*\(/.test(content);
+      if (redirects && SESSION_READ.test(content) && LOGIN_TARGET.test(content)) {
+        const at = content.search(/\bredirect\s*\(/);
+        declare({
+          kind: 'LAYOUT_REDIRECT',
+          file: file.path,
+          line: at === -1 ? null : lineAt(content, at),
+          patterns: [layoutPrefix(file.path)],
+          roles: rolesDeclaredIn(content),
+          evidence: `${file.path} reads a session and redirects to a login path, so it guards everything under ${layoutPrefix(file.path)}`,
+        });
+      }
+      continue;
+    }
+
+    // ── Decorators: Nest and Spring ──
+    if (/@UseGuards\s*\(|@PreAuthorize\s*\(|@Secured\s*\(|@Roles\s*\(/.test(content)) {
+      ledger.examine('route-guards');
+      const mixed = PUBLIC_MARKER.test(content);
+      const at = content.search(/@(?:UseGuards|PreAuthorize|Secured|Roles)\s*\(/);
+      declare({
+        kind: 'DECORATOR',
+        file: file.path,
+        line: at === -1 ? null : lineAt(content, at),
+        patterns: [],
+        roles: rolesDeclaredIn(content),
+        evidence: mixed
+          ? `${file.path} declares a guard decorator AND an explicit public marker, so which of its handlers are guarded was not read`
+          : `${file.path} declares a guard decorator on the handlers it contains`,
+      });
+      if (mixed) {
+        blind.push({
+          file: file.path,
+          coversPrefix: null,
+          why: `${file.path} mixes a guard decorator with an explicit public marker, and this pass cannot say which handler is which`,
+        });
+        shortfalls.note(
+          'route-guards',
+          'EXPRESSION_NOT_LITERAL',
+          `${file.path} mixes a guard decorator with a public marker; per-handler resolution needs the decorator-to-method binding a static pass over text does not have`,
+        );
+      }
+    }
+
+    // ── An Express/Koa middleware chain ──
+    if (/\b(?:app|router|server|fastify)\s*\.\s*(?:use|get|post|put|patch|delete|all)\s*\(/.test(content)) {
+      // `app.use(requireAuth)` with no path guards everything the file declares
+      // after it. Scoped to the file because resolving what else mounts this
+      // router needs an import graph, which rule 4 of this module's header
+      // forbids inventing.
+      const blanket = new RegExp(
+        `\\b(?:app|router|server|fastify)\\s*\\.\\s*use\\s*\\(\\s*(?:${GUARD_NAME_BODY})\\b`,
+      ).exec(content);
+      if (blanket) {
+        ledger.examine('route-guards');
+        declare({
+          kind: 'MIDDLEWARE_CHAIN',
+          file: file.path,
+          line: lineAt(content, blanket.index),
+          patterns: [],
+          roles: rolesDeclaredIn(content),
+          evidence: `${file.path} installs a guard with .use() before the routes it declares`,
+        });
+      }
+
+      // `app.get('/admin', requireAuth, handler)` — the path is right there.
+      for (const m of content.matchAll(
+        /*
+         * The tail runs to the end of the line, NOT to the first `)`.
+         * `app.post('/x', requireRole('ADMIN'), handler)` has a `)` inside the
+         * guard's own argument list, so `[^)]*` cut the tail to
+         * `requireRole('ADMIN'` — an unbalanced fragment that no role pattern
+         * can match, and the route came out GUARDED WITH NO ROLE. A guarded
+         * route whose role we dropped is a route × role matrix with an empty
+         * cell where the only interesting cell was.
+         */
+        /\b(?:app|router|server|fastify)\s*\.\s*(?:get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`\n]{1,300})['"`]\s*,([^\n;]{0,400})/g,
+      )) {
+        const rest = m[2] ?? '';
+        if (!GUARD_NAME.test(rest)) continue;
+        ledger.examine('route-guards');
+        declare({
+          kind: 'MIDDLEWARE_CHAIN',
+          file: file.path,
+          line: lineAt(content, m.index ?? 0),
+          patterns: [normaliseRoute(paramsToColon(m[1] ?? ''))],
+          roles: rolesDeclaredIn(rest),
+          evidence: `${file.path} registers ${normaliseRoute(paramsToColon(m[1] ?? ''))} with a guard between the path and the handler`,
+        });
+      }
+
+      /*
+       * ── A MIDDLEWARE WE COULD NOT RESOLVE IS NOT AN ABSENT GUARD ──────────
+       *
+       * This is the case the whole three-valued verdict exists for, and it was
+       * the one case that still fell through to UNGUARDED.
+       *
+       *   app.get('/exports', policyFor('finance'), handler)
+       *   app.get('/vault', ...buildChain('admin'), handler)
+       *   app.get('/reports', middlewares.admin, handler)
+       *
+       * Every one of those has a guard sitting in the chain under a name this
+       * pass cannot follow — resolving `policyFor` needs the import graph rule
+       * 4 of this module's header forbids inventing. `GUARD_NAME` does not
+       * match, the loop above declares nothing, and `resolveGuards` then found
+       * no declaration and no blind site and answered UNGUARDED: "the guard
+       * pass read this route's own declaration sites and found no guard". We
+       * read the declaration site and found a middleware we could not read,
+       * which is the opposite claim.
+       *
+       * UNGUARDED is spent downstream as a POSITIVE claim of public access — it
+       * is what makes a plan propose an anonymous scenario — so an admin
+       * endpoint came out uncovered-and-public, got an anonymous smoke test,
+       * and the 401 was recorded as the page.
+       *
+       * ── WHAT IS DELIBERATELY NOT CLOUDED ──────────────────────────────────
+       *
+       * A two-argument registration: `app.get('/health', handler)` has no
+       * middleware at all, so UNGUARDED there is earned and stays.
+       *
+       * An INLINE function in the middle: its body is right here, `GUARD_NAME`
+       * and `SESSION_READ` have both had a look at it, and a route whose own
+       * middleware we read is a route we are entitled to speak about. Only a
+       * bare identifier, a member access, a call or a spread — something whose
+       * definition is elsewhere — makes the chain unreadable.
+       *
+       * The site names the ARGUMENT, so a human can dismiss `cors()` in one
+       * glance instead of distrusting the verdict. We cannot tell `cors()` from
+       * `policyFor('finance')` without the import graph, and saying so is
+       * cheaper than being wrong in the flattering direction.
+       */
+      for (const m of content.matchAll(
+        /\b(?:app|router|server|fastify)\s*\.\s*(?:get|post|put|patch|delete|all)\s*\(/g,
+      )) {
+        const openAt = (m.index ?? 0) + m[0].length - 1;
+        const args = callArguments(content, openAt);
+        if (args === null) continue;
+        const rawPath = /^['"`]([^'"`\n]{1,300})['"`]$/.exec(args[0] ?? '');
+        if (!rawPath) continue;
+        const after = args.slice(1);
+        // Already declared GUARDED by the loop above; nothing is unread.
+        if (GUARD_NAME.test(after.join(','))) continue;
+        const unresolved = after.filter((arg, at) => {
+          if (arg.length === 0) return false;
+          // A spread can hide any number of middlewares, including the handler,
+          // so it is unreadable wherever it sits.
+          if (arg.startsWith('...')) return true;
+          // The last argument is the handler, not a middleware in front of it.
+          if (at === after.length - 1) return false;
+          return !INLINE_FUNCTION.test(arg);
+        });
+        if (unresolved.length === 0) continue;
+        const route = normaliseRoute(paramsToColon(rawPath[1] ?? ''));
+        ledger.examine('route-guards');
+        ledger.starve('route-guards');
+        blind.push({
+          file: file.path,
+          coversPrefix: route,
+          inFileOnly: true,
+          why:
+            `${file.path} registers ${route} with ${unresolved[0]} between the path and the ` +
+            'handler, and whether that is a guard needs the import graph this pass does not have',
+        });
+        shortfalls.note(
+          'route-guards',
+          'UNRESOLVED_IMPORT',
+          `${file.path} registers ${route} behind a middleware (${unresolved[0]}) declared elsewhere, so whether it is guarded is UNKNOWN rather than public`,
+        );
+      }
+    }
+
+    // ── A React Router loader that redirects ──
+    if (/react-router/.test(content)) {
+      // JSX: both attributes live in one tag, so the binding is exact.
+      for (const m of content.matchAll(
+        /<Route\b([^>]{0,600}?)\/?>/g,
+      )) {
+        const tag = m[1] ?? '';
+        if (!/\bloader\s*=/.test(tag) || !GUARD_NAME.test(tag)) continue;
+        const path = attr(tag, 'path');
+        if (path === null) continue;
+        ledger.examine('route-guards');
+        declare({
+          kind: 'ROUTER_LOADER',
+          file: file.path,
+          line: lineAt(content, m.index ?? 0),
+          patterns: [normaliseRoute(path)],
+          roles: rolesDeclaredIn(tag),
+          evidence: `${file.path} gives <Route path="${path}"> a guard loader`,
+        });
+      }
+      /*
+       * Objects: bounded to the window between this `path:` and the next one,
+       * so a guard loader on a sibling record cannot be credited to this one.
+       * The window is the honest limit of a text scan — a nested `children:`
+       * array can still put a descendant's loader inside it, which is why the
+       * evidence names the window rather than claiming a resolved binding.
+       */
+      for (const m of content.matchAll(
+        /\bpath\s*:\s*['"`]([^'"`\n]{1,300})['"`]([\s\S]{0,400}?)(?=\bpath\s*:|$)/g,
+      )) {
+        const window = m[2] ?? '';
+        if (!/\bloader\s*:/.test(window) || !GUARD_NAME.test(window)) continue;
+        ledger.examine('route-guards');
+        declare({
+          kind: 'ROUTER_LOADER',
+          file: file.path,
+          line: lineAt(content, m.index ?? 0),
+          patterns: [normaliseRoute(m[1] ?? '')],
+          roles: rolesDeclaredIn(window),
+          evidence: `${file.path} declares a route record for ${normaliseRoute(m[1] ?? '')} whose loader is a guard`,
+        });
+      }
+    }
+
+    // ── An auth wrapper around the file's own default export ──
+    const wrapped =
+      /export\s+default\s+(?:async\s+)?(withAuth|withPageAuthRequired|withApiAuthRequired|withAuthenticationRequired|requireAuth|requireUser|protect)\s*\(/.exec(
+        content,
+      );
+    if (wrapped) {
+      ledger.examine('route-guards');
+      declare({
+        kind: 'AUTH_WRAPPER',
+        file: file.path,
+        line: lineAt(content, wrapped.index),
+        patterns: [],
+        roles: rolesDeclaredIn(content),
+        evidence: `${file.path} exports its default through ${wrapped[1]}(), which guards it`,
+      });
+    }
+  }
+
+  if (capped > 0) {
+    shortfalls.note(
+      'route-guards',
+      'CAP_REACHED',
+      `more than ${MAX_GUARD_DECLARATIONS} guard declarations were found; the rest were not recorded, so at least ${capped} more exist`,
+      capped,
+    );
+  }
+
+  return { declarations, blind, publicPatterns };
+}
+
+/**
+ * Apply the declarations to the routes and endpoints already collected.
+ *
+ * Phase two. Every item gets a verdict — there is no "we skipped this one" —
+ * because an item with no `guard` at all is indistinguishable from an analysis
+ * that predates this pass, and that ambiguity is the thing `PageRoute.guard`'s
+ * doc comment promises not to produce.
+ */
+function resolveGuards(
+  out: Collector,
+  findings: GuardFindings,
+  anyContent: boolean,
+  filesWithoutContent: ReadonlySet<string>,
+): void {
+  const covering = (path: string, file: string): GuardDeclaration[] =>
+    findings.declarations.filter((declaration) =>
+      declaration.patterns.length === 0
+        ? declaration.file === file || isAncestorGuard(declaration, file)
+        : patternsCover(declaration.patterns, path),
+    );
+
+  /*
+   * A blind site clouds a route only when it could actually cover it: the same
+   * FILE, a layout whose prefix matches, or a middleware, which covers
+   * everything.
+   *
+   * `dirname(site.file) === dirname(file)` used to be in this list and was far
+   * too broad — one Nest controller mixing a guard with a `@Public()` marker
+   * turned every endpoint declared anywhere in `src/` UNKNOWN. UNKNOWN is the
+   * safe direction, but UNKNOWN everywhere is not honesty, it is an unusable
+   * report: the customer learns nothing and the route × role matrix has no
+   * ground truth to check the crawl against. A declaration that matches no
+   * route still surfaces in `analysis.guards`, which is the designed finding
+   * for exactly this case.
+   */
+  const blindFor = (path: string, file: string): BlindGuardSite[] =>
+    findings.blind.filter((site) => {
+      if (site.coversPrefix === null) return site.file === file || isGlobalSite(site);
+      if (site.inFileOnly === true) {
+        return site.file === file && patternsCover([site.coversPrefix], path);
+      }
+      return patternsCover([site.coversPrefix], path);
+    });
+
+  const verdict = (path: string, file: string): RouteGuard => {
+    const applying = covering(path, file);
+    if (applying.length > 0) {
+      const roles: string[] = [];
+      for (const declaration of applying) {
+        for (const role of declaration.roles ?? []) {
+          if (!roles.includes(role)) roles.push(role);
+        }
+      }
+      const mixed = applying.some((d) => d.evidence.includes('public marker'));
+      if (mixed) {
+        return {
+          access: 'UNKNOWN',
+          roles: null,
+          declaredBy: applying,
+          evidence: `${file} declares a guard and an explicit public marker; which of its handlers ${path} is was not read`,
+        };
+      }
+      return {
+        access: 'GUARDED',
+        roles: roles.length > 0 ? roles : null,
+        declaredBy: applying,
+        evidence: applying.map((d) => d.evidence).join('; '),
+      };
+    }
+
+    if (findings.publicPatterns.length > 0 && patternsCover(findings.publicPatterns, path)) {
+      return {
+        access: 'UNGUARDED',
+        roles: null,
+        declaredBy: [],
+        evidence: `a publicRoutes list in the middleware config names ${path} as anonymous`,
+      };
+    }
+
+    /*
+     * Every reason we are not entitled to say UNGUARDED, in the order a reader
+     * would ask about them. Each one ends in UNKNOWN, and UNKNOWN is the answer
+     * that costs nothing: the crawl will try the route either way, and the
+     * route × role matrix simply records that the source did not tell us.
+     *
+     * UNGUARDED, by contrast, is spent downstream as a POSITIVE claim — it is
+     * what makes a plan propose an anonymous scenario — so it has to be earned.
+     */
+    if (!anyContent) {
+      return {
+        access: 'UNKNOWN',
+        roles: null,
+        declaredBy: [],
+        evidence:
+          'no file bodies were uploaded, so no guard could be read; this is our missing input, not a public route',
+      };
+    }
+    const blind = blindFor(path, file);
+    if (blind.length > 0) {
+      return {
+        access: 'UNKNOWN',
+        roles: null,
+        declaredBy: [],
+        evidence: `a guard site above ${path} could not be read: ${blind[0]!.why}`,
+      };
+    }
+    if (filesWithoutContent.has(file)) {
+      return {
+        access: 'UNKNOWN',
+        roles: null,
+        declaredBy: [],
+        evidence: `${file} was uploaded as a path with no body, so a guard wrapper or decorator on it was not read`,
+      };
+    }
+    return {
+      access: 'UNGUARDED',
+      roles: null,
+      declaredBy: [],
+      evidence: `no guard was found in ${file}, in any layout above it, or in any middleware matcher covering ${path}`,
+    };
+  };
+
+  for (const route of out.routes) route.guard = verdict(route.route, route.file);
+  for (const endpoint of out.endpoints) endpoint.guard = verdict(endpoint.path, endpoint.file);
+}
+
+/** A layout's or middleware's directory encloses this file's directory. */
+function isAncestorGuard(declaration: GuardDeclaration, file: string): boolean {
+  if (declaration.kind !== 'LAYOUT_REDIRECT' && declaration.kind !== 'NEXT_ROUTE_GROUP') {
+    return false;
+  }
+  const guardDir = dirname(declaration.file);
+  return file === declaration.file || file.startsWith(`${guardDir}/`);
+}
+
+/** A site with no readable scope, which therefore could cover any route. */
+function isGlobalSite(site: BlindGuardSite): boolean {
+  return site.coversPrefix === null && /middleware/.test(basename(site.file));
+}
+
+function detectRouteGuards(
+  files: AnalysedFile[],
+  out: Collector,
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): GuardDeclaration[] {
+  const findings = collectGuards(files, ledger, shortfalls);
+  const anyContent = files.some((file) => file.content !== undefined);
+  const withoutContent = new Set(
+    files.filter((file) => file.content === undefined).map((file) => file.path),
+  );
+  resolveGuards(out, findings, anyContent, withoutContent);
+  return findings.declarations;
+}
+
+// ─── The component inventory ─────────────────────────────────────────────────
+
+/** Files that can declare a component, a hook or a provider. */
+const MODULE_EXT = new Set([
+  '.ts',
+  '.tsx',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+  '.mts',
+  '.cts',
+  '.vue',
+  '.svelte',
+]);
+
+/** A catalogue entry file: Storybook's CSF, and Ladle's and Histoire's copies of it. */
+const STORY_PATH = /\.stories\.[cm]?[jt]sx?$|\.story\.[cm]?[jt]sx?$/;
+
+/**
+ * Exported names that are declarations rather than components.
+ *
+ * `metadata`, `config`, `generateStaticParams` and the HTTP verbs are framework
+ * contracts: Next.js reads them, nothing renders them, and counting them as
+ * exported components would pad the UNIT_GEN denominator with things no unit
+ * test could ever be written for. A denominator padded with untestable entries
+ * is worse than a small one — it makes the percentage fall for a reason the
+ * customer cannot act on.
+ */
+const NOT_A_COMPONENT_EXPORT = new Set<string>([
+  'metadata',
+  'generateMetadata',
+  'generateStaticParams',
+  'generateViewport',
+  'viewport',
+  'config',
+  'revalidate',
+  'dynamic',
+  'dynamicParams',
+  'fetchCache',
+  'runtime',
+  'preferredRegion',
+  'maxDuration',
+  'loader',
+  'action',
+  'middleware',
+  ...HTTP_METHODS,
+]);
+
+/** State kinds a story's own name declares. The CATALOGUE half of the inventory. */
+const STORY_STATE_NAME: Array<{ pattern: RegExp; kind: ComponentStateKind }> = [
+  { pattern: /^(?:loading|pending|fetching|skeleton)$/i, kind: 'LOADING' },
+  { pattern: /^(?:empty|noresults|nodata|blank|zerostate)$/i, kind: 'EMPTY' },
+  { pattern: /^(?:error|errored|failure|failed|errorstate)$/i, kind: 'ERROR' },
+  { pattern: /^(?:forbidden|unauthorized|unauthorised|denied|noaccess|readonly)$/i, kind: 'FORBIDDEN' },
+  { pattern: /^(?:slow|delayed|timeout|throttled)$/i, kind: 'SLOW' },
+  { pattern: /^(?:default|basic|primary|normal|playground)$/i, kind: 'DEFAULT' },
+];
+
+/**
+ * Render branches that declare a state, and the sentence each one justifies.
+ *
+ * SLOW is deliberately absent. A slow response is not a render branch — it is
+ * reached by holding a response open — so no source pattern declares it, and
+ * inventing one would report a measurement nobody took. It arrives from a
+ * CATALOGUE entry named `Slow` or it does not arrive at all, and that is the
+ * honest shape of the fact.
+ */
+const SOURCE_STATE_BRANCH: Array<{ pattern: RegExp; kind: ComponentStateKind; because: string }> = [
+  {
+    /*
+     * `isLoading` is unambiguous on its own. A bare `loading` is not — it is
+     * also a prop name, a CSS class and an import — so it only counts when it
+     * is USED IN A BRANCH. Without that the detector would report a LOADING
+     * state for every file containing the word, and a denominator padded with
+     * states that do not exist is a percentage that falls for a reason the
+     * customer cannot act on.
+     */
+    pattern:
+      /\b(?:isLoading|isPending|isFetching|isValidating)\b|\b(?:loading|pending)\s*(?:\?|&&)|\bif\s*\(\s*!?\s*(?:loading|pending)\b/,
+    kind: 'LOADING',
+    because: 'branches on a loading flag',
+  },
+  {
+    pattern: /\.length\s*===?\s*0|\.length\s*<\s*1|\b(?:isEmpty|hasNoResults|noResults)\b|!\w+\.length/,
+    kind: 'EMPTY',
+    because: 'branches on an empty collection',
+  },
+  {
+    /* Same reasoning as LOADING: a bare `error` is the commonest identifier in
+     * a catch block, which is not a render branch. */
+    pattern:
+      /\b(?:isError|hasError|isRejected)\b|<ErrorBoundary|componentDidCatch|\berror\s*(?:\?|&&)|\bif\s*\(\s*!?\s*error\b/,
+    kind: 'ERROR',
+    because: 'branches on an error',
+  },
+  {
+    pattern:
+      /\b(?:forbidden|unauthorized|unauthorised|canAccess|hasPermission|isAllowed|notAllowed)\b/i,
+    kind: 'FORBIDDEN',
+    because: 'branches on a permission check',
+  },
+];
+
+/** Kinds that RENDER, and therefore have a happy path to be in. */
+const RENDERABLE_KINDS: readonly ComponentItemKind[] = [
+  'COMPONENT',
+  'PAGE',
+  'LAYOUT',
+  'CONTEXT_PROVIDER',
+];
+
+interface ExportSite {
+  name: string;
+  /** Offset of the export, for the line number and for the body window. */
+  index: number;
+}
+
+/**
+ * Every name a module exports, with where it is declared.
+ *
+ * Text, not a parser, and the limits are stated rather than hidden: a name
+ * re-exported from a barrel (`export * from './Button'`) is NOT listed, because
+ * following it needs an import graph and rule 4 of this module's header forbids
+ * inventing one. A barrel therefore contributes nothing instead of
+ * contributing a plausible guess, and `components` counts the file the
+ * component is actually declared in.
+ */
+function exportedNames(content: string): { sites: ExportSite[]; capped: number } {
+  const sites: ExportSite[] = [];
+  const seen = new Set<string>();
+  let capped = 0;
+
+  const add = (name: string, index: number): void => {
+    if (name.length === 0 || seen.has(name)) return;
+    if (sites.length >= MAX_EXPORTS_PER_FILE) {
+      capped++;
+      return;
+    }
+    seen.add(name);
+    sites.push({ name, index });
+  };
+
+  for (const m of content.matchAll(
+    /export\s+(?:async\s+)?(?:function|class)\s+([A-Za-z_$][\w$]*)/g,
+  )) {
+    add(m[1] ?? '', m.index ?? 0);
+  }
+  for (const m of content.matchAll(
+    /export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g,
+  )) {
+    add(m[1] ?? '', m.index ?? 0);
+  }
+  for (const m of content.matchAll(/export\s+default\s+(?:async\s+)?(?:function|class)\s*([A-Za-z_$][\w$]*)?/g)) {
+    add('default', m.index ?? 0);
+  }
+  if (/export\s+default\s+(?!function|class)/.test(content)) {
+    add('default', content.search(/export\s+default\s+/));
+  }
+  for (const m of content.matchAll(/export\s*\{([^}]*)\}(?!\s*from)/g)) {
+    for (const part of (m[1] ?? '').split(',')) {
+      const alias = part.split(/\s+as\s+/);
+      const exported = (alias[alias.length - 1] ?? '').trim();
+      const local = (alias[0] ?? '').trim();
+      /*
+       * Anchored at the LOCAL declaration when there is one, not at the
+       * `export {}` statement. `function helper() { … }` followed by
+       * `export { helper }` is one declaration seen from two places, and
+       * anchoring on the export list gave the body window nothing but the list
+       * itself — so the export was judged un-callable and dropped from the
+       * inventory, and a helper the module plainly exports went missing from
+       * the UNIT_GEN denominator.
+       */
+      const declaration =
+        local.length > 0
+          ? new RegExp(`\\b(?:function|class|const|let|var)\\s+${local.replace(/[^\w$]/g, '')}\\b`).exec(
+              content,
+            )
+          : null;
+      add(exported, declaration?.index ?? m.index ?? 0);
+    }
+  }
+  return { sites, capped };
+}
+
+/**
+ * Where a component's body ends, for the purpose of reading its branches.
+ *
+ * The window stops at the next export so one component's loading state is not
+ * credited to its neighbour. It is a window and not a scope — a nested helper
+ * declared inside the component is inside it, which is correct, and a branch in
+ * a sibling `function` between two exports is also inside it, which is the
+ * limit a text scan has. The evidence sentence names the component, so a
+ * customer who disagrees can see which body was read.
+ */
+function bodyWindow(content: string, sites: readonly ExportSite[], at: number): string {
+  let end = content.length;
+  for (const site of sites) {
+    if (site.index > at && site.index < end) end = site.index;
+  }
+  return content.slice(at, Math.min(end, at + 20_000));
+}
+
+/** Which of the six kinds this export is, from its name, its file and its body. */
+function classifyExport(
+  path: string,
+  name: string,
+  body: string,
+  ext: string,
+): ComponentItemKind | null {
+  if (NOT_A_COMPONENT_EXPORT.has(name)) return null;
+
+  const base = basename(path);
+  const stem = base.replace(/\.[^.]+$/, '');
+  const inAppTree = /(?:^|\/)(?:src\/)?app\//.test(path);
+  const inPagesRouterTree = /(?:^|\/)(?:src\/)?pages\//.test(path);
+  const inRoutesTree = /(?:^|\/)src\/routes\//.test(path);
+
+  if (/^(?:layout|\+layout(?:\.server)?|_app|_document)$/.test(stem)) return 'LAYOUT';
+  /*
+   * PAGE is decided by the SAME convention the route detectors use, and by
+   * nothing looser. In an `app/` tree only `page.*` is a page; `pages/` is the
+   * flat router where every module IS a page. Reading `app/_components/
+   * Button.tsx` as a page because it sits under `app/` and has a default
+   * export would count a button on the ROUTE axis — the double count
+   * `componentHasOwnAxis` exists to prevent, arriving by the back door.
+   */
+  if (name === 'default' && (stem === 'page' || stem === '+page') && (inAppTree || inRoutesTree)) {
+    return 'PAGE';
+  }
+  if (
+    name === 'default' &&
+    inPagesRouterTree &&
+    PAGE_EXT.test(base) &&
+    !stem.startsWith('_') &&
+    !/(?:^|\/)pages\/api\//.test(path)
+  ) {
+    return 'PAGE';
+  }
+
+  if (/^use[A-Z]/.test(name)) return 'HOOK';
+  if (/Provider$/.test(name) || /createContext\s*[<(]/.test(body)) return 'CONTEXT_PROVIDER';
+
+  /*
+   * A component is a PascalCase export that renders. `default` has no case to
+   * read, so the file's own name stands in for it — which is exactly how a
+   * human reads `export default function () {}` in `Button.tsx`.
+   */
+  const named = name === 'default' ? stem : name;
+  const looksLikeComponent = /^[A-Z]/.test(named);
+  const renders =
+    ext === '.vue' ||
+    ext === '.svelte' ||
+    /return\s*\(?\s*</.test(body) ||
+    /=>\s*\(?\s*</.test(body) ||
+    /\bjsx\b|createElement|h\(/.test(body);
+
+  if (looksLikeComponent && renders) return 'COMPONENT';
+
+  /*
+   * UTILITY is "an exported helper", and a helper is something you can CALL.
+   * `export const locales = ['en','de']` is data, and so is
+   * `export const beta = process.env.FEATURE_BETA === 'true'` — neither is a
+   * subject a unit test could be written against, so neither belongs in the
+   * UNIT_GEN denominator. Counting them would make the percentage fall for a
+   * reason the customer cannot act on, which is the mirror image of the
+   * missing-surface problem rather than a cure for it.
+   *
+   * It also stops a double count the other way: `export const billingRouter =
+   * createTRPCRouter({...})` is already enumerated procedure by procedure on
+   * the BACKGROUND_JOB axis, and `componentHasOwnAxis` exists precisely to
+   * keep one surface out of two denominators.
+   */
+  return isCallableExport(body, name) ? 'UTILITY' : null;
+}
+
+/**
+ * Is this export something you can CALL?
+ *
+ * Judged on the INITIALISER and not on the body, which is the distinction that
+ * makes it work. `export const billingRouter = createTRPCRouter({ list:
+ * publicProcedure.query(() => []) })` has an arrow function inside it, so a
+ * scan of the first 400 characters called it callable — and it was then
+ * counted as a helper on the component axis WHILE its two procedures were
+ * counted on the BACKGROUND_JOB axis. One surface in two denominators is
+ * exactly what `componentHasOwnAxis` exists to prevent, and it got in through
+ * a loose regex rather than through the door that guard watches.
+ */
+function isCallableExport(body: string, name: string): boolean {
+  /*
+   * The `export` keyword is OPTIONAL here, because the body window may be
+   * anchored at a LOCAL declaration rather than at an export statement:
+   * `function toCents() {}` followed by `export { toCents }` is one
+   * declaration seen from two places. Requiring the keyword dropped every
+   * helper exported through a list — a real shrink of the UNIT_GEN
+   * denominator, caused by the very fix that was meant to find them.
+   */
+  if (/^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function|class)\b/.test(body)) return true;
+  const declared = new RegExp(
+    `\\b${name === 'default' ? 'default' : name.replace(/[^\w$]/g, '')}\\b\\s*=\\s*([\\s\\S]{0,120})`,
+  ).exec(body);
+  const initialiser = declared?.[1];
+  if (initialiser === undefined) return false;
+  return /^\s*(?:async\s+)?(?:function\b|\(|<|[A-Za-z_$][\w$]*\s*=>)/.test(initialiser);
+}
+
+/**
+ * A one-line props summary, never the full type.
+ *
+ * `allowDeclaredType` is false for a hook and a helper, and that is not a
+ * nicety. The declared-`Props`-interface fallback searches the WHOLE FILE, so
+ * `export function formatMoney()` sitting next to a `ButtonProps` interface was
+ * handed the button's props — a doc comment reading "a one-line summary of the
+ * props" over a value that describes a different export. Only something that
+ * renders is allowed that fallback; the destructure path reads the export's own
+ * signature and is safe for anything.
+ */
+function propsSummaryFor(
+  content: string,
+  body: string,
+  allowDeclaredType: boolean,
+): string | null {
+  const destructured = /\(\s*\{([^}]{1,400})\}/.exec(body);
+  if (destructured) {
+    const names = (destructured[1] ?? '')
+      .split(',')
+      .map((part) => (part.split(/[:=]/)[0] ?? '').trim().replace(/^\.\.\./, ''))
+      .filter((part) => /^[A-Za-z_$][\w$]*$/.test(part));
+    if (names.length > 0) return `props: ${names.slice(0, 20).join(', ')}`;
+  }
+  if (!allowDeclaredType) return null;
+  // A declared Props type is the next best thing, and it is still one line.
+  const declared = /(?:interface|type)\s+\w*Props\w*\s*(?:=\s*)?\{([^}]{1,600})\}/.exec(content);
+  if (declared) {
+    /*
+     * `;` and `,` separate members as validly as a newline does. Keying only
+     * on `\n` read `interface Props { tone: string; onPress: () => void }` as
+     * a one-prop type, so a single-line interface — which is how most small
+     * ones are written — lost every member after the first.
+     */
+    const keys = [
+      ...(declared[1] ?? '').matchAll(/(?:^|[\n;,])\s*([A-Za-z_$][\w$]*)\s*\??\s*:/g),
+    ].map((m) => m[1] ?? '');
+    if (keys.length > 0) return `props: ${keys.slice(0, 20).join(', ')}`;
+  }
+  return null;
+}
+
+/** `Button.stories.tsx` → the catalogue entries it declares, by component name. */
+interface CatalogueEntry {
+  /** The CSF `title`, which is the entry id a human recognises. */
+  title: string | null;
+  file: string;
+  /** The named exports, which are the stories. */
+  stories: string[];
+}
+
+/**
+ * Read the catalogue, and report whether one was read AT ALL.
+ *
+ * `read: false` is the reason this returns a record rather than a map. A repo
+ * with no Storybook must leave `hasCatalogueEntry` NULL on every component —
+ * `false` there would say "a catalogue was read and this component is not in
+ * it", a measured claim about a measurement nobody took. The two look the same
+ * on a screen and mean opposite things to a customer deciding whether to go and
+ * write stories.
+ */
+function readCatalogue(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): { read: boolean; byComponent: Map<string, CatalogueEntry> } {
+  const byComponent = new Map<string, CatalogueEntry>();
+  let read = false;
+
+  for (const file of files) {
+    if (!STORY_PATH.test(file.path)) continue;
+    read = true;
+    ledger.examine('component-inventory');
+    if (file.content === undefined) {
+      shortfalls.note(
+        'component-inventory',
+        'NO_CONTENT',
+        `${file.path} is a catalogue entry whose body was not uploaded, so the states it declares were not read`,
+      );
+      // The file's NAME still proves a catalogue entry exists for its sibling —
+      // `Button.stories.tsx` is about `Button` by Storybook's own convention —
+      // so the component is not demoted to "no story" for want of a body.
+      const subject = basename(file.path).replace(STORY_PATH, '');
+      if (subject.length > 0 && !byComponent.has(subject)) {
+        byComponent.set(subject, { title: null, file: file.path, stories: [] });
+      }
+      continue;
+    }
+
+    const content = file.content;
+    const title = /\btitle\s*:\s*['"`]([^'"`\n]{1,200})['"`]/.exec(content)?.[1] ?? null;
+    const componentRef = /\bcomponent\s*:\s*([A-Za-z_$][\w$]*)/.exec(content)?.[1] ?? null;
+    const stories = exportedNames(content)
+      .sites.map((site) => site.name)
+      .filter((name) => name !== 'default');
+
+    const subjects = new Set<string>();
+    if (componentRef) subjects.add(componentRef);
+    const fromName = basename(file.path).replace(STORY_PATH, '');
+    if (fromName.length > 0) subjects.add(fromName);
+    // The last segment of the CSF title: `Forms/LoginForm` is about LoginForm.
+    if (title) {
+      const leaf = title.split('/').pop()?.trim();
+      if (leaf && /^[A-Za-z_$][\w$]*$/.test(leaf)) subjects.add(leaf);
+    }
+
+    for (const subject of subjects) {
+      const existing = byComponent.get(subject);
+      if (existing) {
+        for (const story of stories) {
+          if (!existing.stories.includes(story)) existing.stories.push(story);
+        }
+        continue;
+      }
+      byComponent.set(subject, { title, file: file.path, stories: [...stories] });
+    }
+    /*
+     * No `ledger.hit` here. `found` on this detector counts COMPONENTS, and
+     * crediting it with stories would make the report claim more components
+     * than the inventory holds — a number that disagrees with the list beside
+     * it is the one thing a customer checks first.
+     */
+  }
+
+  return { read, byComponent };
+}
+
+function detectComponents(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): SourceComponent[] {
+  const catalogue = readCatalogue(files, ledger, shortfalls);
+  const components: SourceComponent[] = [];
+  let capped = 0;
+  let exportsCapped = 0;
+
+  for (const file of files) {
+    if (!MODULE_EXT.has(file.ext)) continue;
+    if (STORY_PATH.test(file.path)) continue;
+    ledger.examine('component-inventory');
+    if (file.content === undefined) {
+      /*
+       * A module whose body was never uploaded declares an unknown number of
+       * components. Counted and named, because the alternative — saying nothing
+       * — is the undisclosed cap: the components in it are absent from the
+       * UNIT_GEN denominator rather than uncovered, and absent raises the
+       * percentage while uncovered lowers it.
+       */
+      shortfalls.note(
+        'component-inventory',
+        'NO_CONTENT',
+        `${file.path} was uploaded as a path with no body, so the components it exports were not counted`,
+      );
+      continue;
+    }
+
+    const { sites, capped: localCap } = exportedNames(file.content);
+    exportsCapped += localCap;
+
+    for (const site of sites) {
+      const body = bodyWindow(file.content, sites, site.index);
+      const kind = classifyExport(file.path, site.name, body, file.ext);
+      if (kind === null) continue;
+
+      if (components.length >= MAX_COMPONENTS) {
+        capped++;
+        continue;
+      }
+
+      const entry =
+        catalogue.byComponent.get(site.name) ??
+        (site.name === 'default'
+          ? catalogue.byComponent.get(basename(file.path).replace(/\.[^.]+$/, ''))
+          : undefined);
+
+      const states: SourceComponentState[] = [];
+      const addState = (state: SourceComponentState): void => {
+        if (states.length >= MAX_STATES_PER_COMPONENT) return;
+        if (states.some((s) => s.kind === state.kind && s.source === state.source)) return;
+        states.push(state);
+      };
+
+      if (RENDERABLE_KINDS.includes(kind)) {
+        addState({
+          kind: 'DEFAULT',
+          source: 'SOURCE',
+          evidence: `${site.name} in ${file.path} renders, so it has a happy path`,
+        });
+      }
+      for (const branch of SOURCE_STATE_BRANCH) {
+        if (!branch.pattern.test(body)) continue;
+        addState({
+          kind: branch.kind,
+          source: 'SOURCE',
+          evidence: `${site.name} ${branch.because} in ${file.path}`,
+        });
+      }
+      for (const story of entry?.stories ?? []) {
+        const match = STORY_STATE_NAME.find((candidate) => candidate.pattern.test(story));
+        if (!match) continue;
+        addState({
+          kind: match.kind,
+          source: 'CATALOGUE',
+          evidence: `the story "${story}" in ${entry?.file ?? 'the catalogue'} declares this state`,
+        });
+      }
+
+      components.push({
+        modulePath: file.path,
+        exportName: site.name,
+        kind,
+        propsSummary: propsSummaryFor(file.content, body, RENDERABLE_KINDS.includes(kind)),
+        /*
+         * The three states, decided here and nowhere else. Null when no
+         * catalogue was read anywhere in the repo; false when one was and this
+         * component is absent from it; true when it is in it.
+         */
+        hasCatalogueEntry: catalogue.read ? entry !== undefined : null,
+        catalogueRef: entry?.title ?? entry?.file ?? null,
+        evidence: `${file.path} exports ${site.name}${
+          site.name === 'default' ? ' (the default export)' : ''
+        } — classified ${kind}`,
+        line: lineAt(file.content, site.index),
+        states,
+      });
+      ledger.hit('component-inventory');
+    }
+  }
+
+  if (capped > 0) {
+    shortfalls.note(
+      'component-inventory',
+      'CAP_REACHED',
+      `more than ${MAX_COMPONENTS} components were found; the rest were not recorded, so at least ${capped} more exist`,
+      capped,
+    );
+  }
+  if (exportsCapped > 0) {
+    shortfalls.note(
+      'component-inventory',
+      'CAP_REACHED',
+      `${exportsCapped} export(s) past the per-file cap of ${MAX_EXPORTS_PER_FILE} were not examined`,
+      exportsCapped,
+    );
+  }
+  return components;
+}
+
+// ─── Surfaces off the HTTP request path ──────────────────────────────────────
+
+/**
+ * The detectors for everything an application does that no crawl can reach.
+ *
+ * This is the half of the surface that was not merely uncovered but ABSENT.
+ * QAAI's PROTOCOL and EMAIL_OTP runners already EXECUTE these surfaces — they
+ * drive a webhook, they read a mailbox — so the product could test a cron it
+ * could not count, and a denominator that omits what the numerator includes is
+ * the one arithmetic error a customer will reproduce in a spreadsheet.
+ */
+function detectBackgroundSurfaces(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): SourceBackgroundSurface[] {
+  const found: SourceBackgroundSurface[] = [];
+  let capped = 0;
+
+  const add = (
+    fact: BackgroundSurfaceFact,
+    file: string,
+    index: number | null,
+    content: string | null,
+    evidence: string,
+  ): void => {
+    if (found.length >= MAX_BACKGROUND_SURFACES) {
+      capped++;
+      return;
+    }
+    const identity = `${fact.kind}|${backgroundIdentity(fact)}`;
+    if (found.some((existing) => `${existing.fact.kind}|${backgroundIdentity(existing.fact)}` === identity)) {
+      return;
+    }
+    found.push({
+      fact,
+      file,
+      line: index !== null && content !== null ? lineAt(content, index) : null,
+      evidence,
+    });
+    ledger.hit('background-surfaces');
+  };
+
+  for (const file of files) {
+    const base = basename(file.path);
+
+    // ── vercel.json crons: JSON, so it parses or it is reported as unparseable ──
+    if (base === 'vercel.json') {
+      ledger.examine('background-surfaces');
+      if (file.content === undefined) {
+        ledger.starve('background-surfaces');
+        shortfalls.note(
+          'background-surfaces',
+          'NO_CONTENT',
+          `${file.path} declares the project's crons and its body was not uploaded`,
+        );
+        continue;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(file.content);
+      } catch {
+        shortfalls.note(
+          'background-surfaces',
+          'UNPARSEABLE',
+          `${file.path} is not valid JSON, so the crons it declares were not read`,
+        );
+        continue;
+      }
+      const crons =
+        parsed !== null && typeof parsed === 'object' && 'crons' in parsed
+          ? (parsed as { crons?: unknown }).crons
+          : undefined;
+      if (Array.isArray(crons)) {
+        for (const entry of crons) {
+          if (entry === null || typeof entry !== 'object') continue;
+          const row = entry as { path?: unknown; schedule?: unknown };
+          if (typeof row.schedule !== 'string' || row.schedule.length === 0) continue;
+          add(
+            {
+              kind: 'CRON',
+              expression: row.schedule,
+              handler: typeof row.path === 'string' ? row.path : null,
+            },
+            file.path,
+            file.content.indexOf('"crons"'),
+            file.content,
+            `${file.path} declares a Vercel cron at ${row.schedule}${
+              typeof row.path === 'string' ? ` hitting ${row.path}` : ''
+            }`,
+          );
+        }
+      }
+      continue;
+    }
+
+    // ── GitHub Actions schedules ──
+    if (/(?:^|\/)\.github\/workflows\/[^/]+\.ya?ml$/.test(file.path)) {
+      ledger.examine('background-surfaces');
+      if (file.content === undefined) {
+        ledger.starve('background-surfaces');
+        shortfalls.note(
+          'background-surfaces',
+          'NO_CONTENT',
+          `${file.path} may declare a schedule and its body was not uploaded`,
+        );
+        continue;
+      }
+      for (const m of file.content.matchAll(/-\s*cron\s*:\s*['"]?([^'"\n]{1,120}?)['"]?\s*$/gm)) {
+        const expression = (m[1] ?? '').trim();
+        if (expression.length === 0) continue;
+        add(
+          { kind: 'CRON', expression, handler: file.path },
+          file.path,
+          m.index ?? 0,
+          file.content,
+          `${file.path} is a scheduled GitHub Actions workflow running at ${expression}`,
+        );
+      }
+      continue;
+    }
+
+    if (file.content === undefined) continue;
+    const content = file.content;
+    if (!MODULE_EXT.has(file.ext) && file.ext !== '.py' && file.ext !== '.rb') continue;
+
+    /*
+     * Once per FILE, because that is what `filesExamined` means. Calling it per
+     * match would turn the honesty surface into a count of regex hits, and a
+     * detector reporting 400 files examined in a 40-file repo is a report
+     * nobody can use to check us.
+     */
+    ledger.examine('background-surfaces');
+
+    // ── node-cron / @nestjs/schedule / cron ──
+    for (const m of content.matchAll(
+      /(?:cron\s*\.\s*schedule|new\s+CronJob|@Cron|schedule\s*\.\s*scheduleJob)\s*\(\s*['"`]([^'"`\n]{1,120})['"`]/g,
+    )) {
+      add(
+        { kind: 'CRON', expression: m[1] ?? '', handler: file.path },
+        file.path,
+        m.index ?? 0,
+        content,
+        `${file.path} schedules a job at ${m[1] ?? ''}`,
+      );
+    }
+    // `@Cron(CronExpression.EVERY_HOUR)` — the enum member names the schedule
+    // just as plainly, and it is NOT normalised to an expression: surface.ts
+    // requires the schedule as written.
+    for (const m of content.matchAll(/@Cron\s*\(\s*(CronExpression\s*\.\s*[A-Z0-9_]+)\s*\)/g)) {
+      add(
+        { kind: 'CRON', expression: (m[1] ?? '').replace(/\s+/g, ''), handler: file.path },
+        file.path,
+        m.index ?? 0,
+        content,
+        `${file.path} schedules a job at ${(m[1] ?? '').replace(/\s+/g, '')}`,
+      );
+    }
+
+    // ── Queue consumers ──
+    for (const m of content.matchAll(
+      /new\s+(?:Worker|Queue|QueueScheduler)\s*(?:<[^>]*>)?\s*\(\s*['"`]([^'"`\n]{1,120})['"`]([\s\S]{0,600})/g,
+    )) {
+      /*
+       * The window spans newlines and the handler's own parentheses, because
+       * `concurrency` comes AFTER them: `new Worker('q', async (job) => {...},
+       * { concurrency: 5 })`. A `[^)]` tail stopped at the `)` of `(job)` and
+       * reported `concurrency: null` for a worker that plainly declares 5 —
+       * a null where a measured value existed, which is the same species of
+       * error as a null that became 0. It is cut at the next registration so a
+       * sibling worker's setting cannot be credited to this one.
+       */
+      const raw = m[2] ?? '';
+      const next = raw.search(/new\s+(?:Worker|Queue|QueueScheduler)\s*(?:<[^>]*>)?\s*\(/);
+      const tail = next === -1 ? raw : raw.slice(0, next);
+      const concurrency = /\bconcurrency\s*:\s*(\d{1,4})\b/.exec(tail)?.[1];
+      add(
+        {
+          kind: 'QUEUE_CONSUMER',
+          queue: m[1] ?? '',
+          concurrency: concurrency === undefined ? null : Number.parseInt(concurrency, 10),
+          handler: file.path,
+        },
+        file.path,
+        m.index ?? 0,
+        content,
+        `${file.path} binds a BullMQ worker or queue to "${m[1] ?? ''}"`,
+      );
+    }
+    for (const m of content.matchAll(
+      /@Processor\s*\(\s*['"`]([^'"`\n]{1,120})['"`]|\bQueueName\s*\.\s*([A-Z0-9_]{1,60})\b/g,
+    )) {
+      const queue = m[1] ?? m[2] ?? '';
+      if (queue.length === 0) continue;
+      add(
+        { kind: 'QUEUE_CONSUMER', queue, concurrency: null, handler: file.path },
+        file.path,
+        m.index ?? 0,
+        content,
+        `${file.path} declares a processor for the "${queue}" queue`,
+      );
+    }
+    for (const m of content.matchAll(
+      /(?:QueueUrl|queueUrl)\s*:\s*['"`]([^'"`\n]{1,300})['"`]|\.\s*subscription\s*\(\s*['"`]([^'"`\n]{1,120})['"`]|consumer\s*\.\s*subscribe\s*\(\s*\{[^}]{0,200}?topics?\s*:\s*\[?\s*['"`]([^'"`\n]{1,120})['"`]/g,
+    )) {
+      const queue = m[1] ?? m[2] ?? m[3] ?? '';
+      if (queue.length === 0) continue;
+      add(
+        { kind: 'QUEUE_CONSUMER', queue, concurrency: null, handler: file.path },
+        file.path,
+        m.index ?? 0,
+        content,
+        `${file.path} consumes the queue, subscription or topic "${queue}"`,
+      );
+    }
+
+    // ── Webhook receivers: a handler that VERIFIES A SIGNATURE ──
+    const verifies =
+      /constructEvent|verifyHeader|verifySignature|verifyWebhook|createHmac|timingSafeEqual|new\s+Webhook\s*\(|svix|x-hub-signature|stripe-signature|x-signature/i.test(
+        content,
+      );
+    if (verifies && handlesRequests(content, file.path)) {
+      const scheme =
+        /stripe-signature/i.test(content) || /constructEvent/.test(content)
+          ? 'stripe-signature'
+          : /svix|new\s+Webhook\s*\(/.test(content)
+            ? 'svix'
+            : /x-hub-signature-256/i.test(content)
+              ? 'hmac-sha256'
+              : /createHmac\s*\(\s*['"`](sha\d+)['"`]/.exec(content)
+                ? `hmac-${/createHmac\s*\(\s*['"`](sha\d+)['"`]/.exec(content)?.[1]}`
+                : null;
+      const path = webhookPathFor(file.path);
+      add(
+        { kind: 'WEBHOOK_RECEIVER', path, signatureScheme: scheme },
+        file.path,
+        content.search(
+          /constructEvent|verifyHeader|verifySignature|verifyWebhook|createHmac|new\s+Webhook\s*\(/,
+        ),
+        content,
+        scheme === null
+          ? `${file.path} verifies an incoming payload; the scheme was not readable, which is not the same as none`
+          : `${file.path} verifies an incoming payload with ${scheme}`,
+      );
+    }
+
+    // ── Outbound email ──
+    for (const m of content.matchAll(
+      /\b(?:sendMail|sendEmail|emails\s*\.\s*send|sgMail\s*\.\s*send|mailer\s*\.\s*send|postmark\w*\s*\.\s*send\w*|ses\s*\.\s*sendEmail)\s*\(([^)]{0,400})/g,
+    )) {
+      const args = m[1] ?? '';
+      const templateId =
+        /\b(?:template|templateId|templateAlias|react|subject)\s*:\s*['"`]?([\w.\-/]{1,120})/.exec(
+          args,
+        )?.[1] ?? null;
+      add(
+        {
+          kind: 'OUTBOUND_EMAIL',
+          /*
+           * No template id is readable for a mail assembled inline, and the
+           * file path is the only identity left. It is a real identity — a
+           * mailbox assertion can match on it — and it is labelled as such in
+           * the evidence rather than passed off as a template the app named.
+           */
+          templateId: templateId ?? file.path,
+          sentBy: file.path,
+        },
+        file.path,
+        m.index ?? 0,
+        content,
+        templateId === null
+          ? `${file.path} sends mail with no readable template id, so the file path stands in as the identity`
+          : `${file.path} sends the "${templateId}" mail`,
+      );
+    }
+
+    // ── Upload handlers ──
+    const uploads =
+      /\bmulter\s*\(|\bformidable\s*\(|\bbusboy\b|createReadStream\s*\(\s*req|\bformData\s*\(\s*\)|request\s*\.\s*files\b/.test(
+        content,
+      ) || /\bfile\s*:\s*File\b|instanceof\s+File\b/.test(content);
+    if (uploads) {
+      const maxBytes = /\b(?:fileSize|maxFileSize|maxSize|limit)\s*:\s*(\d{3,15})\b/.exec(
+        content,
+      )?.[1];
+      const accepted = [
+        ...content.matchAll(/\b(?:accept|mimetype|contentType|allowedTypes)\s*:?\s*['"`]([\w.+/-]*\/[\w.+*-]+)['"`]/g),
+      ]
+        .map((m) => m[1] ?? '')
+        .filter((value, index, all) => value.length > 0 && all.indexOf(value) === index)
+        .slice(0, 20);
+      add(
+        {
+          kind: 'UPLOAD',
+          path: webhookPathFor(file.path),
+          acceptedTypes: accepted,
+          maxBytes: maxBytes === undefined ? null : Number.parseInt(maxBytes, 10),
+        },
+        file.path,
+        content.search(/\bmulter\s*\(|\bformidable\s*\(|\bbusboy\b|\bformData\s*\(\s*\)/),
+        content,
+        `${file.path} accepts an uploaded file${
+          maxBytes === undefined ? ' and declares no size cap' : ` with a declared cap of ${maxBytes} bytes`
+        }`,
+      );
+    }
+
+    // ── Websockets and SSE ──
+    if (/new\s+WebSocketServer|new\s+Server\s*\(\s*\w*\s*,\s*\{[^}]*?cors|socket\.io|\bio\s*\.\s*on\s*\(\s*['"`]connection/.test(content)) {
+      const events = [...content.matchAll(/\b(?:socket|io|ws)\s*\.\s*(?:on|emit)\s*\(\s*['"`]([^'"`\n]{1,80})['"`]/g)]
+        .map((m) => m[1] ?? '')
+        .filter((value, index, all) => value.length > 0 && all.indexOf(value) === index)
+        .slice(0, 40);
+      add(
+        { kind: 'WEBSOCKET', path: webhookPathFor(file.path), events },
+        file.path,
+        content.search(/new\s+WebSocketServer|socket\.io|\bio\s*\.\s*on\s*\(/),
+        content,
+        `${file.path} opens a websocket${events.length > 0 ? ` emitting ${events.slice(0, 5).join(', ')}` : ''}`,
+      );
+    }
+    if (/text\/event-stream/.test(content) && handlesRequests(content, file.path)) {
+      const events = [...content.matchAll(/event\s*:\s*['"`]?([\w.-]{1,60})/g)]
+        .map((m) => m[1] ?? '')
+        .filter((value, index, all) => value.length > 0 && all.indexOf(value) === index)
+        .slice(0, 40);
+      add(
+        { kind: 'SSE', path: webhookPathFor(file.path), events },
+        file.path,
+        content.indexOf('text/event-stream'),
+        content,
+        `${file.path} answers with text/event-stream, so it is a server-sent-event endpoint`,
+      );
+    }
+
+    // ── Next.js server actions ──
+    if (/^\s*['"]use server['"]\s*;?\s*$/m.test(content)) {
+      const moduleLevel = /^\s*['"]use server['"]/.test(content.trimStart());
+      for (const site of exportedNames(content).sites) {
+        if (NOT_A_COMPONENT_EXPORT.has(site.name)) continue;
+        const body = content.slice(site.index, site.index + 2000);
+        // A file-level 'use server' makes every export an action. An inline one
+        // marks only the function that contains it, and a text scan can only
+        // see the directive inside the body it sits in.
+        if (!moduleLevel && !/['"]use server['"]/.test(body)) continue;
+        add(
+          { kind: 'SERVER_ACTION', module: file.path, exportName: site.name },
+          file.path,
+          site.index,
+          content,
+          `${file.path} exports ${site.name} from a 'use server' ${moduleLevel ? 'module' : 'function'}`,
+        );
+      }
+    }
+
+    // ── tRPC procedures ──
+    if (/\b(?:publicProcedure|protectedProcedure|authedProcedure|t\s*\.\s*procedure)\b/.test(content)) {
+      const routerName =
+        /\b(?:export\s+const\s+)?(\w+)Router\s*=\s*(?:createTRPCRouter|router|t\s*\.\s*router)\s*\(/.exec(
+          content,
+        )?.[1] ?? null;
+      for (const m of content.matchAll(
+        /(\w{1,60})\s*:\s*(?:publicProcedure|protectedProcedure|authedProcedure|t\s*\.\s*procedure)([\s\S]{0,300}?)(?:\.query|\.mutation|\.subscription)\s*\(/g,
+      )) {
+        const name = m[1] ?? '';
+        const mutation = /\.mutation\s*\($/.test(m[0] ?? '');
+        add(
+          {
+            kind: 'TRPC_PROCEDURE',
+            procedure: routerName === null ? name : `${routerName}.${name}`,
+            mutation,
+          },
+          file.path,
+          m.index ?? 0,
+          content,
+          `${file.path} declares the tRPC ${mutation ? 'mutation' : 'query'} ${
+            routerName === null ? name : `${routerName}.${name}`
+          }`,
+        );
+      }
+    }
+  }
+
+  if (capped > 0) {
+    shortfalls.note(
+      'background-surfaces',
+      'CAP_REACHED',
+      `more than ${MAX_BACKGROUND_SURFACES} background surfaces were found; the rest were not recorded, so at least ${capped} more exist`,
+      capped,
+    );
+  }
+  return found;
+}
+
+/** The identity inside a kind, for the dedupe. One fact per real surface. */
+function backgroundIdentity(fact: BackgroundSurfaceFact): string {
+  switch (fact.kind) {
+    case 'CRON':
+      return `${fact.expression}|${fact.handler ?? ''}`;
+    case 'QUEUE_CONSUMER':
+      return fact.queue;
+    case 'WEBHOOK_RECEIVER':
+    case 'UPLOAD':
+    case 'WEBSOCKET':
+    case 'SSE':
+      return fact.path;
+    case 'OUTBOUND_EMAIL':
+      return fact.templateId;
+    case 'SERVER_ACTION':
+      return `${fact.module}#${fact.exportName}`;
+    case 'TRPC_PROCEDURE':
+      return fact.procedure;
+  }
+}
+
+/**
+ * The URL a handler file answers at, derived from the file-convention routers.
+ *
+ * Returns the FILE PATH when the convention does not apply, and says so by
+ * being a path rather than a URL. A guessed URL for a handler mounted by code
+ * would send a webhook test to a 404, which is rule 4 of this module's header:
+ * never resolve what cannot be resolved.
+ */
+function webhookPathFor(path: string): string {
+  const app = /(?:^|\/)(?:src\/)?app\/(.+)\/route\.[cm]?[jt]s$/.exec(path);
+  if (app) return joinSegments((app[1] ?? '').split('/').map(appSegment));
+  const pages = /(?:^|\/)(?:src\/)?pages\/(api\/.+)\.[cm]?[jt]s$/.exec(path);
+  if (pages) {
+    const parts = (pages[1] ?? '').split('/');
+    const leaf = parts.pop() ?? '';
+    const tail = leaf === 'index' ? [] : [dynamicSegment(leaf)];
+    return joinSegments([...parts.map((s) => dynamicSegment(s)), ...tail]);
+  }
+  const sveltekit = /(?:^|\/)src\/routes\/(.+)\/\+server\.[cm]?[jt]s$/.exec(path);
+  if (sveltekit) return joinSegments((sveltekit[1] ?? '').split('/').map(svelteSegment));
+  return path;
+}
+
+/**
+ * Does this module handle incoming requests at all?
+ *
+ * The guard on the webhook and SSE detectors, and it exists because
+ * `createHmac` in a crypto helper is not a webhook receiver and
+ * `'text/event-stream'` in a client `fetch` is not an SSE endpoint. Both would
+ * otherwise be reported as background surfaces that do not exist — an
+ * over-report, which on this axis is just as damaging as an omission: the
+ * denominator grows by a surface no test can ever drive, and the percentage
+ * falls for a reason the customer cannot act on.
+ */
+function handlesRequests(content: string, path: string): boolean {
+  if (/(?:^|\/)(?:src\/)?(?:app|pages)\/.*(?:route|api)/.test(path)) return true;
+  if (/(?:^|\/)src\/routes\/.*\+server\./.test(path)) return true;
+  return /\b(?:req|request)\s*\.\s*(?:headers|body|method|rawBody|text|json)\b|\(\s*req(?:uest)?\s*:\s*(?:Next)?Request\b|\bexport\s+(?:async\s+)?function\s+(?:GET|POST|PUT|PATCH|DELETE)\b|\bres\s*\.\s*(?:status|send|json|write)\b/.test(
+    content,
+  );
+}
+
+// ─── The application's feature flags ─────────────────────────────────────────
+
+/**
+ * One SDK's call sites, and what each one tells us about the flag's variants.
+ *
+ * `booleanGate` is the field that does the honest work. A `isEnabled('x')` call
+ * proves the flag is a boolean, so `['on','off']` is an ENUMERATION and not a
+ * guess. A `getStringValue('theme','light')` call proves only that `light` is
+ * the fallback — the other variants live in the provider's dashboard, not in
+ * the repo — so variants come out NULL. Writing `['light']` there instead would
+ * be the "null that became a value" lie, and it would make a flag sweep think
+ * it had covered a flag it had seen one side of.
+ */
+const FLAG_CALL_SITES: Array<{
+  provider: FlagProvider;
+  /** Capture group 1 is the flag key; group 2, when present, is the fallback. */
+  pattern: RegExp;
+  booleanGate: boolean;
+  what: string;
+}> = [
+  {
+    provider: 'LAUNCHDARKLY',
+    pattern:
+      /\b(?:ldClient|ldclient|client|ld)\s*\.\s*(?:variation|boolVariation|stringVariation|numberVariation|jsonVariation)\s*\(\s*['"`]([^'"`\n]{1,200})['"`]\s*(?:,[^,)]{0,120}){0,1}(?:,\s*([^,)\n]{1,60}))?/g,
+    booleanGate: false,
+    what: 'a LaunchDarkly variation call',
+  },
+  {
+    provider: 'LAUNCHDARKLY',
+    pattern: /\buseFlag(?:s)?\s*\(\s*['"`]([^'"`\n]{1,200})['"`]/g,
+    booleanGate: true,
+    what: 'a LaunchDarkly flag hook',
+  },
+  {
+    provider: 'UNLEASH',
+    pattern:
+      /\b(?:unleash|client)\s*\.\s*isEnabled\s*\(\s*['"`]([^'"`\n]{1,200})['"`]|\buseFlag\s*\(\s*['"`]([^'"`\n]{1,200})['"`]|\buseUnleashContext\b/g,
+    booleanGate: true,
+    what: 'an Unleash toggle check',
+  },
+  {
+    provider: 'OPENFEATURE',
+    pattern:
+      /\b\w*[Cc]lient\s*\.\s*get(Boolean|String|Number|Object)(?:Value|Details)\s*\(\s*['"`]([^'"`\n]{1,200})['"`]\s*,\s*([^,)\n]{1,60})/g,
+    booleanGate: false,
+    what: 'an OpenFeature evaluation',
+  },
+  {
+    provider: 'GROWTHBOOK',
+    pattern:
+      /\b(?:growthbook|gb)\s*\.\s*(?:isOn|isOff)\s*\(\s*['"`]([^'"`\n]{1,200})['"`]|\buseFeatureIsOn\s*\(\s*['"`]([^'"`\n]{1,200})['"`]/g,
+    booleanGate: true,
+    what: 'a GrowthBook feature check',
+  },
+  {
+    provider: 'GROWTHBOOK',
+    pattern:
+      /\b(?:growthbook|gb)\s*\.\s*getFeatureValue\s*\(\s*['"`]([^'"`\n]{1,200})['"`]\s*,\s*([^,)\n]{1,60})/g,
+    booleanGate: false,
+    what: 'a GrowthBook feature value',
+  },
+  {
+    provider: 'FLAGSMITH',
+    pattern:
+      /\bflagsmith\s*\.\s*(?:hasFeature|getValue)\s*\(\s*['"`]([^'"`\n]{1,200})['"`]|\buseFlags\s*\(\s*\[\s*['"`]([^'"`\n]{1,200})['"`]/g,
+    booleanGate: true,
+    what: 'a Flagsmith feature check',
+  },
+  {
+    provider: 'STATSIG',
+    pattern:
+      /\b(?:Statsig|statsig)\s*\.\s*checkGate\s*\(\s*['"`]([^'"`\n]{1,200})['"`]|\buseGate\s*\(\s*['"`]([^'"`\n]{1,200})['"`]/g,
+    booleanGate: true,
+    what: 'a Statsig gate check',
+  },
+  {
+    provider: 'STATSIG',
+    pattern:
+      /\b(?:Statsig|statsig)\s*\.\s*(?:getExperiment|getConfig|getDynamicConfig)\s*\(\s*['"`]([^'"`\n]{1,200})['"`]/g,
+    booleanGate: false,
+    what: 'a Statsig experiment or dynamic config',
+  },
+];
+
+/**
+ * Plain environment gates — the commonest flag mechanism of all, and the one
+ * no provider SDK will ever tell us about.
+ *
+ * Only names that SAY they are a gate: `FEATURE_`, `ENABLE_`, `DISABLE_`,
+ * `_ENABLED`, `FLAG_`. `process.env.DATABASE_URL` is configuration, not a flag,
+ * and reading it as one would put a connection string in the flag dimension
+ * and multiply the FLAG_COMBINATION axis by it.
+ */
+const ENV_GATE =
+  /(?:process\s*\.\s*env|import\s*\.\s*meta\s*\.\s*env)\s*(?:\.\s*|\[\s*['"`])((?:NEXT_PUBLIC_|VITE_|REACT_APP_|PUBLIC_|VUE_APP_)?(?:FEATURE_|FEATURES_|FLAG_|FLAGS_|ENABLE_|DISABLE_)[A-Z0-9_]{1,80}|[A-Z0-9_]{1,80}_(?:ENABLED|DISABLED|FEATURE_FLAG))/g;
+
+/** Checked-in flag catalogues. A file whose whole job is to list the flags. */
+const FLAG_CONFIG_FILE = /(?:^|\/)(?:flags|features|feature-flags|featureFlags)\.(?:json|ya?ml)$/;
+
+/**
+ * The truthiness fallback a boolean gate is read against, as a variant name.
+ *
+ * `['on','off']` is the spelling `DimensionDetail.FLAG` documents for a boolean
+ * flag, so a boolean gate's default is one of those two words and never the
+ * literal `false` — a variants list of `['on','off']` whose default is `false`
+ * names a variant that is not in the list, which is a dangling reference inside
+ * our own row.
+ */
+/** A captured literal without the quotes the source wrote around it. */
+function unquote(raw: string): string {
+  const value = raw.trim();
+  const quoted = /^(['"`])([\s\S]*)\1$/.exec(value);
+  return quoted ? (quoted[2] ?? '') : value;
+}
+
+function booleanDefaultFrom(fallback: string | undefined): string | null {
+  if (fallback === undefined) return null;
+  const value = fallback.trim();
+  if (/^(?:true|'true'|"true"|1)$/.test(value)) return 'on';
+  if (/^(?:false|'false'|"false"|0)$/.test(value)) return 'off';
+  return null;
+}
+
+function detectFeatureFlags(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): SourceFeatureFlag[] {
+  const flags: SourceFeatureFlag[] = [];
+  const byKey = new Set<string>();
+  let capped = 0;
+
+  const add = (flag: SourceFeatureFlag): void => {
+    /*
+     * KEYED ON THE KEY ALONE, AND NOT ON THE PROVIDER.
+     *
+     * The same name in LaunchDarkly and in a `NEXT_PUBLIC_FEATURE_*` env gate
+     * is ONE flag read two ways, and the first reading wins so the SDK's
+     * richer answer — variants, a default variant — is not overwritten by the
+     * env gate's poorer one. Keying on the pair would put both in the list and
+     * count one flag twice, which is a denominator divided by a larger number
+     * rather than a bigger measurement of the application. The comment here
+     * used to say "provider AND key", which is what the code does NOT do.
+     */
+    if (byKey.has(flag.key)) return;
+    if (flags.length >= MAX_FLAGS) {
+      capped++;
+      return;
+    }
+    byKey.add(flag.key);
+    flags.push(flag);
+    ledger.hit('feature-flags');
+  };
+
+  for (const file of files) {
+    if (FLAG_CONFIG_FILE.test(file.path)) {
+      ledger.examine('feature-flags');
+      if (file.content === undefined) {
+        ledger.starve('feature-flags');
+        shortfalls.note(
+          'feature-flags',
+          'NO_CONTENT',
+          `${file.path} is a flag catalogue and its body was not uploaded, so the flags it lists were not counted`,
+        );
+        continue;
+      }
+      if (file.path.endsWith('.json')) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(file.content);
+        } catch {
+          shortfalls.note(
+            'feature-flags',
+            'UNPARSEABLE',
+            `${file.path} is not valid JSON, so the flags it declares were not read`,
+          );
+          continue;
+        }
+        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+            const isBoolean = typeof value === 'boolean';
+            add({
+              key,
+              provider: 'CONFIG_FILE',
+              variants: isBoolean ? ['on', 'off'] : null,
+              defaultVariant: isBoolean ? (value ? 'on' : 'off') : null,
+              file: file.path,
+              line: lineAt(file.content, file.content.indexOf(`"${key}"`)),
+              evidence: isBoolean
+                ? `${file.path} lists ${key} as a boolean flag, default ${value ? 'on' : 'off'}`
+                : `${file.path} lists ${key}; its variants are not enumerable from the file`,
+            });
+          }
+        }
+        continue;
+      }
+      /*
+       * YAML without a parser. The top-level keys are readable from the
+       * indentation and the variants are not, so the keys are reported and the
+       * shortfall says what was skipped — half a fact, labelled as half.
+       */
+      for (const m of file.content.matchAll(/^([A-Za-z_][\w.-]{0,80})\s*:/gm)) {
+        add({
+          key: m[1] ?? '',
+          provider: 'CONFIG_FILE',
+          variants: null,
+          defaultVariant: null,
+          file: file.path,
+          line: lineAt(file.content, m.index ?? 0),
+          evidence: `${file.path} lists ${m[1] ?? ''} as a top-level key; its variants were not read`,
+        });
+      }
+      shortfalls.note(
+        'feature-flags',
+        'UNPARSEABLE',
+        `${file.path} is YAML and this pass reads only its top-level keys, so each flag's variants and default were not read`,
+      );
+      continue;
+    }
+
+    if (!MODULE_EXT.has(file.ext)) continue;
+    if (file.content === undefined) continue;
+    const content = file.content;
+    if (!/[Ff]lag|[Ff]eature|isEnabled|checkGate|variation|useGate|isOn\(|process\s*\.\s*env|import\s*\.\s*meta/.test(content)) {
+      continue;
+    }
+    ledger.examine('feature-flags');
+
+    for (const site of FLAG_CALL_SITES) {
+      site.pattern.lastIndex = 0;
+      for (const m of content.matchAll(site.pattern)) {
+        /*
+         * The alternations above put the key in different groups depending on
+         * which branch matched, so the key is the first group that captured a
+         * non-empty string that is NOT the type word. `getBooleanValue` puts
+         * the type in group 1 and the key in group 2, which is why the type
+         * words are excluded by name rather than by position.
+         */
+        const groups = m.slice(1).filter((g): g is string => typeof g === 'string' && g.length > 0);
+        const key = groups.find((g) => !/^(?:Boolean|String|Number|Object)$/.test(g));
+        if (key === undefined) continue;
+        const fallback = groups[groups.length - 1] === key ? undefined : groups[groups.length - 1];
+        add({
+          key,
+          provider: site.provider,
+          variants: site.booleanGate ? ['on', 'off'] : null,
+          /*
+           * Unquoted, because the capture includes the quotes the source wrote:
+           * `getFeatureValue('theme', 'light')` yielded `light` still wrapped
+           * in apostrophes, and a default variant spelled `'light'` matches no
+           * variant named `light` anywhere downstream — a dangling reference
+           * inside our own row.
+           */
+          defaultVariant: site.booleanGate
+            ? booleanDefaultFrom(fallback)
+            : fallback === undefined
+              ? null
+              : unquote(fallback),
+          file: file.path,
+          line: lineAt(content, m.index ?? 0),
+          evidence: site.booleanGate
+            ? `${file.path} reads ${key} through ${site.what}, which is a boolean gate`
+            : `${file.path} reads ${key} through ${site.what}; its variants live in the provider and not in the repo`,
+        });
+      }
+    }
+
+    ENV_GATE.lastIndex = 0;
+    for (const m of content.matchAll(ENV_GATE)) {
+      const key = m[1] ?? '';
+      if (key.length === 0) continue;
+      add({
+        key,
+        provider: 'ENV_GATE',
+        /*
+         * An env gate is read for truthiness, so it has two variants. The
+         * DEFAULT, though, is whatever the deployment sets — which is not in
+         * the repository — so it is null rather than 'off'. Guessing 'off'
+         * would tell a flag sweep it already knows the production state of
+         * every gate in the app.
+         */
+        variants: ['on', 'off'],
+        defaultVariant: null,
+        file: file.path,
+        line: lineAt(content, m.index ?? 0),
+        evidence: `${file.path} gates behaviour on the ${key} environment variable; which value production sets is not in the repository`,
+      });
+    }
+  }
+
+  if (capped > 0) {
+    shortfalls.note(
+      'feature-flags',
+      'CAP_REACHED',
+      `more than ${MAX_FLAGS} flags were found; the rest were not recorded, so at least ${capped} more exist`,
+      capped,
+    );
+  }
+  return flags;
+}
+
+// ─── Locales ─────────────────────────────────────────────────────────────────
+
+/**
+ * ISO 639-1 language subtags.
+ *
+ * The list exists to stop `locales/common.json` and `messages/index.json`
+ * entering the locale denominator. A pure BCP-47 shape check passes `ui`, `db`
+ * and `qa` just as happily as `de`, and three invented locales multiply the
+ * DEVICE_LOCALE axis by a factor nobody asked for — the mirror image of a
+ * missing surface, and just as wrong.
+ */
+const ISO_639_1 = new Set(
+  (
+    'aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce ch co cr cs cu cv cy ' +
+    'da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga gd gl gn gu gv ha he hi ho hr ht hu ' +
+    'hy hz ia id ie ig ii ik io is it iu ja jv ka kg ki kj kk kl km kn ko kr ks ku kv kw ky la lb ' +
+    'lg li ln lo lt lu lv mg mh mi mk ml mn mr ms mt my na nb nd ne ng nl nn no nr nv ny oc oj om ' +
+    'or os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn so sq sr ss st su sv sw ' +
+    'ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve vi vo wa wo xh yi yo za zh zu'
+  ).split(' '),
+);
+
+/**
+ * Languages written right to left.
+ *
+ * A fact, not a guess, and it earns its place because an RTL locale re-lays-out
+ * the page rather than swapping strings — so a localisation sweep that treats
+ * `ar` like `de` tests the translation and not the layout, which is where the
+ * defects are.
+ */
+const RTL_LANGUAGES = new Set(['ar', 'arc', 'ckb', 'dv', 'fa', 'he', 'ku', 'ps', 'sd', 'ug', 'ur', 'yi']);
+
+/** Does this string name a locale, as opposed to a namespace or a section? */
+function localeTag(raw: string): string | null {
+  const value = raw.trim();
+  if (!/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(value)) return null;
+  const language = (value.split('-')[0] ?? '').toLowerCase();
+  if (!ISO_639_1.has(language)) return null;
+  return value;
+}
+
+const isRtl = (tag: string): boolean =>
+  RTL_LANGUAGES.has((tag.split('-')[0] ?? '').toLowerCase());
+
+/** Where in a config the locale list and the default are written, per library. */
+const LOCALE_CONFIG: Array<{
+  reader: LocaleCatalogueReader;
+  /** The dependency or import that proves this library is in use. */
+  signal: RegExp;
+  /**
+   * Matches the property NAME, not a literal array.
+   *
+   * A `(?=\[)` lookahead used to be part of this, and it meant a list written
+   * as `locales = Object.keys(catalogues)` did not match at all — so no
+   * shortfall was recorded and an app with a dozen locales was reported as an
+   * app with none. Finding the property and then failing to read it is the
+   * fact worth reporting; not finding the property at all is silence.
+   */
+  listProperty: RegExp;
+  defaultProperty: RegExp;
+}> = [
+  {
+    reader: 'NEXT_INTL',
+    signal: /next-intl/,
+    listProperty: /\blocales\s*[:=]\s*/,
+    defaultProperty: /\bdefaultLocale\s*[:=]\s*['"`]([^'"`\n]{1,35})['"`]/,
+  },
+  {
+    reader: 'I18NEXT',
+    signal: /i18next|react-i18next/,
+    listProperty: /\b(?:supportedLngs|locales|languages)\s*[:=]\s*/,
+    defaultProperty: /\b(?:fallbackLng|lng|defaultLocale)\s*[:=]\s*['"`]([^'"`\n]{1,35})['"`]/,
+  },
+  {
+    reader: 'VUE_I18N',
+    signal: /vue-i18n/,
+    listProperty: /\b(?:locales|availableLocales)\s*[:=]\s*/,
+    defaultProperty: /\b(?:locale|fallbackLocale)\s*[:=]\s*['"`]([^'"`\n]{1,35})['"`]/,
+  },
+  {
+    reader: 'REACT_INTL',
+    signal: /react-intl/,
+    listProperty: /\b(?:locales|supportedLocales)\s*[:=]\s*/,
+    defaultProperty: /\bdefaultLocale\s*[:=]\s*['"`]([^'"`\n]{1,35})['"`]/,
+  },
+  {
+    reader: 'FRAMEWORK_CONFIG',
+    signal: /\bi18n\s*:/,
+    listProperty: /\blocales\s*[:=]\s*/,
+    defaultProperty: /\bdefaultLocale\s*[:=]\s*['"`]([^'"`\n]{1,35})['"`]/,
+  },
+];
+
+/** A message catalogue path, and the tag it declares. */
+function catalogueTag(path: string): string | null {
+  // `locales/de.json`, `messages/pt-BR.json`
+  const flat = /(?:^|\/)(?:public\/|src\/|app\/)?(?:locales?|messages|lang|translations|i18n)\/([^/]+)\.(?:json|ya?ml|ts|js)$/.exec(
+    path,
+  );
+  if (flat) return localeTag(flat[1] ?? '');
+  // `public/locales/de/common.json`
+  const nested = /(?:^|\/)(?:public\/|src\/|app\/)?(?:locales?|messages|lang|translations|i18n)\/([^/]+)\//.exec(
+    path,
+  );
+  if (nested) return localeTag(nested[1] ?? '');
+  return null;
+}
+
+function detectLocales(
+  files: AnalysedFile[],
+  ledger: Ledger,
+  shortfalls: Shortfalls,
+): SourceLocale[] {
+  const locales: SourceLocale[] = [];
+  const seen = new Set<string>();
+  let capped = 0;
+  /**
+   * The default, once the whole repo has been read.
+   *
+   * Collected separately and applied at the end because the catalogue
+   * DIRECTORY is usually read before the config that names the default, and a
+   * tag recorded `isDefault: false` from the directory must be corrected by the
+   * config rather than left wrong. Directories declare no default at all, which
+   * is why guessing from one is forbidden two paragraphs below.
+   */
+  let declaredDefault: string | null = null;
+
+  const add = (locale: SourceLocale): void => {
+    if (seen.has(locale.tag)) return;
+    if (locales.length >= MAX_LOCALES) {
+      capped++;
+      return;
+    }
+    seen.add(locale.tag);
+    locales.push(locale);
+    ledger.hit('locales');
+  };
+
+  for (const file of files) {
+    // ── A message catalogue. Readable from the PATH, so no body is needed ──
+    const fromPath = catalogueTag(file.path);
+    if (fromPath !== null) {
+      ledger.examine('locales');
+      add({
+        tag: fromPath,
+        reader: 'MESSAGE_DIRECTORY',
+        /*
+         * A catalogue directory declares WHICH locales exist and says nothing
+         * about which one is served by default. `false` here is the only honest
+         * value, and the config pass below is the only thing allowed to set
+         * `true`.
+         */
+        isDefault: false,
+        rtl: isRtl(fromPath),
+        file: file.path,
+        evidence: `${file.path} is a message catalogue for ${fromPath}`,
+      });
+      continue;
+    }
+
+    if (file.content === undefined) continue;
+    const content = file.content;
+
+    // ── hreflang alternates in static markup ──
+    if (/\.html?$|\.(?:ejs|erb|hbs|njk)$/.test(file.path) || /<link\b[^>]*hreflang/i.test(content)) {
+      for (const m of content.matchAll(/<link\b[^>]*\bhreflang\s*=\s*["']([^"']{1,35})["'][^>]*>/gi)) {
+        const tag = localeTag(m[1] ?? '');
+        if (tag === null) continue;
+        ledger.examine('locales');
+        add({
+          tag,
+          reader: 'HREFLANG',
+          isDefault: false,
+          rtl: isRtl(tag),
+          file: file.path,
+          evidence: `${file.path} declares an hreflang alternate for ${tag}`,
+        });
+      }
+    }
+
+    if (!MODULE_EXT.has(file.ext) && file.ext !== '.json' && file.ext !== '.mjs') continue;
+
+    for (const config of LOCALE_CONFIG) {
+      if (!config.signal.test(content)) continue;
+      const at = config.listProperty.exec(content);
+      if (at === null) continue;
+      ledger.examine('locales');
+
+      const tail = content.slice(at.index + at[0].length, at.index + at[0].length + 2000);
+      const stringsEnd = tail.indexOf(']');
+      const list = stringsEnd === -1 ? tail.slice(0, 200) : tail.slice(0, stringsEnd);
+      const tags = [...list.matchAll(/['"`]([^'"`\n]{1,35})['"`]/g)]
+        .map((m) => localeTag(m[1] ?? ''))
+        .filter((tag): tag is string => tag !== null);
+
+      if (tags.length === 0) {
+        /*
+         * The property is there and holds no literal — a list built from
+         * `Object.keys(messages)` or imported from elsewhere. Reported, because
+         * a locale list we could not read is not an app with no locales.
+         */
+        shortfalls.note(
+          'locales',
+          'EXPRESSION_NOT_LITERAL',
+          `${file.path} declares a locale list that is not a literal array, so the locales it holds were not read`,
+        );
+        continue;
+      }
+      for (const tag of tags) {
+        add({
+          tag,
+          reader: config.reader,
+          isDefault: false,
+          rtl: isRtl(tag),
+          file: file.path,
+          evidence: `${file.path} declares ${tag} in its ${config.reader === 'FRAMEWORK_CONFIG' ? 'framework i18n' : config.reader.toLowerCase()} locale list`,
+        });
+      }
+      const named = config.defaultProperty.exec(content)?.[1];
+      const defaultTag = named === undefined ? null : localeTag(named);
+      if (defaultTag !== null) declaredDefault = defaultTag;
+    }
+  }
+
+  /*
+   * Applied last, and only when a config NAMED it. A locale list with no
+   * declared default leaves every row `isDefault: false`, which reads as "we do
+   * not know which one is served" — and that is what `dimensionDenominator`
+   * needs to hear, because it counts no default cells at all when
+   * `defaultValue` is null rather than inventing one.
+   */
+  if (declaredDefault !== null) {
+    const row = locales.find((locale) => locale.tag === declaredDefault);
+    if (row) {
+      row.isDefault = true;
+      row.evidence = `${row.evidence}; a config names it the default locale`;
+    } else {
+      // A default naming a locale no catalogue holds is a dangling reference in
+      // the CUSTOMER's config, and reporting it beats silently adding the row.
+      shortfalls.note(
+        'locales',
+        'UNRESOLVED_IMPORT',
+        `a config names "${declaredDefault}" as the default locale and no catalogue or list declares it`,
+      );
+    }
+  }
+
+  if (capped > 0) {
+    shortfalls.note(
+      'locales',
+      'CAP_REACHED',
+      `more than ${MAX_LOCALES} locales were found; the rest were not recorded, so at least ${capped} more exist`,
+      capped,
+    );
+  }
+  return locales;
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /**
@@ -2815,6 +5860,26 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
 
   const collector = new Collector();
   const ledger = new Ledger();
+  const shortfalls = new Shortfalls();
+
+  // Caps that bit before any detector ran. They are counted here rather than
+  // only described in `warnings`, because "at least N more existed" needs N.
+  if (overflowed) {
+    shortfalls.note(
+      null,
+      'CAP_REACHED',
+      `more than ${MAX_FILES_ANALYSED} files were uploaded and the rest were not analysed at all, so every surface in them is missing from every count below`,
+      input.length - analysed.length - ignored,
+    );
+  }
+  if (truncatedFiles > 0) {
+    shortfalls.note(
+      null,
+      'FILE_TRUNCATED',
+      `${truncatedFiles} file${truncatedFiles === 1 ? ' was' : 's were'} longer than ${MAX_FILE_CHARS} characters and were read only up to that point; anything declared past it was not seen by any detector`,
+      truncatedFiles,
+    );
+  }
 
   // Which kind of app this is decides whether a file path may be read as a URL
   // at all. The signals are read once, here; the ANSWER is per file, because a
@@ -2834,6 +5899,19 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
   detectFlaskFastapi(analysed, collector, ledger);
   detectForms(analysed, collector, ledger);
   const authSurfaces = detectAuthSurfaces(collector, ledger);
+
+  /*
+   * The guard pass runs AFTER the route detectors and before nothing, because
+   * it decides a fact ABOUT the routes they collected. It mutates each route's
+   * and endpoint's `guard`, so every item in the inventory carries a verdict —
+   * including UNKNOWN, which is the verdict for a route we could not analyse
+   * and the one that must never arrive as `false`.
+   */
+  const guards = detectRouteGuards(analysed, collector, ledger, shortfalls);
+  const components = detectComponents(analysed, ledger, shortfalls);
+  const backgroundSurfaces = detectBackgroundSurfaces(analysed, ledger, shortfalls);
+  const featureFlags = detectFeatureFlags(analysed, ledger, shortfalls);
+  const locales = detectLocales(analysed, ledger, shortfalls);
 
   const frameworks = detectFrameworks(analysed);
   const withContent = analysed.filter((f) => f.content !== undefined).length;
@@ -2928,6 +6006,84 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
     );
   }
 
+  // ── The five surfaces, each with the sentence that makes it legible ─────────
+  //
+  // Every one of these says what was NOT established as plainly as what was,
+  // because on these five axes our silence has until now been indistinguishable
+  // from the application having nothing there.
+  const guarded = [...collector.routes, ...collector.endpoints].filter(
+    (item) => item.guard?.access === 'GUARDED',
+  ).length;
+  const accessUnknown = [...collector.routes, ...collector.endpoints].filter(
+    (item) => item.guard?.access === 'UNKNOWN',
+  ).length;
+  const total = collector.routes.length + collector.endpoints.length;
+  if (total > 0) {
+    notes.push(
+      `Of ${total} route${total === 1 ? '' : 's'} and endpoint${total === 1 ? '' : 's'}, ${guarded} ` +
+        `${guarded === 1 ? 'is' : 'are'} behind a guard the source declares and ${accessUnknown} ` +
+        `could not be analysed. The ${accessUnknown} are reported as UNKNOWN and NOT as public: ` +
+        'a route we could not read is not a route anyone may reach, and the two are opposite ' +
+        'facts about an admin page.',
+    );
+  }
+  if (components.length > 0) {
+    const cataloguedRead = components.some((c) => c.hasCatalogueEntry !== null);
+    const withEntry = components.filter((c) => c.hasCatalogueEntry === true).length;
+    const nonHappy = components.reduce(
+      (running, c) => running + c.states.filter((s) => s.kind !== 'DEFAULT').length,
+      0,
+    );
+    notes.push(
+      `${components.length} exported component${components.length === 1 ? '' : 's'}, hook${components.length === 1 ? '' : 's'} ` +
+        `and provider${components.length === 1 ? '' : 's'} were found, declaring ${nonHappy} state${nonHappy === 1 ? '' : 's'} ` +
+        'that are not the happy path. ' +
+        (cataloguedRead
+          ? `A component catalogue was read and ${withEntry} of them appear in it; the rest are still components and are still counted.`
+          : 'No component catalogue was found anywhere in the repo, so whether each component has a story is recorded as unknown rather than as no.'),
+    );
+  }
+  if (backgroundSurfaces.length > 0) {
+    notes.push(
+      `${backgroundSurfaces.length} surface${backgroundSurfaces.length === 1 ? '' : 's'} off the HTTP ` +
+        'request path were found — crons, queue consumers, webhook receivers, outbound mail, uploads, ' +
+        'sockets, server actions and tRPC procedures. Nothing crawls these, so until now they were ' +
+        'absent from a surface count rather than uncovered by it.',
+    );
+  }
+  if (featureFlags.length > 0) {
+    const unenumerable = featureFlags.filter((flag) => flag.variants === null).length;
+    notes.push(
+      `${featureFlags.length} feature flag${featureFlags.length === 1 ? '' : 's'} were found. A crawl ` +
+        'that does not set them sees one configuration of this application and cannot say which one. ' +
+        (unenumerable > 0
+          ? `${unenumerable} of them are not boolean gates, so their variants live in the provider rather than in the repo and were not read here.`
+          : 'All of them are boolean gates, so their variants are enumerable from the call site.'),
+    );
+  }
+  if (locales.length > 0) {
+    const defaulted = locales.some((locale) => locale.isDefault);
+    const rtl = locales.filter((locale) => locale.rtl).length;
+    notes.push(
+      `${locales.length} locale${locales.length === 1 ? '' : 's'} were discovered from the repository ` +
+        `itself, ${rtl} of them right-to-left. ` +
+        (defaulted
+          ? 'A config names the default locale.'
+          : 'No config names a default locale, so none is claimed — guessing one would invent the fact a locale sweep divides by.'),
+    );
+  }
+
+  const unreadGuardSites = shortfalls
+    .report()
+    .filter((row) => row.detector === 'route-guards' && row.reason === 'NO_CONTENT');
+  if (unreadGuardSites.length > 0) {
+    notes.push(
+      `${unreadGuardSites[0]!.count} guard site${unreadGuardSites[0]!.count === 1 ? '' : 's'} ` +
+        '(middleware or layout files) were found with no body uploaded. Every route they could cover ' +
+        'is reported UNKNOWN rather than public.',
+    );
+  }
+
   // ── Warnings ────────────────────────────────────────────────────────────────
   if (overflowed) {
     warnings.push(
@@ -2947,12 +6103,30 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
         'whole of it.',
     );
   }
+  /*
+   * Every counted shortfall as a warning too, and this is not duplication.
+   * `shortfalls` is the machine-readable account a denominator is corrected
+   * from; `warnings` is what a person reads before trusting a number. An
+   * undisclosed cap makes a coverage percentage go UP, so the disclosure has to
+   * appear in the place a human actually looks.
+   */
+  for (const row of shortfalls.report()) {
+    warnings.push(
+      `${row.detector === null ? 'Every detector' : DETECTOR_META[row.detector].label}: ` +
+        `${row.count} fact${row.count === 1 ? '' : 's'} not reported — ${row.detail}.`,
+    );
+  }
 
   return {
     routes: collector.routes,
     endpoints: collector.endpoints,
     forms: collector.forms,
     authSurfaces,
+    guards,
+    components,
+    backgroundSurfaces,
+    featureFlags,
+    locales,
     frameworks,
     detectors: ledger.report(),
     coverage: {
@@ -2963,6 +6137,7 @@ export function analyseCodebase(files: RepoFile[]): CodebaseAnalysis {
       filesTruncated: truncatedFiles,
       truncated: collector.truncated || overflowed,
     },
+    shortfalls: shortfalls.report(),
     notes,
     warnings,
   };
@@ -2987,11 +6162,71 @@ export function summariseAnalysis(analysis: CodebaseAnalysis): string {
       `${analysis.forms.length} form${analysis.forms.length === 1 ? '' : 's'} and ` +
       `${analysis.authSurfaces.length} auth surface${analysis.authSurfaces.length === 1 ? '' : 's'}.`,
   );
+  /*
+   * The five non-crawl axes, in the same sentence as the four crawlable ones.
+   *
+   * Deliberately one summary and not two. Three disjoint inventories of one
+   * application on three screens is the defect this round exists to end, and a
+   * summary that named routes here and components somewhere else would be the
+   * fourth.
+   */
+  /*
+   * Read through `??`, and the sentence CHANGES when they are absent rather
+   * than printing zeroes. "0 components" about a stored analysis that predates
+   * the component reader is a measured claim about something not measured —
+   * and it is the flattering direction, because a reader concludes there is
+   * nothing there to test.
+   */
+  const counted =
+    analysis.components !== undefined ||
+    analysis.backgroundSurfaces !== undefined ||
+    analysis.featureFlags !== undefined ||
+    analysis.locales !== undefined;
+  if (counted) {
+    const components = analysis.components ?? [];
+    const background = analysis.backgroundSurfaces ?? [];
+    const flags = analysis.featureFlags ?? [];
+    const locales = analysis.locales ?? [];
+    parts.push(
+      `It also found ${components.length} component${components.length === 1 ? '' : 's'}, ` +
+        `${background.length} surface${background.length === 1 ? '' : 's'} off the request path, ` +
+        `${flags.length} feature flag${flags.length === 1 ? '' : 's'} and ` +
+        `${locales.length} locale${locales.length === 1 ? '' : 's'}.`,
+    );
+  } else {
+    parts.push(
+      'It did not look for components, background surfaces, feature flags or locales: this analysis ' +
+        'was produced before those readers existed, so nothing is claimed about them in either direction.',
+    );
+  }
   parts.push(
     `${contributed.length} of ${analysis.detectors.length} detectors found something; ` +
       `${ran.length - contributed.length} examined files and found nothing; ` +
       `${idle.length} had no files of their kind to look at.`,
   );
+
+  const unknownAccess = [...analysis.routes, ...analysis.endpoints].filter(
+    (item) => item.guard?.access === 'UNKNOWN',
+  ).length;
+  if (unknownAccess > 0) {
+    parts.push(
+      `${unknownAccess} of them could not be analysed for guards and are reported UNKNOWN, not public.`,
+    );
+  }
+  /*
+   * The lost count, in the summary rather than only in `shortfalls`. A sentence
+   * that states a total and omits what the total cost is the undisclosed cap,
+   * and the summary is the one line a reader is guaranteed to see.
+   */
+  const shortfalls = analysis.shortfalls ?? [];
+  const lost = shortfalls.reduce((running, row) => running + row.count, 0);
+  if (lost > 0) {
+    parts.push(
+      `${lost} fact${lost === 1 ? '' : 's'} went unreported across ${shortfalls.length} ` +
+        `cause${shortfalls.length === 1 ? '' : 's'}, so at least that many more exist than are listed.`,
+    );
+  }
+
   parts.push(
     'All of it is static: this is what the source declares, not what the running application does.',
   );

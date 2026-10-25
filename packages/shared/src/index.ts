@@ -46,3 +46,25 @@ export * from './dialect';
  */
 export * from './synthetic';
 export * from './test-values';
+/*
+ * The two non-crawl enumeration vocabularies: the surface a HUMAN declared
+ * (requirements, acceptance criteria, manual test cases) and the surface an
+ * ARTIFACT declares (API operations, components, background surfaces, observed
+ * traffic).
+ *
+ * Public API because they are a CONTRACT between packages that cannot see each
+ * other's source: the importers and readers live in packages/agent and
+ * apps/worker, the rows live in apps/api, and the traceability matrix and the
+ * component-state counts are rendered by the web app. A vocabulary half of
+ * whose consumers cannot import it is how three disjoint inventories of one
+ * application came to sit on three screens with no combined figure.
+ *
+ * Both pass this barrel's standing test — pure types, data and arithmetic plus
+ * zod, which `schemas.ts` already puts in here, and no `node:` builtin. The
+ * content hash in requirements.ts takes its digest as an INJECTED function for
+ * exactly that reason: importing `node:crypto` here would 500 every page that
+ * reads a value from @qaai/shared, which is why plugin-manifest.ts is reachable
+ * only by subpath.
+ */
+export * from './requirements';
+export * from './api-surface';

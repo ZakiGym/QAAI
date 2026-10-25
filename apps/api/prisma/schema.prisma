@@ -357,9 +357,13 @@ model User {
   auditLogs     AuditLog[]
   chatMessages  ChatMessage[]
 
-  teamMemberships TeamMember[]
-  ownedRules      OwnershipRule[]
-  coverageWaivers CoverageWaiver[]
+  teamMemberships  TeamMember[]
+  ownedRules       OwnershipRule[]
+  coverageWaivers  CoverageWaiver[]
+  /// Requirement→test links this person ASSERTED. The back-relation exists so
+  /// `onDelete: SetNull` can fire: a link's author leaving must not delete the
+  /// claim, and `RequirementLink.byEmail` is what survives.
+  requirementLinks RequirementLink[]
 
   @@index([email])
 }
@@ -616,6 +620,26 @@ model Project {
   failureSignatures FailureSignature[]
   closureCampaigns  ClosureCampaign[]
   gapClosures       GapClosure[]
+
+  /// The non-crawl enumeration sources. Each one is an inventory of what
+  /// EXISTS, read independently of whether anything has ever reached it — which
+  /// is the half of the denominator a crawl structurally cannot produce.
+  /// `specRequirements` and not `requirements`, and the reason is a live
+  /// collision rather than taste. `JobRequirements` already means something
+  /// else in this repo — the browsers and toolchains an on-prem runner must
+  /// have — and `RunShard.requirements` is that column. With this relation
+  /// called `requirements`, the nested-read heuristic in
+  /// scripts/check-wiring.ts matched `requirements: true` in
+  /// apps/api/src/routes/runners.ts and reported THIS table as "read by
+  /// runners.ts", which would have made the check go quiet about a Requirement
+  /// write path with no read path at all.
+  specRequirements Requirement[]
+  requirementLinks RequirementLink[]
+  manualTestCases  ManualTestCase[]
+  apiOperations    ApiOperation[]
+  componentItems   ComponentItem[]
+  trafficIngests   TrafficIngest[]
+  observedJourneys ObservedJourney[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -1067,6 +1091,12 @@ model Test {
   ownershipRules OwnershipRule[]
   flakeHistory   TestFlakeHistory[]
 
+  /// "Which acceptance criteria does this test cover, and which manual case did
+  /// it replace?" — the reverse of the traceability matrix, and the read the
+  /// test detail page makes.
+  requirementLinks RequirementLink[]
+  manualTestCases  ManualTestCase[]
+
   @@index([orgId])
   @@index([projectId, type])
   @@index([suiteId])
@@ -1386,7 +1416,7 @@ model TestResult {
   /// The tag at the head of `errorMessage` (`notRunMessage` / `parseNotRun` in
   /// @qaai/shared) stays, and is not redundant: it is what a surface renders,
   /// and it is all an old row has. A reader with both prefers this column.
-  notRunKind       NotRunKind?
+  notRunKind NotRunKind?
 
   /// ── The mutation metric channel (§4 MUTATION) ─────────────────────────────
   ///
@@ -2539,6 +2569,24 @@ model AgentCall {
 // Ops (§11)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// QAAI'S OWN FEATURE FLAGS. NOT THE CUSTOMER'S.
+///
+/// Four rows written by prisma/seed.ts and read by nothing — one of the four
+/// gaps `scripts/check-wiring.ts` records, kept as a recorded gap rather than
+/// silently wired, because all four seeded rows are `enabled: false` and
+/// switching them on as-is would turn four working features off.
+///
+/// The flags of the APPLICATION UNDER TEST are a different thing entirely and
+/// live nowhere near this table: they are `SurfaceDimension` rows with
+/// `kind: 'FLAG'`, read out of the customer's LaunchDarkly project, their
+/// Unleash instance or their `NEXT_PUBLIC_FEATURE_*` env gates, with the
+/// provider recorded from `FLAG_PROVIDERS` in
+/// packages/shared/src/api-surface.ts.
+///
+/// Reusing this table for them would make a row ambiguous: the same primary key
+/// would mean both "QAAI's visual-regression feature is off" and "the
+/// customer's checkout-v2 flag exists", and no reader could tell which. The
+/// same note is at the other site.
 model FeatureFlag {
   key         String   @id
   description String
@@ -3362,8 +3410,13 @@ model CoverageItem {
   /// disappearing denominator needs an audit trail as much as a growing one.
   retiredAt   DateTime?
 
-  project Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  waiver  CoverageWaiver?
+  project          Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  waiver           CoverageWaiver?
+  /// Requirements claimed to be covered by this surface. The join that lets the
+  /// spec side and the crawl side be reconciled at all: a requirement naming a
+  /// route and a route the source declares are the same thing seen twice, and
+  /// until this row existed there was nothing to say so.
+  requirementLinks RequirementLink[]
 
   @@unique([projectId, key])
   @@index([orgId])
@@ -3735,4 +3788,873 @@ model ClosureCampaign {
   /// columns, in this order, so the 60-second sweep is an index range scan and
   /// not a scan of every campaign the install has ever armed.
   @@index([state, nextTickAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The non-crawl half of enumeration (§ coverage)
+//
+// A crawl can only ever report what it REACHED. Everything below reports what
+// EXISTS, read out of something that already says so: an acceptance criterion
+// somebody wrote, a TestRail suite somebody has been running by hand for three
+// years, an OpenAPI document, a component directory, a cron registration, a
+// week of real traffic. None of it existed in this schema in any shape, which
+// is why the sentence this product is built on — "your source declares 412
+// routes, the crawl reached 25" — could not be said even though both halves
+// were in the repository.
+//
+// Everything here writes into `CoverageItem`, which IS the surface registry.
+// There is no second inventory: an API operation, a component state and a
+// background job each become a `CoverageItem` on one of the twelve
+// `SurfaceKind` axes, with `sources` naming the declarer. The tables below hold
+// the DETAIL those rows cannot — a parameter's declared bounds, a requirement's
+// acceptance criteria, what a probe actually saw — plus the one thing a blob
+// cannot be: addressable.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where a requirement or a manual test case was read from. Mirrors
+/// SPEC_SOURCE_SYSTEMS in packages/shared/src/requirements.ts; `check:enums`
+/// diffs them.
+///
+/// One enum and not two. A tracker (Jira, Linear) and a test-management suite
+/// (TestRail, Xray) are different products, but the column answers one question
+/// — whose copy is authoritative, and where does a re-import go to ask again —
+/// and splitting it would mean two drift guards for one fact.
+/// `TEST_MANAGEMENT_SYSTEMS` narrows it where the distinction matters, which is
+/// the sentence "your TestRail suite has 1,840 cases and 210 are automated".
+enum SpecSourceSystem {
+  JIRA
+  LINEAR
+  AZURE_DEVOPS
+  GITHUB_ISSUES
+  XRAY
+  ZEPHYR
+  TESTRAIL
+  QTEST
+  MARKDOWN
+  CSV
+  MANUAL
+}
+
+/// The NORMALISED status of a requirement. The source system's own word is kept
+/// verbatim in `Requirement.statusRaw` and never thrown away.
+///
+/// UNMAPPED and NOT_STATED exist so that this normalisation cannot lie.
+/// NOT_STATED means the import found no status field at all (a Markdown
+/// criteria file usually has none); UNMAPPED means there WAS one and our
+/// mapping table does not know the word. Without them, every unrecognised
+/// workflow state in every customer's Jira would land on whichever member we
+/// chose as a default — and that default decides whether the requirement enters
+/// the coverage denominator, which is a percentage moved by a mapping table
+/// nobody reviewed.
+enum RequirementStatus {
+  DRAFT
+  READY
+  IN_PROGRESS
+  DONE
+  OBSOLETE
+  UNMAPPED
+  NOT_STATED
+}
+
+/// The shape a criterion was written in, which decides whether a machine can do
+/// anything with it. UNSTRUCTURED means we found no structure and fell back to
+/// sentence splitting — reported rather than hidden, because a criterion count
+/// derived that way is an estimate and must not be printed beside exact ones.
+enum AcceptanceCriterionFormat {
+  GIVEN_WHEN_THEN
+  BULLET
+  NUMBERED
+  CHECKBOX
+  TABLE_ROW
+  UNSTRUCTURED
+}
+
+/// HOW a requirement came to be linked to a test or a surface. THE honesty
+/// column of the traceability feature.
+///
+/// A person pointing at a test and saying "this covers AC-3" and a regex
+/// noticing that a spec title contains the string `AC-3` are not the same fact.
+/// A matrix that renders them identically launders a guess into an audit
+/// artifact, which is worse than having no matrix. The confidence each method
+/// may claim is CAPPED by the method in
+/// `LINK_METHOD_CONFIDENCE_CEILING` (packages/shared/src/requirements.ts) —
+/// SURFACE_MATCH at 0.5, below `TRACEABLE_LINK_CONFIDENCE`, so a guessed link
+/// is named and shown and cannot move the number.
+enum RequirementLinkMethod {
+  MANUAL
+  ID_IN_ANNOTATION
+  ID_IN_TEST_NAME
+  SURFACE_MATCH
+}
+
+/// Whether anything is linked to a requirement or a criterion, and how strong
+/// the strongest link is. Derived from the link rows by `linkStateFrom` and
+/// stored, never set independently.
+///
+/// ── WHY THIS IS A COLUMN AND NOT `count(links) = 0` ─────────────────────────
+///
+/// Because "requirements with no test" is THE report this entity exists to
+/// produce, and the absence of rows cannot be indexed, cannot be ordered by,
+/// and — the point — cannot be told apart from the absence of a LINKER. A
+/// `LEFT JOIN … WHERE link.id IS NULL` silently includes every requirement
+/// imported five minutes ago that nothing has looked at yet, and reports our
+/// own silence as the customer's gap. NOT_SEARCHED is the default on insert
+/// because the default then states the truth.
+enum RequirementLinkState {
+  NOT_SEARCHED
+  NOT_LINKED
+  INFERRED
+  ASSERTED
+}
+
+/// Whether a manual test case has been automated, according to the suite that
+/// holds it.
+///
+/// NOT_STATED is the member that makes the backlog number honest: TestRail's
+/// automation field is optional and most installs leave it empty, so folding
+/// empty into NOT_AUTOMATED would let us quote a backlog of 1,630 cases at a
+/// customer whose suite never claimed anything about 1,400 of them.
+/// `manualBacklogTotals` counts the two separately and never sums them.
+///
+/// CANNOT_AUTOMATE is the TEAM's waiver. The difference from
+/// `SurfaceExercisability.UNEXERCISABLE` is whose limit it is: that one is ours.
+enum ManualTestAutomationStatus {
+  NOT_AUTOMATED
+  AUTOMATION_PLANNED
+  AUTOMATED
+  CANNOT_AUTOMATE
+  OBSOLETE
+  NOT_STATED
+}
+
+/// What a DOCUMENT says about authentication on one operation. Never a claim
+/// about the application — that is `ApiOperationProbe.authRequiredInFact`, and
+/// the two disagreeing is a finding.
+///
+/// Five members, and the last two are why this is not a boolean. OpenAPI's
+/// `security` can be global, overridden per operation, overridden to the empty
+/// array (which MEANS "no auth here"), or omitted entirely; and we may never
+/// have read a document at all, because the row came from a source detector or
+/// from traffic. Collapsing those into `authRequired: boolean` produces the
+/// most dangerous false negative in this product: every operation whose
+/// document we did not read reads as public, a negative-auth test is generated,
+/// it gets a 401, and the 401 is reported as the application correctly refusing
+/// anonymous access — a passing test that asserted nothing.
+enum ApiAuthDeclaration {
+  REQUIRED
+  OPTIONAL
+  NONE
+  UNSTATED
+  NOT_READ
+}
+
+/// What we know about whether an operation EXISTS in the running application.
+///
+/// DECLARED     a document or detector declares it; no probe attempted.
+/// NOT_PROBED   probing was CONSIDERED AND NOT DONE — no base URL, a policy
+///              refusal, or the probe budget was spent. The reason is on the
+///              row. It must never be rendered as "does not exist", and it is
+///              the member most likely to be, because it will be the commonest
+///              on the day this ships.
+/// CONFIRMED    a probe got an answer that proves the path is routed.
+/// NO_ANSWER    a probe was made and nothing answered. Unknown, not absent.
+///
+/// THERE IS DELIBERATELY NO `REFUTED`. A 404 does not prove absence: an
+/// unreloaded gateway, a flag that is off, an authorisation wall that hides
+/// existence, and a genuinely undeployed operation all return the same 404 and
+/// cannot be told apart from outside. So a 404 leaves the state alone and the
+/// PROBE ROW records what it saw; "your document declares an operation that
+/// 404s" is then a statement about an observation instead of a claim baked into
+/// the operation's state that we could not defend.
+enum ApiOperationVerification {
+  DECLARED
+  CONFIRMED
+  NO_ANSWER
+  NOT_PROBED
+}
+
+/// What kind of exported thing a component row is — and, the load-bearing half,
+/// WHETHER IT IS ALREADY COUNTED SOMEWHERE ELSE.
+///
+/// A Next.js `page.tsx` is both an exported component and a ROUTE. A
+/// denominator that counts it twice is not a bigger measurement of the
+/// application, it is the same application divided by a larger number. Three
+/// disjoint inventories of one app on three screens is the defect this round
+/// exists to end, and minting a fourth that double-counts the first would be an
+/// expensive way to make it worse. `componentHasOwnAxis` in
+/// packages/shared/src/api-surface.ts is the guard: PAGE and LAYOUT report the
+/// ROUTE axis and must not be added to a denominator that already holds it.
+enum ComponentItemKind {
+  COMPONENT
+  PAGE
+  LAYOUT
+  HOOK
+  CONTEXT_PROVIDER
+  UTILITY
+}
+
+/// The named states a component can be in, which is what turns "not just the
+/// happy path" from an adjective into a count.
+///
+/// The five that are not DEFAULT are where every interesting frontend defect
+/// lives: a spinner that never clears, an empty state that renders `undefined
+/// results`, an error boundary nobody has ever seen, a forbidden state that
+/// leaks the shape of what it hides, and a slow response the UI treats as a
+/// failure. SLOW is in the list although it is not a render branch, because it
+/// is the state a test can only reach by holding a response open and the one
+/// nobody writes by hand.
+enum ComponentStateKind {
+  DEFAULT
+  LOADING
+  EMPTY
+  ERROR
+  FORBIDDEN
+  SLOW
+}
+
+/// One requirement: a behaviour somebody specified.
+///
+/// ── WHY THIS ENTITY DID NOT EXIST AND WHAT THAT COST ────────────────────────
+///
+/// Two questions were unaskable without it. "Which acceptance criterion has no
+/// test?" is the enterprise question and the whole of Xray's and Zephyr's
+/// traceability product; QAAI could not ask it because there was nothing to ask
+/// it about. And "what is specified and not yet built?" names the one surface
+/// no extractor and no crawl can ever find — there is nothing to extract and
+/// nothing to reach — which is also the only surface where a generated test is
+/// useful BEFORE the feature lands.
+///
+/// ── THE STATUS IS NOT IN THE CONTENT HASH ───────────────────────────────────
+///
+/// `contentHash` covers the external id, title, body and criteria, in that
+/// order, canonicalised by `requirementCanonicalText`. The status is excluded on
+/// purpose: a ticket moving from READY to DONE is not an edit to the
+/// specification, and hashing it would re-open every link in a project on the
+/// day its sprint closed.
+model Requirement {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// The id in the source system: `PROJ-412`, `#1884`. Unique per project per
+  /// system — two trackers may both have a `PROJ-412` and they are not the same
+  /// requirement.
+  externalId   String
+  sourceSystem SpecSourceSystem
+  title        String
+  /// Prose. Empty string is legal and common: plenty of tickets are a title and
+  /// a list of criteria, which live in `criteria` as rows.
+  body         String            @default("")
+  status       RequirementStatus
+  /// The source system's own word for the status, verbatim.
+  ///
+  /// REQUIRED IN SPIRIT when `status` is UNMAPPED: "we could not map it" with
+  /// nothing to show is indistinguishable from a bug in our mapping table, the
+  /// same argument `CoverageItem.refusedByRule` makes for REFUSED. Enforced at
+  /// the producer by `requirementImportSchema`, since a conditional NOT NULL is
+  /// not something a column can express.
+  statusRaw    String?
+  url          String?
+
+  /// Hash of the canonical content, so a re-import can tell CHANGED from
+  /// UNCHANGED — and, through `classifyReimport`, can tell both of those from
+  /// NOT_COMPARABLE when a stored row carries no hash. Calling that UNCHANGED
+  /// drops the customer's edit silently; calling it CHANGED churns every link on
+  /// every import until people stop reading the matrix.
+  contentHash      String
+  /// When the content last actually differed. Null means no import has ever
+  /// seen it change, which for a row imported once is simply the truth.
+  contentChangedAt DateTime?
+
+  /// Whether anything is linked, and how strongly. See the enum's note for why
+  /// this is a column: NOT_SEARCHED (our silence) and NOT_LINKED (the finding)
+  /// are opposite facts and `count(links) = 0` cannot tell them apart.
+  linkState RequirementLinkState @default(NOT_SEARCHED)
+  /// When a linker last ran over this requirement. Null whenever `linkState` is
+  /// NOT_SEARCHED, and the pair is what makes "our silence" auditable rather
+  /// than asserted.
+  linkedAt  DateTime?
+
+  firstImportedAt DateTime  @default(now())
+  lastImportedAt  DateTime  @updatedAt
+  /// Set when the source system stops returning it, rather than deleting the
+  /// row — same argument as `CoverageItem.retiredAt`. A requirement that
+  /// vanishes takes its links with it, and a shrinking denominator needs an
+  /// audit trail at least as much as a growing one.
+  retiredAt       DateTime?
+
+  project  Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  criteria AcceptanceCriterion[]
+  links    RequirementLink[]
+
+  @@unique([projectId, sourceSystem, externalId])
+  @@index([orgId])
+  /// THE REPORT: "every requirement in this project that no test covers",
+  /// ordered and paged. Without it that is a scan of every requirement in the
+  /// install on a screen a customer opens daily.
+  @@index([projectId, linkState])
+  /// The generation filter: a READY requirement's test is expected to FAIL and
+  /// an OBSOLETE one is not a gap at all, so selection reads by status.
+  @@index([projectId, status])
+  @@index([projectId, retiredAt])
+}
+
+/// One acceptance criterion, as a ROW.
+///
+/// A row per criterion rather than one prose body is the entity's whole point:
+/// "which acceptance criterion has no test?" is a question about rows, and a
+/// paragraph holding four criteria is one uncoverable thing instead of four
+/// coverable ones.
+model AcceptanceCriterion {
+  id            String @id @default(cuid())
+  orgId         String
+  requirementId String
+
+  /// Position within the requirement, from 0. Part of the identity: criterion 3
+  /// of PROJ-1 is something a test links to, so a re-import compares text at an
+  /// ordinal and reports a MOVE rather than treating it as a delete plus an
+  /// insert, which would retire a link somebody asserted.
+  ordinal    Int
+  text       String
+  format     AcceptanceCriterionFormat
+  /// The source system's own id, when it has one. Xray and Zephyr do; a
+  /// Markdown bullet does not, and null is the honest answer rather than a
+  /// synthesised id that changes when a bullet is inserted above it.
+  externalId String?
+
+  /// Per-criterion link state, derived by the same `linkStateFrom`. This is the
+  /// column the enterprise question is actually asked against: a requirement
+  /// can be ASSERTED through one criterion while three others are NOT_LINKED,
+  /// and a matrix that only has requirement-level state reports that as covered.
+  linkState RequirementLinkState @default(NOT_SEARCHED)
+  linkedAt  DateTime?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  requirement Requirement       @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  links       RequirementLink[]
+
+  @@unique([requirementId, ordinal])
+  @@index([orgId])
+  /// "Which criteria have no test?" across a project — the read the report
+  /// pages through, and the reason `linkState` is stored on this table too.
+  @@index([linkState])
+}
+
+/// One claim that a test or a surface covers a requirement.
+///
+/// ── THE PROVENANCE IS THE PRODUCT ───────────────────────────────────────────
+///
+/// `method` and `confidence` are not metadata. A link a human asserted and a
+/// link a regex guessed must never read the same, because the second kind is
+/// the only kind that scales and the first kind is the only kind that is
+/// evidence. `clampLinkConfidence` caps what each method may claim and reports
+/// the cap when it bites — an undisclosed cap on a confidence score is an
+/// undisclosed change to the coverage number.
+///
+/// ── EXACTLY ONE TARGET ──────────────────────────────────────────────────────
+///
+/// `testId` XOR `coverageItemId`. Not expressible as a column constraint
+/// without a CHECK (this schema has none anywhere, and Prisma's drift detection
+/// does not model them), so it is enforced on the way in by
+/// `requirementLinkTargetSchema` and on the way out by `linkTargetOfRow`, which
+/// returns NULL for a row with both or neither rather than picking whichever
+/// column happened to be non-null. A malformed row is reported, never silently
+/// read as a test link.
+model RequirementLink {
+  id            String  @id @default(cuid())
+  orgId         String
+  projectId     String
+  requirementId String
+  /// Set when the link is about one criterion. Null means it is about the
+  /// requirement as a whole, which is what a ticket id in a test name proves
+  /// and all it proves — promoting that guess to criterion granularity would
+  /// answer the enterprise question with a link nobody made.
+  criterionId   String?
+
+  /// The automated test claimed to cover it. Exactly one of this and
+  /// `coverageItemId` is set.
+  testId         String?
+  /// The surface registry row claimed to cover it. A `CoverageItem.id`, which
+  /// the linker resolves from a `key` — a key with no row is a dangling
+  /// reference in OUR extractor, exactly like `dimensionDenominator`'s
+  /// `undeclaredValues`, and must be reported as one rather than dropped.
+  coverageItemId String?
+
+  method     RequirementLinkMethod
+  /// 0–1, already clamped to this method's ceiling by `clampLinkConfidence`.
+  confidence Float
+  /// The sentence that justifies the link, in the customer's terms — and the
+  /// place the clamp's `rule` is recorded when a cap bit. Same contract as
+  /// `CoverageItem.evidence`: this is what makes the matrix auditable rather
+  /// than asserted.
+  evidence   String
+
+  /// Who asserted it, for a MANUAL link. Kept as a pair, like `CoverageWaiver`:
+  /// `onDelete: SetNull` must not erase WHO made the claim, so the email
+  /// survives the user row.
+  byUserId String?
+  byEmail  String?
+
+  createdAt DateTime @default(now())
+
+  project      Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requirement  Requirement          @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  criterion    AcceptanceCriterion? @relation(fields: [criterionId], references: [id], onDelete: Cascade)
+  test         Test?                @relation(fields: [testId], references: [id], onDelete: Cascade)
+  coverageItem CoverageItem?        @relation(fields: [coverageItemId], references: [id], onDelete: Cascade)
+  byUser       User?                @relation(fields: [byUserId], references: [id], onDelete: SetNull)
+
+  /// One claim per (requirement, criterion, target, method). The same test may
+  /// be linked to one criterion by an annotation AND by a surface match, and
+  /// those are two different pieces of evidence worth keeping apart; the same
+  /// method asserting the same thing twice is a duplicate, and this makes the
+  /// importer's upsert idempotent.
+  /// `map:` is not cosmetic. Prisma's generated name for a five-column unique
+  /// would be `RequirementLink_requirementId_criterionId_testId_coverageItemId_method_key`
+  /// — 74 bytes, past PostgreSQL's 63-byte identifier limit, which the server
+  /// silently TRUNCATES. A hand-written migration and Prisma's own introspection
+  /// would then disagree about the constraint's name for ever, and every
+  /// subsequent `migrate dev` would report drift it cannot fix.
+  @@unique([requirementId, criterionId, testId, coverageItemId, method], map: "RequirementLink_claim_key")
+  @@index([orgId])
+  @@index([projectId, method])
+  @@index([requirementId])
+  @@index([criterionId])
+  /// "Which requirements does this test cover?" — the reverse read, which the
+  /// test detail page and the impact analysis both make.
+  @@index([testId])
+  @@index([coverageItemId])
+}
+
+/// One manual test case: the largest existing record of "what must be tested",
+/// and the one QAAI could not read at all.
+///
+/// TestRail is WRITE-ONLY in this repo today — results are pushed and nothing
+/// is ever read back — so a customer's 1,840-case suite was invisible to the
+/// denominator while being the most concrete statement of intent they own.
+/// With these rows the automation backlog is a NUMBER (`manualBacklogTotals`),
+/// and `NOT_STATED` keeps that number from quietly including the cases their
+/// suite never classified.
+model ManualTestCase {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  externalId     String
+  sourceSystem   SpecSourceSystem
+  title          String
+  /// The steps as ROWS, in order: `[{ ordinal, action, expected }]`. Prose in
+  /// one blob cannot be counted, cannot be matched against a generated test's
+  /// steps, and cannot show a human which step a conversion dropped.
+  steps          Json             @default("[]")
+  /// The case-level expected result. Null when the suite records only per-step
+  /// ones.
+  expectedResult String?
+  url            String?
+
+  automationStatus  ManualTestAutomationStatus
+  /// The automated test that replaced it, when one exists.
+  ///
+  /// `onDelete: SetNull`: deleting a test must not delete the customer's manual
+  /// case, and the pair (status AUTOMATED, id null) is then a visible,
+  /// queryable inconsistency — a case marked automated whose test is gone —
+  /// rather than a silent downgrade. Exactly the argument `Test.authProfileId`
+  /// and `Test.authProfileRequired` record.
+  automatedByTestId String?
+
+  /// When a human last ran it, as the suite reports it. Null is "the suite does
+  /// not say", which is NOT "never run": a case with no execution history and a
+  /// case whose suite has no such field look identical in a CSV export, and one
+  /// of them is a finding.
+  lastExecutedAt DateTime?
+
+  contentHash      String
+  contentChangedAt DateTime?
+  firstImportedAt  DateTime  @default(now())
+  lastImportedAt   DateTime  @updatedAt
+  retiredAt        DateTime?
+
+  project         Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  automatedByTest Test?   @relation(fields: [automatedByTestId], references: [id], onDelete: SetNull)
+
+  @@unique([projectId, sourceSystem, externalId])
+  @@index([orgId])
+  /// The backlog read: "every case in this project that is not automated",
+  /// grouped by status. The one number this table exists to produce.
+  @@index([projectId, automationStatus])
+  @@index([automatedByTestId])
+  @@index([projectId, retiredAt])
+}
+
+/// One HTTP operation the application declares.
+///
+/// ── WHY THIS IS NOT `HttpEndpoint` ──────────────────────────────────────────
+///
+/// `HttpEndpoint` (a shape inside a stored analysis blob) is a method and a
+/// path, where the method is frequently 'UNKNOWN' and nothing ever verifies any
+/// of it. OpenAPI — the richest declaration of an application's surface that
+/// exists — is parsed today ONLY inside the CONTRACT runner and thrown away the
+/// moment the run ends. So the request shapes, the declared auth and every
+/// parameter bound were read and discarded on every run, which is why boundary
+/// and negative-case generation had nothing to work from.
+///
+/// ── THE PARAMETER BOUNDS ARE THE POINT ──────────────────────────────────────
+///
+/// `parameters` is `ApiParameterBound[]`, and its min/max/maxLength/pattern/enum
+/// are the single most useful numbers in the whole document: `boundaryEdges`
+/// turns them into the values a negative test should send and what the document
+/// ENTITLES the test to expect back. Each bound is three-state — absent means
+/// this reader does not capture that constraint, explicit null means the
+/// declaration states no bound — because a `maxLength` missing because our
+/// reader ignores the keyword is a problem in US and must not be reported as
+/// the application's.
+model ApiOperation {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// GET…TRACE, or 'UNKNOWN' — carried over from `HttpEndpoint.method`
+  /// verbatim. TEXT and not an enum: the domain is `API_OPERATION_METHODS`,
+  /// enforced at the producer by `apiOperationSchema`, exactly as
+  /// `Project.closureApprovalPolicy` and `CoverageItem.unexercisableReason`
+  /// are. 'UNKNOWN' is a real answer and not a placeholder — an endpoint whose
+  /// verbs are unreadable is still an endpoint, and saying GET would be a guess
+  /// dressed as a fact.
+  method         String
+  /// `/orders/{id}`, as the document spells it. Canonicalised to the repo's
+  /// `:param` form only when a `CoverageItem` key is built from it, so the
+  /// document's own spelling survives for a human to match against.
+  pathTemplate   String
+  /// The document's own `operationId`. Null when it has none — most do not.
+  operationId    String?
+  /// Which document this came from: a URL, a repo-relative path, or a
+  /// detector's name. Required: an operation with no provenance cannot be
+  /// re-read, re-diffed or disputed.
+  sourceDocument String
+  /// The sentence that justifies the row, same contract as `CoverageItem`.
+  evidence       String
+
+  authDeclaration ApiAuthDeclaration
+  /// ApiParameterBound[] — see the note above.
+  parameters      Json               @default("[]")
+  /// The declared request and response shapes, opaque. Null means the document
+  /// declared none. A JSON-schema subset modelled as columns here would be a
+  /// second, worse JSON-schema implementation, and the one consumer — boundary
+  /// generation — needs the bounds rather than the whole tree.
+  requestShape    Json?
+  responseShapes  Json?
+
+  verification    ApiOperationVerification @default(DECLARED)
+  /// A `NOT_PROBED_REASONS` member, set only when `verification` is NOT_PROBED.
+  /// Required in spirit for the same reason as `CoverageItem.refusedByRule`:
+  /// NOT_PROBED with no reason is indistinguishable from a bug in the prober,
+  /// and a reader's only response to that is to stop believing the number.
+  /// BUDGET_SPENT in particular is a cap WE applied, and the report has to be
+  /// able to say how many operations it hid.
+  notProbedReason String?
+  /// The newest probe's timestamp, for ordering without a join. Null while
+  /// nothing has ever probed.
+  lastProbedAt    DateTime?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  project Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  probes  ApiOperationProbe[]
+
+  /// The identity. `sourceDocument` is NOT in it on purpose: the same operation
+  /// declared by two documents is one operation, and keying on the document
+  /// would double the denominator for every customer who publishes both a
+  /// gateway spec and a service spec.
+  @@unique([projectId, method, pathTemplate])
+  @@index([orgId])
+  /// "Which declared operations has nothing ever confirmed?" — the read that
+  /// makes DECLARED-versus-CONFIRMED a report rather than a column.
+  @@index([projectId, verification])
+  /// "Which operations does the document say are public?" — the input to
+  /// negative-auth generation, which must only run where the document took a
+  /// position (OPTIONAL or NONE).
+  @@index([projectId, authDeclaration])
+  @@index([projectId, retiredAt])
+}
+
+/// What answered when we actually asked.
+///
+/// A row per probe rather than a column on the operation, because a probe is an
+/// OBSERVATION with a time and a place, and the interesting findings are
+/// differences between observations: an operation the document calls public
+/// that 401s, a verb the document declares that 405s, an operation that
+/// answered last week and does not now. A single overwritten column would erase
+/// every one of those.
+///
+/// Every field that could be a guess is nullable and null means NOT DETERMINED.
+model ApiOperationProbe {
+  id          String @id @default(cuid())
+  orgId       String
+  operationId String
+
+  /// Where it was probed. A BARE COLUMN with no foreign key, following
+  /// `CoverageItem.environmentId`: an observation is a historical fact about a
+  /// place that existed, and deleting the environment row must not delete the
+  /// evidence. Null when the prober was given no environment.
+  environmentId String?
+
+  /// The status that came back. Null when nothing answered.
+  status             Int?
+  /// Whether the verb was allowed. Null when undetermined — a 404 says nothing
+  /// about the verb, and only a 405 or an `Allow` header settles it.
+  verbAllowed        Boolean?
+  /// Whether authentication was required IN FACT: an anonymous request was
+  /// refused and the same request with a credential was not.
+  ///
+  /// Null unless BOTH halves were sent. One anonymous 401 does not establish it
+  /// — the operation may be 401-ing everybody, including us — and recording
+  /// `true` from half the evidence is how the document and the application come
+  /// to agree on paper about an operation that is broken.
+  authRequiredInFact Boolean?
+  /// True when anything at all answered. What separates CONFIRMED from
+  /// NO_ANSWER, and the reason "we got no answer" is never stored as a status
+  /// of 0.
+  answered           Boolean
+  /// The sentence shown beside the probe. Always written, never defaulted to ''.
+  detail             String
+
+  observedAt DateTime @default(now())
+
+  operation ApiOperation @relation(fields: [operationId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  /// "The newest probe for this operation", which is every read this table has.
+  @@index([operationId, observedAt])
+}
+
+/// One exported component, hook or page in the customer's application.
+///
+/// There is no component inventory anywhere in this repo, which is why UNIT_GEN
+/// and component-state coverage have no denominator at all — not a low one, an
+/// ABSENT one. `kind` carries the guard against the obvious way to make that
+/// worse: a PAGE is already counted on the ROUTE axis, and adding it again
+/// divides the same application by a larger number.
+model ComponentItem {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// Repo-relative module path. Identity, with `exportName`.
+  modulePath        String
+  /// The exported name. `default` is a legal and common value.
+  exportName        String
+  kind              ComponentItemKind
+  /// A one-line summary of the props, for a human and for a generator's prompt
+  /// — never the full type. Null when the export takes none.
+  propsSummary      String?
+  /// Whether a story or catalogue entry exists. THREE STATES and all three are
+  /// needed: null means NO CATALOGUE WAS READ, false means one was and this
+  /// component is not in it, true means it is. Null read as false reports
+  /// "nothing is in Storybook" about a project whose Storybook we never looked
+  /// for, which is a measured claim about something not measured.
+  hasCatalogueEntry Boolean?
+  catalogueRef      String?
+  /// The sentence that justifies the row, same contract as `CoverageItem`.
+  evidence          String
+  /// Which reader produced it, so a systematically wrong one can be found.
+  detector          String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  project Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  states  ComponentState[]
+
+  @@unique([projectId, modulePath, exportName])
+  @@index([orgId])
+  /// The UNIT_GEN denominator: "every COMPONENT in this project", excluding the
+  /// kinds already counted on another axis.
+  @@index([projectId, kind])
+  @@index([projectId, retiredAt])
+}
+
+/// One named state of one component.
+///
+/// The row that makes "not just the happy path" countable. `source` is reused
+/// from `SurfaceSource` rather than invented: a state found by reading a branch
+/// on `isLoading` is SOURCE, one found in a Storybook entry is CATALOGUE, one a
+/// person typed is MANUAL, and those are the same three distinctions the
+/// surface registry already draws.
+model ComponentState {
+  id          String @id @default(cuid())
+  orgId       String
+  componentId String
+
+  kind            ComponentStateKind
+  source          SurfaceSource
+  /// The sentence that justifies it: "renders `<Spinner/>` when `isLoading`".
+  evidence        String
+  /// The `CoverageItem.key` this state is counted as, on the COMPONENT_STATE
+  /// axis. TEXT and not a foreign key, deliberately: the registry row is
+  /// written by a different pass and may not exist yet, and a required FK would
+  /// make the order of two independent readers load-bearing. A key with no row
+  /// is reported as a dangling reference, which is a fact about our own
+  /// extractor and the kind we refuse to hide.
+  coverageItemKey String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  component ComponentItem @relation(fields: [componentId], references: [id], onDelete: Cascade)
+
+  @@unique([componentId, kind])
+  @@index([orgId])
+  /// "How many non-DEFAULT states does this project declare, and how many are
+  /// covered?" — the claim this table exists to make checkable.
+  @@index([kind])
+}
+
+/// One traffic ingest, and what it cost the denominator.
+///
+/// ── WHY THE ACCOUNTING IS A ROW ─────────────────────────────────────────────
+///
+/// `POST /traffic/:projectId/analyze` applies at least four caps today — 50,000
+/// entries, 500 tests compared, a `maxJourneys` of up to 40, and a per-session
+/// step limit — and EVERY ONE of them is a lever that makes the coverage
+/// percentage go UP, because truncating shrinks the denominator while the
+/// numerator (the tests that already exist) does not move. All four currently
+/// vanish with the HTTP response, so a number computed from a truncated upload
+/// is indistinguishable afterwards from one computed from a complete one.
+///
+/// `journeysDroppedByCap` is a FLOOR and never an estimate: journeys the
+/// analysis actually held, ranked and dropped. Same contract as
+/// `FlowMap.atLeastMoreUrls`, and inventing a number in the alarming direction
+/// is the same sin as inventing one in the flattering direction.
+///
+/// NOTHING RAW IS STORED HERE, for the same reason routes/traffic.ts never
+/// persists its upload: the analysis redacts on ingest, the paths are already
+/// parameterised and PII-classified, and the only content-shaped column on this
+/// table is a count.
+model TrafficIngest {
+  id            String  @id @default(cuid())
+  orgId         String
+  projectId     String
+  /// A bare column, as on `ApiOperationProbe`. Null when the uploader did not
+  /// say which environment the traffic came from — which is common for a log
+  /// file and is why it is nullable rather than defaulted to production.
+  environmentId String?
+
+  /// HAR | ACCESS_LOG | OTLP, as detected or declared. TEXT, with the domain
+  /// enforced at the producer (`analyzeOptionsSchema` already validates it), so
+  /// this does not add an enum whose only job is to need a drift guard.
+  format        String
+  /// The connector this came from, when it came from one rather than an upload.
+  /// An `Integration.id` — a row the customer owns, which is where a
+  /// connector's credentials belong; never an environment variable.
+  integrationId String?
+
+  /// The window the traffic was observed in, from the entries themselves and
+  /// not from the clock. Null when the source carried no timestamps at all, in
+  /// which case frequencies are counts without a rate and the report says so.
+  observedFrom DateTime?
+  observedTo   DateTime?
+
+  entriesParsed        Int
+  entriesSkipped       Int  @default(0)
+  sessions             Int
+  journeysStored       Int
+  /// Journeys held, ranked and dropped because a cap bit. The floor behind "at
+  /// least N more existed".
+  journeysDroppedByCap Int  @default(0)
+  /// `[{ cap, limit, droppedAtLeast }]` — every cap that ACTUALLY bit, named,
+  /// with the number it was set to. Empty means none did, which is a different
+  /// and far better fact than an empty list because nobody looked.
+  capsThatBit          Json @default("[]")
+
+  createdAt   DateTime @default(now())
+  requestedBy String?
+
+  project  Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  journeys ObservedJourney[]
+
+  @@index([orgId])
+  @@index([projectId, createdAt])
+}
+
+/// One journey real users actually took, made durable.
+///
+/// The third enumeration source. A crawl reports what it could reach and a
+/// source detector reports what the repository declares; this reports what
+/// people DO — including the paths nothing in the repo suggests and no crawler
+/// would find, because they depend on data only production has.
+///
+/// One row per journey per project, carrying the LATEST measurement plus the
+/// window it was seen in. Not one row per observation: the frequencies move
+/// every time a log is uploaded, and keeping every sample would make this table
+/// the largest in the product in exchange for a trend nobody asked for.
+/// `firstObservedAt`/`lastObservedAt` and `ingestCount` keep the shape of its
+/// history; `TrafficIngest` keeps the accounting of each upload.
+model ObservedJourney {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  /// The ingest that last updated this row, so every number here is traceable
+  /// to the upload and the caps it was computed under.
+  ingestId  String
+
+  /// `journeyIdOf`'s deterministic hash of the step sequence (packages/agent/
+  /// src/traffic.ts). THE identity, and computed there rather than here so a
+  /// journey the client round-trips and a journey we stored cannot disagree.
+  journeyKey String
+  name       String
+  feature    String
+  /// `JourneyStep[]` — `[{ method, route, status, errorRate, count, repeats }]`.
+  /// Parameterised and PII-classified by the analyser; never a raw URL.
+  steps      Json
+
+  /// Sessions whose whole canonical path is exactly this, and that as a share
+  /// of all sessions in the window — the headline number, and the reason this
+  /// source outranks a crawl for prioritisation.
+  sessionCount     Int
+  sessionShare     Float
+  requestCount     Int
+  /// Share of this journey's requests that failed IN PRODUCTION. A journey with
+  /// a real error rate and no test is the most valuable row in the table.
+  errorRate        Float
+  /// Median wall-clock. Null when the source carried no timings — not 0, which
+  /// would read as instantaneous.
+  medianDurationMs Int?
+
+  firstObservedAt DateTime
+  lastObservedAt  DateTime
+  /// How many ingests have seen it. 1 is a journey seen once, which is a weaker
+  /// claim than one seen in every upload for a month.
+  ingestCount     Int      @default(1)
+
+  /// The cross-reference against the existing suite, recomputed on every
+  /// ingest: COVERED | PARTIAL | UNCOVERED, and the best test's share of the
+  /// steps. TEXT and a Float rather than reusing `SurfaceStatus`, because this
+  /// is a STEP-SEQUENCE match and not the registry's item-level verdict —
+  /// borrowing the registry's vocabulary for a different computation is how two
+  /// screens come to report two coverage numbers.
+  coverageStatus String
+  matchedRatio   Float
+  /// `"POST /checkout"` for every step no test mentions. The named list, which
+  /// is the part a customer forwards.
+  missingSteps   Json   @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  ingest  TrafficIngest @relation(fields: [ingestId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, journeyKey])
+  @@index([orgId])
+  /// "The journeys most users take that no test covers" — ordered by share,
+  /// filtered by status. The one read this table exists for.
+  @@index([projectId, coverageStatus, sessionShare])
+  @@index([ingestId])
 }

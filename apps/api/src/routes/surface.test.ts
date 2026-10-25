@@ -48,6 +48,7 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Prisma } from '../generated/prisma/client.js';
 
 type Row = Record<string, any>;
 
@@ -214,7 +215,19 @@ const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   flowMap: new Set(['id', 'orgId', 'projectId', 'version']),
   test: new Set(['id', 'orgId', 'projectId', 'disabledAt', 'filePath']),
   testResult: new Set(['id', 'orgId', 'testId', 'runId', 'status', 'test']),
-  coverageItem: new Set(['id', 'orgId', 'projectId', 'key', 'status', 'retiredAt']),
+  coverageItem: new Set([
+    'id',
+    'orgId',
+    'projectId',
+    'key',
+    'status',
+    'retiredAt',
+    // The declarer list. `loadObservedItems` filters on it with
+    // `{ not: Prisma.DbNull }`, and a fake that shrugged at this filter would
+    // feed source-declared rows back into the union as though another declarer
+    // had named them.
+    'sources',
+  ]),
   coverageWaiver: new Set(['id', 'orgId', 'projectId', 'itemId', 'expiresAt']),
   coverageSnapshot: new Set(['id', 'orgId', 'projectId']),
 };
@@ -225,6 +238,12 @@ const GLOBAL_MODELS = new Set<ModelName>(['user']);
 type Store = Record<ModelName, Row[]>;
 
 function matchesCondition(value: unknown, cond: unknown): boolean {
+  // `Prisma.DbNull` is a sentinel OBJECT, not null, and it means SQL NULL —
+  // which for a `Json?` column is a different stored value from JSON `null`.
+  // Resolved here rather than in `matchesWhere` so `{ not: Prisma.DbNull }`
+  // composes through the `not` branch below like any other condition.
+  if (cond === Prisma.DbNull) return (value ?? null) === null;
+  if (cond === Prisma.JsonNull) return value === null;
   if (cond === null) return (value ?? null) === null;
   if (cond instanceof Date) return value instanceof Date && value.getTime() === cond.getTime();
   if (typeof cond === 'object') {

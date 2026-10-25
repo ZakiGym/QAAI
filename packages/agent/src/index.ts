@@ -70,3 +70,34 @@ export * from './boundaries.js';
  * five modules exports any of those.
  */
 export * from './crawl/index.js';
+
+/*
+ * The non-crawl half of enumeration. Five modules, each of which `check:wiring`
+ * flagged under `package-exports` the moment it landed — built, tested, and
+ * reachable from nothing but its own test file.
+ *
+ * Two are reached by a real call path as well as by these lines: `importer.ts`
+ * (already above) imports `api-surface.ts`, and `reconcile.ts` imports
+ * `surface-catalog.ts`'s neighbours. The rest are reached only from here, which
+ * is what makes their shapes public API — apps/api needs `ingestApiDocument`
+ * for POST /api-surface (it answers 501 naming that export until this line
+ * exists), and the enumerate orchestrator needs `extractRouteManifest`,
+ * `routeManifestSurfaceItems`, `matchExpectedSurface` and `reconcileSurface`.
+ *
+ * Name collisions: the five modules' authors each diffed their exported names
+ * against this barrel's existing graph and against each other, and I re-ran the
+ * check across all of packages/agent/src, packages/agent/src/crawl and
+ * packages/shared/src after they landed. `route-manifest.ts` renamed its
+ * `RouteTemplate` to `DeclaredRoute` because `crawl/frontier.ts` owns that name;
+ * nothing else overlaps, and `tsc -p packages/agent/tsconfig.json` reports no
+ * TS2308 on this file.
+ *
+ * Order is deliberate: `api-surface.ts` first because `importer.ts` above
+ * already pulls it into the graph, then the three modules that import
+ * `coverage.js` and `surface-inventory.js` (both above), so no line here
+ * introduces a cycle this barrel did not already have.
+ */
+export * from './api-surface.js';
+export * from './route-manifest.js';
+export * from './surface-catalog.js';
+export * from './reconcile.js';

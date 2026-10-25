@@ -19,9 +19,13 @@
 import { describe, expect, it } from 'vitest';
 import { planItemSchema } from '@qaai/shared';
 import type { Selector } from '@qaai/shared';
+import { EXCLUSION_KINDS, UNEXERCISABLE_REASONS } from '@qaai/shared';
 import {
+  EXCLUSION_AS_EXERCISE,
   MAX_BOUNDARY_CASES_PER_GAP,
   analyzeCoverage,
+  exclusionAsExercise,
+  reverseReconcile,
   assertsAFailure,
   chooseAuthProfile,
   expandNegativeCases,
@@ -531,17 +535,133 @@ describe('affordances', () => {
     expect(gap.evidence[0]).toMatch(/getByRole\('button', \{ name: 'Add to cart' \}\)/);
   });
 
-  it('closes on either the label or the locator expression', () => {
-    const byLabel = run([test_({ id: 'a', code: 'await clickButton("Add to cart");', routes: ['/x'] })]);
+  it('closes on either the label or the locator expression, ON THE PAGE THE CONTROL IS ON', () => {
+    /*
+     * `routes` used to read `['/x']` here — a route the fixture does not have —
+     * and the gaps closed anyway, because the universe was keyed on the locator
+     * expression alone and the usage check was a substring scan over source
+     * with no page in it. The two signals are still both accepted; what changed
+     * is that the test has to be somewhere the control exists.
+     */
+    const byLabel = run([
+      test_({
+        id: 'a',
+        code: 'await clickButton("Add to cart");',
+        routes: ['/products/[id]'],
+      }),
+    ]);
     const byExpression = run([
       test_({
         id: 'b',
         code: "await page.getByRole('button', { name: 'Invite user' }).click();",
-        routes: ['/x'],
+        routes: ['/admin/users'],
       }),
     ]);
     expect(byLabel.gaps.some((g) => g.title.includes('Add to cart'))).toBe(false);
     expect(byExpression.gaps.some((g) => g.title.includes('Invite user'))).toBe(false);
+  });
+
+  it('does not credit a control on a page the test never visits', () => {
+    /*
+     * THE 100%-AT-20% LIE, IN ITS SMALLEST FORM.
+     *
+     * One test, on /about, whose source happens to contain the words "Add to
+     * cart" — a comment, a fixture name, a helper it imports. The button is on
+     * /products/[id]. Under the old page-blind check this closed the gap; now
+     * it does not, and the gap that remains is the true one.
+     */
+    const report = run([
+      test_({
+        id: 'elsewhere',
+        routes: ['/about'],
+        code: 'await page.goto("/about"); // TODO: cover "Add to cart" one day',
+      }),
+    ]);
+
+    expect(
+      report.gaps.some(
+        (g) => g.kind === 'UNUSED_AFFORDANCE' && g.title.includes('Add to cart'),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps "Save" on five pages as five gaps, not one', () => {
+    const fiveSaves = {
+      projectId: 'p1',
+      environmentId: 'e1',
+      version: 1,
+      baseUrl: 'https://app.test',
+      exploredAt: '2026-07-01T00:00:00.000Z',
+      nodes: ['/profile', '/billing', '/team', '/notifications', '/api-keys'].map((route) =>
+        node({
+          id: `n${route}`,
+          route,
+          affordances: [{ label: 'Save', selector: role('Save'), kind: 'button' }],
+        }),
+      ),
+      edges: [],
+      journeys: [],
+      features: [],
+      truncatedReason: null,
+    };
+
+    // One test, one page, one Save pressed.
+    const report = run(
+      [
+        test_({
+          id: 'profile',
+          routes: ['/profile'],
+          code: "await page.getByRole('button', { name: 'Save' }).click();",
+        }),
+      ],
+      fiveSaves,
+    );
+
+    const saves = report.gaps.filter(
+      (g) => g.kind === 'UNUSED_AFFORDANCE' && g.title.includes('Save'),
+    );
+    // Four remain: /billing, /team, /notifications, /api-keys. The old
+    // implementation reported ZERO, because the one Save it knew about was
+    // pressed.
+    expect(saves.map((g) => g.route).sort()).toEqual([
+      '/api-keys',
+      '/billing',
+      '/notifications',
+      '/team',
+    ]);
+    // And the denominator says five, not one.
+    expect(report.totals.affordances).toBe(5);
+    expect(report.totals.affordancesUsed).toBe(1);
+  });
+
+  it('says how many other pages carry the same control, instead of guessing', () => {
+    const sharedHeader = {
+      projectId: 'p1',
+      environmentId: 'e1',
+      version: 1,
+      baseUrl: 'https://app.test',
+      exploredAt: '2026-07-01T00:00:00.000Z',
+      nodes: ['/a', '/b', '/c'].map((route) =>
+        node({
+          id: `n${route}`,
+          route,
+          affordances: [{ label: 'Export', selector: role('Export'), kind: 'button' }],
+        }),
+      ),
+      edges: [],
+      journeys: [],
+      features: [],
+      truncatedReason: null,
+    };
+
+    const report = run([test_({ id: 'none' })], sharedHeader);
+    const gap = report.gaps.find((g) => g.kind === 'UNUSED_AFFORDANCE')!;
+
+    expect(gap).toBeDefined();
+    // The fact, with the arithmetic a reader can check: 2 others of 3 pages.
+    expect(gap.evidence.join(' ')).toMatch(/same locator appears on 2 other pages/);
+    // And it is evidence, not a verdict: both readings are offered.
+    expect(gap.evidence.join(' ')).toMatch(/one shared control/);
   });
 
   it('leaves links to the route gaps rather than reporting both', () => {
@@ -1742,5 +1862,387 @@ describe('rankGapsForClosure is what stops the campaign re-buying the same work'
     });
     expect(selection.gaps.length + selection.skipped.length).toBe(selection.considered);
     expect(selection.considered).toBe(3);
+  });
+});
+
+// ─── The surface nothing is allowed to touch ──────────────────────────────────
+
+/**
+ * The refused class, which used to vanish without trace.
+ *
+ * A crawl declining to follow /logout or /delete-account is correct; recording
+ * nothing about it was not, because absent and uncovered move a percentage in
+ * opposite directions and the surfaces being dropped were the destructive ones.
+ * Every case here is about keeping four facts apart: a surface we cannot drive
+ * safely, a surface a policy refused, a surface that is somebody else's, and a
+ * crawl that never accounted for refusals at all.
+ */
+
+/** A graph with a refusal ledger. `excluded` is the field under test. */
+function graphWithExclusions(excluded: unknown[]): Record<string, unknown> {
+  return { ...shopGraph(), excluded };
+}
+
+const exclusion = (
+  over: Partial<{ url: string; route: string | null; kind: string; rule: string }>,
+): Record<string, unknown> => ({
+  url: over.url ?? 'https://shop.test/logout',
+  route: over.route === undefined ? '/logout' : over.route,
+  kind: over.kind ?? 'SESSION_ENDING',
+  rule: over.rule ?? 'session-ending:logout',
+  discoveredFrom: 'https://shop.test/',
+});
+
+describe('the exclusion classification', () => {
+  it('classifies every exclusion kind the vocabulary names', () => {
+    /*
+     * The RUN-TIME half of the guard. `EXCLUSION_AS_EXERCISE` is a
+     * `Record<ExclusionKind, …>` so the compiler already refuses a missing
+     * member — but a `Record` cannot be enumerated by the compiler at run time,
+     * and eight GateRule kinds shipped unsaveable for two slices because only
+     * one half of this pattern existed.
+     */
+    expect(Object.keys(EXCLUSION_AS_EXERCISE).sort()).toEqual([...EXCLUSION_KINDS].sort());
+    for (const kind of EXCLUSION_KINDS) {
+      const classified = EXCLUSION_AS_EXERCISE[kind];
+      if (classified === null) continue;
+      expect(['UNEXERCISABLE', 'REFUSED']).toContain(classified.state);
+      // A remedy is required and must be a sentence, not a label.
+      expect(classified.remedy.length).toBeGreaterThan(20);
+      if (classified.state === 'UNEXERCISABLE') {
+        expect(UNEXERCISABLE_REASONS).toContain(classified.reason!);
+      } else {
+        // A refusal has a RULE, not a reason. Claiming a motive for a path an
+        // excludeGlobs pattern matched would be our guess printed as theirs.
+        expect(classified.reason).toBeNull();
+      }
+    }
+  });
+
+  it('refuses to call an off-origin URL this application’s surface', () => {
+    expect(exclusionAsExercise('OFF_ORIGIN', 'off-origin:idp')).toBeNull();
+    expect(exclusionAsExercise('UNSUPPORTED_SCHEME', 'scheme:mailto')).toBeNull();
+  });
+
+  it('carries the rule on both classes, so a refusal is always lookupable', () => {
+    for (const kind of EXCLUSION_KINDS) {
+      const exercise = exclusionAsExercise(kind, `rule:${kind}`);
+      if (!exercise) continue;
+      expect(exercise.rule).toBe(`rule:${kind}`);
+      expect(exercise.detail).toContain(`rule:${kind}`);
+    }
+  });
+});
+
+describe('unexercisable surfaces', () => {
+  it('reports a refused logout as a gap with a reason and a remedy', () => {
+    const report = run([test_({ id: 'none' })], graphWithExclusions([exclusion({})]));
+    const gap = report.gaps.find((g) => g.kind === 'UNEXERCISABLE_SURFACE')!;
+
+    expect(gap).toBeDefined();
+    expect(gap.route).toBe('/logout');
+    expect(gap.subject.kind).toBe('unexercisable');
+    if (gap.subject.kind !== 'unexercisable') throw new Error('subject arm');
+    expect(gap.subject.reason).toBe('SESSION_ENDING');
+    expect(gap.subject.rule).toBe('session-ending:logout');
+    // The remedy is the half that makes this actionable rather than a complaint.
+    expect(gap.subject.remedy).toMatch(/auth profile/i);
+    expect(gap.evidence.join(' ')).toMatch(/REMEDY:/);
+    // Never HIGH: the crawler's "this looks destructive" is a path scan.
+    expect(gap.confidence).toBe('MEDIUM');
+    expect(report.totals.unexercisableSurfaces).toBe(1);
+    expect(report.totals.refusedSurfaces).toBe(0);
+  });
+
+  it('counts a destructive surface and a session-ending one apart from a policy refusal', () => {
+    const report = run(
+      [test_({ id: 'none' })],
+      graphWithExclusions([
+        exclusion({}),
+        exclusion({
+          url: 'https://shop.test/account/delete',
+          route: '/account/delete',
+          kind: 'DESTRUCTIVE',
+          rule: 'destructive:delete',
+        }),
+        exclusion({
+          url: 'https://shop.test/internal/debug',
+          route: '/internal/debug',
+          kind: 'POLICY_EXCLUDE',
+          rule: 'excludeGlobs:/internal/**',
+        }),
+      ]),
+    );
+
+    expect(report.totals.unexercisableSurfaces).toBe(2);
+    expect(report.totals.refusedSurfaces).toBe(1);
+    // The POLICY_EXCLUDE one is NOT a gap — nothing is claimed about it in
+    // either direction — but it is named with the rule that refused it.
+    expect(
+      report.gaps.filter((g) => g.kind === 'UNEXERCISABLE_SURFACE').map((g) => g.route).sort(),
+    ).toEqual(['/account/delete', '/logout']);
+    expect(report.caveats.join(' ')).toMatch(/excludeGlobs:\/internal\/\*\* \(1\)/);
+    expect(report.caveats.join(' ')).toMatch(/opposite facts/);
+  });
+
+  it('does not report an off-origin refusal as a surface, and says how many it dropped', () => {
+    const report = run(
+      [test_({ id: 'none' })],
+      graphWithExclusions([
+        exclusion({
+          url: 'https://accounts.google.com/signin',
+          route: null,
+          kind: 'OFF_ORIGIN',
+          rule: 'off-origin:accounts.google.com',
+        }),
+        exclusion({
+          url: 'mailto:support@shop.test',
+          route: null,
+          kind: 'UNSUPPORTED_SCHEME',
+          rule: 'scheme:mailto',
+        }),
+      ]),
+    );
+
+    expect(report.gaps.some((g) => g.kind === 'UNEXERCISABLE_SURFACE')).toBe(false);
+    expect(report.totals.unexercisableSurfaces).toBe(0);
+    expect(report.caveats.join(' ')).toMatch(/2 refused URLs were off-origin or not a page/);
+  });
+
+  it('reports NULL, not 0, when the crawl recorded no refusal ledger at all', () => {
+    const report = run([test_({ id: 'none' })]);
+
+    // The pre-provenance shape: `excluded` is simply not on the map. Zero here
+    // would tell every existing install it has no destructive surface.
+    expect(report.totals.unexercisableSurfaces).toBeNull();
+    expect(report.totals.refusedSurfaces).toBeNull();
+    expect(report.caveats.join(' ')).toMatch(/unknown — not "none"/);
+  });
+
+  it('reports 0 as a real measurement when the ledger is present and empty', () => {
+    const report = run([test_({ id: 'none' })], graphWithExclusions([]));
+
+    expect(report.totals.unexercisableSurfaces).toBe(0);
+    expect(report.totals.refusedSurfaces).toBe(0);
+    expect(report.caveats.join(' ')).not.toMatch(/unknown — not "none"/);
+  });
+
+  it('folds fifty links to one logout into one refused surface, and says it did', () => {
+    const report = run(
+      [test_({ id: 'none' })],
+      graphWithExclusions(
+        Array.from({ length: 50 }, (_unused, index) =>
+          exclusion({ url: `https://shop.test/logout?from=${index}` }),
+        ),
+      ),
+    );
+
+    expect(report.totals.unexercisableSurfaces).toBe(1);
+    expect(report.caveats.join(' ')).toMatch(/49 refusals named a route another refusal/);
+  });
+
+  it('names an unrecognised refusal kind as drift rather than classifying it', () => {
+    const report = run(
+      [test_({ id: 'none' })],
+      graphWithExclusions([exclusion({ kind: 'SOMETHING_NEW' })]),
+    );
+
+    expect(report.totals.unexercisableSurfaces).toBe(0);
+    expect(report.unreadable.join(' ')).toMatch(/"SOMETHING_NEW", which this build does not know/);
+  });
+
+  it('proposes the precondition, not a test that drives a destructive flow', () => {
+    const report = run(
+      [test_({ id: 'none' })],
+      graphWithExclusions([
+        exclusion({
+          url: 'https://shop.test/workspace/destroy',
+          route: '/workspace/destroy',
+          kind: 'DESTRUCTIVE',
+          rule: 'destructive:destroy',
+        }),
+      ]),
+    );
+    const gap = report.gaps.find((g) => g.kind === 'UNEXERCISABLE_SURFACE')!;
+    const item = planItemForGap(gap);
+
+    expect(planItemSchema.safeParse(item).success).toBe(true);
+    expect(item.steps[0]).toMatch(/^BLOCKED until this is true:/);
+    // The proposal must say in its own text that it covers nothing yet, or a
+    // generated test passes while asserting the flow was never driven.
+    expect(item.assertions[0]).toMatch(/NOT COVERED by this test until/);
+  });
+
+  it('keeps the UNEXERCISABLE_SURFACE kind out of the other kinds’ counts', () => {
+    const plain = run([test_({ id: 'none' })]);
+    const withRefusals = run([test_({ id: 'none' })], graphWithExclusions([exclusion({})]));
+
+    // The refused surface adds a gap and changes nothing else: it was never
+    // crawled, so it is not a route, a form or an affordance.
+    expect(withRefusals.totals.routes).toBe(plain.totals.routes);
+    expect(withRefusals.totals.affordances).toBe(plain.totals.affordances);
+    expect(withRefusals.totals.gaps).toBe(plain.totals.gaps + 1);
+  });
+});
+
+// ─── Reverse reconciliation ───────────────────────────────────────────────────
+
+/**
+ * The direction coverage has never run in.
+ *
+ * A test that navigates to a route the enumeration never found is the hardest
+ * evidence of undercount this product can get — a human wrote the URL down.
+ * Every case here is about not converting that evidence into a claim it cannot
+ * support: not minting a surface from it, not reporting zero when nothing was
+ * enumerated, and not reading an unreadable test as agreement.
+ */
+describe('reverseReconcile', () => {
+  const t = (id: string, routes: string[]): CoverageTestInput => test_({ id, routes });
+
+  it('names a target a test references and no declarer enumerated', () => {
+    const result = reverseReconcile({
+      enumerated: ['/', '/orders'],
+      tests: [t('a', ['/admin/billing/invoices'])],
+    });
+
+    expect(result.measured).toBe(true);
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(1);
+    expect(result.unenumerated[0]!.route).toBe('/admin/billing/invoices');
+    expect(result.unenumerated[0]!.testIds).toEqual(['a']);
+    expect(result.unenumerated[0]!.evidence).toMatch(/written down a URL of this application/);
+  });
+
+  it('is NOT measured, with NULL counts, when nothing enumerated', () => {
+    const result = reverseReconcile({ enumerated: null, tests: [t('a', ['/anything'])] });
+
+    expect(result.measured).toBe(false);
+    // The flattering lie this guards: 0 reads as "your suite agrees with our
+    // enumeration perfectly".
+    expect(result.declaredSetUnderstatedByAtLeast).toBeNull();
+    expect(result.targetsCompared).toBeNull();
+    expect(result.unenumerated).toEqual([]);
+    expect(result.caveats.join(' ')).toMatch(/absence of an enumeration to disagree with/);
+  });
+
+  it('counts an empty enumeration as a measurement about our extractor', () => {
+    const result = reverseReconcile({ enumerated: [], tests: [t('a', ['/orders'])] });
+
+    expect(result.measured).toBe(true);
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(1);
+    expect(result.caveats.join(' ')).toMatch(/statement about our extractor/);
+  });
+
+  it('lets a declared template absorb a concrete route the test spelled out', () => {
+    const result = reverseReconcile({
+      enumerated: ['/orders/:param'],
+      tests: [t('a', ['/orders/417'])],
+    });
+
+    // `/orders/417` IS `/orders/:param`. Reporting it as unenumerated would
+    // manufacture undercount out of our own normalisation.
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(0);
+    expect(result.unenumerated).toEqual([]);
+    expect(result.targetsCompared).toBe(1);
+  });
+
+  it('does not let a parent route absorb its child', () => {
+    const result = reverseReconcile({
+      enumerated: ['/checkout'],
+      tests: [t('a', ['/checkout/success'])],
+    });
+
+    // Same asymmetry `routeVisits` already argues for: a test that went to
+    // /checkout has not been to /checkout/success.
+    expect(result.unenumerated.map((target) => target.route)).toEqual(['/checkout/success']);
+  });
+
+  it('does not read a test with no readable routes as agreement', () => {
+    const result = reverseReconcile({
+      enumerated: ['/'],
+      tests: [t('a', []), t('b', [])],
+    });
+
+    expect(result.testsWithNoReadableRoutes).toBe(2);
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(0);
+    expect(result.caveats.join(' ')).toMatch(/neither confirm nor contradict/);
+  });
+
+  it('keeps every spelling the tests used, and counts them exactly', () => {
+    const result = reverseReconcile({
+      enumerated: [],
+      tests: [t('a', ['/orders/[id]']), t('b', ['/orders/:id']), t('c', ['/orders/{id}'])],
+    });
+
+    const target = result.unenumerated[0]!;
+    expect(target.route).toBe('/orders/:param');
+    // Three dialects of one target. The canonical form is OURS; the spellings
+    // are theirs, and a customer disputing the row needs the string they typed.
+    expect(target.spellingCount).toBe(3);
+    expect(target.spellings.sort()).toEqual(['/orders/:id', '/orders/[id]', '/orders/{id}']);
+    expect(target.testIds.sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('reports a concrete instance as its own target when no template was declared', () => {
+    const result = reverseReconcile({
+      enumerated: ['/orders/:param'],
+      tests: [t('a', ['/orders/9'])],
+    });
+    // Absorbed, because a template WAS declared.
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(0);
+
+    const orphan = reverseReconcile({ enumerated: ['/'], tests: [t('a', ['/orders/9'])] });
+    // Not absorbed, because nothing declared the template. `/orders/9` is then
+    // the only spelling we have, and inventing `/orders/:param` from one
+    // numeric segment is the guess that produced 325 invented routes the last
+    // time this codebase inferred a template from an instance.
+    expect(orphan.unenumerated.map((target) => target.route)).toEqual(['/orders/9']);
+  });
+
+  it('ranks the target the most tests agree on first', () => {
+    const result = reverseReconcile({
+      enumerated: [],
+      tests: [t('a', ['/x', '/y']), t('b', ['/y']), t('c', ['/y'])],
+    });
+
+    expect(result.unenumerated.map((target) => target.route)).toEqual(['/y', '/x']);
+  });
+
+  it('says the percentage above it is an upper bound', () => {
+    const result = reverseReconcile({ enumerated: ['/'], tests: [t('a', ['/gone'])] });
+
+    expect(result.caveats.join(' ')).toMatch(/understates this application by AT LEAST 1 route/);
+    expect(result.caveats.join(' ')).toMatch(/upper bound/);
+  });
+
+  it('discloses its own cap as a count, keeping the total exact', () => {
+    const many = Array.from({ length: 260 }, (_unused, index) =>
+      t(`t${index}`, [`/gone/${index}`]),
+    );
+    const result = reverseReconcile({ enumerated: ['/'], tests: many });
+
+    expect(result.truncated).toBe(true);
+    expect(result.unenumerated).toHaveLength(200);
+    // The COUNT is exact even where the list is not. A floor printed in the
+    // field a dashboard reads as the answer is the defect this avoids.
+    expect(result.declaredSetUnderstatedByAtLeast).toBe(260);
+    expect(result.caveats.join(' ')).toMatch(/at least 60 more exist beyond the list/);
+  });
+
+  it('rides on the report, scoped to the crawl that produced it', () => {
+    const report = run([test_({ id: 'ghost', routes: ['/admin/secret-area'] })]);
+
+    expect(report.reverse.measured).toBe(true);
+    expect(report.reverse.unenumerated.map((target) => target.route)).toEqual([
+      '/admin/secret-area',
+    ]);
+    expect(report.caveats.join(' ')).toMatch(/understates this application by AT LEAST 1 route/);
+  });
+
+  it('claims nothing when there is no crawl to compare against', () => {
+    const report = analyzeCoverage({ flowMapGraph: null, tests: [test_({ id: 'a', routes: ['/x'] })] });
+
+    expect(report.crawled).toBe(false);
+    expect(report.reverse.measured).toBe(false);
+    expect(report.reverse.declaredSetUnderstatedByAtLeast).toBeNull();
   });
 });

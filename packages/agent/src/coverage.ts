@@ -49,13 +49,24 @@
  */
 
 import { createHash } from 'node:crypto';
-import { FORM_FIELD_SEMANTICS, locatorsFromFlowMap } from '@qaai/shared';
+import {
+  EXCLUSION_KINDS,
+  EXCLUSION_KIND_LABELS,
+  FORM_FIELD_SEMANTICS,
+  UNEXERCISABLE_REASON_LABELS,
+  controlsFromFlowMap,
+  exclusionsByRule,
+} from '@qaai/shared';
 import type {
+  ExclusionKind,
   FormFieldSemantic,
   PlanItem,
   Priority,
   Selector,
+  SurfaceExercisability,
+  SurfaceExercise,
   TestType,
+  UnexercisableReason,
 } from '@qaai/shared';
 import { expandBoundaries, type BoundaryCase, type BoundaryExpansion, type BoundaryField } from './boundaries.js';
 
@@ -74,6 +85,17 @@ export const GAP_KINDS = [
   'UNUSED_AFFORDANCE',
   /** A feature that has tests, all of which only assert the happy path. */
   'NO_NEGATIVE_CASE',
+  /**
+   * A surface the crawl REFUSED to drive, so nothing downstream has ever
+   * mentioned it: logout, delete account, cancel subscription, destroy
+   * workspace.
+   *
+   * This is the only gap kind whose remedy is not "write a test". The test is
+   * writable the moment the environment can afford the side effect, and until
+   * then the finding is ours and not the customer's — which is why it carries a
+   * reason and a remedy rather than a proposal.
+   */
+  'UNEXERCISABLE_SURFACE',
 ] as const;
 export type GapKind = (typeof GAP_KINDS)[number];
 
@@ -95,6 +117,138 @@ const MAX_NODES = 2000;
 const MAX_GAPS = 300;
 const MAX_AFFORDANCE_GAPS = 40;
 const MAX_EVIDENCE_TESTS = 5;
+/** Refusals read off a flow map. Deduped by route first, so this is routes. */
+const MAX_EXCLUSIONS = 500;
+/** Unexercisable surfaces reported as gaps. The rest are counted in a caveat. */
+const MAX_UNEXERCISABLE_GAPS = 60;
+/** Test-referenced targets the enumeration never found. See `reverseReconcile`. */
+const MAX_REVERSE_TARGETS = 200;
+/** Verbatim spellings kept per reverse-reconciled target, for the audit row. */
+const MAX_SPELLINGS_PER_TARGET = 5;
+
+// ─── The surface nothing is allowed to touch ─────────────────────────────────
+
+/*
+ * THE CLASS THAT VANISHED.
+ *
+ * The crawler refuses /logout, /delete-*, /destroy and __reset — correctly, and
+ * it has to: following a logout makes every observation after it anonymous, and
+ * following a delete destroys a record it cannot put back. The refusal is right.
+ * Recording nothing about it was not.
+ *
+ * `FlowMap.excluded` now carries every refused URL and the rule that refused it
+ * (packages/shared/src/flow-map.ts), and this is where those rows become a
+ * named class with a reason and a REMEDY instead of an absence. The reason it
+ * matters more than its size suggests: a session-ending or destructive flow is
+ * the highest-risk surface in an application — it is where a customer's data
+ * actually goes away — and it was the one surface guaranteed to be missing from
+ * the denominator. Absent raises the percentage. Uncovered lowers it. The
+ * hardest surfaces were the ones being dropped.
+ *
+ * TWO CLASSES, AND THE SPLIT IS THE WHOLE VALUE OF THE TABLE BELOW.
+ *
+ *   UNEXERCISABLE  it exists, it is testable in principle, and this environment
+ *                  cannot afford the side effect. The remedy is OURS: give the
+ *                  harness a disposable session or a disposable record. These
+ *                  become gaps, because somebody can act on them.
+ *   REFUSED        a policy rule excluded it. We did not look, and nothing is
+ *                  claimed in either direction. These become a counted caveat
+ *                  naming the rule, because the customer's own remedy is to
+ *                  change the rule and ours is to say that we did not ask.
+ *
+ * And a third answer that is NOT a surface at all: an off-origin URL is
+ * somebody else's application and an unsupported scheme is not a page. Those
+ * map to NULL. Counting a third-party identity provider's login form as this
+ * app's route produces a coverage gap a customer cannot possibly close, which
+ * is worse than a wrong number — flow-map.ts argues the same point for
+ * `ExternalBoundary`. They are still COUNTED, in a caveat, because a silent
+ * drop and a reasoned exclusion must not look the same from outside.
+ */
+
+export interface ExclusionClassification {
+  state: SurfaceExercisability;
+  /**
+   * Why, for the UNEXERCISABLE class. NULL for REFUSED, and the null is the
+   * point: a refusal has a RULE, not a reason — claiming "it ends the session"
+   * about a path an `excludeGlobs` pattern matched would be our guess at the
+   * customer's intent printed as their motive.
+   */
+  reason: UnexercisableReason | null;
+  /** What it would take to exercise it. A sentence somebody can act on. */
+  remedy: string;
+}
+
+/**
+ * Every exclusion kind, classified. A `Record` and not a lookup function, so
+ * the compiler refuses to let a new `ExclusionKind` ship unclassified — the
+ * half of the guard that eight GateRule kinds shipped without. The run-time
+ * half is the parity test in coverage.test.ts against `EXCLUSION_KINDS`.
+ */
+export const EXCLUSION_AS_EXERCISE: Record<ExclusionKind, ExclusionClassification | null> = {
+  SESSION_ENDING: {
+    state: 'UNEXERCISABLE',
+    reason: 'SESSION_ENDING',
+    remedy:
+      'Bind a second auth profile the harness is allowed to log out, so the session this flow ends is one we can afford to lose.',
+  },
+  DESTRUCTIVE: {
+    state: 'UNEXERCISABLE',
+    reason: 'DESTRUCTIVE',
+    remedy:
+      'Provision a disposable record per run — a throwaway account, workspace or subscription — so the flow can be driven to completion and then thrown away.',
+  },
+  UNSAFE_METHOD: {
+    state: 'REFUSED',
+    reason: null,
+    remedy:
+      'The crawl policy allows safe methods only. Allow the method for this path, or declare the operation from an OpenAPI document instead, where a verb needs no request to be enumerated.',
+  },
+  POLICY_EXCLUDE: {
+    state: 'REFUSED',
+    reason: null,
+    remedy: 'Remove the path from the environment’s `excludeGlobs` to have it enumerated.',
+  },
+  POLICY_NOT_INCLUDED: {
+    state: 'REFUSED',
+    reason: null,
+    remedy:
+      'The environment sets `includeGlobs` and this path matched none of them. Widen the include list to have it enumerated.',
+  },
+  // Not this application's surface. See the header above.
+  OFF_ORIGIN: null,
+  UNSUPPORTED_SCHEME: null,
+};
+
+/**
+ * One refused URL as a `SurfaceExercise`, plus the remedy, or null when the URL
+ * is not this application's surface at all.
+ *
+ * Returns the shared `SurfaceExercise` shape rather than a second one, so a
+ * caller writing a `CoverageItem` passes it straight through and the inventory
+ * and the gap report cannot come to describe one refusal two ways.
+ */
+export function exclusionAsExercise(
+  kind: ExclusionKind,
+  rule: string,
+): (SurfaceExercise & { remedy: string }) | null {
+  const classified = EXCLUSION_AS_EXERCISE[kind];
+  if (!classified) return null;
+
+  const label = EXCLUSION_KIND_LABELS[kind];
+  return {
+    state: classified.state,
+    reason: classified.reason,
+    // Required for REFUSED and carried for both: "excluded by policy" with no
+    // rule named is indistinguishable from a bug in the crawler, and the
+    // customer's only possible response to it is to distrust the number.
+    rule,
+    detail:
+      classified.state === 'UNEXERCISABLE'
+        ? `the crawl refused it because it ${label} (${UNEXERCISABLE_REASON_LABELS[classified.reason!]}); rule: ${rule}`
+        : `the crawl refused it because it ${label}; rule: ${rule}`,
+    remedy: classified.remedy,
+  };
+}
 
 // ─── Inputs ──────────────────────────────────────────────────────────────────
 
@@ -293,7 +447,20 @@ export type GapSubject =
       expression: string;
       controlKind: 'link' | 'button' | 'input';
     }
-  | { kind: 'negative'; feature: string; routes: string[]; forms: FormSummary[]; testIds: string[] };
+  | { kind: 'negative'; feature: string; routes: string[]; forms: FormSummary[]; testIds: string[] }
+  | {
+      kind: 'unexercisable';
+      /** Canonical route, or null when the refused URL had no readable path. */
+      route: string | null;
+      /** The URL as the crawl discovered it. The only handle for a route-less refusal. */
+      url: string;
+      /** Why the crawl would not drive it, from `UNEXERCISABLE_REASONS`. */
+      reason: UnexercisableReason;
+      /** The policy rule that refused it — a line a human can look up. */
+      rule: string;
+      /** What it would take to make this testable. See `EXCLUSION_AS_EXERCISE`. */
+      remedy: string;
+    };
 
 export interface CoverageGap {
   /** Deterministic for a given (kind, subject). Stable across recomputation. */
@@ -377,9 +544,223 @@ export interface CoverageReport {
     affordancesUsed: number;
     gaps: number;
     gapsReturned: number;
+    /**
+     * Surfaces the crawl refused because driving them is unsafe here, and
+     * surfaces a policy rule refused.
+     *
+     * NULL, not 0, when the flow map did not record refusals at all — see
+     * `CrawlModel.excluded`. Every crawl written before the exclusion ledger
+     * existed is in that state, and a 0 would tell those installs they have no
+     * destructive surface.
+     */
+    unexercisableSurfaces: number | null;
+    refusedSurfaces: number | null;
   };
+  /**
+   * Tests that reference surface the enumeration never found.
+   *
+   * See {@link reverseReconcile}. Coverage has only ever run crawl→tests, so a
+   * test pointing at a route the crawl never reached was simply unmatched and
+   * silent — and that reference is the hardest evidence of crawl undercount
+   * this product can obtain, because a human wrote it down.
+   */
+  reverse: ReverseReconciliation;
   /** Changes whenever the answer could change. POST /propose checks it. */
   fingerprint: string;
+}
+
+// ─── Reverse reconciliation: what the TESTS know that we do not ──────────────
+
+/**
+ * One target a test names and the enumeration does not hold.
+ *
+ * `spellings` is verbatim and plural on purpose: two tests may write
+ * `/orders/123` and `/orders/:id` for one target, and the canonical form is
+ * ours while the spellings are theirs. A customer disputing a row needs to see
+ * the string they typed, not our normalisation of it.
+ */
+export interface UnenumeratedTestTarget {
+  /** The canonical route the tests reference. */
+  route: string;
+  /** Up to `MAX_SPELLINGS_PER_TARGET` verbatim spellings; `spellingCount` is exact. */
+  spellings: string[];
+  spellingCount: number;
+  testIds: string[];
+  testNames: string[];
+  evidence: string;
+}
+
+/**
+ * THE DIRECTION COVERAGE HAS NEVER RUN IN.
+ *
+ * Everything else in this file asks "does a test go here?" over surfaces the
+ * crawl found. That question cannot see its own blind spot: a test that
+ * navigates to `/admin/billing/invoices` when the crawl never reached it is not
+ * a gap and not coverage — it is unmatched, and until now it was silent.
+ *
+ * It is also the best evidence of undercount that exists. Every other signal
+ * about our enumeration being incomplete is a guess about what we did not see.
+ * This one is a human being writing down a URL of the application, in a file
+ * they maintain, which our denominator does not contain. If a test goes there,
+ * it exists.
+ *
+ * WHAT THIS IS NOT ALLOWED TO DO
+ *
+ *   · It must not mint surfaces. A test's route is evidence that a surface
+ *     exists; it is not a reading of the surface, carries no file, no method
+ *     and no fields, and `SURFACE_SOURCES` has no member for "a test mentioned
+ *     it". Inventing one would put a guess in the denominator beside eight
+ *     declarers that read something.
+ *   · It must not report a count when nothing enumerated. `enumerated: null` is
+ *     "no enumeration ran" and yields `measured: false` with NULL counts, never
+ *     zero — a zero here reads as "your tests agree with our enumeration
+ *     perfectly", which is the most flattering possible lie.
+ *   · It must not treat an opaque test as agreement. A test whose navigation is
+ *     built at run time contributes no targets, so it can neither confirm nor
+ *     contradict; it is counted separately and named in a caveat.
+ */
+export interface ReverseReconciliation {
+  /** False when `enumerated` was null. Then every count below is null. */
+  measured: boolean;
+  unenumerated: UnenumeratedTestTarget[];
+  /** Distinct readable targets compared. Null when nothing was measured. */
+  targetsCompared: number | null;
+  /** Tests whose route list we could not read. Not evidence either way. */
+  testsWithNoReadableRoutes: number;
+  /**
+   * The floor on how far the enumerated surface understates the application.
+   *
+   * A FLOOR and never an estimate: it counts only targets a test named out
+   * loud, so the real shortfall is at least this and may be far larger. Null
+   * when nothing was measured.
+   */
+  declaredSetUnderstatedByAtLeast: number | null;
+  /** True when `unenumerated` was capped. The count above stays exact. */
+  truncated: boolean;
+  caveats: string[];
+}
+
+export function reverseReconcile(input: {
+  /**
+   * Canonical route identities the enumeration holds, or NULL when no
+   * enumeration ran. Null and `[]` are different answers — see the header.
+   */
+  enumerated: readonly string[] | null;
+  tests: readonly CoverageTestInput[];
+}): ReverseReconciliation {
+  const { enumerated, tests } = input;
+
+  if (enumerated === null) {
+    return {
+      measured: false,
+      unenumerated: [],
+      targetsCompared: null,
+      testsWithNoReadableRoutes: tests.length,
+      declaredSetUnderstatedByAtLeast: null,
+      truncated: false,
+      caveats: [
+        'Nothing has enumerated this application’s surface, so the tests could not be compared against it. This is not a finding that the suite and the enumeration agree — it is the absence of an enumeration to disagree with.',
+      ],
+    };
+  }
+
+  const surface = enumerated.map((identity) => canonicalRoute(identity));
+
+  /** Canonical target → the tests that named it and how they spelled it. */
+  const targets = new Map<
+    string,
+    { spellings: Set<string>; testIds: Set<string>; testNames: Set<string> }
+  >();
+  let testsWithNoReadableRoutes = 0;
+
+  for (const test of tests) {
+    const routes = test.routes.filter((raw) => typeof raw === 'string' && raw.length > 0);
+    if (routes.length === 0) {
+      testsWithNoReadableRoutes += 1;
+      continue;
+    }
+    for (const raw of routes) {
+      const canonical = canonicalRoute(raw);
+      const entry = targets.get(canonical) ?? {
+        spellings: new Set<string>(),
+        testIds: new Set<string>(),
+        testNames: new Set<string>(),
+      };
+      entry.spellings.add(raw);
+      entry.testIds.add(test.id);
+      entry.testNames.add(test.name);
+      targets.set(canonical, entry);
+    }
+  }
+
+  const missing: UnenumeratedTestTarget[] = [];
+  for (const [route, entry] of targets) {
+    /*
+     * `routeVisits(testRoute, surfaceRoute)` — the same matcher and the same
+     * argument order the ROUTE matcher in surface-coverage.ts uses, so a target
+     * absorbed by `/orders/:param` there is absorbed here too. Two spellings of
+     * "does this test go here" would make a target missing on one screen and
+     * present on the other.
+     */
+    if (surface.some((identity) => routeVisits(route, identity))) continue;
+    const spellings = [...entry.spellings];
+    missing.push({
+      route,
+      spellings: spellings.slice(0, MAX_SPELLINGS_PER_TARGET),
+      spellingCount: spellings.length,
+      testIds: [...entry.testIds],
+      testNames: [...entry.testNames],
+      evidence: `${entry.testIds.size} test${entry.testIds.size === 1 ? '' : 's'} navigate to ${route} (${spellings.slice(0, 2).join(', ')}) and no declarer put it in the enumerated surface — so a human has written down a URL of this application that our denominator does not contain.`,
+    });
+  }
+
+  // Most-referenced first: a target five tests agree on is stronger evidence of
+  // undercount than one a single test mentions, and a reader works down.
+  missing.sort(
+    (left, right) =>
+      right.testIds.length - left.testIds.length || left.route.localeCompare(right.route),
+  );
+
+  const caveats: string[] = [];
+  const truncated = missing.length > MAX_REVERSE_TARGETS;
+  if (truncated) {
+    caveats.push(
+      `${missing.length} test-referenced targets are absent from the enumerated surface; the ${MAX_REVERSE_TARGETS} most-referenced are listed. The count is exact — at least ${missing.length - MAX_REVERSE_TARGETS} more exist beyond the list.`,
+    );
+  }
+  if (missing.length > 0) {
+    caveats.push(
+      `The enumerated surface understates this application by AT LEAST ${missing.length} route${missing.length === 1 ? '' : 's'}: that many are referenced by a test and declared by no source we read. Any recall or coverage percentage over this surface is therefore an upper bound.`,
+    );
+  }
+  if (testsWithNoReadableRoutes > 0) {
+    caveats.push(
+      `${testsWithNoReadableRoutes} test${testsWithNoReadableRoutes === 1 ? '' : 's'} declare no route this analysis can read, so they neither confirm nor contradict the enumeration. They are not counted as agreement.`,
+    );
+  }
+  if (enumerated.length === 0) {
+    caveats.push(
+      'The enumeration ran and found no routes, so every route any test references is reported here. That is a statement about our extractor, not about the suite.',
+    );
+  }
+  if (tests.length === 0) {
+    // Zero tests cannot contradict an enumeration, and the floor below is 0 for
+    // that reason alone. Saying so is the difference between "your suite agrees
+    // with us" and "there was no suite".
+    caveats.push(
+      'No tests were supplied, so the reverse direction found nothing by construction. That is not agreement between the suite and the enumeration — there was no suite to compare.',
+    );
+  }
+
+  return {
+    measured: true,
+    unenumerated: missing.slice(0, MAX_REVERSE_TARGETS),
+    targetsCompared: targets.size,
+    testsWithNoReadableRoutes,
+    declaredSetUnderstatedByAtLeast: missing.length,
+    truncated,
+    caveats,
+  };
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -480,6 +861,22 @@ interface CrawlJourney {
   edgeIds: string[];
 }
 
+/**
+ * One URL a rule refused, as this module reads it back off the stored map.
+ *
+ * A narrowing of `ExcludedPath` and not a second shape: `discoveredFrom` is the
+ * only member it drops, because the gap report names the surface rather than the
+ * page that linked to it. Everything that decides the CLASS — kind and rule —
+ * is carried verbatim.
+ */
+export interface CrawlExclusion {
+  url: string;
+  /** Canonical route, when one could be derived. Null when the URL had none. */
+  route: string | null;
+  kind: ExclusionKind;
+  rule: string;
+}
+
 interface CrawlModel {
   ok: boolean;
   version: number | null;
@@ -489,6 +886,22 @@ interface CrawlModel {
   edges: CrawlEdge[];
   journeys: CrawlJourney[];
   features: Array<{ name: string; nodeIds: string[] }>;
+  /**
+   * Every refusal the crawl recorded, or NULL when it recorded none because it
+   * could not.
+   *
+   * THE NULL IS NOT AN EMPTY LIST. `FlowMap.excluded` is optional and every
+   * crawl written before the exclusion ledger existed has no such key. Absent
+   * means "this crawl did not account for refusals"; `[]` means "it did, and
+   * refused nothing". Reading the first as the second would report a clean bill
+   * of health about destructive flows to every install with a map older than
+   * this slice — which is the exact shape of lie this field exists to end.
+   */
+  excluded: CrawlExclusion[] | null;
+  /** Refusals folded away because another refusal already named the route. */
+  exclusionsDeduped: number;
+  /** Refusals dropped by MAX_EXCLUSIONS. A floor on what was not read. */
+  exclusionsDiscarded: number;
   unreadable: string[];
 }
 
@@ -639,6 +1052,12 @@ export function readCrawl(graph: unknown): CrawlModel {
     edges: [],
     journeys: [],
     features: [],
+    // Null and not []: an unreadable graph told us nothing about refusals
+    // either, and `[]` here would be the one place this function invents a
+    // finding instead of degrading to "we know less".
+    excluded: null,
+    exclusionsDeduped: 0,
+    exclusionsDiscarded: 0,
     unreadable,
   };
 
@@ -777,6 +1196,69 @@ export function readCrawl(graph: unknown): CrawlModel {
     }
   }
 
+  /*
+   * The refusal ledger.
+   *
+   * Deduped by ROUTE, because `/logout` linked from fifty pages is one refused
+   * surface and fifty rows would be fifty findings for one fact — the same
+   * argument frontier.ts makes where it writes the ledger. The count of what
+   * was folded away is kept, so the dedupe is a disclosed step rather than a
+   * silent one, and the cap's cost is a separate number because a cap and a
+   * dedupe are not the same event.
+   *
+   * An entry with no readable route is NOT dropped: it is keyed on its URL
+   * instead, so a refusal we could not normalise is still one refusal.
+   */
+  let excluded: CrawlExclusion[] | null = null;
+  let exclusionsDeduped = 0;
+  let exclusionsDiscarded = 0;
+  if (Array.isArray(g.excluded)) {
+    const byRoute = new Map<string, CrawlExclusion>();
+    let read = 0;
+    for (const raw of g.excluded) {
+      if (!raw || typeof raw !== 'object') continue;
+      const e = raw as Record<string, unknown>;
+      const kind = str(e.kind);
+      if (!EXCLUSION_KINDS.includes(kind as ExclusionKind)) {
+        // An unrecognised kind is drift between a stored map and this build,
+        // not a refusal we may classify. Named, never guessed at.
+        unreadable.push(
+          `an excluded URL records the refusal kind "${kind || '(none)'}", which this build does not know, so it could not be classified`,
+        );
+        continue;
+      }
+      let route: string | null = null;
+      if (typeof e.route === 'string' && e.route.startsWith('/')) route = canonicalRoute(e.route);
+      else if (typeof e.url === 'string') {
+        try {
+          route = canonicalRoute(new URL(e.url).pathname);
+        } catch {
+          route = null;
+        }
+      }
+      const url = str(e.url, route ?? '');
+      const key = `${kind}\u0000${route ?? url}`;
+      if (byRoute.has(key)) {
+        exclusionsDeduped += 1;
+        continue;
+      }
+      if (read >= MAX_EXCLUSIONS) {
+        exclusionsDiscarded += 1;
+        continue;
+      }
+      read += 1;
+      byRoute.set(key, {
+        url,
+        route,
+        kind: kind as ExclusionKind,
+        // Never defaulted to ''. A refusal whose rule the map did not record is
+        // a refusal nobody can look up, and saying so is the honest value.
+        rule: str(e.rule, 'the crawl recorded no rule for this refusal'),
+      });
+    }
+    excluded = [...byRoute.values()];
+  }
+
   return {
     ok: nodes.length > 0,
     version: typeof g.version === 'number' ? g.version : null,
@@ -786,6 +1268,9 @@ export function readCrawl(graph: unknown): CrawlModel {
     edges,
     journeys,
     features,
+    excluded,
+    exclusionsDeduped,
+    exclusionsDiscarded,
     unreadable,
   };
 }
@@ -1126,6 +1611,16 @@ const KIND_WEIGHT: Record<GapKind, number> = {
   UNSUBMITTED_FORM: 0.9,
   NO_NEGATIVE_CASE: 0.7,
   UNUSED_AFFORDANCE: 0.5,
+  /*
+   * Weighted ABOVE an unvisited route, which looks aggressive and is not.
+   *
+   * This is the only class whose members are selected FOR being destructive:
+   * the crawl refused them because driving them ends a session or removes a
+   * record. `HIGH_VALUE` already ranks `delete`, `destroy` and `account` at the
+   * top of the blast-radius scale, so the weight is agreeing with the rest of
+   * the table rather than overruling it.
+   */
+  UNEXERCISABLE_SURFACE: 1,
 };
 
 function scoreGap(
@@ -1547,6 +2042,10 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     affordancesUsed: 0,
     gaps: 0,
     gapsReturned: 0,
+    // An unreadable map accounted for no refusals either. Null, not 0 — the
+    // whole point of this pair of fields.
+    unexercisableSurfaces: null,
+    refusedSurfaces: null,
   };
 
   if (!crawl.ok) {
@@ -1564,6 +2063,16 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
         'This project has no readable crawl, so there is nothing to compare the tests against. Run the Explorer and ask again — coverage gaps are the difference between what the crawler saw and what the suite asserts, and half of that is missing.',
       ],
       totals: emptyTotals,
+      /*
+       * `enumerated: null` and not `[]`.
+       *
+       * There is no enumeration here, so every target every test names is
+       * un-enumerated — and reporting that as "your suite references 40
+       * surfaces we never found" would be a finding about the customer made
+       * entirely out of our own missing crawl. `reverseReconcile` answers
+       * UNAVAILABLE for exactly this input.
+       */
+      reverse: reverseReconcile({ enumerated: null, tests: input.tests }),
       fingerprint: fingerprintOf(crawl.version, input.tests, []),
     };
   }
@@ -1992,18 +2501,43 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
   }
 
   // ── 5. Affordances nobody uses ─────────────────────────────────────────────
-  // `locatorsFromFlowMap` already de-duplicates the whole app's controls by
-  // expression and sorts them best-first, which is exactly the universe wanted
-  // here — the same "Log out" link on twenty pages must be one gap, not twenty.
-  const allLocators = locatorsFromFlowMap({
+  /*
+   * ONE CONTROL IS ONE CONTROL ON ONE PAGE — AND THIS IS WHERE IT WAS NOT.
+   *
+   * This read `locatorsFromFlowMap`, which de-duplicates the whole application
+   * by LOCATOR EXPRESSION. The comment that justified it was about a shared
+   * "Log out" link, and for that case it is right. For the common case it was a
+   * measurement error with a direction: `getByRole('button', { name: 'Save' })`
+   * on /profile, /billing, /team, /notifications and /api-keys was ONE control,
+   * and because the `used` check below is a substring scan over test source
+   * with no route in it, ANY test mentioning "Save" marked all five exercised.
+   * Five handlers, five payloads, five validations, one tick — a suite covering
+   * a fifth of the application reporting every control in it used.
+   *
+   * So the universe is now `controlsFromFlowMap`, keyed per (page, locator),
+   * and the usage check is route-aware: a test counts only if it mentions the
+   * control AND goes to the page the control is on. `adjacency` is deliberately
+   * NOT accepted here — a test one click away from /billing has not pressed
+   * /billing's Save button, and `routeVisits`'s own header makes the same
+   * argument for routes.
+   *
+   * The shared-nav case the old comment cared about is still handled, two ways:
+   * `sharedWithRouteCount` carries the fact on every row so the evidence
+   * sentence can say "the same control appears on 19 other pages", and the
+   * MAX_AFFORDANCE_GAPS cap plus its caveat keeps the report readable. What is
+   * gone is the identity having guessed on the customer's behalf.
+   */
+  const allControls = controlsFromFlowMap({
     nodes: routes.map((n) => ({ route: n.route, affordances: n.affordances })),
   });
   let affordancesUsed = 0;
   const affordanceGaps: CoverageGap[] = [];
 
-  for (const locator of allLocators) {
+  for (const locator of allControls) {
     const used = facts.some(
-      (f) => mentions(f, locator.label) || mentions(f, locator.expression),
+      (f) =>
+        (mentions(f, locator.label) || mentions(f, locator.expression)) &&
+        f.routes.some((route) => routeVisits(route, locator.route)),
     );
     if (used) {
       affordancesUsed += 1;
@@ -2023,6 +2557,9 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     });
 
     affordanceGaps.push({
+      // Route first and expression second, which is what `controlIdentity`
+      // keys on. It already was, which is why the five Saves produced five gap
+      // IDS from one gap — the id was per page and the universe was not.
       id: gapId('UNUSED_AFFORDANCE', locator.route, locator.expression),
       kind: 'UNUSED_AFFORDANCE',
       title: `Nobody clicks "${locator.label}" on ${locator.route}`,
@@ -2030,7 +2567,15 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
       feature: node ? (featureOf(crawl, node) ?? null) : null,
       evidence: [
         `The crawl found a ${locator.kind} labelled "${locator.label}" on ${locator.route} (${locator.expression}, locator confidence ${locator.confidence.toFixed(2)}).`,
-        `Neither that label nor that locator appears in any of the ${input.tests.length} enabled tests.`,
+        `No test both reaches ${locator.route} and mentions that label or locator, across the ${input.tests.length} enabled tests.`,
+        // The fact, not a verdict. QAAI cannot tell a shared header from five
+        // independent buttons by looking at a selector, so it says how many
+        // pages carry the same one and lets a human decide.
+        ...(locator.sharedWithRouteCount > 0
+          ? [
+              `The same locator appears on ${locator.sharedWithRouteCount} other page${locator.sharedWithRouteCount === 1 ? '' : 's'}. If it is one shared control, one test closes all of them; if each page has its own handler, each needs its own.`,
+            ]
+          : []),
       ],
       confidence: routeGapConfidence,
       reachability: scored.reachability,
@@ -2221,6 +2766,153 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     );
   }
 
+  // ── 7. Surfaces the crawl refused to drive ─────────────────────────────────
+  /*
+   * The class that used to vanish. See `EXCLUSION_AS_EXERCISE` for the full
+   * argument; the short version is that /logout, /delete-account and
+   * /destroy-workspace are the highest-risk surfaces in an application and were
+   * the one set guaranteed to be absent from the denominator rather than
+   * uncovered. Absent raises the percentage; uncovered lowers it.
+   *
+   * THE REFUSED HALF IS NOT A GAP, and that is deliberate. A policy rule
+   * excluded it, we did not look, and nothing is claimed about it in either
+   * direction — so it is a counted caveat naming the rule rather than a finding
+   * with an owner. The UNEXERCISABLE half IS a gap, because its remedy belongs
+   * to us and somebody can act on it this afternoon.
+   */
+  let unexercisableSurfaces: number | null = null;
+  let refusedSurfaces: number | null = null;
+  if (crawl.excluded !== null) {
+    unexercisableSurfaces = 0;
+    refusedSurfaces = 0;
+    const unexercisableGaps: CoverageGap[] = [];
+    let notOurSurface = 0;
+
+    for (const exclusion of crawl.excluded) {
+      const exercise = exclusionAsExercise(exclusion.kind, exclusion.rule);
+      if (!exercise) {
+        notOurSurface += 1;
+        continue;
+      }
+      if (exercise.state === 'REFUSED') {
+        refusedSurfaces += 1;
+        continue;
+      }
+      unexercisableSurfaces += 1;
+
+      const where = exclusion.route ?? exclusion.url;
+      // `scoreGap` wants the node it is scoring, and by construction there is
+      // none — the crawl refused to visit it, so it has no inbound edges and no
+      // forms. Passing null is the honest input and `scoreGap` already handles
+      // it; the text is what carries HIGH_VALUE's signal.
+      const scored = scoreGap('UNEXERCISABLE_SURFACE', null, {
+        maxInbound,
+        maxOutbound,
+        journeyPriority: null,
+        text: `${where} ${exclusion.kind}`,
+      });
+
+      unexercisableGaps.push({
+        id: gapId('UNEXERCISABLE_SURFACE', where, exclusion.kind),
+        kind: 'UNEXERCISABLE_SURFACE',
+        title: `Nothing can test ${where} — it ${EXCLUSION_KIND_LABELS[exclusion.kind]}`,
+        route: exclusion.route,
+        feature: null,
+        evidence: [
+          `The crawl refused ${exclusion.url} under the rule "${exclusion.rule}": it ${EXCLUSION_KIND_LABELS[exclusion.kind]}.`,
+          `That refusal is correct and is about THIS environment, not about the surface: ${UNEXERCISABLE_REASON_LABELS[exercise.reason!]}.`,
+          `REMEDY: ${exercise.remedy}`,
+          'Until then this surface is counted and named rather than tested. It is not reported as covered and it is not quietly dropped — dropping it would raise the coverage percentage by removing the hardest thing in the application from the denominator.',
+        ],
+        // Never HIGH. The crawl's own refusal heuristic is a path and label
+        // scan, so "this looks destructive" is a guess about the customer's
+        // application and deserves a human's eye before it is believed.
+        confidence: 'MEDIUM',
+        reachability: scored.reachability,
+        blastRadius: scored.blastRadius,
+        score: scored.score,
+        scoreWhy: scored.why,
+        // A refused surface was never visited, so no test can be "in the
+        // neighbourhood" of it in the sense the other gaps mean.
+        relatedTestIds: [],
+        // Unknown, not false. The crawl never reached it, so whether it sits
+        // behind the wall is something we did not measure — and `false` here
+        // would propose an anonymous test of a logged-in flow.
+        requiresAuth: false,
+        authProfile: null,
+        subject: {
+          kind: 'unexercisable',
+          route: exclusion.route,
+          url: exclusion.url,
+          reason: exercise.reason!,
+          rule: exclusion.rule,
+          remedy: exercise.remedy,
+        },
+      });
+    }
+
+    unexercisableGaps.sort((a, b) => b.score - a.score);
+    if (unexercisableGaps.length > MAX_UNEXERCISABLE_GAPS) {
+      caveats.push(
+        `${unexercisableGaps.length} surfaces cannot be driven in this environment; the ${MAX_UNEXERCISABLE_GAPS} highest-scoring are listed. At least ${unexercisableGaps.length - MAX_UNEXERCISABLE_GAPS} more exist.`,
+      );
+    }
+    gaps.push(...unexercisableGaps.slice(0, MAX_UNEXERCISABLE_GAPS));
+
+    if (refusedSurfaces > 0) {
+      const byRule = exclusionsByRule(
+        crawl.excluded
+          .filter((exclusion) => exclusionAsExercise(exclusion.kind, exclusion.rule)?.state === 'REFUSED')
+          .map((exclusion) => ({ ...exclusion, discoveredFrom: null })),
+      );
+      caveats.push(
+        `${refusedSurfaces} surface${refusedSurfaces === 1 ? '' : 's'} were refused by a crawl policy rule and never attempted, so nothing is claimed about ${refusedSurfaces === 1 ? 'it' : 'them'} in either direction: ${byRule
+          .slice(0, 3)
+          .map((group) => `${group.rule} (${group.count})`)
+          .join('; ')}. A refused surface and a surface that does not exist are opposite facts, and this sentence is the only place the difference appears.`,
+      );
+    }
+    if (notOurSurface > 0) {
+      caveats.push(
+        `${notOurSurface} refused URL${notOurSurface === 1 ? ' was' : 's were'} off-origin or not a page at all, so ${notOurSurface === 1 ? 'it is' : 'they are'} not counted as this application's surface. Counting a third party's login form as your route produces a gap you could not possibly close.`,
+      );
+    }
+    if (crawl.exclusionsDeduped > 0) {
+      caveats.push(
+        `${crawl.exclusionsDeduped} refusal${crawl.exclusionsDeduped === 1 ? '' : 's'} named a route another refusal had already named — a link to /logout from fifty pages is one refused surface — and ${crawl.exclusionsDeduped === 1 ? 'was' : 'were'} folded together.`,
+      );
+    }
+    if (crawl.exclusionsDiscarded > 0) {
+      caveats.push(
+        `The refusal ledger was read up to ${MAX_EXCLUSIONS} distinct surfaces and discarded ${crawl.exclusionsDiscarded} more, so at least ${crawl.exclusionsDiscarded} further refused surfaces exist beyond the ones listed.`,
+      );
+    }
+  } else {
+    caveats.push(
+      'This crawl recorded no refusal ledger, so whether it declined to drive a logout or a delete flow is unknown — not "none". Re-crawl to find out: a destructive surface absent from the denominator raises the coverage percentage, which is the wrong direction.',
+    );
+  }
+
+  // ── 8. What the tests know that the crawl does not ─────────────────────────
+  /*
+   * The only direction that can see our own blind spot. See
+   * `reverseReconcile` — a test navigating somewhere the crawl never reached is
+   * a human writing down a URL of the application that our denominator does not
+   * contain, which is the hardest evidence of undercount obtainable.
+   *
+   * Scoped to the crawl's routes HERE, deliberately: this function's whole
+   * input is one flow map, so the honest denominator for it is what that crawl
+   * reached. apps/api/src/lib/coverage-store.ts calls the same function against
+   * the FULL unioned inventory, which is strictly stronger and will report
+   * fewer targets — two measurements of the same thing against two different
+   * surfaces, each labelled with the surface it used.
+   */
+  const reverse = reverseReconcile({
+    enumerated: routes.map((node) => node.route),
+    tests: input.tests,
+  });
+  caveats.push(...reverse.caveats);
+
   gaps.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
   const limit = Math.min(input.limit ?? MAX_GAPS, MAX_GAPS);
   const returned = gaps.slice(0, limit);
@@ -2245,11 +2937,14 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
       journeysWalked,
       forms: totalForms,
       formsExercised,
-      affordances: allLocators.length,
+      affordances: allControls.length,
       affordancesUsed,
       gaps: gaps.length,
       gapsReturned: returned.length,
+      unexercisableSurfaces,
+      refusedSurfaces,
     },
+    reverse,
     fingerprint: fingerprintOf(crawl.version, input.tests, gaps),
   };
 }
@@ -2530,6 +3225,35 @@ export function planItemForGap(gap: CoverageGap): PlanItem {
         'Every rejection leaves no trace — re-reading afterwards shows the original value, not a partially written record',
         `NOT COVERED by this test: ${describeDropped(expansion.dropped, 3)}`,
         ...expansion.caveats.slice(0, 1).map((c) => `READ BEFORE TRUSTING A PASS: ${c}`),
+      ];
+      break;
+    }
+    case 'unexercisable': {
+      /*
+       * THE ONE PLAN ITEM THAT IS NOT A PROPOSAL.
+       *
+       * Every other arm writes the test a Generator should produce. This one
+       * must not: the surface is session-ending or destructive, the environment
+       * cannot afford the side effect, and a generated test that drove it would
+       * either log the suite out mid-run or delete a record nobody can restore.
+       *
+       * So the item states the PRECONDITION as its first step and says in its
+       * own assertions that it covers nothing until that precondition is met —
+       * the same shape the auth-profile-less branch below uses, and for the
+       * same reason: `PlanItem` has nowhere to put "do not generate this yet",
+       * so it has to be a sentence a human reads on the approval screen.
+       */
+      const where = subject.route ?? subject.url;
+      title = `Needs disposable data: ${where}`;
+      testType = subject.reason === 'SESSION_ENDING' ? 'SECURITY_SMOKE' : 'E2E';
+      steps = [
+        `BLOCKED until this is true: ${subject.remedy}`,
+        `Once it is, navigate to ${where} and drive the flow to completion — it ${UNEXERCISABLE_REASON_LABELS[subject.reason].toLowerCase()}, so it must run against data this environment can afford to lose.`,
+        `The crawl refused it under the rule "${subject.rule}"; that rule is about OUR harness and does not need changing for the test to be written.`,
+      ];
+      assertions = [
+        `NOT COVERED by this test until the precondition above is met: ${where}. ${subject.remedy}`,
+        `When it can run, assert the side effect actually happened — that the session is gone, or that the record is gone and the application says so — rather than that a confirmation dialog appeared.`,
       ];
       break;
     }

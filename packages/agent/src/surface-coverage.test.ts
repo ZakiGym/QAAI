@@ -18,8 +18,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { CodebaseAnalysis, FlowMap, SurfaceItem } from '@qaai/shared';
-import { totalsForItems } from '@qaai/shared';
+import type { CodebaseAnalysis, ExclusionKind, FlowMap, SurfaceItem } from '@qaai/shared';
+import { originFromSources, totalsForItems } from '@qaai/shared';
 import {
   buildSurfaceInventory,
   endpointIdentity,
@@ -32,6 +32,14 @@ import {
   type TestExecutionFact,
 } from './surface-coverage.js';
 import type { CoverageTestInput } from './coverage.js';
+/*
+ * The participation vocabulary's OWNER. `surface-inventory.ts` reaches it as a
+ * TYPE-ONLY import (reconcile.ts imports that module at run time, so a value
+ * import back would be a cycle), and a type the compiler erases is a half-guard
+ * — nothing at run time would notice a member respelled in transit. This file
+ * imports both and closes the other half.
+ */
+import { SOURCE_PARTICIPATIONS } from './reconcile.js';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -174,7 +182,12 @@ describe('buildSurfaceInventory', () => {
     ]);
     // The dynamic segment is canonicalised, so a crawl's /orders/123 will match.
     expect(inventory.items.find((item) => item.kind === 'ROUTE')?.label).toBe('/orders/:param');
-    expect(inventory.reconciliation).toEqual({ sourceOnly: 4, crawlOnly: 0, both: 0 });
+    expect(inventory.reconciliation).toEqual({
+      sourceOnly: 4,
+      crawlOnly: 0,
+      both: 0,
+      declarersUnrecorded: 0,
+    });
   });
 
   it('marks a source item the crawl also reached as BOTH, keeping the source file', () => {
@@ -1044,5 +1057,587 @@ describe('rankUncovered', () => {
       'ROUTE:/crawled',
       'FORM:f',
     ]);
+  });
+});
+
+// ─── The eight-declarer union ─────────────────────────────────────────────────
+
+/**
+ * ONE RECONCILED SURFACE, WITH PROVENANCE.
+ *
+ * Three disjoint inventories of one application used to live on three screens
+ * and were never unioned, so a customer could read two different coverage
+ * numbers and no combined figure. The union is only worth having if it is
+ * honest rather than merely bigger, so every test here is one of the four rules
+ * in surface-inventory.ts's header:
+ *
+ *   one surface with N provenances, never N surfaces;
+ *   one declarer is still a declarer, and WHICH one is visible;
+ *   a declarer that failed does not silently drop out;
+ *   unexercisable and refused surfaces stay in, with their reason.
+ */
+
+
+/** A declarer-supplied item, the way a sitemap/OpenAPI/traffic reader hands one over. */
+function declared(
+  key: string,
+  sources: SurfaceItem['sources'],
+  extra: Partial<SurfaceItem> = {},
+): SurfaceItem {
+  return {
+    kind: 'ROUTE',
+    key,
+    label: key.slice('ROUTE:'.length),
+    file: null,
+    line: null,
+    sources,
+    origin: originFromSources(sources ?? []) ?? 'SOURCE_ONLY',
+    evidence: `declared by ${(sources ?? []).join('+') || 'nobody'}`,
+    detector: null,
+    ...extra,
+  };
+}
+
+const excluded = (
+  over: Partial<{ url: string; route: string | null; kind: ExclusionKind; rule: string }> = {},
+) => ({
+  url: over.url ?? 'https://app.example.com/logout',
+  route: over.route === undefined ? '/logout' : over.route,
+  kind: over.kind ?? ('SESSION_ENDING' as ExclusionKind),
+  rule: over.rule ?? 'session-ending:logout',
+  discoveredFrom: null,
+});
+
+const sourceRoute = (route: string): CodebaseAnalysis['routes'][number] => ({
+  route,
+  detector: 'next-app-router',
+  file: `app${route}/page.tsx`,
+  evidence: 'directory path is the URL',
+  dynamic: route.includes('['),
+});
+
+describe('the union carries provenance', () => {
+  it('makes the same route found by three declarers ONE item with three provenances', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: flowMap({ nodes: [node('/orders')] }),
+      observed: [declared('ROUTE:/orders', ['SITEMAP'])],
+    });
+
+    const orders = inventory.items.filter((item) => item.key === 'ROUTE:/orders');
+    expect(orders).toHaveLength(1);
+    expect([...(orders[0]!.sources ?? [])].sort()).toEqual(['CRAWL', 'SITEMAP', 'SOURCE']);
+    // Derived from the union, never written beside it.
+    expect(orders[0]!.origin).toBe('BOTH');
+    // The source side still owns the actionable fields.
+    expect(orders[0]!.file).toBe('app/orders/page.tsx');
+  });
+
+  it('keeps an item only one declarer named, and says which one', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/hidden-admin', ['OPENAPI'])],
+    });
+
+    const hidden = inventory.items.find((item) => item.key === 'ROUTE:/hidden-admin')!;
+    expect(hidden).toBeDefined();
+    expect(hidden.sources).toEqual(['OPENAPI']);
+
+    const openapi = inventory.participation.find((entry) => entry.source === 'OPENAPI')!;
+    expect(openapi.itemsDeclared).toBe(1);
+    // The confidence signal: a route only an OpenAPI document mentions is a
+    // weaker claim than one three declarers agree on.
+    expect(openapi.soleDeclarerOf).toBe(1);
+    expect(inventory.caveats.join(' ')).toMatch(/Items with a single declarer/);
+  });
+
+  it('counts a declarer that agrees with others apart from one that stands alone', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/a'), sourceRoute('/b')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/a', ['TRAFFIC']), declared('ROUTE:/c', ['TRAFFIC'])],
+    });
+
+    const traffic = inventory.participation.find((entry) => entry.source === 'TRAFFIC')!;
+    expect(traffic.itemsDeclared).toBe(2);
+    expect(traffic.soleDeclarerOf).toBe(1);
+    const source = inventory.participation.find((entry) => entry.source === 'SOURCE')!;
+    expect(source.itemsDeclared).toBe(2);
+    expect(source.soleDeclarerOf).toBe(1);
+  });
+
+  it('absorbs a traffic-observed instance into the template the repo declares', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders/[id]')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/orders/417', ['TRAFFIC'])],
+    });
+
+    // One item, not two. Keyed literally these are two, one of which does not
+    // exist as a distinct testable thing — and on a paginated app it is hundreds.
+    const routes = inventory.items.filter((item) => item.kind === 'ROUTE');
+    expect(routes.map((item) => item.key)).toEqual(['ROUTE:/orders/:param']);
+    expect([...(routes[0]!.sources ?? [])].sort()).toEqual(['SOURCE', 'TRAFFIC']);
+  });
+
+  it('does not let a thinner declarer blank out a file the source read', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/orders', ['MANUAL'], { file: null, detector: null })],
+    });
+
+    const orders = inventory.items.find((item) => item.key === 'ROUTE:/orders')!;
+    expect(orders.file).toBe('app/orders/page.tsx');
+    expect(orders.detector).toBe('next-app-router');
+  });
+
+  it('counts an item with no declarer list apart, rather than claiming agreement', () => {
+    const legacy: SurfaceItem = {
+      kind: 'ROUTE',
+      key: 'ROUTE:/legacy',
+      label: '/legacy',
+      file: null,
+      line: null,
+      origin: 'SOURCE_ONLY',
+      evidence: 'a row stored before provenance existed',
+      detector: null,
+    };
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      observed: [legacy],
+    });
+
+    expect(inventory.reconciliation.declarersUnrecorded).toBe(1);
+    expect(inventory.caveats.join(' ')).toMatch(/record no declarer list/);
+  });
+});
+
+describe('the union records which declarers participated', () => {
+  it('pairs every participation value with reconcile’s own vocabulary', () => {
+    // The run-time half of the guard: `SourceParticipation` reaches this module
+    // as a type-only import, which the compiler checks and nothing at run time
+    // can. A member respelled in transit would not fail to compile.
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      participation: [{ source: 'SOURCE', participation: 'FAILED', detail: 'clone timed out' }],
+    });
+    for (const entry of inventory.participation) {
+      expect(SOURCE_PARTICIPATIONS).toContain(entry.participation);
+    }
+  });
+
+  it('marks the union PARTIAL when a declarer was asked and failed', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({ nodes: [node('/orders')] }),
+      participation: [
+        { source: 'CRAWL', participation: 'LOADED', detail: '1 route reached' },
+        { source: 'SITEMAP', participation: 'FAILED', detail: 'sitemap.xml returned 404' },
+      ],
+    });
+
+    expect(inventory.complete).toBe(false);
+    expect(inventory.partialBecause.join(' ')).toMatch(/SITEMAP was asked and could not be read/);
+    // The direction matters and must be stated: a failed declarer shrinks the
+    // denominator, so the percentage goes UP.
+    expect(inventory.partialBecause.join(' ')).toMatch(/raises any percentage/);
+    expect(inventory.caveats.join(' ')).toMatch(/sitemap.xml returned 404/);
+  });
+
+  it('does not read a FAILED declarer as one that declared nothing', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      participation: [{ source: 'OPENAPI', participation: 'FAILED', detail: 'unparseable' }],
+    });
+
+    const openapi = inventory.participation.find((entry) => entry.source === 'OPENAPI')!;
+    expect(openapi.counted).toBe(false);
+    // Null, not 0. "It declared nothing" and "it was never read" differ by the
+    // whole size of the document.
+    expect(openapi.itemsDeclared).toBeNull();
+    expect(openapi.soleDeclarerOf).toBeNull();
+  });
+
+  it('is COMPLETE only when every declarer that was asked loaded', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      participation: [{ source: 'SOURCE', participation: 'LOADED', detail: '1 route' }],
+    });
+
+    expect(inventory.complete).toBe(true);
+    expect(inventory.partialBecause).toEqual([]);
+  });
+
+  it('says NULL, not true, when the caller did not account for the declarers', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+    });
+
+    // The flattering lie: `true` here reads as "every source was read" about a
+    // union that never asked the question.
+    expect(inventory.complete).toBeNull();
+    expect(inventory.partialBecause.join(' ')).toMatch(/whether it is complete is unknown/);
+  });
+
+  it('describes a derived NOT_CONFIGURED as our bookkeeping, not their application', () => {
+    const inventory = buildSurfaceInventory({ analysis: null, flowMap: null });
+    const sitemap = inventory.participation.find((entry) => entry.source === 'SITEMAP')!;
+
+    expect(sitemap.participation).toBe('NOT_CONFIGURED');
+    expect(sitemap.detail).toMatch(/statement about our bookkeeping/);
+  });
+});
+
+describe('refused and unexercisable surfaces stay in the inventory', () => {
+  it('mints an item for a logout the crawl refused to follow', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({ nodes: [node('/orders')], excluded: [excluded()] }),
+    });
+
+    const logout = inventory.items.find((item) => item.key === 'ROUTE:/logout')!;
+    expect(logout).toBeDefined();
+    expect(logout.exercise?.state).toBe('UNEXERCISABLE');
+    expect(logout.exercise?.reason).toBe('SESSION_ENDING');
+    expect(logout.exercise?.rule).toBe('session-ending:logout');
+    // The crawl is the declarer: it found the link and decided not to follow.
+    expect(logout.sources).toEqual(['CRAWL']);
+    // The remedy is what makes this actionable rather than a complaint.
+    expect(logout.meta?.remedy).toMatch(/auth profile/i);
+    expect(inventory.heldOut.unexercisable).toBe(1);
+  });
+
+  it('keeps it in the inventory and out of the coverage division, counted', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({
+        nodes: [node('/orders')],
+        excluded: [excluded(), excluded({ url: 'https://app.example.com/x', route: '/internal', kind: 'POLICY_EXCLUDE', rule: 'excludeGlobs:/internal/**' })],
+      }),
+    });
+    const totals = totalsForItems(
+      inventory.items.map((item) => ({
+        item,
+        status: 'UNCOVERED' as const,
+        matches: [],
+        verification: {
+          lastRunId: null,
+          lastStatus: null,
+          executed: false,
+          everPassed: false,
+          mutationKilled: null,
+        },
+      })),
+    );
+
+    // Three items in the inventory; one in the division. The other two are
+    // named with a reason, which is the whole point — dropping them would raise
+    // the percentage by removing the riskiest things in the app.
+    expect(inventory.items).toHaveLength(3);
+    const routes = totals.byKind.find((kind) => kind.kind === 'ROUTE')!;
+    expect(routes.denominator).toBe(1);
+    expect(routes.unexercisable).toBe(1);
+    expect(routes.refused).toBe(1);
+  });
+
+  it('folds fifty links to one logout into one refused surface', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({
+        nodes: [node('/orders')],
+        excluded: Array.from({ length: 50 }, (_unused, index) =>
+          excluded({ url: `https://app.example.com/logout?from=${index}` }),
+        ),
+      }),
+    });
+
+    expect(inventory.items.filter((item) => item.key === 'ROUTE:/logout')).toHaveLength(1);
+    expect(inventory.heldOut.unexercisable).toBe(1);
+  });
+
+  it('does not count an off-origin refusal as this application’s surface', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({
+        nodes: [node('/orders')],
+        excluded: [
+          excluded({
+            url: 'https://accounts.example.net/signin',
+            route: null,
+            kind: 'OFF_ORIGIN',
+            rule: 'off-origin:accounts.example.net',
+          }),
+        ],
+      }),
+    });
+
+    expect(inventory.items).toHaveLength(1);
+    expect(inventory.heldOut).toEqual({ unexercisable: 0, refused: 0 });
+    expect(inventory.caveats.join(' ')).toMatch(/off-origin or not a page/);
+  });
+
+  it('says a missing refusal ledger is unknown rather than none', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({ nodes: [node('/orders')] }),
+    });
+
+    expect(inventory.heldOut).toEqual({ unexercisable: 0, refused: 0 });
+    expect(inventory.caveats.join(' ')).toMatch(/unknown — not "none"/);
+  });
+
+  it('prefers a reached observation over a refusal of the same surface', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({
+        nodes: [node('/logout')],
+        excluded: [excluded()],
+      }),
+    });
+
+    const logout = inventory.items.find((item) => item.key === 'ROUTE:/logout')!;
+    // Something actually drove it, which beats any prediction that it could
+    // not be driven — but the refusal's sentence is still on the row.
+    expect(logout.exercise?.state).toBe('EXERCISABLE');
+    expect(logout.evidence).toMatch(/would end the session/);
+  });
+
+  it('carries the environment onto every observed item', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: flowMap({ nodes: [node('/orders')], excluded: [excluded()] }),
+    });
+
+    for (const item of inventory.items) {
+      expect(item.environmentId).toBe('env_1');
+    }
+  });
+});
+
+describe('the inventory runs the reverse direction', () => {
+  it('names a route the suite references and no declarer enumerated', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      tests: [test_({ id: 'ghost', routes: ['/admin/reports'] })],
+    });
+
+    expect(inventory.reverse.measured).toBe(true);
+    expect(inventory.reverse.declaredSetUnderstatedByAtLeast).toBe(1);
+    expect(inventory.reverse.unenumerated[0]!.route).toBe('/admin/reports');
+    expect(inventory.caveats.join(' ')).toMatch(/upper bound/);
+  });
+
+  it('counts a target absorbed by the union as agreement', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders/[id]')] }),
+      flowMap: null,
+      tests: [test_({ id: 'ok', routes: ['/orders/417'] })],
+    });
+
+    expect(inventory.reverse.declaredSetUnderstatedByAtLeast).toBe(0);
+  });
+
+  it('claims nothing when the union is empty', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      tests: [test_({ id: 'a', routes: ['/x'] })],
+    });
+
+    // No declarer produced anything, so every test target is "un-enumerated" —
+    // which would be a finding about the customer made out of our own silence.
+    expect(inventory.reverse.measured).toBe(false);
+    expect(inventory.reverse.declaredSetUnderstatedByAtLeast).toBeNull();
+  });
+
+  it('does not read an absent suite as agreement', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+    });
+
+    expect(inventory.reverse.declaredSetUnderstatedByAtLeast).toBe(0);
+    expect(inventory.caveats.join(' ')).toMatch(/there was no suite to compare/);
+  });
+});
+
+describe('the fingerprint moves when the measurement moves', () => {
+  const base = () =>
+    buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+    });
+
+  it('is stable across identical inputs', () => {
+    expect(base().fingerprint).toBe(base().fingerprint);
+  });
+
+  it('moves when a second declarer joins an item', () => {
+    const withTraffic = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/orders', ['TRAFFIC'])],
+    });
+
+    // Same one item, same key — but "declared in source" and "declared in
+    // source and walked by real traffic" are different measurements, and a
+    // fingerprint that held still would keep every cached snapshot valid
+    // through exactly the change this slice added.
+    expect(withTraffic.items).toHaveLength(1);
+    expect(withTraffic.fingerprint).not.toBe(base().fingerprint);
+  });
+
+  it('moves when a second DECLARED declarer joins, which leaves `origin` unchanged', () => {
+    /*
+     * The case the origin field cannot carry, and the reason `sources` is
+     * hashed separately.
+     *
+     * SOURCE and SITEMAP are both DECLARATIONS, so `originFromSources` returns
+     * SOURCE_ONLY for either and for both. A fingerprint over `origin` alone
+     * therefore holds still while the evidence behind the item doubles — and
+     * rule 2 of this union is that a route one declarer names is a weaker claim
+     * than one two agree on. Hashing only `origin` would keep every cached
+     * snapshot valid through exactly that change.
+     */
+    const alsoSitemap = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+      observed: [declared('ROUTE:/orders', ['SITEMAP'])],
+    });
+
+    expect(alsoSitemap.items).toHaveLength(1);
+    expect(alsoSitemap.items[0]!.origin).toBe('SOURCE_ONLY');
+    expect(base().items[0]!.origin).toBe('SOURCE_ONLY');
+    expect(alsoSitemap.fingerprint).not.toBe(base().fingerprint);
+  });
+
+  it('moves when an exercisability is recorded, which `origin` also cannot carry', () => {
+    const observedItem = declared('ROUTE:/orders', ['SOURCE'], {
+      exercise: { state: 'UNEXERCISABLE', reason: 'DESTRUCTIVE', detail: 'deletes the order' },
+    });
+    const classified = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      observed: [observedItem],
+    });
+    const unclassified = buildSurfaceInventory({
+      analysis: null,
+      flowMap: null,
+      observed: [declared('ROUTE:/orders', ['SOURCE'])],
+    });
+
+    // Same key, same single declarer, same origin — one is in the division and
+    // one is not, which is the largest possible change to the number.
+    expect(classified.items[0]!.origin).toBe(unclassified.items[0]!.origin);
+    expect(classified.fingerprint).not.toBe(unclassified.fingerprint);
+  });
+
+  it('moves when an item leaves the division', () => {
+    const refused = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: flowMap({
+        nodes: [],
+        excluded: [excluded({ url: 'https://app.example.com/orders', route: '/orders', kind: 'DESTRUCTIVE', rule: 'destructive:delete' })],
+      }),
+    });
+
+    expect(refused.items).toHaveLength(1);
+    expect(refused.items[0]!.exercise?.state).toBe('UNEXERCISABLE');
+    expect(refused.fingerprint).not.toBe(base().fingerprint);
+  });
+});
+
+describe('the source read’s own shortfalls reach the number', () => {
+  it('says how many facts the readers could not report, and why', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({
+        routes: [sourceRoute('/orders')],
+        shortfalls: [
+          { detector: 'next-app-router', reason: 'NO_CONTENT', count: 12, detail: '12 files were listed without bodies' },
+          { detector: null, reason: 'CAP_REACHED', count: 230, detail: 'the file cap bit' },
+        ],
+      }),
+      flowMap: null,
+    });
+
+    // "At least N more existed", not "possibly incomplete". A surface our own
+    // reader skipped is ABSENT from the denominator rather than uncovered, and
+    // absent raises the percentage while uncovered lowers it.
+    expect(inventory.caveats.join(' ')).toMatch(/could not report at least 242 facts/);
+    expect(inventory.caveats.join(' ')).toMatch(/12× the file body was not uploaded \(next-app-router\)/);
+    expect(inventory.caveats.join(' ')).toMatch(/230× one of this analysis’s own caps was reached \(every detector\)/);
+  });
+
+  it('says UNKNOWN, not zero, for an analysis with no shortfall ledger', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')] }),
+      flowMap: null,
+    });
+
+    expect(inventory.caveats.join(' ')).toMatch(/predates the shortfall ledger/);
+    expect(inventory.caveats.join(' ')).toMatch(/unknown — not zero/);
+  });
+
+  it('reports no shortfall sentence when the readers ran and lost nothing', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({ routes: [sourceRoute('/orders')], shortfalls: [] }),
+      flowMap: null,
+    });
+
+    expect(inventory.caveats.join(' ')).not.toMatch(/could not report at least/);
+    expect(inventory.caveats.join(' ')).not.toMatch(/predates the shortfall ledger/);
+  });
+
+  it('names a guard that protects an area no route detector found', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({
+        routes: [sourceRoute('/orders')],
+        guards: [
+          {
+            kind: 'NEXT_MIDDLEWARE',
+            file: 'middleware.ts',
+            line: 4,
+            patterns: ['/admin/:path*'],
+            roles: ['ADMIN'],
+            evidence: 'middleware matcher covers /admin/:path*',
+          },
+        ],
+      }),
+      flowMap: null,
+    });
+
+    // Evidence about OUR extractor: either the configuration is dead, or a
+    // whole admin area went unread. Suppressing it hides our own error rate.
+    expect(inventory.caveats.join(' ')).toMatch(/1 guard declaration names URL patterns that match no route/);
+    expect(inventory.caveats.join(' ')).toMatch(/middleware.ts: \/admin\/:path\*/);
+  });
+
+  it('says nothing about a guard whose pattern does match a route', () => {
+    const inventory = buildSurfaceInventory({
+      analysis: analysis({
+        routes: [sourceRoute('/admin/users')],
+        guards: [
+          {
+            kind: 'NEXT_MIDDLEWARE',
+            file: 'middleware.ts',
+            line: 4,
+            patterns: ['/admin/*'],
+            roles: ['ADMIN'],
+            evidence: 'middleware matcher covers /admin/*',
+          },
+        ],
+      }),
+      flowMap: null,
+    });
+
+    expect(inventory.caveats.join(' ')).not.toMatch(/match no route/);
   });
 });

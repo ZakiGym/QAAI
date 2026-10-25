@@ -49,6 +49,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Prisma } from '../generated/prisma/client.js';
 
 type Row = Record<string, any>;
 
@@ -129,16 +130,32 @@ type ModelName =
   | 'testResult'
   | 'coverageItem'
   | 'coverageWaiver'
-  | 'coverageSnapshot';
+  | 'coverageSnapshot'
+  | 'componentItem'
+  | 'componentState';
 
 const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   codebaseSnapshot: new Set(['id', 'orgId', 'projectId']),
   flowMap: new Set(['id', 'orgId', 'projectId', 'version']),
   test: new Set(['id', 'orgId', 'projectId', 'disabledAt', 'filePath']),
   testResult: new Set(['id', 'orgId', 'testId', 'runId', 'status', 'test']),
-  coverageItem: new Set(['id', 'orgId', 'projectId', 'key', 'status', 'retiredAt']),
+  coverageItem: new Set([
+    'id',
+    'orgId',
+    'projectId',
+    'key',
+    'status',
+    'retiredAt',
+    // The declarer list. `loadObservedItems` filters on it with
+    // `{ not: Prisma.DbNull }`, and a fake that shrugged at this filter would
+    // feed source-declared rows back into the union as though another declarer
+    // had named them.
+    'sources',
+  ]),
   coverageWaiver: new Set(['id', 'orgId', 'projectId', 'itemId', 'expiresAt']),
   coverageSnapshot: new Set(['id', 'orgId', 'projectId']),
+  componentItem: new Set(['id', 'orgId', 'projectId', 'modulePath', 'exportName', 'retiredAt']),
+  componentState: new Set(['id', 'orgId', 'componentId', 'kind', 'retiredAt', 'component']),
 };
 
 interface Store {
@@ -149,9 +166,17 @@ interface Store {
   coverageItem: Row[];
   coverageWaiver: Row[];
   coverageSnapshot: Row[];
+  componentItem: Row[];
+  componentState: Row[];
 }
 
 function matchesCondition(value: unknown, cond: unknown): boolean {
+  // `Prisma.DbNull` is a sentinel OBJECT, not null, and it means SQL NULL —
+  // which for a `Json?` column is a different stored value from JSON `null`.
+  // Resolved here rather than in `matchesWhere` so `{ not: Prisma.DbNull }`
+  // composes through the `not` branch below like any other condition.
+  if (cond === Prisma.DbNull) return (value ?? null) === null;
+  if (cond === Prisma.JsonNull) return value === null;
   if (cond === null) return (value ?? null) === null;
   if (cond instanceof Date) return value instanceof Date && value.getTime() === cond.getTime();
   if (typeof cond === 'object') {
@@ -181,6 +206,12 @@ function matchesWhere(model: ModelName, row: Row, where: Row, store: Store): boo
       const parent = store.test.find((candidate) => candidate.id === row.testId);
       return parent ? matchesWhere('test', parent, cond as Row, store) : false;
     }
+    // Same shape: `componentState.where.component.projectId`, which is how the
+    // dangling-key read scopes states to a project without a projectId column.
+    if (key === 'component' && model === 'componentState') {
+      const parent = store.componentItem.find((candidate) => candidate.id === row.componentId);
+      return parent ? matchesWhere('componentItem', parent, cond as Row, store) : false;
+    }
     return matchesCondition(row[key] ?? null, cond);
   });
 }
@@ -208,6 +239,15 @@ function projectRow(model: ModelName, row: Row, sel: Row | undefined, store: Sto
     if (key === 'item' && model === 'coverageWaiver') {
       const item = store.coverageItem.find((candidate) => candidate.id === row.itemId);
       out.item = item ? projectRow('coverageItem', item, (want as Row).select, store) : null;
+      continue;
+    }
+    // `componentItem.select.states` is a to-many relation read: the component
+    // inventory is counted from STORAGE rather than from the analysis it was
+    // built from, so this projection is what the counts are derived through.
+    if (key === 'states' && model === 'componentItem') {
+      out.states = store.componentState
+        .filter((candidate) => candidate.componentId === row.id && !candidate.retiredAt)
+        .map((candidate) => projectRow('componentState', candidate, (want as Row).select, store));
       continue;
     }
     if (key === 'waiver' && model === 'coverageItem') {
@@ -276,7 +316,10 @@ function makeDb(store: Store): Row {
        */
       upsert: async ({ where, create, update, select: sel }: Row) => {
         h.ops.push(`${name}.upsert`);
-        const unique = (where.projectId_key ?? where) as Row;
+        const unique = (where.projectId_key ??
+          where.projectId_modulePath_exportName ??
+          where.componentId_kind ??
+          where) as Row;
         const found = store[name].find((row) =>
           Object.entries(unique).every(([key, value]) => row[key] === value),
         );
@@ -326,6 +369,8 @@ function makeDb(store: Store): Row {
     coverageItem: model('coverageItem'),
     coverageWaiver: model('coverageWaiver'),
     coverageSnapshot: model('coverageSnapshot'),
+    componentItem: model('componentItem'),
+    componentState: model('componentState'),
     /*
      * The store calls `$transaction` with an ARRAY of operations. Prisma's are
      * lazy and only run when the transaction opens; the fake's have already
@@ -348,6 +393,12 @@ interface AnalysisShape {
   authSurfaces?: Array<{ kind: string; path: string; file: string }>;
   filesWithContent?: number;
   detectors?: Row[];
+  /**
+   * OPTIONAL, and the optionality is the test. An analysis without the key
+   * predates the component reader; one with `[]` ran it and found none. The
+   * fixture keeps them apart by only writing the key when it is given.
+   */
+  components?: Row[];
 }
 
 /**
@@ -399,6 +450,7 @@ function analysisJson(shape: AnalysisShape): Row {
     })),
     frameworks: [],
     detectors: shape.detectors ?? [],
+    ...(shape.components === undefined ? {} : { components: shape.components }),
     coverage: {
       filesGiven: 8,
       filesAnalysed: 8,
@@ -502,6 +554,8 @@ function seed(overrides: Partial<Store> = {}): Store {
     coverageItem: [],
     coverageWaiver: [],
     coverageSnapshot: [],
+    componentItem: [],
+    componentState: [],
     ...overrides,
   };
   return store;
@@ -514,7 +568,9 @@ function install(next: Store): void {
   h.prisma = makeDb(store);
 }
 
-const { computeCoverage, latestSnapshot, snapshotTrend } = await import('./coverage-store.js');
+const { computeCoverage, latestSnapshot, mayRetireItems, snapshotTrend } = await import(
+  './coverage-store.js'
+);
 const { withTenant } = await import('./prisma.js');
 
 /** Every call runs inside a tenant scope, the way a request does. */
@@ -1091,5 +1147,716 @@ describe('snapshotTrend and latestSnapshot', () => {
     const trend = await withTenant(ORG, () => snapshotTrend(PROJECT, 30));
     // Same projectId on purpose: the scope is the org, not the id in the call.
     expect(trend.map((row) => row.commitSha)).toEqual(['ours']);
+  });
+});
+
+// ─── The eight-declarer union, as the store assembles it ─────────────────────
+
+/**
+ * What this file adds to the inventory's own tests.
+ *
+ * `buildSurfaceInventory` is tested in packages/agent over hand-built inputs.
+ * The three things only this layer can get wrong are:
+ *
+ *   1. THE RETIREMENT SWEEP. It says "every item this computation did not see
+ *      is gone". Traffic ingest and recorded sessions write `CoverageItem` rows
+ *      this computation cannot derive, so a sweep over a two-declarer union
+ *      would retire them and the percentage would RISE with nothing tested.
+ *   2. THE PROVENANCE COLUMNS. The upsert wrote `origin` and not `sources`, so
+ *      a row's stored origin and the origin derivable from its declarers
+ *      disagreed and only one of them reached a screen.
+ *   3. THE PARTICIPATION REPORT. An unreadable `CodebaseSnapshot` used to come
+ *      back as the same `null` as no snapshot at all, which is the difference
+ *      between a hole and a choice.
+ */
+
+/** One stored registry row, as a declarer this computation cannot derive wrote it. */
+function observedRow(over: Partial<Row> = {}): Row {
+  return {
+    id: 'ci_traffic',
+    orgId: ORG,
+    projectId: PROJECT,
+    kind: 'ROUTE',
+    key: 'ROUTE:/checkout',
+    label: '/checkout',
+    file: null,
+    line: null,
+    origin: 'CRAWL_ONLY',
+    evidence: '1,400 real sessions walked it',
+    detector: 'traffic-ingest',
+    meta: {},
+    sources: ['TRAFFIC'],
+    status: 'UNCOVERED',
+    matches: [],
+    retiredAt: null,
+    firstSeenAt: new Date('2026-01-01T00:00:00Z'),
+    ...over,
+  };
+}
+
+describe('computeCoverage — declarers this computation does not derive', () => {
+  it('does NOT retire a traffic-declared row that no source or crawl knows about', async () => {
+    install(seed({ coverageItem: [observedRow()] }));
+    await compute({ persist: true });
+
+    const checkout = itemByKey('ROUTE:/checkout')!;
+    expect(checkout).toBeDefined();
+    // The defect this replaces: the sweep retired it, the item left the
+    // denominator, and the coverage percentage rose with nothing tested.
+    expect(checkout.retiredAt).toBeNull();
+    expect(checkout.sources).toEqual(['TRAFFIC']);
+  });
+
+  it('unions a traffic declarer onto a route the source also declares, and re-derives origin', async () => {
+    install(seed({ coverageItem: [observedRow({ key: 'ROUTE:/orders', label: '/orders' })] }));
+    await compute({ persist: true });
+
+    const orders = itemByKey('ROUTE:/orders')!;
+    expect([...(orders.sources as string[])].sort()).toEqual(['CRAWL', 'SOURCE', 'TRAFFIC']);
+    // Derived from the union, not copied from the stored row's own guess.
+    expect(orders.origin).toBe('BOTH');
+    // And the source side still owns the file, which is what makes it clickable.
+    expect(orders.file).toBe('app/orders/page.tsx');
+  });
+
+  it('writes the declarer list, so the next recompute does not re-derive a narrower one', async () => {
+    await compute({ persist: true });
+
+    const legacy = itemByKey('ROUTE:/admin/legacy')!;
+    expect(legacy.sources).toEqual(['SOURCE']);
+    expect(legacy.origin).toBe('SOURCE_ONLY');
+    const orders = itemByKey('ROUTE:/orders')!;
+    expect([...(orders.sources as string[])].sort()).toEqual(['CRAWL', 'SOURCE']);
+    expect(orders.origin).toBe('BOTH');
+  });
+
+  it('does not feed a source-only stored row back into its own union', async () => {
+    // A stored row whose only declarer is one this computation derives itself.
+    // Re-feeding it would keep a route alive for ever after the repo stopped
+    // declaring it, which makes our own extraction unfalsifiable.
+    install(
+      seed({
+        coverageItem: [
+          observedRow({ key: 'ROUTE:/deleted', label: '/deleted', sources: ['SOURCE'] }),
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    expect(result.inventory!.complete).toBe(true);
+    expect(itemByKey('ROUTE:/deleted')!.retiredAt).not.toBeNull();
+  });
+
+  it('reports every declarer that was asked, and what each one gave', async () => {
+    install(seed({ coverageItem: [observedRow()] }));
+    const result = await compute({ persist: true });
+
+    const by = new Map(result.inventory!.participation.map((entry) => [entry.source, entry]));
+    expect(by.get('SOURCE')!.participation).toBe('LOADED');
+    expect(by.get('SOURCE')!.detail).toMatch(/snap_a: 2 route\(s\)/);
+    expect(by.get('CRAWL')!.participation).toBe('LOADED');
+    expect(by.get('CRAWL')!.detail).toMatch(/flow map v3: 1 node\(s\)/);
+    expect(by.get('TRAFFIC')!.participation).toBe('LOADED');
+    expect(by.get('TRAFFIC')!.itemsDeclared).toBe(1);
+    // A declarer with no rows: NOT_CONFIGURED, with the detail saying out loud
+    // that this computation cannot tell that from "ran and failed".
+    expect(by.get('OPENAPI')!.participation).toBe('NOT_CONFIGURED');
+    expect(by.get('OPENAPI')!.itemsDeclared).toBeNull();
+    expect(by.get('OPENAPI')!.detail).toMatch(/cannot tell "never set up" from "ran and failed"/);
+  });
+
+  it('calls an unreadable analysis FAILED, not absent, and refuses to retire', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_bad',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-02T00:00:00Z'),
+            analysis: { nonsense: true },
+          },
+        ],
+        coverageItem: [observedRow({ key: 'ROUTE:/admin/legacy', label: '/admin/legacy' })],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    const source = result.inventory!.participation.find((entry) => entry.source === 'SOURCE')!;
+    expect(source.participation).toBe('FAILED');
+    expect(source.detail).toMatch(/snap_bad exists but its stored analysis/);
+    expect(result.inventory!.complete).toBe(false);
+    // THE WHOLE POINT. Every route that analysis declared is now missing from
+    // the union, and sweeping would retire all of them and raise the number.
+    expect(itemByKey('ROUTE:/admin/legacy')!.retiredAt).toBeNull();
+    expect(result.snapshot.caveats.join(' ')).toMatch(/every surface it declared is missing/);
+  });
+
+  it('calls a missing analysis NOT_CONFIGURED, which is a choice and not a hole', async () => {
+    install(seed({ codebaseSnapshot: [] }));
+    const result = await compute({ persist: true });
+
+    const source = result.inventory!.participation.find((entry) => entry.source === 'SOURCE')!;
+    expect(source.participation).toBe('NOT_CONFIGURED');
+    expect(source.detail).toMatch(/the repository was never ingested/);
+  });
+
+  it('keeps a refused surface in the stored inventory, with its rule and remedy', async () => {
+    install(
+      seed({
+        flowMap: [
+          {
+            id: 'fm_b',
+            orgId: ORG,
+            projectId: PROJECT,
+            version: 4,
+            graph: {
+              ...flowMapJson(['/orders']),
+              excluded: [
+                {
+                  url: 'https://app.example.test/logout',
+                  route: '/logout',
+                  kind: 'SESSION_ENDING',
+                  rule: 'session-ending:logout',
+                  discoveredFrom: null,
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    const logout = itemByKey('ROUTE:/logout')!;
+    expect(logout).toBeDefined();
+    expect(logout.exercisability).toBe('UNEXERCISABLE');
+    expect(logout.unexercisableReason).toBe('SESSION_ENDING');
+    expect(logout.refusedByRule).toBe('session-ending:logout');
+    expect(logout.exerciseDetail).toMatch(/would end the session/);
+    expect(result.inventory!.heldOut.unexercisable).toBe(1);
+    // In the inventory, out of the division. A destructive flow dropped instead
+    // would raise the percentage.
+    expect(result.snapshot.totals.unexercisable).toBe(1);
+  });
+
+  it('leaves exercisability NULL for an item nobody classified', async () => {
+    await compute({ persist: true });
+
+    // The source-declared majority. Null read as REFUSED would drop them from
+    // the denominator and the percentage would jump on the day of the deploy.
+    expect(itemByKey('ROUTE:/admin/legacy')!.exercisability).toBeNull();
+    expect(itemByKey('ENDPOINT:POST /api/refunds')!.exercisability).toBeNull();
+  });
+
+  it('runs the reverse direction against the whole union', async () => {
+    install(
+      seed({
+        test: [
+          {
+            id: 't_ghost',
+            orgId: ORG,
+            projectId: PROJECT,
+            name: 'reaches an area nothing enumerated',
+            filePath: 'tests/ghost.spec.ts',
+            code: "await page.goto('/admin/reports');",
+            spec: null,
+            tags: [],
+            feature: null,
+            priority: 'P1',
+            type: 'E2E',
+            disabledAt: null,
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    expect(result.inventory!.reverse.measured).toBe(true);
+    expect(result.inventory!.reverse.declaredSetUnderstatedByAtLeast).toBe(1);
+    expect(result.inventory!.reverse.unenumerated[0]!.route).toBe('/admin/reports');
+    expect(result.snapshot.caveats.join(' ')).toMatch(/upper bound/);
+  });
+});
+
+describe('the retirement gate', () => {
+  /*
+   * The most dangerous boolean in the file, both arms.
+   *
+   * The `observedTruncated` arm cannot be reached through `computeCoverage`
+   * without MAX_OBSERVED_ITEMS + 1 stored rows, which is why the gate is a
+   * function: an untestable arm of a destructive decision is how a sweep ends
+   * up retiring live surfaces and nobody finds out until the percentage jumps.
+   */
+  it('permits a sweep only over a complete union with a complete registry read', () => {
+    expect(mayRetireItems({ unionComplete: true, readTruncated: false })).toBe(true);
+  });
+
+  it('refuses when a declarer failed, because its surfaces are missing and not gone', () => {
+    expect(mayRetireItems({ unionComplete: false, readTruncated: false })).toBe(false);
+  });
+
+  it('refuses when completeness was never accounted for, because NULL is not permission', () => {
+    expect(mayRetireItems({ unionComplete: null, readTruncated: false })).toBe(false);
+  });
+
+  it('refuses when the registry read was capped, however complete the union looked', () => {
+    expect(mayRetireItems({ unionComplete: true, readTruncated: true })).toBe(false);
+  });
+});
+
+describe('computeCoverage — retirement over a partial union', () => {
+  /** The pair that proves the gate: retired when complete, kept when not. */
+  const withStaleSourceRow = (analysis: Row) =>
+    seed({
+      codebaseSnapshot: [
+        {
+          id: 'snap_gate',
+          orgId: ORG,
+          projectId: PROJECT,
+          createdAt: new Date('2026-01-02T00:00:00Z'),
+          analysis,
+        },
+      ],
+      coverageItem: [
+        observedRow({
+          id: 'ci_stale',
+          // A route NEITHER the analysis nor the crawl declares, so it is
+          // absent from `seenKeys` and the sweep is the only thing that
+          // decides its fate.
+          key: 'ROUTE:/retired-area',
+          label: '/retired-area',
+          // Declared by the repo alone, so `loadObservedItems` deliberately
+          // does NOT feed it back — which is exactly what puts it at risk of
+          // being retired by a pass that could not read the repo.
+          sources: ['SOURCE'],
+        }),
+      ],
+    });
+
+  it('retires a stale source-declared row when the union is complete', async () => {
+    install(
+      withStaleSourceRow(analysisJson({ routes: [{ route: '/other', file: 'app/other/page.tsx' }] })),
+    );
+    const result = await compute({ persist: true });
+
+    expect(result.inventory!.complete).toBe(true);
+    expect(store.coverageItem.find((row) => row.id === 'ci_stale')!.retiredAt).not.toBeNull();
+  });
+
+  it('does NOT retire it when the source read failed, because the row may still be live', async () => {
+    install(withStaleSourceRow({ nothing: 'readable' }));
+    const result = await compute({ persist: true });
+
+    expect(result.inventory!.complete).toBe(false);
+    /*
+     * THE CATASTROPHE THIS PREVENTS. The analysis failed, so every route it
+     * declared is absent from the union — not retired, ABSENT. A sweep would
+     * mark them all gone, the denominator would collapse to the crawl's
+     * routes, and the coverage percentage would rise sharply with nothing
+     * tested and nothing on screen explaining why.
+     */
+    expect(store.coverageItem.find((row) => row.id === 'ci_stale')!.retiredAt).toBeNull();
+    expect(writesIssued()).not.toContain('coverageItem.updateMany');
+  });
+});
+
+// ─── The component inventory ─────────────────────────────────────────────────
+
+const componentJson = (over: Partial<Row> = {}): Row => ({
+  modulePath: 'src/components/OrderTable.tsx',
+  exportName: 'OrderTable',
+  kind: 'COMPONENT',
+  propsSummary: '{ orders: Order[] }',
+  hasCatalogueEntry: null,
+  catalogueRef: null,
+  evidence: 'src/components/OrderTable.tsx exports OrderTable',
+  line: 12,
+  states: [
+    { kind: 'DEFAULT', source: 'SOURCE', evidence: 'renders the table' },
+    { kind: 'LOADING', source: 'SOURCE', evidence: 'renders <Spinner/> when `isLoading`' },
+  ],
+  ...over,
+});
+
+describe('computeCoverage — the component inventory', () => {
+  it('stores components and their states, and counts the non-happy-path ones', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_c',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [componentJson()] }),
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    expect(store.componentItem).toHaveLength(1);
+    expect(store.componentItem[0]!.modulePath).toBe('src/components/OrderTable.tsx');
+    expect(store.componentState).toHaveLength(2);
+    expect(result.components!.measured).toBe(true);
+    expect(result.components!.own).toBe(1);
+    expect(result.components!.states).toBe(2);
+    expect(result.components!.nonHappyPathStates).toBe(1);
+  });
+
+  it('writes nothing, and says nothing is known, for an analysis with no component reader', async () => {
+    // The baseline fixture omits the key entirely: this snapshot predates the
+    // reader. `[]` would report "this project has no components" about a
+    // project nobody looked at — and would retire the whole stored inventory.
+    install(seed({ componentItem: [{ id: 'ci_old', orgId: ORG, projectId: PROJECT, modulePath: 'a', exportName: 'b', retiredAt: null }] }));
+    const result = await compute({ persist: true });
+
+    expect(result.components!.measured).toBe(false);
+    expect(result.components!.own).toBeNull();
+    expect(result.components!.states).toBeNull();
+    expect(store.componentItem[0]!.retiredAt).toBeNull();
+    expect(result.snapshot.caveats.join(' ')).toMatch(/predates the component reader/);
+  });
+
+  it('reports 0 as a measurement when the reader ran and found none', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_d',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [] }),
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    expect(result.components!.measured).toBe(true);
+    expect(result.components!.own).toBe(0);
+    expect(result.components!.states).toBe(0);
+  });
+
+  it('keeps hasCatalogueEntry NULL rather than claiming no story exists', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_e',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [componentJson()] }),
+          },
+        ],
+      }),
+    );
+    await compute({ persist: true });
+
+    expect(store.componentItem[0]!.hasCatalogueEntry).toBeNull();
+  });
+
+  it('counts a PAGE apart, because its route is already in the denominator', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_f',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({
+              components: [
+                componentJson(),
+                componentJson({
+                  modulePath: 'app/orders/page.tsx',
+                  exportName: 'default',
+                  kind: 'PAGE',
+                  states: [],
+                }),
+              ],
+            }),
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    // Two rows stored; one on its own axis. Adding the PAGE to a denominator
+    // that already holds /orders would count one surface twice.
+    expect(store.componentItem).toHaveLength(2);
+    expect(result.components!.own).toBe(1);
+    expect(result.components!.onAnotherAxis).toBe(1);
+  });
+
+  it('reports a state whose registry key has no row, rather than hiding it', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_g',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [componentJson()] }),
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    // Nothing mints COMPONENT_STATE registry rows yet, so every key dangles.
+    // Counted in our own data rather than left to be discovered by a customer.
+    expect(result.components!.danglingRegistryKeys).toBe(2);
+    expect(store.componentState[0]!.coverageItemKey).toBe(
+      'COMPONENT_STATE:src/components/OrderTable.tsx#OrderTable:DEFAULT',
+    );
+    expect(result.snapshot.caveats.join(' ')).toMatch(/dangling reference in our own data/);
+  });
+
+  it('retires a component the reader stopped finding, keeping the row', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_h',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [] }),
+          },
+        ],
+        componentItem: [
+          {
+            id: 'ci_gone',
+            orgId: ORG,
+            projectId: PROJECT,
+            modulePath: 'src/Old.tsx',
+            exportName: 'Old',
+            kind: 'COMPONENT',
+            evidence: 'was there once',
+            retiredAt: null,
+          },
+        ],
+      }),
+    );
+    await compute({ persist: true });
+
+    const gone = store.componentItem.find((row) => row.id === 'ci_gone')!;
+    expect(gone).toBeDefined();
+    expect(gone.retiredAt).not.toBeNull();
+  });
+
+  it('does not retire past its own cap, which would retire what the cap hid', async () => {
+    /*
+     * The component sweep goes through the same gate as the registry sweep, so
+     * its truncated arm is the one `mayRetireItems` unit-tests above. This is
+     * the integration proof that the gate is actually CALLED here: 5,001
+     * components is one past MAX_COMPONENTS, so the read is a floor and the
+     * stale row must survive.
+     */
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_cap',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({
+              components: Array.from({ length: 5001 }, (_unused, index) =>
+                componentJson({
+                  modulePath: `src/C${index}.tsx`,
+                  exportName: `C${index}`,
+                  states: [],
+                }),
+              ),
+            }),
+          },
+        ],
+        componentItem: [
+          {
+            id: 'ci_past_cap',
+            orgId: ORG,
+            projectId: PROJECT,
+            modulePath: 'src/C9999.tsx',
+            exportName: 'C9999',
+            kind: 'COMPONENT',
+            evidence: 'stored before, and past this run’s cap',
+            retiredAt: null,
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+
+    expect(result.components!.truncated).toBe(true);
+    expect(result.snapshot.caveats.join(' ')).toMatch(/at least 1 more exist/);
+    expect(store.componentItem.find((row) => row.id === 'ci_past_cap')!.retiredAt).toBeNull();
+  });
+
+  it('counts without writing on a dry run, and says the dangling count is unknown', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_i',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-01T00:00:00Z'),
+            analysis: analysisJson({ components: [componentJson()] }),
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: false });
+
+    expect(store.componentItem).toHaveLength(0);
+    expect(result.components!.own).toBe(1);
+    // Null, not 0: we did not look, so we do not know.
+    expect(result.components!.danglingRegistryKeys).toBeNull();
+    expect(writesIssued()).toEqual([]);
+  });
+});
+
+// ─── The product's own sentence ──────────────────────────────────────────────
+
+/**
+ * "SOURCE declare N routes; CRAWL reached M of them."
+ *
+ * `reconcileSurface` assembled that sentence and the arithmetic under it from
+ * the day it landed, and nothing called it — correct code, tested, documented,
+ * reachable from nothing but its own test. These assert the call site, not the
+ * function: that the union's two sides reach it per axis, that the headline
+ * comes out, and that a verb survives the projection onto the ENDPOINT axis.
+ */
+describe('computeCoverage — the reconciliation headline', () => {
+  it('produces one report per axis, each naming its own axis', async () => {
+    const result = await compute({ persist: true });
+
+    expect(result.reconciliation!.map((report) => report.axis)).toEqual(['ROUTE', 'ENDPOINT']);
+  });
+
+  it('states the declared count, the reach and the percentage', async () => {
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    // Two routes declared by the repo; the crawl reached one of them.
+    expect(routes.crawlRecall.declared).toBe(2);
+    expect(routes.crawlRecall.reached).toBe(1);
+    expect(routes.crawlRecall.percent).toBe(50);
+    expect(routes.headline).toMatch(/SOURCE declare 2 route\(s\)/);
+    expect(routes.headline).toMatch(/CRAWL reached 1 of them \(50%\)/);
+    // And the sentence lands beside the number it describes.
+    expect(result.snapshot.caveats.join(' ')).toMatch(/ROUTE: SOURCE declare 2 route\(s\)/);
+  });
+
+  it('refuses a reach rather than printing 0% when nothing observed', async () => {
+    install(seed({ flowMap: [] }));
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    // 0% reached would be a measurement. "Nothing observed any of them" is the
+    // fact.
+    expect(routes.headline).toMatch(/nothing observed any of them/);
+    expect(routes.headline).toMatch(/not 0% reached/);
+  });
+
+  it('splits the verb off the path on the ENDPOINT axis, rather than guessing one', async () => {
+    const result = await compute({ persist: true });
+    const endpoints = result.reconciliation!.find((report) => report.axis === 'ENDPOINT')!;
+
+    expect(endpoints.crawlRecall.declared).toBe(1);
+    // The row's identity keeps the method, which it could only do if the
+    // projection passed `method` separately — handing over `"POST /api/refunds"`
+    // as one spelling would make `normaliseEntry` parse a verb out of a path.
+    expect(endpoints.rows.map((row) => row.identity)).toEqual(['POST /api/refunds']);
+  });
+
+  it('carries the declarer set through, so a traffic-only route is REACHED_BUT_NEVER_DECLARED', async () => {
+    install(seed({ coverageItem: [observedRow()] }));
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    const traffic = routes.participation.find((entry) => entry.source === 'TRAFFIC')!;
+    expect(traffic.counted).toBe(true);
+    expect(traffic.side).toBe('REACHED');
+    const checkout = routes.rows.find((row) => row.identity === '/checkout')!;
+    expect(checkout.state).toBe('REACHED_BUT_NEVER_DECLARED');
+  });
+
+  it('is marked incomplete when a declarer failed, so "reconciled" is not claimed', async () => {
+    install(
+      seed({
+        codebaseSnapshot: [
+          {
+            id: 'snap_bad2',
+            orgId: ORG,
+            projectId: PROJECT,
+            createdAt: new Date('2026-01-02T00:00:00Z'),
+            analysis: { unreadable: true },
+          },
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    expect(routes.complete).toBe(false);
+    const source = routes.participation.find((entry) => entry.source === 'SOURCE')!;
+    expect(source.counted).toBe(false);
+    expect(source.notCountedBecause).not.toBeNull();
+  });
+});
+
+describe('computeCoverage — the environment gate on the reconciliation', () => {
+  it('excludes an observed item from another environment rather than merging it', async () => {
+    install(
+      seed({
+        coverageItem: [
+          observedRow({
+            key: 'ROUTE:/staging-only',
+            label: '/staging-only',
+            // The baseline flow map is env_1. This row was observed elsewhere.
+            environmentId: 'env_staging',
+          }),
+        ],
+      }),
+    );
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    /*
+     * A staging observation merged into a production reconciliation turns
+     * staging-only surfaces into uncovered production gaps — the defect
+     * `selectFlowMap` exists to prevent for flow maps, applied to the sets they
+     * feed. It stays in the INVENTORY (it is a real surface somewhere) and out
+     * of THIS comparison.
+     */
+    expect(routes.rows.some((row) => row.identity === '/staging-only')).toBe(false);
+    expect(itemByKey('ROUTE:/staging-only')).toBeDefined();
+    expect(result.snapshot.caveats.join(' ')).toMatch(
+      /1 observed item was recorded in a different environment/,
+    );
+  });
+
+  it('keeps an observed item whose environment matches', async () => {
+    install(seed({ coverageItem: [observedRow({ environmentId: 'env_1' })] }));
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    expect(routes.rows.some((row) => row.identity === '/checkout')).toBe(true);
+    expect(result.snapshot.caveats.join(' ')).not.toMatch(/different environment/);
+  });
+
+  it('keeps an item that states no environment, because that is not a wrong one', async () => {
+    install(seed({ coverageItem: [observedRow({ environmentId: null })] }));
+    const result = await compute({ persist: true });
+    const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
+
+    expect(routes.rows.some((row) => row.identity === '/checkout')).toBe(true);
   });
 });

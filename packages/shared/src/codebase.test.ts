@@ -24,6 +24,10 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  GUARD_KINDS,
+  GUARD_KIND_LIST,
+  GUARD_VERDICTS,
+  GUARD_VERDICT_LABELS,
   SOURCE_DETECTORS,
   analyseCodebase,
   summariseAnalysis,
@@ -1260,5 +1264,1044 @@ describe('token is only a session token in the right company', () => {
 
   it.each(['/auth/refresh-token', '/auth/access-token'])('%s still is', (route) => {
     expect(surfacesFor(route).map((s) => s.kind)).toContain('SESSION');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The five surfaces nothing in this file could see
+//
+// Written against the SAME contract as everything above it, and with one extra
+// obligation. On these five axes QAAI's silence has until now been
+// indistinguishable from the application having nothing there — and absent
+// raises a coverage percentage while uncovered lowers it. So every block below
+// asserts the three-state answer, not the happy one: that an unread guard site
+// yields UNKNOWN rather than public, that a repo with no Storybook yields null
+// rather than "no story", that a cap reports a COUNT, and that a locale list we
+// could not parse is reported rather than read as an app with no locales.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const pkg = (deps: Record<string, string>): RepoFile =>
+  f('package.json', JSON.stringify({ name: 'app', dependencies: deps }));
+
+const guardOf = (a: CodebaseAnalysis, route: string) => {
+  const found = a.routes.find((r) => r.route === route);
+  if (!found) throw new Error(`no route ${route}; got ${a.routes.map((r) => r.route).join(', ')}`);
+  return found.guard;
+};
+const endpointGuardOf = (a: CodebaseAnalysis, path: string) => {
+  const found = a.endpoints.find((e) => e.path === path);
+  if (!found) throw new Error(`no endpoint ${path}`);
+  return found.guard;
+};
+/*
+ * The five new lists are OPTIONAL on `CodebaseAnalysis` — a stored analysis
+ * written before these readers existed has none of them — so every accessor
+ * below ASSERTS presence rather than defaulting to `[]`. That assertion is
+ * load-bearing: `?? []` in a test would let `analyseCodebase` stop setting a
+ * list entirely while every count below it still read zero, and zero is the
+ * flattering answer.
+ */
+const present = <T>(value: T[] | undefined, what: string): T[] => {
+  if (value === undefined) throw new Error(`analyseCodebase did not set ${what}`);
+  return value;
+};
+const componentsOf = (a: CodebaseAnalysis) => present(a.components, 'components');
+const guardsOf = (a: CodebaseAnalysis) => present(a.guards, 'guards');
+const localesOf = (a: CodebaseAnalysis) => present(a.locales, 'locales');
+const flagsOf = (a: CodebaseAnalysis) => present(a.featureFlags, 'featureFlags');
+const backgroundOf = (a: CodebaseAnalysis) => present(a.backgroundSurfaces, 'backgroundSurfaces');
+const shortfall = (a: CodebaseAnalysis, detector: string | null, reason: string) =>
+  present(a.shortfalls, 'shortfalls').find(
+    (s) => s.detector === detector && s.reason === reason,
+  );
+
+describe('guard detection: who is allowed to reach this route', () => {
+  const NEXT_GUARDED: RepoFile[] = [
+    pkg({ next: '^15.0.0' }),
+    f(
+      'middleware.ts',
+      `import { getToken } from 'next-auth/jwt';
+       import { NextResponse } from 'next/server';
+       export async function middleware(req) {
+         const token = await getToken({ req });
+         if (!token) return NextResponse.redirect('/login');
+       }
+       export const config = { matcher: ['/admin/:path*', '/account'] };`,
+    ),
+    f('app/page.tsx', 'export default function Home() { return <main/>; }'),
+    f('app/admin/page.tsx', 'export default function Admin() { return <main/>; }'),
+    f('app/admin/users/page.tsx', 'export default function Users() { return <main/>; }'),
+    f('app/account/page.tsx', 'export default function Account() { return <main/>; }'),
+  ];
+
+  it('reads a Next.js middleware matcher and marks the routes it covers GUARDED', () => {
+    const a = analyseCodebase(NEXT_GUARDED);
+    expect(guardOf(a, '/admin/users')?.access).toBe('GUARDED');
+    expect(guardOf(a, '/account')?.access).toBe('GUARDED');
+  });
+
+  it('covers the matcher’s own base path, because :path* matches zero segments', () => {
+    /*
+     * The regression this exists for: `/admin/:path*` translated to
+     * `^/admin/.*$` left `/admin` itself UNGUARDED, and UNGUARDED is spent
+     * downstream as a positive claim that a route is public. An admin index
+     * page reported as uncovered-and-public is the worst single output this
+     * file can produce.
+     */
+    expect(guardOf(analyseCodebase(NEXT_GUARDED), '/admin')?.access).toBe('GUARDED');
+  });
+
+  it('leaves a route the matcher does not name UNGUARDED, and says what was looked at', () => {
+    const guard = guardOf(analyseCodebase(NEXT_GUARDED), '/');
+    expect(guard?.access).toBe('UNGUARDED');
+    expect(guard?.evidence).toContain('no guard was found');
+    expect(guard?.declaredBy).toEqual([]);
+  });
+
+  it('reports UNKNOWN, never UNGUARDED, when no file bodies were uploaded', () => {
+    const a = analyseCodebase([f('package.json'), f('app/admin/page.tsx'), f('app/page.tsx')]);
+    expect(a.routes.map((r) => r.guard?.access)).toEqual(['UNKNOWN', 'UNKNOWN']);
+    // The claim must be about OUR input, not about the customer's app.
+    expect(guardOf(a, '/admin')?.evidence).toContain('our missing input');
+  });
+
+  it('clouds every route when a middleware was found and its body was not', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f('middleware.ts'),
+      f('app/admin/page.tsx', 'export default function A() { return <div/>; }'),
+    ]);
+    expect(guardOf(a, '/admin')?.access).toBe('UNKNOWN');
+    const row = shortfall(a, 'route-guards', 'NO_CONTENT');
+    expect(row?.count).toBe(1);
+    expect(row?.detail).toContain('UNKNOWN rather than public');
+  });
+
+  it('refuses a regex matcher rather than half-translating it', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f(
+        'middleware.ts',
+        `import { getToken } from 'next-auth/jwt';
+         export const config = { matcher: ['/((?!api|_next).*)'] };`,
+      ),
+      f('app/admin/page.tsx', 'export default function A() { return <div/>; }'),
+    ]);
+    expect(guardOf(a, '/admin')?.access).toBe('UNKNOWN');
+    expect(shortfall(a, 'route-guards', 'EXPRESSION_NOT_LITERAL')?.count).toBe(1);
+  });
+
+  it('reads a guard route group, and refuses to read an organisational one', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f('app/(authenticated)/billing/page.tsx', 'export default function B() { return <div/>; }'),
+      f('app/(dashboard)/reports/page.tsx', 'export default function R() { return <div/>; }'),
+    ]);
+    expect(guardOf(a, '/billing')?.access).toBe('GUARDED');
+    /*
+     * `(dashboard)` is a filing decision, not an access rule. It sits behind a
+     * login in some applications and in front of one in others, and there is
+     * nothing in the name to say which — so reading it as a guard would mark a
+     * public marketing tree GUARDED on the strength of a folder name.
+     */
+    expect(guardOf(a, '/reports')?.access).toBe('UNGUARDED');
+  });
+
+  it('takes the role from a route group that names one', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f('app/(admin)/settings/page.tsx', 'export default function S() { return <div/>; }'),
+    ]);
+    expect(guardOf(a, '/settings')?.roles).toEqual(['admin']);
+    expect(guardOf(a, '/settings')?.declaredBy[0]?.evidence).toContain(
+      'the only basis for the role claim',
+    );
+  });
+
+  it('reads the role out of a middleware chain whose guard call has its own parentheses', () => {
+    /*
+     * The tail of the registration was cut at the first `)` — which is inside
+     * `requireRole('ADMIN')` — so the route came out GUARDED with no role. A
+     * guarded route whose role was dropped leaves the route × role matrix with
+     * an empty cell exactly where the only interesting cell was.
+     */
+    const a = analyseCodebase([
+      pkg({ express: '^4.19.0' }),
+      f(
+        'src/api.js',
+        `const app = express();
+         app.get('/orders', requireAuth, list);
+         app.post('/admin/refunds', requireRole('ADMIN'), refund);
+         app.get('/health', health);`,
+      ),
+    ]);
+    expect(endpointGuardOf(a, '/admin/refunds')?.roles).toEqual(['ADMIN']);
+    expect(endpointGuardOf(a, '/orders')?.access).toBe('GUARDED');
+    expect(endpointGuardOf(a, '/orders')?.roles).toBeNull();
+    expect(endpointGuardOf(a, '/health')?.access).toBe('UNGUARDED');
+  });
+
+  it('keeps the application’s own spelling of a role', () => {
+    // surface.ts is explicit: a role the app calls `Admin` and one it calls
+    // `admin` are two roles until the customer says otherwise. Normalising
+    // them here would merge two cells and shrink a denominator silently.
+    const a = analyseCodebase([
+      pkg({ express: '^4' }),
+      f('src/api.js', `const app = express();\napp.get('/x', requireRole('Admin'), h);`),
+    ]);
+    expect(endpointGuardOf(a, '/x')?.roles).toEqual(['Admin']);
+  });
+
+  it('guards a subtree from a layout that reads a session and redirects', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f(
+        'app/portal/layout.tsx',
+        `import { getServerSession } from 'next-auth';
+         import { redirect } from 'next/navigation';
+         export default async function Layout({ children }) {
+           const session = await getServerSession();
+           if (!session) redirect('/login');
+           return children;
+         }`,
+      ),
+      f('app/portal/invoices/page.tsx', 'export default function I() { return <div/>; }'),
+      f('app/page.tsx', 'export default function H() { return <div/>; }'),
+    ]);
+    expect(guardOf(a, '/portal/invoices')?.access).toBe('GUARDED');
+    expect(guardOf(a, '/')?.access).toBe('UNGUARDED');
+  });
+
+  it('reads a Spring @PreAuthorize role onto the endpoints the same file declares', () => {
+    const a = analyseCodebase([
+      f('pom.xml', '<project><dependencies/></project>'),
+      f(
+        'src/main/java/com/acme/AdminController.java',
+        `@RestController
+         @RequestMapping("/admin")
+         public class AdminController {
+           @PreAuthorize("hasRole('ADMIN')")
+           @GetMapping("/audit")
+           public List<Row> audit() { return rows; }
+         }`,
+      ),
+    ]);
+    expect(endpointGuardOf(a, '/admin/audit')?.access).toBe('GUARDED');
+    expect(endpointGuardOf(a, '/admin/audit')?.roles).toEqual(['ADMIN']);
+  });
+
+  it('answers UNKNOWN when a guard decorator and a public marker are in one file', () => {
+    /*
+     * A class-level `@UseGuards` with `@Public()` on one method is a MIXTURE,
+     * and a text scan cannot say which handler is which. Claiming GUARDED for
+     * the file would hide a public endpoint inside an inventory of protected
+     * ones — the exact surface an authorization test is written to find.
+     */
+    const a = analyseCodebase([
+      f('pom.xml', '<project/>'),
+      f(
+        'src/main/java/com/acme/MixedController.java',
+        `@RestController
+         @RequestMapping("/billing")
+         @Secured("ROLE_ADMIN")
+         public class MixedController {
+           @AllowAnonymous()
+           @GetMapping("/health")
+           public String health() { return "ok"; }
+           @GetMapping("/invoices")
+           public List<Row> list() { return rows; }
+         }`,
+      ),
+    ]);
+    expect(endpointGuardOf(a, '/billing/invoices')?.access).toBe('UNKNOWN');
+    expect(endpointGuardOf(a, '/billing/invoices')?.evidence).toContain('public marker');
+  });
+
+  it('does not read a middleware that only rewrites locales as a guard', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f(
+        'middleware.ts',
+        `import createMiddleware from 'next-intl/middleware';
+         export default createMiddleware({ locales: ['en', 'de'], defaultLocale: 'en' });
+         export const config = { matcher: ['/(de|en)/:path*'] };`,
+      ),
+      f('app/pricing/page.tsx', 'export default function P() { return <div/>; }'),
+    ]);
+    // We DID read the one file that could have guarded it, so UNGUARDED is
+    // earned rather than defaulted.
+    expect(guardOf(a, '/pricing')?.access).toBe('UNGUARDED');
+    expect(guardsOf(a).filter((g) => g.kind === 'NEXT_MIDDLEWARE')).toHaveLength(0);
+  });
+
+  it('reports a guard declaration that matched no route, because that is about OUR extractor', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f(
+        'middleware.ts',
+        `import { getToken } from 'next-auth/jwt';
+         export const config = { matcher: ['/admin/:path*'] };`,
+      ),
+      f('app/page.tsx', 'export default function H() { return <div/>; }'),
+    ]);
+    // No /admin route is in the inventory, which means either dead config or —
+    // far more likely — an admin area our route detectors failed to read.
+    // Suppressing it would be hiding our own error rate.
+    expect(guardsOf(a).map((g) => g.patterns).flat()).toContain('/admin/:path*');
+    expect(a.routes.every((r) => r.route !== '/admin')).toBe(true);
+  });
+
+  it('reads an auth wrapper around a page’s default export', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^14' }),
+      f(
+        'pages/billing.tsx',
+        `import { withPageAuthRequired } from '@auth0/nextjs-auth0';
+         export default withPageAuthRequired(function Billing() { return <div/>; });`,
+      ),
+    ]);
+    expect(guardOf(a, '/billing')?.access).toBe('GUARDED');
+    expect(guardOf(a, '/billing')?.declaredBy[0]?.kind).toBe('AUTH_WRAPPER');
+  });
+
+  it('reads a React Router loader guard off the <Route> tag it is written on', () => {
+    const a = analyseCodebase([
+      pkg({ 'react-router-dom': '^6.26.0' }),
+      f(
+        'src/App.tsx',
+        `import { Routes, Route } from 'react-router-dom';
+         export default function App() {
+           return (
+             <Routes>
+               <Route path="/" element={<Home />} />
+               <Route path="/vault" loader={requireAuth} element={<Vault />} />
+             </Routes>
+           );
+         }`,
+      ),
+    ]);
+    expect(guardOf(a, '/vault')?.access).toBe('GUARDED');
+    expect(guardOf(a, '/')?.access).toBe('UNGUARDED');
+  });
+
+  it('reads only the matcher array, not the property written after it on the same line', () => {
+    /*
+     * `{ matcher: ['/admin'], regions: ['/iad1'] }` on one line donated
+     * `/iad1` to the matcher, and `/iad1` — a perfectly public route — came out
+     * GUARDED. An invented guard is as damaging as a missed one: it tells the
+     * crawl not to bother with a page it was always allowed to see.
+     */
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f(
+        'middleware.ts',
+        `import { getToken } from 'next-auth/jwt';
+         export const config = { matcher: ['/admin'], runtime: 'nodejs', regions: ['/iad1'] };`,
+      ),
+      f('app/admin/page.tsx', 'export default function A() { return <div/>; }'),
+      f('app/iad1/page.tsx', 'export default function X() { return <div/>; }'),
+    ]);
+    expect(guardsOf(a).flatMap((g) => g.patterns)).toEqual(['/admin']);
+    expect(guardOf(a, '/admin')?.access).toBe('GUARDED');
+    expect(guardOf(a, '/iad1')?.access).toBe('UNGUARDED');
+  });
+
+  it('pairs every GuardKind with a run-time entry, which the compiler alone cannot do', () => {
+    /*
+     * Both halves of the guard this codebase enforces for a vocabulary with a
+     * write path. Eight GateRule kinds shipped unsaveable for two slices
+     * because only the compiler-enforced half existed, and check:wiring cannot
+     * see that class of defect.
+     */
+    expect([...GUARD_KIND_LIST].sort()).toEqual([...GUARD_KINDS].sort());
+    expect(GUARD_KIND_LIST).toHaveLength(GUARD_KINDS.length);
+    for (const verdict of GUARD_VERDICTS) {
+      expect(GUARD_VERDICT_LABELS[verdict]).toBeTruthy();
+    }
+  });
+});
+
+describe('the component inventory, which UNIT_GEN had no denominator for', () => {
+  const CATALOGUED: RepoFile[] = [
+    pkg({ next: '^15.0.0', react: '^19.0.0' }),
+    f('app/page.tsx', 'export default function Home() { return <main/>; }'),
+    f('app/layout.tsx', 'export default function Layout({ children }) { return children; }'),
+    f('app/_components/Button.tsx', 'export const Button = ({ label }) => <button>{label}</button>;'),
+    f(
+      'components/Table.tsx',
+      `export function Table({ rows, onSort }) {
+         if (isLoading) return <Spinner/>;
+         if (rows.length === 0) return <Empty/>;
+         if (error) return <Err/>;
+         return <table/>;
+       }`,
+    ),
+    f(
+      'components/Table.stories.tsx',
+      `export default { title: 'Data/Table', component: Table };
+       export const Default = {};
+       export const Slow = {};`,
+    ),
+    f('hooks/useOrders.ts', 'export function useOrders() { return useQuery(); }'),
+    f('ctx/Theme.tsx', 'export const ThemeProvider = ({ children }) => <div>{children}</div>;'),
+    f('lib/format.ts', 'export function formatMoney(cents: number) { return cents / 100; }'),
+    f('lib/config.ts', "export const SUPPORTED = ['a', 'b'];"),
+  ];
+  const analysis = analyseCodebase(CATALOGUED);
+  const component = (path: string, name: string) => {
+    const found = componentsOf(analysis).find(
+      (c) => c.modulePath === path && c.exportName === name,
+    );
+    if (!found) throw new Error(`no component ${path}#${name}`);
+    return found;
+  };
+
+  it('classifies pages, layouts, components, hooks and providers apart', () => {
+    expect(component('app/page.tsx', 'default').kind).toBe('PAGE');
+    expect(component('app/layout.tsx', 'default').kind).toBe('LAYOUT');
+    expect(component('components/Table.tsx', 'Table').kind).toBe('COMPONENT');
+    expect(component('hooks/useOrders.ts', 'useOrders').kind).toBe('HOOK');
+    expect(component('ctx/Theme.tsx', 'ThemeProvider').kind).toBe('CONTEXT_PROVIDER');
+    expect(component('lib/format.ts', 'formatMoney').kind).toBe('UTILITY');
+  });
+
+  it('does not read a component under app/ as a route entry point', () => {
+    // A button counted on the ROUTE axis is the double count
+    // `componentHasOwnAxis` exists to prevent, arriving by the back door.
+    expect(component('app/_components/Button.tsx', 'Button').kind).toBe('COMPONENT');
+    expect(analysis.routes.map((r) => r.route)).not.toContain('/_components/Button');
+  });
+
+  it('does not count a data constant as an exported helper', () => {
+    // `export const SUPPORTED = ['a','b']` is data. A denominator padded with
+    // things no unit test could be written against makes the percentage fall
+    // for a reason the customer cannot act on.
+    expect(componentsOf(analysis).some((c) => c.exportName === 'SUPPORTED')).toBe(false);
+  });
+
+  it('records three states for the catalogue, not two', () => {
+    // A catalogue WAS read here, so `false` is a measured claim.
+    expect(component('components/Table.tsx', 'Table').hasCatalogueEntry).toBe(true);
+    expect(component('components/Table.tsx', 'Table').catalogueRef).toBe('Data/Table');
+    expect(component('lib/format.ts', 'formatMoney').hasCatalogueEntry).toBe(false);
+  });
+
+  it('leaves hasCatalogueEntry NULL when no catalogue exists anywhere in the repo', () => {
+    /*
+     * The one that matters. `false` would say "a catalogue was read and this
+     * component is not in it" about a project whose Storybook we never looked
+     * for — a measured claim about something not measured, and the kind of
+     * sentence a customer acts on by writing stories they already have.
+     */
+    const bare = analyseCodebase([f('components/Card.tsx', 'export function Card() { return <div/>; }')]);
+    expect(componentsOf(bare)).toHaveLength(1);
+    expect(componentsOf(bare)[0]?.hasCatalogueEntry).toBeNull();
+  });
+
+  it('counts a component with no story as a component', () => {
+    const named = componentsOf(analysis).map((c) => c.exportName);
+    expect(named).toContain('Button');
+    expect(component('app/_components/Button.tsx', 'Button').hasCatalogueEntry).toBe(false);
+  });
+
+  it('reads the states a render branch declares, and says they came from source', () => {
+    const states = component('components/Table.tsx', 'Table').states;
+    const fromSource = states.filter((s) => s.source === 'SOURCE').map((s) => s.kind);
+    expect(fromSource).toContain('LOADING');
+    expect(fromSource).toContain('EMPTY');
+    expect(fromSource).toContain('ERROR');
+    expect(fromSource).toContain('DEFAULT');
+  });
+
+  it('reads SLOW only from a catalogue, because no render branch declares it', () => {
+    /*
+     * A slow response is reached by holding a response open, not by taking a
+     * branch. Inventing a source pattern for it would report a measurement
+     * nobody took on the one state nobody writes by hand.
+     */
+    const states = component('components/Table.tsx', 'Table').states;
+    const slow = states.filter((s) => s.kind === 'SLOW');
+    expect(slow).toHaveLength(1);
+    expect(slow[0]?.source).toBe('CATALOGUE');
+    expect(states.filter((s) => s.kind === 'SLOW' && s.source === 'SOURCE')).toHaveLength(0);
+  });
+
+  it('does not read a bare `loading` or `error` identifier as a state', () => {
+    // Over-reporting is the mirror image of omission, not a cure for it: a
+    // state that does not exist still lowers the percentage.
+    const noisy = analyseCodebase([
+      f(
+        'components/Quiet.tsx',
+        `import loadingGif from './loading.gif';
+         export function Quiet() {
+           try { work(); } catch (error) { report(error); }
+           return <img src={loadingGif} />;
+         }`,
+      ),
+    ]);
+    const states = componentsOf(noisy)[0]?.states.map((s) => s.kind) ?? [];
+    expect(states).toEqual(['DEFAULT']);
+  });
+
+  it('finds an export list’s local declaration rather than giving up on it', () => {
+    const a = analyseCodebase([
+      f('lib/money.ts', 'function toCents(x: number) { return x * 100; }\nexport { toCents };'),
+    ]);
+    expect(componentsOf(a).map((c) => c.exportName)).toEqual(['toCents']);
+    expect(componentsOf(a)[0]?.kind).toBe('UTILITY');
+  });
+
+  it('summarises props from a destructure and from a declared type, never the full type', () => {
+    expect(component('components/Table.tsx', 'Table').propsSummary).toBe('props: rows, onSort');
+    const typed = analyseCodebase([
+      f(
+        'components/Badge.tsx',
+        `interface BadgeProps {
+           tone: 'ok' | 'bad';
+           count?: number;
+         }
+         export function Badge(p: BadgeProps) { return <span/>; }`,
+      ),
+    ]);
+    expect(componentsOf(typed)[0]?.propsSummary).toBe('props: tone, count');
+  });
+
+  it('does not hand a helper the props of a component declared beside it', () => {
+    /*
+     * The declared-`Props` fallback searches the whole file, so a helper next
+     * to a `ButtonProps` interface was described by the button's props — a
+     * field whose doc comment says "a one-line summary of the props"
+     * summarising a different export's.
+     */
+    const a = analyseCodebase([
+      f(
+        'ui/Button.tsx',
+        `interface ButtonProps { tone: string; onPress: () => void }
+         export function Button(p: ButtonProps) { return <button/>; }
+         export function toneClass(tone: string) { return \`t-\${tone}\`; }`,
+      ),
+    ]);
+    const byName = new Map(componentsOf(a).map((c) => [c.exportName, c.propsSummary]));
+    expect(byName.get('Button')).toBe('props: tone, onPress');
+    expect(byName.get('toneClass')).toBeNull();
+  });
+
+  it('counts the modules whose bodies it never got, rather than skipping them silently', () => {
+    const a = analyseCodebase([
+      f('components/A.tsx'),
+      f('components/B.tsx'),
+      f('components/C.tsx', 'export function C() { return <div/>; }'),
+    ]);
+    expect(componentsOf(a)).toHaveLength(1);
+    const row = shortfall(a, 'component-inventory', 'NO_CONTENT');
+    expect(row?.count).toBe(2);
+  });
+});
+
+describe('surfaces off the HTTP request path', () => {
+  const BACKGROUND: RepoFile[] = [
+    pkg({ bullmq: '^5.0.0', nodemailer: '^6.9.0' }),
+    f('vercel.json', JSON.stringify({ crons: [{ path: '/api/cron/digest', schedule: '0 9 * * *' }] })),
+    f(
+      '.github/workflows/nightly.yml',
+      `on:
+  schedule:
+    - cron: '17 3 * * *'
+jobs:
+  build: { runs-on: ubuntu-latest }`,
+    ),
+    f(
+      'workers/email.ts',
+      `import { Worker } from 'bullmq';
+       new Worker('emails', async (job) => {
+         await transporter.sendMail({ template: 'welcome', to: job.data.email });
+       }, { concurrency: 5 });`,
+    ),
+    f(
+      'app/api/stripe/route.ts',
+      `export async function POST(req: Request) {
+         const sig = req.headers.get('stripe-signature');
+         const event = stripe.webhooks.constructEvent(await req.text(), sig, secret);
+       }`,
+    ),
+    f(
+      'jobs/reindex.ts',
+      `import { Cron } from '@nestjs/schedule';
+       export class Reindex {
+         @Cron(CronExpression.EVERY_HOUR)
+         run() {}
+       }`,
+    ),
+    f('actions/invite.ts', `'use server';\nexport async function inviteUser(email: string) { await save(email); }`),
+    f(
+      'server/trpc.ts',
+      `export const billingRouter = createTRPCRouter({
+         list: publicProcedure.query(() => []),
+         refund: protectedProcedure.input(schema).mutation(() => null),
+       });`,
+    ),
+  ];
+  const analysis = analyseCodebase(BACKGROUND);
+  const facts = backgroundOf(analysis).map((s) => s.fact);
+  const ofKind = <K extends string>(kind: K) => facts.filter((fact) => fact.kind === kind);
+
+  it('reads a Vercel cron with its expression as written', () => {
+    const crons = ofKind('CRON');
+    expect(crons).toContainEqual({
+      kind: 'CRON',
+      expression: '0 9 * * *',
+      handler: '/api/cron/digest',
+    });
+  });
+
+  it('reads a GitHub Actions schedule', () => {
+    expect(ofKind('CRON').map((c) => (c.kind === 'CRON' ? c.expression : ''))).toContain('17 3 * * *');
+  });
+
+  it('never normalises a schedule, because @daily is not 0 0 * * *', () => {
+    const named = ofKind('CRON').map((c) => (c.kind === 'CRON' ? c.expression : ''));
+    expect(named).toContain('CronExpression.EVERY_HOUR');
+  });
+
+  it('reads a queue consumer’s concurrency from past the handler’s own parentheses', () => {
+    /*
+     * The tail stopped at the `)` of `(job)`, so a worker that plainly declares
+     * `concurrency: 5` reported null — a null where a measured value existed,
+     * which is the same species of error as a null that became 0.
+     */
+    expect(ofKind('QUEUE_CONSUMER')).toContainEqual({
+      kind: 'QUEUE_CONSUMER',
+      queue: 'emails',
+      concurrency: 5,
+      handler: 'workers/email.ts',
+    });
+  });
+
+  it('reads a webhook receiver and its signature scheme at the URL it answers on', () => {
+    expect(ofKind('WEBHOOK_RECEIVER')).toContainEqual({
+      kind: 'WEBHOOK_RECEIVER',
+      path: '/api/stripe',
+      signatureScheme: 'stripe-signature',
+    });
+  });
+
+  it('reports an unreadable signature scheme as NULL, which is not "none"', () => {
+    /*
+     * "The payload is unsigned" and "we could not read how it is signed" are
+     * different facts, and the difference decides whether an unsigned-payload
+     * test is a valid negative case or a guess.
+     */
+    const a = analyseCodebase([
+      f(
+        'app/api/hook/route.ts',
+        `export async function POST(req: Request) {
+           const given = req.headers.get('x-vendor-digest');
+           if (!secureCompare(given, expected)) return new Response(null, { status: 401 });
+           const body = await req.text();
+           timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+         }`,
+      ),
+    ]);
+    const hook = backgroundOf(a).find((s) => s.fact.kind === 'WEBHOOK_RECEIVER');
+    expect(hook?.fact.kind === 'WEBHOOK_RECEIVER' && hook.fact.signatureScheme).toBeNull();
+    expect(hook?.evidence).toContain('not the same as none');
+  });
+
+  it('does not read a crypto helper as a webhook receiver', () => {
+    const a = analyseCodebase([
+      f('lib/sign.ts', "export const sign = (b: string) => createHmac('sha256', key).update(b).digest('hex');"),
+    ]);
+    expect(backgroundOf(a).filter((s) => s.fact.kind === 'WEBHOOK_RECEIVER')).toHaveLength(0);
+  });
+
+  it('reads outbound mail, and says so when the file path is standing in for a template id', () => {
+    expect(ofKind('OUTBOUND_EMAIL')).toContainEqual({
+      kind: 'OUTBOUND_EMAIL',
+      templateId: 'welcome',
+      sentBy: 'workers/email.ts',
+    });
+    const inline = analyseCodebase([
+      f('lib/notify.ts', 'export const notify = () => transporter.sendMail({ to: who, html: body });'),
+    ]);
+    const mail = backgroundOf(inline).find((s) => s.fact.kind === 'OUTBOUND_EMAIL');
+    expect(mail?.fact.kind === 'OUTBOUND_EMAIL' && mail.fact.templateId).toBe('lib/notify.ts');
+    expect(mail?.evidence).toContain('stands in as the identity');
+  });
+
+  it('reads a server action and a tRPC query apart from a tRPC mutation', () => {
+    expect(ofKind('SERVER_ACTION')).toContainEqual({
+      kind: 'SERVER_ACTION',
+      module: 'actions/invite.ts',
+      exportName: 'inviteUser',
+    });
+    expect(ofKind('TRPC_PROCEDURE')).toContainEqual({
+      kind: 'TRPC_PROCEDURE',
+      procedure: 'billing.list',
+      mutation: false,
+    });
+    expect(ofKind('TRPC_PROCEDURE')).toContainEqual({
+      kind: 'TRPC_PROCEDURE',
+      procedure: 'billing.refund',
+      mutation: true,
+    });
+  });
+
+  it('reports an unreadable vercel.json rather than reporting no crons', () => {
+    /*
+     * "This project declares no crons" and "we could not read the file that
+     * declares them" are opposite facts, and the first one is the undisclosed
+     * cap that makes a coverage percentage go up.
+     */
+    const a = analyseCodebase([f('vercel.json', '{ crons: [ oops }')]);
+    expect(backgroundOf(a)).toHaveLength(0);
+    expect(shortfall(a, 'background-surfaces', 'UNPARSEABLE')?.count).toBe(1);
+  });
+
+  it('reads an upload handler’s declared cap, and reports its absence as absence', () => {
+    const capped = analyseCodebase([
+      f('src/upload.ts', "export const mw = multer({ limits: { fileSize: 5242880 }, dest: '/tmp' });"),
+    ]);
+    const one = backgroundOf(capped).find((s) => s.fact.kind === 'UPLOAD');
+    expect(one?.fact.kind === 'UPLOAD' && one.fact.maxBytes).toBe(5242880);
+
+    const uncapped = analyseCodebase([f('src/upload.ts', "export const mw = multer({ dest: '/tmp' });")]);
+    const two = backgroundOf(uncapped).find((s) => s.fact.kind === 'UPLOAD');
+    expect(two?.fact.kind === 'UPLOAD' && two.fact.maxBytes).toBeNull();
+    expect(two?.evidence).toContain('declares no size cap');
+  });
+});
+
+describe('the application’s feature flags, which decide which app the crawl saw', () => {
+  it('reads each provider’s call site and labels it', () => {
+    const a = analyseCodebase([
+      pkg({ launchdarkly: '^3', '@growthbook/growthbook': '^1', statsig: '^5' }),
+      f(
+        'lib/flags.ts',
+        `export const a = () => ldClient.variation('new-nav', ctx, false);
+         export const b = () => unleash.isEnabled('legacy-import');
+         export const c = () => growthbook.isOn('checkout-v2');
+         export const d = () => gb.getFeatureValue('theme', 'light');
+         export const e = () => flagsmith.hasFeature('dark-mode');
+         export const g = () => Statsig.checkGate('fast-path');
+         export const h = () => ofClient.getStringValue('cta-copy', 'buy');`,
+      ),
+    ]);
+    const byKey = new Map(flagsOf(a).map((flag) => [flag.key, flag]));
+    expect(byKey.get('new-nav')?.provider).toBe('LAUNCHDARKLY');
+    expect(byKey.get('legacy-import')?.provider).toBe('UNLEASH');
+    expect(byKey.get('checkout-v2')?.provider).toBe('GROWTHBOOK');
+    expect(byKey.get('dark-mode')?.provider).toBe('FLAGSMITH');
+    expect(byKey.get('fast-path')?.provider).toBe('STATSIG');
+    expect(byKey.get('cta-copy')?.provider).toBe('OPENFEATURE');
+  });
+
+  it('enumerates a boolean gate’s variants and leaves a multivariate flag’s NULL', () => {
+    /*
+     * `['light']` for a flag whose only readable fact is its fallback would be
+     * a null that became a value, and it would tell a flag sweep it had covered
+     * a flag it had seen one side of.
+     */
+    const a = analyseCodebase([
+      pkg({ '@growthbook/growthbook': '^1' }),
+      f(
+        'lib/flags.ts',
+        `export const c = () => growthbook.isOn('checkout-v2');
+         export const d = () => gb.getFeatureValue('theme', 'light');`,
+      ),
+    ]);
+    const byKey = new Map(flagsOf(a).map((flag) => [flag.key, flag]));
+    expect(byKey.get('checkout-v2')?.variants).toEqual(['on', 'off']);
+    expect(byKey.get('theme')?.variants).toBeNull();
+    expect(byKey.get('theme')?.defaultVariant).toBe('light');
+    expect(byKey.get('theme')?.evidence).toContain('not in the repo');
+  });
+
+  it('reads an env gate and refuses to guess which value production sets', () => {
+    const a = analyseCodebase([
+      f(
+        'lib/gate.ts',
+        `export const beta = () => process.env.NEXT_PUBLIC_FEATURE_BETA === 'true';
+         export const legacy = () => process.env.DISABLE_LEGACY_CART === '1';`,
+      ),
+    ]);
+    const byKey = new Map(flagsOf(a).map((flag) => [flag.key, flag]));
+    expect(byKey.get('NEXT_PUBLIC_FEATURE_BETA')?.provider).toBe('ENV_GATE');
+    expect(byKey.get('NEXT_PUBLIC_FEATURE_BETA')?.variants).toEqual(['on', 'off']);
+    // Null, not 'off': the default is whatever the deployment sets, and that is
+    // not in the repository.
+    expect(byKey.get('NEXT_PUBLIC_FEATURE_BETA')?.defaultVariant).toBeNull();
+    expect(byKey.get('DISABLE_LEGACY_CART')).toBeDefined();
+  });
+
+  it('does not read configuration as a flag', () => {
+    // A connection string in the flag dimension would multiply the
+    // FLAG_COMBINATION axis by it.
+    const a = analyseCodebase([
+      f('lib/db.ts', 'export const url = process.env.DATABASE_URL;\nconst flagHint = 1;'),
+    ]);
+    expect(flagsOf(a)).toHaveLength(0);
+  });
+
+  it('reads a checked-in flag catalogue, with the default a boolean states', () => {
+    const a = analyseCodebase([
+      f('config/flags.json', JSON.stringify({ 'new-nav': true, 'legacy-cart': false, tier: 'pro' })),
+    ]);
+    const byKey = new Map(flagsOf(a).map((flag) => [flag.key, flag]));
+    expect(byKey.get('new-nav')?.defaultVariant).toBe('on');
+    expect(byKey.get('legacy-cart')?.defaultVariant).toBe('off');
+    // A string value is not a boolean gate, so its variants are unknown.
+    expect(byKey.get('tier')?.variants).toBeNull();
+  });
+
+  it('reads only the top-level keys of a YAML catalogue, and reports the rest as unread', () => {
+    const a = analyseCodebase([
+      f('config/features.yml', 'new-nav:\n  enabled: true\n  rollout: 50\nlegacy-cart:\n  enabled: false\n'),
+    ]);
+    expect(flagsOf(a).map((flag) => flag.key)).toEqual(['new-nav', 'legacy-cart']);
+    expect(flagsOf(a).every((flag) => flag.variants === null)).toBe(true);
+    expect(shortfall(a, 'feature-flags', 'UNPARSEABLE')?.detail).toContain('variants and default');
+  });
+
+  it('counts a flag catalogue whose body was not uploaded', () => {
+    const a = analyseCodebase([f('config/flags.json')]);
+    expect(flagsOf(a)).toHaveLength(0);
+    expect(shortfall(a, 'feature-flags', 'NO_CONTENT')?.count).toBe(1);
+  });
+});
+
+describe('locale discovery, instead of whatever a human typed into a spec', () => {
+  it('reads a message catalogue directory and refuses the namespace files in it', () => {
+    /*
+     * `common.json` and `index.json` are namespaces. Three invented locales
+     * multiply the DEVICE_LOCALE axis by a factor nobody asked for, which is
+     * the mirror image of a missing surface and just as wrong.
+     */
+    const a = analyseCodebase([
+      f('messages/en.json', '{}'),
+      f('messages/pt-BR.json', '{}'),
+      f('messages/he.json', '{}'),
+      f('messages/common.json', '{}'),
+      f('messages/index.json', '{}'),
+      f('messages/ui.json', '{}'),
+    ]);
+    expect(localesOf(a).map((l) => l.tag).sort()).toEqual(['en', 'he', 'pt-BR']);
+  });
+
+  it('keeps the application’s own spelling of a tag', () => {
+    const a = analyseCodebase([f('locales/pt-BR.json', '{}')]);
+    expect(localesOf(a)[0]?.tag).toBe('pt-BR');
+  });
+
+  it('marks a right-to-left locale, because RTL re-lays-out the page', () => {
+    const a = analyseCodebase([
+      f('locales/en.json', '{}'),
+      f('locales/ar.json', '{}'),
+      f('locales/he.json', '{}'),
+    ]);
+    const byTag = new Map(localesOf(a).map((l) => [l.tag, l.rtl]));
+    expect(byTag.get('ar')).toBe(true);
+    expect(byTag.get('he')).toBe(true);
+    expect(byTag.get('en')).toBe(false);
+  });
+
+  it('reads a next-intl config written as a const, and the default it names', () => {
+    const a = analyseCodebase([
+      pkg({ 'next-intl': '^3.0.0' }),
+      f(
+        'i18n.ts',
+        `import { getRequestConfig } from 'next-intl/server';
+         export const locales = ['en', 'de', 'ar'];
+         export const defaultLocale = 'en';`,
+      ),
+    ]);
+    expect(localesOf(a).map((l) => l.tag)).toEqual(['en', 'de', 'ar']);
+    expect(localesOf(a).filter((l) => l.isDefault).map((l) => l.tag)).toEqual(['en']);
+    expect(localesOf(a).every((l) => l.reader === 'NEXT_INTL')).toBe(true);
+  });
+
+  it('reads an i18next supportedLngs list and its fallback', () => {
+    const a = analyseCodebase([
+      pkg({ i18next: '^23.0.0' }),
+      f(
+        'src/i18n.ts',
+        `import i18next from 'i18next';
+         i18next.init({ supportedLngs: ['en-GB', 'fr'], fallbackLng: 'fr' });`,
+      ),
+    ]);
+    expect(localesOf(a).map((l) => l.tag).sort()).toEqual(['en-GB', 'fr']);
+    expect(localesOf(a).find((l) => l.isDefault)?.tag).toBe('fr');
+  });
+
+  it('claims NO default when nothing declares one', () => {
+    /*
+     * A catalogue directory declares WHICH locales exist and says nothing about
+     * which one is served. Guessing `en` because it sorts first would invent
+     * the one fact `dimensionDenominator` divides by — it counts no default
+     * cells at all when `defaultValue` is null, which is the honest arithmetic.
+     */
+    const a = analyseCodebase([f('locales/en.json', '{}'), f('locales/de.json', '{}')]);
+    expect(localesOf(a)).toHaveLength(2);
+    expect(localesOf(a).some((l) => l.isDefault)).toBe(false);
+  });
+
+  it('reports a locale list that is not a literal rather than reporting no locales', () => {
+    const a = analyseCodebase([
+      pkg({ 'next-intl': '^3' }),
+      f(
+        'i18n.ts',
+        `import { getRequestConfig } from 'next-intl/server';
+         export const locales = Object.keys(catalogues);`,
+      ),
+    ]);
+    expect(localesOf(a)).toHaveLength(0);
+    expect(shortfall(a, 'locales', 'EXPRESSION_NOT_LITERAL')?.count).toBe(1);
+  });
+
+  it('reads hreflang alternates out of static markup', () => {
+    const a = analyseCodebase([
+      f(
+        'public/index.html',
+        `<link rel="alternate" hreflang="en" href="/en" />
+         <link rel="alternate" hreflang="ja" href="/ja" />`,
+      ),
+    ]);
+    expect(localesOf(a).map((l) => l.tag).sort()).toEqual(['en', 'ja']);
+    expect(localesOf(a).every((l) => l.reader === 'HREFLANG')).toBe(true);
+  });
+
+  it('reports a default naming a locale nothing declares, rather than inventing the row', () => {
+    const a = analyseCodebase([
+      pkg({ 'next-intl': '^3' }),
+      f('i18n.ts', "import 'next-intl';\nexport const locales = ['en'];\nexport const defaultLocale = 'nl';"),
+    ]);
+    expect(localesOf(a).map((l) => l.tag)).toEqual(['en']);
+    expect(shortfall(a, 'locales', 'UNRESOLVED_IMPORT')?.detail).toContain('nl');
+  });
+});
+
+describe('the five readers’ own honesty surface', () => {
+  it('names every new detector in the report, run or not', () => {
+    const a = analyseCodebase([f('readme.md', '# hi')]);
+    const ids = a.detectors.map((d) => d.id);
+    for (const id of [
+      'route-guards',
+      'component-inventory',
+      'background-surfaces',
+      'feature-flags',
+      'locales',
+    ] as const) {
+      expect(ids).toContain(id);
+      expect(detector(a, id).looksFor.length).toBeGreaterThan(20);
+    }
+  });
+
+  it('attributes an input-wide cap to every detector rather than to one of them', () => {
+    const many: RepoFile[] = [];
+    for (let i = 0; i < 5200; i++) many.push(f(`src/mod${i}.ts`, 'export const x = 1;'));
+    const a = analyseCodebase(many);
+    const row = shortfall(a, null, 'CAP_REACHED');
+    expect(row?.count).toBeGreaterThan(0);
+    expect(row?.detail).toContain('every count below');
+  });
+
+  it('counts a truncated file body, because anything past the cap was not seen', () => {
+    const a = analyseCodebase([f('src/huge.ts', `export const x = 1;${' '.repeat(400_001)}`)]);
+    expect(shortfall(a, null, 'FILE_TRUNCATED')?.count).toBe(1);
+  });
+
+  it('puts every counted shortfall in the warnings a person actually reads', () => {
+    const a = analyseCodebase([
+      pkg({ next: '^15' }),
+      f('middleware.ts'),
+      f('app/x/page.tsx', 'export default function X() { return <div/>; }'),
+    ]);
+    expect(present(a.shortfalls, 'shortfalls')).not.toHaveLength(0);
+    for (const row of present(a.shortfalls, 'shortfalls')) {
+      expect(a.warnings.some((w) => w.includes(row.detail))).toBe(true);
+    }
+  });
+
+  it('says in the summary how many facts went unreported, so the total is not read as complete', () => {
+    const a = analyseCodebase([f('components/A.tsx'), f('components/B.tsx')]);
+    expect(summariseAnalysis(a)).toContain('at least that many more exist');
+  });
+
+  it('counts the five new surfaces in the same summary sentence as the four old ones', () => {
+    // Three disjoint inventories of one application on three screens is the
+    // defect this round exists to end; two summaries would be the fourth.
+    const summary = summariseAnalysis(analyseCodebase(NEXT_APP));
+    expect(summary).toContain('page route');
+    expect(summary).toContain('component');
+    expect(summary).toContain('feature flag');
+    expect(summary).toContain('locale');
+  });
+
+  it('gives every route and endpoint a verdict, so absent and UNKNOWN stay distinguishable', () => {
+    const a = analyseCodebase(NEXT_APP);
+    expect(a.routes.length).toBeGreaterThan(0);
+    for (const item of [...a.routes, ...a.endpoints]) {
+      expect(item.guard).toBeDefined();
+      expect(GUARD_VERDICTS).toContain(item.guard?.access);
+      expect(item.guard?.evidence.length ?? 0).toBeGreaterThan(10);
+    }
+  });
+
+  it('always sets all five lists on a fresh analysis', () => {
+    // The precondition every accessor in this file asserts. If
+    // `analyseCodebase` stopped setting one, every count over it would read
+    // zero and zero is the flattering answer.
+    const a = analyseCodebase([f('readme.md', '# hi')]);
+    expect(a.guards).toBeDefined();
+    expect(a.components).toBeDefined();
+    expect(a.backgroundSurfaces).toBeDefined();
+    expect(a.featureFlags).toBeDefined();
+    expect(a.locales).toBeDefined();
+    expect(a.shortfalls).toBeDefined();
+  });
+
+  it('refuses to report zeroes for an analysis that predates these readers', () => {
+    /*
+     * The `analysis` Json column is read back and cast straight to
+     * `CodebaseAnalysis`, and every row written before this slice has none of
+     * the five keys. "0 components" about a snapshot nobody ran a component
+     * reader over is a measured claim about something not measured — and it is
+     * the flattering direction, because a reader concludes there is nothing
+     * there to test.
+     */
+    const stored: CodebaseAnalysis = {
+      routes: [],
+      endpoints: [],
+      forms: [],
+      authSurfaces: [],
+      frameworks: [],
+      detectors: [],
+      coverage: {
+        filesGiven: 12,
+        filesAnalysed: 12,
+        filesWithContent: 12,
+        filesIgnored: 0,
+        filesTruncated: 0,
+        truncated: false,
+      },
+      notes: [],
+      warnings: [],
+    };
+    const summary = summariseAnalysis(stored);
+    expect(summary).toContain('did not look for components');
+    expect(summary).not.toContain('0 components');
+    expect(summary).not.toContain('0 locales');
+  });
+
+  it('survives junk input in the five new readers too', () => {
+    expect(() =>
+      analyseCodebase([
+        { path: 'vercel.json', content: '' },
+        { path: 'messages/.json', content: '{}' },
+        { path: 'middleware.ts', content: 'export const config = { matcher: [] };' },
+        { path: 'config/flags.json', content: 'null' },
+        { path: 'i18n.ts', content: 'next-intl locales: [' },
+        { path: 'a.stories.tsx', content: 'export default {};' },
+      ]),
+    ).not.toThrow();
   });
 });
