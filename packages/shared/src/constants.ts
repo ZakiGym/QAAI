@@ -99,6 +99,173 @@ export type TestResultStatus = (typeof TEST_RESULT_STATUSES)[number];
 export const STEP_STATUSES = ['PASSED', 'FAILED', 'SKIPPED'] as const;
 export type StepStatus = (typeof STEP_STATUSES)[number];
 
+// ─── Why a result did not run (§4) ───────────────────────────────────────────
+//
+// There was one SKIPPED, and four completely different facts were filed under
+// it: a placeholder row nobody reached, a test this deployment has no tool to
+// execute, a test whose environment was broken, and a run somebody cancelled.
+// A reader could not tell "nobody has written this yet" from "this cannot run
+// here", which means the skipped count answered no question at all — and the
+// one question it is asked, every day, is "is this suite actually testing
+// anything?".
+//
+// These are NOT new `TestResultStatus` members. The status column is read by
+// the gate, the counters, the CLI's exit code, the GitHub check, the JUnit
+// writer and the coverage pass, and widening it would quietly change what every
+// one of them means by a skip. The status stays SKIPPED and the REASON becomes
+// its own field, which is additive: nothing that reads the status changes
+// behaviour, and anything that wants the distinction now has it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The four reasons a result exists with nothing measured in it.
+ *
+ *   NOT_RUN        — nothing was attempted and nothing says it could not be.
+ *                    A placeholder row for a test this run selected and never
+ *                    reached: a dead shard, a lost queue job, a worker killed
+ *                    mid-suite. Deliberately the weakest claim of the four,
+ *                    because "we do not know what happened to this" is the
+ *                    honest reading of a row nobody wrote to.
+ *   BLOCKED_BY_ENV — QAAI tried, or refused to try, because the ENVIRONMENT was
+ *                    not usable: the base URL did not answer, the configured
+ *                    login no longer works, there was no repository checkout to
+ *                    run inside. Not a verdict on the application.
+ *   UNSUPPORTED    — this DEPLOYMENT cannot execute this test: no plugin for
+ *                    the type, or the tool the type needs is not on this image
+ *                    (no k6, no Lighthouse, no Firefox). A product/packaging
+ *                    gap, fixed by installing something, not by editing a test.
+ *   CANCELLED      — a person stopped the run. The only one of the four that is
+ *                    somebody's decision rather than a fault, and the only one
+ *                    nobody needs to act on.
+ *
+ * ── Where this is STORED, and why in two places ─────────────────────────────
+ *
+ * In the column `TestResult.notRunKind`, a Prisma enum mirrored by this array
+ * with a `check:enums` parity entry. That is the queryable home, and it is what
+ * makes "how many of this month's skips were the environment's fault?" a
+ * `GROUP BY` instead of a regex over a text column — the same argument the
+ * migration that moved the mutation score out of a Step TITLE makes at length.
+ *
+ * AND as a tag at the head of `TestResult.errorMessage`, written by
+ * `notRunMessage` and read back by `parseNotRun`. That is not redundancy left
+ * over from the interim: the tag is what a surface sees when it renders the
+ * message, the sentence after it is complete English, and every row written
+ * before the column existed carries the tag and nothing else. `parseNotRun` is
+ * therefore still the only way to classify an old row, and a reader with both
+ * should prefer the column and fall back to the tag.
+ *
+ * NEITHER OF THEM HAS A DEFAULT. The column is nullable with no default and the
+ * tag is simply absent, and both spell the same fifth state: not recorded. A
+ * plugin that returns SKIPPED with a plain sentence has made no claim about
+ * which of the four reasons applies, and writing `NOT_RUN` on its behalf would
+ * be putting a claim in the database that nothing produced. `TestExecution.
+ * notRun` in types.ts is how a plugin makes that claim when it does have one.
+ */
+export const NOT_RUN_KINDS = ['NOT_RUN', 'BLOCKED_BY_ENV', 'UNSUPPORTED', 'CANCELLED'] as const;
+export type NotRunKind = (typeof NOT_RUN_KINDS)[number];
+
+/*
+ * No label map and no "which of these count against a pass rate" list here yet,
+ * and that is deliberate rather than an omission: `check:wiring` fails exported
+ * code with no caller, and the two surfaces that want them — the run page's
+ * result row, and the pass-rate and coverage denominators — are not in this
+ * change. The guidance they will need is written down instead of shipped as
+ * dead code:
+ *
+ *   · BLOCKED_BY_ENV and UNSUPPORTED must be EXCLUDED from a pass rate and from
+ *     a coverage denominator rather than scored as skips. A test that could not
+ *     be attempted is not evidence about the application in either direction,
+ *     and counting it is how a dead staging box moved a coverage number.
+ *   · CANCELLED is in the same position for a different reason: nobody wanted
+ *     the answer.
+ *   · NOT_RUN is the weakest of the four and the only honest reading of a row
+ *     nobody wrote to. It is not evidence of anything and should not be
+ *     averaged over either.
+ */
+
+/** Narrows an untrusted string, so an unknown value reads as "not recorded". */
+export function isNotRunKind(value: unknown): value is NotRunKind {
+  return typeof value === 'string' && (NOT_RUN_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * The `TestResult.errorMessage` for a result that did not run.
+ *
+ * The tag is machine-readable and the rest is a sentence somebody can act on.
+ * Both halves are required: a bare tag tells a human nothing, and a bare
+ * sentence tells a program nothing, and this product has shipped both mistakes.
+ */
+export function notRunMessage(kind: NotRunKind, why: string): string {
+  return `[${kind}] ${why}`;
+}
+
+/**
+ * Read the kind back off a stored message, or null when it carries none.
+ *
+ * Null is the honest answer for every row written before this existed and for
+ * every row written by a path that has not learned to tag yet — notably the
+ * plugins, which still return SKIPPED with a plain sentence when their tool is
+ * missing. Null must therefore never be scored as any particular kind; it means
+ * "not recorded", which is a fifth state and is not NOT_RUN.
+ */
+export function parseNotRun(
+  errorMessage: string | null | undefined,
+): { kind: NotRunKind; why: string } | null {
+  if (typeof errorMessage !== 'string') return null;
+  const match = /^\[([A-Z_]+)\]\s*([\s\S]*)$/.exec(errorMessage);
+  if (!match || !isNotRunKind(match[1])) return null;
+  return { kind: match[1], why: (match[2] ?? '').trim() };
+}
+
+// ─── A run that could not be attempted ───────────────────────────────────────
+
+/**
+ * Opening words of `Run.errorMessage` on a run the environment made impossible.
+ *
+ * ── Why a prefix and not a sixth RunStatus ──────────────────────────────────
+ *
+ * `ENVIRONMENT_UNAVAILABLE` wants to be a run status, and it cannot be one yet:
+ * `RunStatus` is a Postgres enum mirrored by `RUN_STATUSES`, and every consumer
+ * of a run — the cockpit's badge, the CLI's exit code, the GitHub check's
+ * conclusion, the JUnit writer, `TERMINAL_RUN_STATUSES`, the monitor streak —
+ * switches on it exhaustively. A sixth member would be a value all of them
+ * accept from the database and none of them can render, which is the drift this
+ * repo's enum guard exists to prevent.
+ *
+ * So the STATUS is ERRORED, which already means exactly "the run did not
+ * finish, so nothing was measured" and already answers `passed: false` — not a
+ * green build and not a red one — and the KIND rides on `errorMessage`, the way
+ * `FLAKE_RUN_PREFIX` rides on `Run.triggeredBy` and
+ * `AUTO_QUARANTINE_REASON_PREFIX` on `Test.quarantineReason`. The sentence
+ * after the prefix is complete English, so a surface that has never heard of
+ * the prefix still shows a reader something true.
+ *
+ * What this costs, stated plainly: an ENVIRONMENT_UNAVAILABLE run cannot be
+ * FILTERED in SQL and cannot be counted on a dashboard, because a prefix on a
+ * free-text column is not a queryable fact. If either of those is wanted, the
+ * answer is the enum member and its migration, not a LIKE query.
+ */
+export const ENVIRONMENT_UNAVAILABLE_PREFIX = 'ENVIRONMENT_UNAVAILABLE:';
+
+/** The `Run.errorMessage` for a run nothing could be attempted in. */
+export function environmentUnavailableMessage(reason: string): string {
+  return `${ENVIRONMENT_UNAVAILABLE_PREFIX} ${reason}`;
+}
+
+/**
+ * The reason, when this run's failure was the environment's — else null.
+ *
+ * Returns the sentence rather than a boolean so a caller that wants to say WHY
+ * does not have to re-derive it by slicing the prefix off itself.
+ */
+export function environmentUnavailableReason(
+  errorMessage: string | null | undefined,
+): string | null {
+  if (typeof errorMessage !== 'string') return null;
+  if (!errorMessage.startsWith(ENVIRONMENT_UNAVAILABLE_PREFIX)) return null;
+  return errorMessage.slice(ENVIRONMENT_UNAVAILABLE_PREFIX.length).trim();
+}
+
 // ─── Org & access (§1) ───────────────────────────────────────────────────────
 
 export const ORG_ROLES = ['OWNER', 'ADMIN', 'MEMBER', 'VIEWER'] as const;
@@ -390,6 +557,46 @@ export const FLAKE_RUN_PREFIX = 'flake-radar:';
 export function isFlakeConfirmationRun(triggeredBy: string | null | undefined): boolean {
   return typeof triggeredBy === 'string' && triggeredBy.startsWith(FLAKE_RUN_PREFIX);
 }
+
+/**
+ * `heal-verify:<healProposalId>` — the whole verification, in a string.
+ *
+ * The same trick as `FLAKE_RUN_PREFIX` above and for the same reason: a
+ * verification needs no table of its own. It IS a Run row tagged with what it
+ * is for, so it survives a worker restart, it is visible in the cockpit like
+ * any other run, and a human can cancel it.
+ *
+ * Beside its neighbour because both its writers — the API's heal-approval route
+ * and the worker's verification sweep — are in different packages, and a run
+ * marker read in one package and written in another is the definition of a
+ * shared constant. It lived in packages/agent/src/healer.ts, which meant the
+ * API imported an agent module to borrow one string.
+ */
+export const HEAL_VERIFY_RUN_PREFIX = 'heal-verify:';
+
+/**
+ * Audit actions the heal lane writes — the only record its sweeps leave.
+ *
+ * Beside `FLAKE_AUDIT_ACTIONS` for the same reason that list is here: the
+ * worker writes these rows and the audit-log reader renders them, so an action
+ * string that lived in a worker PROCESSOR could not be named by the surface
+ * that displays it without importing the processor.
+ *
+ * `unverifiable` is its own action and not a flavour of `verificationFailed`:
+ * "applied, and nobody could check" must never be able to read as either a
+ * pass or a failure.
+ */
+export const HEAL_AUDIT_ACTIONS = {
+  deflakeProposed: 'heal.deflake.proposed',
+  deflakeUnfixable: 'heal.deflake.unfixable',
+  verified: 'heal.verified',
+  verificationFailed: 'heal.verification.failed',
+  unverifiable: 'heal.verification.unverifiable',
+  reverted: 'heal.reverted',
+  retirementProposed: 'heal.retirement.proposed',
+  driftChecked: 'project.drift.checked',
+} as const;
+export type HealAuditAction = (typeof HEAL_AUDIT_ACTIONS)[keyof typeof HEAL_AUDIT_ACTIONS];
 
 /**
  * Opening words of every machine-written `Test.quarantineReason`.

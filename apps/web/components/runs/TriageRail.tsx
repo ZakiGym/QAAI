@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { api, artifactUrl } from '../../lib/api';
+import { api, artifactUrl, type RetriageAccepted } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import type {
   ConsoleEntry,
@@ -345,8 +345,66 @@ function Verdict({
   onReviewed: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  /** What the re-triage door said — its own 202 note, or its refusal. */
+  const [asked, setAsked] = useState<{ text: string; failed: boolean } | null>(null);
   const verdict = result?.verdict ?? null;
   const pending = verdict?.reviewState === 'PENDING';
+
+  // A different test's verdict is a different decision; the last answer must
+  // not stay on screen beside it.
+  useEffect(() => {
+    setAsked(null);
+  }, [verdict?.id]);
+
+  /**
+   * Ask for a fresh verdict — `POST /triage/verdicts/:id/retriage`, which had
+   * no caller at all.
+   *
+   * `split: true` is the second button and a different request: it says the
+   * cluster's answer is wrong for THIS test, so the worker withholds the
+   * cluster context when it answers again — the cluster size is exactly the
+   * evidence that misled the previous call. Scope stays `member` either way:
+   * a cause-wide re-triage costs one model call per member, and that is a
+   * decision for the triage screen's bulk controls, not for a rail where it
+   * would be one click away from a 200-call bill.
+   */
+  const retriage = useCallback(
+    async (split: boolean) => {
+      if (!verdict || busy) return;
+      setBusy(true);
+      setAsked(null);
+      try {
+        const response = await api<RetriageAccepted>(`/triage/verdicts/${verdict.id}/retriage`, {
+          method: 'POST',
+          body: JSON.stringify({ scope: 'member', split }),
+        });
+        setAsked({
+          text: [
+            split
+              ? 'Taken out of its cause and queued for a fresh verdict.'
+              : 'Queued for a fresh verdict.',
+            response.note,
+            response.degradedToMember,
+          ]
+            .filter((part): part is string => typeof part === 'string' && part !== '')
+            .join(' '),
+          failed: false,
+        });
+        onReviewed();
+      } catch (err) {
+        // Printed as the API wrote it: the common refusal is "a re-triage is
+        // already pending for this verdict", which is a fact the reader needs
+        // rather than an error to swallow.
+        setAsked({
+          text: err instanceof Error ? err.message : 'Could not ask for a fresh verdict',
+          failed: true,
+        });
+      } finally {
+        setBusy(false);
+      }
+    },
+    [verdict, busy, onReviewed],
+  );
 
   const review = useCallback(
     async (action: 'accept' | 'override' | 'mute', overrideTo?: string) => {
@@ -429,7 +487,7 @@ function Verdict({
         <span className="text-ink-faint text-meta ml-auto truncate font-mono">{verdict.model}</span>
       </div>
 
-      <div className="mt-2.5 flex items-center gap-2">
+      <div className="mt-2.5 flex flex-wrap items-center gap-2">
         <span
           className={cn(
             'shrink-0 rounded-sm px-2 py-[3px] font-mono text-micro font-semibold tracking-[0.05em]',
@@ -445,6 +503,38 @@ function Verdict({
         <span className="text-ink-faint font-mono text-micro tabular-nums">
           {verdict.confidence.toFixed(2)} confidence
         </span>
+        {/*
+          WHERE THIS ANSWER CAME FROM.
+
+          `derivedFromId` is non-null when this row is a COPY of the verdict
+          reached for another member of the same cause — one model call, one
+          piece of evidence, shared by every member. A reader who cannot tell
+          that apart reads forty agreeing verdicts as forty confirmations.
+        */}
+        {verdict.derivedFromId !== null && (
+          <span
+            className="text-ink-faint font-mono text-micro"
+            title="No model read this result. The cause's verdict was reached from another member of the same cluster and copied here — one model call, not forty."
+          >
+            copy of the cause’s verdict
+          </span>
+        )}
+        {verdict.revision > 1 && (
+          <span
+            className="text-ink-faint font-mono text-micro tabular-nums"
+            title="This verdict has been re-triaged. The previous answers, including any human correction, are kept in its revision history."
+          >
+            rev {verdict.revision}
+          </span>
+        )}
+        {verdict.splitFromClusterKey !== null && (
+          <span
+            className="text-flake font-mono text-micro"
+            title="A human took this result out of its cause, so it was judged on its own evidence."
+          >
+            split out
+          </span>
+        )}
       </div>
 
       <p className="font-display text-ink-dim mt-3 text-[15px] leading-[1.55] italic">
@@ -494,6 +584,52 @@ function Verdict({
       ) : (
         <p className="text-ink-faint mt-4 font-mono text-micro" aria-live="polite">
           reviewed · {verdict.reviewState.toLowerCase()}
+        </p>
+      )}
+
+      {/*
+        ── Ask again ───────────────────────────────────────────────────────────
+
+        The cockpit has been telling people to "re-run triage to get a fresh
+        proposal" (packages/agent/src/heal-apply.ts) since the healer shipped,
+        and the endpoint that does it had no caller. Plain buttons, below the
+        decision row, because this is the second-choice action: agreeing or
+        disagreeing is what a reviewer is here for.
+
+        It supersedes rather than replaces — the current contents, INCLUDING a
+        human's override, are copied into the revision history before the new
+        answer lands — and the note the endpoint returns says so, printed
+        verbatim rather than paraphrased.
+      */}
+      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => void retriage(false)}
+          title="Ask the model again. The current verdict, and any correction on it, is kept in its revision history."
+          className="border-line text-ink-dim hover:text-ink hover:border-line-strong inline-flex items-center rounded-md border px-[11px] py-1.5 text-[12px] transition-colors disabled:opacity-50"
+        >
+          Ask again
+        </button>
+        {/* Only offered when there IS a cause to be taken out of. */}
+        {verdict.clusterKey !== null && verdict.splitFromClusterKey === null && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void retriage(true)}
+            title="This failure does not belong with the others in its cause. Re-triage it on its own evidence, with the cluster context withheld."
+            className="border-line text-ink-dim hover:text-ink hover:border-line-strong inline-flex items-center rounded-md border px-[11px] py-1.5 text-[12px] transition-colors disabled:opacity-50"
+          >
+            Not this cause
+          </button>
+        )}
+      </div>
+      {asked && (
+        <p
+          role={asked.failed ? 'alert' : 'status'}
+          className={cn('mt-2 text-micro leading-relaxed', asked.failed ? 'text-fail' : 'text-ink-faint')}
+        >
+          {asked.text}
         </p>
       )}
     </>

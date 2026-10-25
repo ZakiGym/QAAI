@@ -10,10 +10,40 @@
 import type { Response } from 'express';
 import { logger } from './logger.js';
 
+/**
+ * Every type that is actually published, and nothing else.
+ *
+ * `publish()` writes a NAMED SSE frame (`event: <type>`), and a browser DROPS a
+ * named event for which no listener was registered — it does not fall through
+ * to `onmessage`. So this union is not decoration: it is the list a client has
+ * to register, and the four kinds missing from it (`shard.started`,
+ * `shard.finished`, `verdict.suppressed`, `run.environment`, `plugin.fault`)
+ * were each being published by the worker, relayed by this module, and
+ * delivered to nobody.
+ *
+ * Kept as a union rather than `string` for the same reason: a frame type that
+ * does not have to be named here is a frame type nothing has to listen for.
+ */
+export type RunEventType =
+  | 'run.started'
+  | 'run.finished'
+  /** Preflight found the environment unusable or degraded — worker only. */
+  | 'run.environment'
+  | 'test.started'
+  | 'test.finished'
+  | 'step'
+  | 'verdict'
+  /** A failure whose cause is muted: no verdict was minted, and it still counts. */
+  | 'verdict.suppressed'
+  /** An installed plugin that was not run, and why. */
+  | 'plugin.fault'
+  | 'shard.started'
+  | 'shard.finished'
+  | 'log';
+
 export interface RunEvent {
   runId: string;
-  type:
-    'run.started' | 'run.finished' | 'test.started' | 'test.finished' | 'step' | 'verdict' | 'log';
+  type: RunEventType;
   data: Record<string, unknown>;
   at: string;
 }

@@ -43,11 +43,18 @@ import type { FailureInput, FailureNetworkInput } from '../lib/cluster.js';
 import { notifyPrefsOf } from '../lib/chat-integrations.js';
 import {
   MAX_OWNERSHIP_RULES_PER_PROJECT,
+  OWNERSHIP_RULE_SELECT,
+  OWNERSHIP_STATES,
   OwnershipRuleError,
   normaliseRuleDraft,
+  ownerLabel,
   resolveOwnershipFor,
 } from '../lib/ownership.js';
-import type { OwnershipResolution, OwnershipRuleInput } from '../lib/ownership.js';
+import type {
+  OwnerDirectory,
+  OwnershipResolution,
+  OwnershipRuleInput,
+} from '../lib/ownership.js';
 
 export const teamRouter: Router = Router();
 
@@ -465,22 +472,21 @@ teamRouter.get('/ownership/resolve', async (req, res) => {
   });
 });
 
-/** The project's rules in the shape the matcher wants. */
+/**
+ * The project's rules in the shape the matcher wants.
+ *
+ * `OWNERSHIP_RULE_SELECT` rather than the field list that used to be written
+ * out here. There were three hand-written copies of it in the repo and a copy
+ * that forgets `position` does not fail — it resolves last-match-wins against a
+ * column that is always 0, which routes every failure to the FIRST matching
+ * rule instead of the last and silently inverts CODEOWNERS' own precedence.
+ */
 async function ownershipRulesFor(projectId: string): Promise<OwnershipRuleInput[]> {
   return prisma.ownershipRule.findMany({
     where: { projectId },
     orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
     take: MAX_OWNERSHIP_RULES_PER_PROJECT,
-    select: {
-      id: true,
-      position: true,
-      pathPattern: true,
-      testId: true,
-      suiteId: true,
-      feature: true,
-      ownerUserId: true,
-      ownerTeamId: true,
-    },
+    select: OWNERSHIP_RULE_SELECT,
   });
 }
 
@@ -490,7 +496,15 @@ interface OwnerLabel {
   label: string;
 }
 
-/** Names for the winning owners, in two queries rather than one per test. */
+/**
+ * Names for the winning owners, in two queries rather than one per test.
+ *
+ * The LABEL itself comes from `ownerLabel`, which the digest, the chat alert and
+ * every filed ticket also use. This function used to spell it out again — a
+ * team that is `@payments` in the digest and `Payments` here reads as two
+ * different owners to the person skimming both, and the deleted-row fallbacks
+ * drifted apart too.
+ */
 async function labelOwners(
   resolutions: Map<string, OwnershipResolution>,
 ): Promise<Map<string, OwnerLabel>> {
@@ -512,31 +526,174 @@ async function labelOwners(
         })
       : Promise.resolve([]),
   ]);
-  const teamById = new Map(teams.map((team) => [team.id, team]));
+  const directory: OwnerDirectory = {
+    users,
+    teams: new Map(teams.map((team) => [team.id, team])),
+  };
 
   const byRule = new Map<string, OwnerLabel>();
   for (const match of winners) {
-    if (match.owner.kind === 'USER') {
-      const user = users.get(match.owner.userId);
-      byRule.set(match.ruleId, {
-        kind: 'USER',
-        id: match.owner.userId,
-        // A deleted user cascades its rules away, so this fallback should be
-        // unreachable — it says "deleted" rather than nothing so that if it ever
-        // is reached, the screen says something true.
-        label: user?.name || user?.email || 'a deleted user',
-      });
-    } else {
-      const team = teamById.get(match.owner.teamId);
-      byRule.set(match.ruleId, {
-        kind: 'TEAM',
-        id: match.owner.teamId,
-        label: team ? `@${team.slug}` : 'a deleted team',
-      });
-    }
+    byRule.set(match.ruleId, {
+      kind: match.owner.kind,
+      id: match.owner.kind === 'USER' ? match.owner.userId : match.owner.teamId,
+      // Including the deleted-row fallbacks ("a deleted user" / "a deleted
+      // team"), which should be unreachable — deleting either cascades its
+      // rules away — and say something true rather than rendering as
+      // `undefined` if they ever are reached.
+      label: ownerLabel(match.owner, directory),
+    });
   }
   return byRule;
 }
+
+// ─── GET /team/triage — the failures that are mine ───────────────────────────
+
+/**
+ * How many verdicts one page carries, and the ceiling a caller may ask for.
+ *
+ * Reported on the response beside `total`, never applied quietly: "show me the
+ * failures that are mine" answered with a silently truncated list is the
+ * question answered wrongly, because the number of items is the answer.
+ */
+const TRIAGE_PAGE = 50;
+const TRIAGE_MAX_PAGE = 200;
+
+/**
+ * The sentinel for the state `ownerState` cannot otherwise be asked about.
+ *
+ * `TriageVerdict.ownerState` is a nullable TEXT column and its NULL is a FIFTH
+ * state: nothing has tried to route this verdict yet. That is not NO_RULES (we
+ * looked, nobody has written any) and not NO_MATCH (we looked, none matched) —
+ * it is "we have not looked", and it is the state a verdict written before
+ * routing existed, or written by a run whose routing read failed, is in.
+ * Without a name for it the one query that would find those rows cannot be
+ * expressed.
+ */
+const UNROUTED = 'UNROUTED';
+
+/**
+ * The columns a triage queue row needs, and no more.
+ *
+ * `ownerNote` is in here because it is the sentence that says WHICH KIND of
+ * nobody owns an unowned failure, and a queue that shows the state without the
+ * reason makes RULES_UNUSABLE — routing has silently stopped — look like
+ * NO_MATCH.
+ */
+const TRIAGE_ROW_SELECT = {
+  id: true,
+  verdict: true,
+  overriddenTo: true,
+  confidence: true,
+  reviewState: true,
+  assigneeUserId: true,
+  assigneeTeamId: true,
+  ownerState: true,
+  ownerNote: true,
+  ownerRuleId: true,
+  assignedAt: true,
+  issueUrl: true,
+  createdAt: true,
+  testResult: {
+    select: {
+      id: true,
+      status: true,
+      runId: true,
+      test: { select: { id: true, name: true, filePath: true } },
+      run: { select: { id: true, projectId: true, branch: true, finishedAt: true } },
+    },
+  },
+} as const;
+
+/**
+ * The failures assigned to one person or one team.
+ *
+ * THE READ THAT MAKES THE WRITE WORTH ANYTHING. The notify processor and the
+ * filing endpoint both write `assigneeUserId` / `assigneeTeamId` / `ownerState`
+ * onto a verdict the moment a run goes red, and until now nothing could ask the
+ * obvious question back: which of these are mine? An assignment nobody can
+ * query is a column, not a feature.
+ *
+ *   ?assigneeUserId=  ?assigneeTeamId=   whose queue. Opposite filters, so one.
+ *   ?ownerState=                         OWNED / NO_RULES / NO_MATCH /
+ *                                        RULES_UNUSABLE / UNROUTED (see above).
+ *   ?projectId=                          one project's share of it.
+ *
+ * An unknown `ownerState` is a 400 and not an empty list, for the same reason
+ * the surface report's filters are: "you have nothing assigned" and "you spelled
+ * the filter wrongly" must not look identical, and the first is the reassuring
+ * one.
+ *
+ * PERFORMANCE, stated rather than assumed: the filters this endpoint exists for
+ * are `(orgId, assigneeUserId)` and `(orgId, assigneeTeamId)`, and neither pair
+ * is indexed on `TriageVerdict` today. The query is correct without them and
+ * the page is bounded, so it answers — on a large org it answers by scanning.
+ * The two indexes are requested in this round's hand-off; nothing here depends
+ * on them landing first.
+ */
+teamRouter.get('/triage', async (req, res) => {
+  const assigneeUserId = queryString(req.query.assigneeUserId);
+  const assigneeTeamId = queryString(req.query.assigneeTeamId);
+  const ownerState = queryString(req.query.ownerState);
+  const projectId = queryString(req.query.projectId);
+
+  if (assigneeUserId && assigneeTeamId) {
+    throw badRequest('Filter by assigneeUserId or assigneeTeamId, not both.');
+  }
+
+  // `readonly string[]`, so the membership test needs no cast — the same shape
+  // `isFlakeConfirmationRun` and friends use for a vocabulary checked against
+  // free text.
+  const states: readonly string[] = [...OWNERSHIP_STATES, UNROUTED];
+  if (ownerState && !states.includes(ownerState)) {
+    throw badRequest(
+      `ownerState must be one of ${states.join(', ')}. ${UNROUTED} means nothing has tried to route the verdict yet, which is not the same as nobody owning it.`,
+    );
+  }
+
+  const limit = Math.min(
+    TRIAGE_MAX_PAGE,
+    Math.max(1, Number(req.query.limit ?? TRIAGE_PAGE) || TRIAGE_PAGE),
+  );
+
+  const where = {
+    ...(assigneeUserId ? { assigneeUserId } : {}),
+    ...(assigneeTeamId ? { assigneeTeamId } : {}),
+    // The sentinel resolves to the column's NULL, which is the only way to ask
+    // for the rows nothing has routed.
+    ...(ownerState ? { ownerState: ownerState === UNROUTED ? null : ownerState } : {}),
+    ...(projectId ? { testResult: { run: { projectId } } } : {}),
+  };
+
+  const [verdicts, total] = await Promise.all([
+    prisma.triageVerdict.findMany({
+      where,
+      // Newest first, tie-broken by id: two verdicts minted in the same
+      // millisecond by a parallel suite must not swap places between pages.
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: limit,
+      select: TRIAGE_ROW_SELECT,
+    }),
+    // The count, separately, because the list is a page. Without it the caller
+    // cannot tell a 50-row queue from a 4,000-row one.
+    prisma.triageVerdict.count({ where }),
+  ]);
+
+  res.json({
+    verdicts,
+    returned: verdicts.length,
+    limit,
+    total,
+    /** The flag a caller has to read before treating this page as the queue. */
+    truncated: total > verdicts.length,
+    /** Echoed so a caller can see which filter produced this, typos included. */
+    filter: {
+      assigneeUserId: assigneeUserId || null,
+      assigneeTeamId: assigneeTeamId || null,
+      ownerState: ownerState || null,
+      projectId: projectId || null,
+    },
+  });
+});
 
 // ─── Bulk triage ─────────────────────────────────────────────────────────────
 

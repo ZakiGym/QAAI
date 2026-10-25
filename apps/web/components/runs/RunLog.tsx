@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { Fragment, useMemo } from 'react';
 import { cn } from '../../lib/cn';
+import { gateBlockReason } from '../../lib/gate';
 import { relativeTime } from '../ui';
 import { EmptyState } from '../ui/EmptyState';
 import { SectionLabel, SkeletonRows } from '../ui/layout';
@@ -230,7 +231,17 @@ function Note({ run }: { run: RunRow }) {
   }
 
   if (run.status === 'FAILED' || run.status === 'ERRORED') {
-    const blocked = run.gateResult?.evaluations.find((e) => !e.passed)?.detail;
+    /*
+     * The rule that HELD THE MERGE, selected on its action.
+     *
+     * This used to be `evaluations.find((e) => !e.passed)`, and `passed` is
+     * `boolean | null` where null means NOT MEASURED — so `!e.passed` matched
+     * an unmeasured rule first, and this row printed "not measured — no
+     * coverage snapshot has been computed for this project" as the reason a
+     * merge was blocked. An unmeasured rule cannot block anything; it is the
+     * one state the evaluator refuses to turn into a verdict.
+     */
+    const blocked = gateBlockReason(run.gateResult);
     const counted =
       run.failedCount > 0
         ? `${run.failedCount} ${run.failedCount === 1 ? 'test' : 'tests'} failed`

@@ -456,20 +456,30 @@ export interface CreatedIssue {
 }
 
 /**
- * One POST, with the two rules that matter applied in one place: never follow a
- * redirect (the auth header would go with it) and never let a hung provider hold
- * the request open. Returns the parsed JSON without ever logging it.
+ * One request, with the two rules that matter applied in one place: never
+ * follow a redirect (the auth header would go with it) and never let a hung
+ * provider hold the request open. Returns the parsed JSON without ever logging
+ * it.
+ *
+ * THE METHOD IS A PARAMETER AND THE FUNCTION IS STILL ONE FUNCTION. Editing an
+ * issue needs PATCH on GitHub and PUT on Jira, and the obvious shortcut — a
+ * second `patchJson` next to this one — is how this repo ended up with three
+ * implementations of "is this host private", two of which were wrong. Every
+ * line below is a refusal that has to hold for an edit exactly as it holds for
+ * a create: the Authorization header must not follow a 3xx, the timeout must
+ * bound the request, and the response body must never be logged.
  */
-async function postJson(
+async function sendJson(
   url: string,
   headers: Record<string, string>,
   payload: unknown,
   provider: IssueTrackerKind,
+  method: 'POST' | 'PATCH' | 'PUT' = 'POST',
 ): Promise<{ status: number; json: unknown }> {
   let response: Response;
   try {
     response = await fetch(url, {
-      method: 'POST',
+      method,
       headers: { ...headers, 'content-type': 'application/json', 'user-agent': 'qaai' },
       body: JSON.stringify(payload),
       // Non-negotiable: a 3xx must surface as an error rather than re-sending
@@ -560,7 +570,7 @@ async function fileOnGithub(
   token: string,
   issue: { title: string; body: string },
 ): Promise<CreatedIssue> {
-  const { status, json } = await postJson(
+  const { status, json } = await sendJson(
     // Host is the constant; only the path comes from config.
     `https://${API_HOST.GITHUB}/repos/${cfg.repo}/issues`,
     {
@@ -596,7 +606,7 @@ async function fileOnJira(
    * request shape covers both deployments; the cost is that markdown shows up
    * as literal text in the Jira description.
    */
-  const { status, json } = await postJson(
+  const { status, json } = await sendJson(
     `${cfg.site}/rest/api/2/issue`,
     {
       // Cloud authenticates an API token as Basic email:token; a Data Center
@@ -639,7 +649,7 @@ async function fileOnLinear(
   token: string,
   issue: { title: string; body: string },
 ): Promise<CreatedIssue> {
-  const { status, json } = await postJson(
+  const { status, json } = await sendJson(
     `https://${API_HOST.LINEAR}/graphql`,
     {
       // Linear sends personal API keys raw and OAuth access tokens as a bearer.
@@ -684,6 +694,203 @@ async function fileOnLinear(
     );
   }
   return { provider: 'LINEAR', url, key: identifier };
+}
+
+// ─── Editing one already on the board ────────────────────────────────────────
+
+/**
+ * What an edit may change. Both optional, and at least one is required — see
+ * `updateIssue`.
+ */
+export interface IssuePatch {
+  title?: string;
+  body?: string;
+}
+
+/**
+ * A sentence per failure shape for an EDIT, where the target existing is the
+ * interesting case.
+ *
+ * Separate from `describeFailure` because 404 means something different: on a
+ * create it means the project or repo is wrong, and on an edit it means the
+ * TICKET is gone — somebody deleted it, or moved it to another repo — which the
+ * caller has to be able to tell apart, because the honest answer to the second
+ * is "file a new one", not "fix your integration".
+ */
+function describeEditFailure(provider: IssueTrackerKind, status: number): string {
+  const name = TRACKER_LABEL[provider];
+  if (status === 404 || status === 410) {
+    return `${name} no longer has that issue (${status}) — it was deleted or moved. The ticket QAAI recorded for this cause cannot be rewritten.`;
+  }
+  if (status === 403) {
+    return `${name} refused the edit (403) — the stored token can see that issue but cannot change it.`;
+  }
+  return describeFailure(provider, status);
+}
+
+/**
+ * The issue NUMBER out of a GitHub key.
+ *
+ * `CreatedIssue.key` is `owner/repo#12`, so the number is derivable and the
+ * repo on it is NOT used: the path is built from `cfg.repo`, exactly as the
+ * create path builds it, because a key read back out of the database must never
+ * be able to choose where a request carrying the customer's token is sent. A
+ * key that does not parse is a refusal rather than a guess.
+ */
+function githubIssueNumber(key: string): number {
+  const match = /#(\d+)$/.exec(key);
+  const number = match ? Number(match[1]) : NaN;
+  if (!Number.isInteger(number) || number <= 0) {
+    throw new IssueFilingError(
+      `QAAI recorded "${key}" as the GitHub issue for this cause and cannot read an issue number out of it, so the ticket text could not be rewritten.`,
+    );
+  }
+  return number;
+}
+
+/** The Jira / Linear key, with nothing in it that could redirect a request. */
+function plainKey(key: string, provider: IssueTrackerKind): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}-\d{1,12}$/.test(key)) {
+    throw new IssueFilingError(
+      `QAAI recorded "${key}" as the ${TRACKER_LABEL[provider]} issue for this cause and it is not a key QAAI can address, so the ticket text could not be rewritten.`,
+    );
+  }
+  return key;
+}
+
+const LINEAR_UPDATE_MUTATION = `mutation QaaiEditBug($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) { success issue { identifier } }
+}`;
+
+/**
+ * Rewrite the title and/or body of an issue that is already on the board.
+ *
+ * ── Why this exists ─────────────────────────────────────────────────────────
+ *
+ * The filing path is one ticket per CAUSE, and a cause does not stop growing
+ * when the ticket is created: the same broken dependency takes out four more
+ * tests next week, they join the same ticket, and the ticket still lists the
+ * three tests that were known at filing time. Nobody reading it can tell that
+ * it now covers seven, so somebody files a second ticket — the forty-tickets
+ * defect, arriving by a different door. `createIssue` could only create, so the
+ * re-file path reported `providerBodyRefreshed: false` and meant it.
+ *
+ * ── What it refuses ─────────────────────────────────────────────────────────
+ *
+ * Everything the create path refuses, because it goes through the same
+ * `sendJson`: the host is the pinned constant (or, for Jira, the already
+ * validated `cfg.site`), a 3xx is an error rather than a hop while the
+ * Authorization header is in flight, the request is bounded, and no response
+ * body is logged or returned. The provider's own identifier is parsed into a
+ * number or a key shape rather than interpolated raw, so a value read back out
+ * of the database cannot steer the path.
+ *
+ * An empty patch THROWS rather than issuing a no-op request: a caller that
+ * believes it refreshed a ticket and sent nothing is the caller that reports
+ * `providerBodyRefreshed: true` about a ticket it never touched.
+ */
+export async function updateIssue(
+  cfg: IssueTrackerConfig,
+  token: string,
+  key: string,
+  patch: IssuePatch,
+): Promise<void> {
+  const title = patch.title === undefined ? undefined : patch.title.slice(0, MAX_TITLE);
+  const body = patch.body === undefined ? undefined : patch.body.slice(0, MAX_BODY);
+  if (title === undefined && body === undefined) {
+    throw new IssueFilingError('An issue edit has to change the title, the body, or both.');
+  }
+
+  if (cfg.kind === 'GITHUB') {
+    const { status } = await sendJson(
+      // Host is the constant and the path comes from config, never from `key`.
+      `https://${API_HOST.GITHUB}/repos/${cfg.repo}/issues/${githubIssueNumber(key)}`,
+      {
+        authorization: `Bearer ${token}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+      },
+      { ...(title === undefined ? {} : { title }), ...(body === undefined ? {} : { body }) },
+      'GITHUB',
+      'PATCH',
+    );
+    if (status !== 200) throw new IssueFilingError(describeEditFailure('GITHUB', status), 'PROVIDER');
+    return;
+  }
+
+  if (cfg.kind === 'JIRA') {
+    // v2 like the create path, so one request shape covers Cloud and Data
+    // Center. A successful edit answers 204 with no body.
+    const { status } = await sendJson(
+      `${cfg.site}/rest/api/2/issue/${plainKey(key, 'JIRA')}`,
+      {
+        authorization: cfg.email
+          ? `Basic ${Buffer.from(`${cfg.email}:${token}`).toString('base64')}`
+          : `Bearer ${token}`,
+        accept: 'application/json',
+      },
+      {
+        fields: {
+          ...(title === undefined ? {} : { summary: title }),
+          ...(body === undefined ? {} : { description: body }),
+        },
+      },
+      'JIRA',
+      'PUT',
+    );
+    if (status !== 204 && status !== 200) {
+      throw new IssueFilingError(describeEditFailure('JIRA', status), 'PROVIDER');
+    }
+    return;
+  }
+
+  const { status, json } = await sendJson(
+    `https://${API_HOST.LINEAR}/graphql`,
+    {
+      authorization: token.startsWith('lin_oauth_') ? `Bearer ${token}` : token,
+      accept: 'application/json',
+    },
+    {
+      query: LINEAR_UPDATE_MUTATION,
+      variables: {
+        /*
+         * The identifier QAAI stored (`ENG-12`), not a UUID. Linear resolves an
+         * issue identifier wherever it takes an issue `id`, and the identifier
+         * is what `CreatedIssue.key` carries because it is also what a human
+         * reads. If a future Linear requires the UUID this returns a GraphQL
+         * error, which the caller reports as a refresh that did not happen —
+         * never as one that did.
+         */
+        id: plainKey(key, 'LINEAR'),
+        input: {
+          ...(title === undefined ? {} : { title }),
+          ...(body === undefined ? {} : { description: body }),
+        },
+      },
+    },
+    'LINEAR',
+  );
+
+  if (status !== 200) throw new IssueFilingError(describeEditFailure('LINEAR', status), 'PROVIDER');
+
+  // GraphQL reports failure inside a 200, and an unknown issue id looks exactly
+  // like success until you read this.
+  const errors = pick(json, 'errors');
+  if (Array.isArray(errors) && errors.length > 0) {
+    const message = redactSecrets(String(pick(errors[0], 'message') ?? 'unknown error')).slice(
+      0,
+      200,
+    );
+    throw new IssueFilingError(`Linear refused the edit: ${message}`, 'PROVIDER');
+  }
+
+  // `success: false` with no `errors` array is Linear's other way of saying no.
+  if (pick(pick(pick(json, 'data'), 'issueUpdate'), 'success') !== true) {
+    throw new IssueFilingError(
+      'Linear accepted the request but did not confirm the edit, so the ticket text may be unchanged.',
+      'PROVIDER',
+    );
+  }
 }
 
 /** Files `issue` on the tracker `cfg` describes. `token` is held only for this call. */

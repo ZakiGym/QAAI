@@ -2649,3 +2649,329 @@ function routeFeatureName(route: string | null): string | null {
   if (!first || first === ':param' || first === '*') return null;
   return first.replace(/[-_]/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
+
+// ─── Provenance, and verifying that a gap actually closed ────────────────────
+
+/**
+ * THE DEFECT, VERBATIM: "Gap → plan item → test provenance and verified
+ * closure — the gapId→planItemId map is returned in the HTTP response only and
+ * PlanItem has no gap column, so QAAI cannot say 'this gap is closed by this
+ * test' or notice that it is not."
+ *
+ * Everything below is the deterministic half of fixing that, and it lives here
+ * rather than next to the database for the same reason the rest of this file
+ * does: NOTHING IN IT CALLS A MODEL. "Is this gap closed?" is a claim about the
+ * customer's suite, and a claim we cannot show the working for is worse than no
+ * claim at all. So the rule is a pure function over (what the ledger remembers,
+ * what the report just found), it returns the sentence it decided on, and the
+ * worker's only job is to store what it says.
+ *
+ * The failure mode being designed against is specific, and the product has
+ * already had one instance of it: `Test.authProfileId` exists because an
+ * UNREACHED_AUTH_ROUTE gap asked for an authenticated test, the only test that
+ * could be generated asserted anonymous denial, and so closing the gap
+ * re-created the gap — for ever, with nothing anywhere noticing that the same
+ * gap had now been "closed" four times. A loop with no memory can only ever be
+ * hopeful. These functions are the memory.
+ */
+
+/**
+ * The gap identity a PlanItem row — and the Test that item produces — must both
+ * carry, so that closure is verifiable from either end.
+ *
+ * Deliberately NOT the whole gap. The evidence, the score and the confidence
+ * all move as tests are added, so storing them would mean a provenance record
+ * that disagrees with itself the moment anything changes. What is stored is the
+ * stable identity (`gapId` is a hash of kind + subject, unchanged across
+ * recomputation by construction) plus the two fields a human needs to read the
+ * row six months later: the kind, because the id is a hash and tells nobody
+ * anything, and the title, because the gap may well have stopped being reported
+ * by the time anyone asks what it was.
+ *
+ * TODO(shared-types): `gapId: string | null` belongs on `PlanItem` in
+ * packages/shared/src/types.ts, beside `authProfileId`, so that the plan
+ * endpoints carry it through their own schema instead of the two writers
+ * (apps/api/src/routes/coverage.ts and apps/worker/src/processors/close-loop.ts)
+ * each attaching it by hand. `planItemSchema` in packages/shared/src/schemas.ts
+ * needs the matching `.nullable().default(null)` field. That file belongs to
+ * another agent this round; this interface is the local stand-in.
+ */
+export interface GapProvenance {
+  /** `CoverageGap.id`. Stable across recomputation for the same subject. */
+  gapId: string;
+  gapKind: GapKind;
+  /** Clamped to the DB column's practical width; the full title is in the gap. */
+  gapTitle: string;
+  /** The rank at the moment of proposal, for "why did it pick this one?". */
+  gapScore: number;
+}
+
+/** The three fields a provenance row needs, taken off the gap itself. */
+export function gapProvenance(gap: CoverageGap): GapProvenance {
+  return {
+    gapId: gap.id,
+    gapKind: gap.kind,
+    gapTitle: gap.title.length <= 300 ? gap.title : `${gap.title.slice(0, 299)}…`,
+    gapScore: gap.score,
+  };
+}
+
+/**
+ * The closure ledger's vocabulary.
+ *
+ * Seven states, and the two that look redundant are the only reason this is
+ * worth building:
+ *
+ *   NOT_CLOSED    re-measured, a test exists, and the gap is STILL reported.
+ *                 This is the FINDING — the sentence "we wrote a test for this
+ *                 and it did not close it" is the single most useful thing this
+ *                 ledger can produce, and folding it into OPEN would lose the
+ *                 fact that a generation was already spent on it.
+ *   UNVERIFIABLE  closure could not be checked at all. No readable crawl, or
+ *                 the gap report was a ranked PAGE and this gap's absence from
+ *                 that page is evidence of nothing. A gap that drops off a
+ *                 truncated list recorded as CLOSED is the easiest way for this
+ *                 number to become fiction, and it is the one this file exists
+ *                 to refuse.
+ *
+ * Text rather than a TypeScript enum because the database column is text: see
+ * the migration header for why a new Prisma enum would be an enum with no drift
+ * guard. This array IS the domain; the writer validates against it.
+ */
+export const CLOSURE_STATES = [
+  'OPEN',
+  'PROPOSED',
+  'TEST_WRITTEN',
+  'CLOSED',
+  'NOT_CLOSED',
+  'REOPENED',
+  'UNVERIFIABLE',
+] as const;
+
+export type ClosureState = (typeof CLOSURE_STATES)[number];
+
+/** True for a value that may be stored in `GapClosure.state`. */
+export function isClosureState(value: string): value is ClosureState {
+  return (CLOSURE_STATES as readonly string[]).includes(value);
+}
+
+/** What the ledger remembers about one gap. The stored row, as the rule sees it. */
+export interface ClosureLedgerEntry {
+  gapId: string;
+  state: ClosureState;
+  /** The plan item minted for it, when one was. */
+  planItemId: string | null;
+  /** The test that item produced, when it produced one. */
+  testId: string | null;
+}
+
+/**
+ * What a freshly computed report can say about closure, and — crucially — what
+ * it cannot.
+ *
+ * `complete` is the field that keeps this honest. `analyzeCoverage` takes a
+ * `limit` and reports `totals.gaps` alongside `totals.gapsReturned`, so a
+ * caller holding a page of the ranked list knows only that a gap is not ON THE
+ * PAGE. Passing `complete: false` turns every absence into UNVERIFIABLE instead
+ * of into a closure, which is the difference between a ledger and a flattering
+ * log.
+ */
+export interface ClosureEvidence {
+  /** `CoverageReport.crawled`. False means we know nothing about the app. */
+  crawled: boolean;
+  /** Gap ids the report just produced. */
+  openGapIds: ReadonlySet<string>;
+  /** True only when the report held EVERY gap it found, not a ranked page. */
+  complete: boolean;
+}
+
+export interface ClosureVerdict {
+  gapId: string;
+  state: ClosureState;
+  /** Whether this differs from what the ledger held. Only changes are written. */
+  changed: boolean;
+  /** The sentence behind the state, stored on the row. */
+  why: string;
+}
+
+/**
+ * Decide what the ledger should now say about one gap.
+ *
+ * The order of the branches is the whole rule, and every one of them is a way
+ * this could otherwise lie:
+ *
+ *   1. We could not see the application → UNVERIFIABLE. Not "closed", not
+ *      "open". An empty crawl makes every gap vanish from the report, so a rule
+ *      that read absence as closure would mark an entire project closed the
+ *      first time the Explorer failed.
+ *   2. The gap is still reported → it is not closed, and WHICH not-closed
+ *      matters. A gap with a test behind it that is still reported is
+ *      NOT_CLOSED (or REOPENED, if we had previously recorded it closed); a gap
+ *      with nothing behind it is just still open.
+ *   3. The gap is gone, and the report was complete → CLOSED, and the `why`
+ *      names the test if there is one and says there is none if there is not.
+ *      "It closed and no test of ours is responsible" is a true and useful
+ *      sentence — somebody else's test, or a deleted route — and pretending
+ *      credit would corrupt the only metric this ledger produces.
+ *   4. The gap is gone and the report was a page → UNVERIFIABLE. See
+ *      `ClosureEvidence.complete`.
+ */
+export function verifyClosure(
+  entry: ClosureLedgerEntry,
+  evidence: ClosureEvidence,
+): ClosureVerdict {
+  const settle = (state: ClosureState, why: string): ClosureVerdict => ({
+    gapId: entry.gapId,
+    state,
+    changed: state !== entry.state,
+    why,
+  });
+
+  if (!evidence.crawled) {
+    return settle(
+      'UNVERIFIABLE',
+      'Closure could not be checked: this project has no readable crawl, so the gap report is empty for a reason that has nothing to do with coverage. An absent gap is not a closed gap.',
+    );
+  }
+
+  const stillOpen = evidence.openGapIds.has(entry.gapId);
+
+  if (stillOpen) {
+    if (entry.state === 'CLOSED') {
+      return settle(
+        'REOPENED',
+        entry.testId
+          ? `This gap was recorded closed and is being reported again. Test ${entry.testId} was supposed to have closed it — check that it still exists, still runs, and still asserts what the gap asked for.`
+          : 'This gap was recorded closed and is being reported again. No test of ours was ever credited with closing it, so whatever did close it has been undone.',
+      );
+    }
+    if (entry.testId) {
+      return settle(
+        'NOT_CLOSED',
+        `Test ${entry.testId} was written for this gap and the gap is still being reported. Proposing the same item again would produce the same test, so the loop stops here and says so rather than spending another generation on it.`,
+      );
+    }
+    if (entry.planItemId) {
+      return settle(
+        'PROPOSED',
+        `Plan item ${entry.planItemId} exists for this gap and no test has landed from it yet. Generation has not finished, or there is no model key on this deployment.`,
+      );
+    }
+    return settle('OPEN', 'Still reported as a gap, and nothing has been proposed for it yet.');
+  }
+
+  if (!evidence.complete) {
+    return settle(
+      'UNVERIFIABLE',
+      'Closure could not be checked: the gap report this was measured against was a ranked page rather than the full list, so this gap being absent from it means only that it is not in the top slice.',
+    );
+  }
+
+  return settle(
+    'CLOSED',
+    entry.testId
+      ? `Closed: the gap is no longer reported, and test ${entry.testId} is the test written for it.`
+      : 'Closed: the gap is no longer reported. No test of ours was written for it, so something else closed it — an existing test, or the surface it described no longer exists.',
+  );
+}
+
+/**
+ * Pick the gaps a campaign should spend its budget on next.
+ *
+ * ── WHY THIS IS NOT JUST `gaps.slice(0, k)` ─────────────────────────────────
+ *
+ * Because the obvious version is an infinite loop with a budget attached. The
+ * gap list is recomputed every tick and the ranking is deterministic, so the
+ * top K is the SAME top K until something actually closes — and a campaign that
+ * re-proposes its top K every fifteen minutes spends a whole night's budget
+ * writing the same eight tests eight times, each time believing it is making
+ * progress. The ledger is what breaks that: anything already in flight, already
+ * attempted and known not to have closed, or re-opened after a closure, is
+ * skipped BY NAME with the reason attached.
+ *
+ * NOT_CLOSED and REOPENED are skipped rather than retried, and that is the
+ * important one. `planItemForGap` is deterministic: given the same gap it
+ * returns the same title, the same steps and the same assertions, so a retry is
+ * not another attempt — it is the identical attempt, and it will fail
+ * identically. A loop that retries a deterministic failure is the shape of
+ * every runaway job this repo has ever had. The honest move is to stop, record
+ * that the gap resisted the obvious test, and let a human read the row.
+ *
+ * Nothing is dropped silently: `considered` is the full count and every
+ * exclusion is named, because a campaign that proposed three items out of a
+ * hundred gaps has to be able to say why.
+ */
+export interface ClosureSelection {
+  /** Chosen, worst-first, at most `limit`. */
+  gaps: CoverageGap[];
+  /** Everything deliberately not chosen, with the reason. Never silent. */
+  skipped: Array<{ gapId: string; title: string; why: string }>;
+  /** How many gaps were offered. `gaps.length + skipped.length` by construction. */
+  considered: number;
+}
+
+export function rankGapsForClosure(
+  gaps: readonly CoverageGap[],
+  options: {
+    /** Hard cap on the returned list — the tick's share of the night's budget. */
+    limit: number;
+    /** What the ledger already knows, keyed by gap id. */
+    ledger?: ReadonlyMap<string, ClosureState>;
+  },
+): ClosureSelection {
+  const ledger = options.ledger ?? new Map<string, ClosureState>();
+  const skipped: ClosureSelection['skipped'] = [];
+
+  /*
+   * Score descending, then gap id ascending. The tiebreak is not tidiness: two
+   * ticks of one campaign must pick the same gap for the same reason, or the
+   * ledger's "already attempted" bookkeeping is comparing two different
+   * orderings and the skip list stops meaning anything.
+   */
+  const ordered = [...gaps].sort((a, b) =>
+    b.score !== a.score ? b.score - a.score : a.id.localeCompare(b.id),
+  );
+
+  const chosen: CoverageGap[] = [];
+  for (const gap of ordered) {
+    const state = ledger.get(gap.id);
+
+    if (state === 'PROPOSED' || state === 'TEST_WRITTEN') {
+      skipped.push({
+        gapId: gap.id,
+        title: gap.title,
+        why: 'Work is already in flight for this gap — an item was proposed and no test has landed from it yet. Proposing again would mint a duplicate and hand the Generator the same job twice.',
+      });
+      continue;
+    }
+    if (state === 'NOT_CLOSED') {
+      skipped.push({
+        gapId: gap.id,
+        title: gap.title,
+        why: 'A test was already written for this gap and the gap is still reported. The proposal is deterministic, so a retry would produce the identical test and fail identically. This one needs a human, not another generation.',
+      });
+      continue;
+    }
+    if (state === 'REOPENED') {
+      skipped.push({
+        gapId: gap.id,
+        title: gap.title,
+        why: 'This gap was recorded closed and has come back. Re-proposing the same item would re-close it on paper and change nothing, so the campaign leaves it for review.',
+      });
+      continue;
+    }
+
+    if (chosen.length >= options.limit) {
+      skipped.push({
+        gapId: gap.id,
+        title: gap.title,
+        why: `Past this tick's budget of ${options.limit} item(s). It stays in the ledger and is eligible on the next tick.`,
+      });
+      continue;
+    }
+
+    chosen.push(gap);
+  }
+
+  return { gaps: chosen, skipped, considered: ordered.length };
+}

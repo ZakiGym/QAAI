@@ -6,6 +6,7 @@
 import type {
   EnvironmentKind,
   Language,
+  NotRunKind,
   OrgRole,
   Plan,
   Priority,
@@ -17,6 +18,23 @@ import type {
   Verdict,
 } from './constants';
 import type { RunJob } from './jobs';
+/*
+ * The vitals vocabulary, imported rather than restated: `MAX_VITAL_BREACHES`
+ * names a metric, and a gate that spelled its own six metric names would drift
+ * from the plugin that measures them the first time a seventh is added.
+ *
+ * THIS IMPORT MUST STAY TYPE-ONLY, and the reason changed: `schemas.ts` now
+ * imports `FINDING_KINDS` and `FINDING_SEVERITIES` back out of this file as
+ * VALUES, because `gateRuleSchema` validates a `MAX_FINDINGS` rule and a
+ * hand-written `z.enum([...])` there would be a third copy of a vocabulary
+ * that already exists twice. `import type` is erased by `verbatimModuleSyntax`,
+ * so the module graph that actually executes is schemas → types → constants and
+ * there is no cycle. A plain `import { PERFORMANCE_METRICS }` here would close
+ * it, and in ESM the loser of that race reads an uninitialised binding — so if
+ * this file ever needs a VALUE from schemas.ts, the vocabulary moves down to
+ * constants.ts instead.
+ */
+import type { PerformanceMetric } from './schemas';
 
 // ─── Identity & tenancy ──────────────────────────────────────────────────────
 
@@ -122,6 +140,31 @@ export interface TestExecution {
    * is NOT a pass — it is a flake candidate and the gate treats it as such.
    */
   retriedAndPassed: boolean;
+  /**
+   * Why this result has nothing measured in it, when the PLUGIN is the one that
+   * knows.
+   *
+   * The worker already classifies the skips it decides itself — no checkout, a
+   * dead base URL, no plugin for the type — and writes them as
+   * `notRunMessage(kind, why)` into `errorMessage`. A plugin could not: it
+   * returns SKIPPED with a plain English sentence ("k6 is not installed on this
+   * image"), the tag is absent, and `parseNotRun` correctly reads that back as
+   * null — "not recorded". So the one party that actually knows WHICH of the
+   * four reasons applies was the one party with no way to say it, and every
+   * tool-missing skip in the product reached the database untyped.
+   *
+   * Optional and nullable like `newBaseline` and `mutation` above, for the same
+   * reason: it is a plugin-produced extra that the WORKER persists, and every
+   * existing plugin that leaves it undefined keeps compiling and keeps meaning
+   * exactly what it meant.
+   *
+   * ABSENT IS NOT `NOT_RUN`. Undefined means the plugin made no claim about
+   * why, which is the fifth state `parseNotRun` and `TestResult.notRunKind`
+   * both spell NULL. `NOT_RUN` is a claim — the weakest of the four, but still a
+   * claim — and defaulting to it would put a sentence in the database that no
+   * plugin wrote.
+   */
+  notRun?: { kind: NotRunKind; why: string } | null;
   /** Findings that are first-class results rather than pass/fail (a11y, security). */
   findings: Finding[];
   /**
@@ -220,9 +263,54 @@ export interface MutationRunData {
   survivors: SurvivingMutant[];
 }
 
+/**
+ * What kind of problem a finding is. Mirrors the `FindingKind` Postgres enum.
+ *
+ * Named rather than left inline on `Finding` because a gate rule now selects on
+ * it (`MAX_FINDINGS.onlyKinds`), and a rule that could only be written as
+ * `Finding['kind'][]` would make the gate's configuration shape depend on the
+ * shape of a row.
+ */
+export const FINDING_KINDS = [
+  'ACCESSIBILITY',
+  'SECURITY',
+  'PERFORMANCE',
+  'LOCALIZATION',
+  'VISUAL',
+] as const;
+export type FindingKind = (typeof FINDING_KINDS)[number];
+
+/**
+ * How bad one finding is, in the plugins' OWN vocabulary.
+ *
+ * These four words are not a scale this file invented to make gating tidy: they
+ * are what the plugins already emit — axe's impact levels pass straight through
+ * (`packages/runner/src/plugins/accessibility.ts`), the security smoke test
+ * files a missing CSP as SERIOUS and a referrer-policy as MINOR, the performance
+ * plugin files a blown budget as SERIOUS and a noisy metric as MINOR. A gate
+ * that invented a fifth level, or a 1-10 score, would be gating on a number
+ * nothing in the product produces.
+ */
+/**
+ * Worst first, and the ORDER is the contract.
+ *
+ * `MAX_FINDINGS` is written as "at or above SERIOUS", which only means anything
+ * if one list decides what "above" is. Two implementations of that ranking —
+ * one in the gate, one in a screen's sort — is how a rule comes to block on a
+ * severity the UI shows below the threshold.
+ *
+ * An `as const` array with the type derived from it, which is this repo's own
+ * idiom (see constants.ts) and not decoration: `z.enum()` needs the tuple, and
+ * the zod schema that validates a `MAX_FINDINGS` rule on its way into the
+ * database is in a different file. A hand-written union there would be a third
+ * copy of this vocabulary.
+ */
+export const FINDING_SEVERITIES = ['CRITICAL', 'SERIOUS', 'MODERATE', 'MINOR'] as const;
+export type FindingSeverity = (typeof FINDING_SEVERITIES)[number];
+
 export interface Finding {
-  kind: 'ACCESSIBILITY' | 'SECURITY' | 'PERFORMANCE' | 'LOCALIZATION' | 'VISUAL';
-  severity: 'CRITICAL' | 'SERIOUS' | 'MODERATE' | 'MINOR';
+  kind: FindingKind;
+  severity: FindingSeverity;
   /** Stable id so the same violation dedupes across runs: axe rule id, check name. */
   code: string;
   message: string;
@@ -548,6 +636,23 @@ export interface ShardPlan {
 
 // ─── Quality gates (§4) ──────────────────────────────────────────────────────
 
+/**
+ * What one rule's evaluation did about a merge.
+ *
+ * UNMEASURED is the fourth state and the whole reason this is a named type.
+ * A `MIN_COVERAGE` rule on a project that has never computed a coverage
+ * snapshot has no answer: PASS would be a claim about the customer's suite made
+ * from our own silence, and BLOCK would hold a merge over a measurement WE did
+ * not take. Both are lies in opposite directions, so the rule returns neither.
+ *
+ * An UNMEASURED evaluation never contributes to `GateResult.passed` — it cannot
+ * block — and it is always rendered, because the surfaces that show a gate show
+ * every evaluation's `detail`. That is deliberate: the alternative (dropping the
+ * rule) makes a configured gate silently absent, and absent looks exactly like
+ * green.
+ */
+export type GateAction = 'PASS' | 'WARN' | 'BLOCK' | 'UNMEASURED';
+
 export type GateRule =
   | { kind: 'BLOCK_ON_VERDICT'; verdict: Verdict; onlyPriorities: Priority[] }
   | { kind: 'MAX_FLAKE_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' }
@@ -563,16 +668,306 @@ export type GateRule =
    * declaration of a union member is how two parts of a system quietly
    * disagree about what a rule is.
    */
-  | { kind: 'MAX_QUARANTINE_PERCENT'; percent: number; action: 'WARN' | 'BLOCK' };
+  | { kind: 'MAX_QUARANTINE_PERCENT'; percent: number; action: 'WARN' | 'BLOCK' }
+  /*
+   * ── The measurement rules ─────────────────────────────────────────────────
+   *
+   * Everything above this line is scored from the run's own result rows, which
+   * is why those four rules were the only ones that ever existed: they needed
+   * nothing but the suite. The consequence was that a pull request deleting the
+   * only checkout test passed every gate in the product — every remaining test
+   * passed, the flake rate was zero, p95 was fine, and the thing that had
+   * changed (what is tested AT ALL) was not a quantity any rule could read.
+   *
+   * These five rules gate on what QAAI measures BESIDE the suite: the surface
+   * coverage denominator, the changed surface of the diff, the findings the
+   * plugins file, the mutation score, and the performance budgets. Each of them
+   * can be unmeasured on a given run, and each of them says so rather than
+   * passing.
+   */
+  /**
+   * The project's surface-coverage percentage floor (§ coverage denominator).
+   *
+   * Scored against the most recent stored `CoverageSnapshot`, whose `percent` is
+   * NULL — not 0 — when the denominator is zero. A null percentage is an
+   * UNMEASURED evaluation, never a 0% failure: "we found nothing to measure" and
+   * "nothing you have is covered" are different sentences and only one of them
+   * is about the customer.
+   */
+  | { kind: 'MIN_COVERAGE'; percent: number; action: 'WARN' | 'BLOCK' }
+  /**
+   * The floor on the part of the surface THIS DIFF touches.
+   *
+   * The whole-project number moves by tenths and so gates nothing on a normal
+   * pull request; patch coverage is the number that can actually refuse a merge,
+   * because a change that adds an untested route scores 0% on its own changed
+   * surface while the project percentage does not move.
+   *
+   * What it cannot see is written out in `PatchCoverage.caveats` and carried
+   * into the evaluation's detail — a diff that RENAMES a route produces the same
+   * evidence as one that adds a route and a stale inventory, and this rule is
+   * not allowed to pretend otherwise.
+   */
+  | { kind: 'MIN_PATCH_COVERAGE'; percent: number; action: 'WARN' | 'BLOCK' }
+  /**
+   * Refuse a diff that touches a route no test covers.
+   *
+   * The name is the one in the defect register and it over-promises by one word:
+   * NEW cannot be proven from a diff and an inventory. A route absent from the
+   * inventory is either brand new or renamed or simply not extracted yet, and
+   * those three leave identical evidence — so this rule gates on the routes the
+   * inventory DOES know and reports the unrecognised ones as unrecognised. See
+   * `PatchCoverage.unrecognised`.
+   */
+  | { kind: 'NO_NEW_UNCOVERED_ROUTES'; action: 'WARN' | 'BLOCK' }
+  /**
+   * How many findings at or above a severity a run may carry.
+   *
+   * This is the rule the accessibility plugin's docstring has always referred
+   * to — "whether it blocks a merge is a quality-gate decision (§4), not the
+   * runner's call" — and which did not exist, so a PASSED accessibility test
+   * with a critical violation gated green.
+   *
+   * `max: 0` with `atOrAbove: 'CRITICAL'` is the one most teams want. The
+   * severities are the plugins' own (`FINDING_SEVERITIES`), and `onlyKinds: []`
+   * means every kind.
+   */
+  | {
+      kind: 'MAX_FINDINGS';
+      atOrAbove: FindingSeverity;
+      /** Empty means every kind. */
+      onlyKinds: FindingKind[];
+      max: number;
+      action: 'WARN' | 'BLOCK';
+    }
+  /**
+   * The mutation-score floor — the only rule in this list that gates on whether
+   * the tests ASSERT anything.
+   *
+   * Scored from the `mutationScore`/`mutationDetected`/`mutationUndetected`
+   * columns on TestResult, and the three states those columns encode are kept
+   * distinct: every column null means mutation testing did not run (UNMEASURED),
+   * counts with a null score means nothing valid ran (UNMEASURED, with the
+   * excluded count said out loud), and a score of 0 means every mutant survived,
+   * which FAILS.
+   */
+  | { kind: 'MIN_MUTATION_SCORE'; percent: number; action: 'WARN' | 'BLOCK' }
+  /**
+   * How many Core Web Vitals budget breaches a run may carry.
+   *
+   * Read this one carefully, because it is deliberately NOT "LCP under 2500ms".
+   * The performance plugin measures six metrics against budgets the test's spec
+   * declares, and the only part of that it PERSISTS is the breach — as a
+   * `PERFORMANCE` finding with the code `performance.budget-exceeded.<metric>`.
+   * The median it measured lives in a step title and nowhere else.
+   *
+   * So a numeric vitals gate would have to regex a number out of a sentence,
+   * which is precisely the defect the mutation columns were added to end. This
+   * rule therefore gates on the fact the product stores (a budget was blown,
+   * and on which metric) and leaves the THRESHOLD where it already is and where
+   * a team can argue about it: the budget in the spec. A run with no performance
+   * test in it is UNMEASURED, not a run with zero breaches.
+   */
+  | {
+      kind: 'MAX_VITAL_BREACHES';
+      /** A single metric, or every one of them. */
+      metric: PerformanceMetric | 'ANY';
+      max: number;
+      action: 'WARN' | 'BLOCK';
+    }
+  /**
+   * The gate evaluation that is about the ENVIRONMENT rather than about the
+   * tests: nothing could be attempted, or some of it could not.
+   *
+   * Appended by the run finaliser (`ENVIRONMENT_GATE_RULE` in
+   * apps/worker/src/processors/run.ts), not configured by a project, for the
+   * same reason as `MAX_QUARANTINE_PERCENT` above — a run in which nothing was
+   * measured must not be able to merge, and a brake a project can delete is not
+   * a brake. It rides the gate result because a gate evaluation already reaches
+   * the chat alert, the GitHub check summary, the CLI's BLOCK lines and the run
+   * page's gate chip; a fifth notification channel nobody subscribes to is how
+   * PAGERDUTY ended up in the Prisma enum and nowhere else.
+   *
+   * It carries no threshold on purpose. The whole message is in the evaluation's
+   * `detail` — which blocked tests, and why — because that is the field every
+   * one of those surfaces actually renders.
+   */
+  | { kind: 'ENVIRONMENT_AVAILABLE'; action: 'WARN' | 'BLOCK' };
+
+/**
+ * Every discriminant `GateRule` has, as a runtime value.
+ *
+ * ── Why this exists, and what it caught ─────────────────────────────────────
+ *
+ * `gateRuleSchema` in schemas.ts is the ONLY write path to
+ * `Project.gateRules` (PUT /projects/:id/gate-rules parses through it). Six
+ * measurement rules were added to the union above and not to that schema, so
+ * for as long as that lasted no project could save one: the feature was
+ * reachable only by hand-editing a database row, and `check:wiring` cannot see
+ * this class of break — a union member with no write path is not a disconnected
+ * FILE, so nothing flagged it.
+ *
+ * This list is what makes that checkable. The `Record` below is the
+ * compile-time half: a record keyed on the union's own discriminant cannot be
+ * written without naming every member, and naming one that does not exist is an
+ * excess property, so a seventh kind breaks THIS line rather than quietly
+ * shipping unsaveable. `schemas.test.ts` is the run-time half: it asserts the
+ * zod union's options are exactly these.
+ *
+ * Two mechanisms rather than one because each catches what the other cannot. A
+ * hand-written list would drift from the union; a list derived from the union
+ * with no runtime form could not be compared against zod, whose options exist
+ * only at run time.
+ */
+const GATE_RULE_KIND_PRESENT: Record<GateRule['kind'], true> = {
+  BLOCK_ON_VERDICT: true,
+  MAX_FLAKE_RATE: true,
+  MAX_P95_LATENCY_MS: true,
+  MIN_PASS_RATE: true,
+  MAX_QUARANTINE_PERCENT: true,
+  MIN_COVERAGE: true,
+  MIN_PATCH_COVERAGE: true,
+  NO_NEW_UNCOVERED_ROUTES: true,
+  MAX_FINDINGS: true,
+  MIN_MUTATION_SCORE: true,
+  MAX_VITAL_BREACHES: true,
+  ENVIRONMENT_AVAILABLE: true,
+};
+
+export const GATE_RULE_KINDS = Object.keys(GATE_RULE_KIND_PRESENT) as ReadonlyArray<
+  GateRule['kind']
+>;
+export type GateRuleKind = GateRule['kind'];
+
+/**
+ * Why a gate result is not the one finalisation wrote, and what it replaced.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * `gateResult` was computed in `finalizeRun`, which runs BEFORE triage: the
+ * default rule is `BLOCK_ON_VERDICT REAL_BUG`, no verdict row existed yet, so
+ * the rule found no REAL_BUG verdicts, and the gate came back `passed: true` on
+ * a run with real failures. The one rule a new project gets could not see the
+ * verdicts it is named after.
+ *
+ * ── What re-scoring may and may not do ──────────────────────────────────────
+ *
+ * It SUPERSEDES. The evaluations are replaced wholesale and `generation` counts
+ * how many times that has happened; nothing is ever appended, so a re-delivered
+ * webhook or an overlapping sweep cannot grow the gate. A re-score whose
+ * evaluations come out identical is not written at all, which is what makes the
+ * operation idempotent rather than merely repeatable.
+ *
+ * And it says so. `reversedGreen` is set when a build that had already reported
+ * a passing gate now blocks — the one transition that costs a team trust if it
+ * happens quietly — and `reason` is a sentence written to be printed verbatim.
+ */
+export interface GateRescore {
+  atIso: string;
+  /** 1 is the finalisation gate; 2 and up are re-scores. */
+  generation: number;
+  /** What the superseded result said. */
+  previousPassed: boolean;
+  /** True when a gate that reported a pass now blocks. Never left implicit. */
+  reversedGreen: boolean;
+  /** Printable verbatim, and it names the flip when there is one. */
+  reason: string;
+}
 
 export interface GateResult {
   passed: boolean;
   evaluations: Array<{
     rule: GateRule;
-    passed: boolean;
-    action: 'WARN' | 'BLOCK' | 'PASS';
+    /**
+     * `null` when the rule's input was not measured — see {@link GateAction}.
+     * Not `false`: a reader that prints "failed" for a rule nothing measured is
+     * inventing a failure, and a reader that prints "passed" is inventing a
+     * pass.
+     */
+    passed: boolean | null;
+    action: GateAction;
     detail: string;
   }>;
+  /**
+   * How many evaluations had no answer. Present on every result the evaluator
+   * produces, so a surface can say "4 of 6 rules measured" instead of showing
+   * six rules and implying all six were scored.
+   */
+  unmeasured?: number;
+  /** Present only once the gate has been scored again after triage. */
+  rescored?: GateRescore;
+}
+
+// ─── Patch coverage: the join between a diff and the coverage denominator ────
+
+/**
+ * What the coverage inventory knows about one route a diff touched.
+ *
+ * The first five mirror `SurfaceStatus` exactly, because inventing a second
+ * vocabulary for the same fact is how two screens come to disagree about one
+ * route. The sixth does not exist there and is the honest part: a changed route
+ * the inventory has never heard of.
+ */
+export type PatchSurfaceState =
+  | 'COVERED'
+  | 'ASSERTED_NOT_RUN'
+  | 'UNCOVERED'
+  | 'UNKNOWN'
+  | 'WAIVED'
+  /**
+   * The diff names a route with no `CoverageItem` row.
+   *
+   * Three different worlds produce this and the evidence cannot tell them apart:
+   * the route is new in this very diff, the route was renamed (the old row is
+   * retired, the new one does not exist yet), or nobody has recomputed the
+   * inventory since the extractor last ran. So it is counted on its own, it is
+   * never folded into UNCOVERED, and it never counts as covered.
+   */
+  | 'NOT_IN_INVENTORY';
+
+export interface PatchCoverageRoute {
+  /** Canonical route, dynamic segments collapsed onto `:param`. */
+  route: string;
+  state: PatchSurfaceState;
+  /** The `CoverageItem.key` this resolved to, when it resolved to one. */
+  key: string | null;
+  /** The changed files that implicated this route. */
+  paths: string[];
+  /** True when the change was a layout/template — everything BELOW this route. */
+  subtree: boolean;
+}
+
+/**
+ * Coverage of the surface a diff actually touches.
+ *
+ * `impact.ts` could map a diff to routes and the coverage store could map routes
+ * to tests, and nothing joined them, so the product knew both halves of "this
+ * change lands on three routes and two of them have no test" and could state
+ * neither. This is that join, and the arithmetic is kept as counts so the
+ * division is checkable by hand.
+ */
+export interface PatchCoverage {
+  /** Routes in the diff the inventory knows, minus waived ones. */
+  denominator: number;
+  covered: number;
+  assertedNotRun: number;
+  uncovered: number;
+  unknown: number;
+  waived: number;
+  /** Changed routes with no inventory row. NOT part of the denominator. */
+  unrecognised: number;
+  /** `covered / denominator`, one decimal, or null when there is nothing to divide. */
+  percent: number | null;
+  /** Every route the join considered, with what it concluded and why. */
+  routes: PatchCoverageRoute[];
+  /** What a reader must know before trusting the number. Never empty by default. */
+  caveats: string[];
+  /**
+   * False when the join had nothing to join against — no coverage rows at all,
+   * or a diff from which no route could be derived. A gate rule reading this
+   * must report UNMEASURED rather than 0%.
+   */
+  measured: boolean;
 }
 
 // ─── Triage & healing (§3.3, §3.4) ───────────────────────────────────────────
@@ -593,7 +988,120 @@ export interface TriageVerdict {
   suspectCommit: { sha: string; author: string; message: string; files: string[] } | null;
   /** Which model produced this, for the cost ledger and for A/B on prompt changes. */
   model: string;
+
+  /* ── A verdict is about a CAUSE, not about a result ─────────────────────────
+   *
+   * The four columns the `20261024030000_triage_per_cause` migration added, and
+   * the reason they are on the TYPE and not only in the database: triage now
+   * answers once per cause and ATTACHES that answer to every member of the
+   * cluster, so the shape every package passes around has to be able to say
+   * which cause an answer is about and whether this particular row is the one a
+   * model actually looked at. While it could not, the two facts existed only as
+   * Prisma columns — so the cockpit, the CLI and the API's own read paths each
+   * received a verdict they could not distinguish from a first-hand judgement.
+   *
+   * Required rather than optional, and that is the point. These are not an older
+   * server's missing fields; they are the sentence a writer has to finish. Each
+   * one has a value that means "no claim" (`null`, or revision 1) and is
+   * cheaper to write than a cast.
+   */
+
+  /**
+   * The cause this verdict answers — `sha1(signature)[0,12)`, byte-identical to
+   * the cluster id the cockpit links on. Null while nothing has clustered this
+   * result, which is a real state and not a missing one: a verdict reached
+   * before the clusterer ran belongs to no cause yet.
+   */
+  clusterKey: string | null;
+
+  /**
+   * THE HONESTY COLUMN. The `TriageVerdict.id` this row was COPIED from, when
+   * it was a copy.
+   *
+   * NULL means a model read this result itself. Anything else means this
+   * classification was reached by looking at a different test in the same
+   * cluster, and a reader who cannot tell the two apart will read 200 agreeing
+   * verdicts as 200 pieces of evidence when they are one. The `cluster:` prefix
+   * on `model` says the same thing to a human; this says it to a query.
+   */
+  derivedFromId: string | null;
+
+  /**
+   * 1 for the first answer, 2 and up after a re-triage. Never 0: there is no
+   * such thing as a verdict that was never reached, and a zero here would make
+   * "how many times was this re-judged" undercount by one on every row.
+   *
+   * The superseded contents live in `TriageVerdictRevision`, so an increment
+   * here is always matched by exactly one appended revision row.
+   */
+  revision: number;
+
+  /**
+   * The cause this verdict was split OUT of, when a human disagreed that it
+   * belonged there.
+   *
+   * Kept because the split is a correction of OUR clustering, not of the
+   * customer's code, and it is the only record that the signature hash put two
+   * different failures in one bucket. Null on every verdict nobody split.
+   */
+  splitFromClusterKey: string | null;
 }
+
+/**
+ * The cause's identity, as a caller holds it.
+ *
+ * Read off `FailureSignature` / `RunFailureCluster` (apps/api/src/routes/
+ * clusters.ts) and handed to `summariseFailure` in failure-summary.ts, which is
+ * why it lives here rather than there: it is a row's shape, and failure-summary
+ * is a pure classifier that only consumes it.
+ *
+ * Dates are ISO STRINGS rather than `Date`, deliberately. The web app receives
+ * this off a JSON response, where it is already a string; declaring `Date` would
+ * mean every web caller re-hydrating three fields in order to format one
+ * sentence, and the first one to forget would be comparing a string to a Date
+ * and getting `false` for free.
+ */
+export interface CauseIdentity {
+  /** sha1(signature)[0,12) — the same key the cockpit links on. */
+  clusterKey: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  /** Distinct runs this cause has appeared in. */
+  runsSeen: number;
+  /**
+   * True only when this run is the run that minted the identity. The caller
+   * answers it with an equality against `firstSeenRunId`, so it is a fact
+   * rather than a "have we seen it lately" heuristic.
+   */
+  newInThisBuild: boolean;
+  /** Non-null while a mute is recorded, expired or not. */
+  mutedUntil: string | null;
+  mutedReason: string | null;
+}
+
+/**
+ * Lifecycle of one heal proposal. Mirrors the `HealState` enum in
+ * `apps/api/prisma/schema.prisma` (`check:enums` diffs them).
+ *
+ * It had no TypeScript mirror at all, which is why `OPEN_HEAL_STATES` in
+ * packages/agent/src/healer.ts is typed `readonly string[]` and its callers
+ * hand Prisma's enum straight in — a list of magic strings compared against
+ * another list of magic strings, with nothing anywhere to catch a typo or a
+ * seventh state.
+ *
+ * SUPERSEDED is included and is not optional: it is the state the supersede
+ * planner WRITES, so a mirror that left it out would type-check every caller
+ * except the one that matters.
+ */
+export const HEAL_STATES = [
+  'PROPOSED',
+  'APPROVED',
+  'REJECTED',
+  'APPLIED',
+  'AUTO_APPLIED',
+  'SUPERSEDED',
+] as const;
+export type HealState = (typeof HEAL_STATES)[number];
 
 export interface HealProposal {
   testId: string;
@@ -603,10 +1111,154 @@ export interface HealProposal {
   /**
    * Selector-only heals are eligible for org-level auto-approve (§3.4); anything
    * touching assertions requires a human regardless of the setting.
+   *
+   * RETIRE mirrors the `HealRisk` member of the same name and was missing here,
+   * so the one risk level that is not a patch at all — "this test should stop
+   * existing", applied by disabling the test and carrying no diff — was a value
+   * the database accepted and TypeScript could not name. `isAutoApprovable` in
+   * packages/agent/src/healer.ts refuses it by name, and `healKindOf` switches
+   * on it to tell a RETIREMENT from a PATCH; both were doing so against a
+   * string the union said was impossible.
    */
-  riskLevel: 'SELECTOR_ONLY' | 'ASSERTION_CHANGE' | 'STRUCTURAL';
+  riskLevel: 'SELECTOR_ONLY' | 'ASSERTION_CHANGE' | 'STRUCTURAL' | 'RETIRE';
   confidence: number;
 }
+
+// ─── Ownership: who a failure belongs to, and which kind of nobody (§8) ──────
+
+/**
+ * Who owns something. A user or a team, never both and never a bare string.
+ *
+ * Declared here rather than in apps/api/src/lib/ownership.ts because
+ * `OwnerAssignment` below carries one and `@qaai/shared` cannot depend on the
+ * API. The matching logic — patterns, precedence, the rule table — stays there;
+ * only the shape a reader receives lives here.
+ */
+export type OwnerRef = { kind: 'USER'; userId: string } | { kind: 'TEAM'; teamId: string };
+
+/**
+ * Why a thing has no owner — and the whole reason this is a named vocabulary.
+ *
+ * `owner: null` covers three situations that must not be confused, because only
+ * one of them is benign:
+ *
+ *   NO_RULES        nobody has written any rules. Expected: ownership is opt-in.
+ *   NO_MATCH        rules exist and none cover this. Someone meant to route
+ *                   this area and did not.
+ *   RULES_UNUSABLE  a rule that COULD have matched could not be evaluated, so
+ *                   routing has silently stopped. This is the dangerous one: it
+ *                   is indistinguishable from NO_MATCH from the outside, and it
+ *                   means a team that believes it is being paged is not.
+ *
+ * A nullable `assigneeUserId` column alone cannot tell those apart, which is
+ * exactly how an unowned failure ends up LOOKING owned — the worse of the two
+ * failures, because nobody goes looking for it. `TriageVerdict.ownerState` is
+ * the column that stores one of these, and it is a `String?` whose null means a
+ * fourth thing again: nothing has tried to route this verdict yet.
+ */
+export const OWNERSHIP_STATES = ['OWNED', 'NO_RULES', 'NO_MATCH', 'RULES_UNUSABLE'] as const;
+export type OwnershipState = (typeof OWNERSHIP_STATES)[number];
+
+/**
+ * `OWNERSHIP_STATES` plus the one state only a multi-subject ticket can be in.
+ *
+ * SPLIT belongs to a thing that covers MANY subjects: one cause spanning forty
+ * tests owned by three teams has no single true assignee, and picking one would
+ * route the whole ticket to somebody who owns a third of it. It is never
+ * written on a single verdict, which is why it is a separate list rather than a
+ * fifth member of the one above.
+ */
+export const ISSUE_OWNER_STATES = [...OWNERSHIP_STATES, 'SPLIT'] as const;
+export type IssueOwnerState = (typeof ISSUE_OWNER_STATES)[number];
+
+/** What a tracker issue was filed ABOUT. Mirrors `TrackerIssue.subject`. */
+export const ISSUE_SUBJECTS = ['FAILURE', 'COVERAGE_GAP'] as const;
+export type IssueSubject = (typeof ISSUE_SUBJECTS)[number];
+
+/**
+ * The resolution, in the shape a writer needs rather than a reader.
+ *
+ * `note` is a sentence written to be stored and shown verbatim, because the
+ * person who sees "unowned" on a failure at 3am cannot open the rule list and
+ * work out which of the states above they are in.
+ */
+export interface OwnerAssignment {
+  state: OwnershipState;
+  owner: OwnerRef | null;
+  ruleId: string | null;
+  note: string;
+  /**
+   * Rules that could not be evaluated. Carried even when an owner WAS found: a
+   * project can route this test correctly and still have a broken rule that has
+   * stopped routing twenty others.
+   */
+  unusable: Array<{ ruleId: string; reason: string }>;
+}
+
+// ─── Closing the coverage loop: the ledger and the campaign ─────────────────
+
+/**
+ * The closure ledger's vocabulary — what became of one coverage gap.
+ *
+ * Seven states, and the two that look redundant are the only reason the ledger
+ * is worth building:
+ *
+ *   NOT_CLOSED    re-measured, a test exists, and the gap is STILL reported.
+ *                 This is the FINDING. Folding it into OPEN would lose the fact
+ *                 that a generation was already spent on it.
+ *   UNVERIFIABLE  closure could not be checked at all — no readable crawl, or
+ *                 the gap report was a ranked PAGE and this gap's absence from
+ *                 that page is evidence of nothing. A gap that drops off a
+ *                 truncated list and is recorded as CLOSED is the easiest way
+ *                 for this number to become fiction.
+ *
+ * `GapClosure.state` is TEXT rather than a Prisma enum (see that migration for
+ * why), so this array IS the domain and the writer validates against it at run
+ * time — `isClosureState` in packages/agent/src/coverage.ts.
+ */
+export const CLOSURE_STATES = [
+  'OPEN',
+  'PROPOSED',
+  'TEST_WRITTEN',
+  'CLOSED',
+  'NOT_CLOSED',
+  'REOPENED',
+  'UNVERIFIABLE',
+] as const;
+export type ClosureState = (typeof CLOSURE_STATES)[number];
+
+/**
+ * Whether the closure autopilot's plan items land APPROVED or PROPOSED.
+ *
+ * The domain of `ClosureCampaign.approvalPolicy`. HUMAN_REVIEW is the default
+ * and the column carries no database default, so switching this product on for
+ * an existing customer cannot also switch on unattended code generation for
+ * them.
+ */
+export const CLOSURE_APPROVAL_POLICIES = ['AUTO_APPROVE', 'HUMAN_REVIEW'] as const;
+export type ClosureApprovalPolicy = (typeof CLOSURE_APPROVAL_POLICIES)[number];
+
+/**
+ * The domain of `ClosureCampaign.state`. Seven of the eight are terminal, which
+ * is the anti-spin argument restated as a type: a campaign can leave RUNNING in
+ * seven different ways and re-enter it in none.
+ *
+ * Here rather than in apps/worker/src/processors/close-loop.ts because the API
+ * renders a campaign's state and could not name it without importing a worker
+ * PROCESSOR — which would drag the queue, the browser and the Prisma client
+ * into an HTTP read path to borrow eight strings.
+ */
+export const CLOSURE_CAMPAIGN_STATES = [
+  'RUNNING',
+  'TARGET_MET',
+  'SETTLED',
+  'BUDGET_SPENT',
+  'NOTHING_LEFT',
+  'TICK_CEILING',
+  'UNMEASURABLE',
+  'BLOCKED',
+] as const;
+export type ClosureCampaignState = (typeof CLOSURE_CAMPAIGN_STATES)[number];
 
 // ─── LLM accounting (§0) ─────────────────────────────────────────────────────
 

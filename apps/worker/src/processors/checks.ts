@@ -38,6 +38,16 @@
  *   concluded and its state written, so a missing `Pull requests: write`, a
  *   deleted comment or a rate limit costs the comment and never the verdict.
  *
+ * ── The gate, re-scored ─────────────────────────────────────────────────────
+ * `completed` also scores the quality gate AGAIN before it reports anything.
+ * `Run.gateResult` is written by the run finaliser, which runs before triage —
+ * so the rule every new project gets, `BLOCK_ON_VERDICT REAL_BUG`, was scored
+ * at a moment when no verdict row existed, found no REAL_BUG verdicts, and came
+ * back as a pass on a run with real failures. The merge box was green over a
+ * broken build by construction. See the section above `rescoreRunGate` for what
+ * the re-score may and may not do, and the sweep below for how it arrives after
+ * triage rather than before it.
+ *
  * ── The sweep, and why it exists ────────────────────────────────────────────
  * The natural place to enqueue those two phases is the run processor: one line
  * where a run starts, one where it finalises. `apps/worker/src/processors/run.ts`
@@ -47,6 +57,16 @@
  * flake and schedule sweeps that already run here. When run.ts does enqueue
  * directly, the sweep finds nothing left to do and becomes redundant rather
  * than wrong.
+ *
+ * The sweep has a SECOND pass, and it is not about checks at all: it re-scores
+ * the gate of a terminal run that has no check to post — no pull request, no
+ * installation, no GitHub app configured in this deployment — because four of
+ * the measurement rules are assembled only by the re-score and need no diff.
+ * Without it a customer running the suite from their own CI through
+ * packages/cli, which is the primary install, read "not measured" on a
+ * `MIN_COVERAGE` rule on every run they would ever do. That pass needs no app,
+ * so it runs before the GitHub half's configuration check. See
+ * `sweepRescoreWithoutCheck` for what it costs and what it still does not reach.
  *
  * ── Which way this fails ────────────────────────────────────────────────────
  * Toward reporting. A missing app is a SKIP with a sentence naming what to
@@ -92,7 +112,40 @@ import {
  * an expired one suppresses nothing, so its failure has to gate again and has
  * to read as a plain failure in the merge box.
  */
-import { quarantineSuppresses } from '@qaai/runner';
+import {
+  DEFAULT_GATE_RULES,
+  QUARANTINE_NAMES_SCANNED,
+  evaluateGates,
+  gateAwaitsTriage,
+  quarantineHealthFrom,
+  quarantineSuppresses,
+  rescoreGate,
+  runOutcome,
+  untriagedBlockers,
+  type GateInput,
+} from '@qaai/runner';
+/*
+ * The impact analysis, imported rather than re-implemented. It maps a diff to
+ * the routes it touches; `patchCoverage` joins those routes to the coverage
+ * inventory. Both are pure functions over data this file reads, which is why a
+ * worker may import them from the API package — `lib/impact.ts` pulls in
+ * @qaai/shared and nothing else.
+ */
+import { analyzeImpact, patchCoverage, type PatchCoverageRow } from '../../../api/src/lib/impact.js';
+/*
+ * `parseNotRun` reads the typed not-run tag back off `TestResult.errorMessage`.
+ * It is the only way to classify a row written before `TestResult.notRunKind`
+ * existed, and the gate rules need the classification to keep a test nobody
+ * could attempt out of a pass rate.
+ */
+import { parseNotRun } from '@qaai/shared';
+import type {
+  FindingKind,
+  FindingSeverity,
+  GateResult,
+  GateRule,
+  PerformanceMetric,
+} from '@qaai/shared';
 import { connection, logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
 
@@ -100,11 +153,26 @@ import { open as openSecret } from '../vault.js';
 
 const checksQueue = new Queue(CHECKS_QUEUE, { connection });
 
-export async function enqueueCheck(job: ChecksJob, delayMs = 0): Promise<void> {
+export async function enqueueCheck(
+  job: ChecksJob,
+  delayMs = 0,
+  /**
+   * An extra component of the job id, for the one case that legitimately needs
+   * the SAME phase to run twice on one run: the gate was re-scored after triage
+   * and the check has to be re-reported.
+   *
+   * Without it the de-duplication below would swallow the second report — a
+   * completed job keeps its id, so re-adding `check-<run>-completed` is a no-op
+   * and the merge box would keep showing the pre-triage verdict forever. The
+   * suffix is the gate's generation, so each generation re-reports exactly once
+   * and a loop is impossible: a generation only exists because the gate changed.
+   */
+  jobKey?: string,
+): Promise<void> {
   await checksQueue.add(CHECKS_QUEUE, job, {
     // One job per run per phase: a redelivered webhook or an overlapping sweep
     // must not put two check runs on the same pull request.
-    jobId: `check-${job.runId}-${job.phase}`,
+    jobId: `check-${job.runId}-${job.phase}${jobKey ? `-${jobKey}` : ''}`,
     attempts: 3,
     backoff: { type: 'exponential', delay: 5_000 },
     ...(delayMs > 0 ? { delay: delayMs } : {}),
@@ -236,12 +304,35 @@ async function loadRun(orgId: string, runId: string) {
        * The column cannot drift that way, so the column is selected.
        */
       quarantinedFailedCount: true,
+      /*
+       * Selected for `runOutcome`, which the post-triage re-score has to call:
+       * a gate that now blocks has to be able to write the run's status through
+       * the ONE function allowed to answer "did this run pass", and that
+       * function takes every counter. Leaving `skippedCount` out would mean
+       * passing it a zero and letting the one source of truth be fed a number
+       * that is not the row's.
+       */
+      skippedCount: true,
       totalCount: true,
       errorMessage: true,
       gateResult: true,
       startedAt: true,
       finishedAt: true,
-      project: { select: { id: true, repoFullName: true, repoInstallationId: true } },
+      project: {
+        select: {
+          id: true,
+          repoFullName: true,
+          repoInstallationId: true,
+          /*
+           * The project's OWN rules, because the re-score must reach the same
+           * verdict the finaliser would have reached with the verdicts in hand.
+           * Scoring the re-run against `DEFAULT_GATE_RULES` would quietly
+           * replace a customer's gate with ours.
+           */
+          gateRules: true,
+          quarantineBudgetPercent: true,
+        },
+      },
       environment: { select: { name: true, kind: true } },
       results: {
         where: { status: { in: ['FAILED', 'TIMED_OUT'] } },
@@ -289,7 +380,19 @@ async function loadRun(orgId: string, runId: string) {
 
 type LoadedRun = NonNullable<Awaited<ReturnType<typeof loadRun>>>;
 
-async function buildEvidence(orgId: string, run: LoadedRun): Promise<CheckEvidence> {
+async function buildEvidence(
+  orgId: string,
+  run: LoadedRun,
+  /**
+   * The gate as re-scored after triage, when it was. Passed in rather than
+   * re-read off the row: the write and this read would otherwise be two
+   * round-trips that can disagree, and the merge box has to show the verdict
+   * this job just computed.
+   */
+  rescored?: GateResult | null,
+  /** The run's status after the re-score, when the re-score changed it. */
+  status?: string | null,
+): Promise<CheckEvidence> {
   const testIds = run.results.map((r) => r.test.id);
   /*
    * One instant for the whole check, not one per failure. Two tests whose
@@ -351,12 +454,17 @@ async function buildEvidence(orgId: string, run: LoadedRun): Promise<CheckEviden
     };
   });
 
-  const gate = (run.gateResult ?? null) as { passed?: boolean } | null;
+  /*
+   * The re-scored gate wins when there is one. `conclusionFor` keys the merge
+   * box off `gateBlocking` before it looks at anything else, so this is the
+   * line that makes a post-triage BLOCK actually hold a merge.
+   */
+  const gate = (rescored ?? run.gateResult ?? null) as { passed?: boolean } | null;
 
   return {
     run: {
       id: run.id,
-      status: run.status,
+      status: status ?? run.status,
       commitSha: run.commitSha ?? '',
       prNumber: run.prNumber,
       passedCount: run.passedCount,
@@ -434,7 +542,7 @@ const FAILURES_SHOWN_EXPANDED = 5;
 /** A cache miss walks the PR's comments. Bounded: 3 pages, oldest first. */
 const COMMENT_SCAN_PAGES = 3;
 const COMMENTS_PER_PAGE = 100;
-const COMMENT_TIMEOUT_MS = 15_000;
+const GITHUB_TIMEOUT_MS = 15_000;
 /**
  * Long enough to outlive the pull request it belongs to in the normal case, so
  * the marker scan below runs about once per PR rather than once per push.
@@ -533,8 +641,15 @@ interface CommentReply {
 }
 
 /**
- * One request to GitHub's issue-comment API, under the rules every credential
- * in this codebase travels by.
+ * One request to GitHub, under the rules every credential in this codebase
+ * travels by.
+ *
+ * It was `commentRequest` and served the issue-comment API alone. The
+ * post-triage gate re-score needs the pull request's changed FILES — patch
+ * coverage has to know which routes a diff touches — and the choice there was
+ * between a second hand-rolled fetch and one helper used by both. A second copy
+ * of the credential rules is how one of them comes to relax a rule, so there is
+ * one helper and the read path uses it too.
  *
  * This repeats `githubJson` from lib/github-app.ts — the host is a pinned
  * constant, a 3xx is an error rather than a hop that would re-send the
@@ -546,7 +661,7 @@ interface CommentReply {
  * those rules is how an installation token leaves the building, so the rules
  * are repeated in full rather than approximated.
  */
-async function commentRequest(
+async function githubRequest(
   path: string,
   init: { method: 'GET' | 'POST' | 'PATCH'; token: string; body?: unknown },
 ): Promise<CommentReply> {
@@ -571,12 +686,12 @@ async function commentRequest(
       },
       ...(init.body === undefined ? {} : { body: JSON.stringify(init.body) }),
       redirect: 'manual',
-      signal: AbortSignal.timeout(COMMENT_TIMEOUT_MS),
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
   } catch (err) {
     const reason =
       err instanceof Error && err.name === 'TimeoutError'
-        ? `did not answer within ${COMMENT_TIMEOUT_MS / 1000}s`
+        ? `did not answer within ${GITHUB_TIMEOUT_MS / 1000}s`
         : 'was unreachable';
     throw new GithubAppError(`GitHub ${reason}.`, 'PROVIDER');
   }
@@ -700,7 +815,7 @@ async function findMarkedComment(
   const pr = pathNumber(prNumber, 'pull request number');
 
   for (let page = 1; page <= COMMENT_SCAN_PAGES; page += 1) {
-    const { status, json, rateLimited } = await commentRequest(
+    const { status, json, rateLimited } = await githubRequest(
       `/repos/${slug}/issues/${pr}/comments?per_page=${COMMENTS_PER_PAGE}&page=${page}`,
       { method: 'GET', token },
     );
@@ -732,7 +847,7 @@ async function createComment(
 ): Promise<number> {
   const slug = githubRepoSlug(repo);
   const pr = pathNumber(prNumber, 'pull request number');
-  const { status, json, rateLimited } = await commentRequest(
+  const { status, json, rateLimited } = await githubRequest(
     `/repos/${slug}/issues/${pr}/comments`,
     { method: 'POST', token, body: { body } },
   );
@@ -761,7 +876,7 @@ async function updateComment(
 ): Promise<boolean> {
   const slug = githubRepoSlug(repo);
   const id = pathNumber(commentId, 'comment id');
-  const { status, json, rateLimited } = await commentRequest(
+  const { status, json, rateLimited } = await githubRequest(
     `/repos/${slug}/issues/comments/${id}`,
     { method: 'PATCH', token, body: { body } },
   );
@@ -1110,6 +1225,650 @@ async function commentAfterCheck(
   }
 }
 
+// ─── Re-scoring the gate, now that the verdicts exist ────────────────────────
+//
+// THE DEFECT. `Run.gateResult` is written by the run finaliser, which runs
+// BEFORE triage. The rule every new project gets is `BLOCK_ON_VERDICT REAL_BUG`
+// — and at finalisation no TriageVerdict row exists, so the rule found no
+// REAL_BUG verdicts and the gate came back `passed: true` on a run with real
+// failures. The default gate could not see the verdicts it is named after, and
+// the gate chip said PASS beside "2 failed".
+//
+// WHY HERE. This processor already runs after the run is terminal, already owns
+// the sentence a reviewer reads in the merge box, and already keys the check's
+// conclusion off `gateBlocking`. Re-scoring anywhere else would mean a second
+// place that decides red or green, which is the defect packages/runner/gates.ts
+// exists to have ended.
+//
+// WHAT IT IS ALLOWED TO DO. Supersede the stored gate, and — through
+// `runOutcome`, the one function allowed to answer it — write the run's
+// terminal status when the new gate changes that answer. What it may NOT do is
+// flip a build that already reported a pass to a failure quietly: every write
+// carries `rescored.reason`, which names the flip, and logs it at warn.
+//
+// WHICH WAY IT FAILS. Toward the stored gate. Every query here is inside one
+// try/catch; a failure logs and leaves finalisation's gate in place, because a
+// check that cannot be posted is better than a check that reports a verdict
+// assembled from half the inputs.
+
+/** Results read for the re-score. A suite larger than this is capped, and says so. */
+const RESCORE_RESULTS_SCANNED = 5_000;
+/** Findings read for the re-score. `+1` is fetched so truncation is detectable. */
+const RESCORE_FINDINGS_SCANNED = 500;
+/** Tests read to attribute the diff. Only read when a patch-coverage rule exists. */
+const RESCORE_TESTS_SCANNED = 2_000;
+/** Coverage rows read for the patch-coverage join. */
+const RESCORE_COVERAGE_ITEMS_SCANNED = 5_000;
+/** GitHub's page size for a pull request's files, and how many pages to walk. */
+const PR_FILES_PER_PAGE = 100;
+const PR_FILES_PAGES = 3;
+
+/** The code the performance plugin files a blown Core Web Vitals budget under. */
+const VITAL_BREACH_PREFIX = 'performance.budget-exceeded.';
+
+/**
+ * The project's rules, or the documented default when it has written none.
+ *
+ * The same fallback the finaliser applies, because a re-score that used a
+ * different rule list from the one that produced the stored gate would report a
+ * change of mind that was really a change of question.
+ */
+function rulesFor(raw: unknown): GateRule[] {
+  return Array.isArray(raw) && raw.length > 0 ? (raw as GateRule[]) : DEFAULT_GATE_RULES;
+}
+
+const needs = (rules: readonly GateRule[], ...kinds: Array<GateRule['kind']>): boolean =>
+  rules.some((rule) => kinds.includes(rule.kind));
+
+/**
+ * The pull request's changed files.
+ *
+ * Bounded at three pages of 100, and the bound is REPORTED rather than silently
+ * applied: `truncated` makes patch coverage report "not measured" instead of
+ * dividing by the first 300 files of a 900-file diff. Any refusal — the app was
+ * never granted `Pull requests: read`, the PR is gone — is a null, which is also
+ * "not measured". Neither one is allowed to look like a clean changed surface.
+ */
+async function pullRequestPaths(
+  token: string,
+  repo: string,
+  prNumber: number,
+): Promise<{ paths: string[]; truncated: boolean } | null> {
+  const slug = githubRepoSlug(repo);
+  const pr = pathNumber(prNumber, 'pull request number');
+  const paths: string[] = [];
+
+  for (let page = 1; page <= PR_FILES_PAGES; page += 1) {
+    const { status, json } = await githubRequest(
+      `/repos/${slug}/pulls/${pr}/files?per_page=${PR_FILES_PER_PAGE}&page=${page}`,
+      { method: 'GET', token },
+    );
+    if (status !== 200 || !Array.isArray(json)) return null;
+
+    for (const entry of json) {
+      const filename = field(entry, 'filename');
+      if (typeof filename === 'string' && filename.length > 0) paths.push(filename);
+      /*
+       * A rename lands in the diff as the NEW filename plus a
+       * `previous_filename`. Both are collected: the old path is what the
+       * coverage inventory still has a row for, and dropping it would make
+       * every rename look like a pure addition.
+       */
+      const previous = field(entry, 'previous_filename');
+      if (typeof previous === 'string' && previous.length > 0) paths.push(previous);
+    }
+
+    if (json.length < PR_FILES_PER_PAGE) {
+      return { paths: [...new Set(paths)], truncated: false };
+    }
+  }
+
+  // Three full pages means there is at least one more we did not read.
+  return { paths: [...new Set(paths)], truncated: true };
+}
+
+/** The suite's quarantine health, as the finaliser computes it. */
+async function quarantineHealth(
+  orgId: string,
+  projectId: string,
+  budgetPercent: number | null,
+  now: Date,
+): Promise<GateInput['quarantine']> {
+  const [totalTests, inForce, rows] = await Promise.all([
+    prisma.test.count({ where: { orgId, projectId, disabledAt: null } }),
+    // The suppressions in force, counted in the DATABASE: the row list below is
+    // capped and counting from it would make the budget stop working on exactly
+    // the suites it exists to catch.
+    prisma.test.count({
+      where: {
+        orgId,
+        projectId,
+        disabledAt: null,
+        quarantined: true,
+        OR: [{ quarantineExpiresAt: null }, { quarantineExpiresAt: { gt: now } }],
+      },
+    }),
+    prisma.test.findMany({
+      where: { orgId, projectId, disabledAt: null, quarantined: true },
+      select: { id: true, name: true, quarantinedAt: true, quarantineExpiresAt: true },
+      take: QUARANTINE_NAMES_SCANNED,
+      orderBy: { quarantinedAt: 'asc' },
+    }),
+  ]);
+
+  return quarantineHealthFrom({ totalTests, quarantinedCount: inForce, budgetPercent, rows, now });
+}
+
+/**
+ * The run's results, with the human override beating the model's verdict.
+ *
+ * Reads one past the cap so truncation is a fact rather than a guess: EVERY
+ * rule's arithmetic divides by this list, so a capped read would compute a pass
+ * rate, a flake rate and a verdict count over a subset nobody chose. The caller
+ * refuses to re-score at all in that case — see `rescoreRunGate`.
+ */
+async function resultsFor(orgId: string, runId: string, now: Date) {
+  return prisma.testResult.findMany({
+    where: { runId, orgId },
+    take: RESCORE_RESULTS_SCANNED + 1,
+    select: {
+      testId: true,
+      status: true,
+      durationMs: true,
+      retriedAndPassed: true,
+      /*
+       * The two places a not-run reason is written, both read, because they
+       * answer for different rows. `notRunKind` is the queryable column and the
+       * tag on `errorMessage` is what every row written before it carries — a
+       * reader holding both prefers the column (see `NOT_RUN_KINDS` in
+       * @qaai/shared). Without them a test the environment blocked arrives here
+       * indistinguishable from a test that ran and did not pass, and lands in
+       * the pass rate's denominator.
+       */
+      notRunKind: true,
+      errorMessage: true,
+      mutationScore: true,
+      mutationDetected: true,
+      mutationUndetected: true,
+      mutationExcluded: true,
+      test: {
+        select: {
+          name: true,
+          priority: true,
+          /*
+           * The test TYPE, and the only honest way to count what measured the
+           * Core Web Vitals. "Zero breaches" from a run with no PERFORMANCE
+           * test in it is a fact about the suite, not about the pages, so the
+           * vitals rule has to be able to tell those apart.
+           */
+          type: true,
+          quarantined: true,
+          quarantineExpiresAt: true,
+        },
+      },
+      verdict: { select: { verdict: true, reviewState: true, overriddenTo: true } },
+    },
+  }).then((rows) =>
+    rows.map((row) => ({
+      row,
+      gate: {
+        testId: row.testId,
+        testName: row.test.name,
+        status: row.status,
+        priority: row.test.priority,
+        // The suppression as it stands NOW, expiry included — not the column.
+        quarantined: quarantineSuppresses(row.test, now),
+        retriedAndPassed: row.retriedAndPassed,
+        /*
+         * NULL stays null. "Not recorded" is a fifth state and it is not
+         * NOT_RUN: a plugin that returned SKIPPED with a plain sentence made no
+         * claim about why, and writing one here would put a classification into
+         * a gate's denominator that nothing produced.
+         */
+        notRun: row.notRunKind ?? parseNotRun(row.errorMessage)?.kind ?? null,
+        // A human override beats the model, always. Same rule as the finaliser.
+        verdict: effectiveVerdict(row.verdict),
+        durationMs: row.durationMs,
+      },
+    })),
+  );
+}
+
+/**
+ * The verdict that counts: a human's override, or the model's answer.
+ *
+ * One function because two readers in this file ask it — the re-score's results
+ * and the untriaged guard — and the run finaliser applies the same rule to the
+ * same column in apps/worker/src/processors/run.ts. A reader that forgot the
+ * override would score a gate against a verdict a person had already corrected.
+ */
+function effectiveVerdict(
+  verdict: { verdict: string; reviewState: string; overriddenTo: string | null } | null,
+): GateInput['results'][number]['verdict'] {
+  if (!verdict) return null;
+  const chosen =
+    verdict.reviewState === 'OVERRIDDEN' ? (verdict.overriddenTo ?? verdict.verdict) : verdict.verdict;
+  return chosen as GateInput['results'][number]['verdict'];
+}
+
+/**
+ * The findings this run recorded, with every exclusion counted.
+ *
+ * Muted findings never gate (`Finding.mutedAt` says so in the schema) and
+ * neither do findings from a test whose quarantine is in force — the same rule
+ * the rest of this file applies to that test's failure. Both are COUNTED, so
+ * the gate detail can say "4 criticals, 11 muted" rather than "4 criticals".
+ */
+async function findingsFor(orgId: string, runId: string, now: Date) {
+  const rows = await prisma.finding.findMany({
+    where: { orgId, testResult: { runId } },
+    // One past the cap, so truncation is a fact rather than a guess.
+    take: RESCORE_FINDINGS_SCANNED + 1,
+    select: {
+      kind: true,
+      severity: true,
+      code: true,
+      location: true,
+      mutedAt: true,
+      testResult: {
+        select: {
+          test: { select: { name: true, quarantined: true, quarantineExpiresAt: true } },
+        },
+      },
+    },
+  });
+
+  const truncated = rows.length > RESCORE_FINDINGS_SCANNED;
+  const kept = truncated ? rows.slice(0, RESCORE_FINDINGS_SCANNED) : rows;
+
+  const findings: Array<{
+    kind: FindingKind;
+    severity: FindingSeverity;
+    code: string;
+    location: string;
+    testName: string | null;
+  }> = [];
+  let excludedMuted = 0;
+  let excludedQuarantined = 0;
+  const breaches: Array<{ metric: PerformanceMetric; location: string; message: string }> = [];
+
+  for (const row of kept) {
+    if (row.mutedAt !== null) {
+      excludedMuted += 1;
+      continue;
+    }
+    if (quarantineSuppresses(row.testResult.test, now)) {
+      excludedQuarantined += 1;
+      continue;
+    }
+    findings.push({
+      kind: row.kind,
+      severity: row.severity,
+      code: row.code,
+      location: row.location,
+      testName: row.testResult.test.name,
+    });
+    /*
+     * Core Web Vitals reach a gate as the breach the product PERSISTS, not as a
+     * number. The performance plugin keeps the median it measured in a step
+     * title and files the breach as this finding, so the metric name is read off
+     * the finding's code — a stable identifier the plugin constructs — and not
+     * regexed out of a human sentence. See the `MAX_VITAL_BREACHES` docstring.
+     */
+    if (row.kind === 'PERFORMANCE' && row.code.startsWith(VITAL_BREACH_PREFIX)) {
+      breaches.push({
+        metric: row.code.slice(VITAL_BREACH_PREFIX.length) as PerformanceMetric,
+        location: row.location,
+        message: row.code,
+      });
+    }
+  }
+
+  return { findings, truncated, excludedMuted, excludedQuarantined, breaches };
+}
+
+/** The latest stored coverage snapshot, as a gate rule needs it. */
+async function coverageFor(projectId: string): Promise<GateInput['coverage']> {
+  const snapshot = await prisma.coverageSnapshot.findFirst({
+    where: { projectId },
+    orderBy: { createdAt: 'desc' },
+    select: { percent: true, denominator: true, covered: true, createdAt: true, commitSha: true },
+  });
+  if (!snapshot) return undefined;
+  return {
+    // NULL stays null all the way to the rule, which reports UNMEASURED. A zero
+    // denominator has no percentage and 0% would be a claim about the customer's
+    // app made from our extractor finding nothing.
+    percent: snapshot.percent,
+    denominator: snapshot.denominator,
+    covered: snapshot.covered,
+    measuredAtIso: snapshot.createdAt.toISOString(),
+    commitSha: snapshot.commitSha,
+  };
+}
+
+/**
+ * Patch coverage: the diff's routes joined to the coverage inventory.
+ *
+ * Returns undefined — "not measured" — rather than an empty answer whenever any
+ * input is missing: no pull request, no changed files, a refused GitHub read.
+ * `patchCoverage` itself returns `measured: false` for the cases where the diff
+ * IS readable and still cannot be scoped (a lockfile, an unattributable file),
+ * with the reason in its caveats.
+ */
+async function patchCoverageFor(args: {
+  orgId: string;
+  projectId: string;
+  prNumber: number | null;
+  commitSha: string | null;
+  token: string;
+  repo: string;
+  coverageCommitSha: string | null;
+  coverageMeasuredAtIso: string | null;
+}): Promise<GateInput['patch']> {
+  if (args.prNumber === null) return undefined;
+
+  const diff = await pullRequestPaths(args.token, args.repo, args.prNumber);
+  if (!diff) return undefined;
+
+  const [tests, items] = await Promise.all([
+    /*
+     * The suite the attribution is corroborated against. Capped, and the cap
+     * fails SAFE: fewer known tokens and routes means `attribute()` demotes
+     * more paths, which makes patch coverage report "not measured" rather than
+     * a percentage over a surface it half recognised.
+     */
+    prisma.test.findMany({
+      where: { orgId: args.orgId, projectId: args.projectId, disabledAt: null },
+      take: RESCORE_TESTS_SCANNED,
+      select: {
+        id: true,
+        name: true,
+        filePath: true,
+        code: true,
+        spec: true,
+        tags: true,
+        feature: true,
+        priority: true,
+      },
+    }),
+    prisma.coverageItem.findMany({
+      where: { projectId: args.projectId, retiredAt: null },
+      take: RESCORE_COVERAGE_ITEMS_SCANNED + 1,
+      select: { key: true, status: true, label: true },
+    }),
+  ]);
+
+  /*
+   * The attribution is the product's own, not a second copy of it: the same
+   * `analyzeImpact` that decides which tests to run decides which routes this
+   * diff touches, so a gate and a selection can never disagree about one diff.
+   */
+  const routeRows = items.slice(0, RESCORE_COVERAGE_ITEMS_SCANNED) as PatchCoverageRow[];
+  const analysis = analyzeImpact({
+    /*
+     * The inventory's routes, so a changed page NOTHING tests can still be
+     * attributed to its route. Without them `attribute()` demotes a route the
+     * suite has never visited, and the one case this gate exists to catch — a
+     * diff that adds an untested page — comes back "unattributable". See
+     * `ImpactInput.knownRoutes`.
+     */
+    knownRoutes: routeRows.flatMap((row) => {
+      const identity = row.key.startsWith('ROUTE:') ? row.key.slice('ROUTE:'.length) : null;
+      return identity ? [identity] : [];
+    }),
+    changedPaths: diff.paths,
+    tests: tests.map((test) => ({
+      id: test.id,
+      name: test.name,
+      filePath: test.filePath,
+      code: test.code,
+      spec: test.spec,
+      tags: test.tags,
+      feature: test.feature,
+      priority: test.priority,
+    })),
+  });
+
+  const truncatedInventory = items.length > RESCORE_COVERAGE_ITEMS_SCANNED;
+  return patchCoverage({
+    attributions: analysis.attributions,
+    rows: routeRows,
+    diffCommitSha: args.commitSha,
+    inventoryCommitSha: args.coverageCommitSha,
+    inventoryMeasuredAtIso: args.coverageMeasuredAtIso,
+    diffTruncated: diff.truncated,
+    changedPathCount: diff.paths.length,
+    inventoryTruncated: truncatedInventory,
+  });
+}
+
+/**
+ * Score the gate again against everything that is now known, and persist it if
+ * it changed.
+ *
+ * Returns the gate the check should report. `null` means the stored one stands —
+ * either nothing changed, or the inputs could not be read, and both of those
+ * leave finalisation's answer in place rather than inventing one.
+ */
+async function rescoreRunGate(args: {
+  /** Null when this deployment has no GitHub app. Only patch coverage needs it. */
+  cfg: AppConfig | null;
+  orgId: string;
+  run: LoadedRun;
+  /**
+   * The repository this run can reach as a check, when it can reach one.
+   *
+   * NULL IS A SUPPORTED CASE and it is the common one: a run from
+   * packages/cli in somebody's CI has no pull request and no installation, and
+   * four of the measurement rules — `MIN_COVERAGE`, `MAX_FINDINGS`,
+   * `MIN_MUTATION_SCORE`, `MAX_VITAL_BREACHES` — need neither. Requiring a
+   * target here is what made those four reportable only on a GitHub-app pull
+   * request, so a customer who configured `MIN_COVERAGE` and installs the
+   * product the way the README does read "not measured" on every run. The two
+   * patch rules DO need a diff, and they say so themselves when it is absent.
+   */
+  target: { repo: string; installationId: string } | null;
+}): Promise<{ gate: GateResult | null; status: string | null }> {
+  const { orgId, run } = args;
+
+  /*
+   * A cancelled or errored run measured nothing, and `runOutcome` already says
+   * so: re-scoring it would replace "nobody wanted this answer" with a gate
+   * verdict about a suite that never finished.
+   */
+  if (run.status === 'CANCELLED' || run.status === 'ERRORED') return { gate: null, status: null };
+
+  try {
+    const now = new Date();
+    const rules = rulesFor(run.project.gateRules);
+
+    const results = await resultsFor(orgId, run.id, now);
+    /*
+     * A suite larger than the cap is not re-scored. There is no honest way to
+     * score a pass rate over the first 5,000 of 6,000 results, and the
+     * finalisation gate at least divided by the whole run.
+     */
+    if (results.length > RESCORE_RESULTS_SCANNED) {
+      logger.warn(
+        { runId: run.id, cap: RESCORE_RESULTS_SCANNED },
+        'this run has more results than the re-score reads, so the gate was not re-scored; the gate finalisation wrote stands',
+      );
+      return { gate: null, status: null };
+    }
+    const input: GateInput = { results: results.map((r) => r.gate) };
+
+    input.quarantine = await quarantineHealth(
+      orgId,
+      run.project.id,
+      run.project.quarantineBudgetPercent ?? null,
+      now,
+    );
+
+    if (needs(rules, 'MAX_FINDINGS', 'MAX_VITAL_BREACHES')) {
+      const read = await findingsFor(orgId, run.id, now);
+      input.findings = {
+        findings: read.findings,
+        truncated: read.truncated,
+        excludedMuted: read.excludedMuted,
+        excludedQuarantined: read.excludedQuarantined,
+      };
+      /*
+       * `performanceTests` is the honesty field: zero means no performance test
+       * ran, so "no breaches" would be a fact about the suite rather than about
+       * the pages, and the rule reports UNMEASURED.
+       */
+      input.vitals = {
+        performanceTests: results.filter((r) => r.row.test.type === 'PERFORMANCE').length,
+        breaches: read.breaches,
+        /*
+         * The same cap, reported to the same standard. The breaches are read off
+         * the findings list, so when that list was capped the breach count is a
+         * floor — and a vitals rule that cleared on a floor would be the exact
+         * silent pass the `MAX_FINDINGS` truncation guard exists to refuse.
+         */
+        truncated: read.truncated,
+      };
+    }
+
+    if (needs(rules, 'MIN_MUTATION_SCORE')) {
+      const measured = results.filter((r) => hasMutation(r.row));
+      input.mutation = {
+        resultsWithData: measured.length,
+        detected: sum(measured.map((r) => r.row.mutationDetected ?? 0)),
+        undetected: sum(measured.map((r) => r.row.mutationUndetected ?? 0)),
+        excluded: sum(measured.map((r) => r.row.mutationExcluded ?? 0)),
+      };
+    }
+
+    const wantsCoverage = needs(rules, 'MIN_COVERAGE');
+    const wantsPatch = needs(rules, 'MIN_PATCH_COVERAGE', 'NO_NEW_UNCOVERED_ROUTES');
+    const coverage = wantsCoverage || wantsPatch ? await coverageFor(run.project.id) : undefined;
+    if (wantsCoverage) input.coverage = coverage;
+
+    /*
+     * Patch coverage, and ONLY patch coverage, needs GitHub. With no app or no
+     * installation there is no diff to join, so `input.patch` stays absent and
+     * the two patch rules report what is true — that nobody measured the
+     * changed surface. The other four rules are scored either way, which is the
+     * whole point of not requiring a target.
+     */
+    if (wantsPatch && args.cfg && args.target) {
+      input.patch = await patchCoverageFor({
+        orgId,
+        projectId: run.project.id,
+        prNumber: run.prNumber,
+        commitSha: run.commitSha,
+        token: await tokenFor(args.cfg, args.target.installationId),
+        repo: args.target.repo,
+        coverageCommitSha: coverage?.commitSha ?? null,
+        coverageMeasuredAtIso: coverage?.measuredAtIso ?? null,
+      });
+    }
+
+    const decision = rescoreGate({ stored: run.gateResult, next: evaluateGates(rules, input), at: now });
+    if (!decision.gate) return { gate: null, status: null };
+
+    /*
+     * The status comes from `runOutcome` and from nowhere else. A gate that now
+     * blocks means the run did not pass, and leaving `Run.status` at PASSED
+     * while the gate says BLOCK would be a sixth place deciding red or green —
+     * the exact defect packages/runner/src/gates.ts was written to end.
+     */
+    const outcome = runOutcome({
+      counts: {
+        passed: run.passedCount,
+        failed: run.failedCount,
+        flaky: run.flakyCount,
+        skipped: run.skippedCount,
+        quarantinedFailed: run.quarantinedFailedCount,
+      },
+      gatePassed: decision.gate.passed,
+      forcedStatus: null,
+    });
+
+    /*
+     * Guarded on the status we read. A cancel that arrived while this was
+     * running is terminal and may not be relabelled; neither may an ERRORED
+     * run, which measured nothing.
+     */
+    const wrote = await prisma.run.updateMany({
+      where: { id: run.id, orgId, status: { in: ['PASSED', 'FAILED'] } },
+      /*
+       * The cast Prisma's `Json` input requires of a typed interface — the same
+       * one `finalizeRun` applies to the same column, and the same rule
+       * coverage-store.ts documents for `SurfaceKindTotals`. Written as the
+       * narrowest cast that compiles rather than `any`.
+       */
+      data: { gateResult: decision.gate as unknown as object, status: outcome.status },
+    });
+    if (wrote.count === 0) {
+      logger.info(
+        { runId: run.id },
+        'the run left PASSED/FAILED before the gate could be re-scored; the stored gate stands',
+      );
+      return { gate: null, status: null };
+    }
+
+    const line = {
+      runId: run.id,
+      generation: decision.generation,
+      previousPassed: decision.previousPassed,
+      nowPassed: decision.gate.passed,
+      status: outcome.status,
+      /*
+       * Logged because it is the count of evaluations this scoring did not
+       * recompute and kept — the environment line the finaliser appends, above
+       * all. A re-score that moved one silently is how an unattemptable run's
+       * BLOCK came to be cleared.
+       */
+      carriedForward: decision.carriedForward,
+      reason: decision.reason,
+    };
+    /*
+     * A green that goes red is a warn, not an info. It is the one transition
+     * that costs a team trust, so it is logged at a level somebody reads, with
+     * the sentence that says why.
+     */
+    if (decision.reversedGreen) {
+      logger.warn(line, 'the gate was re-scored after triage and now BLOCKS a run that had reported a pass');
+    } else {
+      logger.info(line, 'the gate was re-scored after triage');
+    }
+
+    return { gate: decision.gate, status: outcome.status };
+  } catch (err) {
+    /*
+     * Toward the stored gate, every time. The re-score is an improvement on the
+     * finalisation gate, not a precondition for reporting one, and a check that
+     * cannot be posted is strictly worse than a check carrying the older
+     * verdict — which is at least a verdict the product computed.
+     */
+    logger.warn(
+      { err, runId: run.id },
+      'the gate could not be re-scored after triage; the check reports the gate finalisation wrote',
+    );
+    return { gate: null, status: null };
+  }
+}
+
+/** Did this result report mutation columns at all? NULL is not zero. */
+function hasMutation(row: {
+  mutationScore: number | null;
+  mutationDetected: number | null;
+  mutationUndetected: number | null;
+  mutationExcluded: number | null;
+}): boolean {
+  return (
+    row.mutationScore !== null ||
+    row.mutationDetected !== null ||
+    row.mutationUndetected !== null ||
+    row.mutationExcluded !== null
+  );
+}
+
+const sum = (values: readonly number[]): number => values.reduce((total, v) => total + v, 0);
+
 async function phaseStarted(cfg: AppConfig, job: ChecksJob): Promise<void> {
   const run = await loadRun(job.orgId, job.runId);
   if (!run) return;
@@ -1170,7 +1929,16 @@ async function phaseCompleted(cfg: AppConfig, job: ChecksJob): Promise<void> {
     return;
   }
 
-  const evidence = await buildEvidence(job.orgId, run);
+  /*
+   * Score the gate again BEFORE the check is built. The stored gate was written
+   * by the finaliser, before any triage verdict existed, so the default
+   * `BLOCK_ON_VERDICT REAL_BUG` rule had nothing to find — see the section
+   * header above `rescoreRunGate`. Non-fatal by construction: it returns null
+   * and the check reports the stored gate.
+   */
+  const rescore = await rescoreRunGate({ cfg, orgId: job.orgId, run, target });
+
+  const evidence = await buildEvidence(job.orgId, run, rescore.gate, rescore.status);
   const output = buildCheckOutput(evidence);
   const annotations = buildAnnotations(evidence);
   const [firstBatch = [], ...rest] = chunkAnnotations(annotations);
@@ -1243,44 +2011,273 @@ async function phaseCompleted(cfg: AppConfig, job: ChecksJob): Promise<void> {
 const SWEEP_WINDOW_MS = 2 * 3600_000;
 const SWEEP_LIMIT = 100;
 
-async function phaseSweep(): Promise<void> {
+async function phaseSweep(cfg: AppConfig | null): Promise<void> {
   const since = new Date(Date.now() - SWEEP_WINDOW_MS);
+  /** Runs the check half has already dealt with this tick. */
+  const seen = new Set<string>();
 
+  if (cfg) {
+    const runs = await prisma.run.findMany({
+      where: {
+        queuedAt: { gt: since },
+        prNumber: { not: null },
+        commitSha: { not: null },
+        project: { repoFullName: { not: null }, repoInstallationId: { not: null } },
+      },
+      orderBy: { queuedAt: 'desc' },
+      take: SWEEP_LIMIT,
+      select: { id: true, orgId: true, status: true },
+    });
+
+    for (const run of runs) {
+      seen.add(run.id);
+      const state = await readState(run.id);
+      if (state?.done) {
+        await rescoreAfterTriage(cfg, run.id, run.orgId);
+        continue;
+      }
+
+      const phase = TERMINAL.has(run.status) ? 'completed' : 'started';
+      // Enqueue rather than act: the job id de-duplicates, so a sweep that
+      // overlaps with a direct enqueue from run.ts collapses onto one job.
+      await enqueueCheck({ orgId: run.orgId, runId: run.id, phase });
+    }
+  }
+
+  await sweepRescoreWithoutCheck(cfg, since, seen);
+}
+
+/**
+ * The re-score, for the runs that will never have a check.
+ *
+ * ── Why this is here, and why that is borrowed ground ───────────────────────
+ *
+ * Four of the measurement rules — `MIN_COVERAGE`, `MAX_FINDINGS`,
+ * `MIN_MUTATION_SCORE`, `MAX_VITAL_BREACHES` — are scored from inputs that only
+ * `rescoreRunGate` assembles, and both of its callers used to need a GitHub-app
+ * pull request. So a customer who installs the product the way the README
+ * does — `packages/cli` in their own CI, no app, no PR — configured
+ * `MIN_COVERAGE 80` and read "not measured" on every run they would ever do.
+ * None of those four rules needs a diff.
+ *
+ * This loop is not where the measurement BELONGS. It belongs beside
+ * finalisation, where every run passes exactly once and nothing has to be swept
+ * for: `evaluateRunGates` in apps/worker/src/processors/run.ts assembles only
+ * `results` and `quarantine`, and teaching it the other four is the real fix.
+ * Until then this is reachable from the file that already owns the re-score, and
+ * a feature that works for the primary install beats one that waits for another
+ * file to be edited — the same trade, with the same reasoning, as the check
+ * sweep above it.
+ *
+ * WHAT IT COSTS, bounded on every side: only terminal runs, only inside the
+ * same two-hour window, only the first `SWEEP_LIMIT`, and only those whose
+ * stored gate is still PROVISIONAL — which is also why `failedCount > 0` is a
+ * sound prefilter rather than an optimisation that drops work: a gate awaits
+ * triage only when a failure that GATES has no verdict, and such a failure is
+ * counted in `failedCount` (a quarantined one is not, and does not reach the
+ * rule either).
+ *
+ * WHAT IT DOES NOT COVER, said plainly because it is the remaining half of the
+ * defect. Only a PROVISIONAL gate is swept, and a gate is provisional only while
+ * a `BLOCK_ON_VERDICT` rule has an untriaged failure to wait for. So a run with
+ * no failures, and a project whose rule list holds no verdict rule at all, are
+ * never re-scored: their `MIN_COVERAGE` stays whatever the finalisation gate
+ * said — "not measured", with the reason naming the read that did not happen.
+ * Only run.ts can close that, by assembling the four inputs where every run
+ * passes once. Re-scoring every terminal run from a sweep instead would pay five
+ * reads a minute per run for two hours to find out nothing had changed.
+ */
+async function sweepRescoreWithoutCheck(
+  cfg: AppConfig | null,
+  since: Date,
+  seen: Set<string>,
+): Promise<void> {
   const runs = await prisma.run.findMany({
     where: {
       queuedAt: { gt: since },
-      prNumber: { not: null },
-      commitSha: { not: null },
-      project: { repoFullName: { not: null }, repoInstallationId: { not: null } },
+      status: { in: ['PASSED', 'FAILED'] },
+      failedCount: { gt: 0 },
     },
     orderBy: { queuedAt: 'desc' },
     take: SWEEP_LIMIT,
-    select: { id: true, orgId: true, status: true },
+    select: { id: true, orgId: true, gateResult: true },
   });
 
   for (const run of runs) {
-    const state = await readState(run.id);
-    if (state?.done) continue;
-
-    const phase = TERMINAL.has(run.status) ? 'completed' : 'started';
-    // Enqueue rather than act: the job id de-duplicates, so a sweep that
-    // overlaps with a direct enqueue from run.ts collapses onto one job.
-    await enqueueCheck({ orgId: run.orgId, runId: run.id, phase });
+    if (seen.has(run.id)) continue;
+    // The provisional test before `loadRun`, so a tick over a hundred settled
+    // runs costs one query rather than a hundred and one.
+    if (!gateAwaitsTriage(run.gateResult)) continue;
+    await rescoreAfterTriage(cfg, run.id, run.orgId);
   }
+}
+
+/**
+ * The failures a verdict rule could still be waiting on, read narrowly.
+ *
+ * ── Why not a `count`, which is what this was ───────────────────────────────
+ *
+ * It counted `status in (FAILED, TIMED_OUT) AND verdict IS NULL` with no
+ * quarantine filter and no priority filter, while the RULE it was waiting for
+ * excludes quarantined results and applies `onlyPriorities`. So a run with one
+ * untriaged CRITICAL_PATH failure beside one untriaged quarantined or IMPORTANT
+ * failure stayed PROVISIONAL FOR EVER: the moment the critical one was triaged
+ * the rule stopped waiting, and the guard never did. Its own test asserted the
+ * guard existed, not that it waited on the same thing.
+ *
+ * So the judgement is `untriagedBlockers` in packages/runner/src/gates.ts — the
+ * function the rule itself uses — and this reads the rows it needs. Narrow on
+ * purpose: a row that is neither a failure nor carries a verdict can be neither
+ * an offender nor untriaged, so the predicate over these rows is the predicate
+ * over the whole run, computed from the failures rather than from 5,000 results.
+ *
+ * Read one past the cap, so `truncated` is a fact rather than a guess. A guard
+ * that answered "nothing is waiting" from the first 5,000 of 6,000 failures
+ * would be a cap deciding a gate, which is the same mistake as a pass rate
+ * computed over a capped read — and the caller refuses rather than deciding.
+ */
+async function untriagedCandidates(
+  orgId: string,
+  runId: string,
+  now: Date,
+): Promise<{ rows: GateInput['results']; truncated: boolean }> {
+  const rows = await prisma.testResult.findMany({
+    where: {
+      runId,
+      orgId,
+      OR: [{ status: { in: ['FAILED', 'TIMED_OUT'] } }, { verdict: { isNot: null } }],
+    },
+    take: RESCORE_RESULTS_SCANNED + 1,
+    select: {
+      testId: true,
+      status: true,
+      test: {
+        select: { name: true, priority: true, quarantined: true, quarantineExpiresAt: true },
+      },
+      verdict: { select: { verdict: true, reviewState: true, overriddenTo: true } },
+    },
+  });
+
+  return {
+    truncated: rows.length > RESCORE_RESULTS_SCANNED,
+    rows: rows.slice(0, RESCORE_RESULTS_SCANNED).map((row) => ({
+      testId: row.testId,
+      testName: row.test.name,
+      status: row.status,
+      priority: row.test.priority,
+      quarantined: quarantineSuppresses(row.test, now),
+      /*
+       * Neither field is read by `untriagedBlockers`, and both are filled with
+       * the honest value rather than a plausible one: nothing here retried, and
+       * no not-run reason was read, so nothing here may claim one.
+       */
+      retriedAndPassed: false,
+      notRun: null,
+      verdict: effectiveVerdict(row.verdict),
+      durationMs: 0,
+    })),
+  };
+}
+
+/**
+ * The other half of re-scoring: the runs whose gate was already written.
+ *
+ * ── Why this is not just done in `phaseCompleted` ───────────────────────────
+ *
+ * It IS done there. But triage is a queue of its own, and a short suite reaches
+ * terminal and gets its check long before the triage jobs for its failures have
+ * run — so on most real runs `phaseCompleted` re-scores a gate whose verdicts
+ * still do not exist, computes the same UNMEASURED answer, writes nothing, and
+ * nothing ever asks again. The sweep is where "ask again" lives, which is what
+ * it already is for every other phase.
+ *
+ * ── Why it is cheap ─────────────────────────────────────────────────────────
+ *
+ * Two guards, in this order. A gate that is not PROVISIONAL is not re-scored at
+ * all — once the verdict rule has an answer there is nothing to wait for. And a
+ * run the verdict rules are still waiting on is not re-scored either: re-scoring
+ * would produce the same UNMEASURED answer, so a project with no triage running
+ * (no model key, triage switched off) costs one narrow read of that run's
+ * failures per sweep tick rather than the several reads of a full scoring.
+ *
+ * That read is the exchange this guard makes on purpose. It used to be a single
+ * `count`, which was cheaper and answered a different question than the rule —
+ * and a guard that waits on the wrong thing does not hold a gate open for a
+ * minute, it holds it open until the sweep window closes.
+ *
+ * ── And the runs with no check to re-report ─────────────────────────────────
+ *
+ * `target` may be null here. A run with no pull request, or on a repo where the
+ * app is not installed, still gets its gate re-scored — four of the measurement
+ * rules need no diff — and simply has no check to re-report afterwards.
+ */
+async function rescoreAfterTriage(
+  cfg: AppConfig | null,
+  runId: string,
+  orgId: string,
+): Promise<void> {
+  const run = await loadRun(orgId, runId);
+  if (!run || !TERMINAL.has(run.status)) return;
+  if (!gateAwaitsTriage(run.gateResult)) return;
+
+  const rules = rulesFor(run.project.gateRules);
+  const candidates = await untriagedCandidates(orgId, runId, new Date());
+  if (candidates.truncated) {
+    logger.warn(
+      { runId, cap: RESCORE_RESULTS_SCANNED },
+      'this run has more failing results than the triage guard reads, so whether the gate is still waiting could not be decided; the gate finalisation wrote stands',
+    );
+    return;
+  }
+  if (untriagedBlockers(rules, candidates.rows).length > 0) return;
+
+  const target = checkTarget(run);
+  const rescore = await rescoreRunGate({ cfg, orgId, run, target });
+  if (!rescore.gate) return;
+
+  const generation = rescore.gate.rescored?.generation ?? 2;
+
+  if (!target) {
+    // Nothing to re-report: the gate and the run's status are the report.
+    logger.info(
+      { runId, generation },
+      'the gate was re-scored after triage; this run has no check to re-report',
+    );
+    return;
+  }
+
+  /*
+   * Re-report, through the phase that already owns the reporting. The job id
+   * carries the generation, so this cannot loop: the next sweep tick finds a
+   * gate that is no longer provisional and does nothing.
+   */
+  await enqueueCheck({ orgId, runId, phase: 'completed' }, 0, `g${generation}`);
+  logger.info(
+    { runId, generation },
+    'the gate was re-scored after triage; the check will be re-reported',
+  );
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 export async function processChecks(job: ChecksJob): Promise<void> {
   const cfg = appConfig();
-  if (!cfg) {
-    // No app: nothing to do, and nothing is broken. The PAT comment path in
-    // notify.ts is untouched and remains the PR feedback.
+
+  /*
+   * The sweep runs WITHOUT a GitHub app, and that is the change that makes the
+   * measurement rules reachable for the install most customers have. Its check
+   * half is still behind `cfg` — nothing talks to GitHub without an app — but
+   * its re-score half needs no app at all, and returning here used to mean that
+   * a deployment with no app never scored `MIN_COVERAGE` on any run, ever.
+   */
+  if (job.phase === 'sweep') {
+    await phaseSweep(cfg);
     return;
   }
 
-  if (job.phase === 'sweep') {
-    await phaseSweep();
+  if (!cfg) {
+    // No app: nothing to report, and nothing is broken. The PAT comment path in
+    // notify.ts is untouched and remains the PR feedback.
     return;
   }
 

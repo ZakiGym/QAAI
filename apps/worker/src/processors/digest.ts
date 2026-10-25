@@ -56,8 +56,20 @@ import { open as openSecret } from '../vault.js';
 // alternative is a second implementation of "is this a real failure", and two
 // answers to that question is how the gate and the digest come to disagree.
 import { isRealFailure } from '../../../api/src/lib/run-selection.js';
-import { resolveOwnershipFor } from '../../../api/src/lib/ownership.js';
-import type { OwnershipRuleInput } from '../../../api/src/lib/ownership.js';
+/*
+ * `OWNERSHIP_RULE_SELECT` and `ownerLabel` rather than a hand-written field
+ * list and a hand-written `@${slug}`. This file had its own copy of both, and
+ * both are the kind of copy that fails silently: a select that forgets
+ * `position` resolves last-match-wins against a column that is always 0 (so
+ * every failure routes to the FIRST matching rule instead of the last), and a
+ * label spelled differently here than in the ticket reads as two owners to the
+ * person skimming both.
+ */
+import { OWNERSHIP_RULE_SELECT, assignOwner, ownerLabel } from '../../../api/src/lib/ownership.js';
+import type {
+  OwnershipRuleInput,
+  OwnershipState,
+} from '../../../api/src/lib/ownership.js';
 // Same rule for the chat credential envelope and the notification preference:
 // the API seals and writes them, notify.ts and this file read them, and all
 // three must agree on the shape.
@@ -102,6 +114,20 @@ export interface DigestItem {
   verdict: string | null;
   /** "@payments", "Dana Klein", or null — an unowned test is a normal state. */
   owner: string | null;
+  /**
+   * WHICH KIND of nobody, when `owner` is null.
+   *
+   * `owner: null` alone cannot tell "ownership is not configured" (expected)
+   * from "a rule that should have matched can no longer be evaluated, so
+   * routing has silently stopped" (the dangerous one). The digest used to
+   * simply omit the label for all of them, which made the two indistinguishable
+   * on the one surface a human reads every morning.
+   *
+   * NULL means NOT RESOLVED — ownership was never asked about this item.
+   * `fixed` items are in that state deliberately: resolving for a test that
+   * went green is work nobody reads. It is not the same as NO_RULES.
+   */
+  ownerState: OwnershipState | null;
   /** Flakes only: how many times it needed a retry inside the window. */
   retries?: number;
 }
@@ -263,14 +289,20 @@ export async function collectDigest(
     [...newFailures, ...flakes].map((row) => row.test),
   );
 
-  const item = (row: ResultRow): DigestItem => ({
-    testId: row.testId,
-    name: row.test.name,
-    filePath: row.test.filePath,
-    runId: row.runId,
-    verdict: row.verdict?.overriddenTo ?? row.verdict?.verdict ?? null,
-    owner: owners.get(row.testId) ?? null,
-  });
+  const item = (row: ResultRow): DigestItem => {
+    const resolution = owners.get(row.testId);
+    return {
+      testId: row.testId,
+      name: row.test.name,
+      filePath: row.test.filePath,
+      runId: row.runId,
+      verdict: row.verdict?.overriddenTo ?? row.verdict?.verdict ?? null,
+      owner: resolution?.label ?? null,
+      // Absent from the map means ownership was not resolved for this item at
+      // all — see `DigestItem.ownerState`. Not NO_RULES, which is a finding.
+      ownerState: resolution?.state ?? null,
+    };
+  };
 
   return {
     projectId: project.id,
@@ -287,7 +319,7 @@ export async function collectDigest(
     fixed: fixed.sort((a, b) => a.test.name.localeCompare(b.test.name)).map(item),
     stillFailing,
     silentSchedules: await silentSchedules(orgId, projectId, runs.length, until),
-    unowned: newFailures.filter((row) => !owners.get(row.testId)).length,
+    unowned: newFailures.filter((row) => !owners.get(row.testId)?.label).length,
     truncated: results.length >= MAX_RESULTS,
   };
 }
@@ -409,37 +441,48 @@ async function silentSchedules(
     .map((schedule) => schedule.name);
 }
 
-/** Owner labels per test, or nothing. Two queries, never one per test. */
+/** What ownership resolved to for one test: the label, and which kind of nobody. */
+export interface DigestOwner {
+  label: string | null;
+  state: OwnershipState;
+}
+
+/**
+ * Who owns each listed test — a LABEL and a STATE, never a bare label.
+ *
+ * Two queries, never one per test. The state comes along because `null` on its
+ * own is three different facts (nobody configured ownership / rules exist and
+ * none match / a rule can no longer be evaluated and routing has stopped), and
+ * the morning digest is the one surface where telling them apart changes what
+ * somebody does next.
+ *
+ * `assignOwner` rather than `resolveOwnership` directly: it is the function
+ * that refuses to return a bare null, and it is the same one the notify
+ * processor and the filing endpoint route through, so the digest's answer and
+ * the ticket's answer come from one place.
+ */
 async function ownersFor(
   orgId: string,
   projectId: string,
   tests: Array<{ id: string; filePath: string; suiteId: string | null; feature: string | null }>,
-): Promise<Map<string, string>> {
-  const labels = new Map<string, string>();
-  if (tests.length === 0) return labels;
+): Promise<Map<string, DigestOwner>> {
+  const owners = new Map<string, DigestOwner>();
+  if (tests.length === 0) return owners;
 
   const rules = (await prisma.ownershipRule.findMany({
     where: { orgId, projectId },
     orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
-    select: {
-      id: true,
-      position: true,
-      pathPattern: true,
-      testId: true,
-      suiteId: true,
-      feature: true,
-      ownerUserId: true,
-      ownerTeamId: true,
-    },
+    // The shared select. A copy that forgot `position` would resolve
+    // last-match-wins against a column that is always 0.
+    select: OWNERSHIP_RULE_SELECT,
   })) as OwnershipRuleInput[];
-  if (rules.length === 0) return labels;
 
-  const resolved = resolveOwnershipFor(tests, rules);
+  const assignments = tests.map((test) => ({ test, assignment: assignOwner(test, rules) }));
 
   const userIds: string[] = [];
   const teamIds: string[] = [];
-  for (const resolution of resolved.values()) {
-    const owner = resolution.owner?.owner;
+  for (const { assignment } of assignments) {
+    const owner = assignment.owner;
     if (!owner) continue;
     if (owner.kind === 'USER') userIds.push(owner.userId);
     else teamIds.push(owner.teamId);
@@ -459,35 +502,70 @@ async function ownersFor(
         })
       : Promise.resolve([]),
   ]);
-  const userById = new Map(users.map((user) => [user.id, user]));
-  const teamById = new Map(teams.map((team) => [team.id, team]));
+  const directory = {
+    users: new Map(users.map((user) => [user.id, user])),
+    teams: new Map(teams.map((team) => [team.id, team])),
+  };
 
-  for (const [testId, resolution] of resolved) {
-    const owner = resolution.owner?.owner;
-    if (!owner) continue;
-    if (owner.kind === 'USER') {
-      const user = userById.get(owner.userId);
-      if (user) labels.set(testId, user.name || user.email);
-    } else {
-      const team = teamById.get(owner.teamId);
-      if (team) labels.set(testId, `@${team.slug}`);
-    }
+  for (const { test, assignment } of assignments) {
+    owners.set(test.id, {
+      // `ownerLabel`, which is also what the chat alert and the ticket print.
+      // A row whose user or team is gone used to produce NO label here while
+      // the state still said OWNED — an owned failure rendering as unowned.
+      label: assignment.owner ? ownerLabel(assignment.owner, directory) : null,
+      state: assignment.state,
+    });
   }
 
   // Rules that could not be evaluated are logged rather than dropped: routing
   // that has silently stopped looks exactly like a suite nobody has assigned.
-  const broken = [...resolved.values()].flatMap((resolution) => resolution.skipped);
-  if (broken.length > 0) {
+  // Now also stated on the LINE, via RULES_UNUSABLE — see `unownedPhrase`.
+  const broken = new Map<string, string>();
+  for (const { assignment } of assignments) {
+    for (const skipped of assignment.unusable) broken.set(skipped.ruleId, skipped.reason);
+  }
+  if (broken.size > 0) {
     logger.warn(
-      { projectId, rules: [...new Set(broken.map((s) => s.ruleId))] },
+      { projectId, rules: [...broken.keys()] },
       'ownership rules could not be evaluated; those failures are being reported unowned',
     );
   }
 
-  return labels;
+  return owners;
 }
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
+
+/**
+ * What an unowned item says about itself, per state — and the two deliberate
+ * silences.
+ *
+ * NO_RULES is silent because ownership is opt-in: a line reading "nobody owns
+ * this" under every failure in an install that never filled the table in is how
+ * a digest gets filtered to a folder, and then the RULES_UNUSABLE line is
+ * filtered with it. Not-resolved is silent for the same reason it exists —
+ * nothing was asked, so nothing is claimed.
+ *
+ * RULES_UNUSABLE is the whole reason this map is not just `item.owner ?? ''`.
+ * It was logged on the worker and NOWHERE a human looks: a team that believes
+ * it is being paged and is not reads an identical digest to a team that never
+ * configured anything.
+ */
+const UNOWNED_PHRASE: Record<OwnershipState, string | null> = {
+  // Unreachable: `ownerLabel` always returns a string, down to "a deleted
+  // team", so an OWNED item always has a label to print instead.
+  OWNED: null,
+  NO_RULES: null,
+  NO_MATCH: 'nobody owns this',
+  RULES_UNUSABLE: 'unowned — an ownership rule could not be evaluated, so routing may have stopped',
+};
+
+/** The owner clause on a digest line: a name, a named kind of nobody, or nothing. */
+function ownerSuffix(item: DigestItem): string {
+  if (item.owner) return ` — ${item.owner}`;
+  const phrase = item.ownerState ? UNOWNED_PHRASE[item.ownerState] : null;
+  return phrase ? ` — ${phrase}` : '';
+}
 
 /**
  * Plain text, and deliberately no bold.
@@ -516,7 +594,7 @@ export function renderDigest(digest: Digest, webUrl: string): string {
     if (items.length === 0) return;
     lines.push('', `${icon} ${title} (${items.length})`);
     for (const item of items.slice(0, MAX_LISTED)) {
-      lines.push(`  • ${item.name}${item.owner ? ` — ${item.owner}` : ''}`);
+      lines.push(`  • ${item.name}${ownerSuffix(item)}`);
       lines.push(`    ${detail(item)}`);
     }
     if (items.length > MAX_LISTED) lines.push(`  …and ${items.length - MAX_LISTED} more`);

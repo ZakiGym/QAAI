@@ -27,10 +27,16 @@ import {
   expandNegativeCases,
   signsIn,
   canonicalRoute,
+  gapProvenance,
+  isClosureState,
   planItemForGap,
+  rankGapsForClosure,
   readCrawl,
   routeVisits,
+  verifyClosure,
+  CLOSURE_STATES,
   type AuthProfileChoice,
+  type ClosureState,
   type CoverageGap,
   type CoverageTestInput,
 } from './coverage.js';
@@ -1501,5 +1507,240 @@ describe('the fingerprint notices a role change', () => {
     // Without this, a re-bind would pass the staleness check on /propose and a
     // human could generate a test for a gap they had just closed.
     expect(bound).not.toBe(anonymous);
+  });
+});
+
+// ─── Provenance and verified closure ─────────────────────────────────────────
+
+/**
+ * These are the tests for the memory the loop never had.
+ *
+ * The defect is "QAAI cannot say 'this gap is closed by this test' or notice
+ * that it is not", and the dangerous half is the second one. Every case below
+ * is an answer the ledger must NOT give:
+ *
+ *   • "closed" because the crawl failed and the gap report came back empty;
+ *   • "closed" because the gap fell off the bottom of a ranked page;
+ *   • "still open, nothing proposed" about a gap we already spent a generation
+ *     on, which is how a loop re-proposes the same work until the budget runs
+ *     out;
+ *   • credit for a closure nothing of ours caused.
+ */
+
+const ledgerEntry = (over: Partial<Parameters<typeof verifyClosure>[0]> = {}) => ({
+  gapId: 'gap_abc',
+  state: 'PROPOSED' as ClosureState,
+  planItemId: 'item_1',
+  testId: null,
+  ...over,
+});
+
+const evidence = (over: Partial<Parameters<typeof verifyClosure>[1]> = {}) => ({
+  crawled: true,
+  openGapIds: new Set<string>(),
+  complete: true,
+  ...over,
+});
+
+describe('gapProvenance carries the identity and nothing that moves', () => {
+  it('takes the stable id, the kind and the title off the gap', () => {
+    const gap = payGap();
+    const provenance = gapProvenance(gap);
+
+    expect(provenance.gapId).toBe(gap.id);
+    expect(provenance.gapKind).toBe(gap.kind);
+    expect(provenance.gapTitle).toBe(gap.title);
+    expect(provenance.gapScore).toBe(gap.score);
+  });
+
+  it('clamps a long title to what the column can hold', () => {
+    const gap = { ...payGap(), title: 'x'.repeat(900) };
+    const provenance = gapProvenance(gap);
+    expect(provenance.gapTitle.length).toBeLessThanOrEqual(300);
+    expect(provenance.gapTitle.endsWith('…')).toBe(true);
+  });
+
+  it('is stable across two analyses of the same crawl, which is what makes the ledger possible', () => {
+    const tests = [test_({ id: 't1', routes: ['/'] })];
+    const first = run(tests).gaps.map((gap) => gapProvenance(gap).gapId);
+    const second = run(tests).gaps.map((gap) => gapProvenance(gap).gapId);
+    expect(first).toEqual(second);
+    expect(first.length).toBeGreaterThan(0);
+  });
+});
+
+describe('verifyClosure refuses to claim a closure it cannot see', () => {
+  it('calls everything UNVERIFIABLE when there is no readable crawl', () => {
+    /*
+     * THE WORST AVAILABLE BUG. An empty gap report makes every gap "absent",
+     * so a rule that read absence as closure would mark an entire project
+     * closed the first time the Explorer failed — and the number would be
+     * wrong in the flattering direction with no error anywhere.
+     */
+    const verdict = verifyClosure(
+      ledgerEntry({ state: 'TEST_WRITTEN', testId: 'test_1' }),
+      evidence({ crawled: false }),
+    );
+    expect(verdict.state).toBe('UNVERIFIABLE');
+    expect(verdict.why).toContain('An absent gap is not a closed gap');
+  });
+
+  it('calls a gap missing from a TRUNCATED report UNVERIFIABLE, not closed', () => {
+    const verdict = verifyClosure(
+      ledgerEntry({ state: 'TEST_WRITTEN', testId: 'test_1' }),
+      evidence({ complete: false }),
+    );
+    expect(verdict.state).toBe('UNVERIFIABLE');
+    expect(verdict.why).toContain('ranked page');
+  });
+
+  it('records CLOSED and names the test when the gap is gone from a complete report', () => {
+    const verdict = verifyClosure(
+      ledgerEntry({ state: 'TEST_WRITTEN', testId: 'test_42' }),
+      evidence(),
+    );
+    expect(verdict.state).toBe('CLOSED');
+    expect(verdict.changed).toBe(true);
+    expect(verdict.why).toContain('test_42');
+  });
+
+  it('takes no credit for a closure no test of ours caused', () => {
+    const verdict = verifyClosure(ledgerEntry({ planItemId: null, testId: null }), evidence());
+    expect(verdict.state).toBe('CLOSED');
+    expect(verdict.why).toContain('No test of ours');
+  });
+
+  it('calls a gap with a test behind it NOT_CLOSED while it is still reported', () => {
+    /*
+     * This is the loop with no exit, caught. `Test.authProfileId` exists
+     * because an auth gap asked for a signed-in test, an anonymous one was
+     * written, and the gap re-opened on every analysis for ever. Without this
+     * state the ledger would read "still open, nothing proposed" and the
+     * campaign would propose the identical item again, tick after tick.
+     */
+    const verdict = verifyClosure(
+      ledgerEntry({ state: 'TEST_WRITTEN', testId: 'test_7' }),
+      evidence({ openGapIds: new Set(['gap_abc']) }),
+    );
+    expect(verdict.state).toBe('NOT_CLOSED');
+    expect(verdict.why).toContain('test_7');
+    expect(verdict.why).toContain('same test');
+  });
+
+  it('calls a gap that comes back after a closure REOPENED, naming the test that failed it', () => {
+    const verdict = verifyClosure(
+      ledgerEntry({ state: 'CLOSED', testId: 'test_9' }),
+      evidence({ openGapIds: new Set(['gap_abc']) }),
+    );
+    expect(verdict.state).toBe('REOPENED');
+    expect(verdict.why).toContain('test_9');
+  });
+
+  it('leaves a still-open gap with no test as PROPOSED or OPEN, and says which', () => {
+    const open = evidence({ openGapIds: new Set(['gap_abc']) });
+
+    expect(verifyClosure(ledgerEntry({ planItemId: 'item_1' }), open).state).toBe('PROPOSED');
+    expect(verifyClosure(ledgerEntry({ planItemId: null, state: 'OPEN' }), open).state).toBe(
+      'OPEN',
+    );
+  });
+
+  it('reports `changed` only when the state actually moved', () => {
+    const open = evidence({ openGapIds: new Set(['gap_abc']) });
+    expect(verifyClosure(ledgerEntry({ state: 'PROPOSED' }), open).changed).toBe(false);
+    expect(verifyClosure(ledgerEntry({ state: 'OPEN' }), open).changed).toBe(true);
+  });
+
+  it('only accepts states the database column can hold', () => {
+    for (const state of CLOSURE_STATES) expect(isClosureState(state)).toBe(true);
+    expect(isClosureState('CLOSED_ENOUGH')).toBe(false);
+  });
+});
+
+describe('rankGapsForClosure is what stops the campaign re-buying the same work', () => {
+  const gapAt = (id: string, score: number): CoverageGap => ({ ...payGap(), id, score });
+
+  it('returns the worst first, capped, and names what the cap held back', () => {
+    const selection = rankGapsForClosure(
+      [gapAt('gap_a', 10), gapAt('gap_b', 90), gapAt('gap_c', 50)],
+      { limit: 2 },
+    );
+
+    expect(selection.gaps.map((gap) => gap.id)).toEqual(['gap_b', 'gap_c']);
+    expect(selection.considered).toBe(3);
+    // Never silent: the campaign has to be able to say why it proposed 2 of 3.
+    expect(selection.skipped).toHaveLength(1);
+    expect(selection.skipped[0]).toMatchObject({ gapId: 'gap_a' });
+    expect(selection.skipped[0]!.why).toContain('budget');
+  });
+
+  it('breaks ties on id, so two ticks of one campaign choose the same gaps', () => {
+    const first = rankGapsForClosure([gapAt('gap_z', 50), gapAt('gap_a', 50)], { limit: 1 });
+    const second = rankGapsForClosure([gapAt('gap_a', 50), gapAt('gap_z', 50)], { limit: 1 });
+    expect(first.gaps.map((g) => g.id)).toEqual(second.gaps.map((g) => g.id));
+  });
+
+  it('skips work already in flight rather than minting a duplicate', () => {
+    const selection = rankGapsForClosure([gapAt('gap_a', 90), gapAt('gap_b', 80)], {
+      limit: 10,
+      ledger: new Map<string, ClosureState>([
+        ['gap_a', 'PROPOSED'],
+        ['gap_b', 'TEST_WRITTEN'],
+      ]),
+    });
+
+    expect(selection.gaps).toEqual([]);
+    expect(selection.skipped.map((s) => s.gapId)).toEqual(['gap_a', 'gap_b']);
+    expect(selection.skipped.every((s) => s.why.includes('in flight'))).toBe(true);
+  });
+
+  it('refuses to retry a gap a test already failed to close', () => {
+    /*
+     * The anti-spin lever. `planItemForGap` is deterministic: the same gap
+     * yields the same title, the same steps and the same assertions, so a
+     * retry is not another attempt — it is the identical attempt, and it fails
+     * identically. A campaign that retried NOT_CLOSED gaps would spend its
+     * whole nightly budget rewriting one test.
+     */
+    const selection = rankGapsForClosure([gapAt('gap_a', 90), gapAt('gap_b', 80)], {
+      limit: 10,
+      ledger: new Map<string, ClosureState>([
+        ['gap_a', 'NOT_CLOSED'],
+        ['gap_b', 'REOPENED'],
+      ]),
+    });
+
+    expect(selection.gaps).toEqual([]);
+    expect(selection.skipped[0]!.why).toContain('needs a human');
+    expect(selection.skipped[1]!.why).toContain('leaves it for review');
+  });
+
+  it('still picks up a gap the ledger holds as CLOSED, UNVERIFIABLE or OPEN', () => {
+    // A CLOSED gap that is being reported again has already been moved to
+    // REOPENED by `verifyClosure`; one that still reads CLOSED here is a gap
+    // whose history exists and which is on offer again, and is eligible.
+    const selection = rankGapsForClosure(
+      [gapAt('gap_a', 90), gapAt('gap_b', 80), gapAt('gap_c', 70)],
+      {
+        limit: 10,
+        ledger: new Map<string, ClosureState>([
+          ['gap_a', 'CLOSED'],
+          ['gap_b', 'UNVERIFIABLE'],
+          ['gap_c', 'OPEN'],
+        ]),
+      },
+    );
+    expect(selection.gaps.map((g) => g.id)).toEqual(['gap_a', 'gap_b', 'gap_c']);
+    expect(selection.skipped).toEqual([]);
+  });
+
+  it('accounts for every gap it was given', () => {
+    const gaps = [gapAt('gap_a', 90), gapAt('gap_b', 80), gapAt('gap_c', 70)];
+    const selection = rankGapsForClosure(gaps, {
+      limit: 1,
+      ledger: new Map<string, ClosureState>([['gap_b', 'NOT_CLOSED']]),
+    });
+    expect(selection.gaps.length + selection.skipped.length).toBe(selection.considered);
+    expect(selection.considered).toBe(3);
   });
 });

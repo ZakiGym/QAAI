@@ -43,10 +43,14 @@ vi.mock('../context.js', () => ({
 }));
 
 const {
+  CLOSURE_CAMPAIGN_RETENTION_DAYS,
   MUTATION_SURVIVOR_RETENTION_DAYS,
   RETENTION_QUEUE,
+  RUN_FAILURE_CLUSTER_RETENTION_DAYS,
   decideArtifact,
+  pruneClosureCampaigns,
   pruneMutationSurvivors,
+  pruneRunFailureClusters,
   retentionDaysForPlan,
   scanMissingObjects,
   scanStrayObjects,
@@ -1103,5 +1107,288 @@ describe('pruning surviving mutants', () => {
      * Changing it means re-making that argument.
      */
     expect(MUTATION_SURVIVOR_RETENTION_DAYS).toBe(90);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Run-failure clusters: the table that grows with (runs × causes per run)
+//
+// The property that matters most here is a NEGATIVE one, and it has its own
+// test: `FailureSignature` must not be pruned on this clock or on any clock.
+// Its whole value is the long first-seen date — "this has been breaking since
+// March" is a fact because that row holds it — and a signature row is one per
+// CAUSE per project, so it has none of the growth problem this prune exists for
+// and all of the value this prune would destroy.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('pruning run failure clusters', () => {
+  interface Occurrence {
+    id: string;
+    createdAt: Date;
+  }
+
+  interface PruneCalls {
+    wheres: Array<Record<string, unknown>>;
+    deleted: string[];
+    orders: unknown[];
+    /** Models the prune touched at all. The signature table must not be here. */
+    models: string[];
+  }
+
+  /**
+   * A stand-in that honours the window, `take` and the ordering — a fake that
+   * ignored any of the three would let a prune with NO window pass every
+   * assertion below, and that prune deletes every cause occurrence in the
+   * install. Any model other than `runFailureCluster` throws, which is how the
+   * "does not touch FailureSignature" test is enforced rather than hoped for.
+   */
+  function fakeClusters(rows: Occurrence[]): PruneCalls {
+    const live = [...rows];
+    const calls: PruneCalls = { wheres: [], deleted: [], orders: [], models: [] };
+
+    const unexpected = (model: string): Record<string, unknown> => ({
+      findMany: async () => {
+        calls.models.push(model);
+        throw new Error(`fake prisma: the cluster prune must not read ${model}`);
+      },
+      deleteMany: async () => {
+        calls.models.push(model);
+        throw new Error(`fake prisma: the cluster prune must not delete from ${model}`);
+      },
+      updateMany: async () => {
+        calls.models.push(model);
+        throw new Error(`fake prisma: the cluster prune must not write to ${model}`);
+      },
+    });
+
+    h.prisma = {
+      failureSignature: unexpected('failureSignature'),
+      runFailureCluster: {
+        findMany: async (args: {
+          where?: Record<string, unknown>;
+          orderBy?: unknown;
+          take?: number;
+        }) => {
+          calls.models.push('runFailureCluster');
+          const where = args.where ?? {};
+          calls.wheres.push(where);
+          calls.orders.push(args.orderBy);
+          const lt = (where.createdAt as { lt?: Date } | undefined)?.lt;
+          return live
+            .filter((row) => (lt ? row.createdAt < lt : true))
+            .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+            .slice(0, args.take ?? live.length)
+            .map((row) => ({ id: row.id }));
+        },
+        deleteMany: async (args: { where: { id: { in: string[] } } }) => {
+          const ids = args.where.id.in;
+          calls.deleted.push(...ids);
+          for (const id of ids) {
+            const index = live.findIndex((row) => row.id === id);
+            if (index >= 0) live.splice(index, 1);
+          }
+          return { count: ids.length };
+        },
+      },
+    };
+
+    return calls;
+  }
+
+  const ago = (days: number) => new Date(NOW.getTime() - days * DAY);
+
+  it('deletes only the occurrences past the window, oldest first', async () => {
+    const calls = fakeClusters([
+      { id: 'old1', createdAt: ago(400) },
+      { id: 'old2', createdAt: ago(91) },
+      // One day inside the window. The boundary is the only interesting input.
+      { id: 'fresh', createdAt: ago(89) },
+    ]);
+
+    const report = await pruneRunFailureClusters({ now: NOW, apply: true });
+
+    expect(report.deleted).toBe(2);
+    expect(calls.deleted).toEqual(['old1', 'old2']);
+    expect(calls.orders[0]).toEqual({ createdAt: 'asc' });
+    expect(report.olderThan).toBe('2026-05-03');
+  });
+
+  it('never touches FailureSignature — that row IS the long first-seen date', async () => {
+    /*
+     * The one thing this prune must not do. `FailureSignature.firstSeenAt` and
+     * `firstSeenRunId` are what make "new in this build" an equality instead of
+     * a search, and what make "this has been breaking since March" a fact
+     * rather than an impression. The fake throws on any read or write of that
+     * model, so a prune that swept the two tables on one clock fails here
+     * rather than in production six months after the dates were deleted.
+     */
+    const calls = fakeClusters([{ id: 'old1', createdAt: ago(400) }]);
+
+    await pruneRunFailureClusters({ now: NOW, apply: true });
+
+    expect(calls.models).not.toContain('failureSignature');
+    expect(new Set(calls.models)).toEqual(new Set(['runFailureCluster']));
+  });
+
+  it('reports what it would delete and deletes nothing on a dry run', async () => {
+    const calls = fakeClusters([{ id: 'old1', createdAt: ago(400) }]);
+
+    const report = await pruneRunFailureClusters({ now: NOW, apply: false });
+
+    expect(report).toMatchObject({ applied: false, examined: 1, deleted: 0 });
+    expect(calls.deleted).toEqual([]);
+  });
+
+  it('is bounded per tick and says there is more to do', async () => {
+    const calls = fakeClusters(
+      Array.from({ length: 5 }, (_, index) => ({
+        id: `old${index}`,
+        createdAt: ago(100 + index),
+      })),
+    );
+
+    const report = await pruneRunFailureClusters({ now: NOW, apply: true, limit: 2 });
+
+    expect(calls.deleted).toHaveLength(2);
+    // Without `more` a prune that has fallen behind looks finished.
+    expect(report.more).toBe(true);
+  });
+
+  it('keeps the window at 90 days, the same argument as the survivor prune', () => {
+    expect(RUN_FAILURE_CLUSTER_RETENTION_DAYS).toBe(90);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Closure campaigns: one row per project per day, unbounded
+//
+// The interesting rule is the refusal: a campaign still RUNNING past the window
+// never stopped, which is a bug in the stop rule, and deleting the row would
+// make the symptom disappear along with the evidence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('pruning closure campaigns', () => {
+  interface Campaign {
+    id: string;
+    state: string;
+    startedAt: Date;
+  }
+
+  interface PruneCalls {
+    wheres: Array<Record<string, unknown>>;
+    deleted: string[];
+    orders: unknown[];
+  }
+
+  function fakeCampaigns(rows: Campaign[]): PruneCalls {
+    const live = [...rows];
+    const calls: PruneCalls = { wheres: [], deleted: [], orders: [] };
+
+    h.prisma = {
+      closureCampaign: {
+        findMany: async (args: {
+          where?: Record<string, unknown>;
+          orderBy?: unknown;
+          take?: number;
+        }) => {
+          const where = args.where ?? {};
+          calls.wheres.push(where);
+          calls.orders.push(args.orderBy);
+          const lt = (where.startedAt as { lt?: Date } | undefined)?.lt;
+          return live
+            .filter((row) => (lt ? row.startedAt < lt : true))
+            .sort((a, b) => a.startedAt.getTime() - b.startedAt.getTime())
+            .slice(0, args.take ?? live.length)
+            .map((row) => ({ id: row.id, state: row.state }));
+        },
+        deleteMany: async (args: { where: { id: { in: string[] } } }) => {
+          const ids = args.where.id.in;
+          calls.deleted.push(...ids);
+          for (const id of ids) {
+            const index = live.findIndex((row) => row.id === id);
+            if (index >= 0) live.splice(index, 1);
+          }
+          return { count: ids.length };
+        },
+      },
+    };
+
+    return calls;
+  }
+
+  const ago = (days: number) => new Date(NOW.getTime() - days * DAY);
+
+  it('deletes finished campaigns past the window, oldest first', async () => {
+    const calls = fakeCampaigns([
+      { id: 'old_met', state: 'TARGET_MET', startedAt: ago(800) },
+      { id: 'old_settled', state: 'SETTLED', startedAt: ago(366) },
+      { id: 'fresh', state: 'TARGET_MET', startedAt: ago(364) },
+    ]);
+
+    const report = await pruneClosureCampaigns({ now: NOW, apply: true });
+
+    expect(calls.deleted).toEqual(['old_met', 'old_settled']);
+    expect(report).toMatchObject({ deleted: 2, kept: 0, keptBecause: null });
+    expect(calls.orders[0]).toEqual({ startedAt: 'asc' });
+  });
+
+  it('keeps a RUNNING campaign past the window, and COUNTS it rather than shrugging', async () => {
+    /*
+     * A RUNNING row a year old is not old data — it is a campaign that never
+     * stopped, which means the stop rule has a bug or a worker died holding it.
+     * Deleting it removes the only evidence while making the symptom vanish.
+     * And a skip reported as "0 deleted" with nothing else said reads exactly
+     * like an empty table, which is why `kept` and `keptBecause` exist.
+     */
+    const calls = fakeCampaigns([
+      { id: 'stuck', state: 'RUNNING', startedAt: ago(800) },
+      { id: 'done', state: 'BUDGET_SPENT', startedAt: ago(800) },
+    ]);
+
+    const report = await pruneClosureCampaigns({ now: NOW, apply: true });
+
+    expect(calls.deleted).toEqual(['done']);
+    expect(report.kept).toBe(1);
+    expect(report.keptBecause).toContain('never reached a terminal state');
+    expect(h.log.some((line) => line.includes('still RUNNING'))).toBe(true);
+  });
+
+  it('keeps a campaign whose state it does not recognise', async () => {
+    // An unrecognised state is not a licence to delete: the KEEP-on-uncertainty
+    // direction every other decision in this module takes.
+    const calls = fakeCampaigns([{ id: 'odd', state: 'PAUSED_BY_SOMETHING', startedAt: ago(800) }]);
+
+    const report = await pruneClosureCampaigns({ now: NOW, apply: true });
+
+    expect(calls.deleted).toEqual([]);
+    expect(report.kept).toBe(1);
+  });
+
+  it('reports what it would delete and deletes nothing on a dry run', async () => {
+    const calls = fakeCampaigns([{ id: 'done', state: 'SETTLED', startedAt: ago(800) }]);
+
+    const report = await pruneClosureCampaigns({ now: NOW, apply: false });
+
+    expect(report).toMatchObject({ applied: false, examined: 1, deleted: 0 });
+    expect(calls.deleted).toEqual([]);
+  });
+
+  it('windows on startedAt, not finishedAt', async () => {
+    /*
+     * `finishedAt` is nullable, and a campaign that stopped without stamping it
+     * is a campaign whose own record is incomplete. Keying the window on that
+     * column would exempt exactly those rows for ever.
+     */
+    const calls = fakeCampaigns([{ id: 'done', state: 'SETTLED', startedAt: ago(800) }]);
+
+    await pruneClosureCampaigns({ now: NOW, apply: true });
+
+    expect(Object.keys(calls.wheres[0]!)).toEqual(['startedAt']);
+  });
+
+  it('keeps a finished campaign for a year, because the question is an audit one', () => {
+    // The only record that an unattended generator ran against a customer's
+    // repo on a given night, what target it chased and why it stopped.
+    expect(CLOSURE_CAMPAIGN_RETENTION_DAYS).toBe(365);
   });
 });

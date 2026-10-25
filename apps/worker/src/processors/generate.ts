@@ -263,9 +263,48 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
   });
   const secretNames = environment ? Object.keys(await secretsFor(orgId, environment.id)) : [];
 
+  /*
+   * APPROVED ITEMS ONLY, and the filter is defence in depth rather than
+   * decoration.
+   *
+   * The producers are supposed to make it impossible — POST /plans/:id/approve
+   * approves before it enqueues, POST /coverage/:id/propose mints its items
+   * APPROVED because the ticking already happened, and the closure campaign
+   * writes PROPOSED precisely when its project's policy is HUMAN_REVIEW. So
+   * this filter is for the paths that are NOT those three: a re-delivered job
+   * carrying ids a human has since REJECTED, a job enqueued by hand, and the
+   * one that matters — a HUMAN_REVIEW campaign whose items are waiting on the
+   * approval screen and whose ids reach here anyway. Generating those would
+   * spend a strong-tier model call on work nobody approved and then store a
+   * test under a plan item that says it was never agreed to, which is the
+   * approval policy being silently switched off.
+   *
+   * GENERATED is admitted alongside APPROVED on purpose: that is a redelivered
+   * job over work that already landed, and the duplicate guard below is what
+   * answers it — honestly, by pointing the item at the test it already has
+   * rather than minting a second one. REJECTED and PROPOSED are the two that
+   * must not be generated, and leaving them out of the query (rather than
+   * filtering in the loop) means they cost nothing and are reported as a
+   * difference in the batch's own log line.
+   */
   const items = await prisma.planItem.findMany({
-    where: { id: { in: planItemIds }, orgId, testPlanId },
+    where: { id: { in: planItemIds }, orgId, testPlanId, state: { in: ['APPROVED', 'GENERATED'] } },
   });
+  /*
+   * Counted rather than shrugged off. A job asking for ten items and finding
+   * two is a producer or an approval screen disagreeing with this processor,
+   * and a batch that silently generates eight is how that disagreement stays
+   * invisible. The number cannot say WHICH reason applies — not approved, since
+   * rejected, not in this plan, or never existed — so the log line does not
+   * claim to.
+   */
+  const notGenerable = planItemIds.length - items.length;
+  if (notGenerable > 0) {
+    logger.warn(
+      { planId: testPlanId, requested: planItemIds.length, generating: items.length },
+      'some plan items in this job are not approved (or not in this plan); they were not generated',
+    );
+  }
 
   // One suite per generation batch keeps the cockpit's left pane meaningful
   // instead of a flat list that grows forever.
@@ -423,6 +462,25 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
           authProfileId: item.authProfileId,
           authProfileRequired: item.authProfileId !== null,
           planItemId: item.id,
+          /*
+           * THE PROVENANCE, copied onto the test AT BIRTH.
+           *
+           * The closure loop stamps this column on its next tick, by walking
+           * the plan item — which works for every test a campaign is tracking
+           * and for no other. A test generated from a plan item nobody is
+           * tracking (a human clicking POST /coverage/:id/propose, most of
+           * them) landed with `gapId: null` and the ledger could then never
+           * name the test written for that gap. Copying it here is the only
+           * moment both facts are in hand, and it makes the provenance
+           * independent of whether a campaign exists and of whether the plan
+           * survives: a TestPlan is deletable, and `Test → PlanItem → gap`
+           * evaporates with it exactly when the loop needs it.
+           *
+           * NULL stays NULL. The Explorer proposes a cold plan from a crawl
+           * with no gap behind it; `item.gapId` is null for those and a
+           * back-filled id would invent a provenance that never existed.
+           */
+          gapId: item.gapId,
           versions: {
             create: {
               orgId,
@@ -492,6 +550,10 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
       refused: refusals.length,
       alreadyGenerated,
       failed: failures.length,
+      // Not a failure and not a success: items this job named that it was not
+      // allowed to generate. Reported so a batch of ten that produced two
+      // cannot read as a batch of two.
+      notGenerable,
       planId: testPlanId,
     },
     'generation batch complete',

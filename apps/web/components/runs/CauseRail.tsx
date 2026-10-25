@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   api,
+  type ClusterIdentity,
   type ClusterReport,
   type FailureCluster,
   type UnclusteredFailure,
@@ -41,6 +42,12 @@ interface Cause {
   /** Present only for a real cluster — a single failure gets no recommendation. */
   suggested: FailureCluster['suggested'] | null;
   members: Array<{ testId: string; testName: string }>;
+  /**
+   * What the identity tables know about this cause. NULL when the worker has
+   * not recorded it — which is genuinely different from "not new", and is why
+   * nothing below reads a missing identity as false.
+   */
+  identity: ClusterIdentity | null;
 }
 
 function toCause(entry: FailureCluster | UnclusteredFailure): Cause {
@@ -51,6 +58,7 @@ function toCause(entry: FailureCluster | UnclusteredFailure): Cause {
       count: entry.count,
       suggested: entry.suggested,
       members: entry.members.map((m) => ({ testId: m.testId, testName: m.testName })),
+      identity: entry.identity,
     };
   }
   return {
@@ -59,7 +67,109 @@ function toCause(entry: FailureCluster | UnclusteredFailure): Cause {
     count: 1,
     suggested: null,
     members: [{ testId: entry.member.testId, testName: entry.member.testName }],
+    identity: entry.identity,
   };
+}
+
+/**
+ * "This cause is NEW IN THIS BUILD" — the first thing a reviewer needs, and it
+ * had no reader.
+ *
+ * An equality against `FailureSignature.firstSeenRunId` at the server, not a
+ * "have we seen it lately" heuristic: a cause that has failed for three weeks
+ * is somebody's known problem, and a cause ninety seconds old belongs to
+ * whoever just merged. Rendered as two words rather than a number because that
+ * is the whole claim.
+ *
+ * Nothing is drawn when the identity is missing. A rail that said "not new"
+ * because it could not tell would be making the louder claim from the weaker
+ * evidence.
+ */
+function CauseMarks({ identity }: { identity: ClusterIdentity | null }) {
+  if (!identity) return null;
+  const muted = identity.mute?.inForce === true;
+  if (!identity.newInThisBuild && !muted) {
+    // Seen before, and not muted: say how long it has been around, which is the
+    // honest opposite of "new" and more useful than the absence of a marker.
+    return identity.runsSeen > 1 ? (
+      <span
+        className="text-ink-faint shrink-0 font-mono text-micro tabular-nums"
+        title={`First seen ${new Date(identity.firstSeenAt).toLocaleString()} · ${identity.occurrences} occurrences`}
+      >
+        {identity.runsSeen} runs
+      </span>
+    ) : null;
+  }
+  return (
+    <>
+      {identity.newInThisBuild && (
+        <span
+          className="text-fail shrink-0 font-mono text-micro font-semibold"
+          title="This cause has never been seen in this project before this run."
+        >
+          NEW
+        </span>
+      )}
+      {/* A muted cause appears here WITH its mute rather than vanishing: no
+          verdict was minted for it, and a suppression nobody can see is a blind
+          spot wearing a feature's clothes. */}
+      {muted && (
+        <span
+          className="text-flake shrink-0 font-mono text-micro"
+          title={`Muted until ${new Date(identity.mute!.until).toLocaleString()}${
+            identity.mute!.reason ? ` — ${identity.mute!.reason}` : ''
+          }. ${identity.mute!.suppressed} failure(s) suppressed so far; no verdict was minted for this one.`}
+        >
+          muted
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * What triaging this run cost, and what grouping saved — `triageCost` in
+ * apps/api/src/routes/clusters.ts.
+ *
+ * "One model call for forty failures" is the claim this product makes about
+ * itself, and until now it was a claim in a docstring rather than a number on a
+ * screen. The nulls are rendered as nulls: a run with no identity recorded
+ * spent its calls somewhere this report cannot see, and printing "0 calls · 6
+ * saved" would turn missing data into a boast.
+ */
+function TriageCost({ summary }: { summary: ClusterReport['summary'] }) {
+  if (summary.modelCalls === null) {
+    return (
+      <p className="text-ink-faint mb-3 text-[11.5px]">
+        Triage cost was not recorded for this run.
+      </p>
+    );
+  }
+  return (
+    <p
+      className="text-ink-faint mb-3 text-[11.5px]"
+      title={`One verdict per cause: ${summary.modelCalls} model call(s) for ${summary.clustered} clusterable failure(s). One call per failure would have been ${summary.wouldHaveBeen}.${
+        summary.attachments === null ? '' : ` ${summary.attachments} verdict(s) were attached as copies.`
+      }`}
+    >
+      <span className="tabular-nums">{summary.modelCalls}</span>{' '}
+      {summary.modelCalls === 1 ? 'model call' : 'model calls'}
+      {summary.savedCalls !== null && summary.savedCalls > 0 && (
+        <>
+          {' · '}
+          <span className="tabular-nums">{summary.savedCalls}</span> saved by grouping
+        </>
+      )}
+      {summary.suppressedCauses > 0 && (
+        <>
+          {' · '}
+          <span className="text-flake">
+            <span className="tabular-nums">{summary.suppressedCauses}</span> muted
+          </span>
+        </>
+      )}
+    </p>
+  );
 }
 
 /** The recommendation's provenance, in the two or three words the rail has room for. */
@@ -126,6 +236,9 @@ export function CauseRail({ runId, results, selectedTestId, onSelectTest }: Caus
       count: 1,
       suggested: null,
       members: [{ testId: result.test.id, testName: result.test.name }],
+      // The fallback rail is built from the results alone, so there is no
+      // identity to show and nothing claims otherwise.
+      identity: null,
     }));
   }, [report, clusteringFailed, failing]);
 
@@ -179,6 +292,8 @@ export function CauseRail({ runId, results, selectedTestId, onSelectTest }: Caus
         </p>
       )}
 
+      {report && <TriageCost summary={report.summary} />}
+
       {failing.length > 0 && causes.length === 0 && !clusteringFailed && (
         <p className="text-ink-faint text-[11.5px]">Grouping the failures…</p>
       )}
@@ -189,12 +304,13 @@ export function CauseRail({ runId, results, selectedTestId, onSelectTest }: Caus
             key={cause.id}
             className="bg-surface-1 border-line-strong mb-1 rounded-lg border p-3"
           >
-            <div className="flex items-baseline gap-2">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
               {cause.count > 1 && (
                 <span className="text-fail shrink-0 font-mono text-micro font-semibold tabular-nums">
                   ×{cause.count}
                 </span>
               )}
+              <CauseMarks identity={cause.identity} />
               <span className="text-body-sm leading-[1.35] font-semibold">{cause.label}</span>
             </div>
             {cause.suggested && (
@@ -235,12 +351,13 @@ export function CauseRail({ runId, results, selectedTestId, onSelectTest }: Caus
             onClick={() => cause.members[0] && onSelectTest(cause.members[0].testId)}
             className="hover:bg-surface-1 mb-1 block w-full rounded-lg p-3 text-left transition-colors"
           >
-            <span className="flex items-baseline gap-2">
+            <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
               {cause.count > 1 && (
                 <span className="text-fail shrink-0 font-mono text-micro font-semibold tabular-nums">
                   ×{cause.count}
                 </span>
               )}
+              <CauseMarks identity={cause.identity} />
               <span className="text-ink-dim text-body-sm leading-[1.35]">{cause.label}</span>
             </span>
             {cause.suggested && (

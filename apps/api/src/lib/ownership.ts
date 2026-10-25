@@ -46,16 +46,52 @@
  * ownership.test.ts.
  */
 
+/*
+ * The vocabulary this module WRITES — who owns something, which kind of nobody
+ * owns it, and what a ticket can be filed about — now lives in
+ * packages/shared/src/types.ts, and is imported here rather than declared
+ * twice. The matching itself (patterns, precedence, the rule table) stays in
+ * this file; only the shapes a reader receives were promoted, because the web
+ * app renders these states and could not name them while they lived inside the
+ * API.
+ *
+ * Re-exported at the bottom of the file, not here, because three modules
+ * already import them from this one — see that block.
+ */
+import type {
+  IssueOwnerState,
+  OwnerAssignment,
+  OwnerRef,
+  OwnershipState,
+} from '@qaai/shared';
+
 /** Which of the four things a rule points at. */
 export type OwnershipSubject = 'TEST' | 'SUITE' | 'FEATURE' | 'PATH';
-
-/** Who a rule routes to. Exactly one of the two, ever. */
-export type OwnerRef = { kind: 'USER'; userId: string } | { kind: 'TEAM'; teamId: string };
 
 /** A stable grouping key — the digest buckets failures by this. */
 export function ownerKey(owner: OwnerRef): string {
   return owner.kind === 'USER' ? `USER:${owner.userId}` : `TEAM:${owner.teamId}`;
 }
+
+/**
+ * The Prisma `select` that produces an `OwnershipRuleInput`.
+ *
+ * Exported because there are already three hand-written copies of this field
+ * list (the digest, GET /team/ownership/resolve, and now the filing path), and
+ * a copy that forgets `position` does not fail — it resolves last-match-wins
+ * against a column that is always 0, which quietly routes every failure to the
+ * first rule that matches instead of the last.
+ */
+export const OWNERSHIP_RULE_SELECT = {
+  id: true,
+  position: true,
+  pathPattern: true,
+  testId: true,
+  suiteId: true,
+  feature: true,
+  ownerUserId: true,
+  ownerTeamId: true,
+} as const;
 
 /** One `OwnershipRule` row, reduced to what matching needs. */
 export interface OwnershipRuleInput {
@@ -385,8 +421,25 @@ export function resolveOwnership(
       hit = sameFeature(rule.feature, test.feature);
       reason = `Assigned to the "${rule.feature}" feature.`;
     } else {
+      const path = normaliseTestPath(test.filePath);
       try {
-        hit = matchesPath(rule.pathPattern!, test.filePath);
+        /*
+         * An item with NO FILE has no path for a pattern to match, and the
+         * pattern must not be allowed to match it anyway. `*` compiles to
+         * `[^/]*`, which matches the empty string — so without this guard the
+         * commonest CODEOWNERS line there is would own every surface the crawl
+         * found and the source analysis never declared (`ownableSurface`
+         * fabricates `filePath: ''` for exactly those), on the strength of a
+         * path that does not exist. The reason sentence gave it away: it read
+         * " matches *." with nothing in front of the verb.
+         *
+         * A gap attributed to the wrong team is worse than one attributed to
+         * nobody — the wrong team closes the ticket. The pattern is still
+         * COMPILED here, so a rule that can no longer be evaluated is still
+         * reported as unusable rather than quietly skipped.
+         */
+        const matches = matchesPath(rule.pathPattern!, test.filePath);
+        hit = path !== '' && matches;
       } catch (err) {
         skipped.push({
           ruleId: rule.id,
@@ -397,7 +450,7 @@ export function resolveOwnership(
         });
         continue;
       }
-      reason = `${normaliseTestPath(test.filePath)} matches ${rule.pathPattern}.`;
+      reason = `${path} matches ${rule.pathPattern}.`;
     }
 
     if (hit) matched.push({ ruleId: rule.id, subject, owner, reason });
@@ -523,3 +576,270 @@ export function normaliseRuleDraft(draft: OwnershipRuleDraft): NormalisedOwnersh
   }
   return { subject: 'FEATURE', pathPattern: null, testId: null, suiteId: null, feature, owner };
 }
+
+// ─── Assignment ──────────────────────────────────────────────────────────────
+
+/**
+ * Why a thing has no owner — and the point of the whole section.
+ *
+ * `resolveOwnership` returns `owner: null` for four situations that a reader
+ * must not confuse, because only one of them is benign:
+ *
+ *   NO_RULES        nobody has written any rules. Expected, and not a problem
+ *                   to nag about — ownership is opt-in (see the header).
+ *   NO_MATCH        rules exist and none cover this. Someone meant to route
+ *                   this area and did not.
+ *   RULES_UNUSABLE  a rule that could have matched could not be evaluated, so
+ *                   routing has silently STOPPED. This is the dangerous one: it
+ *                   is indistinguishable from NO_MATCH from the outside, and it
+ *                   means a team that believes it is being paged is not.
+ *
+ * A nullable `assigneeUserId` column alone cannot tell those apart, which is
+ * exactly how an unowned failure ends up LOOKING owned — the worse of the two
+ * failures, because nobody goes looking for it.
+ *
+ * SPLIT is the fifth value and belongs only to a thing that covers MANY
+ * subjects: one cause spanning forty tests owned by three different teams has
+ * no single true assignee, and picking one would route the whole ticket to
+ * somebody who owns a third of it. It is never written on a single verdict.
+ *
+ * `OWNERSHIP_STATES`, `ISSUE_OWNER_STATES`, `ISSUE_SUBJECTS` and
+ * `OwnerAssignment` are imported from `@qaai/shared` at the top of this file —
+ * they used to be declared here, which meant the web app could not name the
+ * state it was rendering.
+ */
+
+/**
+ * Who owns this, and if nobody, which kind of nobody.
+ *
+ * A thin wrapper over `resolveOwnership` on purpose: the matching is the part
+ * worth testing exhaustively and it stays above, untouched. What this adds is
+ * the refusal to return a bare null.
+ */
+export function assignOwner(test: OwnableTest, rules: OwnershipRuleInput[]): OwnerAssignment {
+  const resolution = resolveOwnership(test, rules);
+  const unusable = resolution.skipped;
+
+  if (resolution.owner) {
+    return {
+      state: 'OWNED',
+      owner: resolution.owner.owner,
+      ruleId: resolution.owner.ruleId,
+      note:
+        unusable.length > 0
+          ? `${resolution.owner.reason} (${unusable.length} other rule(s) could not be evaluated: ${unusable[0]!.reason})`
+          : resolution.owner.reason,
+      unusable,
+    };
+  }
+
+  const where = normaliseTestPath(test.filePath) || 'this item';
+
+  if (rules.length === 0) {
+    return {
+      state: 'NO_RULES',
+      owner: null,
+      ruleId: null,
+      note: 'Nobody has written an ownership rule for this project, so QAAI does not claim to know who owns this.',
+      unusable,
+    };
+  }
+
+  if (unusable.length > 0) {
+    return {
+      state: 'RULES_UNUSABLE',
+      owner: null,
+      ruleId: null,
+      // Named as loudly as the sentence allows: this is the case where a team
+      // believes it is being routed to and is not.
+      note: `None of the ${rules.length} ownership rules match ${where}, and ${unusable.length} could not be evaluated at all — routing may have stopped without anyone noticing. First problem: ${unusable[0]!.reason}`,
+      unusable,
+    };
+  }
+
+  return {
+    state: 'NO_MATCH',
+    owner: null,
+    ruleId: null,
+    note: `None of the ${rules.length} ownership rules match ${where}. It is unowned until one does.`,
+    unusable,
+  };
+}
+
+/**
+ * The exact column set a `TriageVerdict` assignment writes.
+ *
+ * Exists so that two call sites — the notify processor, which routes a finished
+ * run, and the filing endpoint, which routes whatever it is about to file —
+ * cannot disagree about what "assigned" means on a row. They were always going
+ * to drift: one of them would remember to clear the opposite id and the other
+ * would not, and a verdict holding both a user and a team is a routing hole
+ * that looks like a routing rule.
+ */
+export interface VerdictOwnerColumns {
+  assigneeUserId: string | null;
+  assigneeTeamId: string | null;
+  ownerRuleId: string | null;
+  ownerState: OwnershipState;
+  ownerNote: string;
+  assignedAt: Date;
+}
+
+export function verdictOwnerColumns(
+  assignment: OwnerAssignment,
+  now: Date = new Date(),
+): VerdictOwnerColumns {
+  const owner = assignment.owner;
+  return {
+    // Both written on every assignment, never only the one that applies: a
+    // re-route from a user to a team has to CLEAR the user, or the row keeps
+    // paging whoever used to own it.
+    assigneeUserId: owner?.kind === 'USER' ? owner.userId : null,
+    assigneeTeamId: owner?.kind === 'TEAM' ? owner.teamId : null,
+    ownerRuleId: assignment.ruleId,
+    ownerState: assignment.state,
+    // Truncated at the width a message column is worth: the note is a sentence
+    // for a human, and a rule list that produced a 4KB reason is still readable
+    // at this length.
+    ownerNote: assignment.note.slice(0, 1_000),
+    assignedAt: now,
+  };
+}
+
+/**
+ * One owner for a set of subjects, or an honest refusal.
+ *
+ * A cause that spans forty tests is one ticket, and that ticket needs one
+ * assignee — but only if one is TRUE. Unanimity among the owned members is the
+ * only condition under which it is, so anything else returns SPLIT and the
+ * ticket says so rather than naming the owner of the largest share, which is a
+ * guess dressed as a routing decision. Members with no owner do not veto
+ * unanimity: "the payments team owns eight of these and nobody owns the other
+ * two" still routes to payments, with the gap stated.
+ */
+export function consensusOwner(assignments: readonly OwnerAssignment[]): {
+  state: IssueOwnerState;
+  owner: OwnerRef | null;
+  note: string;
+} {
+  const owned = assignments.filter((a) => a.owner !== null);
+  const distinct = new Map(owned.map((a) => [ownerKey(a.owner!), a.owner!]));
+
+  if (distinct.size === 1) {
+    const owner = [...distinct.values()][0]!;
+    const unowned = assignments.length - owned.length;
+    return {
+      state: 'OWNED',
+      owner,
+      note:
+        unowned > 0
+          ? `${owned.length} of ${assignments.length} are owned, and all of them by the same owner. The other ${unowned} are unowned.`
+          : `All ${assignments.length} are owned by the same owner.`,
+    };
+  }
+
+  if (distinct.size > 1) {
+    return {
+      state: 'SPLIT',
+      owner: null,
+      note: `These are owned by ${distinct.size} different owners, so there is no single assignee this ticket could truthfully carry.`,
+    };
+  }
+
+  // Nobody owns any of them: report the worst of the reasons, since
+  // RULES_UNUSABLE is the one that needs acting on.
+  const worst =
+    assignments.find((a) => a.state === 'RULES_UNUSABLE') ??
+    assignments.find((a) => a.state === 'NO_MATCH') ??
+    assignments[0];
+  return {
+    state: worst?.state ?? 'NO_RULES',
+    owner: null,
+    note: worst?.note ?? 'Nothing here has an owner.',
+  };
+}
+
+/**
+ * A surface item, in the shape the resolver already takes.
+ *
+ * An untested route is routed by the same rules as a failing test, and must be:
+ * a team that wrote `app/checkout/** → @payments` has said who owns checkout,
+ * and having to say it twice — once for failures, once for gaps — is how the
+ * two answers end up different. Only PATH and FEATURE rules can match, because
+ * a surface has no test id and no suite; `key` stands in as the id so the
+ * resolution map can be keyed by it, and it can never collide with a TEST rule
+ * because a surface key is `KIND:identity` and a test id is a cuid.
+ *
+ * `file` is null for an item the crawl found and the source analysis never
+ * declared. That is not an error — it is a surface whose ownership CANNOT be
+ * resolved by path, and `assignOwner` will say NO_MATCH rather than inventing
+ * one.
+ */
+export function ownableSurface(item: {
+  key: string;
+  file: string | null;
+  feature: string | null;
+}): OwnableTest {
+  return {
+    id: item.key,
+    filePath: item.file ?? '',
+    suiteId: null,
+    feature: item.feature,
+  };
+}
+
+// ─── Naming an owner ─────────────────────────────────────────────────────────
+
+/** Rows needed to print an owner. The shape both `User` and `Team` selects give. */
+export interface OwnerDirectory {
+  users: ReadonlyMap<string, { name?: string | null; email?: string | null }>;
+  teams: ReadonlyMap<string, { slug?: string | null }>;
+}
+
+/**
+ * What to call this owner on screen.
+ *
+ * One spelling, in one place, because there are already two: the digest prints
+ * `@slug` for a team and `name || email` for a user, and so does
+ * GET /team/ownership/resolve — and a team that is `@payments` in the digest
+ * and `Payments` in a ticket reads as two different owners to the person
+ * skimming both.
+ *
+ * The deleted-row fallbacks should be unreachable (deleting a user or a team
+ * cascades its rules away) and say something true anyway, because a label that
+ * renders as `undefined` is how a screen loses trust over a row nobody can
+ * explain.
+ */
+export function ownerLabel(owner: OwnerRef, directory: OwnerDirectory): string {
+  if (owner.kind === 'USER') {
+    const user = directory.users.get(owner.userId);
+    return user?.name || user?.email || 'a deleted user';
+  }
+  const team = directory.teams.get(owner.teamId);
+  return team?.slug ? `@${team.slug}` : 'a deleted team';
+}
+
+// ─── Re-exported vocabulary ──────────────────────────────────────────────────
+
+/*
+ * MANDATORY, not tidiness. `OwnershipState`, `IssueOwnerState`,
+ * `IssueSubject`, `OwnerRef` and `OwnerAssignment` were declared in this file
+ * and are imported FROM this file by routes/surface.ts, routes/issues.ts and
+ * ownership.test.ts. Promoting them into @qaai/shared without re-exporting
+ * them here would break those three modules for no reader's benefit: a module
+ * that resolves ownership is exactly where a caller looks for the words
+ * ownership is described in.
+ *
+ * `packages/shared/src/types.test.ts` pins the member spellings, which is the
+ * half that matters — every one of these is the validated domain of a TEXT
+ * column, so a member dropped or respelled in transit does not fail to
+ * compile. It fails to match a row somebody already wrote.
+ */
+export { ISSUE_OWNER_STATES, ISSUE_SUBJECTS, OWNERSHIP_STATES } from '@qaai/shared';
+export type {
+  IssueOwnerState,
+  IssueSubject,
+  OwnerAssignment,
+  OwnerRef,
+  OwnershipState,
+} from '@qaai/shared';

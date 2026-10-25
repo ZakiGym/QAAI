@@ -210,8 +210,34 @@ function makeDb(): Record<string, unknown> {
     },
 
     testResult: {
-      // Only reached by the sharding packer's timing lookup.
-      findMany: async () => [],
+      findMany: async ({ where = {}, select }: Row = {}) => {
+        // The sharding packer's timing lookup, which has no rows to find here.
+        if (where.durationMs?.gt !== undefined) return [];
+        // The result-cache lookup, which asks for passes from previous runs.
+        if (where.status === 'PASSED') return [];
+        return store.results
+          .filter((row) => !where.runId || row.runId === where.runId)
+          .sort((a, b) => Number(a.createdAt ?? 0) - Number(b.createdAt ?? 0))
+          .map((row) => ({
+            ...project(row, select),
+            // `select: { test: { select: … } }` — joined loosely, because what
+            // these tests are about is WHICH tests get re-run, not Prisma's
+            // projection.
+            ...(select?.test
+              ? {
+                  test:
+                    store.tests.find((test) => test.id === row.testId) ?? {
+                      id: row.testId,
+                      name: row.testId,
+                      disabledAt: null,
+                      filePath: `specs/${row.testId}.spec.ts`,
+                      quarantined: false,
+                      quarantineExpiresAt: null,
+                    },
+                }
+              : {}),
+          }));
+      },
       updateMany: async () => ({ count: 0 }),
     },
     testVersion: { findMany: async () => [] },
@@ -685,6 +711,9 @@ function seedFinishedRun(
     gateResult?: unknown;
     results?: Row[];
     tests?: Row[];
+    totalCount?: number;
+    runnerPool?: string | null;
+    baseUrlOverride?: string | null;
   } = {},
 ): string {
   if (over.tests) store.tests = over.tests;
@@ -694,7 +723,19 @@ function seedFinishedRun(
     projectId: 'proj_1',
     environmentId: 'env_1',
     status: over.status ?? 'PASSED',
-    totalCount: 10,
+    totalCount: over.totalCount ?? 10,
+    // Columns POST /runs/:runId/rerun-failures copies onto the re-run. Present
+    // and null rather than absent, because "the previous run had no commit" and
+    // "the fake forgot the column" must not look the same.
+    suiteId: null,
+    commitSha: null,
+    branch: null,
+    prNumber: null,
+    baseUrlOverride: over.baseUrlOverride ?? null,
+    runnerPool: over.runnerPool ?? null,
+    failFast: false,
+    stopRequestedAt: null,
+    stopReason: null,
     passedCount: over.passedCount ?? 9,
     failedCount: over.failedCount ?? 0,
     flakyCount: over.flakyCount ?? 0,
@@ -917,5 +958,408 @@ describe('GET /runs/:runId/junit.xml — a suppressed failure must not go red in
     const xml = await getJunit(id);
     expect(xml).not.toContain('<failure message="injected"/>');
     expect(xml).toContain('&lt;/skipped&gt;');
+  });
+});
+
+// ─── Fail-fast: the flag is now RECORDED ─────────────────────────────────────
+
+/**
+ * THE DEFECT, VERBATIM: "Enforce fail-fast and the stop request in the worker —
+ * the column, the migration, the endpoint and the user-facing promise all
+ * exist; the consumer does not, so a stop request is ignored."
+ *
+ * The consumer could never have existed. `Run.failFast` defaulted to false on
+ * every row ever created, because this endpoint accepted the flag, built a
+ * report about it, and did not write it — so a worker polling the column would
+ * have found every run in the install asking to run to the end. The promise was
+ * broken one step earlier than anybody was looking.
+ */
+describe('POST /runs writes the fail-fast flag onto the run', () => {
+  it('records it, so something can poll it', async () => {
+    const { status, body } = await startRunRequest({ failFast: true });
+
+    expect(status).toBe(202);
+    expect(store.runs[0]!.failFast).toBe(true);
+    expect(body.failFast).toMatchObject({ requested: true, recorded: true });
+  });
+
+  it('still says `enforced: false`, because the run loop does not read it yet', async () => {
+    const { body } = await startRunRequest({ failFast: true });
+
+    /*
+     * The two halves, kept apart. Writing the column and claiming the run stops
+     * early would be the same lie as before in a nicer costume: the
+     * between-tests poll in apps/worker/src/processors/run.ts reads `status`
+     * and `finalizedAt` and not `stopRequestedAt`.
+     */
+    expect(body.failFast.enforced).toBe(false);
+    expect(body.failFast.stopChannel).toBe('Run.stopRequestedAt');
+    expect(body.failFast.note).toContain('does not yet READ stopRequestedAt');
+  });
+
+  it('leaves the column false, and the field absent, when nobody asked', async () => {
+    const { body } = await startRunRequest();
+    expect(store.runs[0]!.failFast).toBe(false);
+    expect(body.failFast).toBeUndefined();
+  });
+});
+
+// ─── POST /runs/:runId/rerun-failures ────────────────────────────────────────
+
+/**
+ * THE DEFECT, VERBATIM: "Re-run only the failures of a previous run — every
+ * re-run path re-executes the whole suite, which makes the loop unusable on a
+ * 5,000-test suite."
+ *
+ * The cases below are in order of how expensive the mistake would be, and the
+ * first one is the whole reason this endpoint needs tests at all: a re-run that
+ * EXECUTES NOTHING and reports PASSED is the worst answer available here, and
+ * it is the answer the obvious implementation gives when every failing test has
+ * since been deleted, disabled or moved under `fixtures/`.
+ */
+async function rerunFailures(
+  runId: string,
+  body: Row = {},
+): Promise<{ status: number; body: Row }> {
+  const res = await fetch(`${baseUrl}/runs/${runId}/rerun-failures`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return { status: res.status, body: text ? (JSON.parse(text) as Row) : {} };
+}
+
+const testRow = (over: Row): Row => ({
+  orgId: 'org_1',
+  projectId: 'proj_1',
+  type: 'E2E',
+  disabledAt: null,
+  suiteId: null,
+  quarantined: false,
+  quarantineExpiresAt: null,
+  filePath: `specs/${over.id}.spec.ts`,
+  name: over.id,
+  ...over,
+});
+
+describe('re-running only the failures', () => {
+  it('queues a run of the failures alone, and reports what it did not run', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      failedCount: 2,
+      totalCount: 4,
+      tests: [
+        testRow({ id: 'test_ok' }),
+        testRow({ id: 'test_bad' }),
+        testRow({ id: 'test_slow' }),
+        testRow({ id: 'test_skip' }),
+      ],
+      results: [
+        { testId: 'test_ok', status: 'PASSED', retriedAndPassed: false, createdAt: 1 },
+        { testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 2 },
+        { testId: 'test_slow', status: 'TIMED_OUT', retriedAndPassed: false, createdAt: 3 },
+        { testId: 'test_skip', status: 'SKIPPED', retriedAndPassed: false, createdAt: 4 },
+      ],
+    });
+
+    const { status, body } = await rerunFailures(id);
+
+    expect(status).toBe(202);
+    expect(body.reran).toBe(2);
+    expect(body.ofTotal).toBe(4);
+
+    // Two placeholder results, for the two failures. Not four.
+    const rerunRun = store.runs.find((run) => run.id !== id)!;
+    expect(rerunRun.totalCount).toBe(2);
+    const placeholders = store.results.filter((row) => row.runId === rerunRun.id);
+    expect(placeholders.map((row) => row.testId).sort()).toEqual(['test_bad', 'test_slow']);
+
+    // Queued once, on the NEW run id, so a double-clicked button cannot
+    // execute the same slice twice.
+    expect(h.enqueued).toHaveLength(1);
+    expect(h.enqueued[0]!.options?.jobId).toBe(`run-${rerunRun.id}`);
+  });
+
+  it('copies the base URL override, so the re-run hits the same application', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      baseUrlOverride: 'https://pr-412.preview.example.test',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    await rerunFailures(id);
+
+    /*
+     * A preview-deploy run's failures belong to the preview URL. Re-running
+     * them against the environment's default would be re-running them against
+     * a different application, and a green result from that is worse than no
+     * result at all.
+     */
+    const rerunRun = store.runs.find((run) => run.id !== id)!;
+    expect(rerunRun.baseUrlOverride).toBe('https://pr-412.preview.example.test');
+  });
+
+  it('keeps an on-prem run on-prem, and enqueues nothing', async () => {
+    store.environments[0]!.runnerPool = 'eu';
+    store.runners.push(runner({ name: 'eu-01', pools: ['eu'] }));
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      runnerPool: 'eu',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { body } = await rerunFailures(id);
+
+    /*
+     * One dispatch path or the other, never both — a re-run that quietly moved
+     * an enterprise's work onto QAAI's own workers would be the exact bug the
+     * dispatch branch exists to prevent, arriving through a new door.
+     */
+    expect(h.enqueued).toEqual([]);
+    expect(body.dispatch).toMatchObject({ target: 'on-prem', pool: 'eu' });
+    const rerunRun = store.runs.find((run) => run.id !== id)!;
+    expect(rerunRun.runnerPool).toBe('eu');
+    expect(store.runnerJobs).toHaveLength(1);
+  });
+
+  it('is triggered MANUAL even when the original was a monitor check', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+    store.runs[0]!.trigger = 'MONITOR';
+
+    await rerunFailures(id);
+
+    // Labelling it MONITOR would corrupt the monitor's failure streak with a
+    // run nobody scheduled.
+    expect(store.runs.find((run) => run.id !== id)!.trigger).toBe('MANUAL');
+  });
+
+  it('excludes a test that has since been disabled, by name', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 2,
+      tests: [
+        testRow({ id: 'test_bad' }),
+        testRow({ id: 'test_off', name: 'retired check', disabledAt: new Date(NOW) }),
+      ],
+      results: [
+        { testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 },
+        { testId: 'test_off', status: 'FAILED', retriedAndPassed: false, createdAt: 2 },
+      ],
+    });
+
+    const { body } = await rerunFailures(id);
+
+    expect(body.reran).toBe(1);
+    expect(body.excluded).toHaveLength(1);
+    expect(body.excluded[0]).toMatchObject({ testId: 'test_off', name: 'retired check' });
+    expect(body.excluded[0].why).toContain('disabled');
+    // And it is genuinely not queued — every other selection path in this file
+    // excludes a disabled test, so this must not be the one place it runs.
+    const rerunRun = store.runs.find((run) => run.id !== id)!;
+    expect(store.results.filter((row) => row.runId === rerunRun.id)).toHaveLength(1);
+  });
+
+  it('excludes a test that has moved under fixtures/, which holds no runnable code', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 2,
+      tests: [
+        testRow({ id: 'test_bad' }),
+        testRow({ id: 'test_data', filePath: 'fixtures/users.json' }),
+      ],
+      results: [
+        { testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 },
+        { testId: 'test_data', status: 'FAILED', retriedAndPassed: false, createdAt: 2 },
+      ],
+    });
+
+    const { body } = await rerunFailures(id);
+    expect(body.reran).toBe(1);
+    expect(body.excluded[0].why).toContain('fixtures/');
+  });
+
+  it('counts results that no longer exist rather than reporting fewer failures', async () => {
+    /*
+     * A TEST THAT NO LONGER EXISTS. `TestResult.test` is `onDelete: Cascade`,
+     * so deleting a Test takes its results with it — the failure cannot be
+     * re-run because the evidence of it is gone too. The ONLY trace left is the
+     * count the run recorded when it started, and without this arithmetic a run
+     * of 500 whose results were pruned reads as a run with one failure.
+     */
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 500,
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { body } = await rerunFailures(id);
+
+    expect(body.reran).toBe(1);
+    expect(body.ofResults).toBe(1);
+    expect(body.ofTotal).toBe(500);
+    expect(body.vanishedResults).toBe(499);
+  });
+
+  it('skips a failure that passed on retry, and says so rather than dropping it', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 2,
+      tests: [testRow({ id: 'test_bad' }), testRow({ id: 'test_flake' })],
+      results: [
+        { testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 },
+        { testId: 'test_flake', status: 'FAILED', retriedAndPassed: true, createdAt: 2 },
+      ],
+    });
+
+    const { body } = await rerunFailures(id);
+    expect(body.reran).toBe(1);
+    expect(body.retriedAndPassedSkipped).toBe(1);
+
+    // And the caller who wanted them can have them.
+    h.enqueued.length = 0;
+    const second = await rerunFailures(id, { includeFlaky: true });
+    expect(second.body.reran).toBe(2);
+    expect(second.body.retriedAndPassedSkipped).toBe(0);
+  });
+
+  it('re-runs a quarantined failure but says it cannot turn the run red', async () => {
+    const id = seedFinishedRun({
+      status: 'PASSED',
+      quarantinedFailedCount: 1,
+      totalCount: 1,
+      tests: [
+        testRow({
+          id: 'test_q',
+          quarantined: true,
+          quarantineExpiresAt: new Date(NOW + 86_400_000),
+        }),
+      ],
+      results: [{ testId: 'test_q', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { body } = await rerunFailures(id);
+
+    // It runs — the test is not broken-by-decree, its failure is just not
+    // allowed to gate — and a caller reading `reran: 1` deserves to know that.
+    expect(body.reran).toBe(1);
+    expect(body.quarantinedIncluded).toBe(1);
+  });
+
+  it('refuses a run that is still going, rather than re-running a partial answer', async () => {
+    const id = seedFinishedRun({
+      status: 'RUNNING',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { status, body } = await rerunFailures(id);
+    expect(status).toBe(400);
+    expect(body.error.message).toContain('still running');
+    expect(h.enqueued).toEqual([]);
+  });
+
+  it('refuses rather than queueing an empty run when every failure is gone', async () => {
+    /*
+     * THE WORST AVAILABLE ANSWER, refused. A run that executes nothing
+     * finalises PASSED, and a green re-run of a red build is a lie that looks
+     * exactly like a fix.
+     */
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 2,
+      tests: [testRow({ id: 'test_off', disabledAt: new Date(NOW) })],
+      results: [{ testId: 'test_off', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { status, body } = await rerunFailures(id);
+
+    expect(status).toBe(409);
+    expect(body.error.message).toContain('can no longer run');
+    expect(body.error.details.excluded).toHaveLength(1);
+    expect(body.error.details.vanishedResults).toBe(1);
+    expect(h.enqueued).toEqual([]);
+    expect(store.runs).toHaveLength(1);
+  });
+
+  it('says "nothing failed" differently from "nothing can be re-run"', async () => {
+    const id = seedFinishedRun({
+      status: 'PASSED',
+      totalCount: 1,
+      tests: [testRow({ id: 'test_ok' })],
+      results: [{ testId: 'test_ok', status: 'PASSED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { status, body } = await rerunFailures(id);
+    // 422, not 409: the request was coherent and there is nothing to retry.
+    expect(status).toBe(422);
+    expect(body.error.message).toContain('no failures');
+  });
+
+  it('404s on a run that does not exist, and on another org’s run', async () => {
+    expect((await rerunFailures('run_nope')).status).toBe(404);
+
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+    h.actor = { userId: 'user_9', orgId: 'org_other', role: 'MEMBER', ip: null };
+    expect((await rerunFailures(id)).status).toBe(404);
+  });
+
+  it('meters the re-run, because it costs the same browser', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    await rerunFailures(id);
+
+    // Through `startRun` like every other run-creating path. Six of the seven
+    // used to forget, which is why that function exists.
+    expect(store.usage).toHaveLength(1);
+    expect(store.usage[0]!.quantity).toBe(1n);
+  });
+
+  it('records that the re-run was a SUBSET in the audit row', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      totalCount: 500,
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    await rerunFailures(id);
+
+    // Six months later this row is the only thing that still remembers a run
+    // of 1 was deliberate rather than a catastrophically shrunken suite.
+    const entry = h.audits.find((row) => row.action === 'run.rerun-failures');
+    expect(entry?.metadata).toMatchObject({
+      ofRun: id,
+      reran: 1,
+      ofResults: 1,
+      vanishedResults: 499,
+    });
+  });
+
+  it('arms fail-fast on the re-run when asked', async () => {
+    const id = seedFinishedRun({
+      status: 'FAILED',
+      tests: [testRow({ id: 'test_bad' })],
+      results: [{ testId: 'test_bad', status: 'FAILED', retriedAndPassed: false, createdAt: 1 }],
+    });
+
+    const { body } = await rerunFailures(id, { failFast: true });
+    expect(store.runs.find((run) => run.id !== id)!.failFast).toBe(true);
+    expect(body.failFast).toMatchObject({ recorded: true, enforced: false });
   });
 });

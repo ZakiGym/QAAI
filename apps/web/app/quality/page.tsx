@@ -10,7 +10,11 @@ import { SECTION_TABS_SLOT_ID } from '../../components/shell/AppShell';
 import { Button } from '../../components/ui/Button';
 import { EmptyState } from '../../components/ui/EmptyState';
 import { Badge, Page, PageHeader, SectionLabel, SkeletonRows } from '../../components/ui/layout';
-import { GateRuleRow, type GateRule } from '../../components/triage/GateRuleRow';
+import {
+  GateRuleRow,
+  type GateRule,
+  type StoredGateRule,
+} from '../../components/triage/GateRuleRow';
 
 /**
  * Quality — the gates, the flake radar and the findings, on one screen.
@@ -67,7 +71,14 @@ export default function QualityPage() {
   // Was `projects[0]` — this screen silently reported on whichever project came
   // back first and never said which one that was.
   const { project, projectId, loading: projectLoading } = useProject();
-  const [rules, setRules] = useState<GateRule[]>([]);
+  /*
+   * Typed as STORED rules, not editable ones: @qaai/shared's GateRule has
+   * twelve kinds and GateRuleRow has controls for four, so a project may hold
+   * one this screen cannot edit. It is rendered as what it is and written back
+   * untouched — dropping it from the array on save would silently delete a gate
+   * the project is relying on.
+   */
+  const [rules, setRules] = useState<StoredGateRule[]>([]);
   const [savingRules, setSavingRules] = useState(false);
   const [ruleNote, setRuleNote] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -99,8 +110,8 @@ export default function QualityPage() {
       ]);
       setFindings(f.findings);
       setFlaky(q.tests);
-      const g = await api<{ rules: GateRule[] }>(`/projects/${id}/gate-rules`).catch(
-        onFail({ rules: [] as GateRule[] }),
+      const g = await api<{ rules: StoredGateRule[] }>(`/projects/${id}/gate-rules`).catch(
+        onFail({ rules: [] as StoredGateRule[] }),
       );
       setRules(g.rules);
     },

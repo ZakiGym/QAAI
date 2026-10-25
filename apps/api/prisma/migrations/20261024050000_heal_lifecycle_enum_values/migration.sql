@@ -1,0 +1,38 @@
+-- Two new enum members: HealRisk.RETIRE and HealState.SUPERSEDED.
+--
+-- Alone in their own migration, for the same reason the MOBILE and PERFORMANCE
+-- TestType members were: Postgres will not let a value added by
+-- ALTER TYPE ... ADD VALUE be *used* by any other statement in the same
+-- transaction, and Prisma runs one migration file in one transaction. Keeping
+-- them separate means the column migration that follows — and every migration
+-- after it — can reference these values freely.
+--
+-- WHY RETIRE
+--
+-- Nothing in this product could ever say "this test should stop existing". The
+-- Healer proposes patches, quarantine suppresses a signal, and a test whose
+-- route was deleted from the application six months ago kept running, kept
+-- failing, and kept being re-proposed a fix against a page that is gone. RETIRE
+-- is the missing verdict. It is deliberately NOT a diff: `applyHealDiff` refuses
+-- a patch that removes a test block ("a heal may fix a test, not delete one"),
+-- and that refusal is correct — so a retirement is applied by DISABLING the
+-- test, which is reversible, rather than by deleting the customer's code, which
+-- is not.
+--
+-- WHY SUPERSEDED
+--
+-- The idempotence guard on healing is per TestResult, so one permanently broken
+-- test minted a fresh strong-model proposal on every run and could fill the
+-- review queue by itself. Superseding keeps the queue at one open proposal per
+-- TEST while keeping the old rows — their diffs, their confidences, their
+-- reasons — so the record of what was proposed is never rewritten.
+--
+-- NEITHER VALUE IS BACK-FILLED ONTO ANYTHING. Existing rows keep the state and
+-- the risk level they were written with; a migration that re-labelled a
+-- customer's already-reviewed proposals would be a migration having an opinion.
+--
+-- IF NOT EXISTS keeps both re-runnable against a database where an operator
+-- already added them by hand.
+ALTER TYPE "HealRisk" ADD VALUE IF NOT EXISTS 'RETIRE';
+
+ALTER TYPE "HealState" ADD VALUE IF NOT EXISTS 'SUPERSEDED';

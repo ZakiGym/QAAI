@@ -661,17 +661,94 @@ export interface FailFastPlan {
 }
 
 /**
- * Fail-fast is accepted by the API and NOT yet enforced, and this function's job
- * is to make sure nobody has to find that out from a run that kept going.
+ * Whether the run loop obeys a stop request, i.e. whether `enforced` is true.
+ *
+ * ── WHY THIS IS A CONSTANT AND NOT A HARD-CODED `false` ────────────────────
+ *
+ * Because `enforced` is a claim about code in another process, and the one way
+ * to keep the API's answer and the worker's behaviour from disagreeing is to
+ * make them disagree in exactly one visible place.
+ *
+ * ── THIS CONSTANT IS NOW STALE, AND SAYING SO IS THE POINT OF IT ───────────
+ *
+ * It was written when three of the four parts of fail-fast had landed and the
+ * fourth had not. THE FOURTH HAS SINCE LANDED, in the same round and in
+ * another agent's file, and this comment used to describe the old state of it
+ * — "the poll selects `status` and `finalizedAt` and nothing else" — which is
+ * no longer true of the file it names. As of this writing:
+ *
+ *   - `Run.failFast`, `Run.stopRequestedAt`, `Run.stopReason` exist.
+ *   - The scheduler sweep (`sweepFailFastStops` in apps/worker/src/processors/
+ *     schedule.ts) writes the last two at the first failure that counts, and
+ *     run.ts:1534 now writes them inline too, so the stop is immediate rather
+ *     than up to sixty seconds late.
+ *   - THE POLL READS THEM: apps/worker/src/processors/run.ts:1163 selects
+ *     `stopRequestedAt` and `stopReason`, breaks out of the per-test loop on a
+ *     non-null request, deliberately leaves `cancelled` FALSE so the run is
+ *     filed on its real counts rather than as CANCELLED, and stamps the tests
+ *     it never reached `NOT_RUN` with the stop's own sentence (run.ts:1625).
+ *
+ * So `false` is now the ONLY thing holding `enforced` down, and every sentence
+ * built from it under-promises: a caller is told their run will execute every
+ * selected test when it will stop. That is the mirror of the defect this
+ * constant was introduced to fix, and it is a lie in a shipped response.
+ *
+ * ── WHY IT IS STILL `false`, AND EXACTLY WHAT FLIPPING IT COSTS ────────────
+ *
+ * Flipping it alone turns another agent's green tests red and would leave one
+ * response self-contradictory, so it is a four-edit change and not a one-line
+ * one. All four, none of them in this file:
+ *
+ *   1. apps/api/src/routes/runs.ts:302 `FAIL_FAST_NOTE` — a SECOND prose copy
+ *      of this fact ("does not yet READ stopRequestedAt"), served beside
+ *      `enforced` in the same object at runs.ts:1025 and :1419. The claim in
+ *      the paragraph above — that there is no second copy of this fact — was
+ *      true of THIS file and wrong about the product.
+ *   2. apps/api/src/routes/runs.ts:278-301, the doc comment over it.
+ *   3. apps/api/src/routes/runs.test.ts:986-997, a test whose NAME is "still
+ *      says `enforced: false`, because the run loop does not read it yet" and
+ *      which asserts both the flag and the note's stale wording.
+ *   4. apps/api/src/routes/runs.test.ts:1363, the same assertion on the re-run
+ *      endpoint.
+ *
+ * `failFastReason(true)` is already written and already tested, so the moment
+ * those four move, this line becomes `true` and nothing else here changes.
+ */
+export const FAIL_FAST_ENFORCED_BY_RUN_LOOP = false;
+
+/**
+ * The sentence the API returns about fail-fast, for either state of the world.
+ *
+ * Separate and pure so BOTH branches are tested, rather than only whichever one
+ * today's constant selects. The branch that is not live is the one that will be
+ * wrong when it goes live.
+ */
+export function failFastReason(enforced: boolean): string {
+  if (enforced) {
+    return 'This run stops early at the first failure that counts. The flag is recorded on `Run.failFast`; the scheduler sweep writes `Run.stopRequestedAt` and `Run.stopReason` naming the test that tripped it, and the run loop reads that between tests and stops. Failures that passed on retry and failures a quarantine suppresses do not trip it, and the run is filed by its result rather than as cancelled.';
+  }
+  return 'This run will execute every selected test. The flag IS recorded, on `Run.failFast`, and the scheduler sweep writes `Run.stopRequestedAt` and `Run.stopReason` at the first failure that counts — so the request is made and is readable on the run. What is missing is the last step: the run loop polls `status` and `finalizedAt` between tests and not `stopRequestedAt`, so nothing acts on the request yet. The API accepts the flag and says, here, that the run will not actually stop early.';
+}
+
+/**
+ * Say what fail-fast will and will not do, so nobody has to find out from a run
+ * that kept going.
  *
  * Stopping a run mid-flight is the worker's decision to act on and the run row's
  * to carry — that is how cancellation already works, and inventing a second
  * channel for the same idea (a queue message, a Redis flag) would give a sharded
- * run two sources of truth about whether it should still be running. The run row
- * has nowhere to put the request today: `Run` has no `failFast` column, and the
- * worker's between-tests poll reads only `status` and `finalizedAt`. Both
- * changes live in files this change does not own, so the honest thing is to say
- * so in the response rather than accept the flag and silently ignore it.
+ * run two sources of truth about whether it should still be running.
+ *
+ * ── WHAT THIS DOC COMMENT USED TO SAY, AND WHY IT MATTERED ─────────────────
+ *
+ * That "`Run` has no `failFast` column", and the returned `reason` told callers
+ * the `Run.failFast` / `Run.stopRequestedAt` pair did not exist. Both columns
+ * exist and both are written. The string is returned to callers beside
+ * accurate fields (see apps/api/src/routes/runs.ts), so the one field whose job
+ * is to explain itself was the one telling a reader the opposite of the truth —
+ * and a reader who believes it goes looking for a migration that is already
+ * deployed. The remaining gap is real but it is one step, not four, and
+ * FAIL_FAST_ENFORCED_BY_RUN_LOOP is where it is recorded.
  */
 export function planFailFast(requested: boolean): FailFastPlan {
   if (!requested) {
@@ -679,8 +756,7 @@ export function planFailFast(requested: boolean): FailFastPlan {
   }
   return {
     requested: true,
-    enforced: false,
-    reason:
-      'This run will execute every selected test. Stopping early needs a `Run.failFast` / `Run.stopRequestedAt` pair for the worker to poll between tests, alongside the cancellation check it already makes — until those exist the API accepts the flag and says, here, that it did nothing.',
+    enforced: FAIL_FAST_ENFORCED_BY_RUN_LOOP,
+    reason: failFastReason(FAIL_FAST_ENFORCED_BY_RUN_LOOP),
   };
 }

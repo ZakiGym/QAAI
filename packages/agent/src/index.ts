@@ -24,6 +24,23 @@ export * from './surface-inventory.js';
 export * from './surface-coverage.js';
 
 /*
+ * The heal lane's two newest modules. Both were reached by RELATIVE PATH from
+ * another workspace — `../../../../packages/agent/src/deflake.js` in
+ * apps/worker/src/processors/flake.ts and the same shape for obsolete.js there
+ * and in apps/api/src/routes/agent.ts — because this file was owned by another
+ * change when they landed. A relative import across a workspace boundary
+ * compiles and then bypasses the package's own entry point, which is the thing
+ * the comment in repro.ts establishes as the one to avoid.
+ *
+ * `obsolete.js` imports from coverage.js and suite-health.js, both already in
+ * this graph, so neither line adds a cycle. No name collides: the two export
+ * the `Deflake`, `Obsolete`, `Drift` and `Surface` shapes plus
+ * `proposeDeflake`, `auditTestsAgainstCrawl` and `driftCheck`.
+ */
+export * from './deflake.js';
+export * from './obsolete.js';
+
+/*
  * The generation gates. Each of these was flagged `package-exports` by
  * check:wiring the moment it landed — built, tested, and reachable from
  * nothing but its own test file, which is this codebase's signature defect.

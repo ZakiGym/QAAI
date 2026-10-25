@@ -26,7 +26,14 @@
  * precisely why the fallbacks below are as blunt as they are.
  */
 
-import type { Priority } from '@qaai/shared';
+import { coveragePercent, parseSurfaceKey } from '@qaai/shared';
+import type {
+  PatchCoverage,
+  PatchCoverageRoute,
+  PatchSurfaceState,
+  Priority,
+  SurfaceStatus,
+} from '@qaai/shared';
 
 export type Confidence = 'HIGH' | 'MEDIUM' | 'LOW' | 'NONE';
 
@@ -92,6 +99,29 @@ export interface ImpactInput {
   tests: ImpactTestInput[];
   /** Serialised FlowMap of the latest crawl, or null when the app was never crawled. */
   flowMapGraph?: unknown;
+  /**
+   * Routes the app is known to serve from a source OTHER than the suite.
+   *
+   * ── The hole this closes ──────────────────────────────────────────────────
+   *
+   * `attribute()` demotes a route read off a path's shape unless the suite has
+   * been seen at it — correctly, because `support/pages/LoginPage.ts` is not
+   * "the /loginpage route". But "the suite has been seen at it" is close to
+   * "a test already covers it", so the one case patch coverage exists to catch —
+   * a diff that adds a page NOTHING tests — was demoted to `unattributable`,
+   * and the gate could not name the route the pull request had just left
+   * untested.
+   *
+   * The coverage inventory is the other witness: its ROUTE items come from the
+   * SOURCE analysis reading the routing table, independently of whether any test
+   * has ever been there. A route it declares is corroboration of exactly the
+   * kind `suiteHasSeen` wants, and it is the reason the gate can say "/promo has
+   * no test" rather than "we cannot place app/promo/page.tsx".
+   *
+   * Optional, and absent for every existing caller: the selection endpoint
+   * passes nothing and behaves exactly as before.
+   */
+  knownRoutes?: string[];
 }
 
 /** A route the analysis believes a file serves. */
@@ -1324,6 +1354,14 @@ export function analyzeImpact(input: ImpactInput): ImpactAnalysis {
 
   const suiteTokens = new Set<string>();
   const suiteRoutes = new Set<string>(flow.routes);
+  /*
+   * The source analysis's routes count as "the app has been seen here", which is
+   * what lets a route with no test be attributed at all. See `knownRoutes`.
+   */
+  for (const route of input.knownRoutes ?? []) {
+    const canonical = normalizeRoute(route);
+    if (canonical) suiteRoutes.add(canonical);
+  }
   for (const entry of entries) {
     for (const token of entry.tokens) suiteTokens.add(token);
     for (const route of entry.routes) suiteRoutes.add(route);
@@ -1553,5 +1591,352 @@ export function analyzeImpact(input: ImpactInput): ImpactAnalysis {
       skip: skip.length,
       changedPaths: changedPaths.length,
     },
+  };
+}
+
+// ─── Patch coverage: the join nothing performed ──────────────────────────────
+
+/**
+ * Coverage of the surface a diff touches, which is the number that can refuse a
+ * merge.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * Everything above this line maps a diff to ROUTES. `CoverageItem` rows map
+ * ROUTES to tests. Both halves existed, in different packages, and nothing
+ * joined them — so the product could say "this change lands on three routes"
+ * and could say "two of your routes have no test" and could not say "two of the
+ * three routes this change lands on have no test", which is the only one of the
+ * three a reviewer can act on. The whole-project percentage moves by tenths on
+ * a normal pull request and therefore gates nothing; this moves to 0% the moment
+ * a change lands on an untested route.
+ *
+ * ── WHAT THIS CANNOT SEE, stated here rather than apologised for later ──────
+ *
+ *  1. A RENAME AND AN ADDITION ARE THE SAME EVIDENCE. When a diff moves
+ *     `app/cart/page.tsx` to `app/basket/page.tsx`, the inventory holds a row
+ *     for `/cart` (retired on the next extraction) and no row for `/basket`.
+ *     The diff alone cannot distinguish that from a brand-new `/basket`, nor
+ *     from an inventory nobody has recomputed since the extractor last ran. All
+ *     three produce `NOT_IN_INVENTORY`, which is counted on its own, never
+ *     folded into UNCOVERED, and never counted as covered.
+ *
+ *  2. IT IS AS OLD AS THE INVENTORY. The rows were written by the last coverage
+ *     computation, at whatever commit that was. When the snapshot's commit is
+ *     not the diff's commit, that is stated as a caveat rather than left for a
+ *     reader to assume.
+ *
+ *  3. IT CANNOT SCOPE A CHANGE WITH NO ROUTE. A lockfile, the request
+ *     middleware, the root layout, an auth module — `attribute()` already calls
+ *     those blast-radius changes, and their changed surface is the whole
+ *     application. So is a source file nothing could attribute. In both cases
+ *     this reports `measured: false` and names the file, because the asymmetry
+ *     at the top of this module applies here too: the cost of saying "not
+ *     measured" is a gate that does not fire, and the cost of dividing by a
+ *     surface we did not fully see is a PASSING number on a change that
+ *     introduced an untested route. Only one of those lies.
+ *
+ *  4. IT IS ROUTES ONLY. Endpoints, forms and auth surfaces are in the
+ *     inventory and are not reachable from a diff by this analysis, so they are
+ *     outside the denominator and said to be.
+ *
+ *  5. A ROUTE NEW TO BOTH THE SUITE AND THE INVENTORY IS INVISIBLE. `attribute()`
+ *     will not read a route off a path's shape unless something has seen the app
+ *     there — a test, the crawl, or the inventory (`ImpactInput.knownRoutes`).
+ *     A page that nothing tests AND nothing has extracted yet therefore arrives
+ *     as a bare name, then as blast radius, and this reports "not measured".
+ *     The case it DOES catch is the common one: a route the source analysis has
+ *     extracted, with no test against it. Which means the gate is only as sharp
+ *     as how recently coverage was computed, and that is why the staleness
+ *     caveat is not decoration.
+ */
+
+/** A `CoverageItem` row, as this join needs it. The caller reads the database. */
+export interface PatchCoverageRow {
+  /** `CoverageItem.key` — `ROUTE:/orders/:id`. Non-ROUTE keys are ignored. */
+  key: string;
+  status: SurfaceStatus;
+  label: string;
+}
+
+/** `SurfaceStatus` and `PatchSurfaceState` share five members by design. */
+const PATCH_STATE: Record<SurfaceStatus, PatchSurfaceState> = {
+  COVERED: 'COVERED',
+  ASSERTED_NOT_RUN: 'ASSERTED_NOT_RUN',
+  UNCOVERED: 'UNCOVERED',
+  UNKNOWN: 'UNKNOWN',
+  WAIVED: 'WAIVED',
+};
+
+/** Attribution kinds that cannot change what the application serves. */
+const NO_SURFACE: ReadonlySet<PathAttribution['kind']> = new Set([
+  'test-file',
+  'test-support',
+  'documentation',
+]);
+
+export function patchCoverage(input: {
+  /** The attributions `analyzeImpact` produced for this diff. */
+  attributions: readonly PathAttribution[];
+  /** ROUTE rows from the project's coverage inventory, retired ones excluded. */
+  rows: readonly PatchCoverageRow[];
+  /** The commit the diff is of, when the caller knows it. */
+  diffCommitSha?: string | null;
+  /** The commit the inventory was measured against, from the snapshot. */
+  inventoryCommitSha?: string | null;
+  inventoryMeasuredAtIso?: string | null;
+  /**
+   * True when the caller could not read the whole diff — a cap, a page limit.
+   * An incomplete diff cannot produce a trustworthy denominator.
+   */
+  diffTruncated?: boolean;
+  /**
+   * How many files the diff held, when the caller knows.
+   *
+   * It exists to tell "this diff changed nothing" apart from "this diff was too
+   * wide to attribute": `analyzeImpact` returns an EMPTY attribution list in
+   * both cases, and reading the second as the first would report a clean
+   * changed surface for a 2,000-file merge commit.
+   */
+  changedPathCount?: number;
+  /**
+   * True when the caller's inventory read was capped.
+   *
+   * A partial inventory makes `NOT_IN_INVENTORY` meaningless — a route that is
+   * covered would look unrecognised purely because its row was past the cap.
+   */
+  inventoryTruncated?: boolean;
+}): PatchCoverage {
+  const caveats: string[] = [];
+  const empty = (why: string): PatchCoverage => {
+    caveats.unshift(why);
+    return {
+      denominator: 0,
+      covered: 0,
+      assertedNotRun: 0,
+      uncovered: 0,
+      unknown: 0,
+      waived: 0,
+      unrecognised: 0,
+      percent: null,
+      routes: [],
+      caveats,
+      measured: false,
+    };
+  };
+
+  if (input.diffTruncated) {
+    return empty(
+      'The list of changed files was capped before it was read, so the changed surface is ' +
+        'incomplete and any percentage over it would be computed from a subset nobody chose.',
+    );
+  }
+
+  if (input.inventoryTruncated) {
+    return empty(
+      'The coverage inventory read was capped, so a route with no row cannot be told apart from ' +
+        'a route whose row was past the cap.',
+    );
+  }
+
+  if (input.attributions.length === 0 && (input.changedPathCount ?? 0) > 0) {
+    return empty(
+      `No attribution was produced for the ${input.changedPathCount} changed file(s) — a diff ` +
+        `past the ${MAX_CHANGED_PATHS}-file attribution limit, which is a refactor or a merge ` +
+        `commit — so the changed surface is unknown rather than empty.`,
+    );
+  }
+
+  const meaningful = input.attributions.filter(
+    (attribution) => !attribution.ignored && !NO_SURFACE.has(attribution.kind),
+  );
+
+  // Blast radius first: a lockfile or the root layout makes "the changed
+  // surface" the whole application, and a number scoped to three routes would
+  // be answering a different question from the one the gate asked.
+  const blast = meaningful.filter((attribution) => attribution.blastRadius);
+  if (blast.length > 0) {
+    return empty(
+      `This diff changes ${blast
+        .slice(0, 3)
+        .map((attribution) => attribution.path)
+        .join(', ')}${blast.length > 3 ? ` and ${blast.length - 3} more` : ''}, which can affect ` +
+        `any page, so the changed surface is the whole application rather than a set of routes. ` +
+        `Hold this change to the project coverage floor instead.`,
+    );
+  }
+
+  const unattributable = meaningful.filter(
+    (attribution) => attribution.routes.length === 0 || attribution.confidence === 'NONE',
+  );
+  if (unattributable.length > 0) {
+    return empty(
+      `${unattributable.length} changed file(s) could not be attributed to any route — ` +
+        `${unattributable
+          .slice(0, 3)
+          .map((attribution) => attribution.path)
+          .join(', ')}${unattributable.length > 3 ? ', …' : ''} — so the changed surface is ` +
+        `incomplete, and the part we cannot see is exactly where an untested route would be.`,
+    );
+  }
+
+  if (input.rows.length === 0) {
+    return empty(
+      'This project has no stored coverage inventory, so there is nothing to join the diff ' +
+        'against. Compute coverage once and this starts answering.',
+    );
+  }
+
+  // ── The inventory, keyed by canonical route ────────────────────────────────
+  const inventory = new Map<string, { key: string; status: SurfaceStatus; label: string }>();
+  let nonRouteRows = 0;
+  for (const row of input.rows) {
+    const parsed = parseSurfaceKey(row.key);
+    if (!parsed || parsed.kind !== 'ROUTE') {
+      nonRouteRows += 1;
+      continue;
+    }
+    inventory.set(normalizeRoute(parsed.identity), {
+      key: row.key,
+      status: row.status,
+      label: row.label,
+    });
+  }
+  if (nonRouteRows > 0) {
+    caveats.push(
+      `${nonRouteRows} inventory item(s) are endpoints, forms or auth surfaces rather than ` +
+        `routes. A diff cannot be mapped onto those by this analysis, so they are outside this ` +
+        `denominator.`,
+    );
+  }
+  if (inventory.size === 0) {
+    return empty(
+      'The coverage inventory holds no routes, so a diff cannot be joined to it at all.',
+    );
+  }
+
+  // ── The changed surface ────────────────────────────────────────────────────
+  //
+  // One entry per inventory route the diff reaches, plus one per changed route
+  // the inventory has never heard of. A nested layout reaches everything BELOW
+  // its route, which is what `subtree` means, so it expands.
+  const touched = new Map<string, { paths: Set<string>; subtree: boolean }>();
+  const unseen = new Map<string, { paths: Set<string>; subtree: boolean }>();
+
+  const note = (
+    into: Map<string, { paths: Set<string>; subtree: boolean }>,
+    route: string,
+    path: string,
+    subtree: boolean,
+  ): void => {
+    const held = into.get(route);
+    if (held) {
+      held.paths.add(path);
+      held.subtree = held.subtree || subtree;
+      return;
+    }
+    into.set(route, { paths: new Set([path]), subtree });
+  };
+
+  for (const attribution of meaningful) {
+    for (const source of attribution.routes) {
+      const route = normalizeRoute(source.route);
+      if (source.subtree) {
+        const below = [...inventory.keys()].filter(
+          (candidate) => candidate === route || candidate.startsWith(`${route}/`),
+        );
+        if (below.length === 0) {
+          note(unseen, route, attribution.path, true);
+          continue;
+        }
+        for (const candidate of below) note(touched, candidate, attribution.path, true);
+        continue;
+      }
+      if (inventory.has(route)) note(touched, route, attribution.path, false);
+      else note(unseen, route, attribution.path, false);
+    }
+  }
+
+  const routes: PatchCoverageRoute[] = [];
+  const counts: Record<PatchSurfaceState, number> = {
+    COVERED: 0,
+    ASSERTED_NOT_RUN: 0,
+    UNCOVERED: 0,
+    UNKNOWN: 0,
+    WAIVED: 0,
+    NOT_IN_INVENTORY: 0,
+  };
+
+  for (const [route, hit] of [...touched.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    const item = inventory.get(route)!;
+    const state = PATCH_STATE[item.status];
+    counts[state] += 1;
+    routes.push({
+      route,
+      state,
+      key: item.key,
+      paths: [...hit.paths].sort(),
+      subtree: hit.subtree,
+    });
+  }
+
+  for (const [route, hit] of [...unseen.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    counts.NOT_IN_INVENTORY += 1;
+    routes.push({
+      route,
+      state: 'NOT_IN_INVENTORY',
+      key: null,
+      paths: [...hit.paths].sort(),
+      subtree: hit.subtree,
+    });
+  }
+
+  if (routes.length === 0) {
+    return empty(
+      'None of the changed files resolved to a route, so there is no changed surface to measure.',
+    );
+  }
+
+  // WAIVED leaves the denominator, exactly as it does in the project number.
+  // NOT_IN_INVENTORY is not in it either — not because it is excused, but
+  // because we do not know what it is.
+  const denominator =
+    counts.COVERED + counts.ASSERTED_NOT_RUN + counts.UNCOVERED + counts.UNKNOWN;
+
+  if (counts.NOT_IN_INVENTORY > 0) {
+    caveats.push(
+      `${counts.NOT_IN_INVENTORY} changed route(s) have no inventory row: a route this diff adds, ` +
+        `a route it renames, or an inventory nobody has recomputed. The three leave identical ` +
+        `evidence, so none of them is counted as covered or as a gap.`,
+    );
+  }
+
+  const inventorySha = input.inventoryCommitSha ?? null;
+  const diffSha = input.diffCommitSha ?? null;
+  if (inventorySha && diffSha && inventorySha !== diffSha) {
+    caveats.push(
+      `The inventory was measured at ${inventorySha.slice(0, 7)} and this diff is of ` +
+        `${diffSha.slice(0, 7)}, so a route this change adds or renames is not in it yet.`,
+    );
+  } else if (!inventorySha) {
+    caveats.push(
+      `The inventory records no commit${
+        input.inventoryMeasuredAtIso ? ` (measured ${input.inventoryMeasuredAtIso})` : ''
+      }, so how old it is relative to this diff cannot be stated.`,
+    );
+  }
+
+  return {
+    denominator,
+    covered: counts.COVERED,
+    assertedNotRun: counts.ASSERTED_NOT_RUN,
+    uncovered: counts.UNCOVERED,
+    unknown: counts.UNKNOWN,
+    waived: counts.WAIVED,
+    unrecognised: counts.NOT_IN_INVENTORY,
+    percent: coveragePercent(counts.COVERED, denominator),
+    routes,
+    caveats,
+    measured: true,
   };
 }

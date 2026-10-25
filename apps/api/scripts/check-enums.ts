@@ -81,7 +81,37 @@ const PAIRS: Array<{
     source: 'runners',
     kind: 'union',
   },
+  // Why a result did not run (§4). The run finaliser writes it on every
+  // unattempted test and the pass-rate and coverage denominators are meant to
+  // EXCLUDE two of its four members — so a database value TypeScript does not
+  // know about is a skip that silently counts as evidence about the customer's
+  // application. The TS side is NOT_RUN_KINDS in constants.ts, which is also
+  // what `isNotRunKind` and `parseNotRun` validate against, so this entry
+  // guards the read path as well as the write.
+  { prismaEnum: 'NotRunKind', tsConst: 'NOT_RUN_KINDS' },
 ];
+
+/*
+ * NOT LISTED YET, and the reason is a finding rather than an exemption:
+ *
+ *   { prismaEnum: 'HealState', tsConst: 'HEAL_STATES', source: 'types' }
+ *
+ * `HealState` now HAS a TypeScript mirror (`HEAL_STATES` in
+ * packages/shared/src/types.ts) and the two agree member for member — the
+ * static half of this check passes for it today. What fails is the third
+ * source, the live one: `HealState.SUPERSEDED` was added to schema.prisma by
+ * migration 20261024050000_heal_lifecycle_enum_values and that migration has
+ * not been deployed, so the database does not have the value. `planSupersede`
+ * in packages/agent/src/healer.ts writes SUPERSEDED, which means every
+ * supersede INSERT fails at run time on a database in that state — exactly the
+ * defect this script's docstring describes, and exactly what adding the pair
+ * would report.
+ *
+ * It is left out only because adding it would make this script red for a
+ * reason no code change can fix, and a red check with no available remedy is a
+ * check people start skipping. Run `prisma migrate deploy`, then add the line
+ * above; it should pass immediately.
+ */
 
 function prismaEnumMembers(source: string, name: string): string[] | null {
   const block = new RegExp(`enum\\s+${name}\\s*\\{([^}]*)\\}`).exec(source);

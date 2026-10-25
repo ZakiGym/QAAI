@@ -29,6 +29,17 @@ import { HealCard, appliesImmediately } from '../../components/triage/HealCard';
  * could say nothing about which file was about to be rewritten.
  */
 function confirmBody(heal: Heal): string {
+  /*
+   * A RETIREMENT gets its own sentence and its own second half, because the
+   * other two describe a diff being written and a retirement writes none. This
+   * dialog said "This restructures the test. Apply it? The diff is written to
+   * <path> straight away…" about a proposal whose effect is to switch the test
+   * OFF — every clause of it false, in the one place the product asks for
+   * consent.
+   */
+  if (heal.riskLevel === 'RETIRE') {
+    return `This switches ${heal.test.name} off. It stops running, and it stops covering whatever it covered — the suite will not fail for it again. Its code and history stay in your repository, so you can switch it back on. Retire it?`;
+  }
   const lead =
     heal.riskLevel === 'ASSERTION_CHANGE'
       ? 'This changes what the test asserts. Apply it?'
@@ -258,9 +269,11 @@ function HealQueue({ showAll }: { showAll: boolean }) {
             if (busyId === null) setConfirming(null);
           }}
           onConfirm={() => void submit(confirming, true)}
-          title="Apply this fix?"
+          /* The title and the button say which of the two decisions this is.
+             A retirement is not a fix being applied. */
+          title={confirming.riskLevel === 'RETIRE' ? 'Retire this test?' : 'Apply this fix?'}
           body={confirmBody(confirming)}
-          confirmLabel="Apply fix"
+          confirmLabel={confirming.riskLevel === 'RETIRE' ? 'Retire the test' : 'Apply fix'}
           busy={busyId === confirming.id}
         />
       )}

@@ -542,3 +542,175 @@ describe('the kind table', () => {
     expect(FAILURE_KINDS.filter((k) => k !== 'UNKNOWN' && !covered.has(k))).toEqual([]);
   });
 });
+
+// ─── The cause's identity ────────────────────────────────────────────────────
+
+/**
+ * These notes exist because of a register defect: `signatureOf()` produced a
+ * stable key for a failure CAUSE and the key was stored nowhere, so "is this
+ * the same thing as yesterday" and "which of these is new in this build" had no
+ * answer. The answers now exist (`FailureSignature`), and this is where they
+ * reach the one box a reviewer actually reads.
+ *
+ * What is asserted is the DISTINCTION, not the prose: new / not new / nothing
+ * recorded are three states, and the whole value of the feature is that they
+ * stay three.
+ */
+const CAUSE = {
+  clusterKey: 'abc123abc123',
+  firstSeenAt: new Date(Date.now() - 21 * 86_400_000).toISOString(),
+  lastSeenAt: new Date().toISOString(),
+  runsSeen: 14,
+  newInThisBuild: false,
+  mutedUntil: null,
+  mutedReason: null,
+};
+
+describe('the cause identity in the reliability notes', () => {
+  const signals = (over: Partial<typeof CAUSE> | null): string[] =>
+    (
+      summariseFailure(
+        failure({
+          errorMessage: PW_SELECTOR_MISS,
+          ...(over === null ? {} : { cause: { ...CAUSE, ...over } }),
+        }),
+      )?.notes ?? []
+    ).map((n) => n.signal);
+
+  /*
+   * ABSENT IS A THIRD STATE. A run from before this feature existed has no
+   * identity, and asserting "not new" about it would be inventing a fact — the
+   * same mistake `classified: false` exists to prevent one layer up.
+   */
+  it('says nothing when no identity was recorded', () => {
+    expect(signals(null)).toEqual([]);
+  });
+
+  it('calls out a cause that is new in this build', () => {
+    const summary = summariseFailure(
+      failure({ errorMessage: PW_SELECTOR_MISS, cause: { ...CAUSE, newInThisBuild: true } }),
+    );
+    const note = summary!.notes.find((n) => n.signal === 'CAUSE_NEW_IN_BUILD')!;
+    expect(note.sentence).toMatch(/new in this build/);
+    expect(note.sentence).toMatch(/Whatever changed here is the first place to look/);
+    expect(signals({ newInThisBuild: true })).not.toContain('CAUSE_SEEN_BEFORE');
+  });
+
+  /*
+   * And the opposite sentence has to be just as explicit, because it is the one
+   * that stops a reviewer blaming the commit under test for a three-week-old
+   * breakage.
+   */
+  it('says a recurring cause is not new, with its age and run count', () => {
+    const summary = summariseFailure(failure({ errorMessage: PW_SELECTOR_MISS, cause: CAUSE }));
+    const note = summary!.notes.find((n) => n.signal === 'CAUSE_SEEN_BEFORE')!;
+    expect(note.sentence).toMatch(/not new/);
+    expect(note.sentence).toMatch(/14 runs/);
+    expect(note.sentence).toMatch(/21 days ago/);
+    expect(note.sentence).toMatch(/unlikely to be what introduced it/);
+  });
+
+  it('never claims a cause is flaky just because it is old or new', () => {
+    for (const newInBuild of [true, false]) {
+      const summary = summariseFailure(
+        failure({ errorMessage: PW_SELECTOR_MISS, cause: { ...CAUSE, newInThisBuild: newInBuild } }),
+      );
+      const causeNotes = summary!.notes.filter((n) => n.signal.startsWith('CAUSE_'));
+      expect(causeNotes.length).toBeGreaterThan(0);
+      expect(causeNotes.every((n) => n.looksFlaky === false)).toBe(true);
+    }
+  });
+
+  it('keeps the test-level signals alongside the cause-level ones', () => {
+    expect(
+      signals({ newInThisBuild: true }).length,
+    ).toBeGreaterThan(0);
+    const both = summariseFailure(
+      failure({
+        errorMessage: PW_SELECTOR_MISS,
+        retriedAndPassed: true,
+        previousOutcome: 'PASSED',
+        cause: CAUSE,
+      }),
+    );
+    // A test can be failing for the first time while the CAUSE behind it has
+    // been breaking other tests for three weeks. Both are said.
+    expect(both!.notes.map((n) => n.signal)).toEqual([
+      'RETRIED_AND_PASSED',
+      'NEW_SINCE_LAST_RUN',
+      'CAUSE_SEEN_BEFORE',
+    ]);
+  });
+
+  it('reports a live mute as recorded, counted and not paging', () => {
+    const summary = summariseFailure(
+      failure({
+        errorMessage: PW_SELECTOR_MISS,
+        cause: {
+          ...CAUSE,
+          mutedUntil: new Date(Date.now() + 86_400_000).toISOString(),
+          mutedReason: 'known issue, fix lands next sprint',
+        },
+      }),
+    );
+    const note = summary!.notes.find((n) => n.signal === 'CAUSE_MUTED')!;
+    expect(note.sentence).toMatch(/muted until/);
+    expect(note.sentence).toMatch(/known issue, fix lands next sprint/);
+    expect(note.sentence).toMatch(/still recorded and counted/);
+    expect(note.sentence).toMatch(/not minting verdicts or paging anyone/);
+  });
+
+  /*
+   * AN EXPIRED MUTE IS NOT SILENT. "Muted until last Tuesday" is exactly the
+   * state somebody has to decide about, and a box that mentioned a mute only
+   * while it was live would make every lapsed mute invisible at the moment it
+   * started mattering again.
+   */
+  it('reports an expired mute as expired, and says the cause is loud again', () => {
+    const summary = summariseFailure(
+      failure({
+        errorMessage: PW_SELECTOR_MISS,
+        cause: {
+          ...CAUSE,
+          mutedUntil: new Date(Date.now() - 86_400_000).toISOString(),
+          mutedReason: 'was known',
+        },
+      }),
+    );
+    const note = summary!.notes.find((n) => n.signal === 'CAUSE_MUTED')!;
+    expect(note.sentence).toMatch(/mute on this cause expired/);
+    expect(note.sentence).toMatch(/minting verdicts again/);
+  });
+
+  it('says "earlier today" rather than "0 days ago"', () => {
+    const summary = summariseFailure(
+      failure({
+        errorMessage: PW_SELECTOR_MISS,
+        cause: { ...CAUSE, firstSeenAt: new Date().toISOString() },
+      }),
+    );
+    expect(summary!.notes.find((n) => n.signal === 'CAUSE_SEEN_BEFORE')!.sentence).toMatch(
+      /earlier today/,
+    );
+  });
+
+  it('omits the age rather than printing NaN when the date is unusable', () => {
+    const summary = summariseFailure(
+      failure({ errorMessage: PW_SELECTOR_MISS, cause: { ...CAUSE, firstSeenAt: 'not a date' } }),
+    );
+    const sentence = summary!.notes.find((n) => n.signal === 'CAUSE_SEEN_BEFORE')!.sentence;
+    expect(sentence).not.toMatch(/NaN/);
+    expect(sentence).toMatch(/14 runs\./);
+  });
+
+  it('does not disturb the kind, the headline or the next action', () => {
+    const bare = summariseFailure(failure({ errorMessage: PW_SELECTOR_MISS }))!;
+    const withCause = summariseFailure(
+      failure({ errorMessage: PW_SELECTOR_MISS, cause: CAUSE }),
+    )!;
+    expect(withCause.kind).toBe(bare.kind);
+    expect(withCause.headline).toBe(bare.headline);
+    expect(withCause.nextAction).toBe(bare.nextAction);
+    expect(withCause.classified).toBe(bare.classified);
+  });
+});

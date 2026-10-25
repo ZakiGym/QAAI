@@ -15,12 +15,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AUTO_QUARANTINE_REASON_PREFIX,
+  FIXTURE_PREFIX,
   FLAKE_AUDIT_ACTIONS,
   FLAKE_POLICY_DEFAULTS,
   PLAN_LIMITS,
   resolveFlakePolicy,
 } from '@qaai/shared';
 import type { FlakePolicy, TestResultStatus } from '@qaai/shared';
+import { verificationRunTag } from '@qaai/agent';
 import type { FlakeSample } from './flake.js';
 
 // The worker's context opens Postgres and Redis at import time, so it is
@@ -45,7 +47,9 @@ vi.mock('../queues.js', () => ({
 
 const {
   decideFlakeAction,
+  deflakeSweep,
   describeMeasurement,
+  driftSweep,
   findSuspects,
   investigationTag,
   isMachineQuarantine,
@@ -53,6 +57,9 @@ const {
   parseInvestigationTag,
   processFlakeTick,
   pruneFlakeHistory,
+  verifyAppliedHeals,
+  HEAL_AUDIT_ACTIONS,
+  HEAL_VERIFY_DEADLINE_MINUTES,
 } = await import('./flake.js');
 
 type Measurement = ReturnType<typeof measureSamples>;
@@ -1208,5 +1215,856 @@ describe('flake-history retention', () => {
     // flakes in order to tidy up a table would be trading the product for the
     // housekeeping.
     expect(calls.updated.some((u) => u.data.quarantined === true)).toBe(true);
+  });
+});
+
+describe('a run QAAI started itself never makes its own test a suspect', () => {
+  /*
+   * Through the sweep, not through `findSuspects` directly — the question is
+   * whether the QUERY MAPPING marks these rows, and a test that computed
+   * `fromConfirmationRun` itself would pass however that mapping was written.
+   * (It did, until this was rewritten: the mutation that dropped the
+   * verification arm from the mapping left every assertion green.)
+   */
+  const scenarioFor = (triggeredBy: string | null) => ({
+    tests: { 'test-1': testRow() },
+    suspectRows: [
+      {
+        testId: 'test-1',
+        orgId: 'org-1',
+        status: 'PASSED',
+        retriedAndPassed: true,
+        run: { projectId: 'proj-1', environmentId: 'env-1', triggeredBy },
+      },
+    ],
+  });
+
+  it('opens an investigation from a run of the customer\u2019s own suite', async () => {
+    const { prisma, calls } = fakePrisma(scenarioFor('user_42'));
+    h.prisma = prisma;
+    await processFlakeTick({ at: new Date().toISOString() });
+    expect(calls.created).toHaveLength(1);
+  });
+
+  it('ignores a flake investigation\u2019s own confirmation runs', async () => {
+    const { prisma, calls } = fakePrisma(scenarioFor(investigationTag('test-1', 'inv98765')));
+    h.prisma = prisma;
+    await processFlakeTick({ at: new Date().toISOString() });
+    expect(calls.created).toEqual([]);
+  });
+
+  it('ignores a heal verification run', async () => {
+    /*
+     * THE HOLE: a verification runs ONE test, on purpose, right after that
+     * test's code changed. A verification that fails is exactly the "it passed
+     * and failed across recent runs" pattern the suspect scan reads as
+     * instability — so every applied heal that did not work would open a flake
+     * investigation about a test we already know is broken, and spend ten more
+     * runs confirming it.
+     */
+    const { prisma, calls } = fakePrisma(scenarioFor(verificationRunTag('heal-1')));
+    h.prisma = prisma;
+    await processFlakeTick({ at: new Date().toISOString() });
+    expect(calls.created).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The three sweeps that turn a flake into a fix: heal verification, deflake
+// proposals, and the drift check.
+//
+// A separate stand-in from the one above, deliberately. These sweeps read
+// different tables, and widening the investigation fake until it served both
+// would have made every existing case above depend on rows it does not care
+// about — which is how a fake starts passing tests for the wrong reason.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The shape of a Prisma argument object in these stand-ins. */
+type Row = Record<string, any>;
+
+const HEAL_CODE = [
+  "import { test, expect } from '@playwright/test';",
+  '',
+  "test('checkout completes', async ({ page }) => {",
+  "  await page.goto('/checkout');",
+  '  await page.waitForTimeout(500);',
+  "  await page.getByRole('button', { name: 'Pay' }).click();",
+  "  await expect(page.getByTestId('receipt')).toBeVisible();",
+  '});',
+  '',
+].join('\n');
+
+/** A diff that applies to HEAL_CODE. */
+const HEAL_DIFF = [
+  '--- a/tests/checkout.spec.ts',
+  '+++ b/tests/checkout.spec.ts',
+  '@@ -7,1 +7,1 @@',
+  "-  await expect(page.getByTestId('receipt')).toBeVisible();",
+  "+  await expect(page.getByTestId('order-receipt')).toBeVisible();",
+].join('\n');
+
+interface HealScenario {
+  pendingHeals?: Row[];
+  /** Keyed by run id. */
+  runs?: Record<string, { status: string; results: Row[] }>;
+  versions?: Array<{ version: number; code: string }>;
+  flakeVerdicts?: Row[];
+  tests?: Record<string, Row>;
+  /** Open proposals `openHealsFor` returns. */
+  openHeals?: Row[];
+  audits?: AuditRow[];
+  crawls?: Row[];
+  projectTests?: Row[];
+  coverageItems?: Array<{ key: string; origin: string; retiredAt: Date | null }>;
+}
+
+function fakeHealPrisma(scenario: HealScenario) {
+  const audits = scenario.audits ?? [];
+  const calls = {
+    audits,
+    healCreates: [] as Row[],
+    healUpdates: [] as Row[],
+    healUpdateMany: [] as Row[],
+    testUpdates: [] as Row[],
+    runsCancelled: [] as Row[],
+    transactions: [] as number[],
+    /** The arguments the route-item read was made with. See the ORDER BY test. */
+    coverageQueries: [] as Row[],
+  };
+
+  const prisma = {
+    healProposal: {
+      findMany: async (args: Row) =>
+        args.where?.verifyState === 'PENDING'
+          ? (scenario.pendingHeals ?? [])
+          : (scenario.openHeals ?? []),
+      create: async (args: Row) => {
+        calls.healCreates.push(args.data);
+        return args.data;
+      },
+      update: async (args: Row) => {
+        calls.healUpdates.push(args);
+        return {};
+      },
+      updateMany: async (args: Row) => {
+        calls.healUpdateMany.push(args);
+        return { count: (args.where?.id?.in ?? []).length };
+      },
+    },
+    testVersion: {
+      findFirst: async (args: Row) => {
+        const all = scenario.versions ?? [];
+        if (args.where?.version !== undefined) {
+          return all.find((v) => v.version === args.where.version) ?? null;
+        }
+        return [...all].sort((a, b) => b.version - a.version)[0] ?? null;
+      },
+    },
+    test: {
+      findFirst: async (args: Row) => scenario.tests?.[args.where.id] ?? null,
+      // `take` honoured here too, so the test-scan cap can be seen to bite.
+      findMany: async (args: Row = {}) => {
+        const all = scenario.projectTests ?? [];
+        return typeof args.take === 'number' ? all.slice(0, args.take) : all;
+      },
+      update: async (args: Row) => {
+        calls.testUpdates.push(args);
+        return {};
+      },
+    },
+    run: {
+      findMany: async () => [],
+      findFirst: async (args: Row) => {
+        const run = scenario.runs?.[args.where.id];
+        return run ? { id: args.where.id, ...run } : null;
+      },
+      updateMany: async (args: Row) => {
+        calls.runsCancelled.push(args);
+        return { count: 1 };
+      },
+    },
+    triageVerdict: { findMany: async () => scenario.flakeVerdicts ?? [] },
+    /*
+     * The investigation half of the tick, answered with nothing. Present so the
+     * one test that goes through `processFlakeTick` reaches the sweeps below
+     * rather than dying on a missing stand-in — and absent from the per-sweep
+     * tests, which call their sweep directly.
+     */
+    testResult: { findMany: async () => [], findFirst: async () => null },
+    testFlakeHistory: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
+    flowMap: { findMany: async () => scenario.crawls ?? [] },
+    coverageItem: {
+      count: async () =>
+        (scenario.coverageItems ?? []).filter((item) => item.origin !== 'CRAWL_ONLY').length,
+      /*
+       * HONOURS `take`, like the database does. A fake that returns every row
+       * however small the `take` is cannot show a cap biting — and the cap on
+       * this query is the authority for one of the two independent negatives a
+       * retirement rests on, so "the fake ignored the cap" is the difference
+       * between a test that proves the fence and one that cannot see it.
+       */
+      findMany: async (args: Row = {}) => {
+        calls.coverageQueries.push(args);
+        const all = [...(scenario.coverageItems ?? [])].sort((a, b) => a.key.localeCompare(b.key));
+        return typeof args.take === 'number' ? all.slice(0, args.take) : all;
+      },
+    },
+    auditLog: {
+      findFirst: async ({ where }: { where: Record<string, any> }) => {
+        const action = where.action as { in?: string[] } | string | undefined;
+        const wanted =
+          typeof action === 'string' ? [action] : Array.isArray(action?.in) ? action.in : null;
+        return (
+          audits.find((row) => {
+            if (where.targetId && row.targetId !== where.targetId) return false;
+            if (where.targetType && row.targetType !== where.targetType) return false;
+            if (wanted && !wanted.includes(row.action)) return false;
+            const createdAt = where.createdAt as { gte?: Date } | undefined;
+            if (createdAt?.gte && row.createdAt < createdAt.gte) return false;
+            return true;
+          }) ?? null
+        );
+      },
+      create: async ({ data }: { data: Omit<AuditRow, 'createdAt'> }) => {
+        const row = { ...data, createdAt: new Date() };
+        audits.push(row);
+        return row;
+      },
+    },
+    $transaction: async (ops: Promise<unknown>[]) => {
+      calls.transactions.push(ops.length);
+      return Promise.all(ops);
+    },
+  };
+
+  return { prisma, calls };
+}
+
+const pendingHeal = (over: Row = {}): Row => ({
+  id: 'heal-1',
+  orgId: 'org-1',
+  testId: 'test-1',
+  state: 'APPLIED',
+  verifyRunId: 'run-verify-1',
+  appliedVersion: 4,
+  decidedAt: new Date(Date.now() - 10 * 60_000),
+  createdAt: new Date(Date.now() - 20 * 60_000),
+  ...over,
+});
+
+describe('verifying a heal that was applied', () => {
+  it('records VERIFIED when the test passed, and changes no code', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal()],
+      runs: {
+        'run-verify-1': {
+          status: 'PASSED',
+          results: [{ status: 'PASSED', retriedAndPassed: false }],
+        },
+      },
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.healUpdates[0]!.data.verifyState).toBe('VERIFIED');
+    expect(calls.testUpdates).toEqual([]);
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.verified);
+  });
+
+  it('does NOT revert a heal a person approved, and leaves the test red', async () => {
+    // Silently rolling back an approved change is its own surprise. Nothing is
+    // suppressed: the test is still failing and still gating.
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal({ state: 'APPLIED' })],
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.healUpdates[0]!.data.verifyState).toBe('STILL_FAILING');
+    expect(calls.testUpdates).toEqual([]);
+    expect(String(calls.healUpdates[0]!.data.verifyNote)).toMatch(/a person approved it/);
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.verificationFailed);
+    expect(calls.audits.at(-1)!.metadata.reverted).toBe(false);
+  });
+
+  it('DOES revert an unattended heal that failed verification, by appending a version', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal({ state: 'AUTO_APPLIED' })],
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.testUpdates).toHaveLength(1);
+    const data = calls.testUpdates[0]!.data;
+    expect(data.code).toBe('OLD CODE');
+    // Append, never rewind: the history of what QAAI wrote is not ours to edit.
+    expect(data.versions.create.version).toBe(5);
+    expect(data.versions.create.code).toBe('OLD CODE');
+    expect(String(data.versions.create.message)).toMatch(/Reverted an auto-applied heal/);
+    // The proposal keeps AUTO_APPLIED rather than going back in the queue: a fix
+    // we now have evidence does not work must not be re-offered.
+    expect(calls.healUpdates[0]!.data.state).toBeUndefined();
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.reverted);
+    expect(calls.audits.at(-1)!.metadata).toMatchObject({ reverted: true, revertedToVersion: 3 });
+    // Both halves in one transaction: a revert whose audit row failed to write
+    // is a change to the customer's test nobody can explain.
+    expect(calls.transactions).toEqual([3]);
+  });
+
+  it('refuses to revert when the version it replaced is not in the history', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal({ state: 'AUTO_APPLIED' })],
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [{ version: 4, code: 'HEALED CODE' }],
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.testUpdates).toEqual([]);
+    expect(String(calls.healUpdates[0]!.data.verifyNote)).toMatch(/could NOT be reverted/);
+    expect(calls.audits.at(-1)!.metadata.reverted).toBe(false);
+  });
+
+  it('calls it UNVERIFIABLE when the verifying run is gone', async () => {
+    const { prisma, calls } = fakeHealPrisma({ pendingHeals: [pendingHeal()], runs: {} });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.healUpdates[0]!.data.verifyState).toBe('UNVERIFIABLE');
+    expect(String(calls.healUpdates[0]!.data.verifyNote)).toMatch(/has NOT been shown to pass/);
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.unverifiable);
+    expect(calls.testUpdates).toEqual([]);
+  });
+
+  it('waits while the run is still in flight, and claims nothing', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal()],
+      runs: { 'run-verify-1': { status: 'RUNNING', results: [] } },
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.healUpdates).toEqual([]);
+    expect(calls.audits).toEqual([]);
+  });
+
+  it('gives up on a run past the deadline, cancels it, and says nobody checked', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [
+        pendingHeal({
+          decidedAt: new Date(Date.now() - (HEAL_VERIFY_DEADLINE_MINUTES + 10) * 60_000),
+        }),
+      ],
+      runs: { 'run-verify-1': { status: 'QUEUED', results: [] } },
+    });
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.runsCancelled).toHaveLength(1);
+    expect(calls.healUpdates[0]!.data.verifyState).toBe('UNVERIFIABLE');
+    expect(String(calls.healUpdates[0]!.data.verifyNote)).toMatch(/did not finish within 90/);
+  });
+
+  it('one bad row does not stop the sweep for every other org', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      pendingHeals: [pendingHeal({ id: 'heal-bad' }), pendingHeal({ id: 'heal-good' })],
+      runs: {
+        'run-verify-1': {
+          status: 'PASSED',
+          results: [{ status: 'PASSED', retriedAndPassed: false }],
+        },
+      },
+    });
+    let first = true;
+    (prisma.run as unknown as { findFirst: (a: Row) => Promise<unknown> }).findFirst = async (
+      args: Row,
+    ) => {
+      if (first) {
+        first = false;
+        throw new Error('connection reset');
+      }
+      return args.where.id === 'run-verify-1'
+        ? { id: args.where.id, status: 'PASSED', results: [{ status: 'PASSED', retriedAndPassed: false }] }
+        : null;
+    };
+    h.prisma = prisma;
+
+    await verifyAppliedHeals(new Date());
+
+    expect(calls.healUpdates).toHaveLength(1);
+    expect(calls.audits.at(-1)!.targetId).toBe('heal-good');
+  });
+});
+
+describe('turning a FLAKE verdict into a repair', () => {
+  const verdictRow = (over: Row = {}): Row => ({
+    id: 'verdict-1',
+    orgId: 'org-1',
+    explanation: 'the step timed out once and passed on retry',
+    testResult: { testId: 'test-1', errorMessage: 'Timeout 5000ms exceeded' },
+    ...over,
+  });
+
+  const healTestRow = (over: Row = {}): Row => ({
+    id: 'test-1',
+    name: 'checkout completes',
+    filePath: 'tests/checkout.spec.ts',
+    code: HEAL_CODE,
+    disabledAt: null,
+    projectId: 'proj-1',
+    ...over,
+  });
+
+  it('proposes the deterministic fix and records how it was derived', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      flakeVerdicts: [verdictRow()],
+      tests: { 'test-1': healTestRow() },
+    });
+    h.prisma = prisma;
+
+    await deflakeSweep(new Date());
+
+    expect(calls.healCreates).toHaveLength(1);
+    const proposal = calls.healCreates[0]!;
+    // STRUCTURAL, never SELECTOR_ONLY: an unattended rewrite of how a test waits
+    // is a bigger claim than an unattended rename of a button.
+    expect(proposal.riskLevel).toBe('STRUCTURAL');
+    expect(proposal.diff).toContain('waitForTimeout');
+    expect(proposal.verdictId).toBe('verdict-1');
+    expect(proposal.evidence.kind).toBe('DEFLAKE');
+    expect(proposal.evidence.findings[0].kind).toBe('FIXED_SLEEP');
+    // The never-weaken arithmetic rides along as evidence, not as a promise.
+    expect(proposal.evidence.assertionsAfter).toBeGreaterThan(
+      proposal.evidence.assertionsBefore as number,
+    );
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.deflakeProposed);
+  });
+
+  it('records an honest refusal, and no proposal, when it has no automatic fix', async () => {
+    // A proposal with an empty diff is a review-queue row with a dead Approve
+    // button. The finding still has to be somewhere, so it is in the audit log.
+    const { prisma, calls } = fakeHealPrisma({
+      flakeVerdicts: [verdictRow()],
+      tests: {
+        'test-1': healTestRow({
+          code: [
+            "import { test, expect } from '@playwright/test';",
+            "test('clean', async ({ page }) => {",
+            "  await page.goto('/checkout');",
+            "  await expect(page.getByTestId('total')).toHaveText('$42.00');",
+            '});',
+          ].join('\n'),
+        }),
+      },
+    });
+    h.prisma = prisma;
+
+    await deflakeSweep(new Date());
+
+    expect(calls.healCreates).toEqual([]);
+    const audit = calls.audits.at(-1)!;
+    expect(audit.action).toBe(HEAL_AUDIT_ACTIONS.deflakeUnfixable);
+    expect(String(audit.metadata.reason)).toMatch(/somewhere QAAI cannot see/);
+  });
+
+  it('does not mint a second proposal while an open one still applies', async () => {
+    // THE DEFECT: the guard was per TestResult, so one permanently flaky test
+    // minted a fresh proposal every run and filled the queue by itself.
+    const { prisma, calls } = fakeHealPrisma({
+      flakeVerdicts: [verdictRow()],
+      tests: { 'test-1': healTestRow() },
+      openHeals: [
+        {
+          id: 'open-1',
+          state: 'PROPOSED',
+          riskLevel: 'SELECTOR_ONLY',
+          diff: HEAL_DIFF,
+          createdAt: new Date(),
+        },
+      ],
+    });
+    h.prisma = prisma;
+
+    await deflakeSweep(new Date());
+
+    expect(calls.healCreates).toEqual([]);
+    expect(calls.audits).toEqual([]);
+  });
+
+  it('supersedes an open proposal that no longer applies, and nothing else', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      flakeVerdicts: [verdictRow()],
+      tests: { 'test-1': healTestRow() },
+      openHeals: [
+        {
+          id: 'stale-1',
+          state: 'PROPOSED',
+          riskLevel: 'SELECTOR_ONLY',
+          diff: [
+            '--- a/tests/checkout.spec.ts',
+            '+++ b/tests/checkout.spec.ts',
+            '@@ -7,1 +7,1 @@',
+            "-  await expect(page.getByTestId('gone')).toBeVisible();",
+            "+  await expect(page.getByTestId('other')).toBeVisible();",
+          ].join('\n'),
+          createdAt: new Date(),
+        },
+      ],
+    });
+    h.prisma = prisma;
+
+    await deflakeSweep(new Date());
+
+    expect(calls.healCreates).toHaveLength(1);
+    expect(calls.healUpdateMany[0]!.where.id.in).toEqual(['stale-1']);
+    expect(calls.healUpdateMany[0]!.data.state).toBe('SUPERSEDED');
+    expect(calls.healUpdateMany[0]!.data.supersededById).toBe(calls.healCreates[0]!.id);
+  });
+
+  it('respects the cooldown, so an unfixable flake is not re-analysed every tick', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      flakeVerdicts: [verdictRow()],
+      tests: { 'test-1': healTestRow() },
+      audits: [
+        {
+          orgId: 'org-1',
+          action: HEAL_AUDIT_ACTIONS.deflakeUnfixable,
+          targetType: 'Test',
+          targetId: 'test-1',
+          metadata: {},
+          createdAt: new Date(),
+        },
+      ],
+    });
+    h.prisma = prisma;
+
+    await deflakeSweep(new Date());
+
+    expect(calls.healCreates).toEqual([]);
+    expect(calls.audits).toHaveLength(1);
+  });
+
+  it('never deflakes a fixture or a disabled test', async () => {
+    for (const over of [{ filePath: `${FIXTURE_PREFIX}data.json` }, { disabledAt: new Date() }]) {
+      const { prisma, calls } = fakeHealPrisma({
+        flakeVerdicts: [verdictRow()],
+        tests: { 'test-1': healTestRow(over) },
+      });
+      h.prisma = prisma;
+      await deflakeSweep(new Date());
+      expect(calls.healCreates).toEqual([]);
+    }
+  });
+});
+
+describe('the drift check and retirement proposals', () => {
+  const crawlRow = (nodes: unknown[], truncatedReason: string | null = null): Row => ({
+    id: 'flowmap-1',
+    orgId: 'org-1',
+    projectId: 'proj-1',
+    version: 9,
+    graph: { baseUrl: 'https://app.test', nodes, exploredAt: '2026-10-24T00:00:00.000Z' },
+    truncatedReason,
+  });
+
+  const projectTest = (over: Row = {}): Row => ({
+    id: 'test-1',
+    name: 'checkout completes',
+    filePath: 'tests/checkout.spec.ts',
+    type: 'E2E',
+    priority: 'IMPORTANT',
+    feature: 'checkout',
+    tags: [],
+    code: HEAL_CODE,
+    spec: null,
+    flakeRate: 0,
+    quarantined: false,
+    consecutiveFailures: 0,
+    ...over,
+  });
+
+  const ordersNode = {
+    id: 'n1',
+    route: '/orders',
+    url: 'https://app.test/orders',
+    title: 'Orders',
+    stateKey: 'default',
+    requiresRoles: [],
+    behindAuth: false,
+    forms: [],
+    affordances: [],
+    screenshotKey: null,
+    a11yViolationCount: 0,
+  };
+
+  it('proposes retiring a test whose route is gone from the code and the crawl', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toHaveLength(1);
+    const proposal = calls.healCreates[0]!;
+    expect(proposal.riskLevel).toBe('RETIRE');
+    // No diff, on purpose: a retirement is not a patch.
+    expect(proposal.diff).toBe('');
+    expect(proposal.evidence.kind).toBe('RETIREMENT');
+    expect(String(proposal.explanation)).toMatch(/DISABLES the test/);
+    expect(calls.audits.map((row) => row.action)).toEqual([
+      HEAL_AUDIT_ACTIONS.retirementProposed,
+      HEAL_AUDIT_ACTIONS.driftChecked,
+    ]);
+  });
+
+  it('proposes nothing from a truncated crawl, and still records the check', async () => {
+    // "Past where the crawl stopped" and "not there" are indistinguishable from
+    // inside a truncated crawl. The audit row is still written, so the check is
+    // not repeated every five minutes for ever.
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode], 'page budget exhausted')],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    const audit = calls.audits.at(-1)!;
+    expect(audit.action).toBe(HEAL_AUDIT_ACTIONS.driftChecked);
+    expect(audit.metadata.summary).toMatchObject({ OBSOLETE: 0, UNMEASURED: 1 });
+    expect(String((audit.metadata.caveats as string[]).join(' '))).toMatch(/stopped early/);
+  });
+
+  it('proposes nothing when no source analysis has run', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      // Crawl-only items: nothing has read the code, so "not declared" is the
+      // absence of a detector rather than a fact.
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'CRAWL_ONLY', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    expect(String((calls.audits.at(-1)!.metadata.caveats as string[]).join(' '))).toMatch(
+      /No source analysis/,
+    );
+  });
+
+  it('warns about drift without proposing anything, before the test fails', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [
+        crawlRow([
+          {
+            ...ordersNode,
+            route: '/checkout',
+            affordances: [
+              {
+                label: 'Place order',
+                kind: 'button',
+                selector: { strategy: 'ROLE', value: 'button', name: 'Place order', confidence: 0.9 },
+              },
+            ],
+          },
+        ]),
+      ],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/checkout', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    const audit = calls.audits.at(-1)!;
+    expect(audit.metadata.summary).toMatchObject({ DRIFTED: 1 });
+    const warnings = audit.metadata.warnings as Array<{ missing: Array<{ locator: string }> }>;
+    expect(warnings[0]!.missing[0]!.locator).toBe('role=button[pay]');
+  });
+
+  it('runs once per crawl, however often the tick fires', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+    const after = calls.audits.length;
+    await driftSweep();
+
+    expect(calls.audits).toHaveLength(after);
+  });
+
+  it('never compares a fixture', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest({ filePath: `${FIXTURE_PREFIX}users.json` })],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    expect(calls.audits.at(-1)!.metadata.testsCompared).toBe(0);
+  });
+
+  it('is reached by the tick', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    expect(calls.audits.some((row) => row.action === HEAL_AUDIT_ACTIONS.driftChecked)).toBe(true);
+  });
+
+  /*
+   * ── THE CAP THAT COULD MANUFACTURE A RETIREMENT ───────────────────────────
+   *
+   * The declared-route list is the authority for ONE OF THE TWO independent
+   * negatives behind an OBSOLETE verdict, and it was read with a bare
+   * `take: 2000`. On a project with more route items than that, a route the
+   * source DOES declare does not come back, arrives at `obsolete.ts` as
+   * `declared: false` — precisely the negative a retirement needs — and the cap
+   * proposes switching off a test whose page is perfectly fine. The crawl side
+   * has been fenced since the feature was written; this is the other side.
+   */
+  const routeItems = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      key: `ROUTE:/filler-${String(i).padStart(4, '0')}`,
+      origin: 'BOTH',
+      retiredAt: null,
+    }));
+
+  it('proposes nothing when the route-item cap bit, and records that it bit', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      // Exactly the scenario of the first test in this block — /checkout absent
+      // from a complete crawl and from the declared routes — plus one route item
+      // too many, which is the only difference.
+      coverageItems: [
+        { key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null },
+        ...routeItems(2_000),
+      ],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    const audit = calls.audits.at(-1)!;
+    expect(audit.action).toBe(HEAL_AUDIT_ACTIONS.driftChecked);
+    expect(audit.metadata.summary).toMatchObject({ OBSOLETE: 0, UNMEASURED: 1 });
+    // The disclosure: a count with a "more exist" flag beside it, not a bare
+    // number that reads as the whole table.
+    expect(audit.metadata.routeItemsTruncated).toBe(true);
+    expect(audit.metadata.routesCompared).toBe(2_000);
+    expect(audit.metadata.routeItemScanLimit).toBe(2_000);
+    expect(String((audit.metadata.caveats as string[]).join(' '))).toMatch(
+      /capped before it reached this comparison/,
+    );
+  });
+
+  it('reads the route items in a defined order, so two readers cannot disagree', async () => {
+    // Without an ORDER BY, Postgres returns whichever 2,000 rows it likes, so
+    // this sweep and GET /agent/projects/:id/drift can be handed different
+    // subsets of one table and reach different verdicts about one test — the
+    // screen and the queue disagreeing, which is what sharing the analysis is
+    // supposed to make impossible.
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.coverageQueries).toHaveLength(1);
+    expect(calls.coverageQueries[0]!.orderBy).toEqual({ key: 'asc' });
+    // Read one over the cap on purpose: "there are more" has to be a fact, not
+    // an inference from a full page.
+    expect(calls.coverageQueries[0]!.take).toBe(2_001);
+  });
+
+  it('discloses the test-scan cap instead of reporting a page as the whole suite', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: Array.from({ length: 501 }, (_, i) => projectTest({ id: `test-${i}` })),
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    const audit = calls.audits.at(-1)!;
+    expect(audit.metadata.testsCompared).toBe(500);
+    expect(audit.metadata.testsTruncated).toBe(true);
+    expect(audit.metadata.testScanLimit).toBe(500);
+  });
+
+  it('records both caps as not having bitten on an ordinary project', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [crawlRow([ordersNode])],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    const audit = calls.audits.at(-1)!;
+    expect(audit.metadata.testsTruncated).toBe(false);
+    expect(audit.metadata.routeItemsTruncated).toBe(false);
+    expect(audit.metadata.routesCompared).toBe(1);
+    // And the retirement it would have withheld is still proposed, so the fence
+    // is a fence and not a blanket refusal.
+    expect(calls.healCreates).toHaveLength(1);
   });
 });

@@ -5,7 +5,14 @@
 
 import { Queue } from 'bullmq';
 import { QUEUE_NAMES } from '@qaai/shared';
-import type { CopilotJob, GenerateJob, NotifyJob, ShardedRunJob, TriageJob } from '@qaai/shared';
+import type {
+  CopilotJob,
+  ExploreJob,
+  GenerateJob,
+  NotifyJob,
+  ShardedRunJob,
+  TriageJob,
+} from '@qaai/shared';
 // Pure module — types, constants and the search, no Prisma and no Express. That
 // is what makes it importable here; apps/api/src/lib/plan.ts and vault.ts are
 // duplicated instead precisely because they are not.
@@ -45,6 +52,7 @@ export interface AnalyzeSourceJob {
 }
 
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
+const exploreQueue = new Queue(QUEUE_NAMES.explore, { connection });
 const analyzeSourceQueue = new Queue(ANALYZE_SOURCE_QUEUE, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
 const triageQueue = new Queue(QUEUE_NAMES.triage, { connection });
@@ -72,6 +80,35 @@ const BACKGROUND_RUN_PRIORITY = 100;
 
 export async function enqueueGenerate(job: GenerateJob): Promise<void> {
   await generateQueue.add(QUEUE_NAMES.generate, job, { attempts: 2 });
+}
+
+/**
+ * Queue a crawl from inside the worker.
+ *
+ * The only producer today is the closure loop's re-crawl
+ * (processors/close-loop.ts): the denominator it is trying to move is partly
+ * made of what a crawl reached, so a campaign measuring against a six-week-old
+ * FlowMap is closing gaps in an application that has since changed. Until now
+ * the only way to ask for a crawl was POST /projects/:id/explore, which means
+ * a human.
+ *
+ * `attempts: 1`, and the job id pins one crawl per project in flight. Both for
+ * the same reason `enqueueAnalyzeSource` above gives, and the reason is stronger
+ * here: the Explorer WRITES — a FlowMap version and a TestPlan — so a retry does
+ * not re-do the work, it duplicates it, and the customer ends up with two
+ * identical plans to approve and a FlowMap version that moved twice for one
+ * crawl. Everything the processor needs is read fresh from the database, so the
+ * next deliberate crawl is always a better answer than a retry of this one.
+ *
+ * The job id is per PROJECT and not per request, which also means a loop that
+ * asks twice gets one crawl — the belt to close-loop's own `recrawlQueuedAt`
+ * brace.
+ */
+export async function enqueueExplore(job: ExploreJob): Promise<void> {
+  await exploreQueue.add(QUEUE_NAMES.explore, job, {
+    jobId: `explore-${job.projectId}`,
+    attempts: 1,
+  });
 }
 
 /**
@@ -265,5 +302,6 @@ export async function closeProducers(): Promise<void> {
     flakeQueue.close(),
     bisectQueue.close(),
     analyzeSourceQueue.close(),
+    exploreQueue.close(),
   ]);
 }

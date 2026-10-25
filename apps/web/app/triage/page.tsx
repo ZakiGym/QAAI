@@ -10,6 +10,7 @@ import { useProject } from '../../components/shell/ProjectContext';
 import { SECTION_TABS_SLOT_ID } from '../../components/shell/AppShell';
 import { Page, PageHeader, SectionLabel, SkeletonRows } from '../../components/ui/layout';
 import { CauseGroup, busyKey, type Action, type OwnerRow } from '../../components/triage/CauseGroup';
+import { TriageHealth } from '../../components/triage/TriageHealth';
 import {
   groupByCause,
   indexCauses,
@@ -454,6 +455,16 @@ export default function TriagePage() {
       {/* The section strip — VERDICTS / HEALS / QUALITY — is the shell's, and it
           belongs under this page's title, so the shell portals it in here. */}
       <div id={SECTION_TABS_SLOT_ID} />
+
+      {/*
+        How well the machine is doing, and what has been switched off.
+
+        Both are facts about the QUEUE rather than about one verdict, which is
+        why they sit above it and not in the cockpit's per-result rail. Needs a
+        project: `GET /triage/accuracy` and `GET /triage/signatures` are both
+        project-scoped, and guessing one would report another project's numbers.
+      */}
+      {project && <TriageHealth projectId={project.id} />}
 
       {error && (
         <p

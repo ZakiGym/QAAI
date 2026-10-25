@@ -42,10 +42,12 @@ import { FIXTURE_PREFIX, QUEUE_NAMES } from '@qaai/shared';
 import type { Priority, TestType } from '@qaai/shared';
 import {
   analyzeCoverage,
+  gapProvenance,
   planItemForGap,
   type CoverageGap,
   type CoverageReport,
   type CoverageTestInput,
+  type GapProvenance,
 } from '@qaai/agent';
 import {
   routeLiteralsFromCode,
@@ -299,6 +301,88 @@ const GAP_KIND_NAMES = new Set([
 ]);
 
 /**
+ * Record, in the closure ledger, that a human proposed a test for these gaps.
+ *
+ * ── Why the HUMAN path needs this at all ────────────────────────────────────
+ *
+ * The ledger (`GapClosure`) is written by the closure campaign on every tick,
+ * so a gap the AUTOPILOT worked on has a row with a state, a plan item, a test
+ * and a `reopenCount`. A gap a person ticked on the coverage screen had none of
+ * that: the plan item existed, the test eventually existed, and the one table
+ * that answers "did the test we wrote actually close it?" had never heard of
+ * either. The loop the product is sold on had memory for one of its two doors.
+ *
+ * `campaignId` stays null, and that is the field that keeps the two apart: the
+ * column is documented as "the campaign that last worked on it. Null for a gap
+ * recorded by a human clicking propose rather than by the autopilot."
+ *
+ * ── Why it is best-effort, and counted ──────────────────────────────────────
+ *
+ * The plan is already written by the time this runs, and it is the deliverable:
+ * the gaps, the steps read off the crawl and the assertions are all complete
+ * and worth having. Throwing here would 500 a request whose plan exists, and a
+ * retry would mint a second plan for the same gaps. So a failure costs the
+ * MEMORY and not the work — and it is returned to the caller as a number
+ * rather than swallowed, because a ledger that quietly missed three rows is a
+ * ledger that will later report three gaps nobody ever proposed anything for.
+ */
+async function recordProposedClosures(args: {
+  orgId: string;
+  projectId: string;
+  items: ReadonlyArray<{ provenance: GapProvenance; rowId: string }>;
+  now: Date;
+}): Promise<{ recorded: number; failed: number }> {
+  let recorded = 0;
+  let failed = 0;
+  for (const { provenance, rowId } of args.items) {
+    try {
+      /*
+       * Upsert, keyed on (projectId, gapId). A gap seen before — OPEN, or
+       * UNVERIFIABLE from a tick with no readable crawl — keeps its history and
+       * its `reopenCount`; minting a second row would reset exactly the counter
+       * that says "your generator keeps producing a test that does not close
+       * this". Same write the close-loop tick makes, deliberately.
+       */
+      await prisma.gapClosure.upsert({
+        where: { projectId_gapId: { projectId: args.projectId, gapId: provenance.gapId } },
+        create: {
+          orgId: args.orgId,
+          projectId: args.projectId,
+          gapId: provenance.gapId,
+          gapKind: provenance.gapKind,
+          gapTitle: provenance.gapTitle,
+          planItemId: rowId,
+          state: 'PROPOSED',
+          why: `Proposed by hand from the coverage screen at rank score ${provenance.gapScore}. Plan item ${rowId}.`,
+          proposedAt: args.now,
+          lastCheckedAt: args.now,
+        },
+        update: {
+          planItemId: rowId,
+          gapKind: provenance.gapKind,
+          gapTitle: provenance.gapTitle,
+          state: 'PROPOSED',
+          why: `Re-proposed by hand from the coverage screen at rank score ${provenance.gapScore}. Plan item ${rowId}.`,
+          proposedAt: args.now,
+          lastCheckedAt: args.now,
+          /*
+           * `testId` is deliberately NOT cleared, and neither is
+           * `reopenCount`: proposing a gap again does not undo the test that
+           * was written for it last time, and it certainly does not undo the
+           * record of how often this gap has come back.
+           */
+        },
+      });
+      recorded += 1;
+    } catch {
+      // Per gap, so one unwritable row does not cost the others theirs.
+      failed += 1;
+    }
+  }
+  return { recorded, failed };
+}
+
+/**
  * A proposal is a preview, and a preview must never be able to lose the report.
  * If one gap has a shape `planItemForGap` cannot express, the reader still gets
  * every other gap and an explicit null for this one.
@@ -381,6 +465,9 @@ coverageRouter.post(
     const items = selected.map((gap) => ({
       gap,
       rowId: randomUUID(),
+      // The three fields the ledger and the plan item both need, taken off the
+      // gap itself rather than re-derived on either side of the write.
+      provenance: gapProvenance(gap),
       item: planItemForGap(gap),
     }));
 
@@ -397,7 +484,7 @@ coverageRouter.post(
           .slice(0, 50)
           .map((gap) => ({ what: gap.title, why: 'not selected in this request' })),
         items: {
-          create: items.map(({ item, rowId }) => ({
+          create: items.map(({ item, provenance, rowId }) => ({
             id: rowId,
             orgId: actor.orgId,
             title: item.title,
@@ -409,6 +496,23 @@ coverageRouter.post(
             assertions: item.assertions,
             journeyId: item.journeyId,
             authProfileId: item.authProfileId,
+            /*
+             * THE PROVENANCE, which this endpoint computed and threw away.
+             *
+             * It minted the row ids itself and returned
+             * `mapping: [{ gapId, planItemId }]` in the response — so the
+             * answer existed for the length of one request and then nowhere.
+             * QAAI could never afterwards say "this gap is closed by this
+             * test", and, much worse, could never notice that it is NOT: a gap
+             * whose test was written, bound and passed, and which the next
+             * analysis reports again, was indistinguishable from a gap nobody
+             * had ever looked at.
+             *
+             * `gapKind` rides along because `gapId` is a hash of (kind,
+             * subject) and tells a human reading the row nothing.
+             */
+            gapId: provenance.gapId,
+            gapKind: provenance.gapKind,
             /*
              * APPROVED, not PROPOSED. The Explorer proposes cold and a human
              * ticks them on the approval screen; here the ticking already
@@ -426,6 +530,18 @@ coverageRouter.post(
     });
 
     /*
+     * The ledger, written for the human door exactly as the campaign writes it
+     * for the autopilot's. Before the response, so the caller is told how many
+     * rows the memory actually holds.
+     */
+    const ledger = await recordProposedClosures({
+      orgId: actor.orgId,
+      projectId,
+      items,
+      now: new Date(),
+    });
+
+    /*
      * Generation needs a key. Missing one is a MISSING TOOL, not a failure: the
      * deterministic half of this request — the gaps, the steps read off the
      * crawl, the assertions — is already done and already worth having. So the
@@ -439,12 +555,25 @@ coverageRouter.post(
         action: 'coverage.propose',
         targetType: 'TestPlan',
         targetId: plan.id,
-        metadata: { gaps: selected.length, queued: false, reason: 'no ANTHROPIC_API_KEY' },
+        metadata: {
+          gaps: selected.length,
+          queued: false,
+          reason: 'no ANTHROPIC_API_KEY',
+          closuresRecorded: ledger.recorded,
+          closuresFailed: ledger.failed,
+        },
       });
       res.status(200).json({
         testPlanId: plan.id,
         items: plan.items,
         mapping: items.map(({ gap, rowId }) => ({ gapId: gap.id, planItemId: rowId })),
+        /*
+         * The mapping is now STORED as well as returned — on the plan items and
+         * in the closure ledger. It stays on the response because a caller
+         * driving this from CI wants it in the same breath, and because
+         * `closureLedger` says how much of it was durably recorded.
+         */
+        closureLedger: ledger,
         skippedGapIds: missing,
         generation: {
           queued: false,
@@ -474,6 +603,11 @@ coverageRouter.post(
         kinds: [...new Set(selected.map((gap) => gap.kind))],
         flowMapVersion,
         queued: true,
+        // How much of the provenance was durably recorded. A proposal whose
+        // ledger rows did not land is still a proposal, and the audit row is
+        // where somebody later finds out why the gap had no history.
+        closuresRecorded: ledger.recorded,
+        closuresFailed: ledger.failed,
       },
     });
 
@@ -482,6 +616,7 @@ coverageRouter.post(
       testPlanId: plan.id,
       items: plan.items,
       mapping: items.map(({ gap, rowId }) => ({ gapId: gap.id, planItemId: rowId })),
+      closureLedger: ledger,
       skippedGapIds: missing,
       generation: { queued: true },
       fingerprint: report.fingerprint,

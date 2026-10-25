@@ -63,7 +63,7 @@
  */
 
 import { Queue } from 'bullmq';
-import { PLAN_LIMITS, TERMINAL_RUN_STATUSES } from '@qaai/shared';
+import { CLOSURE_CAMPAIGN_STATES, PLAN_LIMITS, TERMINAL_RUN_STATUSES } from '@qaai/shared';
 import type { Plan } from '@qaai/shared';
 import { defaultLocalArtifactRoot } from '@qaai/storage';
 /*
@@ -186,6 +186,62 @@ export const MUTATION_SURVIVOR_RETENTION_DAYS = 90;
  * never correctness.
  */
 const MUTATION_SURVIVOR_PRUNE_LIMIT = 5_000;
+
+/**
+ * How long one run's record of one CAUSE is kept — `RunFailureCluster`.
+ *
+ * ── Why it needs a window at all ────────────────────────────────────────────
+ *
+ * This table grows with (runs × causes per run), which is the mutation-survivor
+ * shape exactly: nothing in this product deletes a `Run` or a `TestResult`, so
+ * the cascade from `FailureSignature` is a cleanup that never fires. Hourly CI
+ * over a suite with a handful of recurring causes writes millions of rows a
+ * year, every one of them saying "cause X appeared in run Y", about runs whose
+ * artifacts this same sweep deleted months earlier.
+ *
+ * ── WHAT THIS MUST NOT TOUCH, and it is the whole point of the number ───────
+ *
+ * `FailureSignature` is NOT pruned on this clock, or on any clock. Its value IS
+ * the long dates: `firstSeenAt` is how "this has been breaking since March"
+ * exists as a fact rather than an impression, and `firstSeenRunId` is what makes
+ * "new in this build" an equality instead of a search. A signature row is one
+ * per CAUSE per project — bounded by how many distinct ways a suite can break,
+ * which is a number that stops growing — so it has none of the growth problem
+ * this prune exists for and all of the value this prune would destroy.
+ *
+ * `runCount`, `occurrenceCount` and `suppressedCount` live on that signature
+ * row and are NOT recomputed from the occurrences, so pruning here does not
+ * move them. What is lost at 90 days is the per-run LIST on a cause's page —
+ * "which runs did this appear in" — for runs older than that, and the summary
+ * counters go on telling the truth about the whole history.
+ *
+ * 90 days, the same number and the same argument as
+ * `MUTATION_SURVIVOR_RETENTION_DAYS` above: this row is a per-run measurement,
+ * and a measurement should not outlive the longest retention any plan buys for
+ * the results it was derived from.
+ */
+export const RUN_FAILURE_CLUSTER_RETENTION_DAYS = 90;
+
+/**
+ * How long a finished closure campaign is kept — `ClosureCampaign`.
+ *
+ * One row per project per day, unbounded, and nothing deletes it. That is
+ * slower growth than the table above and still unbounded: a hundred projects
+ * is 36,500 rows a year describing nights nobody will ask about again.
+ *
+ * 365 rather than 90, deliberately. A campaign row is the only record that an
+ * unattended generator ran against a customer's repo on a given night, what
+ * target it was chasing and why it stopped — which is an audit question, and
+ * audit questions are asked in years. It is also tiny: no diffs, no code, a
+ * dozen numbers and a sentence.
+ *
+ * ONLY TERMINAL CAMPAIGNS. A RUNNING row older than a year is not old data, it
+ * is a campaign that never stopped — a bug in the stop rule, or a worker that
+ * died holding one — and deleting it would destroy the only evidence of that
+ * while making the symptom disappear. Those are kept for ever and reported, in
+ * the same KEEP-on-uncertainty direction the artifact sweep above takes.
+ */
+export const CLOSURE_CAMPAIGN_RETENTION_DAYS = 365;
 
 export const DEFAULT_BATCH_SIZE = envNumber('QAAI_RETENTION_BATCH_SIZE', 500);
 export const DEFAULT_MAX_BATCHES = envNumber('QAAI_RETENTION_MAX_BATCHES', 20);
@@ -1122,6 +1178,187 @@ export async function pruneMutationSurvivors(
   return report;
 }
 
+// ─── Run-failure clusters and closure campaigns ──────────────────────────────
+
+/**
+ * The shape both prunes report, and the reason it is shared.
+ *
+ * Identical to `SurvivorPruneReport` on purpose: three bounded deletes in one
+ * tick that each described themselves differently would be three things an
+ * operator has to learn to read before trusting a dry run.
+ */
+export interface RowPruneReport {
+  /** True only when the job asked AND `QAAI_RETENTION_APPLY` allows. */
+  applied: boolean;
+  requestedApply: boolean;
+  /** The cutoff, as a date, so a log line says what the window resolved to. */
+  olderThan: string;
+  /** Rows past the window this tick identified, capped by the prune limit. */
+  examined: number;
+  /** Rows actually deleted. Zero on a dry run, by construction. */
+  deleted: number;
+  /** The cap was reached, so there is more to do on the next tick. */
+  more: boolean;
+  /**
+   * Rows past the window that were KEPT, and why — not a count of nothing.
+   *
+   * The closure prune skips a campaign that never reached a terminal state, and
+   * a skip reported as zero deletions would be indistinguishable from an empty
+   * table. A stuck campaign is a finding, so it is counted and named.
+   */
+  kept: number;
+  keptBecause: string | null;
+}
+
+/**
+ * Delete `RunFailureCluster` rows past `RUN_FAILURE_CLUSTER_RETENTION_DAYS`.
+ *
+ * Shaped like `pruneMutationSurvivors` down to the dry-run gates: select the
+ * ids OLDEST FIRST, then `deleteMany` over that explicit list, because
+ * `deleteMany` takes no LIMIT in Prisma and a prune that falls behind has to
+ * make progress from the far end rather than nibble at a random slice.
+ *
+ * Nothing here touches `FailureSignature` — see that constant's comment. The FK
+ * points the other way (`RunFailureCluster.signatureId`, cascading from the
+ * signature), so deleting occurrences cannot take a cause's identity with them.
+ */
+export async function pruneRunFailureClusters(
+  opts: { now?: Date; apply?: boolean; limit?: number } = {},
+): Promise<RowPruneReport> {
+  const now = opts.now ?? new Date();
+  const requestedApply = opts.apply === true;
+  const applied = requestedApply && APPLY_ENABLED;
+  const limit = Math.max(1, Math.min(opts.limit ?? MUTATION_SURVIVOR_PRUNE_LIMIT, 50_000));
+  const before = new Date(now.getTime() - RUN_FAILURE_CLUSTER_RETENTION_DAYS * 86_400_000);
+
+  const doomed = await prisma.runFailureCluster.findMany({
+    where: { createdAt: { lt: before } },
+    orderBy: { createdAt: 'asc' },
+    take: limit,
+    select: { id: true },
+  });
+
+  const report: RowPruneReport = {
+    applied,
+    requestedApply,
+    olderThan: before.toISOString().slice(0, 10),
+    examined: doomed.length,
+    deleted: 0,
+    more: doomed.length === limit,
+    kept: 0,
+    keptBecause: null,
+  };
+  if (doomed.length === 0) return report;
+
+  if (!applied) {
+    logger.info(
+      { examined: report.examined, olderThan: report.olderThan, requestedApply },
+      'retention: would prune run failure clusters past their window (dry run)',
+    );
+    return report;
+  }
+
+  const gone = await prisma.runFailureCluster.deleteMany({
+    where: { id: { in: doomed.map((row) => row.id) } },
+  });
+  report.deleted = gone.count;
+  logger.info(
+    { deleted: gone.count, olderThan: report.olderThan },
+    'retention: pruned run failure clusters past their window',
+  );
+  return report;
+}
+
+/**
+ * Delete TERMINAL `ClosureCampaign` rows past `CLOSURE_CAMPAIGN_RETENTION_DAYS`.
+ *
+ * The state filter is the interesting part. `CLOSURE_CAMPAIGN_STATES` has
+ * exactly one non-terminal member — RUNNING — and a RUNNING row a year old is
+ * not old data, it is a campaign that never stopped. Deleting it would hide a
+ * bug in the stop rule by removing the one row that proves it, so those are
+ * kept and COUNTED (`kept` / `keptBecause`), because a skip reported as "0
+ * deleted" reads exactly like an empty table.
+ *
+ * `startedAt` rather than `finishedAt` is the clock: a campaign that stopped
+ * without stamping `finishedAt` is a campaign whose own record is incomplete,
+ * and keying the window on a nullable column would exempt exactly those rows
+ * for ever.
+ */
+export async function pruneClosureCampaigns(
+  opts: { now?: Date; apply?: boolean; limit?: number } = {},
+): Promise<RowPruneReport> {
+  const now = opts.now ?? new Date();
+  const requestedApply = opts.apply === true;
+  const applied = requestedApply && APPLY_ENABLED;
+  const limit = Math.max(1, Math.min(opts.limit ?? MUTATION_SURVIVOR_PRUNE_LIMIT, 50_000));
+  const before = new Date(now.getTime() - CLOSURE_CAMPAIGN_RETENTION_DAYS * 86_400_000);
+
+  // Read past the window WITHOUT the state filter, so the ones being kept can
+  // be counted rather than silently excluded by the query.
+  const candidates = await prisma.closureCampaign.findMany({
+    where: { startedAt: { lt: before } },
+    orderBy: { startedAt: 'asc' },
+    take: limit,
+    select: { id: true, state: true },
+  });
+
+  const stuck = candidates.filter((row) => !isTerminalCampaign(row.state));
+  const doomed = candidates.filter((row) => isTerminalCampaign(row.state));
+
+  const report: RowPruneReport = {
+    applied,
+    requestedApply,
+    olderThan: before.toISOString().slice(0, 10),
+    examined: doomed.length,
+    deleted: 0,
+    more: candidates.length === limit,
+    kept: stuck.length,
+    keptBecause:
+      stuck.length > 0
+        ? `${stuck.length} campaign(s) past the window have never reached a terminal state, which means they never stopped. Kept: the row is the only evidence of that.`
+        : null,
+  };
+
+  if (stuck.length > 0) {
+    logger.warn(
+      { campaigns: stuck.map((row) => row.id), olderThan: report.olderThan },
+      'retention: closure campaigns past their window are still RUNNING; keeping them and not pruning them',
+    );
+  }
+  if (doomed.length === 0) return report;
+
+  if (!applied) {
+    logger.info(
+      { examined: report.examined, olderThan: report.olderThan, requestedApply },
+      'retention: would prune finished closure campaigns past their window (dry run)',
+    );
+    return report;
+  }
+
+  const gone = await prisma.closureCampaign.deleteMany({
+    where: { id: { in: doomed.map((row) => row.id) } },
+  });
+  report.deleted = gone.count;
+  logger.info(
+    { deleted: gone.count, olderThan: report.olderThan },
+    'retention: pruned finished closure campaigns past their window',
+  );
+  return report;
+}
+
+/**
+ * Whether a campaign has stopped.
+ *
+ * Derived from `CLOSURE_CAMPAIGN_STATES` rather than from a hand-written list
+ * of the seven terminal ones, so a ninth state added later is NOT-terminal here
+ * until somebody decides otherwise — which is the direction this module errs in
+ * everywhere else. A string the vocabulary does not contain at all is also
+ * not-terminal: an unrecognised state is not a licence to delete.
+ */
+function isTerminalCampaign(state: string): boolean {
+  return (CLOSURE_CAMPAIGN_STATES as readonly string[]).includes(state) && state !== 'RUNNING';
+}
+
 // ─── Queue wiring ────────────────────────────────────────────────────────────
 
 /**
@@ -1155,6 +1392,29 @@ export async function processRetentionTick(job: RetentionJob): Promise<void> {
    */
   await pruneMutationSurvivors({ apply: job.apply === true }).catch((err: unknown) =>
     logger.warn({ err }, 'retention: could not prune mutation survivors; it will retry next tick'),
+  );
+
+  /*
+   * The same two rules as the survivor prune above, for the same two reasons:
+   * never throw into the tick (the irreversible artifact sweep has already
+   * finished, and a failed housekeeping delete must not make the queue re-run
+   * it), and not org-scoped by `job.orgId` (both windows are global and these
+   * rows carry no plan-dependent expiry, so a per-org pass would prune one
+   * org's slice of a global policy). Each is awaited separately so one failing
+   * does not cost the other its turn.
+   */
+  await pruneRunFailureClusters({ apply: job.apply === true }).catch((err: unknown) =>
+    logger.warn(
+      { err },
+      'retention: could not prune run failure clusters; it will retry next tick',
+    ),
+  );
+
+  await pruneClosureCampaigns({ apply: job.apply === true }).catch((err: unknown) =>
+    logger.warn(
+      { err },
+      'retention: could not prune closure campaigns; it will retry next tick',
+    ),
   );
 }
 

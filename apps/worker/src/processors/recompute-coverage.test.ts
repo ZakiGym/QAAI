@@ -80,6 +80,7 @@ const {
   RECOMPUTE_COVERAGE_QUEUE,
   RECOMPUTE_WINDOW_MS,
   _resetComputeCache,
+  coverageDelta,
   describeSnapshot,
   enqueueRecomputeCoverage,
   processRecomputeCoverage,
@@ -140,8 +141,21 @@ function stubCompute(result?: {
   return { compute, calls };
 }
 
+/**
+ * The default client every test starts from.
+ *
+ * `coverageSnapshot.findFirst` is the delta's one read, and it is stubbed as
+ * "no previous snapshot" here rather than left undefined on purpose: a test
+ * that forgot it would fail with a TypeError about the stub instead of with
+ * whatever it was actually asserting, and the trigger tests below have no
+ * business knowing that the processor reads a snapshot at all.
+ */
+function noPreviousSnapshot(): Record<string, unknown> {
+  return { coverageSnapshot: { findFirst: async () => null } };
+}
+
 beforeEach(() => {
-  h.prisma = {};
+  h.prisma = noPreviousSnapshot();
   h.log = [];
   h.queueAdds = [];
   h.addThrows = null;
@@ -169,6 +183,7 @@ describe('coalescing by project', () => {
     await requestRecompute({ reason: 'crawl', orgId: 'org_1', projectId: 'proj_1' });
     await requestRecompute({ reason: 'tests-changed', orgId: 'org_1', projectId: 'proj_1' });
     h.prisma = {
+      ...noPreviousSnapshot(),
       run: { findFirst: async () => ({ projectId: 'proj_1', commitSha: 'deadbee' }) },
     };
     await requestRecompute({ reason: 'run', orgId: 'org_1', runId: 'run_1' });
@@ -183,6 +198,7 @@ describe('coalescing by project', () => {
 
   it('collapses a 20-shard run onto one job id', async () => {
     h.prisma = {
+      ...noPreviousSnapshot(),
       run: { findFirst: async () => ({ projectId: 'proj_1', commitSha: 'c0ffee1' }) },
     };
     for (let shard = 0; shard < 20; shard += 1) {
@@ -221,6 +237,7 @@ describe('coalescing by project', () => {
 describe('the run trigger', () => {
   it('resolves the project and the commit from the run row', async () => {
     h.prisma = {
+      ...noPreviousSnapshot(),
       run: { findFirst: async () => ({ projectId: 'proj_7', commitSha: 'abc1234' }) },
     };
     const job = await requestRecompute({ reason: 'run', orgId: 'org_1', runId: 'run_9' });
@@ -238,6 +255,7 @@ describe('the run trigger', () => {
   it('reads the run scoped by org — the worker drains every tenant', async () => {
     const seen: Array<Record<string, unknown>> = [];
     h.prisma = {
+      ...noPreviousSnapshot(),
       run: {
         findFirst: async (args: { where: Record<string, unknown> }) => {
           seen.push(args.where);
@@ -250,7 +268,7 @@ describe('the run trigger', () => {
   });
 
   it('skips quietly when the run row is gone, instead of enqueuing a projectless job', async () => {
-    h.prisma = { run: { findFirst: async () => null } };
+    h.prisma = { ...noPreviousSnapshot(), run: { findFirst: async () => null } };
     const job = await requestRecompute({ reason: 'run', orgId: 'org_1', runId: 'run_9' });
     expect(job).toBeNull();
     expect(h.queueAdds).toHaveLength(0);
@@ -271,6 +289,7 @@ describe('requestRecompute never throws', () => {
 
   it('swallows a database failure while resolving a run', async () => {
     h.prisma = {
+      ...noPreviousSnapshot(),
       run: {
         findFirst: async () => {
           throw new Error('connection terminated');
@@ -548,5 +567,126 @@ describe('wiring', () => {
       queue: 'qaai.recompute-coverage',
       name: 'qaai.recompute-coverage',
     });
+  });
+});
+
+// ─── The delta, which is what lets a loop decide it has finished ────────────
+
+/**
+ * These are the tests for the arithmetic the closure loop's stop rule rests on,
+ * and every one of them is a way the loop stops for the wrong reason.
+ *
+ * The expensive mistake is collapsing "not measured" to 0. A loop that settles
+ * on a small delta would then settle immediately on any project with an empty
+ * denominator — null minus null read as zero — and report that it had closed
+ * the gaps on an application it had never been able to see.
+ */
+describe('coverageDelta', () => {
+  it('reports movement between two measurements, signed', () => {
+    expect(coverageDelta(40, 46.5)).toMatchObject({ points: 6.5 });
+    expect(coverageDelta(46.5, 40)).toMatchObject({ points: -6.5 });
+    expect(coverageDelta(40, 40).points).toBe(0);
+    expect(coverageDelta(40, 40).why).toContain('Unchanged');
+  });
+
+  it('never returns 0 for two measurements that do not exist', () => {
+    const delta = coverageDelta(null, null);
+    // The whole point. 0 here is "settled"; null is "there is no number".
+    expect(delta.points).toBeNull();
+    expect(delta.why).toContain('not a delta of zero');
+  });
+
+  it('reports no movement for a first measurement rather than a jump from zero', () => {
+    const delta = coverageDelta(null, 62);
+    expect(delta.points).toBeNull();
+    expect(delta.why).toContain('First measurement');
+    // Specifically NOT +62: nothing improved by sixty-two points.
+    expect(delta.why).not.toContain('62 point');
+  });
+
+  it('calls a project becoming unmeasurable a loss of visibility, not a drop', () => {
+    const delta = coverageDelta(71, null);
+    expect(delta.points).toBeNull();
+    expect(delta.why).toContain('loss of visibility');
+  });
+
+  it('rounds to two places, and never stores negative zero', () => {
+    // 0.1 + 0.2 !== 0.3, so the raw subtraction is -5.5e-17 and rounds to -0.
+    // A stored -0 renders "Down 0 point(s)" in one place and "0" over the wire.
+    expect(coverageDelta(0.1 + 0.2, 0.3).points).toBe(0);
+    expect(Object.is(coverageDelta(0.1 + 0.2, 0.3).points, -0)).toBe(false);
+    expect(coverageDelta(0.1 + 0.2, 0.3).why).toContain('Unchanged');
+  });
+});
+
+describe('processRecomputeCoverage reports the delta against the STORED trend', () => {
+  it('reads the previous snapshot BEFORE writing the new one', async () => {
+    const order: string[] = [];
+    h.prisma = {
+      coverageSnapshot: {
+        findFirst: async () => {
+          order.push('read');
+          return { percent: 40 };
+        },
+      },
+    };
+    const compute = vi.fn(async () => {
+      order.push('write');
+      return {
+        entries: [],
+        uncovered: [],
+        snapshot: snapshot({ totals: totals({ percent: 46 }) }),
+        unmeasuredKinds: [],
+        snapshotId: 'snap_2',
+      };
+    });
+
+    const outcome = await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'close-loop' },
+      { compute },
+    );
+
+    /*
+     * THE BUG THIS CATCHES, and it is silent: `compute` with `persist: true`
+     * writes a CoverageSnapshot row as its LAST action, so a previous-snapshot
+     * query issued afterwards finds the row this job just wrote and reports the
+     * number against itself. Every delta in the product would be 0.0, and a
+     * loop that stops on a small delta would stop on its first tick, for ever,
+     * on every project.
+     */
+    expect(order).toEqual(['read', 'write']);
+    expect(outcome.previousPercent).toBe(40);
+    expect(outcome.deltaPoints).toBe(6);
+  });
+
+  it('carries a null delta for a project with nothing to measure', async () => {
+    h.prisma = { coverageSnapshot: { findFirst: async () => null } };
+    const { compute } = stubCompute({
+      snapshot: snapshot({ totals: totals({ percent: null, denominator: 0, covered: 0 }) }),
+    });
+
+    const outcome = await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'close-loop' },
+      { compute },
+    );
+
+    expect(outcome.percent).toBeNull();
+    expect(outcome.previousPercent).toBeNull();
+    expect(outcome.deltaPoints).toBeNull();
+    expect(outcome.deltaWhy).toContain('not a delta of zero');
+  });
+
+  it('accepts close-loop as a reason and logs it, so the trend says who measured', async () => {
+    h.prisma = { coverageSnapshot: { findFirst: async () => ({ percent: 10 }) } };
+    const { compute } = stubCompute();
+
+    const outcome = await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'close-loop' },
+      { compute },
+    );
+
+    expect(outcome.reason).toBe('close-loop');
+    const line = h.log.find((entry) => entry.msg === 'coverage recomputed');
+    expect(line?.obj).toMatchObject({ reason: 'close-loop', deltaPoints: 40 });
   });
 });

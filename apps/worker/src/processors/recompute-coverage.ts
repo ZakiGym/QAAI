@@ -173,8 +173,23 @@ export const RECOMPUTE_WINDOW_MS = 30_000;
  */
 export const RECOMPUTE_ATTEMPTS = 2;
 
-/** Why a recompute was asked for. Logged, so a surprising snapshot is traceable. */
-export type RecomputeReason = 'source-analysis' | 'crawl' | 'run' | 'tests-changed';
+/**
+ * Why a recompute was asked for. Logged, so a surprising snapshot is traceable.
+ *
+ * `close-loop` is the sixth, and unlike the other five nobody asked for it: it
+ * is the closure campaign re-measuring itself (processors/close-loop.ts). It is
+ * a distinct reason rather than being filed under one of the others precisely
+ * because it is the only one that is NOT caused by a change to the inputs — the
+ * loop measures to find out whether its own work moved the number, and a
+ * snapshot written for that purpose has to be distinguishable in the trend from
+ * one written because a crawl landed.
+ */
+export type RecomputeReason =
+  | 'source-analysis'
+  | 'crawl'
+  | 'run'
+  | 'tests-changed'
+  | 'close-loop';
 
 /**
  * Ids and a reason only — the same rule as every other payload in this system
@@ -352,6 +367,85 @@ async function jobForTrigger(trigger: RecomputeTrigger): Promise<RecomputeCovera
   };
 }
 
+// ─── The delta, which is what makes a loop able to stop ─────────────────────
+
+/**
+ * The movement between two stored measurements, in PERCENTAGE POINTS.
+ *
+ * It lives here, beside the code that writes the snapshot, rather than in the
+ * loop that reads it — because the number and its predecessor are both known at
+ * exactly this point and nowhere else, and a consumer that re-derived the delta
+ * would be re-reading the trend to recompute something the writer already had.
+ * The closure loop's settle rule (`decideTick` in processors/close-loop.ts) is
+ * the first consumer; a CI gate's "coverage dropped" check is the obvious next
+ * one, and it must not have to implement this arithmetic a second time.
+ *
+ * ── NULL IS NOT ZERO, AND HERE IS WHERE THAT MATTERS MOST ───────────────────
+ *
+ * Three of the four combinations of (previous, current) are not a delta at all,
+ * and collapsing any of them to 0 breaks a loop that stops on a small delta:
+ *
+ *   previous NULL, current NULL   nothing was measurable then or now. A delta
+ *                                 of 0 would read as "the number has settled",
+ *                                 which is a loop deciding it has finished
+ *                                 because it never started.
+ *   previous NULL, current set    the FIRST measurement. There is no movement
+ *                                 to report; reporting `current - 0` would
+ *                                 claim a jump from zero coverage that never
+ *                                 happened.
+ *   previous set, current NULL    the project became unmeasurable — the crawl
+ *                                 was deleted, the analysis went away. That is
+ *                                 a REGRESSION in what we can see, not a
+ *                                 movement in coverage, and it must not be
+ *                                 reported as one.
+ *
+ * So the only case that produces a number is both-set, and `why` names which
+ * of the four happened so the sentence on a campaign row is never "delta:
+ * null".
+ */
+export interface CoverageDelta {
+  /** Signed. Positive is improvement. Null means there is no delta to report. */
+  points: number | null;
+  why: string;
+}
+
+export function coverageDelta(previous: number | null, current: number | null): CoverageDelta {
+  if (previous === null && current === null) {
+    return {
+      points: null,
+      why: 'Not measured before and not measured now: the surface denominator is empty, so there is no percentage and therefore no movement. This is not a delta of zero.',
+    };
+  }
+  if (previous === null) {
+    return {
+      points: null,
+      why: `First measurement at ${current}%. There is no previous snapshot to compare against, so no movement is reported.`,
+    };
+  }
+  if (current === null) {
+    return {
+      points: null,
+      why: `Coverage was ${previous}% and is now not measurable at all — the source analysis or the crawl this project was measured from has gone. That is a loss of visibility, not a change in coverage.`,
+    };
+  }
+  const rounded = Math.round((current - previous) * 100) / 100;
+  /*
+   * `=== 0 ? 0 : rounded` is not superstition: float noise on two equal
+   * percentages rounds to NEGATIVE zero, and -0 is what would then be stored in
+   * the Float column and interpolated into a sentence. "Down 0 point(s)" is a
+   * small lie, and `JSON.stringify(-0)` is "0" while the database keeps -0, so
+   * it is a small lie that disagrees with itself across the wire.
+   */
+  const points = rounded === 0 ? 0 : rounded;
+  return {
+    points,
+    why:
+      points === 0
+        ? `Unchanged at ${current}%.`
+        : `${points > 0 ? 'Up' : 'Down'} ${Math.abs(points)} point(s), from ${previous}% to ${current}%.`,
+  };
+}
+
 // ─── Reporting the result honestly ───────────────────────────────────────────
 
 /** The part of a snapshot a log line (and a test) cares about. */
@@ -374,6 +468,19 @@ export interface RecomputeOutcome {
   unmeasuredKinds: SurfaceKind[];
   /** In full, next to the figure. Rule 5. */
   caveats: string[];
+  /**
+   * The previous PERSISTED snapshot's percentage, and the movement since it.
+   *
+   * Both nullable, and both read from the stored trend rather than from
+   * anything in flight: the question a delta answers is "has the number this
+   * product REPORTS moved?", and the number it reports is the one in the
+   * CoverageSnapshot table. `deltaPoints` is null whenever there is no delta to
+   * report — see `coverageDelta` for the three ways that happens and why none
+   * of them is zero.
+   */
+  previousPercent: number | null;
+  deltaPoints: number | null;
+  deltaWhy: string;
   headline: string;
 }
 
@@ -520,6 +627,22 @@ export async function processRecomputeCoverage(
 ): Promise<RecomputeOutcome> {
   const compute = deps.compute ?? (await loadComputeCoverage());
 
+  /*
+   * Read BEFORE the computation, not after, and that ordering is the whole
+   * correctness of the delta: `compute` with `persist: true` writes a new
+   * CoverageSnapshot row as its last action, so a "previous snapshot" query
+   * issued afterwards would find the row this very job just wrote and report a
+   * delta of the number against itself — zero, always, on every project.
+   *
+   * A null here is an ordinary first measurement, and `coverageDelta` says so
+   * rather than treating the absence as 0%.
+   */
+  const previous = await prisma.coverageSnapshot.findFirst({
+    where: { projectId: job.projectId },
+    orderBy: { createdAt: 'desc' },
+    select: { percent: true },
+  });
+
   const computed = await compute({
     orgId: job.orgId,
     projectId: job.projectId,
@@ -529,6 +652,7 @@ export async function processRecomputeCoverage(
   });
 
   const { snapshot, unmeasuredKinds } = computed;
+  const delta = coverageDelta(previous?.percent ?? null, snapshot.totals.percent);
   const outcome: RecomputeOutcome = {
     projectId: job.projectId,
     reason: job.reason,
@@ -542,6 +666,9 @@ export async function processRecomputeCoverage(
     waived: snapshot.totals.waived,
     unmeasuredKinds,
     caveats: snapshot.caveats,
+    previousPercent: previous?.percent ?? null,
+    deltaPoints: delta.points,
+    deltaWhy: delta.why,
     headline: describeSnapshot(snapshot, unmeasuredKinds),
   };
 

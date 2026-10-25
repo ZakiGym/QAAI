@@ -14,7 +14,12 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { analyzeImpact, type ImpactTestInput } from './impact.js';
+import {
+  analyzeImpact,
+  patchCoverage,
+  type ImpactTestInput,
+  type PatchCoverageRow,
+} from './impact.js';
 
 const t = (over: Partial<ImpactTestInput> & { id: string }): ImpactTestInput => ({
   name: over.id,
@@ -127,5 +132,254 @@ describe('but it still selects', () => {
     expect(result.strategy).toBe('SELECTIVE');
     expect(result.run.map((r) => r.testId)).toEqual(['about']);
     expect(result.savedPercent).toBeGreaterThan(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Patch coverage: the join between a diff and the coverage denominator.
+//
+// Both halves of this existed for months in different packages — this file maps
+// a diff to routes, `coverage-store.ts` maps routes to tests — and nothing
+// joined them, so the product knew "this change lands on three routes" and knew
+// "two of your routes have no test" and could state neither together. The
+// project-wide percentage moves by tenths on a normal pull request and therefore
+// gates nothing; this number goes to 0% the moment a change lands on an
+// untested route, which is what makes it able to refuse a merge.
+//
+// The tests that matter most here are the ones where it REFUSES to answer. A
+// patch-coverage percentage computed over a surface we did not fully see is a
+// passing number on a change that introduced an untested route, and that lie is
+// worse than silence.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const route = (identity: string, status: PatchCoverageRow['status'] = 'COVERED'): PatchCoverageRow => ({
+  key: `ROUTE:${identity}`,
+  status,
+  label: identity,
+});
+
+function join(
+  changedPaths: string[],
+  rows: PatchCoverageRow[],
+  over: Partial<Parameters<typeof patchCoverage>[0]> & { tests?: ImpactTestInput[] } = {},
+) {
+  const { tests, ...rest } = over;
+  const analysis = analyzeImpact({
+    changedPaths,
+    tests: tests ?? [checkout, about],
+    // The inventory is the other witness to "the app serves this route", which
+    // is what lets a page with no test be attributed at all.
+    knownRoutes: rows.map((row) => row.key.replace(/^ROUTE:/, '')),
+  });
+  return patchCoverage({
+    attributions: analysis.attributions,
+    rows,
+    changedPathCount: changedPaths.length,
+    ...rest,
+  });
+}
+
+describe('patch coverage answers when it can see the changed surface', () => {
+  it('scores a changed page against the route the inventory holds', () => {
+    const result = join(['app/checkout/page.tsx'], [route('/checkout'), route('/about')]);
+
+    expect(result.measured).toBe(true);
+    expect(result.denominator).toBe(1);
+    expect(result.covered).toBe(1);
+    expect(result.percent).toBe(100);
+    expect(result.routes.map((r) => [r.route, r.state])).toEqual([['/checkout', 'COVERED']]);
+  });
+
+  it('names the changed route that has no test, which is the whole point', () => {
+    // The archetypal pull request this gate exists for: a new page, no test.
+    const result = join(
+      ['app/promo/page.tsx'],
+      [route('/checkout'), route('/promo', 'UNCOVERED')],
+    );
+
+    expect(result.measured).toBe(true);
+    expect(result.percent).toBe(0);
+    expect(result.uncovered).toBe(1);
+    expect(result.routes[0]).toMatchObject({ route: '/promo', state: 'UNCOVERED' });
+  });
+
+  it('keeps a waived route out of the denominator and still shows it', () => {
+    const result = join(
+      ['app/checkout/page.tsx', 'app/legacy/page.tsx'],
+      [route('/checkout'), route('/legacy', 'WAIVED')],
+    );
+    expect(result.denominator).toBe(1);
+    expect(result.waived).toBe(1);
+    expect(result.percent).toBe(100);
+  });
+
+  it('keeps UNKNOWN in the denominator, exactly as the project number does', () => {
+    // An item we cannot reason about is a hole in OUR knowledge. Moving it out
+    // of the denominator would raise the percentage every time our extractor
+    // got worse.
+    const result = join(
+      ['app/checkout/page.tsx', 'app/about/page.tsx'],
+      [route('/checkout'), route('/about', 'UNKNOWN')],
+    );
+    expect(result.denominator).toBe(2);
+    expect(result.percent).toBe(50);
+  });
+
+  it('counts a test that exists but has never run as its own state', () => {
+    const result = join(['app/checkout/page.tsx'], [route('/checkout', 'ASSERTED_NOT_RUN')]);
+    expect(result.assertedNotRun).toBe(1);
+    expect(result.covered).toBe(0);
+    // And it is NOT an UNCOVERED route: the two are different facts and only
+    // one of them means "nobody wrote a test".
+    expect(result.uncovered).toBe(0);
+  });
+
+  it('expands a nested layout to everything below its route', () => {
+    const result = join(
+      ['app/shop/layout.tsx'],
+      [route('/shop'), route('/shop/cart', 'UNCOVERED'), route('/about')],
+    );
+    expect(result.routes.map((r) => r.route)).toEqual(['/shop', '/shop/cart']);
+    expect(result.routes.every((r) => r.subtree)).toBe(true);
+    expect(result.percent).toBe(50);
+  });
+});
+
+describe('patch coverage refuses to answer rather than divide by a surface it did not see', () => {
+  it('reports a lockfile as unscopeable and names it', () => {
+    const result = join(['package-lock.json', 'app/checkout/page.tsx'], [route('/checkout')]);
+    expect(result.measured).toBe(false);
+    expect(result.percent).toBeNull();
+    expect(result.caveats[0]).toContain('package-lock.json');
+    expect(result.caveats[0]).toContain('project coverage floor');
+  });
+
+  it('reports a file nothing could place rather than scoring the rest', () => {
+    // The part we cannot see is exactly where an untested route would be.
+    // `attribute()` already calls this one blast radius, so it arrives here as
+    // an unscopeable change.
+    const result = join(['src/lib/mystery.ts', 'app/checkout/page.tsx'], [route('/checkout')]);
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('src/lib/mystery.ts');
+  });
+
+  it('refuses when a changed file maps to a NAME but to no route', () => {
+    // `src/lib/checkout-helpers.ts` matches the suite's "checkout" token, so it
+    // is attributable — at LOW confidence, to no route at all. There is no
+    // honest way to score a changed surface that includes it: whatever it
+    // touches is not in the set of routes we are about to divide by.
+    const result = join(
+      ['src/lib/checkout-helpers.ts', 'app/checkout/page.tsx'],
+      [route('/checkout')],
+    );
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('could not be attributed');
+    expect(result.caveats[0]).toContain('checkout-helpers.ts');
+  });
+
+  it('says so when the project has no inventory to join against', () => {
+    const result = join(['app/checkout/page.tsx'], []);
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('no stored coverage inventory');
+  });
+
+  it('refuses when the changed-file list was capped', () => {
+    const result = join(['app/checkout/page.tsx'], [route('/checkout')], { diffTruncated: true });
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('capped before it was read');
+  });
+
+  it('refuses when the inventory read was capped', () => {
+    // A route with no row cannot be told apart from a route whose row was past
+    // the cap.
+    const result = join(['app/checkout/page.tsx'], [route('/checkout')], {
+      inventoryTruncated: true,
+    });
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('inventory read was capped');
+  });
+
+  it('tells a diff too wide to attribute apart from a diff that changed nothing', () => {
+    // `analyzeImpact` returns an empty attribution list for both, and reading
+    // the second as the first would report a clean changed surface for a
+    // 2,000-file merge commit.
+    const wide = patchCoverage({
+      attributions: [],
+      rows: [route('/checkout')],
+      changedPathCount: 2_000,
+    });
+    expect(wide.measured).toBe(false);
+    expect(wide.caveats[0]).toContain('attribution limit');
+
+    const nothing = patchCoverage({ attributions: [], rows: [route('/checkout')] });
+    expect(nothing.measured).toBe(false);
+    expect(nothing.caveats[0]).toContain('resolved to a route');
+  });
+
+  it('a diff of nothing but spec files has no changed surface', () => {
+    const result = join(['specs/checkout.spec.ts'], [route('/checkout')]);
+    expect(result.measured).toBe(false);
+  });
+});
+
+describe('patch coverage says what it cannot distinguish', () => {
+  it('cannot tell a renamed route from a new one, and refuses to guess', () => {
+    // `app/cart/page.tsx` → `app/basket/page.tsx`, with a test that already
+    // visits /basket so the route is attributable, and an inventory that has
+    // not been recomputed since — so /basket has no row. That is the same
+    // evidence as a brand-new /basket page, and the same evidence as an
+    // inventory nobody recomputed, and this refuses to pick between them.
+    const basket = t({ id: 'basket', code: "page.goto('/basket')" });
+    const stale = join(['app/basket/page.tsx', 'app/cart/page.tsx'], [route('/cart')], {
+      tests: [basket, about],
+    });
+
+    expect(stale.unrecognised).toBe(1);
+    expect(stale.routes.find((r) => r.route === '/basket')?.state).toBe('NOT_IN_INVENTORY');
+    // Neither covered nor a gap: the denominator holds /cart alone.
+    expect(stale.denominator).toBe(1);
+    expect(stale.percent).toBe(100);
+    expect(stale.caveats.some((c) => c.includes('renames'))).toBe(true);
+  });
+
+  it('cannot see a route that is new to BOTH the suite and the inventory', () => {
+    // The honest limit of the whole feature, asserted so it cannot be forgotten:
+    // a page nothing tests AND nothing has extracted yet cannot be attributed to
+    // a route at all — `attribute()` demotes it to a bare name and then to
+    // blast radius — so patch coverage reports "not measured" rather than a 0%
+    // that happens to be right for the wrong reason. The gate that catches this
+    // case is the one on the inventory computed from the PR's own commit.
+    const result = join(['app/promo/page.tsx'], [route('/checkout')]);
+    expect(result.measured).toBe(false);
+    expect(result.caveats[0]).toContain('app/promo/page.tsx');
+  });
+
+  it('says how old the inventory is relative to the diff', () => {
+    const result = join(['app/checkout/page.tsx'], [route('/checkout')], {
+      diffCommitSha: 'bbbbbbbbbb',
+      inventoryCommitSha: 'aaaaaaaaaa',
+    });
+    expect(result.caveats.some((c) => c.includes('aaaaaaa') && c.includes('bbbbbbb'))).toBe(true);
+  });
+
+  it('says when the inventory records no commit at all', () => {
+    const result = join(['app/checkout/page.tsx'], [route('/checkout')], {
+      diffCommitSha: 'bbbbbbbbbb',
+      inventoryCommitSha: null,
+      inventoryMeasuredAtIso: '2026-10-01T00:00:00.000Z',
+    });
+    expect(result.caveats.some((c) => c.includes('records no commit'))).toBe(true);
+  });
+
+  it('states that endpoints and forms are outside this denominator', () => {
+    // A diff cannot be mapped onto an endpoint by this analysis — the file
+    // layout proves which URL serves a handler and says nothing about which
+    // pages call it — so they are named rather than silently dropped.
+    const result = join(
+      ['app/checkout/page.tsx'],
+      [route('/checkout'), { key: 'ENDPOINT:GET /api/orders', status: 'UNCOVERED', label: 'orders' }],
+    );
+    expect(result.caveats.some((c) => c.includes('endpoints, forms or auth surfaces'))).toBe(true);
+    expect(result.denominator).toBe(1);
   });
 });

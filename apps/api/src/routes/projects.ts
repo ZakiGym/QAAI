@@ -6,6 +6,7 @@ import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
 import { z } from 'zod';
 import {
+  CLOSURE_APPROVAL_POLICIES,
   FIXTURE_PREFIX,
   GIT_INTEGRATION_KINDS,
   INLINE_EDIT_PREFIX,
@@ -154,7 +155,52 @@ projectsRouter.get('/:projectId', async (req, res) => {
 });
 
 /**
- * Rename an app, or change the language and framework its tests are written in.
+ * The closure autopilot's three settings, validated here.
+ *
+ * ── Why these are a door at all ─────────────────────────────────────────────
+ *
+ * `Project.coverageTargetPercent` IS THE AUTOPILOT'S ON SWITCH: the close-loop
+ * sweep arms a campaign for a project that has one and ignores every project
+ * that does not. Nothing in the API could set it, so the whole feature —
+ * campaigns, budgets, the closure ledger, the nightly tick — was reachable only
+ * by a seed script or by somebody with a psql prompt. A feature that ships
+ * without the switch that turns it on has not shipped.
+ *
+ * ── Why the schema is local ─────────────────────────────────────────────────
+ *
+ * `updateProjectSchema` lives in @qaai/shared and is not this change's file, so
+ * it is EXTENDED here rather than restated: `name`, `primaryLanguage` and
+ * `primaryFramework` keep their one definition, and the `.refine` that answers
+ * "nothing to update" is inherited and now sees all six fields. Restating the
+ * first three locally would be two validators for one request shape, which is
+ * the drift this repo keeps paying for. The right end state is these three
+ * beside the others in the shared schema — see the handover.
+ *
+ * ── The three rules, each one a way to spend somebody's money ───────────────
+ *
+ *  · `coverageTargetPercent` is 1-100 and NULLABLE, and null is how the
+ *    autopilot is switched back OFF. 0 is deliberately not allowed: a target of
+ *    zero is met by every project on earth, so a campaign armed on it would
+ *    arm and immediately settle, which looks exactly like a broken loop.
+ *  · `closureApprovalPolicy` is validated against the shared vocabulary rather
+ *    than a local pair of strings. The column is TEXT, so a typo here is not a
+ *    value the database refuses — it is a value `approvalPolicyOf` does not
+ *    recognise, which falls back to HUMAN_REVIEW. That fallback is the safe
+ *    direction and is exactly why it must not be reachable: a team that typed
+ *    `AUTO_APPROVVE` would believe they had switched unattended generation on.
+ *  · `closureItemBudget` is 1-200. It is the money cap — every item is a model
+ *    call and eventually a browser — so there is no unbounded setting, and the
+ *    documented default (40) is what null means.
+ */
+const updateProjectClosureSchema = updateProjectSchema.extend({
+  coverageTargetPercent: z.number().int().min(1).max(100).nullable().optional(),
+  closureApprovalPolicy: z.enum(CLOSURE_APPROVAL_POLICIES).nullable().optional(),
+  closureItemBudget: z.number().int().min(1).max(200).nullable().optional(),
+});
+
+/**
+ * Rename an app, change the language and framework its tests are written in, or
+ * arm the closure autopilot.
  *
  * The first-run funnel says on every step that nothing it asks is binding.
  * That was false: language and framework were set once at create time and
@@ -170,7 +216,7 @@ projectsRouter.get('/:projectId', async (req, res) => {
  */
 projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
   const actor = actorOf(req);
-  const input = updateProjectSchema.parse(req.body);
+  const input = updateProjectClosureSchema.parse(req.body);
 
   const project = await prisma.project.findUnique({
     where: { id: String(req.params.projectId) },
@@ -180,6 +226,12 @@ projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
       primaryLanguage: true,
       primaryFramework: true,
       archivedAt: true,
+      // Read because the audit row carries the BEFORE value of each of them,
+      // and because switching the autopilot on is the one change here that
+      // starts spending model calls unattended.
+      coverageTargetPercent: true,
+      closureApprovalPolicy: true,
+      closureItemBudget: true,
     },
   });
   if (!project || project.archivedAt) throw notFound('Project');
@@ -196,6 +248,22 @@ projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
       ...(input.name !== undefined ? { name: input.name } : {}),
       primaryLanguage: language,
       primaryFramework: framework,
+      /*
+       * Each of the three only when the body NAMED it, which is what keeps an
+       * explicit `null` (switch the autopilot off, fall back to the documented
+       * default) different from an absent key (leave it alone). A spread of
+       * `{ coverageTargetPercent: input.coverageTargetPercent }` would clear
+       * all three on every rename.
+       */
+      ...(input.coverageTargetPercent !== undefined
+        ? { coverageTargetPercent: input.coverageTargetPercent }
+        : {}),
+      ...(input.closureApprovalPolicy !== undefined
+        ? { closureApprovalPolicy: input.closureApprovalPolicy }
+        : {}),
+      ...(input.closureItemBudget !== undefined
+        ? { closureItemBudget: input.closureItemBudget }
+        : {}),
     },
     include: { environments: true, _count: { select: { tests: true, runs: true } } },
   });
@@ -205,7 +273,15 @@ projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
    * framework silently re-points every future generation at a different runner,
    * and "it used to write Playwright" is the question someone asks a week later
    * when a generated suite stops matching the one they already had.
+   *
+   * The autopilot's three are in the same row for a sharper reason:
+   * `coverageTargetPercent` going from null to a number is the moment this
+   * project starts proposing plan items, calling a model and writing tests
+   * overnight with nobody watching. `armed` is on the row as its own boolean so
+   * that moment can be FOUND — an audit log somebody has to diff two numbers
+   * in to spot the most consequential change in it is not an audit log.
    */
+  const armed = project.coverageTargetPercent === null && updated.coverageTargetPercent !== null;
   await audit({
     actor,
     action: 'project.update',
@@ -216,11 +292,27 @@ projectsRouter.patch('/:projectId', requireRole('ADMIN'), async (req, res) => {
         name: project.name,
         primaryLanguage: project.primaryLanguage,
         primaryFramework: project.primaryFramework,
+        coverageTargetPercent: project.coverageTargetPercent,
+        closureApprovalPolicy: project.closureApprovalPolicy,
+        closureItemBudget: project.closureItemBudget,
       },
       to: {
         name: updated.name,
         primaryLanguage: updated.primaryLanguage,
         primaryFramework: updated.primaryFramework,
+        coverageTargetPercent: updated.coverageTargetPercent,
+        closureApprovalPolicy: updated.closureApprovalPolicy,
+        closureItemBudget: updated.closureItemBudget,
+      },
+      closureAutopilot: {
+        armed,
+        disarmed: project.coverageTargetPercent !== null && updated.coverageTargetPercent === null,
+        /*
+         * Said in words on the row that arms it, because the policy decides
+         * whether the loop writes code unattended or queues it for a human,
+         * and null means the cautious default rather than "no policy".
+         */
+        approvalPolicy: updated.closureApprovalPolicy ?? 'HUMAN_REVIEW (default)',
       },
     },
   });

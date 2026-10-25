@@ -331,6 +331,20 @@ const CHECKOUT_ITEM = {
   assertions: ['The order total reads $42.00'],
   journeyId: null,
   authProfileId: null,
+  /**
+   * APPROVED, which is the state the processor is now allowed to generate.
+   *
+   * On the row because the processor filters on it: a fixture with no state
+   * would be a fixture no producer ever writes, and the filter exists precisely
+   * so an item a human has not approved is not turned into code.
+   */
+  state: 'APPROVED',
+  /**
+   * The coverage gap this item was minted to close. Null here, because the one
+   * journey these tests generate came off a crawl rather than out of a gap
+   * report — the provenance suite below supplies its own item with an id on it.
+   */
+  gapId: null,
 };
 
 const CHECKOUT_PATH = 'checkout/checkout-shows-the-order-total.spec.ts';
@@ -418,7 +432,15 @@ function fakeWorld(options: { items?: Array<Record<string, unknown>>; tests?: Fa
     // tests are about.
     environment: { findFirst: async () => null },
     planItem: {
-      findMany: async () => options.items ?? [CHECKOUT_ITEM],
+      /*
+       * The `where` is HONOURED, and that is the whole value of it here: the
+       * processor's state filter is what stops an item nobody approved being
+       * handed to a strong-tier model, and a fake that returned every row it
+       * was given would pass whether the filter was there or not. (Confirmed by
+       * mutation: dropping the filter from the processor is caught below.)
+       */
+      findMany: async ({ where }: { where: Record<string, unknown> } = { where: {} }) =>
+        (options.items ?? [CHECKOUT_ITEM]).filter((row) => matchesWhere(row, where ?? {})),
       update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         planItemUpdates.push({ id: where.id, data });
         return { id: where.id, ...data };
@@ -825,5 +847,151 @@ describe('duplicateCandidates', () => {
     // Same feature first, then the rest — including the featureless tests an
     // imported suite arrives as, which a bare `not` would have dropped.
     expect(mixed.existing.map((row) => row.id)).toEqual(['same', 'other', 'none']);
+  });
+});
+
+// ─── 6. Provenance, and the approval the generator has to respect ────────────
+
+/**
+ * Two properties of the LANDING, both of which were missing and neither of
+ * which a careless edit would notice.
+ *
+ * `Test.gapId` is how the closure ledger names the test written for a gap. It
+ * was stamped by the close-loop tick, which walks the plan item — so it worked
+ * for a campaign's items and for nothing else, and every test generated from a
+ * human clicking POST /coverage/:id/propose landed with no provenance at all.
+ * The ledger could then never say "this gap is closed by this test", and — much
+ * worse — could never notice that it is NOT.
+ *
+ * The state filter is the other half. A closure campaign on a HUMAN_REVIEW
+ * policy mints its items PROPOSED precisely so a person decides; the processor
+ * generated whatever ids its job named, so an item waiting on the approval
+ * screen could be turned into code and stored.
+ */
+describe('the provenance a generated test is born with', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  const admitted = (): void => {
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+  };
+
+  it('copies the gap id from the plan item onto the test row', async () => {
+    const world = fakeWorld({
+      items: [{ ...CHECKOUT_ITEM, gapId: 'gap_8f2c1d', gapKind: 'UNVISITED_ROUTE' }],
+    });
+    admitted();
+
+    await processGenerate(job);
+
+    const row = world.created[0]!;
+    expect(row.gapId).toBe('gap_8f2c1d');
+    // In the same write that creates the row, so the provenance does not
+    // depend on a later tick, on a campaign existing, or on the plan surviving.
+    expect(row.planItemId).toBe('item-checkout');
+    expect(world.planItemUpdates).toEqual([
+      { id: 'item-checkout', data: { state: 'GENERATED', generatedTestId: 'test-1' } },
+    ]);
+  });
+
+  it('leaves it NULL for a cold plan, rather than inventing one', async () => {
+    /*
+     * The Explorer proposes from a crawl with no gap behind it. NULL is the
+     * ordinary case and always will be; a back-filled id would claim a
+     * provenance that never existed, and the ledger would then name a test for
+     * a gap nobody ever reported.
+     */
+    const world = fakeWorld();
+    admitted();
+
+    await processGenerate(job);
+
+    expect(world.created[0]!.gapId).toBeNull();
+  });
+
+  it('refuses to generate an item a human has not approved', async () => {
+    const world = fakeWorld({ items: [{ ...CHECKOUT_ITEM, state: 'PROPOSED' }] });
+    admitted();
+
+    await processGenerate(job);
+
+    // Nothing stored, nothing transitioned, and the model was never asked.
+    expect(world.created).toHaveLength(0);
+    expect(world.planItemUpdates).toEqual([]);
+    expect(h.prompts).toHaveLength(0);
+    /*
+     * And it is REPORTED, at warn: a batch of one that produced none must not
+     * read as a batch of none, and the counts say how many of the ids the job
+     * named were generable.
+     */
+    const warned = h.log.find((line) => line.level === 'warn' && /not approved/.test(line.msg));
+    expect(warned).toBeDefined();
+    expect(warned!.obj).toMatchObject({ requested: 1, generating: 0 });
+  });
+
+  it('refuses to generate an item a human REJECTED', async () => {
+    const world = fakeWorld({ items: [{ ...CHECKOUT_ITEM, state: 'REJECTED' }] });
+    admitted();
+
+    await processGenerate(job);
+
+    expect(world.created).toHaveLength(0);
+    expect(h.prompts).toHaveLength(0);
+  });
+
+  it('generates the approved items in a batch that also names unapproved ones', async () => {
+    /*
+     * The mixed batch, which is the one the filter has to get right: a job over
+     * a HUMAN_REVIEW campaign's items, half of them ticked. Eight approved
+     * items must still be generated, and the two that were not must still be
+     * left alone.
+     */
+    const world = fakeWorld({
+      items: [
+        { ...CHECKOUT_ITEM, state: 'PROPOSED' },
+        { ...CHECKOUT_ITEM, id: 'item-delivery', title: 'Delivery shows the ETA', gapId: 'gap_eta' },
+      ],
+    });
+    h.llmReplies.push({
+      name: 'Delivery shows the ETA',
+      filePath: 'delivery/delivery-shows-the-eta.spec.ts',
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate({ ...job, planItemIds: ['item-checkout', 'item-delivery'] });
+
+    expect(world.created).toHaveLength(1);
+    expect(world.created[0]!.planItemId).toBe('item-delivery');
+    expect(world.created[0]!.gapId).toBe('gap_eta');
+  });
+
+  it('still honours a redelivered job over work that already landed', async () => {
+    /*
+     * GENERATED is admitted alongside APPROVED on purpose: that state means a
+     * previous job already stored the test, and the duplicate guard answers it
+     * honestly by pointing the item at the test it already has. Excluding it
+     * would leave a redelivered job with nothing to repair the pointer with.
+     */
+    const world = fakeWorld({
+      items: [{ ...CHECKOUT_ITEM, state: 'GENERATED' }],
+      tests: [existingTest({ id: 'already', planItemId: 'item-checkout' })],
+    });
+    admitted();
+
+    await processGenerate(job);
+
+    expect(world.created).toHaveLength(0);
+    expect(world.planItemUpdates).toEqual([
+      { id: 'item-checkout', data: { state: 'GENERATED', generatedTestId: 'already' } },
+    ]);
   });
 });

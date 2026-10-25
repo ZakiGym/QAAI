@@ -22,6 +22,20 @@ import {
   pairMessage,
 } from './constants';
 import { SELECTOR_STRATEGIES } from './flow-map';
+/*
+ * The findings vocabulary, imported rather than restated. `MAX_FINDINGS` selects
+ * on a severity and a kind, and a `z.enum` here that spelled its own four
+ * severities would be a THIRD copy of a list the plugins already emit and
+ * types.ts already names — which is how a gate comes to block on a severity the
+ * cockpit renders below the threshold.
+ *
+ * types.ts imports this module back, but with `import type` only (it wants
+ * `PerformanceMetric`), and `verbatimModuleSyntax` erases that, so the module
+ * graph that executes is schemas → types → constants with no cycle. Keep it
+ * that way: a value import there would close the loop, and in ESM the loser of
+ * that race reads an uninitialised binding.
+ */
+import { FINDING_KINDS, FINDING_SEVERITIES } from './types';
 
 const slug = z
   .string()
@@ -317,6 +331,24 @@ export const planItemSchema = z.object({
   assertions: z.array(z.string().min(1)).min(1).max(20),
   journeyId: z.string().nullable().default(null),
   authProfileId: z.string().nullable().default(null),
+  /**
+   * The coverage gap this item was minted to close — `CoverageGap.id`, a stable
+   * hash of (kind, subject), so the next analysis produces the same id for the
+   * same gap.
+   *
+   * It existed as `PlanItem.gapId` in the database and nowhere in the wire
+   * shape, so the two writers (apps/api/src/routes/coverage.ts and
+   * apps/worker/src/processors/close-loop.ts) each attached it by hand after
+   * this schema had already parsed the item and dropped it. A column written
+   * around its own validator is a column that will eventually be written
+   * wrong.
+   *
+   * `.nullable().default(null)` rather than required, and nullable forever: the
+   * Explorer proposes a cold plan from a crawl with no gap behind it, and a
+   * back-filled id would invent a provenance that never existed. Null here
+   * means "not minted for a gap" — it is not a missing value to be guessed at.
+   */
+  gapId: z.string().nullable().default(null),
 });
 
 export const testPlanSchema = z.object({
@@ -482,6 +514,18 @@ export const triageVerdictSchema = z.object({
 
 // ─── Healing (§3.4) ──────────────────────────────────────────────────────────
 
+/**
+ * What a MODEL may propose — which is why there is no RETIRE here while
+ * `HealProposal.riskLevel` in types.ts has one.
+ *
+ * This schema is handed to `llm.structured` (packages/agent/src/healer.ts), so
+ * every member of it is something a model is being invited to choose. RETIRE
+ * means "this test should stop existing", it is minted by the deterministic
+ * obsolescence detector (`apps/worker/src/processors/flake.ts`) and never by a
+ * prompt, and `isAutoApprovable` refuses it by name. Adding it here to make the
+ * two lists match would let a model retire a customer's test — the one mistake
+ * in this feature that is unrecoverable.
+ */
 export const healProposalSchema = z.object({
   diff: z.string().min(1),
   explanation: z.string().min(1).max(2000),
@@ -658,12 +702,81 @@ export const createMonitorSchema = z.object({
 // ─── Quality gates (§5) ──────────────────────────────────────────────────────
 
 /**
+ * The metrics a PERFORMANCE test can put a budget on.
+ *
+ * LOAD answers "how many requests per second does the server survive". None of
+ * these answer that, and that is the point: a page that serves in 20ms and
+ * paints in four seconds passes every server-side test ever written. These are
+ * what the person holding the laptop experiences.
+ *
+ * Every one is "lower is better", which is what lets the plugin treat them
+ * uniformly: a budget is always a ceiling and exceeding it always fails.
+ */
+export const PERFORMANCE_METRICS = ['lcpMs', 'clsScore', 'inpMs', 'tbtMs', 'fcpMs', 'ttfbMs'] as const;
+export type PerformanceMetric = (typeof PERFORMANCE_METRICS)[number];
+
+export const PERFORMANCE_METRIC_LABELS: Record<PerformanceMetric, string> = {
+  lcpMs: 'LCP — largest contentful paint',
+  clsScore: 'CLS — cumulative layout shift',
+  inpMs: 'INP — interaction to next paint',
+  tbtMs: 'TBT — total blocking time',
+  fcpMs: 'FCP — first contentful paint',
+  ttfbMs: 'TTFB — time to first byte',
+};
+
+/** Units, so a step can say "2100ms" and "0.14" rather than a bare number. */
+export const PERFORMANCE_METRIC_UNITS: Record<PerformanceMetric, 'ms' | 'score'> = {
+  lcpMs: 'ms',
+  clsScore: 'score',
+  inpMs: 'ms',
+  tbtMs: 'ms',
+  fcpMs: 'ms',
+  ttfbMs: 'ms',
+};
+
+// ─── The gate rules themselves ───────────────────────────────────────────────
+
+/**
+ * What a rule does when it is not satisfied. Configuration, so only two
+ * members: PASS and UNMEASURED are OUTCOMES the evaluator decides, and a rule
+ * that could be configured to "pass" would be a rule that does nothing.
+ */
+const gateAction = z.enum(['WARN', 'BLOCK']);
+
+/** A percentage floor or ceiling, 0–100 inclusive. */
+const gatePercent = z.number().min(0).max(100);
+
+/**
  * The rules that decide whether a run blocks a deploy.
  *
  * A discriminated union so an invalid combination cannot be stored: a
  * BLOCK_ON_VERDICT rule has no rate, and a MAX_FLAKE_RATE rule has no verdict.
  * These have lived on Project.gateRules as untyped JSON with no way to edit
  * them — the product's teeth, configurable only by hand-editing the database.
+ *
+ * ── THIS SCHEMA IS THE ONLY WRITE PATH, AND IT WAS FOUR KINDS BEHIND ────────
+ *
+ * PUT /projects/:projectId/gate-rules parses through it (apps/api/src/routes/
+ * projects.ts) and nothing else writes `Project.gateRules`. Seven members were
+ * added to `GateRule` in types.ts and not here, so every one of them was
+ * REFUSED on the way in: the six measurement rules — the ones that gate on
+ * coverage, patch coverage, mutation score, findings and vitals, which is to
+ * say everything QAAI measures besides the suite — plus the environment
+ * evaluation, could not be saved by any customer. The whole feature was
+ * reachable only by hand-editing a database row.
+ *
+ * `check:wiring` cannot see this class of break, and that is worth stating
+ * plainly: it looks for a FILE nobody reaches. A union member with no write
+ * path is live code in a reached file, so nothing flagged it and nothing would
+ * flag the next one. `GATE_RULE_KINDS` in types.ts and the parity test in
+ * schemas.test.ts are what close it: the kinds list cannot be written without
+ * naming every union member, and the test asserts this union's options are
+ * exactly that list.
+ *
+ * Every vocabulary here is imported — verdicts and priorities from
+ * constants.ts, severities and kinds from types.ts, metrics from the block
+ * above — so a gate can never be configured against a word nothing in the
+ * product produces.
  */
 export const gateRuleSchema = z.discriminatedUnion('kind', [
   z.object({
@@ -673,18 +786,93 @@ export const gateRuleSchema = z.discriminatedUnion('kind', [
   }),
   z.object({
     kind: z.literal('MAX_FLAKE_RATE'),
-    ratePercent: z.number().min(0).max(100),
-    action: z.enum(['WARN', 'BLOCK']),
+    ratePercent: gatePercent,
+    action: gateAction,
   }),
   z.object({
     kind: z.literal('MAX_P95_LATENCY_MS'),
     ms: z.number().int().positive().max(600_000),
-    action: z.enum(['WARN', 'BLOCK']),
+    action: gateAction,
   }),
   z.object({
     kind: z.literal('MIN_PASS_RATE'),
-    ratePercent: z.number().min(0).max(100),
-    action: z.enum(['WARN', 'BLOCK']),
+    ratePercent: gatePercent,
+    action: gateAction,
+  }),
+  /*
+   * Appended by the evaluator rather than configured by a project — see the
+   * member's own note in types.ts — and accepted here anyway, because THE
+   * UNION IS THE DOMAIN. A kind this schema refuses is a rule the product can
+   * hold and the product's only validator cannot check, which is the defect
+   * this whole schema exists to close; "a project would not normally send it"
+   * is not the same statement as "it is invalid".
+   *
+   * Saving one is also meaningful rather than inert: `scoreRule` in
+   * packages/runner/src/gates.ts has a real arm for it, so a project writing
+   * its own stricter quarantine ceiling gets it scored. The evaluator's own
+   * appended copy is what cannot be deleted.
+   */
+  z.object({
+    kind: z.literal('MAX_QUARANTINE_PERCENT'),
+    percent: gatePercent,
+    action: gateAction,
+  }),
+  // ── The measurement rules: everything QAAI measures beside the suite ──────
+  z.object({
+    kind: z.literal('MIN_COVERAGE'),
+    percent: gatePercent,
+    action: gateAction,
+  }),
+  z.object({
+    kind: z.literal('MIN_PATCH_COVERAGE'),
+    percent: gatePercent,
+    action: gateAction,
+  }),
+  z.object({
+    kind: z.literal('MIN_MUTATION_SCORE'),
+    percent: gatePercent,
+    action: gateAction,
+  }),
+  z.object({
+    kind: z.literal('NO_NEW_UNCOVERED_ROUTES'),
+    action: gateAction,
+  }),
+  z.object({
+    kind: z.literal('MAX_FINDINGS'),
+    atOrAbove: z.enum(FINDING_SEVERITIES),
+    /** Empty means every kind, which is why the default is `[]` and not null. */
+    onlyKinds: z.array(z.enum(FINDING_KINDS)).default([]),
+    /**
+     * `0` is the value most teams want with `atOrAbove: 'CRITICAL'`, so the
+     * floor is 0 and not 1. The ceiling is a sanity bound on a stored integer,
+     * not a product limit.
+     */
+    max: z.number().int().min(0).max(10_000),
+    action: gateAction,
+  }),
+  z.object({
+    kind: z.literal('MAX_VITAL_BREACHES'),
+    /** One metric, or every one of them. Never a threshold — see the member. */
+    metric: z.union([z.literal('ANY'), z.enum(PERFORMANCE_METRICS)]),
+    max: z.number().int().min(0).max(1_000),
+    action: gateAction,
+  }),
+  /*
+   * Also evaluator-appended, and accepted for the same "the union is the
+   * domain" reason — but with a cost that has to be said out loud, because it
+   * is the opposite of the one above.
+   *
+   * `GateInput` carries no environment signal. The real evaluation is built by
+   * the run finaliser, which knows which tests were blocked and why
+   * (`ENVIRONMENT_GATE_RULE` in apps/worker/src/processors/run.ts). So a
+   * project that saves this rule gets an UNMEASURED evaluation from
+   * `scoreRule` — never a PASS, which would be a gate certifying an
+   * environment it has no input about. Accepting it here keeps the validator
+   * complete; it does not make it a useful thing to configure.
+   */
+  z.object({
+    kind: z.literal('ENVIRONMENT_AVAILABLE'),
+    action: gateAction,
   }),
 ]);
 
@@ -2021,38 +2209,14 @@ export type DatasetConfig = z.infer<typeof datasetSchema>;
 
 // ─── Performance budgets — Core Web Vitals (§4) ───────────────────────────────
 
-/**
- * The metrics a PERFORMANCE test can put a budget on.
- *
- * LOAD answers "how many requests per second does the server survive". None of
- * these answer that, and that is the point: a page that serves in 20ms and
- * paints in four seconds passes every server-side test ever written. These are
- * what the person holding the laptop experiences.
- *
- * Every one is "lower is better", which is what lets the plugin treat them
- * uniformly: a budget is always a ceiling and exceeding it always fails.
+/*
+ * The vitals vocabulary used to be declared here, under this header. It now
+ * sits above `gateRuleSchema` in the Quality gates section, because that schema
+ * reads it: a `const` referenced 1,300 lines before its own initialiser is a
+ * temporal dead zone, and the symptom is not a type error — it is the whole
+ * @qaai/shared barrel throwing "Cannot access 'PERFORMANCE_METRICS' before
+ * initialization" at import time, on every page of the web app.
  */
-export const PERFORMANCE_METRICS = ['lcpMs', 'clsScore', 'inpMs', 'tbtMs', 'fcpMs', 'ttfbMs'] as const;
-export type PerformanceMetric = (typeof PERFORMANCE_METRICS)[number];
-
-export const PERFORMANCE_METRIC_LABELS: Record<PerformanceMetric, string> = {
-  lcpMs: 'LCP — largest contentful paint',
-  clsScore: 'CLS — cumulative layout shift',
-  inpMs: 'INP — interaction to next paint',
-  tbtMs: 'TBT — total blocking time',
-  fcpMs: 'FCP — first contentful paint',
-  ttfbMs: 'TTFB — time to first byte',
-};
-
-/** Units, so a step can say "2100ms" and "0.14" rather than a bare number. */
-export const PERFORMANCE_METRIC_UNITS: Record<PerformanceMetric, 'ms' | 'score'> = {
-  lcpMs: 'ms',
-  clsScore: 'score',
-  inpMs: 'ms',
-  tbtMs: 'ms',
-  fcpMs: 'ms',
-  ttfbMs: 'ms',
-};
 
 /**
  * Resource classes a byte budget can be set on.

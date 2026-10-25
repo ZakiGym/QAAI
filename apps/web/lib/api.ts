@@ -3,6 +3,8 @@
  * the API share one auth mechanism and the cockpit needs no token handling.
  */
 
+import type { GateResult } from '@qaai/shared';
+
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
 
 export class ApiError extends Error {
@@ -72,6 +74,23 @@ export interface Verdict {
   evidence: Array<{ kind: string; ref: string; detail: string }>;
   reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED';
   model: string;
+  /**
+   * The cause columns. `GET /runs/:runId` returns the whole verdict row, so
+   * these have been on the wire since the triage-per-cause migration and no
+   * screen could name them.
+   *
+   * `derivedFromId` is the honesty column and the reason these are here at all:
+   * NULL means a model read THIS result, anything else means the row is a copy
+   * of the answer reached for a different member of the same cause. A reader
+   * who cannot tell them apart reads forty copies of one model call as forty
+   * pieces of evidence.
+   */
+  clusterKey: string | null;
+  derivedFromId: string | null;
+  /** 1 for the first answer, 2 and up after a re-triage. Never 0. */
+  revision: number;
+  /** Set when a human took this result out of its cause. */
+  splitFromClusterKey: string | null;
 }
 
 export interface TestResult {
@@ -108,10 +127,31 @@ export interface Run {
   failedCount: number;
   flakyCount: number;
   skippedCount: number;
-  gateResult: {
-    passed: boolean;
-    evaluations: Array<{ passed: boolean; action: string; detail: string }>;
-  } | null;
+  /**
+   * The gate, as `@qaai/shared` declares it — not a restatement of it.
+   *
+   * This was hand-written here as `{ passed: boolean; evaluations: Array<{
+   * passed: boolean; action: string; detail: string }> }`, and all three
+   * narrowings were wrong in the same direction:
+   *
+   *  · `evaluations[].passed` is `boolean | null`, where NULL MEANS NOT
+   *    MEASURED. Typing it `boolean` made `!e.passed` true for a rule nothing
+   *    scored, so the run log printed "not measured — no coverage snapshot has
+   *    been computed" as the reason a merge was blocked.
+   *  · `unmeasured` — the evaluator's own count of rules with no input — could
+   *    not be read at all, so a surface could show six rules and imply six
+   *    answers.
+   *  · `rescored` — set when the gate was scored AGAIN after triage, including
+   *    `reversedGreen` for a pass that became a block — could not be read
+   *    either, which is the one transition that costs a team trust if it
+   *    happens quietly.
+   *
+   * Imported rather than mirrored because the evaluator produces exactly this
+   * object and it is stored and returned verbatim; `GateRescore.atIso` is a
+   * string and every other member is JSON-safe, so there is nothing for a
+   * client-side shape to add. Type-only, so no runtime import of the package.
+   */
+  gateResult: GateResult | null;
   environment: { name: string; kind: string; baseUrl?: string };
   results?: TestResult[];
 }
@@ -223,24 +263,67 @@ export interface GitPreview {
   totalBytes: number;
 }
 
+/**
+ * What is known about whether an applied heal actually worked —
+ * `verificationOf` in apps/api/src/routes/agent.ts, returned on EVERY row.
+ *
+ * `state: null` is "nothing to say": nobody applied this proposal, so nothing
+ * was verified. The field that must not be misread is `claimsFixed` — true ONLY
+ * when a run executed the test after the patch was written and it passed.
+ * Everything else, an applied heal nobody could check included, is false.
+ *
+ * `state` is a string and not a union on purpose: it is a TEXT column whose
+ * domain is enforced at the producer, so a value written by a newer deployment
+ * reaches here as a value this client does not know. The API reports such a
+ * value as unrecognised in `note` rather than letting it fall through to "not
+ * verified", and the UI has to do the same — see HEAL_VERIFY_LABEL.
+ */
+export interface HealVerification {
+  state: string | null;
+  /** The test was re-run after the patch and it passed. Nothing else sets this. */
+  claimsFixed: boolean;
+  note: string | null;
+  /** The verifying run, when one was started. `heal-verify:<id>` triggered it. */
+  runId: string | null;
+  at: string | null;
+}
+
 /** A Healer proposal, with the patched result the server computed for review. */
 export interface Heal {
   id: string;
   testId: string;
   diff: string;
   explanation: string;
-  riskLevel: 'SELECTOR_ONLY' | 'ASSERTION_CHANGE' | 'STRUCTURAL';
+  /**
+   * RETIRE is not a patch: it proposes that the test STOP EXISTING, carries no
+   * diff, and is applied by disabling the test. It has been a `HealRisk` member
+   * and a value this endpoint returns since obsolete-test detection shipped,
+   * and it was missing from this union — so the one proposal that deletes
+   * coverage was typed as impossible and rendered as whatever the risk map's
+   * fallback happened to be.
+   */
+  riskLevel: 'SELECTOR_ONLY' | 'ASSERTION_CHANGE' | 'STRUCTURAL' | 'RETIRE';
   confidence: number;
-  state: 'PROPOSED' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'AUTO_APPLIED';
+  /** SUPERSEDED is what the supersede planner writes when a newer proposal wins. */
+  state: 'PROPOSED' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'AUTO_APPLIED' | 'SUPERSEDED';
   createdAt: string;
   test: { id: string; name: string; filePath: string; code: string };
   /** Applying the diff server-side, so the UI can show a true before/after. */
   preview: {
+    /** RETIREMENT previews carry evidence instead of a patch — there is no diff. */
+    kind: 'PATCH' | 'RETIREMENT';
     applies: boolean;
     code: string | null;
     reason: string | null;
     fuzz: number | null;
+    /** Present when nothing could verify that the heal keeps the assertions. */
+    review: string | null;
+    /** What the gates found in the patched file. Flags, not refusals. */
+    flags: string[];
+    /** Which checks ran — so a screen can never imply one that did not. */
+    checks: string | null;
   };
+  verification: HealVerification;
 }
 
 // ─── Insights: coverage gaps (GET/POST /coverage) ────────────────────────────
@@ -1055,6 +1138,46 @@ export interface ClusterSuggestion {
   reason: string;
 }
 
+/**
+ * What the identity tables say about one cause — `GET /clusters/run/:runId`.
+ *
+ * NOT `CauseIdentity` from `@qaai/shared`, which is the REDUCED shape handed to
+ * `summariseFailure` (no cost, no per-run membership, and the mute flattened to
+ * `mutedUntil`/`mutedReason`). This is the row this endpoint returns, with
+ * dates as the ISO strings JSON made of them.
+ *
+ * `identity` is NULL when the worker has not recorded the cause yet, which is
+ * genuinely different from "not new" and is never flattened into false. Runs
+ * that predate the feature have no identities at all.
+ */
+export interface ClusterIdentity {
+  clusterKey: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  /** Distinct runs this cause has appeared in. */
+  runsSeen: number;
+  occurrences: number;
+  /**
+   * An equality against `FailureSignature.firstSeenRunId`, not a window search.
+   * A cause that has failed for three weeks is somebody's known problem; a
+   * cause ninety seconds old belongs to whoever just merged.
+   */
+  newInThisBuild: boolean;
+  /** Failing results in THIS run the worker attributed to this cause. */
+  membersThisRun: number;
+  /** What triaging this cause cost. One call for forty failures is the claim. */
+  modelCalls: number;
+  attachments: number;
+  suppressedThisRun: boolean;
+  mute: {
+    inForce: boolean;
+    until: string;
+    reason: string | null;
+    by: string | null;
+    suppressed: number;
+  } | null;
+}
+
 export interface FailureCluster {
   id: string;
   signature: string;
@@ -1066,6 +1189,7 @@ export interface FailureCluster {
   suggested: ClusterSuggestion;
   /** One member's untouched error text, so the grouping can be audited. */
   sample: string;
+  identity: ClusterIdentity | null;
 }
 
 /** A failure that matched nothing else — same shape minus the plural claims. */
@@ -1078,6 +1202,7 @@ export interface UnclusteredFailure {
   sample: string;
   /** NO_SIGNAL means the error carried nothing to group on — not "it is unique". */
   reason: 'ONLY_OCCURRENCE' | 'NO_SIGNAL';
+  identity: ClusterIdentity | null;
 }
 
 export interface ClusterReport {
@@ -1096,8 +1221,135 @@ export interface ClusterReport {
    * `failures` counts what was CLUSTERABLE, which can be lower than the run's
    * failedCount when a result carried no error text. Both are returned so the
    * UI never has to explain a number it cannot reconcile.
+   *
+   * The cost half is `triageCost` in apps/api/src/routes/clusters.ts, and the
+   * nulls are the point: `modelCalls` and `savedCalls` are NULL — never 0 —
+   * when no identity was recorded for this run at all. A run that predates the
+   * per-cause collapse spent its calls, and reporting 0 saved would read as
+   * "we saved everything", which is the opposite of the truth.
    */
-  summary: { failures: number; clustered: number; clusters: number; largestCluster: number };
+  summary: {
+    failures: number;
+    clustered: number;
+    clusters: number;
+    largestCluster: number;
+    modelCalls: number | null;
+    attachments: number | null;
+    /** What one-call-per-failure would have cost: the clustered count. */
+    wouldHaveBeen: number;
+    /** Floored at 0 — never a negative saving dressed up as a win. */
+    savedCalls: number | null;
+    suppressedCauses: number;
+  };
+}
+
+// ─── Triage feedback loops (/triage/*) ──────────────────────────────────────
+//
+// Four endpoints that shipped with no reader at all: the cause list (and the
+// mute roster inside it), the re-triage door, the mute doors, and the accuracy
+// scorecard. Shapes transcribed from apps/api/src/routes/triage.ts.
+
+/**
+ * One cause, as every endpoint in routes/triage.ts reports it (`causeView`).
+ *
+ * `muted` is not a field: a live mute is `mute.inForce`, computed through
+ * `muteInForce` at the server so an expired mute can never read as live at one
+ * endpoint and as expired at another. The expiry is still returned once it has
+ * passed, because "muted until last Tuesday" is the thing somebody has to
+ * decide about.
+ */
+export interface TriageCause {
+  clusterKey: string;
+  signature: string;
+  label: string;
+  firstSeenAt: string;
+  firstSeenRunId: string;
+  lastSeenAt: string;
+  lastSeenRunId: string;
+  runsSeen: number;
+  occurrences: number;
+  /**
+   * NULL — not false — when the request named no run. "Not new" and "nobody
+   * asked about a build" are different facts.
+   */
+  newInThisBuild: boolean | null;
+  mute: {
+    inForce: boolean;
+    until: string;
+    at: string | null;
+    by: string | null;
+    reason: string | null;
+    /** Failures swallowed while the mute was live. The cost of the silence. */
+    suppressed: number;
+  } | null;
+}
+
+/**
+ * `GET /triage/signatures`. `returned === limit` means THERE MAY BE MORE — a
+ * different statement from "that is all of them", which is why the endpoint
+ * returns both and why a surface has to say so.
+ */
+export interface TriageCauseList {
+  causes: TriageCause[];
+  returned: number;
+  limit: number;
+}
+
+/** One verdict kind's row in the scorecard. */
+export interface VerdictAccuracyRow {
+  verdict: Verdict['verdict'];
+  /** Verdicts of this kind the model produced in the window. */
+  minted: number;
+  /** Of those, how many a human actually looked at. */
+  reviewed: number;
+  accepted: number;
+  overridden: number;
+  muted: number;
+  pending: number;
+  /**
+   * NULL WHEN NOTHING WAS REVIEWED. Not 0 — "this verdict has never been
+   * wrong" and "nobody has ever checked it" are opposite facts, and printing
+   * 0% for the second reads as a pass. Any surface rendering this has to
+   * branch on the null.
+   */
+  overrideRatePercent: number | null;
+  correctedTo: Array<{ to: Verdict['verdict']; count: number }>;
+  /** One sentence a person can read without the table. */
+  sentence: string;
+}
+
+/** `GET /triage/accuracy`. */
+export interface TriageAccuracy {
+  projectId: string;
+  windowDays: number;
+  rows: VerdictAccuracyRow[];
+  totals: {
+    minted: number;
+    reviewed: number;
+    accepted: number;
+    overridden: number;
+    muted: number;
+    pending: number;
+    overrideRatePercent: number | null;
+    /** The share of verdicts a human ever looked at — the honesty denominator. */
+    reviewCoveragePercent: number | null;
+  };
+  /** What the numbers do and do not cover, in words, written to be printed. */
+  caveat: string;
+  kinds: Array<Verdict['verdict']>;
+  supersededCorrections: number;
+  supersededReviews: number;
+}
+
+/** `POST /triage/verdicts/:verdictId/retriage` — 202, and it supersedes. */
+export interface RetriageAccepted {
+  requested: number;
+  scope: 'member' | 'cluster';
+  split: boolean;
+  jobs: string[];
+  /** Set when a cause-wide request could only cover the one result. */
+  degradedToMember: string | null;
+  note: string;
 }
 
 // ─── Impact analysis (POST /impact/analyze, GET /impact/signals) ─────────────

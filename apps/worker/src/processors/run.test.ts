@@ -76,6 +76,40 @@ const h = vi.hoisted(
     materialise: (() => unknown) | null;
     materialiseCalls: number;
     cleanups: number;
+    /**
+     * The base-URL probe the REAL preflight is given. The preflight itself is
+     * imported for real (it depends on node:fs and @qaai/shared, no browser);
+     * only its one network call is a stand-in, because a unit test that reaches
+     * the network is not a unit test and a suite that fails on a train is a
+     * suite people delete.
+     */
+    probe: (
+      url: string,
+      timeoutMs: number,
+    ) => Promise<{
+      reached: boolean;
+      status: number | null;
+      detail: string;
+    }>;
+    /** Likewise the runnability probes: PATH and the browser install. */
+    probes: {
+      onPath?: (binary: string) => boolean;
+      browserInstalled?: (engine: string) => boolean | null;
+      platform?: string;
+    };
+    /** Every base-URL probe attempt, so the retry policy is observable. */
+    probeCalls: number;
+    /**
+     * Test types this build has NO plugin for.
+     *
+     * The registry answers every type, which is why the loop's own
+     * "no plugin for this type" branch was unreachable from this file — and
+     * therefore untested, including the typed reason it writes. Reaching it
+     * needs both halves: no plugin, AND a preflight that did not run (a working
+     * preflight refuses the type before the loop, which is the whole point of
+     * it).
+     */
+    pluginless: Set<string>;
   } => ({
     prisma: {},
     published: [],
@@ -93,6 +127,10 @@ const h = vi.hoisted(
     materialise: null,
     materialiseCalls: 0,
     cleanups: 0,
+    probe: async () => ({ reached: true, status: 200, detail: 'answered HTTP 200' }),
+    probes: { onPath: () => true, browserInstalled: () => true, platform: 'linux' },
+    probeCalls: 0,
+    pluginless: new Set<string>(),
   }),
 );
 
@@ -170,62 +208,129 @@ vi.mock('@qaai/storage', () => ({
  * So `gates.js` is imported FOR REAL (it depends only on @qaai/shared, no
  * browser) and everything that would open a browser stays a stand-in.
  */
-vi.mock('@qaai/runner', async () => ({
-  ...(await import('../../../../packages/runner/src/gates.js')),
-  reasonUnsupported: (type: string) => `${type} is not supported`,
+vi.mock('@qaai/runner', async () => {
+  const gates = await import('../../../../packages/runner/src/gates.js');
   /*
-   * Standing in for a real browser login. It records WHICH profile and HOW
-   * OFTEN, which is the assertion the per-profile cache exists to satisfy: one
-   * login per profile per run, including one for a profile that refuses.
+   * The PREFLIGHT is imported for real, for exactly the reason `gates.js` is:
+   * a stubbed preflight would make the thing under test unobservable. Its only
+   * two impure edges are injected — the base-URL request and the PATH/browser
+   * probes — so what runs here is the real decision logic over inputs a test
+   * controls, rather than a stand-in agreeing with whatever the processor does.
    */
-  signInWithProfile: async (profile: { id: string; name: string }) => {
-    h.logins.push(profile.id);
-    const refusal = h.loginRefusals.get(profile.id);
-    if (refusal) {
-      return { ok: false, storageState: null, message: refusal, expiresAt: null };
-    }
-    return {
-      ok: true,
-      storageState: { cookies: [{ name: 'sid', value: `session-for-${profile.id}` }] },
-      message: 'signed in',
-      expiresAt: new Date(Date.now() + 3600_000),
-    };
-  },
-  pluginFor: () => ({
-    validate: () => {},
-    execute: async (ctx: Record<string, unknown>, test: { id: string }) => {
-      h.executed.push(test.id);
-      h.contexts.push({
-        testId: test.id,
-        storageState: ctx.storageState,
-        workspace: (ctx.workspace as { root?: string } | null)?.root ?? null,
-        authProfileId: (ctx.authProfileId as string | null) ?? null,
-      });
-      h.afterExecute?.(test.id);
-      const status = (h.statusFor.get(test.id) ?? 'PASSED') as 'PASSED';
+  const preflight = await import('../../../../packages/runner/src/preflight.js');
+  return {
+    ...gates,
+    ...preflight,
+    environmentPreflight: (args: Parameters<typeof preflight.environmentPreflight>[0]) =>
+      preflight.environmentPreflight({
+        ...args,
+        probe: async (url: string, timeoutMs: number) => {
+          h.probeCalls += 1;
+          return h.probe(url, timeoutMs);
+        },
+        // No real waiting between retry attempts; the policy is asserted by
+        // counting attempts, not by timing them.
+        sleep: async () => {},
+      }),
+    runnabilityFor: (
+      types: readonly string[],
+      opts: { hasPlugin?: (type: string) => boolean } = {},
+    ) =>
+      preflight.checkRunnability(types as never, {
+        probes: h.probes,
+        pluginless: (type) =>
+          (opts.hasPlugin?.(type) ?? true) ? null : `${type} is not supported`,
+      }),
+    reasonUnsupported: (type: string) => `${type} is not supported`,
+    /*
+     * Standing in for a real browser login. It records WHICH profile and HOW
+     * OFTEN, which is the assertion the per-profile cache exists to satisfy: one
+     * login per profile per run, including one for a profile that refuses.
+     */
+    signInWithProfile: async (profile: { id: string; name: string }) => {
+      h.logins.push(profile.id);
+      const refusal = h.loginRefusals.get(profile.id);
+      if (refusal) {
+        return { ok: false, storageState: null, message: refusal, expiresAt: null };
+      }
       return {
-        testId: test.id,
-        status,
-        durationMs: 10,
-        steps: [],
-        network: [],
-        console: [],
-        videoKey: null,
-        traceKey: null,
-        errorMessage: status === 'PASSED' ? null : `${test.id} failed`,
-        retriedAndPassed: false,
-        findings: [],
+        ok: true,
+        storageState: { cookies: [{ name: 'sid', value: `session-for-${profile.id}` }] },
+        message: 'signed in',
+        expiresAt: new Date(Date.now() + 3600_000),
       };
     },
-  }),
-}));
+    pluginFor: (type: string) =>
+      h.pluginless.has(type)
+        ? null
+        : {
+            validate: () => {},
+            execute: async (ctx: Record<string, unknown>, test: { id: string }) => {
+              h.executed.push(test.id);
+              h.contexts.push({
+                testId: test.id,
+                storageState: ctx.storageState,
+                workspace: (ctx.workspace as { root?: string } | null)?.root ?? null,
+                authProfileId: (ctx.authProfileId as string | null) ?? null,
+              });
+              h.afterExecute?.(test.id);
+              const status = (h.statusFor.get(test.id) ?? 'PASSED') as 'PASSED';
+              return {
+                testId: test.id,
+                status,
+                durationMs: 10,
+                steps: [],
+                network: [],
+                console: [],
+                videoKey: null,
+                traceKey: null,
+                errorMessage: status === 'PASSED' ? null : `${test.id} failed`,
+                retriedAndPassed: false,
+                findings: [],
+              };
+            },
+          },
+  };
+});
 
-// run.ts reaches into schedule.ts for the monitor streak; index.ts imports the
-// tick from the same module, so one mock serves both.
-vi.mock('./schedule.js', () => ({
-  recordMonitorResult: async () => {},
-  processScheduleTick: async () => {},
-}));
+/*
+ * run.ts reaches into schedule.ts for the monitor streak and for the fail-fast
+ * rule; index.ts imports the tick from the same module, so one mock serves all
+ * three.
+ *
+ * The REAL module cannot be imported here, even partially: it pulls in
+ * apps/api's `start-run.js` and the closure loop, which between them want an
+ * environment, a queue and a browser. So `failFastTripped` is a stand-in that
+ * mirrors schedule.ts's rule, built on the runner's own
+ * `quarantineSuppresses` so that at least the quarantine arm is the real one —
+ * and what the tests below pin is the half that lives in run.ts: that the loop
+ * consults the rule with the right DATA (the status, `retriedAndPassed`, and
+ * the quarantine columns including the expiry), and obeys the answer. The rule
+ * itself is schedule.ts's own suite to own.
+ */
+vi.mock('./schedule.js', async () => {
+  const { quarantineSuppresses } = await import('../../../../packages/runner/src/gates.js');
+  return {
+    recordMonitorResult: async () => {},
+    processScheduleTick: async () => {},
+    failFastStopReason: (testName: string | null) =>
+      testName
+        ? `Fail-fast: "${testName}" failed, so the rest of this run was not executed.`
+        : 'Fail-fast: a test failed, so the rest of this run was not executed.',
+    failFastTripped: (
+      result: {
+        status: string;
+        retriedAndPassed: boolean;
+        test: { quarantined: boolean; quarantineExpiresAt: Date | null };
+      },
+      now: Date,
+    ) => {
+      if (result.status !== 'FAILED' && result.status !== 'TIMED_OUT') return false;
+      if (result.retriedAndPassed) return false;
+      return !quarantineSuppresses(result.test, now);
+    },
+  };
+});
 
 /*
  * ── index.ts's own imports ──────────────────────────────────────────────────
@@ -360,6 +465,14 @@ interface ResultRow {
   retriedAndPassed: boolean;
   durationMs: number;
   errorMessage?: string | null;
+  /**
+   * The typed reason as a COLUMN rather than as a tag in the message.
+   *
+   * Modelled because it is the half a surface can GROUP BY, and because a fake
+   * that dropped it would let the processor write the tag and nothing else —
+   * which is the state the column was shipped in: correct, queryable, empty.
+   */
+  notRunKind?: string | null;
   test: TestRow;
 }
 
@@ -385,6 +498,16 @@ interface RunRow {
   quarantinedFailedCount: number;
   gateResult: unknown;
   errorMessage: string | null;
+  /** §5 fail-fast: stop at the first real failure. */
+  failFast: boolean;
+  /**
+   * Set the moment something decides this run should stop early — the inline
+   * check in the loop, the sweep in schedule.ts, or a person pressing stop.
+   * Deliberately NOT a cancel: a fail-fast stop is a FAILED run that chose not
+   * to finish.
+   */
+  stopRequestedAt: Date | null;
+  stopReason: string | null;
 }
 
 interface Db {
@@ -401,6 +524,15 @@ interface Db {
   flakeHistory: Map<string, FlakeHistoryRow>;
   /** How much of the suite is quarantined, as the budget query would see it. */
   projectTests: TestRow[];
+  /**
+   * Triage verdicts that EXIST at finalisation, by test id.
+   *
+   * The fake returned `verdict: null` unconditionally, and that is a large part
+   * of why ENV_ISSUE could lead nowhere unnoticed: the one input that
+   * distinguishes "a credential expired" from "the code is broken" was
+   * unreachable from every test in this file.
+   */
+  verdicts: Map<string, { verdict: string; overriddenTo: string | null; reviewState: string }>;
 }
 
 /** One `TestFlakeHistory` row, as the upsert maintains it. */
@@ -488,6 +620,9 @@ function runRow(over: Partial<RunRow> = {}): RunRow {
     quarantinedFailedCount: 0,
     gateResult: null,
     errorMessage: null,
+    failFast: false,
+    stopRequestedAt: null,
+    stopReason: null,
     ...over,
   };
 }
@@ -505,6 +640,15 @@ function runMatches(row: RunRow, where: Record<string, unknown>): boolean {
   if ('finalizedAt' in where && where.finalizedAt === null && row.finalizedAt !== null)
     return false;
   if ('startedAt' in where && where.startedAt === null && row.startedAt !== null) return false;
+  /*
+   * `stopRequestedAt: null` is the first-writer-wins claim the inline fail-fast
+   * check shares with the sweep and with POST /team/runs/:runId/stop. A fake
+   * that ignored it would let a second writer overwrite the reason on the row,
+   * so the run's story would be whoever wrote LAST rather than whoever actually
+   * stopped it.
+   */
+  if ('stopRequestedAt' in where && where.stopRequestedAt === null && row.stopRequestedAt !== null)
+    return false;
   const status = where.status;
   if (typeof status === 'string' && row.status !== status) return false;
   if (status && typeof status === 'object') {
@@ -526,6 +670,8 @@ function fakeDb(
     profiles?: ProfileRow[];
     /** Every live test in the project, for the quarantine budget. */
     projectTests?: TestRow[];
+    /** Triage verdicts already recorded when the run finalises. */
+    verdicts?: Record<string, string>;
     /** The project's own cap, as a percent. Null means the documented default. */
     quarantineBudgetPercent?: number | null;
     /** Mutate the world the instant the processor has taken its snapshot. */
@@ -555,6 +701,12 @@ function fakeDb(
      * a whole suite; a test that cares about the budget overrides it.
      */
     projectTests: opts.projectTests ?? [],
+    verdicts: new Map(
+      Object.entries(opts.verdicts ?? {}).map(([testId, verdict]) => [
+        testId,
+        { verdict, overriddenTo: null, reviewState: 'PENDING' },
+      ]),
+    ),
     otherRuns: [
       runRow({ id: 'run2', status: 'RUNNING' }),
       runRow({ id: 'run3', status: 'QUEUED' }),
@@ -562,8 +714,20 @@ function fakeDb(
   };
 
   const runModel = {
-    findFirst: async (args: { where: Record<string, unknown> }) => {
+    findFirst: async (args: {
+      where: Record<string, unknown>;
+      include?: { results?: { where?: { shardIndex?: number } } };
+    }) => {
       if (!runMatches(db.run, args.where)) return null;
+      /*
+       * The SHARD FILTER, honoured. The processor passes
+       * `results: { where: { shardIndex } }` so a shard executes only its own
+       * slice, and a fake that returned every row would have each shard run the
+       * whole suite — which would make the completion rule, the per-shard
+       * counts and every assertion about a sibling's untouched rows
+       * meaningless.
+       */
+      const shardIndex = args.include?.results?.where?.shardIndex;
       const snapshot = {
         ...db.run,
         environment: { id: 'env1', baseUrl: 'https://staging.example.com' },
@@ -577,7 +741,10 @@ function fakeDb(
           repoInstallationId: null,
           defaultBranch: 'main',
         },
-        results: db.results,
+        results:
+          shardIndex === undefined
+            ? db.results
+            : db.results.filter((r) => r.shardIndex === shardIndex),
       };
       opts.afterFindFirst?.(db);
       return snapshot;
@@ -609,7 +776,7 @@ function fakeDb(
           // it would keep honouring a suppression that ran out.
           quarantineExpiresAt: r.test.quarantineExpiresAt,
         },
-        verdict: null,
+        verdict: db.verdicts.get(r.testId) ?? null,
       })),
     groupBy: async () => {
       const byStatus = new Map<string, number>();
@@ -618,14 +785,50 @@ function fakeDb(
     },
     update: async (args: {
       where: { id: string };
-      data: { status?: string; errorMessage?: string | null };
+      data: { status?: string; errorMessage?: string | null; notRunKind?: string | null };
     }) => {
       const row = db.results.find((r) => r.id === args.where.id);
       if (row && args.data.status) row.status = args.data.status;
       // The MESSAGE is the product here: an unrunnable test is only honest if
       // it says why, so the fake has to keep it for the assertions to see.
       if (row && 'errorMessage' in args.data) row.errorMessage = args.data.errorMessage ?? null;
+      /*
+       * And the COLUMN, kept separately from the message rather than derived
+       * from it. A fake that reparsed the tag out of `errorMessage` would
+       * report a kind for a row the processor never wrote one to, which is the
+       * "a null that became a value" mistake performed by the test harness.
+       */
+      if (row && 'notRunKind' in args.data) row.notRunKind = args.data.notRunKind ?? null;
       return {};
+    },
+    /*
+     * The bulk stamp that records WHY untouched placeholders did not run.
+     *
+     * Its `where` is modelled faithfully and that is the whole value of it:
+     * `errorMessage: null` is what keeps the stamp off rows the execution loop
+     * already wrote, and a fake that ignored the filter would pass even if the
+     * processor relabelled a plugin's own skip as "cancelled". (Confirmed by
+     * mutation: dropping the filter from the processor is caught here.)
+     */
+    updateMany: async (args: {
+      where: Record<string, unknown>;
+      data: { errorMessage?: string | null; notRunKind?: string | null };
+    }) => {
+      const matched = db.results.filter((r) => {
+        if (args.where.status !== undefined && r.status !== args.where.status) return false;
+        if ('errorMessage' in args.where && args.where.errorMessage === null) {
+          if (r.errorMessage !== null && r.errorMessage !== undefined) return false;
+        }
+        if (args.where.shardIndex !== undefined && r.shardIndex !== args.where.shardIndex) {
+          return false;
+        }
+        return true;
+      });
+      for (const row of matched) {
+        row.errorMessage = args.data.errorMessage ?? null;
+        if ('notRunKind' in args.data) row.notRunKind = args.data.notRunKind ?? null;
+      }
+      return { count: matched.length };
     },
   };
 
@@ -822,6 +1025,10 @@ beforeEach(() => {
   h.materialise = null;
   h.materialiseCalls = 0;
   h.cleanups = 0;
+  h.probe = async () => ({ reached: true, status: 200, detail: 'answered HTTP 200' });
+  h.probes = { onPath: () => true, browserInstalled: () => true, platform: 'linux' };
+  h.probeCalls = 0;
+  h.pluginless = new Set<string>();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2001,5 +2208,1446 @@ describe('the flake trend', () => {
 
     expect(db.run.status).toBe('PASSED');
     expect(h.log).toContain('warn:could not record the flake history point for this test');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (9) An unusable environment is not a suite of test failures
+//
+// The defect, stated as the customer experienced it: the VPN tunnel to staging
+// dropped, and QAAI reported eleven failing tests, a red board, a pass rate
+// down eleven, a coverage number down eleven and a pull-request comment naming
+// eleven "failures" — with the one fact that mattered, that NOTHING had been
+// measured, appearing nowhere at all. A red build caused by a dead host was
+// byte-identical to a red build caused by a bug.
+//
+// So these assertions are about three things that must never be confused:
+//
+//   · a run that COULD NOT be attempted is ERRORED with ENVIRONMENT_UNAVAILABLE
+//     and a BLOCKing gate line — not PASSED over untouched placeholder rows,
+//     and not FAILED as though the application had been judged;
+//   · a result QAAI could not attempt carries a TYPED reason, so "nobody wrote
+//     this yet", "this cannot run here" and "a person stopped the run" stop
+//     being one SKIPPED; and
+//   · the preflight is an instrument, so when the instrument breaks the suite
+//     executes exactly as it did before the instrument existed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A base URL that is not listening at all. */
+const deadHost = async () => ({
+  reached: false,
+  status: null,
+  detail: 'the connection was refused',
+});
+
+describe('a run whose environment never answered', () => {
+  it('executes nothing and reports ERRORED, not PASSED and not FAILED', async () => {
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(h.executed).toEqual([]);
+    /*
+     * The two wrong answers, ruled out by name. PASSED is what a bare `return`
+     * from the preflight would have produced — three placeholder SKIPPED rows,
+     * zero failures, a clean green board over a suite that never ran. FAILED is
+     * what executing the suite anyway produced before the preflight existed.
+     */
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.failedCount).toBe(0);
+    expect(db.run.skippedCount).toBe(3);
+  });
+
+  it('says ENVIRONMENT_UNAVAILABLE on the run, with the reason', async () => {
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/connection was refused/);
+    expect(db.run.errorMessage).toMatch(/not on your application/);
+  });
+
+  it('BLOCKS the gate, because nothing may merge on a run that did not happen', async () => {
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.passed).toBe(false);
+    const blocking = gate.evaluations.filter((e) => e.action === 'BLOCK');
+    expect(blocking).toHaveLength(1);
+    expect(blocking[0]!.detail).toMatch(/nothing in this run could be attempted/i);
+    expect(blocking[0]!.detail).toMatch(/nothing may merge/i);
+  });
+
+  it('tags every result BLOCKED_BY_ENV with the reason', async () => {
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    for (const row of db.results) {
+      expect(row.status).toBe('SKIPPED');
+      expect(row.errorMessage).toMatch(/^\[BLOCKED_BY_ENV\]/);
+      expect(row.errorMessage).toMatch(/verdict on the environment, not on your application/i);
+    }
+  });
+
+  it('still notifies, so the team hears that the environment is down', async () => {
+    // The whole value of an alert is that somebody receives it. A run that
+    // reports an environment fault into a database nobody is watching is the
+    // "correct code wired to nothing" shape this repo has a CI check for.
+    fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(h.notified.map((n) => n.event)).toContain('run.finished');
+    const [finished] = published('run.finished');
+    expect(finished!.data.environment).toMatchObject({ unattemptable: true, blockedByEnv: 3 });
+  });
+
+  it('publishes a live frame naming the failed check', async () => {
+    fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    const [frame] = published('run.environment');
+    expect(frame).toBeTruthy();
+    expect(frame!.data.reason).toMatch(/connection was refused/);
+    const checks = frame!.data.checks as Array<{ name: string; kind: string }>;
+    expect(checks.map((c) => c.name)).toEqual(['BASE_URL']);
+    expect(checks[0]!.kind).toBe('BLOCKED_BY_ENV');
+  });
+
+  it('retries the probe before condemning the run', async () => {
+    // One unlucky packet must never cancel a suite: a false negative here costs
+    // every test in the run, not one.
+    fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(h.probeCalls).toBe(3);
+  });
+
+  it('runs the whole suite when the first attempt was the unlucky one', async () => {
+    const db = fakeDb();
+    let attempts = 0;
+    h.probe = async () => {
+      attempts += 1;
+      return attempts === 1
+        ? { reached: false, status: null, detail: 'the connection was reset' }
+        : { reached: true, status: 200, detail: 'answered HTTP 200' };
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2', 't3']);
+    expect(db.run.status).toBe('PASSED');
+    // Second attempt succeeded, so the third was never made.
+    expect(h.probeCalls).toBe(2);
+  });
+
+  it('does not treat a 500 from the application as an unusable environment', async () => {
+    /*
+     * The most important assertion in this file. A 5xx from the app under test
+     * is very possibly THE BUG, and a preflight that refused to run on one
+     * would suppress exactly the run that was about to catch an outage.
+     */
+    const db = fakeDb();
+    h.probe = async () => ({
+      reached: true,
+      status: 500,
+      detail: 'answered HTTP 500',
+    });
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2', 't3']);
+    expect(db.run.status).toBe('PASSED');
+    expect(published('run.environment')).toEqual([]);
+  });
+
+  it('does not probe a login against a host that is not listening', async () => {
+    // A failed login against a dead host measures the host a second time and
+    // reports it as a credential problem, sending the reader to rotate a
+    // password that was never broken.
+    fakeDb({
+      results: [resultFor('t1', { authProfileId: 'p_admin' })],
+      profiles: [profileRow({ id: 'p_admin' })],
+    });
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(h.logins).toEqual([]);
+  });
+});
+
+describe('a run whose only identity no longer signs in', () => {
+  it('reports ENVIRONMENT_UNAVAILABLE instead of a wall of failing tests', async () => {
+    /*
+     * The register defect in one test: "a broken login turns into N test
+     * failures that poison the pass rate AND the coverage number". Two tests
+     * on one rotated password used to be two FAILED rows.
+     */
+    const db = fakeDb({
+      results: [
+        resultFor('t1', { authProfileId: 'p_admin' }),
+        resultFor('t2', { authProfileId: 'p_admin' }),
+      ],
+      profiles: [profileRow({ id: 'p_admin' })],
+    });
+    h.loginRefusals.set('p_admin', 'the password was rejected');
+
+    await processRun(job());
+
+    expect(h.executed).toEqual([]);
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.failedCount).toBe(0);
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/no longer works/);
+    // One login for one profile, probe included — not one per test.
+    expect(h.logins).toEqual(['p_admin']);
+  });
+
+  it('still FAILS a test whose binding is broken rather than its environment', async () => {
+    /*
+     * The other half, and the line this change refuses to cross. A profile
+     * somebody DELETED is a defect in the suite — a test claiming a role it
+     * cannot have — and a skip does not block a gate, so filing it as "the
+     * environment" would let a suite whose permission tests stopped running
+     * keep merging green. Only a credential the application actually REFUSED
+     * counts as the environment.
+     */
+    const db = fakeDb({
+      results: [resultFor('t1', { authProfileId: 'p_gone' })],
+      profiles: [],
+    });
+
+    await processRun(job());
+
+    expect(db.results[0]!.status).toBe('FAILED');
+    expect(db.run.status).toBe('FAILED');
+    expect(db.run.errorMessage).toBeNull();
+  });
+});
+
+describe('a test type this deployment cannot execute', () => {
+  it('is UNSUPPORTED before the run, not a plugin discovering ENOENT after it', async () => {
+    /*
+     * A LOAD test on an image with no k6. `plugins/load.ts` already handled
+     * this honestly — it spawns k6, reads ENOENT and reports SKIPPED with an
+     * install line — but only after the run had been queued, scheduled and
+     * started. The preflight answers it for free, before anything executes,
+     * and the reason is now typed rather than a sentence.
+     */
+    const db = fakeDb({
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'E2E' })],
+    });
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t2']);
+    expect(db.results[0]!.status).toBe('SKIPPED');
+    expect(db.results[0]!.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    expect(db.results[0]!.errorMessage).toMatch(/cannot execute LOAD tests/);
+    // The install line, because a refusal with no remedy is a wall.
+    expect(db.results[0]!.errorMessage).toMatch(/brew install k6/);
+  });
+
+  it('distinguishes "this cannot run here" from "the environment is broken"', async () => {
+    // One SKIPPED used to carry both. The tags are the fix, and they point at
+    // different people: one installs a tool on the worker, the other fixes the
+    // thing under test.
+    const db = fakeDb({
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'UNIT_GEN' })],
+    });
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+
+    await processRun(job());
+
+    expect(db.results[0]!.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    // UNIT_GEN needs a checkout, and this project has no repository.
+    expect(db.results[1]!.errorMessage).toMatch(/^\[BLOCKED_BY_ENV\]/);
+  });
+
+  it('WARNS on the gate rather than blocking, when the rest of the suite ran', async () => {
+    /*
+     * The policy, asserted so it is a decision rather than an accident: 400
+     * passing tests are still 400 passing tests, and holding every release
+     * because one type has no tool is how a brake gets switched off by the
+     * people it protects. The cost is real and is named in run.ts: such a run
+     * CAN still report PASSED with tests nobody executed.
+     */
+    const db = fakeDb({
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'E2E' })],
+    });
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+
+    await processRun(job());
+
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.passed).toBe(true);
+    const warned = gate.evaluations.filter(
+      (e) => e.action === 'WARN' && /deployment cannot execute/i.test(e.detail),
+    );
+    expect(warned).toHaveLength(1);
+    expect(db.run.status).toBe('PASSED');
+  });
+
+  it('never refuses a type whose tool the spec chooses', async () => {
+    /*
+     * Lighthouse is optional — plugins/performance.ts falls back to its own
+     * collector "which costs the audit detail and nothing else" — and which
+     * engines a CROSS_BROWSER test wants is in its own spec. Refusing either
+     * would refuse a test that works, which is the preflight causing the very
+     * outcome it exists to prevent.
+     */
+    const db = fakeDb({
+      results: [
+        resultFor('t1', { type: 'PERFORMANCE' }),
+        resultFor('t2', { type: 'CROSS_BROWSER' }),
+      ],
+    });
+    h.probes = {
+      onPath: (binary) => binary !== 'lighthouse',
+      browserInstalled: (engine) => engine === 'chromium',
+      platform: 'linux',
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2']);
+    expect(db.run.status).toBe('PASSED');
+  });
+});
+
+describe('ENV_ISSUE, the triage verdict that used to lead nowhere', () => {
+  it('reports ERRORED rather than FAILED when every failure was the environment', async () => {
+    /*
+     * THE DEFECT. `BLOCKING_VERDICTS` is REAL_BUG alone, so an ENV_ISSUE never
+     * blocked the gate — and it did not have to, because the FAILED result had
+     * already put the run at FAILED through `counts.failed`. A board red from
+     * an expired credential was indistinguishable from a board red from a bug.
+     */
+    const db = fakeDb({
+      results: [resultFor('t1'), resultFor('t2')],
+      verdicts: { t2: 'ENV_ISSUE' },
+    });
+    h.statusFor = new Map([['t2', 'FAILED']]);
+
+    await processRun(job());
+
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/triaged as environment issues/);
+  });
+
+  it('does not rewrite the counters, so the five columns still sum to the results', async () => {
+    /*
+     * Deliberately NOT suppressed in the counts. `failedCount` still says one
+     * test failed, because one did; moving it to a sixth bucket needs a column
+     * this change does not own, and moving it into `skipped` is the same
+     * mistake in a kinder word that gates.ts already refuses for quarantine.
+     */
+    const db = fakeDb({
+      results: [resultFor('t1'), resultFor('t2')],
+      verdicts: { t2: 'ENV_ISSUE' },
+    });
+    h.statusFor = new Map([['t2', 'FAILED']]);
+
+    await processRun(job());
+
+    expect(db.run.failedCount).toBe(1);
+    expect(db.run.skippedCount).toBe(0);
+    const total =
+      db.run.passedCount +
+      db.run.failedCount +
+      db.run.flakyCount +
+      db.run.skippedCount +
+      db.run.quarantinedFailedCount;
+    expect(total).toBe(db.results.length);
+  });
+
+  it('suppresses the gate rather than failing it, and alerts', async () => {
+    // `BLOCKING_VERDICTS` says ENV_ISSUE "alerts but never gates". The WARN is
+    // the alert — it reaches the chat message, the check summary, the CLI's
+    // output and the run page through plumbing that already exists.
+    const db = fakeDb({
+      results: [resultFor('t1'), resultFor('t2')],
+      verdicts: { t2: 'ENV_ISSUE' },
+    });
+    h.statusFor = new Map([['t2', 'FAILED']]);
+
+    await processRun(job());
+
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.evaluations.some((e) => e.action === 'BLOCK')).toBe(false);
+    expect(
+      gate.evaluations.filter(
+        (e) => e.action === 'WARN' && /triaged as environment issues/.test(e.detail),
+      ),
+    ).toHaveLength(1);
+    expect(h.notified.map((n) => n.event)).toContain('run.finished');
+    const [finished] = published('run.finished');
+    expect(finished!.data.environment).toMatchObject({ envIssueFailures: 1 });
+  });
+
+  it('still reports FAILED when a real bug failed alongside the environment one', async () => {
+    // The run must not be excused by one environment failure. Only when EVERY
+    // gating failure was the environment's does the verdict change.
+    const db = fakeDb({
+      results: [resultFor('t1'), resultFor('t2'), resultFor('t3')],
+      verdicts: { t2: 'ENV_ISSUE' },
+    });
+    h.statusFor = new Map([
+      ['t2', 'FAILED'],
+      ['t3', 'FAILED'],
+    ]);
+
+    await processRun(job());
+
+    expect(db.run.status).toBe('FAILED');
+    expect(db.run.errorMessage).toBeNull();
+  });
+
+  it('honours a human override of the verdict, exactly as the gate does', async () => {
+    const db = fakeDb({ results: [resultFor('t1')], verdicts: {} });
+    db.verdicts.set('t1', {
+      verdict: 'REAL_BUG',
+      overriddenTo: 'ENV_ISSUE',
+      reviewState: 'OVERRIDDEN',
+    });
+    h.statusFor = new Map([['t1', 'FAILED']]);
+
+    await processRun(job());
+
+    expect(db.run.status).toBe('ERRORED');
+  });
+});
+
+describe('the typed reason a result did not run', () => {
+  it('stamps CANCELLED on the tests a cancel never reached', async () => {
+    /*
+     * A placeholder SKIPPED and a deliberate skip were one value. "A person
+     * stopped this" and "a worker died holding it" lead to different actions —
+     * one is nothing to do, the other is a re-run — and the suite could not
+     * tell them apart.
+     */
+    const db = fakeDb();
+    h.afterExecute = (testId) => {
+      if (testId === 't1') db.run.status = 'CANCELLED';
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1']);
+    expect(db.results[1]!.errorMessage).toMatch(/^\[CANCELLED\]/);
+    expect(db.results[2]!.errorMessage).toMatch(/^\[CANCELLED\]/);
+    expect(db.run.status).toBe('CANCELLED');
+  });
+
+  it('never relabels a result the execution loop already explained', async () => {
+    /*
+     * `errorMessage: null` is the whole safety of the bulk stamp: a row with a
+     * message was written by the loop, which knew more than a sweep does. A
+     * cancel must not rewrite "no repository checkout" as "cancelled".
+     */
+    const db = fakeDb({
+      results: [
+        resultFor('t1', { type: 'UNIT_GEN' }),
+        resultFor('t2', { type: 'E2E' }),
+        resultFor('t3', { type: 'E2E' }),
+      ],
+    });
+    h.afterExecute = (testId) => {
+      if (testId === 't2') db.run.status = 'CANCELLED';
+    };
+
+    await processRun(job());
+
+    expect(db.results[0]!.errorMessage).toMatch(/^\[BLOCKED_BY_ENV\]/);
+    expect(db.results[0]!.errorMessage).toMatch(/was not evaluated/);
+    expect(db.results[2]!.errorMessage).toMatch(/^\[CANCELLED\]/);
+  });
+
+  it('tags an unsupported TYPE separately from an unusable environment', async () => {
+    const db = fakeDb({ results: [resultFor('t1', { type: 'E2E' })] });
+    // The registry has a plugin for every type, so the only way to be
+    // pluginless here is the mock's own lookup saying so.
+    h.probes = { onPath: () => true, browserInstalled: () => false, platform: 'linux' };
+
+    await processRun(job());
+
+    expect(db.results[0]!.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    expect(db.results[0]!.errorMessage).toMatch(/npx playwright install/);
+    expect(db.run.status).toBe('ERRORED');
+  });
+});
+
+describe('the preflight as an instrument', () => {
+  it('executes the suite exactly as before when the preflight itself breaks', async () => {
+    /*
+     * The rule the whole feature rests on, and the same one `loadProjectPlugins`
+     * is written under: a broken instrument must not cost a customer their CI
+     * run. A `TypeError` in a PATH probe falls back to the behaviour that
+     * existed before any of this, where a missing tool surfaces as the plugin's
+     * own ENOENT skip.
+     */
+    const db = fakeDb();
+    const explode = (): never => {
+      throw new Error('the probe exploded');
+    };
+    h.probes = { onPath: explode, browserInstalled: explode };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2', 't3']);
+    expect(db.run.status).toBe('PASSED');
+    expect(h.log).toContain(
+      'error:the environment preflight itself failed; executing the suite as if it had not run',
+    );
+  });
+
+  it('adds no logins to a run that was already authenticating', async () => {
+    /*
+     * The probe IS the login the run was going to perform — it goes through the
+     * run's own session cache. A preflight that signed in separately would
+     * charge every authenticated run a second browser launch per profile, which
+     * is a tax on every customer to catch an occasional rotated password.
+     */
+    fakeDb({
+      results: [
+        resultFor('t1', { authProfileId: 'p_admin' }),
+        resultFor('t2', { authProfileId: 'p_admin' }),
+        resultFor('t3', { authProfileId: 'p_member' }),
+      ],
+      profiles: [profileRow({ id: 'p_admin' }), profileRow({ id: 'p_member' })],
+    });
+
+    await processRun(job());
+
+    expect(h.logins).toEqual(['p_admin', 'p_member']);
+    expect(h.executed).toEqual(['t1', 't2', 't3']);
+  });
+
+  it('probes nothing for a suite that never touches the environment over HTTP', async () => {
+    // A CLI-only suite has nothing to be right or wrong about, and a probe it
+    // did not need is a request somebody else's server has to answer.
+    fakeDb({ results: [resultFor('t1', { type: 'CLI' })] });
+
+    await processRun(job());
+
+    expect(h.probeCalls).toBe(0);
+    expect(h.executed).toEqual(['t1']);
+  });
+});
+
+describe('a sharded run whose slices could not be attempted', () => {
+  /**
+   * A minimal `RunShard` table, installed over the one `fakeDb` provides.
+   *
+   * Enough of it to be honest about the three queries the completion rule makes
+   * — the claim, the reap, and "are my siblings done?" — because the question
+   * this suite asks is whether a SHARDED run reports an unusable environment
+   * the same way an unsharded one does, and that answer is produced entirely by
+   * those three.
+   */
+  /**
+   * One result per shard, each routed to its own slice.
+   *
+   * `shardIndex` is what makes a sharded run sharded — the processor filters on
+   * it so a shard executes only its own tests — and a slice with no rows in it
+   * is NOT unattemptable, it is empty. Leaving these null made every shard read
+   * as a shard with nothing to do, which is a different (and correct) answer to
+   * a different question.
+   */
+  const slicedResults = (count = 2) =>
+    Array.from({ length: count }, (_, index) => ({
+      ...resultFor(`t${index + 1}`),
+      shardIndex: index,
+    }));
+
+  function withShards(count: number) {
+    const rows = Array.from({ length: count }, (_, index) => ({
+      index,
+      status: 'QUEUED',
+      errorMessage: null as string | null,
+    }));
+    const matches = (row: (typeof rows)[number], where: Record<string, unknown>): boolean => {
+      if (where.index !== undefined && row.index !== where.index) return false;
+      if (typeof where.status === 'string' && row.status !== where.status) return false;
+      if (Array.isArray(where.OR)) {
+        return (where.OR as Array<Record<string, unknown>>).some(
+          (arm) => typeof arm.status !== 'string' || arm.status === row.status,
+        );
+      }
+      return true;
+    };
+    h.prisma.runShard = {
+      updateMany: async (args: {
+        where: Record<string, unknown>;
+        data: Record<string, unknown>;
+      }) => {
+        const hit = rows.filter((row) => matches(row, args.where));
+        for (const row of hit) Object.assign(row, args.data);
+        return { count: hit.length };
+      },
+      findUnique: async (args: { where: { runId_index: { index: number } } }) =>
+        rows.find((row) => row.index === args.where.runId_index.index) ?? null,
+      findMany: async () => rows.map((row) => ({ ...row })),
+    };
+    return rows;
+  }
+
+  it('marks its shard FAILED, so siblings cannot finalise the run as a clean pass', async () => {
+    /*
+     * The worst outcome available here. A shard that executed nothing and
+     * reported COMPLETED would let the last sibling finalise the run over
+     * placeholder rows — a green board across a suite that never ran, which is
+     * the single failure the whole sharding feature was written to prevent.
+     */
+    fakeDb({ run: { shardCount: 2, totalCount: 2 }, results: slicedResults() });
+    const shards = withShards(2);
+    h.probe = deadHost;
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    expect(h.executed).toEqual([]);
+    expect(shards[0]!.status).toBe('FAILED');
+    expect(shards[0]!.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    // Sibling still QUEUED, so nothing has finalised yet.
+    expect(shards[1]!.status).toBe('QUEUED');
+  });
+
+  it('reports ENVIRONMENT_UNAVAILABLE in the run message, not buried inside it', async () => {
+    /*
+     * Composing the shards' messages used to bury the marker mid-string — "2 of
+     * 2 shards did not complete (shard 0: ENVIRONMENT_UNAVAILABLE: …)" — and a
+     * prefix in the middle of a sentence is not a prefix. The identical
+     * unsharded run said so in its first word; this one could not be
+     * distinguished from a run whose workers crashed.
+     */
+    const db = fakeDb({ run: { shardCount: 1, totalCount: 1 }, results: slicedResults(1) });
+    withShards(1);
+    h.probe = deadHost;
+
+    await processRun(job({ shard: { index: 0, count: 1 } }));
+
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/could not be attempted/);
+    expect(db.run.errorMessage).toMatch(/connection was refused/);
+  });
+
+  it('derives the BLOCKing gate line from the rows, since no shard holds the whole run', async () => {
+    // A shard knows its own slice was unattemptable and nothing about its
+    // siblings'. The run-level answer therefore comes from the result rows,
+    // which are the only place that holds the whole run.
+    const db = fakeDb({ run: { shardCount: 1, totalCount: 1 }, results: slicedResults(1) });
+    withShards(1);
+    h.probe = deadHost;
+
+    await processRun(job({ shard: { index: 0, count: 1 } }));
+
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.passed).toBe(false);
+    expect(gate.evaluations.some((e) => e.action === 'BLOCK')).toBe(true);
+  });
+
+  it('keeps the plain wording when a shard died for a reason that was not the environment', async () => {
+    // One shard whose worker blew up alongside one whose environment was down
+    // is a run that failed for two reasons, and naming only the kinder one
+    // would be the reassuring half of a true answer.
+    const db = fakeDb({ run: { shardCount: 2, totalCount: 2 }, results: slicedResults() });
+    const shards = withShards(2);
+    shards[1]!.status = 'FAILED';
+    shards[1]!.errorMessage = 'the worker ran out of memory';
+    h.probe = deadHost;
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.errorMessage).not.toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/2 of 2 shards did not complete/);
+    expect(db.run.errorMessage).toMatch(/ran out of memory/);
+  });
+
+  it('does not claim the whole run was unattemptable when a sibling finished', async () => {
+    /*
+     * THE SELF-CONTRADICTING RUN. This is the probe, verbatim: two shards, the
+     * first one env-dead, the second COMPLETED with a pass. The run used to
+     * report `ENVIRONMENT_UNAVAILABLE: 1 of 2 shards could not be attempted`
+     * while its own gate line said only PART of the suite was blocked and
+     * `gateResult.passed` was true — because the hoist asked "was every BROKEN
+     * shard environmental?", which is not the question the marker answers.
+     *
+     * @qaai/shared documents the prefix as meaning "a run the environment made
+     * impossible". One of these two tests was executed and passed, so this run
+     * is not that, and a program reading the one machine-readable field would
+     * have been told it was.
+     */
+    const db = fakeDb({
+      run: { shardCount: 2, totalCount: 2 },
+      results: [
+        { ...resultFor('t1'), shardIndex: 0 },
+        // The sibling's slice, already executed and green.
+        { ...resultFor('t2'), shardIndex: 1, status: 'PASSED', errorMessage: null },
+      ],
+    });
+    const shards = withShards(2);
+    shards[1]!.status = 'COMPLETED';
+    h.probe = deadHost;
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    // Still ERRORED, and still says a shard could not be attempted — what it
+    // no longer says is that the RUN could not be.
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.errorMessage).not.toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/1 of 2 shards could not be attempted/);
+    expect(db.run.errorMessage).toMatch(/connection was refused/);
+
+    // And the gate agrees with the message now, rather than contradicting it.
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.passed).toBe(true);
+    expect(
+      gate.evaluations.some((e) => e.action === 'WARN' && /^Environment —/.test(e.detail)),
+    ).toBe(true);
+    expect(gate.evaluations.some((e) => e.action === 'BLOCK')).toBe(false);
+    expect(db.run.passedCount).toBe(1);
+    expect(db.run.skippedCount).toBe(1);
+  });
+
+  it('reports a MISSING TOOL as this deployment’s gap, not the environment’s', async () => {
+    /*
+     * The same hoist, with the other marker. A shard of LOAD tests on an image
+     * with no k6 is a hole in OUR image: "install k6" and "check your VPN" are
+     * advice for different people, and the run-level field used to give the
+     * second answer to the first problem.
+     */
+    const db = fakeDb({
+      run: { shardCount: 1, totalCount: 1 },
+      results: [{ ...resultFor('t1', { type: 'LOAD' }), shardIndex: 0 }],
+    });
+    const shards = withShards(1);
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+
+    await processRun(job({ shard: { index: 0, count: 1 } }));
+
+    expect(shards[0]!.errorMessage).toMatch(/^TOOLING_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/^TOOLING_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/brew install k6/);
+    expect(db.run.status).toBe('ERRORED');
+  });
+
+  it('keeps the plain wording when the shards failed for two different gaps', async () => {
+    /*
+     * One shard with no k6 beside one whose host never answered is a run that
+     * failed for two reasons, and hoisting either marker would name one of them
+     * as the whole cause. Same rule as the dead-worker case above, one level
+     * finer: "every one of them, and the same one".
+     */
+    const db = fakeDb({ run: { shardCount: 2, totalCount: 2 }, results: slicedResults() });
+    const shards = withShards(2);
+    shards[1]!.status = 'FAILED';
+    shards[1]!.errorMessage = 'ENVIRONMENT_UNAVAILABLE: the connection was refused.';
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+    db.results[0]!.test.type = 'LOAD';
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    expect(db.run.errorMessage).not.toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    expect(db.run.errorMessage).not.toMatch(/^TOOLING_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/2 of 2 shards did not complete/);
+    // Both causes survive into the composed sentence.
+    expect(db.run.errorMessage).toMatch(/TOOLING_UNAVAILABLE/);
+    expect(db.run.errorMessage).toMatch(/connection was refused/);
+  });
+});
+
+describe('the tests a dead shard never reached', () => {
+  it('records NOT_RUN rather than leaving them indistinguishable from a skip', async () => {
+    /*
+     * A shard whose worker died leaves its slice sitting at the placeholder
+     * SKIPPED that run creation wrote, and that placeholder was
+     * indistinguishable from a test somebody deliberately skipped. "Nobody
+     * reached this" and "this was skipped on purpose" lead to different actions
+     * — one is a re-run, the other is nothing — and the suite could not tell
+     * them apart.
+     *
+     * NOT_RUN is deliberately the weakest of the four kinds: this process knows
+     * only that the shard ended and that nothing wrote to these rows.
+     */
+    const db = fakeDb({
+      run: { shardCount: 2, totalCount: 2 },
+      results: [
+        { ...resultFor('t1'), shardIndex: 0 },
+        { ...resultFor('t2'), shardIndex: 1 },
+      ],
+    });
+    const rows = Array.from({ length: 2 }, (_, index) => ({
+      index,
+      status: index === 1 ? 'ABANDONED' : 'QUEUED',
+      errorMessage: index === 1 ? 'No heartbeat for 300s — the worker is gone.' : null,
+    }));
+    h.prisma.runShard = {
+      updateMany: async (args: { where: { index?: number }; data: Record<string, unknown> }) => {
+        const hit = rows.filter(
+          (r) => args.where.index === undefined || r.index === args.where.index,
+        );
+        // Only the claim/finish path writes here in this test; the reaper's
+        // RUNNING filter matches nothing because neither shard is RUNNING.
+        if (args.where.index !== undefined) for (const r of hit) Object.assign(r, args.data);
+        return { count: args.where.index === undefined ? 0 : hit.length };
+      },
+      findUnique: async (args: { where: { runId_index: { index: number } } }) =>
+        rows.find((r) => r.index === args.where.runId_index.index) ?? null,
+      findMany: async () => rows.map((r) => ({ ...r })),
+    };
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    // Shard 0's own test ran and is untouched by the stamp.
+    expect(h.executed).toEqual(['t1']);
+    expect(db.results[0]!.status).toBe('PASSED');
+    // Shard 1's never did, and now says so.
+    expect(db.results[1]!.status).toBe('SKIPPED');
+    expect(db.results[1]!.errorMessage).toMatch(/^\[NOT_RUN\]/);
+    expect(db.results[1]!.errorMessage).toMatch(/Shard 1 did not complete/);
+    expect(db.results[1]!.errorMessage).toMatch(/No heartbeat/);
+    // And the run cannot report a pass over a slice that never executed.
+    expect(db.run.status).toBe('ERRORED');
+  });
+
+  it('never stamps a sibling slice another worker is still executing', async () => {
+    /*
+     * The scoping, and it is not hypothetical: five shards poll the same run
+     * row, so a cancel is seen by whichever shard looks next. An unscoped stamp
+     * from shard 0 would write "cancelled" onto shard 1's untouched rows while
+     * shard 1 is still running those very tests — and shard 1 would then
+     * persist real results over a message claiming nobody ran them, or lose the
+     * race and leave a lie on the row.
+     */
+    const db = fakeDb({
+      run: { shardCount: 2, totalCount: 3 },
+      results: [
+        { ...resultFor('t1'), shardIndex: 0 },
+        { ...resultFor('t2'), shardIndex: 0 },
+        { ...resultFor('t3'), shardIndex: 1 },
+      ],
+    });
+    const rows = [
+      { index: 0, status: 'QUEUED', errorMessage: null as string | null },
+      // Alive and still working: its slice is nobody else's to label.
+      { index: 1, status: 'RUNNING', errorMessage: null as string | null },
+    ];
+    h.prisma.runShard = {
+      updateMany: async (args: { where: { index?: number }; data: Record<string, unknown> }) => {
+        if (args.where.index === undefined) return { count: 0 };
+        const hit = rows.filter((r) => r.index === args.where.index);
+        for (const r of hit) Object.assign(r, args.data);
+        return { count: hit.length };
+      },
+      findUnique: async (args: { where: { runId_index: { index: number } } }) =>
+        rows.find((r) => r.index === args.where.runId_index.index) ?? null,
+      findMany: async () => rows.map((r) => ({ ...r })),
+    };
+    h.afterExecute = (testId) => {
+      if (testId === 't1') db.run.status = 'CANCELLED';
+    };
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    expect(h.executed).toEqual(['t1']);
+    // This shard's own unreached test is labelled.
+    expect(db.results[1]!.errorMessage).toMatch(/^\[CANCELLED\]/);
+    // The live sibling's is untouched — still the placeholder it was created as.
+    expect(db.results[2]!.errorMessage ?? null).toBeNull();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (10) Fail-fast, and the stop request nothing used to read
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE DEFECT, VERBATIM: "Enforce fail-fast and the stop request in the worker —
+ * the column, the migration, the endpoint and the user-facing promise all
+ * exist; the consumer does not, so a stop request is ignored."
+ *
+ * Four surfaces promised this behaviour. `createRunSchema` accepts `failFast`,
+ * POST /runs reports it back, `Run.failFast`/`stopRequestedAt`/`stopReason` are
+ * columns with a migration behind them, the sweep in schedule.ts writes the
+ * request once a minute, and POST /team/runs/:runId/stop told the caller the
+ * worker "checks between tests". The poll read `status` and `finalizedAt` and
+ * nothing else, so a fail-fast run executed all 5,000 tests after the first
+ * failure and a person pressing stop was ignored until the run ended on its own.
+ *
+ * The assertions are mostly about what must NOT happen: no test executed after
+ * the stop, and — the one that matters most — the run must not be relabelled
+ * CANCELLED. Cancelled means nobody wanted the answer; a fail-fast stop means
+ * the answer arrived early and was bad, and filing the second as the first puts
+ * a broken build in the same bucket as an abandoned one.
+ */
+describe('a fail-fast run that hits a real failure', () => {
+  const failing = (over: Partial<RunRow> = {}) => {
+    const db = fakeDb({ run: { failFast: true, totalCount: 3, ...over } });
+    h.statusFor.set('t1', 'FAILED');
+    return db;
+  };
+
+  it('stops after the failure instead of executing the rest of the suite', async () => {
+    const db = failing();
+
+    await processRun(job());
+
+    // t1 ran and failed; t2 and t3 were never started.
+    expect(h.executed).toEqual(['t1']);
+    expect(db.run.stopRequestedAt).toBeInstanceOf(Date);
+    expect(db.run.stopReason).toBe(
+      'Fail-fast: "test t1" failed, so the rest of this run was not executed.',
+    );
+  });
+
+  it('finalises FAILED on its real counts, and is never relabelled CANCELLED', async () => {
+    const db = failing();
+
+    await processRun(job());
+
+    /*
+     * The whole point of keeping `cancelled` false. CANCELLED would answer
+     * `passed: false` too, so the mistake would be invisible in the one place
+     * people look — and it would say a person abandoned a run that in fact
+     * failed, which is the opposite of what happened.
+     */
+    expect(db.run.status).toBe('FAILED');
+    expect(db.run.failedCount).toBe(1);
+    /*
+     * And the five columns still sum to the number of results. The in-memory
+     * counters describe only the test this process reached, so the summary is
+     * re-counted off the rows exactly as a cancel re-counts it; keeping them
+     * would have written `skippedCount: 0` over two SKIPPED results.
+     */
+    expect(db.run.skippedCount).toBe(2);
+    expect(
+      db.run.passedCount +
+        db.run.failedCount +
+        db.run.flakyCount +
+        db.run.skippedCount +
+        db.run.quarantinedFailedCount,
+    ).toBe(db.results.length);
+  });
+
+  it('records the tests it never reached as NOT_RUN, in the column as well as the tag', async () => {
+    const db = failing();
+
+    await processRun(job());
+
+    for (const row of db.results.slice(1)) {
+      expect(row.status).toBe('SKIPPED');
+      // NOT_RUN and deliberately not CANCELLED: nobody reached these, and
+      // nobody decided anything about them either.
+      expect(row.errorMessage).toMatch(/^\[NOT_RUN\]/);
+      expect(row.errorMessage).toMatch(/Fail-fast/);
+      // The queryable half. A prefix on a text column cannot be GROUP BY'd.
+      expect(row.notRunKind).toBe('NOT_RUN');
+    }
+    // The failure itself keeps its own message and carries NO kind: it ran.
+    expect(db.results[0]!.notRunKind ?? null).toBeNull();
+  });
+
+  it('says on the live frame that the run was halted, and how many were missed', async () => {
+    failing();
+
+    await processRun(job());
+
+    const finished = published('run.finished')[0]!.data as {
+      stopped: { reason: string; notReached: number } | null;
+      environment: { notReached: number; notRecorded: number };
+    };
+    /*
+     * Published rather than left to be inferred. A stopped run finalises on its
+     * real counts, which is right here because the counts are red — but a run
+     * halted while everything was green would report PASSED over tests nobody
+     * executed, so the FACT of the stop has to reach a surface either way.
+     */
+    expect(finished.stopped).not.toBeNull();
+    expect(finished.stopped!.notReached).toBe(2);
+    expect(finished.stopped!.reason).toMatch(/Fail-fast/);
+    // Counted as NOT REACHED, not as unexplained: these rows carry a reason.
+    expect(finished.environment.notReached).toBe(2);
+    expect(finished.environment.notRecorded).toBe(0);
+  });
+
+  it('does not stop on a failure a quarantine in force has suppressed', async () => {
+    /*
+     * A quarantined failure is a failure somebody explicitly switched off. It
+     * does not reach `failedCount` and it does not gate, so stopping a
+     * 5,000-test run on one would make quarantine suppress a failure
+     * everywhere except the one place where it ends the build early.
+     */
+    const db = fakeDb({
+      run: { failFast: true, totalCount: 2 },
+      results: [
+        resultFor('t1', {
+          quarantined: true,
+          quarantineExpiresAt: new Date(Date.now() + 86_400_000),
+        }),
+        resultFor('t2'),
+      ],
+    });
+    h.statusFor.set('t1', 'FAILED');
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2']);
+    expect(db.run.stopRequestedAt).toBeNull();
+  });
+
+  it('does stop on a failure whose quarantine has EXPIRED', async () => {
+    // The expiry arm, which is why the loop hands over the columns rather than
+    // the raw flag: a quarantine that ran out last week suppresses nothing.
+    const db = fakeDb({
+      run: { failFast: true, totalCount: 2 },
+      results: [
+        resultFor('t1', {
+          quarantined: true,
+          quarantineExpiresAt: new Date(Date.now() - 86_400_000),
+        }),
+        resultFor('t2'),
+      ],
+    });
+    h.statusFor.set('t1', 'FAILED');
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1']);
+    expect(db.run.stopRequestedAt).toBeInstanceOf(Date);
+  });
+
+  it('leaves the reason written by whoever asked first', async () => {
+    /*
+     * Idempotent by construction: the request is only ever written once, by the
+     * first writer. This sweep, a person in the cockpit and this loop can all
+     * race on the same run, and the row has to end up with one story.
+     */
+    const db = fakeDb({
+      run: {
+        failFast: true,
+        totalCount: 3,
+        stopRequestedAt: new Date(Date.now() - 1000),
+        stopReason: 'Stopped by a reviewer from the cockpit.',
+      },
+    });
+    h.statusFor.set('t1', 'FAILED');
+
+    await processRun(job());
+
+    expect(db.run.stopReason).toBe('Stopped by a reviewer from the cockpit.');
+    // And the pre-existing request stopped the run before anything executed.
+    expect(h.executed).toEqual([]);
+  });
+
+  it('runs the whole suite when fail-fast was not asked for', async () => {
+    // The normal case, so the brake cannot be applied to runs that never asked.
+    const db = fakeDb({ run: { totalCount: 3 } });
+    h.statusFor.set('t1', 'FAILED');
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1', 't2', 't3']);
+    expect(db.run.stopRequestedAt).toBeNull();
+    expect(db.run.status).toBe('FAILED');
+  });
+});
+
+describe('a run a person asked to stop', () => {
+  it('stops between tests, and is not reported as a cancel', async () => {
+    /*
+     * POST /team/runs/:runId/stop writes `stopRequestedAt` and deliberately not
+     * `status = CANCELLED`, and told the caller the worker checks between
+     * tests. It did not. This is that promise, kept — and the run keeps the
+     * verdict its results earned rather than being filed as abandoned.
+     */
+    const db = fakeDb({ run: { totalCount: 3 } });
+    h.afterExecute = (testId) => {
+      if (testId !== 't1') return;
+      db.run.stopRequestedAt = new Date();
+      db.run.stopReason = 'Stopped by a reviewer: the staging data is wrong.';
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1']);
+    expect(db.run.status).not.toBe('CANCELLED');
+    expect(db.results[1]!.errorMessage).toMatch(/^\[NOT_RUN\]/);
+    expect(db.results[1]!.errorMessage).toMatch(/the staging data is wrong/);
+    /*
+     * The known gap, asserted so that nobody mistakes it for an accident: with
+     * one passing test and two nobody reached, this run reports PASSED. It is
+     * the same hole a partially-blocked environment leaves, it needs the same
+     * fix (a MIN_ATTEMPTED_RATE gate rule, which needs a `GateRule` kind this
+     * change cannot add), and until then the stop is on the frame and on the
+     * rows rather than in the verdict.
+     */
+    expect(db.run.status).toBe('PASSED');
+    const finished = published('run.finished')[0]!.data as { stopped: { notReached: number } };
+    expect(finished.stopped.notReached).toBe(2);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (11) The environment and the image are different gaps
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * packages/runner/src/preflight.ts calls this conflation the design's central
+ * error, in these words: "install k6" is useless advice for a down staging box,
+ * and "check your VPN" is useless advice for a worker image that never had
+ * Lighthouse in it.
+ *
+ * The per-test rows have been honest about it since the typed kinds landed —
+ * `[UNSUPPORTED]` for a missing tool, `[BLOCKED_BY_ENV]` for an unusable
+ * environment — and the gate detail says "install the missing tool on the
+ * worker". The ONE MACHINE-READABLE RUN-LEVEL FACT said the opposite: a run of
+ * two LOAD tests on an image with no k6 reported
+ * `ENVIRONMENT_UNAVAILABLE: … missing k6`, and @qaai/shared documents that
+ * prefix as meaning "a run the environment made impossible".
+ */
+describe('a run nothing could be attempted in because a TOOL is missing', () => {
+  const noK6 = (): void => {
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+  };
+
+  it('does not report the customer’s environment as unavailable', async () => {
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'LOAD' })],
+    });
+    noK6();
+
+    await processRun(job());
+
+    expect(h.executed).toEqual([]);
+    // The marker names the right party, and the sentence after it is still
+    // complete English for a surface that has never heard of either prefix.
+    expect(db.run.errorMessage).not.toMatch(/ENVIRONMENT_UNAVAILABLE/);
+    expect(db.run.errorMessage).toMatch(/^TOOLING_UNAVAILABLE:/);
+    expect(db.run.errorMessage).toMatch(/cannot execute LOAD tests/);
+    expect(db.run.errorMessage).toMatch(/brew install k6/);
+  });
+
+  it('is still ERRORED, still BLOCKs the gate, and still measures nothing', async () => {
+    /*
+     * The verdict does not soften because the gap is ours rather than theirs.
+     * There is no evidence about this change either way, so nothing may merge
+     * on the strength of it.
+     */
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'LOAD' })],
+    });
+    noK6();
+
+    await processRun(job());
+
+    expect(db.run.status).toBe('ERRORED');
+    expect(db.run.failedCount).toBe(0);
+    expect(db.run.skippedCount).toBe(2);
+    const gate = db.run.gateResult as {
+      passed: boolean;
+      evaluations: Array<{ action: string; detail: string }>;
+    };
+    expect(gate.passed).toBe(false);
+    expect(
+      gate.evaluations.some(
+        (e) => e.action === 'BLOCK' && /install the missing tool on the worker/.test(e.detail),
+      ),
+    ).toBe(true);
+  });
+
+  it('writes UNSUPPORTED into the column as well as the tag, on every row', async () => {
+    /*
+     * The column is the half that can answer "how many of this month's skips
+     * were the environment's fault?" — a GROUP BY rather than a regex over a
+     * text column. It shipped correct, queryable and EMPTY: nothing wrote it.
+     */
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'LOAD' })],
+    });
+    noK6();
+
+    await processRun(job());
+
+    for (const row of db.results) {
+      expect(row.notRunKind).toBe('UNSUPPORTED');
+      expect(row.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    }
+  });
+
+  it('blames the ENVIRONMENT when the same run also could not reach the host', async () => {
+    /*
+     * A mixed run is a run that failed for two reasons, and the environment IS
+     * implicated in it — so the marker names the environment, and the sentence
+     * widens to the summary rather than leading with one cause under a marker
+     * that names the other.
+     */
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'E2E' })],
+    });
+    noK6();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    // Both halves named, because both have to be fixed.
+    expect(db.run.errorMessage).toMatch(/LOAD/);
+    expect(db.run.errorMessage).toMatch(/connection was refused/);
+    // And the rows still carry their own, different kinds.
+    expect(db.results[0]!.notRunKind).toBe('UNSUPPORTED');
+    expect(db.results[1]!.notRunKind).toBe('BLOCKED_BY_ENV');
+  });
+
+  it('keeps blaming the environment when the environment is the only cause', async () => {
+    // The case that already worked, pinned so the new marker cannot capture it.
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    expect(db.run.errorMessage).toMatch(/^ENVIRONMENT_UNAVAILABLE:/);
+    for (const row of db.results) expect(row.notRunKind).toBe('BLOCKED_BY_ENV');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (12) The bulk stamp, and the two filters that keep it honest
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the bulk stamp that records why a result did not run', () => {
+  it('never writes a cancellation onto a test that executed and passed', async () => {
+    /*
+     * `status: 'SKIPPED'` is the other half of the stamp's safety and it was
+     * untested: a passing result has `errorMessage: null`, so without the
+     * status filter the message filter alone would match EVERY PASSING TEST IN
+     * THE RUN, and a cancel would write "the run was cancelled before this
+     * test was reached" onto results that ran and passed. A lie about a pass is
+     * the most expensive one this file can tell.
+     */
+    const db = fakeDb();
+    h.afterExecute = (testId) => {
+      if (testId === 't1') db.run.status = 'CANCELLED';
+    };
+
+    await processRun(job());
+
+    expect(h.executed).toEqual(['t1']);
+    expect(db.results[0]!.status).toBe('PASSED');
+    expect(db.results[0]!.errorMessage ?? null).toBeNull();
+    expect(db.results[0]!.notRunKind ?? null).toBeNull();
+    // The rows nobody reached are the only ones labelled.
+    expect(db.results[1]!.notRunKind).toBe('CANCELLED');
+    expect(db.results[2]!.notRunKind).toBe('CANCELLED');
+  });
+
+  it('counts a NOT_RUN row as not reached, never as unexplained', async () => {
+    /*
+     * `untagged` is documented as "SKIPPED rows carrying no typed reason", and
+     * NOT_RUN rows — which DO carry one — were added to that same count three
+     * lines below the comment. The two facts have different remedies: a dead
+     * shard's slice is a re-run, and an untagged skip is a writer that has not
+     * learned to tag yet.
+     */
+    const db = fakeDb({
+      run: { shardCount: 2, totalCount: 2 },
+      results: [
+        { ...resultFor('t1'), shardIndex: 0 },
+        { ...resultFor('t2'), shardIndex: 1 },
+      ],
+    });
+    const rows = [
+      { index: 0, status: 'QUEUED', errorMessage: null as string | null },
+      {
+        index: 1,
+        status: 'ABANDONED',
+        errorMessage: 'No heartbeat for 300s — the worker is gone.',
+      },
+    ];
+    h.prisma.runShard = {
+      updateMany: async (args: { where: { index?: number }; data: Record<string, unknown> }) => {
+        if (args.where.index === undefined) return { count: 0 };
+        const hit = rows.filter((r) => r.index === args.where.index);
+        for (const r of hit) Object.assign(r, args.data);
+        return { count: hit.length };
+      },
+      findUnique: async (args: { where: { runId_index: { index: number } } }) =>
+        rows.find((r) => r.index === args.where.runId_index.index) ?? null,
+      findMany: async () => rows.map((r) => ({ ...r })),
+    };
+
+    await processRun(job({ shard: { index: 0, count: 2 } }));
+
+    expect(db.results[1]!.notRunKind).toBe('NOT_RUN');
+    const finished = published('run.finished')[0]!.data as {
+      environment: { notReached: number; notRecorded: number };
+    };
+    expect(finished.environment.notReached).toBe(1);
+    expect(finished.environment.notRecorded).toBe(0);
+  });
+
+  it('leaves a row nothing explained in the unexplained count', async () => {
+    /*
+     * The honesty field, still honest. A plugin that returns SKIPPED with a
+     * plain sentence has made no claim about which of the four reasons
+     * applies, and NULL is the fifth state — "not recorded" — which is not
+     * NOT_RUN and must not be folded into it.
+     */
+    const db = fakeDb({ run: { totalCount: 1 }, results: [resultFor('t1')] });
+    h.statusFor.set('t1', 'SKIPPED');
+
+    await processRun(job());
+
+    expect(db.results[0]!.notRunKind ?? null).toBeNull();
+    const finished = published('run.finished')[0]!.data as {
+      environment: { notReached: number; notRecorded: number };
+    };
+    expect(finished.environment.notRecorded).toBe(1);
+    expect(finished.environment.notReached).toBe(0);
+  });
+});
+
+describe('a run only PART of which could be attempted', () => {
+  it('writes the kind on the blocked row while the rest of the suite executes', async () => {
+    /*
+     * The other write path. An unattemptable run labels its rows in one bulk
+     * pass before the loop; a PARTIALLY blocked one goes through the loop,
+     * which builds a synthetic execution and hands it to `persistExecution` —
+     * so the kind has to travel as DATA on the execution rather than be
+     * re-read out of the message that was just formatted from it.
+     *
+     * This is also the shape that gives a plugin somewhere to put its own
+     * claim: a plugin that returns SKIPPED because its tool is missing can now
+     * say which of the four reasons applies, and the worker persists it.
+     */
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'LOAD' }), resultFor('t2', { type: 'E2E' })],
+    });
+    h.probes = {
+      onPath: (binary) => binary !== 'k6',
+      browserInstalled: () => true,
+      platform: 'linux',
+    };
+
+    await processRun(job());
+
+    // The E2E test ran, so this is not the unattemptable path.
+    expect(h.executed).toEqual(['t2']);
+    expect(db.results[0]!.notRunKind).toBe('UNSUPPORTED');
+    expect(db.results[0]!.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    // And the one that ran carries no kind: it was measured.
+    expect(db.results[1]!.notRunKind ?? null).toBeNull();
+    // The run-level marker stays out of it entirely — part of the suite ran.
+    expect(db.run.errorMessage ?? null).toBeNull();
+    expect(db.run.status).toBe('PASSED');
+  });
+});
+
+describe('a test type nothing in this build can execute', () => {
+  it('is SKIPPED with the typed reason in the column, not just in the message', async () => {
+    /*
+     * The loop's own "no plugin for this type" branch, which was unreachable
+     * from this file and therefore untested — including the kind it writes.
+     *
+     * It takes BOTH halves to get here, and that is worth saying because it is
+     * the design working: with a healthy preflight, a type with no plugin is
+     * refused before the loop (`hasPlugin` feeds `runnabilityFor`). This branch
+     * is the fallback for a run whose preflight itself broke — the instrument
+     * failing must cost the run nothing — and it has to be as honest as the
+     * preflight would have been, because the row it writes is the only thing a
+     * reader sees.
+     */
+    const db = fakeDb({
+      run: { totalCount: 2 },
+      results: [resultFor('t1', { type: 'E2E' }), resultFor('t2', { type: 'LOAD' })],
+    });
+    // No plugin for E2E, and a PATH probe that throws while answering for LOAD
+    // — so the preflight gives up entirely and the loop is what meets the
+    // pluginless type. (A preflight that survives refuses it first, which is
+    // why the second half is needed to reach this branch at all.)
+    h.pluginless = new Set(['E2E']);
+    const explode = (): never => {
+      throw new Error('the probe exploded');
+    };
+    h.probes = { onPath: explode, browserInstalled: explode };
+
+    await processRun(job());
+
+    expect(h.log).toContain(
+      'error:the environment preflight itself failed; executing the suite as if it had not run',
+    );
+    // The type with a plugin still runs: a broken instrument costs nothing.
+    expect(h.executed).toEqual(['t2']);
+    expect(db.results[0]!.status).toBe('SKIPPED');
+    expect(db.results[0]!.errorMessage).toMatch(/^\[UNSUPPORTED\]/);
+    /*
+     * "Nobody built this yet" and "this cannot run here" were one SKIPPED for
+     * the whole life of this file; the kind is the distinction, and it has to
+     * be in the COLUMN to be countable. A message prefix cannot be grouped by.
+     */
+    expect(db.results[0]!.notRunKind).toBe('UNSUPPORTED');
+    // And the executed one carries no kind at all: it was measured.
+    expect(db.results[1]!.notRunKind ?? null).toBeNull();
   });
 });

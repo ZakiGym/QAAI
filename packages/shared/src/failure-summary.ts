@@ -28,6 +28,17 @@
  */
 
 import type { TestResultStatus } from './constants';
+/*
+ * `CauseIdentity` lives in types.ts, beside `TriageVerdict`, because it is the
+ * shape of a row (`FailureSignature` / `RunFailureCluster`) and this module is
+ * a pure classifier that only reads one. It was declared locally while types.ts
+ * was another change's to edit; it is imported now, so there is one declaration
+ * and not two that can disagree about what `newInThisBuild` means.
+ *
+ * Type-only, so nothing about this module's "runs with no model and no database"
+ * property changes: the import is erased.
+ */
+import type { CauseIdentity } from './types';
 
 // ─── The kinds ───────────────────────────────────────────────────────────────
 
@@ -170,6 +181,18 @@ export interface FailureSummaryInput {
    * result row alone cannot tell them apart.
    */
   previousOutcome?: TestResultStatus | null;
+  /**
+   * What the persisted identity knows about this failure's CAUSE, when the
+   * caller has it (apps/api/src/routes/clusters.ts reads it from
+   * `FailureSignature` / `RunFailureCluster`).
+   *
+   * This is about the cause and `previousOutcome` is about the test, and the
+   * two routinely disagree in the way that matters: a test can be failing for
+   * the first time while the cause behind it has been breaking other tests for
+   * three weeks. Absent means nothing recorded the cause, which is a third
+   * state and is never flattened into "new".
+   */
+  cause?: CauseIdentity | null;
 }
 
 // ─── Output ──────────────────────────────────────────────────────────────────
@@ -190,7 +213,22 @@ export interface FailureLocation {
  * refuses to guess which.
  */
 export interface ReliabilityNote {
-  signal: 'RETRIED_AND_PASSED' | 'NEW_SINCE_LAST_RUN' | 'FAILING_BEFORE' | 'FLAKY_BEFORE';
+  signal:
+    | 'RETRIED_AND_PASSED'
+    | 'NEW_SINCE_LAST_RUN'
+    | 'FAILING_BEFORE'
+    | 'FLAKY_BEFORE'
+    /**
+     * The three CAUSE signals. They sit in the same list as the test signals
+     * above on purpose — the box is read once, and splitting "about this test"
+     * from "about this cause" into two boxes is how the second one stops being
+     * read. Every one of them is `looksFlaky: false`: how old a cause is says
+     * nothing about whether it is a flake, and a cause three weeks old is just
+     * as likely to be a bug nobody fixed.
+     */
+    | 'CAUSE_NEW_IN_BUILD'
+    | 'CAUSE_SEEN_BEFORE'
+    | 'CAUSE_MUTED';
   looksFlaky: boolean;
   sentence: string;
 }
@@ -628,6 +666,76 @@ function reliabilityNotes(input: FailureSummaryInput): ReliabilityNote[] {
       break;
     default:
       break;
+  }
+
+  notes.push(...causeNotes(input.cause));
+
+  return notes;
+}
+
+/** A day, for the "how long has this been broken" sentence. */
+const DAY_MS = 86_400_000;
+
+function daysBetween(fromIso: string, to: number): number | null {
+  const from = Date.parse(fromIso);
+  if (!Number.isFinite(from)) return null;
+  return Math.max(0, Math.round((to - from) / DAY_MS));
+}
+
+/**
+ * What the cause's identity is worth saying.
+ *
+ * NEW IN THIS BUILD IS THE HEADLINE. It is the one sentence that routes a
+ * failure to a person: a cause that first appeared in this build belongs to
+ * whoever just merged, and a cause that has been breaking tests for three weeks
+ * is somebody's known problem and almost never the fault of the commit under
+ * test. A reviewer who is told neither reads the same stack trace either way.
+ *
+ * The expired-mute case is deliberately NOT silent. "Muted until last Tuesday"
+ * is exactly the state somebody has to decide about, and a box that mentioned a
+ * mute only while it was live would make every lapsed mute invisible at the
+ * moment it started mattering again.
+ */
+function causeNotes(cause: CauseIdentity | null | undefined): ReliabilityNote[] {
+  if (!cause) return [];
+  const notes: ReliabilityNote[] = [];
+  const now = Date.now();
+
+  if (cause.newInThisBuild) {
+    notes.push({
+      signal: 'CAUSE_NEW_IN_BUILD',
+      looksFlaky: false,
+      sentence:
+        'This cause is new in this build — nothing before this run produced the same failure ' +
+        'signature. Whatever changed here is the first place to look.',
+    });
+  } else {
+    const age = daysBetween(cause.firstSeenAt, now);
+    notes.push({
+      signal: 'CAUSE_SEEN_BEFORE',
+      looksFlaky: false,
+      sentence:
+        `This cause is not new: the same failure signature has appeared in ${cause.runsSeen} ` +
+        `run${cause.runsSeen === 1 ? '' : 's'}` +
+        (age === null ? '' : `, first ${age === 0 ? 'earlier today' : `${age} day${age === 1 ? '' : 's'} ago`}`) +
+        '. The change under test is unlikely to be what introduced it.',
+    });
+  }
+
+  if (cause.mutedUntil) {
+    const until = Date.parse(cause.mutedUntil);
+    const live = Number.isFinite(until) && until > now;
+    notes.push({
+      signal: 'CAUSE_MUTED',
+      looksFlaky: false,
+      sentence: live
+        ? `This cause is muted until ${cause.mutedUntil}${
+            cause.mutedReason ? `: ${cause.mutedReason}` : ''
+          }. It is still recorded and counted, and it is not minting verdicts or paging anyone.`
+        : `The mute on this cause expired on ${cause.mutedUntil}${
+            cause.mutedReason ? ` (it said: ${cause.mutedReason})` : ''
+          }, so it is minting verdicts again. Re-mute it or fix it.`,
+    });
   }
 
   return notes;

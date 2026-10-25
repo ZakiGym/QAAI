@@ -1,9 +1,21 @@
 'use client';
 
 import { useState } from 'react';
-import { duration } from '../ui';
 import { Badge } from '../ui/layout';
 import { Button } from '../ui/Button';
+import {
+  PRIORITIES,
+  VERDICTS,
+  actionOf,
+  describeRule,
+  humanise,
+  isEditableRule,
+  type StoredGateRule,
+} from './gate-rules';
+
+/* Re-exported: /quality imports the type and the row from this module. */
+export { actionOf, describeRule, isEditableRule } from './gate-rules';
+export type { GateRule, StoredGateRule } from './gate-rules';
 
 /**
  * A deploy gate, as a sentence.
@@ -15,38 +27,6 @@ import { Button } from '../ui/Button';
  * behind `edit` until somebody actually wants to change a number.
  */
 
-export type GateRule =
-  | { kind: 'BLOCK_ON_VERDICT'; verdict: string; onlyPriorities: string[] }
-  | { kind: 'MAX_FLAKE_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' }
-  | { kind: 'MAX_P95_LATENCY_MS'; ms: number; action: 'WARN' | 'BLOCK' }
-  | { kind: 'MIN_PASS_RATE'; ratePercent: number; action: 'WARN' | 'BLOCK' };
-
-const VERDICTS = ['REAL_BUG', 'INTENDED_CHANGE', 'FLAKE', 'ENV_ISSUE'] as const;
-const PRIORITIES = ['CRITICAL_PATH', 'IMPORTANT', 'NICE_TO_HAVE'] as const;
-
-const humanise = (value: string) => value.toLowerCase().replace(/_/g, ' ');
-
-/** A verdict rule always blocks; the others carry their own severity. */
-export const actionOf = (rule: GateRule): 'WARN' | 'BLOCK' =>
-  'action' in rule ? rule.action : 'BLOCK';
-
-export function describeRule(rule: GateRule): string {
-  switch (rule.kind) {
-    case 'BLOCK_ON_VERDICT':
-      return `Block the deploy when triage calls a failure a ${humanise(rule.verdict)}${
-        rule.onlyPriorities.length
-          ? `, but only for ${rule.onlyPriorities.map(humanise).join(' or ')} tests`
-          : ''
-      }.`;
-    case 'MAX_FLAKE_RATE':
-      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when more than ${rule.ratePercent}% of tests are flaky.`;
-    case 'MAX_P95_LATENCY_MS':
-      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when the 95th-percentile test takes longer than ${duration(rule.ms)}.`;
-    case 'MIN_PASS_RATE':
-      return `${rule.action === 'BLOCK' ? 'Block' : 'Warn'} when the pass rate falls below ${rule.ratePercent}%.`;
-  }
-}
-
 const CONTROL =
   'border-line text-row-sub focus:border-accent rounded-md border bg-transparent px-2 py-1 outline-none transition-colors';
 
@@ -55,31 +35,48 @@ export function GateRuleRow({
   onChange,
   onRemove,
 }: {
-  rule: GateRule;
-  onChange: (next: GateRule) => void;
+  rule: StoredGateRule;
+  onChange: (next: StoredGateRule) => void;
   onRemove: () => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const blocks = actionOf(rule) === 'BLOCK';
+  const action = actionOf(rule);
+  const editable = isEditableRule(rule);
 
   return (
     <div className="border-line border-b">
       <div className="flex items-center gap-3 py-[11px]">
-        <Badge tone={blocks ? 'fail' : 'flake'} tint>
-          {actionOf(rule)}
+        <Badge tone={action === 'BLOCK' ? 'fail' : action === 'WARN' ? 'flake' : 'neutral'} tint>
+          {/* A rule whose severity this build cannot read says so, rather than
+              being badged BLOCK on a guess. */}
+          {action ?? 'rule'}
         </Badge>
         <p className="text-row min-w-0 flex-1">{describeRule(rule)}</p>
-        <button
-          type="button"
-          onClick={() => setEditing((open) => !open)}
-          aria-expanded={editing}
-          className="text-ink-faint hover:text-ink shrink-0 text-[11.5px] transition-colors"
-        >
-          {editing ? 'done' : 'edit'}
-        </button>
+        {/* No `edit` for a kind with no controls: the panel below would write
+            this editor's field names onto a rule that does not have them. */}
+        {editable && (
+          <button
+            type="button"
+            onClick={() => setEditing((open) => !open)}
+            aria-expanded={editing}
+            className="text-ink-faint hover:text-ink shrink-0 text-[11.5px] transition-colors"
+          >
+            {editing ? 'done' : 'edit'}
+          </button>
+        )}
+        {!editable && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onRemove}
+            className="text-fail hover:text-fail shrink-0"
+          >
+            Remove
+          </Button>
+        )}
       </div>
 
-      {editing && (
+      {editing && editable && (
         <div className="flex flex-wrap items-center gap-2 pb-3.5">
           {rule.kind === 'BLOCK_ON_VERDICT' ? (
             <>

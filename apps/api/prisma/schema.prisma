@@ -169,6 +169,38 @@ enum StepStatus {
   SKIPPED
 }
 
+/// Why a result exists with nothing measured in it (NOT_RUN_KINDS in
+/// packages/shared/src/constants.ts; `check:enums` diffs them).
+///
+/// There was one SKIPPED, and four completely different facts were filed under
+/// it: a placeholder row nobody reached, a test this deployment has no tool to
+/// execute, a test whose environment was broken, and a run somebody cancelled.
+/// A reader could not tell "nobody has written this yet" from "this cannot run
+/// here", so the skipped count answered no question at all.
+///
+/// NOT a widening of TestResultStatus, deliberately. The status column is read
+/// by the gate, the five counters, the CLI's exit code, the GitHub check, the
+/// JUnit writer and the coverage pass; a sixth member there would quietly
+/// change what every one of them means by a skip. The status stays SKIPPED and
+/// the REASON is its own nullable column, which is purely additive.
+///
+///   NOT_RUN        nothing was attempted and nothing says it could not be — a
+///                  dead shard, a lost queue job, a worker killed mid-suite.
+///                  The WEAKEST claim of the four, and still a claim.
+///   BLOCKED_BY_ENV the ENVIRONMENT was not usable: the base URL did not
+///                  answer, the configured login no longer works, there was no
+///                  repository checkout. Not a verdict on the application.
+///   UNSUPPORTED    this DEPLOYMENT cannot execute this test — no plugin for
+///                  the type, or the tool it needs is not on this image.
+///   CANCELLED      a person stopped the run. The only one of the four that is
+///                  a decision rather than a fault.
+enum NotRunKind {
+  NOT_RUN
+  BLOCKED_BY_ENV
+  UNSUPPORTED
+  CANCELLED
+}
+
 enum Verdict {
   REAL_BUG
   INTENDED_CHANGE
@@ -187,6 +219,14 @@ enum HealRisk {
   SELECTOR_ONLY
   ASSERTION_CHANGE
   STRUCTURAL
+  /// "This test should stop existing." Not a patch: a RETIRE proposal carries no
+  /// diff at all (see HealProposal.diff) and is applied by DISABLING the test,
+  /// never by deleting the customer's code. It can only ever be reviewed by a
+  /// person — `isAutoApprovable` in packages/agent/src/healer.ts refuses every
+  /// risk level but SELECTOR_ONLY, and refuses this one by name as well, because
+  /// the one mistake that is unrecoverable here is retiring a test that was
+  /// merely unreached.
+  RETIRE
 }
 
 enum HealState {
@@ -195,6 +235,16 @@ enum HealState {
   REJECTED
   APPLIED
   AUTO_APPLIED
+  /// Replaced by a newer open proposal for the SAME TEST.
+  ///
+  /// The idempotence guard on healing used to be per TestResult, so a test that
+  /// failed every run minted a fresh strong-model proposal every run and could
+  /// fill the review queue by itself — fifty rows describing one broken test,
+  /// forty-nine of them against code that had already moved on. Superseding is
+  /// how the queue stays one-row-per-test: the newest proposal is the only open
+  /// one, and the old rows keep their diffs and their reasons so the history of
+  /// what was proposed is not rewritten.
+  SUPERSEDED
 }
 
 enum Language {
@@ -509,6 +559,37 @@ model Project {
   /// Nullable rather than defaulted so "this project never thought about it" and
   /// "this project chose 5" stay distinguishable; the UI can say which.
   quarantineBudgetPercent  Int?
+  /// The coverage percentage this project is trying to reach, and — because
+  /// nothing else arms it — the ON SWITCH for the closure autopilot
+  /// (apps/worker/src/processors/close-loop.ts). Null means no campaign is ever
+  /// created for this project, which is every project until somebody sets one.
+  ///
+  /// A column and not an environment variable for the same reason as
+  /// `quarantineBudgetPercent` above: this one spends model calls and browser
+  /// time on its own at 3am, so the brake has to be something the person
+  /// running this product can find, read and change per project. An env var
+  /// would arm it for every project in the install at once, which is the
+  /// opposite of a brake.
+  ///
+  /// Nullable rather than defaulted so "this project never asked for an
+  /// autopilot" and "this project chose 80" stay distinguishable. A default
+  /// here would switch the autopilot on for every existing customer in one
+  /// migration.
+  coverageTargetPercent    Int?
+  /// Whether the autopilot's plan items land APPROVED (code is written without
+  /// anyone ticking a box) or PROPOSED (a human approves first). Null means the
+  /// documented default in close-loop.ts, which is the cautious one.
+  ///
+  /// Text and not an enum: apps/api/scripts/check-enums.ts enforces
+  /// schema/TypeScript parity from a hand-maintained list, so a new Prisma enum
+  /// added without an entry in it is an enum with no drift guard. The domain is
+  /// enforced at the producer (`CLOSURE_APPROVAL_POLICIES` in close-loop.ts),
+  /// exactly as `MutationSurvivor.reason` does.
+  closureApprovalPolicy    String?
+  /// How many plan items one night's campaign may ever propose for this
+  /// project. Null means the documented default. This is the money cap: every
+  /// item is a model call and, eventually, a browser.
+  closureItemBudget        Int?
   archivedAt               DateTime?
   createdAt                DateTime    @default(now())
   updatedAt                DateTime    @updatedAt
@@ -531,6 +612,9 @@ model Project {
   pluginEnablements PluginEnablement[]
   coverageItems     CoverageItem[]
   coverageSnapshots CoverageSnapshot[]
+  failureSignatures FailureSignature[]
+  closureCampaigns  ClosureCampaign[]
+  gapClosures       GapClosure[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -664,6 +748,29 @@ model PlanItem {
   assertions      Json // string[]
   journeyId       String?
   authProfileId   String?
+  /// The coverage gap this item was minted to close — `CoverageGap.id` from
+  /// packages/agent/src/coverage.ts, which is a stable hash of (kind, subject)
+  /// and therefore the same id the next analysis will produce for the same gap.
+  ///
+  /// ── The defect this closes ─────────────────────────────────────────────────
+  ///
+  /// POST /coverage/:projectId/propose already knew the answer: it mints the row
+  /// ids itself and returns `mapping: [{ gapId, planItemId }]` in the HTTP
+  /// response. That mapping existed for the length of one request and was then
+  /// thrown away. So QAAI could never afterwards say "this gap is closed by this
+  /// test" — and, much worse, could never notice that it is NOT: a gap whose
+  /// test was written, bound and passed, and which the next analysis reports
+  /// again, was indistinguishable from a gap nobody had ever looked at. The loop
+  /// the product is sold on had no memory, so it could only ever be hopeful.
+  ///
+  /// Nullable, and nullable forever: the Explorer proposes a cold plan from a
+  /// crawl with no gap behind it, and back-filling an id onto those rows would
+  /// invent a provenance that never existed.
+  gapId           String?
+  /// The gap's kind when it was proposed (`GapKind`), kept beside the id
+  /// because the id is a hash and tells a reader nothing. Text, not an enum —
+  /// see `Project.closureApprovalPolicy` for why.
+  gapKind         String?
   state           PlanItemState @default(PROPOSED)
   decidedBy       String?
   decidedAt       DateTime?
@@ -675,6 +782,10 @@ model PlanItem {
 
   @@index([orgId])
   @@index([testPlanId, state])
+  /// "Which item was minted for this gap?" — asked once per gap per close-loop
+  /// tick while the ledger is reconciled. Without it that is a scan of every
+  /// plan item the install has ever produced.
+  @@index([gapId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -752,6 +863,25 @@ model Test {
   reviewFlags String[]  @default([])
   /// Which plan item produced this, when it came from the Explorer.
   planItemId  String?
+  /// The coverage gap this test was written to close, copied from
+  /// `PlanItem.gapId` when the Generator's output lands.
+  ///
+  /// It is denormalised onto the test ON PURPOSE, and the reason is the whole
+  /// point of the column: closure has to be checkable from the TEST side. The
+  /// question the product must be able to answer is "this gap is open again —
+  /// which test was supposed to have closed it, and does that test still
+  /// exist, still run, and still assert what it was written to assert?".
+  /// Walking Test → PlanItem → gap answers it only while the plan survives,
+  /// and a TestPlan is deletable (`onDelete: Cascade` from the project, and the
+  /// retention sweep prunes old plans), so the provenance would evaporate
+  /// exactly when the loop needed it. A denormalised id is one more thing that
+  /// can disagree with its source; a provenance trail that disappears is worse.
+  ///
+  /// Null is the ordinary case and always will be: hand-written tests, imported
+  /// tests and the Explorer's cold plan close no particular gap. Null is never
+  /// read as "closes nothing" — the closure ledger (`GapClosure`) is the
+  /// authority on what is closed, and this column is what lets it name a test.
+  gapId       String?
   disabledAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -811,6 +941,10 @@ model Test {
   /// Read by the profile-deletion path and by "which tests run as this role?";
   /// without it both are a full scan of every test in the install.
   @@index([authProfileId])
+  /// "Which test was written to close this gap?" — the read behind every
+  /// re-opened-gap finding, and the one that has to be fast enough to run for
+  /// every row in the ledger on one close-loop tick.
+  @@index([gapId])
 }
 
 /// Flake rate over time: one row per test per UTC day.
@@ -1094,6 +1228,29 @@ model TestResult {
   /// which is what makes sharding additive: every existing row and every
   /// existing code path reads null and behaves exactly as before.
   shardIndex       Int?
+
+  /// Why this result has nothing measured in it — the queryable half of the
+  /// four reasons a SKIPPED row exists (see enum NotRunKind above).
+  ///
+  /// NULL MEANS NOT RECORDED, AND THAT IS A FIFTH STATE. It is NOT NOT_RUN.
+  /// NOT_RUN is a claim — "nothing was attempted and nothing says it could not
+  /// be" — and it is the one a dead shard or a lost queue job earns. NULL is
+  /// the absence of any claim: every row written before this column existed,
+  /// and every row written by a path that has not learned to classify yet
+  /// (notably the plugins, which return SKIPPED with a plain sentence when
+  /// their tool is missing). Scoring NULL as NOT_RUN would put a sentence in
+  /// the database that nothing produced; defaulting it to NOT_RUN would do it
+  /// to every historical row at once.
+  ///
+  /// NULLABLE WITH NO DEFAULT, and that is also why there is no `@default`:
+  /// this is the largest table in the product, and a nullable column with no
+  /// default is recorded in the catalogue without touching a row. See the
+  /// migration.
+  ///
+  /// The tag at the head of `errorMessage` (`notRunMessage` / `parseNotRun` in
+  /// @qaai/shared) stays, and is not redundant: it is what a surface renders,
+  /// and it is all an old row has. A reader with both prefers this column.
+  notRunKind       NotRunKind?
 
   /// ── The mutation metric channel (§4 MUTATION) ─────────────────────────────
   ///
@@ -1398,16 +1555,179 @@ model TriageVerdict {
   reviewedBy    String?
   reviewedAt    DateTime?
   overriddenTo  Verdict?
-  /// Set when this verdict was filed as a bug (§7).
+  /// Set when this verdict was filed as a bug (§7). Every member of a CAUSE
+  /// carries the SAME url: forty tests downstream of one broken dependency are
+  /// one ticket, and each of the forty verdicts links to it.
   issueUrl      String?
-  createdAt     DateTime           @default(now())
+  /// The cause this verdict was filed under — `TrackerIssue.causeKey`. The
+  /// idempotence key: a second file for the same cause finds the row through
+  /// this and links, instead of minting a second ticket.
+  issueCauseKey String?
+
+  /// ─── Who owns this failure (§8) ────────────────────────────────────────
+  ///
+  /// Resolved from OwnershipRule at triage time. Exactly one of the two ids,
+  /// or neither — and when it is neither, `ownerState` says WHY, because an
+  /// unowned failure that looks owned is worse than one that is visibly
+  /// unowned. States are OWNED / NO_RULES / NO_MATCH / RULES_UNUSABLE
+  /// (OWNERSHIP_STATES in src/lib/ownership.ts); null means nothing has tried
+  /// to route this verdict yet, which is a third thing again.
+  assigneeUserId String?
+  assigneeTeamId String?
+  /// The rule that won, so "why does the payments team own this?" has an answer.
+  ownerRuleId    String?
+  ownerState     String?
+  /// The reason sentence, shown verbatim. Carries the unusable-rule warning
+  /// when routing may have stopped silently.
+  ownerNote      String?
+  assignedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  /// ─── A verdict is about a CAUSE, not about a result (§3.3) ──────────────
+  ///
+  /// THE DEFECT: triage ran once per RESULT. One dead dependency that takes
+  /// out 200 tests spent 200 model calls and produced 200 independently-worded
+  /// verdicts for ONE cause — and a reviewer then read the same sentence 200
+  /// times in 200 slightly different wordings, which is worse than reading it
+  /// once, because 200 agreeing verdicts look like 200 pieces of evidence. The
+  /// clusterer that already knew they were one cause
+  /// (apps/api/src/lib/cluster.ts) was read-only and ran in the cockpit, after
+  /// the money had been spent.
+  ///
+  /// `clusterKey` is sha1(signature)[0,12) — BYTE-IDENTICAL to the id the
+  /// cockpit already shows on a failure cluster, so the link in the UI and the
+  /// key in this row are the same string. There is one implementation of that
+  /// hash (`failureClusterKey`, packages/agent/src/triage.ts) and
+  /// apps/api/src/routes/clusters.test.ts asserts it against the clusterer's
+  /// own ids, so the two cannot drift apart silently.
+  ///
+  /// `runId` is DENORMALISED off testResult.run on purpose. "Does this run
+  /// already have a verdict for this cause?" is the question every one of those
+  /// 200 jobs asks, and through the relation it is a join no index serves.
+  /// Here, @@index([runId, clusterKey]) answers it outright — and a result
+  /// never moves between runs, so the copy cannot go stale.
+  ///
+  /// `derivedFromId` is the HONESTY column. A verdict copied onto a member from
+  /// the cluster's single model call is not an independent judgement of that
+  /// member, and a reader who cannot tell a copy from a first-hand call will
+  /// over-trust the agreement. NULL means a model looked at this result itself.
+  clusterKey    String?
+  runId         String?
+  derivedFromId String?
+
+  /// ─── Re-triage: supersede, never overwrite ──────────────────────────────
+  ///
+  /// THE DEFECT: packages/agent/src/heal-apply.ts tells the reader to "Re-run
+  /// triage to get a fresh proposal" and no mechanism existed — enqueueTriage
+  /// dedupes on `triage-<testResultId>` forever, and processTriage returns the
+  /// moment a verdict row exists.
+  ///
+  /// A REQUEST COLUMN rather than a job field, deliberately: TriageJob is
+  /// shared with the run processor (packages/shared/src/jobs.ts), and a flag
+  /// living only in a queue payload is lost when the worker is cycled. A
+  /// re-triage asked for at 02:00 still happens if the worker restarts at 02:01.
+  ///
+  /// The verdict's current contents are COPIED INTO TriageVerdictRevision
+  /// before they are replaced, and that is the whole point: `reviewState` and
+  /// `overriddenTo` are the only record of the model having been wrong, and
+  /// they are what trains the prompt (`summariseCorrections`,
+  /// packages/agent/src/triage.ts). A re-triage that overwrote them in place
+  /// would delete the training signal in order to produce a fresh guess.
+  retriageRequestedAt DateTime?
+  retriageRequestedBy String?
+  retriageReason      String?
+  /// 1 until something supersedes this verdict. The revision rows hold every
+  /// number below the current one.
+  revision            Int       @default(1)
+  /// Set when a reviewer deliberately took this result OUT of its cluster
+  /// because the cluster's one answer was wrong for this member specifically —
+  /// the same stack from two tests really can be a real bug in one and a stale
+  /// selector in the other. A split verdict is never overwritten by a later
+  /// cluster attach; see apps/worker/src/processors/triage.ts.
+  splitFromClusterKey String?
 
   testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
 
   batchItems TriageBatchItem[]
+  revisions  TriageVerdictRevision[]
 
   @@index([orgId, verdict])
   @@index([orgId, reviewState])
+  /// "Has this run already answered this cause?" — asked once per failing
+  /// result, which on a 200-test outage is 200 times.
+  @@index([runId, clusterKey])
+  /// "Every verdict ever reached about this cause", for the cause page and for
+  /// the accuracy scorecard's per-cause breakdown.
+  @@index([orgId, clusterKey])
+}
+
+/// One ticket on the customer's board, keyed by the CAUSE it was filed for (§7).
+///
+/// WHY THIS TABLE EXISTS
+///
+/// The only place a filed issue was recorded was `TriageVerdict.issueUrl`, one
+/// column on one result. That shape can only express "this result has a
+/// ticket", so POST /issues filed one per failing result: a shared dependency
+/// dying meant forty tests failing, forty presses of a one-click button and
+/// forty tickets for one bug. There was also nowhere at all to record an issue
+/// filed for something that is not a result — an untested surface has no
+/// TestResult row, so a coverage gap could not be filed.
+///
+/// `causeKey` is the idempotence key and the reason the table is worth having:
+/// sha256 of the project plus the cause's identity (a cluster signature for a
+/// failure, the project/feature/owner triple for a coverage gap). Unique per
+/// org, so a second file for the same cause FINDS this row and links to the
+/// ticket already on the board. A customer whose board filled up with forty
+/// tickets will not forgive a second occurrence.
+///
+/// NO FOREIGN KEY TO Integration OR Project, deliberately. The url points at a
+/// ticket on someone else's system, which exists whether or not the
+/// integration that filed it is still connected; cascading this row away when
+/// an admin disconnects a tracker would delete the only record that the bug was
+/// already reported and the next run would file it again.
+model TrackerIssue {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// FAILURE | COVERAGE_GAP. A string, not an enum: apps/api/scripts/check-enums.ts
+  /// enforces schema/TypeScript parity from a hand-maintained list, so a new
+  /// enum with no entry in it is an enum with no drift guard. The domain is
+  /// enforced at the producer (ISSUE_SUBJECTS in src/lib/ownership.ts).
+  subject  String
+  /// sha256(subject | projectId | cause identity), hex. See the header.
+  causeKey String
+  /// The cause in readable form: the cluster signature, or the gap filter.
+  cause    String
+
+  provider      IntegrationKind
+  /// Which integration filed it. Not a relation — see the header.
+  integrationId String?
+  url           String
+  /// The provider's own identifier: `owner/repo#12`, `QA-12`, `ENG-12`.
+  key           String?
+  title         String
+
+  /// Who the ticket was filed for, resolved from OwnershipRule. `ownerState`
+  /// also admits SPLIT, which only an issue can be: one cause whose members
+  /// are owned by different people has no single true assignee, and claiming
+  /// one would route the whole ticket to someone who owns a third of it.
+  ownerUserId String?
+  ownerTeamId String?
+  ownerState  String
+
+  /// What the ticket covered when it was last filed or re-filed: the count, and
+  /// the names themselves (test result ids, or surface keys). The names are the
+  /// whole argument of a coverage ticket — "coverage is 61%" is not actionable.
+  affectedCount Int  @default(0)
+  subjectKeys   Json @default("[]")
+
+  filedBy   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, causeKey])
+  @@index([projectId, subject])
 }
 
 model HealProposal {
@@ -1416,6 +1736,11 @@ model HealProposal {
   testId      String
   /// The verdict that triggered this heal.
   verdictId   String?
+  /// Unified diff against the test's current code — EXCEPT on a RETIRE
+  /// proposal, which is empty: retirement is not a patch, and a diff that
+  /// deleted the test would be refused by `applyHealDiff` anyway ("a heal may
+  /// fix a test, not delete one"). Readers must branch on `riskLevel` before
+  /// trying to apply this.
   diff        String
   explanation String
   riskLevel   HealRisk
@@ -1427,10 +1752,279 @@ model HealProposal {
   prUrl       String?
   createdAt   DateTime  @default(now())
 
+  /// The proposal that replaced this one, when `state` is SUPERSEDED. Kept as a
+  /// plain id and not a self-relation: it is read to render "replaced by" and
+  /// never joined through, and a self-relation on this table would make every
+  /// delete path think about a cycle that does not exist.
+  supersededById String?
+
+  // ─── Verification (§3.4) ───────────────────────────────────────────────────
+  //
+  // A heal recorded APPLIED while the test is still red is worse than no heal:
+  // it tells a human the problem is handled. Both apply paths therefore start a
+  // single-test run against the heal and record its outcome here, and the sweep
+  // in apps/worker/src/processors/flake.ts reads it back.
+  //
+  // Every column is nullable with NO DEFAULT, which is the honest encoding: a
+  // proposal nobody applied has nothing to verify, and NULL says "no claim" in
+  // a way `false` or `'PENDING'` could not.
+
+  /// TestVersion.version this heal wrote. The revert path's only way back —
+  /// without it, an auto-applied heal that fails verification cannot be undone
+  /// except by guessing which version came before it.
+  appliedVersion Int?
+  /// The single-test Run started to check the applied heal.
+  verifyRunId    String?
+  /// One of HEAL_VERIFY_STATES in packages/agent/src/healer.ts: PENDING,
+  /// VERIFIED, STILL_FAILING, UNVERIFIABLE.
+  ///
+  /// TEXT and not a Prisma enum, for the reason spelled out in
+  /// 20261024010000_mutation_metric_and_survivors: apps/api/scripts/check-enums.ts
+  /// enforces schema/TypeScript enum parity from a hand-maintained list, so a
+  /// new enum with no entry in that list is an enum with no drift guard. The
+  /// domain is enforced at the producer instead — healer.ts is the only writer.
+  /// Promote it in the same change that adds its parity entry.
+  verifyState    String?
+  verifiedAt     DateTime?
+  /// What the verification found, in a sentence a human can act on. Carries the
+  /// reason a verification could not run at all, which is the case that must
+  /// never read as a pass.
+  verifyNote     String?
+
+  /// Machine-readable evidence for a proposal no model wrote: the deflake
+  /// findings, or the routes and locators behind a retirement. Json because the
+  /// shape differs per `riskLevel` and nothing queries inside it — the prose a
+  /// reviewer reads is in `explanation`.
+  evidence Json?
+
   test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
 
   @@index([orgId, state])
   @@index([testId])
+  /// The verification sweep's own query: "which applied heals are still waiting
+  /// on a verdict?", asked once per tick across every org. Without it that is a
+  /// scan of every heal the install has ever proposed.
+  @@index([verifyState])
+}
+
+/// What a verdict USED to say — kept because a re-triage must not erase the
+/// correction a human already made.
+///
+/// TriageVerdict.testResultId is `@unique`, so there is exactly one live
+/// verdict per result and a fresh one has nowhere to go but on top of the old
+/// one. Overwriting in place would destroy `reviewState` / `overriddenTo`,
+/// which are the only evidence the model was ever overruled — and overrides
+/// are what the triage prompt now reads back as a prior
+/// (`summariseCorrections`, packages/agent/src/triage.ts). A re-triage that
+/// silently replaced them would erase the thing that makes re-triage worth
+/// doing.
+///
+/// Append-only. Nothing updates or deletes a revision row, and the
+/// `(verdictId, revision)` unique key is what makes a redelivered supersede
+/// idempotent instead of doubling the history.
+model TriageVerdictRevision {
+  id        String @id @default(cuid())
+  orgId     String
+  verdictId String
+  /// The revision number these contents HELD, so revision 1 is the original.
+  revision  Int
+
+  verdict     Verdict
+  confidence  Float
+  explanation String
+  /// Evidence[] from packages/shared, exactly as the superseded verdict held it.
+  evidence    Json
+  model       String
+
+  /// The human half, which is the half worth keeping.
+  reviewState  VerdictReviewState
+  overriddenTo Verdict?
+  reviewedBy   String?
+  reviewedAt   DateTime?
+
+  supersededAt DateTime @default(now())
+  /// Who asked for the re-triage, and why they said the old answer was wrong.
+  supersededBy String?
+  reason       String?
+
+  parent TriageVerdict @relation(fields: [verdictId], references: [id], onDelete: Cascade)
+
+  @@unique([verdictId, revision])
+  @@index([orgId, verdictId])
+  /// The accuracy scorecard counts superseded corrections too: a model answer a
+  /// human fixed is evidence whether or not a later re-triage replaced it.
+  /// Without this the scorecard reads the live rows only and quietly
+  /// under-counts every project that uses re-triage.
+  @@index([orgId, reviewState])
+}
+
+/// A failure CAUSE, with an identity that outlives the run it appeared in.
+///
+/// THE DEFECT: `signatureOf()` (apps/api/src/lib/cluster.ts) produced a stable
+/// key for a cause and the key was stored nowhere. So the two questions a
+/// reviewer actually has on a red build —
+///
+///   · "is this the same thing as yesterday?"
+///   · "which of these is NEW in this build?"
+///
+/// — had no answer at all. The second is the single most useful sentence you
+/// can put in front of a reviewer: a cause that has been failing for three
+/// weeks is somebody's known problem, and a cause that appeared ninety seconds
+/// ago belongs to whoever just merged.
+///
+/// ── Why the mute lives HERE and not on the test ───────────────────────────
+///
+/// `VerdictReviewState.MUTED` was written by two endpoints and read by nothing,
+/// so the next run of a known issue minted a fresh verdict and paged somebody
+/// again. Making the mute durable means keying it on the SIGNATURE, not the
+/// test: quarantine keys suppression on a test and therefore swallows every
+/// FUTURE failure of that test including ones nobody has seen, which is why
+/// `Test.quarantineExpiresAt` had to exist. A mute keyed on the signature stops
+/// only the cause that was actually inspected — if the cause changes, the
+/// signature changes, and the new cause is loud again with no human action.
+/// That property is the reason this model exists rather than a `mutedAt`
+/// column on TriageVerdict.
+///
+/// `mutedUntil` is never "forever". A mute with no end date is the quarantine
+/// mistake again, so the writer clamps it to MUTE_MAX_DAYS
+/// (packages/agent/src/triage.ts); null here means not muted at all.
+///
+/// The counters exist because a suppressed failure must stay COUNTABLE. "It
+/// went quiet" and "it stopped happening" are different facts, and a muted
+/// cause that recorded nothing would make them indistinguishable — which is
+/// how a mute turns into a blind spot.
+model FailureSignature {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// sha1(signature)[0,12) — the same string the cockpit shows as a cluster id.
+  clusterKey String
+  /// The full signature verbatim, so a reviewer can audit the grouping that
+  /// produced this identity, plus `labelFor()`'s sentence denormalised: the
+  /// label is derived from the signature, but recomputing it needs the
+  /// clusterer and the cause page must be readable from this row alone.
+  signature  String
+  label      String
+
+  /// ── The identity ───────────────────────────────────────────────────────
+  ///
+  /// `firstSeenRunId` is what turns "new in this build" into an EQUALITY
+  /// instead of a search: a cause is new in run R exactly when
+  /// firstSeenRunId = R. No window, no "have we seen it in the last N runs"
+  /// scan over TestResult, and the answer does not change as history grows.
+  firstSeenAt     DateTime @default(now())
+  firstSeenRunId  String
+  lastSeenAt      DateTime
+  lastSeenRunId   String
+  /// Distinct RUNS it appeared in, and failing results across all of them.
+  /// RunFailureCluster holds the authoritative list of runs; these two are the
+  /// summary the cause page reads without touching it.
+  runCount        Int      @default(0)
+  occurrenceCount Int      @default(0)
+
+  /// ── Suppression ────────────────────────────────────────────────────────
+  mutedUntil      DateTime?
+  mutedAt         DateTime?
+  mutedBy         String?
+  /// Required by the endpoint that sets it. A mute with no stated reason is an
+  /// unexplained silence somebody else will inherit.
+  mutedReason     String?
+  /// Failing results seen while a mute was IN FORCE. Separate from
+  /// occurrenceCount so "muted and gone" and "muted and still firing forty
+  /// times a day" stay distinguishable — that is the fact that decides whether
+  /// a mute should be renewed.
+  suppressedCount Int       @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project     Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  occurrences RunFailureCluster[]
+
+  @@unique([orgId, projectId, clusterKey])
+  /// "Everything new in this build", straight off the index, for a caller that
+  /// has the run id and not the cluster keys.
+  @@index([orgId, projectId, firstSeenRunId])
+  /// The cause list: most recently seen first.
+  @@index([orgId, projectId, lastSeenAt])
+  /// The mute roster — and the one read that wants EXPIRED mutes too, which is
+  /// why it indexes `mutedUntil` rather than a partial "still muted".
+  @@index([orgId, mutedUntil])
+}
+
+/// ONE verdict per cause per run — and the row that makes it one.
+///
+/// THE DEFECT this closes is the 200-model-call outage, and the fix needs a
+/// CLAIM rather than a check: the triage queue runs at `concurrency * 2`
+/// (apps/worker/src/index.ts), so two jobs for two members of one cluster
+/// genuinely do look for an existing verdict at the same moment, both find
+/// none, and both call the model. `@@unique([runId, clusterKey])` IS the lock —
+/// the INSERT is the claim, exactly like SsoAssertionSeen — and the loser waits
+/// for the winner's verdict instead of paying for a second one.
+///
+/// It is also the per-run OCCURRENCE record, which is why there is no separate
+/// join table: "the runs this cause appeared in" is this table filtered by
+/// clusterKey, and the row has to exist anyway for the claim.
+///
+/// `firstSeenInProject` is written from the SAME signature row the claim path
+/// just minted or read (`claimCause`, apps/worker/src/processors/triage.ts), so
+/// it cannot disagree with `firstSeenRunId` — not a shared transaction, which
+/// a path that catches a unique violation cannot use on PostgreSQL. It exists
+/// so the run page answers "what is new in this build?" from one index read on
+/// (orgId, runId), with no second query and no join. It is also the value AS OF
+/// this run, which is the correct thing for an old run's page to show after the
+/// cause has recurred.
+///
+/// `modelCalls` and `attachments` are the accounting, stored rather than
+/// inferred: "we collapsed 200 failures into one call" is a claim about money,
+/// and a claim about money should be a number somebody can read back.
+/// `modelCalls` is normally 1 and is 2+ only when a waiter timed out and
+/// triaged itself — which has to be VISIBLE, not rounded down to the number we
+/// were hoping for.
+model RunFailureCluster {
+  id        String @id @default(cuid())
+  orgId     String
+  runId     String
+  projectId String
+
+  clusterKey String
+  signature  String
+  label      String
+
+  /// The result whose triage job won the claim and paid for the model call.
+  ownerResultId String
+  /// The verdict that call produced. Null while the owner is still in flight,
+  /// which is exactly the state a waiter polls on.
+  verdictId     String?
+
+  /// Failing results in this run carrying this signature.
+  members            Int     @default(0)
+  /// Model calls actually spent on this cause in this run.
+  modelCalls         Int     @default(0)
+  /// Members that took the owner's verdict instead of making their own call.
+  attachments        Int     @default(0)
+  /// True when a mute was in force for this cause while this run executed, so
+  /// the run page shows a suppressed cause as suppressed rather than as absent.
+  suppressed         Boolean @default(false)
+  /// Set in the transaction that minted the signature. See above.
+  firstSeenInProject Boolean @default(false)
+
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
+  /// Nullable, and the relation is a convenience rather than the identity: the
+  /// durable join between a run and a cause is `clusterKey`, which survives a
+  /// signature row being pruned. Cascade so a deleted project's causes take
+  /// their occurrences with them.
+  signatureId  String?
+  signatureRow FailureSignature? @relation(fields: [signatureId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, clusterKey])
+  /// The run page: every cause in this run, one index read.
+  @@index([orgId, runId])
+  /// The cause page: "which runs did this appear in", newest first.
+  @@index([orgId, clusterKey, createdAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2611,4 +3205,201 @@ model CoverageSnapshot {
   @@index([orgId])
   @@index([projectId, createdAt])
   @@index([projectId, commitSha])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Closing the gaps: provenance, and the campaign that spends a budget doing it
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One gap, and the auditable story of whether it was ever actually closed.
+///
+/// ── THE DEFECT, VERBATIM ────────────────────────────────────────────────────
+/// "Gap → plan item → test provenance and verified closure — the
+/// gapId→planItemId map is returned in the HTTP response only and PlanItem has
+/// no gap column, so QAAI cannot say 'this gap is closed by this test' or
+/// notice that it is not."
+///
+/// Both halves of that sentence matter, and the second one is the expensive
+/// half. A product that writes a test for a gap and never re-measures is not
+/// wrong once — it is wrong forever, confidently, in the direction that
+/// flatters it. The loop that made `Test.authProfileId` necessary is the exact
+/// shape: a gap asked for an authenticated test, an anonymous test was written,
+/// the gap re-opened on the next analysis, and nothing anywhere noticed that
+/// the same gap had now been "closed" four times.
+///
+/// ── WHY A ROW PER GAP AND NOT A COLUMN ON PlanItem ──────────────────────────
+/// `PlanItem.gapId` records an INTENTION ("this item was minted for that gap")
+/// and is immutable. This table records a HISTORY, and the history is the
+/// product: first seen, proposed, test written, closed, re-opened, re-opened
+/// again. A gap can be attempted more than once, by more than one campaign,
+/// and `reopenCount` is the number that tells a team their generator keeps
+/// producing a test that does not assert what the gap asked for.
+///
+/// ── THE STATES, AND THE ONE THAT MUST NEVER BE A LIE ────────────────────────
+/// `state` is text (see `Project.closureApprovalPolicy` for why not an enum);
+/// the domain is `CLOSURE_STATES` in packages/agent/src/coverage.ts, which is
+/// also where the transition rule lives, deterministically and with no model
+/// call. Two of the seven exist purely so that the table cannot flatter itself:
+///
+///   NOT_CLOSED    re-measured, a test exists, and the gap is STILL reported.
+///                 This is the finding. Folding it into OPEN would lose the
+///                 fact that we already spent a generation on it.
+///   UNVERIFIABLE  we could not re-measure. No readable crawl, or the gap
+///                 report was a ranked PAGE and this gap's absence from that
+///                 page is not evidence of anything. A gap that drops off a
+///                 truncated list must never be recorded as closed — that is
+///                 the single easiest way for this number to become fiction.
+model GapClosure {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  /// `CoverageGap.id` — a stable hash of (kind, subject), so the same gap gets
+  /// the same id from every later analysis. That stability is what makes this
+  /// table possible at all.
+  gapId     String
+  /// Carried because `gapId` is a hash and a human reading this row needs to
+  /// know what it was about even after the gap has stopped being reported.
+  gapKind   String
+  gapTitle  String
+
+  /// The campaign that last worked on it. Null for a gap recorded by a human
+  /// clicking propose rather than by the autopilot.
+  campaignId String?
+  /// The item minted for it, and the test that item produced. Both nullable and
+  /// both separately meaningful: an item with no test is generation that has not
+  /// landed (or a model key that was never set), which is a different state from
+  /// a gap nobody has proposed anything for.
+  planItemId String?
+  testId     String?
+
+  state String  @default("OPEN")
+  /// The sentence behind the current state, written by `verifyClosure`. Stored
+  /// rather than re-derived because the evidence it was decided on (which gaps
+  /// the report held that minute) is gone by the time anyone reads the row.
+  why   String?
+
+  firstSeenAt   DateTime  @default(now())
+  proposedAt    DateTime?
+  testSeenAt    DateTime?
+  closedAt      DateTime?
+  reopenedAt    DateTime?
+  /// How many times this gap has come back after being recorded closed. The
+  /// number that says "stop generating; this item does not close this gap".
+  reopenCount   Int       @default(0)
+  /// When closure was last actually checked. Distinct from `updatedAt`: a row
+  /// nothing has re-measured for a week is not a row whose state is current,
+  /// and a reader has to be able to tell.
+  lastCheckedAt DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One row per gap per project, which is what makes the upsert in the
+  /// close-loop tick idempotent under a redelivered job.
+  @@unique([projectId, gapId])
+  @@index([orgId])
+  @@index([projectId, state])
+  @@index([campaignId])
+  /// "Which gap did this test close?" — the reverse read, used when a test is
+  /// deleted or disabled and the gaps it was holding closed have to re-open.
+  @@index([testId])
+}
+
+/// One night's budgeted attempt to move a project's coverage number.
+///
+/// ── THE DEFECTS, VERBATIM ───────────────────────────────────────────────────
+/// "Budgeted closure campaign with a project coverage target — caps are per
+/// request (25 proposals, 12/40 plan items) and the overflow becomes prose
+/// telling a human to click again." And: "Closure autopilot (scheduled
+/// close-the-top-K with an approval policy and a nightly budget) — closure is
+/// seven manual steps across three screens."
+///
+/// So the overflow becomes QAAI's problem. This row is the durable work queue
+/// for that: the target, the money cap, the approval policy, how far it has
+/// got, what the number was last time, and — the field that makes it a loop
+/// rather than a cron job — `nextTickAt`.
+///
+/// ── WHY THE ROW IS THE QUEUE ────────────────────────────────────────────────
+/// There is no `qaai.close-loop` BullMQ queue, and that is deliberate rather
+/// than lazy. A re-queueing job whose own result decides whether to re-queue is
+/// the shape that produces a worker that never idles, and this repo has already
+/// paid for one queue with no consumer (see the bisect note in
+/// apps/worker/src/queues.ts). The 60-second scheduler sweep
+/// (`processScheduleTick`) advances whatever is due, so the pacing is a column
+/// compared against a clock — inspectable in psql, survives every restart, and
+/// structurally incapable of spinning faster than the sweep.
+///
+/// ── WHY ONE CAMPAIGN PER PROJECT PER UTC DAY ────────────────────────────────
+/// `@@unique([projectId, dayKey])` IS the nightly budget. It is not a counter
+/// that something has to remember to reset: a campaign that spends its budget,
+/// settles, or gives up cannot be replaced until the day rolls over, because
+/// the insert would collide. Budget enforcement by unique constraint is the
+/// only kind that cannot be defeated by a retry.
+model ClosureCampaign {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  /// `YYYY-MM-DD` in UTC. UTC and not the project's timezone, because the only
+  /// thing this key has to do is be the same string for every worker in every
+  /// region that might arm this campaign in the same night.
+  dayKey    String
+
+  state String @default("RUNNING")
+
+  /// Resolved from `Project.coverageTargetPercent` when the campaign is armed,
+  /// and then frozen. A target edited mid-campaign must not retroactively
+  /// decide that last night's run met it.
+  targetPercent     Int
+  /// How many gaps one tick may propose, and how many the whole campaign may.
+  topK              Int
+  nightlyItemBudget Int
+  approvalPolicy    String
+
+  /// Ticks taken, and the hard ceiling's counter. Bounded by
+  /// CLOSE_LOOP_MAX_TICKS so a bug in the stop rule runs out of ticks instead
+  /// of running all night.
+  tick          Int @default(0)
+  itemsProposed Int @default(0)
+  /// Consecutive ticks whose coverage delta was inside the settle threshold.
+  /// Two in a row is what "the number has stopped moving" means here; one is
+  /// what a tick taken before generation landed looks like.
+  settledTicks  Int @default(0)
+
+  /// The last two measurements and the gap between them, in PERCENTAGE POINTS.
+  ///
+  /// Nullable, and null means NOT MEASURED — never 0. A project with no source
+  /// analysis and no crawl has an empty denominator and therefore no
+  /// percentage, and recording that as 0.0 would make "we cannot see your app"
+  /// indistinguishable from "nothing in your app is covered", then settle the
+  /// campaign on a delta of zero between two numbers that never existed.
+  lastPercent     Float?
+  previousPercent Float?
+  lastDeltaPoints Float?
+  /// The snapshot row the last tick wrote, so the campaign's claim about the
+  /// number is traceable to the stored measurement it came from.
+  lastSnapshotId  String?
+
+  /// When this campaign asked for a fresh crawl, if it did. At most once per
+  /// campaign — so at most once per project per day — because a loop that
+  /// re-crawls every tick is a browser farm running until morning.
+  recrawlQueuedAt DateTime?
+
+  startedAt     DateTime  @default(now())
+  lastTickAt    DateTime?
+  /// When the next tick is due, or null when the campaign has stopped. The
+  /// scheduler sweep reads exactly this.
+  nextTickAt    DateTime?
+  /// Why it stopped, in a sentence meant to be shown verbatim. A campaign that
+  /// stopped with no reason is a campaign nobody can argue with.
+  stoppedReason String?
+  finishedAt    DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, dayKey])
+  @@index([orgId])
+  /// The sweep's own query: "every RUNNING campaign whose tick is due". Both
+  /// columns, in this order, so the 60-second sweep is an index range scan and
+  /// not a scan of every campaign the install has ever armed.
+  @@index([state, nextTickAt])
 }

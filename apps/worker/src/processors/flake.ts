@@ -26,6 +26,26 @@
  * transaction as the quarantine flip, because a decision nobody can see did not
  * happen.
  *
+ * ── Quarantine is not the product; it is the brake ──────────────────────────
+ * Quarantine SUPPRESSES a signal. For a long time it was the ONLY thing
+ * downstream of the word "flake", which meant this product's answer to "your
+ * test is unreliable" was "fine, we will stop listening to it". Three sweeps
+ * added to the tick close that:
+ *
+ *   `deflakeSweep`        turns a FLAKE verdict into a REPAIR — model-free
+ *                         where the defect is deterministic (a fixed sleep, an
+ *                         un-awaited action), and an honest "no fix, here is
+ *                         why" where it is not. See packages/agent/src/deflake.ts.
+ *   `verifyAppliedHeals`  re-runs the test after a heal is applied, because
+ *                         APPLIED was a claim nobody checked — and a heal
+ *                         recorded APPLIED while still red tells a human the
+ *                         problem is handled.
+ *   `driftSweep`          compares the suite against the newest crawl, so a
+ *                         renamed locator is reported BEFORE it costs a failing
+ *                         run, and a test whose page no longer exists is
+ *                         proposed for retirement instead of being healed
+ *                         forever against a page that is gone.
+ *
  * ── Which way it fails ──────────────────────────────────────────────────────
  * A quarantined test still RUNS; it just stops gating. So quarantine SUPPRESSES
  * a signal, and every uncertainty here resolves towards not suppressing:
@@ -45,11 +65,12 @@ import {
   FLAKE_AUDIT_ACTIONS,
   FLAKE_POLICY_DEFAULTS,
   FLAKE_RUN_PREFIX,
+  HEAL_AUDIT_ACTIONS,
   MANUAL_QUARANTINE_ACTIONS,
   TERMINAL_RUN_STATUSES,
   resolveFlakePolicy,
 } from '@qaai/shared';
-import type { FlakePolicy, Priority, RunStatus, TestResultStatus } from '@qaai/shared';
+import type { FlakePolicy, FlowMap, Priority, RunStatus, TestResultStatus } from '@qaai/shared';
 /*
  * The budget, the expiry and what "quarantine in force" means all live in
  * packages/runner/src/gates.ts — the module that already owned the one rule
@@ -65,6 +86,33 @@ import {
   QUARANTINE_MAX_DAYS,
 } from '@qaai/runner';
 import type { QuarantineBudgetVerdict } from '@qaai/runner';
+/*
+ * The heal lifecycle rules. Pure decisions, no Prisma — the verdict about what a
+ * verification means and which proposals a new one replaces lives beside the
+ * Healer itself, so the API's approval route and this sweep cannot come to
+ * different conclusions about the same row.
+ */
+import {
+  auditTestsAgainstCrawl,
+  decideVerification,
+  driftCheck,
+  parseVerificationRunTag,
+  planSupersede,
+  proposeDeflake,
+  shouldProposeHeal,
+} from '@qaai/agent';
+import type { OpenHeal, TestSurfaceReport } from '@qaai/agent';
+/*
+ * One remaining relative import, and a narrower reason than the three this file
+ * used to carry.
+ *
+ * `deflake.js` and `obsolete.js` are now in the package barrel, so they come in
+ * through the `@qaai/agent` line above like everything else. `suite-health.js`
+ * is not exported from it — promoting that module is somebody else's change —
+ * and this is a TYPE-ONLY import, so it is erased at build time and reaches no
+ * runtime code across the boundary.
+ */
+import type { SuiteHealthTestInput } from '../../../../packages/agent/src/suite-health.js';
 // One toll for every path that creates a Run: the plan gate and the usage
 // counter. It lives in the API workspace and takes its Prisma client as an
 // argument so this file can call the same implementation POST /runs does.
@@ -126,6 +174,112 @@ const FLAKE_HISTORY_RETENTION_DAYS = 90;
 const FLAKE_HISTORY_PRUNE_LIMIT = 5_000;
 
 const TERMINAL: readonly string[] = TERMINAL_RUN_STATUSES;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tunables for the three sweeps below. Exported constants rather than
+// environment variables, deliberately: scripts/check-wiring.ts fails an env var
+// nobody deploying this could discover, and none of these is a knob an operator
+// should be guessing at. A project-level column is the right home for anything
+// a customer genuinely needs to differ on — `FlakePolicy` is where that goes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/*
+ * The audit actions the heal lane writes — the only record these sweeps leave.
+ *
+ * They live in packages/shared/src/constants.ts now, beside
+ * `FLAKE_AUDIT_ACTIONS`: this file WRITES the rows and the audit-log reader in
+ * the API RENDERS them, and an action string declared in a worker processor
+ * could not be named by the surface that displays it without importing the
+ * processor. Re-exported because flake.test.ts destructures it out of this
+ * module, and because every reader already here keeps working unchanged.
+ */
+export { HEAL_AUDIT_ACTIONS };
+
+/**
+ * How long a verifying run has to produce a terminal status before the heal is
+ * recorded UNVERIFIABLE.
+ *
+ * Longer than a flake investigation's deadline, because a verification is ONE
+ * run rather than ten, and because the cost of being early here is the worst
+ * outcome this feature has: "nobody checked" written about a run that was about
+ * to come back green. 90 minutes is comfortably past any single-test run that is
+ * going to finish at all.
+ */
+export const HEAL_VERIFY_DEADLINE_MINUTES = 90;
+
+/** Ceiling on the verification sweep, so one install cannot hold the tick open. */
+const HEAL_VERIFY_SCAN_LIMIT = 50;
+
+/**
+ * How far back the deflake sweep looks for FLAKE verdicts.
+ *
+ * Wide enough that a verdict filed while the worker was down is still picked up,
+ * and narrow enough that the sweep is not re-reading last month's verdicts
+ * forever. The per-test cooldown below is what actually stops repetition.
+ */
+const DEFLAKE_VERDICT_LOOKBACK_HOURS = 24;
+
+const DEFLAKE_SCAN_LIMIT = 200;
+
+/**
+ * Deflake proposals written per tick, across every org.
+ *
+ * The analysis is deterministic and cheap, but each proposal is a row in
+ * somebody's review queue. Five per tick is a few dozen an hour, which is more
+ * than any team can read; the cap exists so a project that goes wholesale flaky
+ * cannot bury its own queue in one afternoon.
+ */
+const DEFLAKE_PROPOSALS_PER_TICK = 5;
+
+/**
+ * How long before the same test is analysed for a deflake again.
+ *
+ * Applies to the UNFIXABLE answer in particular: "QAAI looked and has no
+ * automatic fix" is worth recording once, not once every five minutes forever.
+ */
+const DEFLAKE_RETRY_HOURS = 24;
+
+/** Flow maps read per tick, before reducing to the newest per project. */
+const DRIFT_FLOWMAP_SCAN_LIMIT = 50;
+
+/** Tests compared per project per crawl. */
+const DRIFT_TEST_SCAN_LIMIT = 500;
+
+/**
+ * Route items read per project per crawl — the SOURCE side of a retirement.
+ *
+ * This cap is the dangerous one in this file, and it is read one row over it on
+ * purpose so that "there are more" is a FACT and not an inference. The declared
+ * -route list is one of the two independent negatives a retirement rests on: on
+ * a project with more route items than this, a route the source genuinely
+ * declares does not come back, arrives at `obsolete.ts` as `declared: false`,
+ * and the cap manufactures a retirement proposal for a test whose page is
+ * perfectly fine. So beyond it the whole project's source side is declared
+ * TRUNCATED and every proposal for that crawl is withheld — the same way
+ * `truncatedReason` withholds them on the crawl side — and the audit row
+ * records that the cap bit.
+ *
+ * The ORDER BY matters for the same reason the cap does: without one, Postgres
+ * returns whichever 2,000 rows it likes, so this sweep and GET /agent/drift
+ * could read different subsets of the same table and reach different verdicts
+ * about the same test. `key` is unique per (project, kind) and indexed.
+ */
+const DRIFT_ROUTE_ITEM_SCAN_LIMIT = 2_000;
+
+/** Drift warnings kept in the audit row. The full list is recomputable on read. */
+const DRIFT_WARNINGS_RECORDED = 50;
+
+/**
+ * Retirement proposals minted per project per crawl.
+ *
+ * Low on purpose. A crawl that suddenly reaches nothing — a base URL that
+ * changed, an environment that was down in a way the crawler read as empty —
+ * would otherwise propose retiring the customer's entire suite in one tick.
+ * `obsolete.ts` refuses to propose on a truncated crawl, which catches most of
+ * that; this is the backstop for the case where the crawl believed it was
+ * complete.
+ */
+const RETIREMENTS_PER_PROJECT_PER_CRAWL = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The decision, as pure functions. Everything below this line that matters is
@@ -397,7 +551,20 @@ export interface SuspectRow {
   environmentId: string;
   status: TestResultStatus | string;
   retriedAndPassed: boolean;
-  /** Confirmation runs are excluded: an investigation must not feed itself. */
+  /**
+   * True for a run QAAI started to measure or check something, rather than a run
+   * of the customer's suite. Excluded from the suspect scan.
+   *
+   * TWO kinds qualify, and the second was a hole. A flake investigation's
+   * confirmation runs obviously must not feed the scan — an investigation would
+   * keep re-suspecting the test it is currently measuring. A HEAL VERIFICATION
+   * run is the same shape and the same problem: it runs one test, on purpose,
+   * right after that test's code changed, and a verification that fails is
+   * precisely the "it passed and failed across recent runs" pattern the scan
+   * reads as instability. Left in, every applied heal that did not work would
+   * open a flake investigation about a test we already know is broken, and spend
+   * ten more runs confirming it.
+   */
   fromConfirmationRun: boolean;
 }
 
@@ -487,6 +654,34 @@ export async function processFlakeTick(_job: FlakeTickJob): Promise<void> {
 
   const active = await advanceInvestigations(now, policies);
   await openInvestigations(now, policies, active);
+
+  /*
+   * ── The three sweeps that turn a flake into a fix ──────────────────────────
+   *
+   * Each one is independent, bounded, and `.catch()`ed: this tick is shared by
+   * every org on the install, so one project's bad row must never stop another
+   * project's measurement. Nothing is decided by a sweep that threw, so nothing
+   * is suppressed and the next tick retries.
+   *
+   * WHY THEY LIVE IN THIS FILE. All three are periodic comparisons over test
+   * health that need no new queue and no new table — which is the shape this
+   * file already is (see "Where the state lives" above), and registering a new
+   * queue means editing packages/shared's QUEUE_NAMES and the worker's
+   * registry, neither of which this change owns. `driftSweep` in particular
+   * should ideally be called by processors/explore.ts the moment a crawl
+   * finishes rather than noticed afterwards; it keys off the FlowMap id so it
+   * runs exactly once per crawl either way, and moving the call there later
+   * changes nothing about the function. See the report accompanying this change.
+   */
+  await verifyAppliedHeals(now).catch((err) =>
+    logger.error({ err }, 'could not advance heal verification; it will be retried next tick'),
+  );
+  await deflakeSweep(now).catch((err) =>
+    logger.error({ err }, 'could not propose deflakes; it will be retried next tick'),
+  );
+  await driftSweep().catch((err) =>
+    logger.error({ err }, 'could not run the drift check; it will be retried next tick'),
+  );
 
   /*
    * Retention for the flake trend. Here rather than in the run processor
@@ -1283,7 +1478,9 @@ async function suspectCandidates(now: Date): Promise<Candidate[]> {
       environmentId: row.run.environmentId,
       status: row.status,
       retriedAndPassed: row.retriedAndPassed,
-      fromConfirmationRun: parseInvestigationTag(row.run.triggeredBy) !== null,
+      fromConfirmationRun:
+        parseInvestigationTag(row.run.triggeredBy) !== null ||
+        parseVerificationRunTag(row.run.triggeredBy) !== null,
     })),
   ).map((suspect) => ({ ...suspect, forRelease: false }));
 }
@@ -1374,4 +1571,849 @@ async function flakePolicyFor(
 
   cache.set(projectId, policy);
   return policy;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Verifying a heal that was applied.
+//
+// `HealProposal.state = 'APPLIED'` used to be a claim nobody checked. Both apply
+// paths wrote the patched code, wrote a TestVersion, flipped the state, and
+// never ran the test again — so a heal that applied cleanly, parsed, kept every
+// assertion and fixed NOTHING was recorded as applied, and the next human to
+// look saw a handled problem where there was a red test. That is worse than no
+// healing: an unhealed failure at least stays on the board.
+//
+// The apply paths start the run (they are the ones holding the environment and
+// the plan toll); this sweep is what reads it back. Same division as the flake
+// investigations above, and for the same reason: a worker restart must not lose
+// the answer.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface PendingVerification {
+  id: string;
+  orgId: string;
+  testId: string;
+  state: string;
+  verifyRunId: string | null;
+  appliedVersion: number | null;
+  decidedAt: Date | null;
+  createdAt: Date;
+}
+
+export async function verifyAppliedHeals(now: Date): Promise<void> {
+  /*
+   * Served by HealProposal(verifyState), added in
+   * 20261024051000_heal_verification_and_supersede. The overwhelming majority of
+   * rows have the column NULL — nobody applied them — so the PENDING set this
+   * reads is tiny however many proposals the install has ever made.
+   */
+  const pending = (await prisma.healProposal.findMany({
+    where: { verifyState: 'PENDING' },
+    orderBy: { createdAt: 'asc' },
+    take: HEAL_VERIFY_SCAN_LIMIT,
+    select: {
+      id: true,
+      orgId: true,
+      testId: true,
+      state: true,
+      verifyRunId: true,
+      appliedVersion: true,
+      decidedAt: true,
+      createdAt: true,
+    },
+  })) as PendingVerification[];
+
+  for (const heal of pending) {
+    try {
+      await advanceVerification(heal, now);
+    } catch (err) {
+      // One heal's verification must never stop the sweep for every other org.
+      // Nothing was written, so the row stays PENDING and the next tick retries.
+      logger.error({ err, healId: heal.id }, 'could not advance a heal verification');
+    }
+  }
+}
+
+async function advanceVerification(heal: PendingVerification, now: Date): Promise<void> {
+  const startedAt = heal.decidedAt ?? heal.createdAt;
+
+  const run = heal.verifyRunId
+    ? await prisma.run.findFirst({
+        where: { id: heal.verifyRunId, orgId: heal.orgId },
+        select: {
+          id: true,
+          status: true,
+          results: {
+            where: { testId: heal.testId },
+            select: { status: true, retriedAndPassed: true },
+          },
+        },
+      })
+    : null;
+
+  /*
+   * No run at all. Either the apply path recorded PENDING without an id — which
+   * would be a bug, and this is how it becomes visible rather than a row stuck
+   * PENDING forever — or a person deleted the run. Both are "nobody checked",
+   * which is the answer this feature exists to be able to give.
+   */
+  if (!run) {
+    await recordVerification(heal, now, {
+      state: 'UNVERIFIABLE',
+      revert: false,
+      passedOnRetry: false,
+      note: heal.verifyRunId
+        ? `The heal was applied and nobody has confirmed it works: the run that was checking it (${heal.verifyRunId}) is gone. The test has NOT been shown to pass — re-run it.`
+        : 'The heal was applied and no verifying run was ever started, so nobody has confirmed it works. The test has NOT been shown to pass — re-run it.',
+    });
+    return;
+  }
+
+  if (!TERMINAL.includes(run.status)) {
+    const deadline = new Date(startedAt.getTime() + HEAL_VERIFY_DEADLINE_MINUTES * 60_000);
+    if (now <= deadline) return;
+
+    // Stop the queued work too: a verification nobody is waiting on any more
+    // must not execute hours later against a verdict already written.
+    await prisma.run
+      .updateMany({
+        where: { id: run.id, orgId: heal.orgId, status: { in: ['QUEUED', 'RUNNING'] } },
+        data: { status: 'CANCELLED', finishedAt: now },
+      })
+      .catch(() => {});
+
+    await recordVerification(heal, now, {
+      state: 'UNVERIFIABLE',
+      revert: false,
+      passedOnRetry: false,
+      note:
+        `The heal was applied and nobody has confirmed it works: the verifying run did not finish ` +
+        `within ${HEAL_VERIFY_DEADLINE_MINUTES} minutes and was cancelled. The test has NOT been ` +
+        `shown to pass — re-run it.`,
+    });
+    return;
+  }
+
+  const result = run.results[0] ?? null;
+  const outcome = decideVerification({
+    healState: heal.state,
+    runStatus: run.status,
+    resultStatus: result?.status ?? null,
+    retriedAndPassed: result?.retriedAndPassed ?? false,
+    appliedVersion: heal.appliedVersion,
+  });
+
+  await recordVerification(heal, now, outcome);
+}
+
+/**
+ * Write the verdict, and the revert when there is one, atomically.
+ *
+ * A revert whose audit row failed to write is a change to the customer's test
+ * that nobody can explain; a proposal whose state flipped without the code
+ * moving is a lie in the other direction. One transaction, like the quarantine
+ * flip above.
+ */
+async function recordVerification(
+  heal: PendingVerification,
+  now: Date,
+  outcome: ReturnType<typeof decideVerification>,
+): Promise<void> {
+  let note = outcome.note;
+  let reverting = outcome.revert;
+  let restored: { code: string; version: number } | null = null;
+
+  if (reverting && heal.appliedVersion !== null) {
+    const previous = await prisma.testVersion.findFirst({
+      where: { testId: heal.testId, version: heal.appliedVersion - 1 },
+      select: { code: true, version: true },
+    });
+    if (previous) restored = previous;
+    else {
+      /*
+       * The decision said revert and the history cannot support it. Writing
+       * "whatever came before", guessed, could put a version of the test in the
+       * customer's repository that this heal never replaced — so the patch
+       * stays and the note says so, loudly, instead.
+       */
+      reverting = false;
+      note = `${note} In the event it could NOT be reverted: version ${heal.appliedVersion - 1} is not in this test's history. Revert it by hand.`;
+    }
+  }
+
+  const action = reverting
+    ? HEAL_AUDIT_ACTIONS.reverted
+    : outcome.state === 'VERIFIED'
+      ? HEAL_AUDIT_ACTIONS.verified
+      : outcome.state === 'UNVERIFIABLE'
+        ? HEAL_AUDIT_ACTIONS.unverifiable
+        : HEAL_AUDIT_ACTIONS.verificationFailed;
+
+  const writes: unknown[] = [
+    prisma.healProposal.update({
+      where: { id: heal.id },
+      /*
+       * `state` is deliberately NOT touched, on either path.
+       *
+       * A reverted proposal keeps AUTO_APPLIED — it WAS auto-applied, and that
+       * is what happened — rather than going back to PROPOSED. Putting it back
+       * in the review queue would offer a human a fix we now have evidence does
+       * not work, which is how a product recommends the same wrong answer
+       * forever. The next triage proposes afresh instead; `shouldProposeHeal`
+       * only ever reuses an OPEN proposal.
+       */
+      data: { verifyState: outcome.state, verifiedAt: now, verifyNote: note },
+    }),
+    prisma.auditLog.create({
+      data: {
+        orgId: heal.orgId,
+        userId: null,
+        action,
+        targetType: 'HealProposal',
+        targetId: heal.id,
+        metadata: {
+          testId: heal.testId,
+          healState: heal.state,
+          verifyState: outcome.state,
+          reverted: reverting,
+          revertedToVersion: restored?.version ?? null,
+          passedOnRetry: outcome.passedOnRetry,
+          runId: heal.verifyRunId,
+          note,
+        },
+      },
+    }),
+  ];
+
+  if (reverting && restored) {
+    const latest = await prisma.testVersion.findFirst({
+      where: { testId: heal.testId },
+      orderBy: { version: 'desc' },
+      select: { version: true },
+    });
+    writes.push(
+      prisma.test.update({
+        where: { id: heal.testId },
+        data: {
+          code: restored.code,
+          /*
+           * Append, never rewind. The reverted code goes in as a NEW version
+           * rather than deleting the heal's version row: the history of what was
+           * written to a customer's test is not ours to edit, and "what did QAAI
+           * do to this test and when" is the question asked after exactly this
+           * kind of incident.
+           */
+          versions: {
+            create: {
+              orgId: heal.orgId,
+              version: (latest?.version ?? restored.version) + 1,
+              code: restored.code,
+              source: 'HEALER',
+              message: `Reverted an auto-applied heal that failed verification, back to version ${restored.version}. ${note}`.slice(
+                0,
+                2_000,
+              ),
+            },
+          },
+        },
+      }),
+    );
+  }
+
+  await prisma.$transaction(writes as never);
+
+  logger.info(
+    {
+      healId: heal.id,
+      testId: heal.testId,
+      verifyState: outcome.state,
+      reverted: reverting,
+    },
+    'heal verification recorded',
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Turning a FLAKE verdict into a repair.
+//
+// Triage could say FLAKE and the only machinery downstream of that word was
+// quarantine, which stops the test gating and leaves the flake exactly where it
+// was. This sweep is the other half: for each recently-flagged flake, ask
+// `proposeDeflake` for the repair and put it where a person can accept it.
+//
+// The analysis calls NO MODEL. A fixed sleep and an un-awaited action are
+// deterministic findings with deterministic fixes, and everything else is
+// reported as named-but-not-patched rather than guessed at — see
+// packages/agent/src/deflake.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Open proposals for one test, in the shape the lifecycle rules want. */
+async function openHealsFor(orgId: string, testId: string): Promise<OpenHeal[]> {
+  return await prisma.healProposal.findMany({
+    where: { orgId, testId, state: { in: ['PROPOSED', 'APPROVED'] } },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+    select: { id: true, state: true, riskLevel: true, diff: true, createdAt: true },
+  });
+}
+
+interface FlakeVerdictRow {
+  id: string;
+  orgId: string;
+  explanation: string;
+  testResult: { testId: string; errorMessage: string | null };
+}
+
+export async function deflakeSweep(now: Date): Promise<void> {
+  const since = new Date(now.getTime() - DEFLAKE_VERDICT_LOOKBACK_HOURS * 3_600_000);
+
+  /*
+   * A human override beats the model, in both directions — the same rule
+   * `findRecentRealBugVerdict` applies above. A verdict somebody overrode AWAY
+   * from FLAKE is not a flake, and one overridden INTO FLAKE is.
+   */
+  const verdicts = (await prisma.triageVerdict.findMany({
+    where: {
+      createdAt: { gte: since },
+      OR: [
+        { reviewState: 'OVERRIDDEN', overriddenTo: 'FLAKE' },
+        { reviewState: { not: 'OVERRIDDEN' }, verdict: 'FLAKE' },
+      ],
+    },
+    orderBy: { createdAt: 'desc' },
+    take: DEFLAKE_SCAN_LIMIT,
+    select: {
+      id: true,
+      orgId: true,
+      explanation: true,
+      testResult: { select: { testId: true, errorMessage: true } },
+    },
+  })) as FlakeVerdictRow[];
+
+  const seen = new Set<string>();
+  let budget = DEFLAKE_PROPOSALS_PER_TICK;
+
+  for (const verdict of verdicts) {
+    if (budget <= 0) break;
+    const testId = verdict.testResult.testId;
+    // Newest verdict per test only: the older ones describe the same test.
+    if (seen.has(testId)) continue;
+    seen.add(testId);
+
+    try {
+      if (await deflakeOne(verdict, now)) budget -= 1;
+    } catch (err) {
+      logger.error({ err, testId, verdictId: verdict.id }, 'could not propose a deflake');
+    }
+  }
+}
+
+/** @returns true when something was written (a proposal or an honest refusal). */
+async function deflakeOne(verdict: FlakeVerdictRow, now: Date): Promise<boolean> {
+  const { orgId } = verdict;
+  const testId = verdict.testResult.testId;
+
+  /*
+   * The cooldown, and it covers the UNFIXABLE answer as much as the fixable
+   * one. "QAAI looked and has no automatic fix" is worth recording once, not
+   * once every five minutes for as long as the test keeps failing.
+   */
+  const recent = await prisma.auditLog.findFirst({
+    where: {
+      orgId,
+      targetType: 'Test',
+      targetId: testId,
+      action: { in: [HEAL_AUDIT_ACTIONS.deflakeProposed, HEAL_AUDIT_ACTIONS.deflakeUnfixable] },
+      createdAt: { gte: new Date(now.getTime() - DEFLAKE_RETRY_HOURS * 3_600_000) },
+    },
+    select: { id: true },
+  });
+  if (recent) return false;
+
+  const test = await prisma.test.findFirst({
+    where: { id: testId, orgId },
+    select: {
+      id: true,
+      name: true,
+      filePath: true,
+      code: true,
+      disabledAt: true,
+      projectId: true,
+    },
+  });
+  // Fixtures are test data, not tests — they never run and never gate.
+  if (!test || test.disabledAt || test.filePath.startsWith(FIXTURE_PREFIX)) return false;
+
+  const openHeals = await openHealsFor(orgId, testId);
+  const decision = shouldProposeHeal({
+    openHeals,
+    currentCode: test.code,
+    filePath: test.filePath,
+  });
+  if (!decision.propose) {
+    // The per-TEST guard. Without it one permanently flaky test would mint a
+    // fresh proposal on every tick and fill the review queue by itself.
+    logger.debug({ testId, reuseId: decision.reuseId }, 'skipping a deflake proposal');
+    return false;
+  }
+
+  const proposal = proposeDeflake({
+    testName: test.name,
+    filePath: test.filePath,
+    code: test.code,
+    evidence: {
+      verdictExplanation: verdict.explanation,
+      failureMessage: verdict.testResult.errorMessage,
+    },
+  });
+
+  const findings = proposal.findings.map((finding) => ({
+    kind: finding.kind,
+    line: finding.line,
+    quote: finding.quote,
+    why: finding.why,
+    repair: finding.repair,
+    patched: finding.patched,
+  }));
+
+  if (!proposal.fixable) {
+    /*
+     * No HealProposal row, and that is the deliberate choice: a proposal with
+     * an empty diff is a row in a review queue with a dead Approve button. The
+     * finding is recorded in the audit log — the same place every other
+     * decision this file makes is recorded — so "QAAI analysed this flake and
+     * had no automatic fix, for this reason" is answerable, rather than being
+     * silently absent.
+     */
+    await prisma.auditLog.create({
+      data: {
+        orgId,
+        userId: null,
+        action: HEAL_AUDIT_ACTIONS.deflakeUnfixable,
+        targetType: 'Test',
+        targetId: testId,
+        metadata: {
+          verdictId: verdict.id,
+          reason: proposal.unfixableReason,
+          explanation: proposal.explanation,
+          recommendations: proposal.recommendations,
+          dialect: proposal.dialect,
+          findings,
+        },
+      },
+    });
+    logger.info(
+      { testId, reason: proposal.unfixableReason, findings: findings.length },
+      'deflake analysed with no automatic fix',
+    );
+    return true;
+  }
+
+  /*
+   * The id is minted here rather than by the database so the new row and the
+   * supersede that points at it can be written in ONE transaction. A proposal
+   * whose siblings were not closed is a review queue with two rows for one
+   * test, which is the defect this supersede exists to fix.
+   */
+  const healId = randomUUID();
+  const plan = planSupersede({
+    incomingId: healId,
+    incomingRiskLevel: proposal.riskLevel,
+    // Only the proposals the guard above called STALE. An open patch that still
+    // applies is a fix for a different problem on the same test, and closing it
+    // would throw away work nobody reviewed.
+    openHeals: openHeals.filter((heal) => decision.staleIds.includes(heal.id)),
+  });
+
+  await prisma.$transaction([
+    prisma.healProposal.create({
+      data: {
+        id: healId,
+        orgId,
+        testId,
+        verdictId: verdict.id,
+        diff: proposal.diff,
+        explanation: proposal.explanation,
+        // STRUCTURAL, always: a deflake rewrites how a test waits, which is
+        // never selector-only and so never eligible for unattended apply.
+        riskLevel: 'STRUCTURAL',
+        confidence: proposal.confidence,
+        evidence: {
+          kind: 'DEFLAKE',
+          findings,
+          recommendations: proposal.recommendations,
+          assertionsBefore: proposal.assertionsBefore,
+          assertionsAfter: proposal.assertionsAfter,
+          dialect: proposal.dialect,
+        },
+      },
+    }),
+    prisma.healProposal.updateMany({
+      where: { id: { in: plan.ids } },
+      data: { state: 'SUPERSEDED', supersededById: healId, decidedAt: now },
+    }),
+    prisma.auditLog.create({
+      data: {
+        orgId,
+        userId: null,
+        action: HEAL_AUDIT_ACTIONS.deflakeProposed,
+        targetType: 'Test',
+        targetId: testId,
+        metadata: {
+          healId,
+          verdictId: verdict.id,
+          confidence: proposal.confidence,
+          superseded: plan.ids,
+          supersedeReason: plan.reason,
+          assertionsBefore: proposal.assertionsBefore,
+          assertionsAfter: proposal.assertionsAfter,
+          findings,
+        },
+      },
+    }),
+  ]);
+
+  logger.info(
+    { testId, healId, confidence: proposal.confidence, superseded: plan.ids.length },
+    'proposed a deflake fix',
+  );
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pre-failure drift check, and retirement proposals.
+//
+// The Explorer re-crawls and knows, that instant, which locators a test uses
+// that the application no longer shows. Nothing looked — so every rename cost a
+// failing CI run, a triage call and a heal proposal before anyone heard about
+// it, when the information was in the flow map before the run started.
+//
+// Keyed on the FlowMap ROW ID, so this runs exactly once per crawl however often
+// the tick fires. The audit row IS the state, like everything else in this file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface CrawlRow {
+  id: string;
+  orgId: string;
+  projectId: string;
+  version: number;
+  graph: unknown;
+  truncatedReason: string | null;
+}
+
+/**
+ * Takes no clock, unlike its two siblings: nothing here is time-based. A crawl
+ * is checked exactly once — the audit row keyed on the FlowMap id is the only
+ * state — so there is no window, no deadline and no cooldown to measure.
+ *
+ * WHAT IT LOSES, stated because it is a real limitation: the scan reads the
+ * `DRIFT_FLOWMAP_SCAN_LIMIT` most recent flow maps across the whole install. On
+ * an install where more than that many crawls land between two ticks, a quiet
+ * project's crawl can be pushed out of the window and never checked. The fix is
+ * for processors/explore.ts to call this (or its per-project equivalent) when a
+ * crawl finishes, which is where this belongs anyway — see the tick.
+ */
+export async function driftSweep(): Promise<void> {
+  const crawls = (await prisma.flowMap.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: DRIFT_FLOWMAP_SCAN_LIMIT,
+    select: {
+      id: true,
+      orgId: true,
+      projectId: true,
+      version: true,
+      graph: true,
+      truncatedReason: true,
+    },
+  })) as CrawlRow[];
+
+  // Newest per project. A project that re-crawled twice between ticks is
+  // compared against the newer crawl only — the older one's answer is stale by
+  // definition, and spending the comparison on it would be spending it on a
+  // question nobody asked.
+  const newest = new Map<string, CrawlRow>();
+  for (const crawl of crawls) if (!newest.has(crawl.projectId)) newest.set(crawl.projectId, crawl);
+
+  for (const crawl of newest.values()) {
+    try {
+      await driftOne(crawl);
+    } catch (err) {
+      logger.error(
+        { err, projectId: crawl.projectId, flowMapId: crawl.id },
+        'could not check a project for drift',
+      );
+    }
+  }
+}
+
+async function driftOne(crawl: CrawlRow): Promise<void> {
+  const already = await prisma.auditLog.findFirst({
+    where: {
+      orgId: crawl.orgId,
+      targetType: 'FlowMap',
+      targetId: crawl.id,
+      action: HEAL_AUDIT_ACTIONS.driftChecked,
+    },
+    select: { id: true },
+  });
+  if (already) return;
+
+  const testRows = await prisma.test.findMany({
+    where: { orgId: crawl.orgId, projectId: crawl.projectId, disabledAt: null },
+    orderBy: { createdAt: 'asc' },
+    // One over the cap, so the audit row can state that more exist rather than
+    // reporting `testsCompared` as though it were the project's whole suite.
+    take: DRIFT_TEST_SCAN_LIMIT + 1,
+    select: {
+      id: true,
+      name: true,
+      filePath: true,
+      type: true,
+      priority: true,
+      feature: true,
+      tags: true,
+      code: true,
+      spec: true,
+      flakeRate: true,
+      quarantined: true,
+      consecutiveFailures: true,
+    },
+  });
+  const testsTruncated = testRows.length > DRIFT_TEST_SCAN_LIMIT;
+  const tests = testRows.slice(0, DRIFT_TEST_SCAN_LIMIT);
+
+  /*
+   * ── The input that decides whether a retirement is even possible ───────────
+   *
+   * `declaredRoutes` is NULL when no source analysis has run, and null is not an
+   * empty list: with nothing having read the code, "the source does not declare
+   * this route" is the absence of a detector rather than a fact about the
+   * application, and `obsolete.ts` withholds every retirement proposal on that
+   * basis. The probe is for any SOURCE-origin item of ANY kind, because source
+   * analysis is what produces endpoints, forms and auth surfaces — a project
+   * whose code declares no page routes at all would otherwise read as having no
+   * source analysis.
+   */
+  const sourceItems = await prisma.coverageItem.count({
+    where: {
+      orgId: crawl.orgId,
+      projectId: crawl.projectId,
+      origin: { in: ['SOURCE_ONLY', 'BOTH'] },
+    },
+  });
+  const routeItemRows = await prisma.coverageItem.findMany({
+    where: { orgId: crawl.orgId, projectId: crawl.projectId, kind: 'ROUTE' },
+    orderBy: { key: 'asc' },
+    take: DRIFT_ROUTE_ITEM_SCAN_LIMIT + 1,
+    select: { key: true, origin: true, retiredAt: true },
+  });
+  const routeItemsTruncated = routeItemRows.length > DRIFT_ROUTE_ITEM_SCAN_LIMIT;
+  const routeItems = routeItemRows.slice(0, DRIFT_ROUTE_ITEM_SCAN_LIMIT);
+
+  const routeOf = (key: string): string => key.replace(/^ROUTE:/, '');
+  const declaredRoutes =
+    sourceItems > 0
+      ? routeItems.filter((item) => item.origin !== 'CRAWL_ONLY').map((item) => routeOf(item.key))
+      : null;
+  const retiredRoutes = routeItems
+    .filter((item) => item.retiredAt !== null)
+    .map((item) => routeOf(item.key));
+
+  const report = auditTestsAgainstCrawl({
+    tests: tests
+      // Fixtures are test data, not tests.
+      .filter((test) => !test.filePath.startsWith(FIXTURE_PREFIX))
+      .map((test) => test as unknown as SuiteHealthTestInput),
+    flowMap: readFlowMap(crawl),
+    declaredRoutes,
+    /*
+     * The source-side fence. Beyond the cap the declared list is a page of the
+     * project's route items rather than the list, so "the source does not
+     * declare this route" stops being a fact — and every retirement proposal
+     * for this crawl is withheld rather than resting on it.
+     */
+    declaredRoutesTruncatedReason: routeItemsTruncated
+      ? `QAAI read the first ${DRIFT_ROUTE_ITEM_SCAN_LIMIT} route items of this project and there are more`
+      : null,
+    retiredRoutes,
+  });
+  const check = driftCheck(report);
+
+  const retirements = await proposeRetirements(crawl, report);
+
+  await prisma.auditLog.create({
+    data: {
+      orgId: crawl.orgId,
+      userId: null,
+      action: HEAL_AUDIT_ACTIONS.driftChecked,
+      targetType: 'FlowMap',
+      targetId: crawl.id,
+      metadata: {
+        projectId: crawl.projectId,
+        crawlVersion: crawl.version,
+        testsCompared: report.tests.length,
+        /*
+         * Both caps, stated. `testsCompared: 12` on a project with nine hundred
+         * tests is a number that gets read as the whole suite, and
+         * `routesCompared` was not recorded at all — so nothing anywhere said
+         * that the authority for one of the two negatives behind a retirement
+         * had been truncated. A count with no "more exist" beside it is how a
+         * cap becomes a silent claim.
+         */
+        testsTruncated,
+        testScanLimit: DRIFT_TEST_SCAN_LIMIT,
+        routesCompared: routeItems.length,
+        routeItemsTruncated,
+        routeItemScanLimit: DRIFT_ROUTE_ITEM_SCAN_LIMIT,
+        summary: check.summary,
+        // Capped: the audit row is a record, not the report. Recomputing the
+        // whole thing is a read away (GET /agent/projects/:id/drift).
+        warnings: check.warnings.slice(0, DRIFT_WARNINGS_RECORDED).map((warning) => ({
+          testId: warning.testId,
+          name: warning.name,
+          priority: warning.priority,
+          missing: warning.missing,
+        })),
+        warningsTruncated: Math.max(0, check.warnings.length - DRIFT_WARNINGS_RECORDED),
+        retirementsProposed: retirements,
+        // The caveats ride along, because a count without them is the kind of
+        // number that gets quoted on its own six months later.
+        caveats: report.caveats,
+      },
+    },
+  });
+
+  logger.info(
+    {
+      projectId: crawl.projectId,
+      crawlVersion: crawl.version,
+      drifted: check.warnings.length,
+      obsolete: check.obsoleteCount,
+      retirementsProposed: retirements.length,
+    },
+    'drift check complete',
+  );
+}
+
+/** The stored graph, or null when it is not a shape this can read. */
+function readFlowMap(crawl: CrawlRow): FlowMap | null {
+  const graph = crawl.graph as Partial<FlowMap> | null;
+  if (!graph || typeof graph !== 'object' || !Array.isArray(graph.nodes)) return null;
+  return {
+    projectId: crawl.projectId,
+    environmentId: typeof graph.environmentId === 'string' ? graph.environmentId : '',
+    baseUrl: typeof graph.baseUrl === 'string' ? graph.baseUrl : '',
+    nodes: graph.nodes,
+    edges: Array.isArray(graph.edges) ? graph.edges : [],
+    journeys: Array.isArray(graph.journeys) ? graph.journeys : [],
+    features: Array.isArray(graph.features) ? graph.features : [],
+    exploredAt: typeof graph.exploredAt === 'string' ? graph.exploredAt : '',
+    /*
+     * The ROW is the authority on these two, not the blob. A `graph` written by
+     * an older crawler may carry neither, and a missing `truncatedReason` read
+     * as "the crawl was complete" is precisely the mistake that would let a
+     * truncated crawl retire somebody's tests.
+     */
+    version: crawl.version,
+    truncatedReason: crawl.truncatedReason,
+  };
+}
+
+/** Route checks as plain JSON, for the `evidence` column and the audit row. */
+function routesAsJson(
+  routes: TestSurfaceReport['routes'],
+): Array<{ route: string; reached: boolean; declared: boolean; retired: boolean }> {
+  return routes.map((route) => ({
+    route: route.route,
+    reached: route.reached,
+    declared: route.declared,
+    retired: route.retired,
+  }));
+}
+
+/**
+ * Mint RETIRE proposals for the tests `obsolete.ts` is willing to call obsolete.
+ *
+ * Every guard that matters is upstream of here — a retirement is only ever
+ * proposed when source analysis exists, the crawl ran to completion, the test
+ * was read in full and every route it drives is absent from both sides. This
+ * function adds two more: a cap per crawl, and the per-test lifecycle guard, so
+ * a project cannot accumulate one retirement row per tick for the same test.
+ */
+async function proposeRetirements(
+  crawl: CrawlRow,
+  report: ReturnType<typeof auditTestsAgainstCrawl>,
+): Promise<Array<{ testId: string; healId: string; confidence: number }>> {
+  const out: Array<{ testId: string; healId: string; confidence: number }> = [];
+
+  const obsolete = report.tests.filter(
+    (test): test is TestSurfaceReport & { retirement: NonNullable<TestSurfaceReport['retirement']> } =>
+      test.verdict === 'OBSOLETE' && test.retirement !== null,
+  );
+
+  for (const test of obsolete) {
+    if (out.length >= RETIREMENTS_PER_PROJECT_PER_CRAWL) break;
+
+    const openHeals = await openHealsFor(crawl.orgId, test.testId);
+    const decision = shouldProposeHeal({
+      openHeals,
+      currentCode: '',
+      kind: 'RETIREMENT',
+    });
+    if (!decision.propose) continue;
+
+    const healId = randomUUID();
+    await prisma.$transaction([
+      prisma.healProposal.create({
+        data: {
+          id: healId,
+          orgId: crawl.orgId,
+          testId: test.testId,
+          verdictId: null,
+          /*
+           * EMPTY, on purpose and documented on the column. A retirement is not
+           * a patch: `applyHealDiff` refuses a diff that removes a test block,
+           * and that refusal is correct — so this is applied by DISABLING the
+           * test, which is reversible, rather than by deleting the customer's
+           * code, which is not.
+           */
+          diff: '',
+          explanation: test.retirement.explanation,
+          riskLevel: 'RETIRE',
+          confidence: test.retirement.confidence,
+          evidence: {
+            kind: 'RETIREMENT',
+            crawlVersion: crawl.version,
+            routes: routesAsJson(test.routes),
+            evidence: test.retirement.evidence,
+            caveats: test.caveats,
+          },
+        },
+      }),
+      prisma.auditLog.create({
+        data: {
+          orgId: crawl.orgId,
+          userId: null,
+          action: HEAL_AUDIT_ACTIONS.retirementProposed,
+          targetType: 'Test',
+          targetId: test.testId,
+          metadata: {
+            healId,
+            crawlVersion: crawl.version,
+            confidence: test.retirement.confidence,
+            routes: routesAsJson(test.routes),
+            evidence: test.retirement.evidence,
+          },
+        },
+      }),
+    ]);
+
+    out.push({ testId: test.testId, healId, confidence: test.retirement.confidence });
+    logger.info(
+      { testId: test.testId, healId, confidence: test.retirement.confidence },
+      'proposed retiring an obsolete test',
+    );
+  }
+
+  return out;
 }

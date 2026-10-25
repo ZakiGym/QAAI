@@ -24,6 +24,14 @@
 import { CronExpressionParser } from 'cron-parser';
 import { PLAN_LIMITS } from '@qaai/shared';
 import type { ScheduleTickJob, ShardAssignment } from '@qaai/shared';
+/*
+ * The ONE definition of "is this test's quarantine in force right now"
+ * (packages/runner/src/gates.ts). Imported rather than restated because the
+ * fail-fast sweep below is a new reader of the same rule, and a second copy of
+ * it is how a quarantined test's failure came to be counted by the run's
+ * counters while being invisible to every gate.
+ */
+import { quarantineSuppresses } from '@qaai/runner';
 // The run toll — the plan gate and the usage counter — lives in the API
 // workspace because six other places create Runs too and there must be exactly
 // one of it. It takes its Prisma client as an argument precisely so this file
@@ -31,6 +39,7 @@ import type { ScheduleTickJob, ShardAssignment } from '@qaai/shared';
 import { effectivePlan, startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
 import { enqueueRun, enqueueNotify } from '../queues.js';
+import { advanceClosureCampaigns } from './close-loop.js';
 
 /** Next fire time for a cron expression, or null when it is unparseable. */
 function nextFireTime(cron: string, timezone: string, after: Date): Date | null {
@@ -400,6 +409,263 @@ async function queueRun(args: {
   return { id: run.id, shards: shardCount };
 }
 
+
+// ─── Fail-fast and the stop request (§5) ─────────────────────────────────────
+//
+// THE DEFECT, VERBATIM: "Enforce fail-fast and the stop request in the worker —
+// the column, the migration, the endpoint and the user-facing promise all exist;
+// the consumer does not, so a stop request is ignored."
+//
+// Four surfaces already promise this. `createRunSchema` accepts `failFast`;
+// POST /runs reports it back; `Run.failFast` / `Run.stopRequestedAt` /
+// `Run.stopReason` are columns with a migration behind them; and
+// POST /team/runs/:runId/stop writes the request and tells the caller the worker
+// "checks between tests". Nothing wrote `failFast` onto a run row, and nothing
+// anywhere read `stopRequestedAt`.
+//
+// ── WHY THE PRODUCER IS HERE AND THE CONSUMER IS NOT ────────────────────────
+//
+// There are two halves to enforcing fail-fast, and they belong in different
+// files:
+//
+//   THE DECISION — "this fail-fast run has already had a real failure, so it
+//   should stop" — is a query plus a rule, and it is what this sweep does. It
+//   writes `stopRequestedAt` with the same conditional, first-writer-wins
+//   UPDATE that POST /team/runs/:runId/stop uses, so a human pressing stop and
+//   this sweep tripping on the same run cannot produce two different stories.
+//
+//   THE STOP ITSELF belongs in the between-tests poll in
+//   apps/worker/src/processors/run.ts, which reads `status` and `finalizedAt`
+//   and nothing else. That file is owned by another agent this round. The exact
+//   change is three lines and it is named in this change's handover; until it
+//   lands, this sweep writes a request that the run loop does not yet read, and
+//   NOTHING HERE PRETENDS OTHERWISE — `planFailFast` in
+//   apps/api/src/lib/run-selection.ts still reports `enforced: false`, and the
+//   POST /runs response still says so.
+//
+// Writing the request anyway is not theatre: the column is what the cockpit, the
+// share page and the audit row already render, and the sweep makes a fail-fast
+// run SAY that it should have stopped — at the first failure rather than after
+// the other 4,999 tests — which is strictly better than the silence it replaces.
+//
+// ── WHY A 60-SECOND SWEEP AND NOT AN INLINE CHECK ───────────────────────────
+//
+// An inline check after each test would be instant, and it is the right place
+// for it — in run.ts, in the same loop, in the same change that makes the loop
+// read the column. A sweep is what can be built from outside that file, and it
+// has one genuine advantage worth keeping afterwards: it catches a fail-fast run
+// whose worker died holding it, which an inline check by definition cannot.
+
+/**
+ * How many runs one sweep may consider.
+ *
+ * Bounded because this runs inside the 60-second tick alongside the cron
+ * schedules and the production monitors: an install with a thousand concurrent
+ * fail-fast runs must not be able to turn one tick into a long job that starves
+ * them. Only runs that are QUEUED or RUNNING are ever read, so on a healthy
+ * install the real number is tiny and the cap never bites.
+ */
+export const FAIL_FAST_SWEEP_LIMIT = 200;
+
+/**
+ * How many of one run's failed results the sweep reads looking for the first
+ * REAL one.
+ *
+ * ── WHY THERE IS A NUMBER HERE AT ALL ──────────────────────────────────────
+ *
+ * Because the question is not "did anything fail" — the `where` answers that —
+ * it is "did anything fail in a way that COUNTS", and whether a failure counts
+ * is decided by `failFastTripped`, a function. Quarantine is a property of the
+ * Test row and its expiry is compared against the clock, so a `where` clause
+ * that tried to express the rule would be a second copy of
+ * `quarantineSuppresses` written in Prisma, free to drift from the first. So
+ * rows are read and the function is asked, and reading rows needs a bound.
+ *
+ * ── WHY 25 WAS A LIE AND 200 IS NOT ────────────────────────────────────────
+ *
+ * The bound was 25, hard-coded and silent. A fail-fast run whose first 25
+ * FAILED/TIMED_OUT rows were all quarantined or retried-into-passes was never
+ * asked to stop — and because the sweep re-reads the same oldest 25 every sixty
+ * seconds, never would be, however many real failures sat at row 26. Nothing
+ * counted the truncation and nothing reported it: the run simply ran to the end
+ * while the API had told its owner it would not.
+ *
+ * 200 is the same order as FAIL_FAST_SWEEP_LIMIT and four small columns wide,
+ * so it costs one bounded query per run. What matters more than the number is
+ * that one row PAST it is fetched, so the sweep can tell "no real failure in
+ * this run" from "no real failure in the part of it I looked at" — and when it
+ * is the second, it says so and counts it (`undecided`) instead of returning a
+ * silence that reads like the first.
+ */
+export const FAIL_FAST_FAILURE_SCAN_LIMIT = 200;
+
+/** What one sweep did, including the part it could not decide. */
+export interface FailFastSweep {
+  /** Runs asked to stop. */
+  requested: number;
+  /**
+   * Runs where the scan hit FAIL_FAST_FAILURE_SCAN_LIMIT without finding a real
+   * failure, so "not stopped" means "not established", not "nothing to find".
+   * Counted because a suppressed failure is still a failure that was not
+   * counted, and that is the one thing this sweep may not do silently.
+   */
+  undecided: number;
+}
+
+/** The sentence written onto `Run.stopReason`, read verbatim by three surfaces. */
+export function failFastStopReason(testName: string | null): string {
+  return testName
+    ? `Fail-fast: "${testName}" failed, so the rest of this run was not executed.`
+    : 'Fail-fast: a test failed, so the rest of this run was not executed.';
+}
+
+/**
+ * Does this result trip fail-fast?
+ *
+ * Deliberately the same shape as `isRealFailure` in
+ * apps/api/src/lib/run-selection.ts, and the two conditions are the two ways
+ * this could otherwise stop a run it has no business stopping:
+ *
+ *   A RETRY THAT PASSED is not a failure. `retriedAndPassed` exists because a
+ *   test that failed once and passed on retry is flaky, not broken, and halting
+ *   a 5,000-test suite on a flake is the single fastest way to make people turn
+ *   this feature off.
+ *
+ *   A QUARANTINED FAILURE is a failure somebody has explicitly switched off.
+ *   It does not reach `Run.failedCount`, it does not gate, and it must not stop
+ *   a run either — otherwise quarantine would suppress a failure everywhere
+ *   except the one place where it ends the build early.
+ *
+ * TIMED_OUT counts. A test that ran out of time did not pass, and "the suite
+ * stopped because something hung" is exactly the signal fail-fast is for.
+ */
+export function failFastTripped(
+  result: {
+    status: string;
+    retriedAndPassed: boolean;
+    test: { quarantined: boolean; quarantineExpiresAt: Date | null };
+  },
+  now: Date,
+): boolean {
+  if (result.status !== 'FAILED' && result.status !== 'TIMED_OUT') return false;
+  if (result.retriedAndPassed) return false;
+  return !quarantineSuppresses(result.test, now);
+}
+
+/**
+ * Ask every fail-fast run that has already failed to stop.
+ *
+ * Returns how many requests were written. Never throws: a run whose stop could
+ * not be requested is a run that finishes normally, which is the behaviour that
+ * has shipped for the life of the product — while a throw here would take the
+ * whole scheduler tick down and with it every nightly and every monitor in the
+ * install.
+ */
+async function sweepFailFastStops(now: Date): Promise<FailFastSweep> {
+  const sweep: FailFastSweep = { requested: 0, undecided: 0 };
+  let candidates: Array<{ id: string; orgId: string }> = [];
+  try {
+    candidates = await prisma.run.findMany({
+      where: {
+        failFast: true,
+        // Already asked. Idempotent by construction: the row is only ever
+        // written once, by whoever gets there first.
+        stopRequestedAt: null,
+        status: { in: ['QUEUED', 'RUNNING'] },
+      },
+      take: FAIL_FAST_SWEEP_LIMIT,
+      select: { id: true, orgId: true },
+    });
+  } catch (err) {
+    logger.error({ err }, 'could not read fail-fast runs this tick');
+    return sweep;
+  }
+
+  for (const run of candidates) {
+    try {
+      /*
+       * The FIRST real failure, in the order the results were written, because
+       * the reason on the row names a test and the test it should name is the
+       * one that tripped it. `take` is bounded rather than `findFirst`-with-a
+       * -filter on quarantine, because quarantine is a property of the Test row
+       * and the suppression rule is a function, not a query — a `where` clause
+       * that tried to express it would be a second copy of
+       * `quarantineSuppresses` written in Prisma.
+       *
+       * ONE ROW PAST THE LIMIT, which is the whole fix: it is the difference
+       * between a cap and a disclosed cap. See FAIL_FAST_FAILURE_SCAN_LIMIT.
+       */
+      const page = await prisma.testResult.findMany({
+        where: { runId: run.id, status: { in: ['FAILED', 'TIMED_OUT'] } },
+        orderBy: { createdAt: 'asc' },
+        take: FAIL_FAST_FAILURE_SCAN_LIMIT + 1,
+        select: {
+          status: true,
+          retriedAndPassed: true,
+          test: { select: { name: true, quarantined: true, quarantineExpiresAt: true } },
+        },
+      });
+      const truncated = page.length > FAIL_FAST_FAILURE_SCAN_LIMIT;
+      const failures = truncated ? page.slice(0, FAIL_FAST_FAILURE_SCAN_LIMIT) : page;
+
+      const tripped = failures.find((result) => failFastTripped(result, now));
+      if (!tripped) {
+        /*
+         * NOT ESTABLISHED, which is not the same as nothing to find, and the
+         * difference is counted rather than swallowed. Every row read was a
+         * failure that something suppressed, and there are more of them past
+         * the limit this sweep agreed to read — so this run is not being left
+         * alone because it is healthy.
+         *
+         * Logged at WARN with both numbers, because the operator-visible
+         * symptom otherwise is a fail-fast run that quietly ran to the end.
+         */
+        if (truncated) {
+          sweep.undecided += 1;
+          logger.warn(
+            {
+              runId: run.id,
+              orgId: run.orgId,
+              scanned: FAIL_FAST_FAILURE_SCAN_LIMIT,
+              limit: FAIL_FAST_FAILURE_SCAN_LIMIT,
+            },
+            'fail-fast undecided: every failure read was suppressed and more exist past the scan limit; this run was NOT asked to stop',
+          );
+        }
+        continue;
+      }
+
+      /*
+       * Conditional, so the first writer wins and the reason on the row names
+       * whoever actually stopped it. This sweep and a person pressing stop in
+       * the cockpit can race, and the run must end up with one story — the same
+       * claim POST /team/runs/:runId/stop makes, deliberately written the same
+       * way.
+       *
+       * `status` is NOT touched. A fail-fast stop is a FAILED run that chose not
+       * to finish; filing it as CANCELLED would hide a broken build behind a
+       * word that means "nobody wanted the answer".
+       */
+      const claimed = await prisma.run.updateMany({
+        where: { id: run.id, stopRequestedAt: null, status: { in: ['QUEUED', 'RUNNING'] } },
+        data: { stopRequestedAt: now, stopReason: failFastStopReason(tripped.test.name) },
+      });
+      if (claimed.count === 0) continue;
+
+      sweep.requested += 1;
+      logger.warn(
+        { runId: run.id, orgId: run.orgId, test: tripped.test.name },
+        'fail-fast tripped: stop requested',
+      );
+    } catch (err) {
+      // Per run, so one unreadable run does not cost the other 199 theirs.
+      logger.error({ err, runId: run.id }, 'could not request a fail-fast stop for this run');
+    }
+  }
+
+  return sweep;
+}
+
 export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> {
   const now = new Date();
 
@@ -496,6 +762,40 @@ export async function processScheduleTick(_job: ScheduleTickJob): Promise<void> 
         'monitor check queued',
       );
     }
+  }
+
+  /*
+   * ── The two sweeps that ride this tick ────────────────────────────────────
+   *
+   * LAST, and after the cron schedules and the monitors, deliberately. Both are
+   * work nobody is waiting on, and a nightly suite that fired four seconds late
+   * because a closure campaign was measuring is a worse trade than a campaign
+   * that measures four seconds later. Both are also written so they cannot
+   * throw — a stop request that could not be written, or a campaign that blew
+   * up, must not take a customer's uptime check down with it.
+   *
+   * They ride THIS tick rather than getting queues of their own for the reason
+   * `ClosureCampaign` spells out: a job whose own result decides whether it
+   * re-queues is the shape of a worker that never idles, and this sweep's fixed
+   * 60-second cadence is a ceiling that no bug in the stop rules can raise.
+   */
+  const failFast = await sweepFailFastStops(now);
+  const campaigns = await advanceClosureCampaigns(now);
+
+  if (
+    failFast.requested > 0 ||
+    // Reported on the same line as the stops, because a tick that could not
+    // decide a run is a thing an operator has to be able to see without going
+    // looking for a warning.
+    failFast.undecided > 0 ||
+    campaigns.armed > 0 ||
+    campaigns.advanced > 0 ||
+    campaigns.failed > 0
+  ) {
+    logger.info(
+      { stopsRequested: failFast.requested, stopsUndecided: failFast.undecided, ...campaigns },
+      'schedule tick: fail-fast stops requested and closure campaigns advanced',
+    );
   }
 }
 

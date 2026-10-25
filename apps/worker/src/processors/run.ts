@@ -22,16 +22,35 @@
 
 import {
   emptyRunCounts,
+  environmentBlock,
+  environmentPreflight,
   evaluateGates,
+  preflightSummary,
   quarantineSuppresses,
   reasonUnsupported,
+  repoWorkspaceCheck,
+  runnabilityFor,
   runOutcome,
   signInWithProfile,
   tallyResult,
-  QUARANTINE_EXPIRY_WARNING_DAYS,
-  QUARANTINE_MAX_DAYS,
+  unattemptable,
+  /*
+   * The quarantine classification and the cap it reads, both imported rather
+   * than restated. This file used to carry its own copy of each: the four rules
+   * (expired, expiring soon, unbounded-and-old-enough-to-be-news) were written
+   * out here and again in gates.ts for the post-triage re-score, and a
+   * re-scored gate that disagreed with finalisation about "expiring soon" would
+   * be a green-wash performed by the code that exists to stop one.
+   */
+  quarantineHealthFrom,
+  QUARANTINE_NAMES_SCANNED,
 } from '@qaai/runner';
-import type { QuarantineHealthInput, RunCountsWithQuarantine } from '@qaai/runner';
+import type {
+  QuarantineHealthInput,
+  RequiredIdentity,
+  RunCountsWithQuarantine,
+  SessionProbeResult,
+} from '@qaai/runner';
 import { loadProjectPlugins, resolveTestPlugin } from '../lib/plugin-loading.js';
 import {
   testNeedsRepository,
@@ -49,25 +68,44 @@ import {
   attachAuthProfile,
   attachRunWorkspace,
 } from '../../../../packages/runner/src/run-workspace.js';
-import { FIXTURE_PREFIX, GRID_INTEGRATION_KINDS, RUN_SHARD_TERMINAL } from '@qaai/shared';
-import type { GridIntegrationKind, RunShardRef } from '@qaai/shared';
+import {
+  environmentUnavailableMessage,
+  environmentUnavailableReason,
+  notRunMessage,
+  parseNotRun,
+  FIXTURE_PREFIX,
+  GRID_INTEGRATION_KINDS,
+  RUN_SHARD_TERMINAL,
+} from '@qaai/shared';
+import type { GridIntegrationKind, NotRunKind, RunShardRef } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
 import { open as openSecret } from '../vault.js';
 import type {
   ExecutableTest,
+  GateResult,
   GateRule,
   MutationRunData,
   RunContext,
   ShardedRunJob,
   TestExecution,
   TestResultStatus,
+  TestType,
 } from '@qaai/shared';
 import { DEFAULT_GATE_RULES } from '@qaai/runner';
 import { artifactKey } from '@qaai/storage';
 import { logger, prisma, publishEvent, storage } from '../context.js';
 import { secretsFor } from '../vault.js';
 import { enqueueNotify, enqueueTriage } from '../queues.js';
-import { recordMonitorResult } from './schedule.js';
+/*
+ * `failFastTripped` and `failFastStopReason` are imported rather than restated,
+ * and that is the whole point of taking them from here: the 60-second sweep in
+ * schedule.ts and the inline check in this loop write the SAME column, so a
+ * second copy of "does this failure trip fail-fast" would be two writers able
+ * to disagree about whether a run should have stopped — and the sentence on
+ * `Run.stopReason` is read verbatim by three surfaces, so there must be exactly
+ * one of it.
+ */
+import { failFastStopReason, failFastTripped, recordMonitorResult } from './schedule.js';
 
 /** Retention window per plan (§5); the sweeper deletes past this. */
 const RETENTION_DAYS: Record<string, number> = {
@@ -77,15 +115,15 @@ const RETENTION_DAYS: Record<string, number> = {
   ENTERPRISE: 365,
 };
 
-/**
- * How many quarantined tests the rot alarm names.
- *
- * The COUNT behind the budget is exact (a `count`, not a length); this bounds
- * only the list of names the warning can print. A suite with 4,000 quarantined
- * tests has a budget problem the first 200 names describe perfectly well, and
- * nothing that runs inside run finalisation gets to be unbounded.
+/*
+ * How many quarantined tests the rot alarm names used to be declared here, as
+ * its own `const QUARANTINE_NAMES_SCANNED = 200`. It is now imported from
+ * @qaai/runner beside `quarantineHealthFrom`, because the cap and the
+ * classification have to travel together: this finaliser and the post-triage
+ * re-score both build a `QuarantineHealthInput`, and two callers reading
+ * different numbers of names is how one of them comes to report a different set
+ * of warnings about the same suite.
  */
-const QUARANTINE_NAMES_SCANNED = 200;
 
 /**
  * How many recent results one flake-rate measurement is computed over.
@@ -153,6 +191,144 @@ const STALE_QUEUED_SHARD_MS = 2 * 60 * 60_000;
  * can never reach the run's status, the CLI's exit code or the GitHub check.
  */
 type RunCounts = RunCountsWithQuarantine;
+
+/**
+ * ── The environment rule, stated once ───────────────────────────────────────
+ *
+ * **A test QAAI could not attempt is never reported as a pass and never as a
+ * failure of the application. A run in which NOTHING could be attempted is
+ * neither a green build nor a red one: it is ERRORED, with
+ * ENVIRONMENT_UNAVAILABLE and a BLOCKing gate evaluation, because there is no
+ * verdict to be had and nothing may merge on the strength of one.**
+ *
+ * Three cases, three different reports, and the whole point is that they stop
+ * being the same report:
+ *
+ *  1. NOTHING COULD BE ATTEMPTED (the base URL is down, the only login is
+ *     broken, the one type in the suite has no tool on this image). Every
+ *     result is `[BLOCKED_BY_ENV]`/`[UNSUPPORTED]` with the reason, no test is
+ *     executed, the run is ERRORED, the gate BLOCKs, and `Run.errorMessage`
+ *     opens with ENVIRONMENT_UNAVAILABLE. Previously: N failing tests, a red
+ *     board, a poisoned pass rate and a poisoned coverage number, with the
+ *     cause nowhere.
+ *
+ *  2. SOME TESTS WERE BLOCKED. The rest execute and report normally; the
+ *     blocked ones are not-run with their reason and a WARN evaluation names
+ *     them. Deliberately a WARN and not a BLOCK: a suite in which one role's
+ *     password rotated still has 400 tests worth of signal, and holding every
+ *     merge on that is how a brake gets switched off. The gap this leaves is
+ *     named in the report rather than pretended away — a run CAN still report
+ *     PASSED with tests nobody ran, and the honest fix is a configurable
+ *     `MIN_ATTEMPTED_RATE` gate rule, which belongs in gates.ts.
+ *
+ *  3. EVERY GATING FAILURE WAS TRIAGED ENV_ISSUE. The run is ERRORED rather
+ *     than FAILED, so a board red from an expired credential stops looking
+ *     exactly like a board red from a bug. The counts are NOT rewritten: the
+ *     five columns still sum to the number of results, and `failedCount` still
+ *     says three tests failed, because they did — what changes is that the run
+ *     says the environment was the cause instead of implying the code was.
+ */
+
+/**
+ * A gate evaluation about the ENVIRONMENT, rather than about the tests.
+ *
+ * No cast. `ENVIRONMENT_AVAILABLE` is a member of the shared `GateRule` union
+ * now, so a typo in this object fails to compile instead of typechecking its
+ * way into a stored gate result. The DETAIL still carries the whole message,
+ * because that is what every surface actually renders (`blockingGateRules` in
+ * processors/notify.ts reads `detail`, the GitHub check summary prints it, the
+ * CLI prints it).
+ *
+ * It rides the gate result rather than a new notification channel for the
+ * reason gates.ts gives for the quarantine alarm: a gate evaluation already
+ * reaches the chat alert, the check summary, the CLI's BLOCK lines and the run
+ * page's gate chip, through plumbing that is already tested. A fifth channel
+ * nobody subscribes to is how PAGERDUTY ended up in the Prisma enum and
+ * nowhere else.
+ */
+const ENVIRONMENT_GATE_RULE = (action: 'WARN' | 'BLOCK'): GateRule => ({
+  kind: 'ENVIRONMENT_AVAILABLE',
+  action,
+});
+
+/**
+ * Opening words of `Run.errorMessage` on a run THIS DEPLOYMENT could not
+ * attempt, as opposed to one the environment made impossible.
+ *
+ * ── The misattribution this exists to end ───────────────────────────────────
+ *
+ * `ENVIRONMENT_UNAVAILABLE` is documented in @qaai/shared as meaning "a run the
+ * environment made impossible", and until now it was also what a run of two
+ * LOAD tests on a worker image with no k6 reported. The rows were tagged
+ * `[UNSUPPORTED]` correctly and the gate detail correctly said "install the
+ * missing tool on the worker", but the one MACHINE-READABLE run-level fact
+ * named the customer's environment for a hole in ours. preflight.ts says the
+ * conflation is the design's central error, in these words: "install k6" is
+ * useless advice for a down staging box and "check your VPN" is useless advice
+ * for a worker image that never had Lighthouse in it.
+ *
+ * ── Why a second prefix and not a field ─────────────────────────────────────
+ *
+ * For the reason @qaai/shared gives for the first one: `RunStatus` is a
+ * Postgres enum every consumer switches on exhaustively, so the KIND rides on
+ * `errorMessage` and the sentence after it is complete English. The cost is the
+ * same cost, stated there and inherited here: a prefix on a free-text column
+ * cannot be filtered in SQL.
+ *
+ * ── Why it is declared HERE and not beside its sibling ──────────────────────
+ *
+ * packages/shared/src/constants.ts is not this change's file. Nothing outside
+ * this module reads either marker today (`environmentUnavailableReason` has
+ * exactly one caller, below), so a local declaration is reachable by everything
+ * that needs it. It belongs next to `ENVIRONMENT_UNAVAILABLE_PREFIX` with its
+ * own reader the moment a surface wants to tell the two apart — see the
+ * handover.
+ */
+const TOOLING_UNAVAILABLE_PREFIX = 'TOOLING_UNAVAILABLE:';
+
+/**
+ * The run-level message for a slice nothing could be attempted in.
+ *
+ * The KIND decides the marker, and it is the per-test kind the preflight
+ * already produced rather than a second judgement: `UNSUPPORTED` means every
+ * blocked test was blocked by something missing on this image, and anything
+ * else means the thing under test is implicated. A mixed run reports the
+ * environment, because the environment IS implicated in it.
+ */
+function runGapMessage(kind: NotRunKind, reason: string): string {
+  return kind === 'UNSUPPORTED'
+    ? `${TOOLING_UNAVAILABLE_PREFIX} ${reason}`
+    : environmentUnavailableMessage(reason);
+}
+
+/**
+ * Read a run-level gap marker back off a stored message, or null for a message
+ * that carries neither.
+ *
+ * Null is the honest answer for a shard that died holding the job, a vault key
+ * that rotated, or anything else that is not a gap: `completeShardedRun` uses
+ * exactly that to refuse to hoist a marker onto a run that failed for two
+ * different reasons.
+ */
+function runGapReason(
+  errorMessage: string | null | undefined,
+): { kind: NotRunKind; reason: string } | null {
+  const environment = environmentUnavailableReason(errorMessage);
+  if (environment !== null) return { kind: 'BLOCKED_BY_ENV', reason: environment };
+  if (typeof errorMessage === 'string' && errorMessage.startsWith(TOOLING_UNAVAILABLE_PREFIX)) {
+    return {
+      kind: 'UNSUPPORTED',
+      reason: errorMessage.slice(TOOLING_UNAVAILABLE_PREFIX.length).trim(),
+    };
+  }
+  return null;
+}
+
+/** One row of a `GateResult`. Named locally because nothing exports the element type. */
+type GateResultEvaluation = GateResult['evaluations'][number];
+
+/** How many blocked tests an environment gate detail names before it counts. */
+const ENVIRONMENT_NAMES_LISTED = 3;
 
 export async function processRun(job: ShardedRunJob): Promise<void> {
   const { orgId, runId } = job;
@@ -265,6 +441,35 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
    */
   let repoWorkspace: MaterialisedWorkspace | null = null;
   let repoGap: string | null = null;
+  /*
+   * The preflight's answer, and — separately — whether it concluded that
+   * nothing in this run could be attempted. Declared out here because the
+   * finalisation below the try has to be able to say so: a run that was never
+   * attempted must not fall through to the ordinary pass/fail verdict, which
+   * over a suite of untouched placeholder rows would compute PASSED.
+   */
+  let preflight: PreflightDecision | null = null;
+  /**
+   * Why nothing in this slice could be attempted, and WHICH KIND of gap it was.
+   *
+   * A string used to be enough because there was one answer: the environment.
+   * It is a kind and a sentence now because the two causes need different
+   * people — `UNSUPPORTED` is somebody installing a tool on this image,
+   * `BLOCKED_BY_ENV` is somebody fixing the thing under test — and the run-level
+   * message is the only machine-readable place that distinction could live.
+   */
+  let runGap: { kind: NotRunKind; why: string } | null = null;
+  /**
+   * The sentence on `Run.stopReason` when something asked this run to stop
+   * early, read by the poll below.
+   *
+   * Separate from `cancelled` on purpose, and that separation is the feature:
+   * `Run.stopRequestedAt` is documented as NOT being a cancel — a fail-fast
+   * stop is a FAILED run that chose not to finish — so filing it as CANCELLED
+   * would hide a broken build behind a word that means "nobody wanted the
+   * answer", and would rewrite the counts off the result rows as a cancel does.
+   */
+  let stopRequested: string | null = null;
 
   try {
     const org = await prisma.organization.findUniqueOrThrow({
@@ -395,7 +600,20 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
      * taking a browser and thirty seconds, against an app that is going to
      * refuse all of them.
      */
-    type ResolvedSession = { ok: true; storageState: unknown } | { ok: false; why: string };
+    /*
+     * ── Why a refusal carries a FAULT ────────────────────────────────────────
+     *
+     * "The password rotated" and "this test points at a profile somebody
+     * deleted" both used to be one `{ ok: false, why }`, and they are opposite
+     * facts: the first means nothing was measured and the application is not to
+     * blame, the second is a defect in the SUITE that has to gate. The
+     * preflight needs the difference in order to decide whether a run was
+     * unattemptable or merely wrong, so the refusal says which it is rather
+     * than leaving a reader of the sentence to infer it.
+     */
+    type ResolvedSession =
+      | { ok: true; storageState: unknown }
+      | { ok: false; why: string; fault: 'CONFIG' | 'ENVIRONMENT' };
     const sessions = new Map<string, ResolvedSession>();
     if (defaultProfileId) sessions.set(defaultProfileId, { ok: true, storageState });
 
@@ -422,6 +640,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         if (!profile) {
           return {
             ok: false,
+            fault: 'CONFIG',
             why: `This test runs as auth profile ${profileId}, which no longer exists in this organisation.`,
           };
         }
@@ -435,6 +654,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
            */
           return {
             ok: false,
+            fault: 'CONFIG',
             why: `Auth profile "${profile.name}" belongs to a different environment, so it cannot be used for this run.`,
           };
         }
@@ -456,6 +676,8 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         } catch (err) {
           return {
             ok: false,
+            // The attempt was MADE and the environment did not complete it.
+            fault: 'ENVIRONMENT',
             why: `Signing in as "${profile.name}" threw: ${
               err instanceof Error ? err.message : 'unknown error'
             }`,
@@ -465,6 +687,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         if (!result.ok) {
           return {
             ok: false,
+            fault: 'ENVIRONMENT',
             why: `Could not sign in as auth profile "${profile.name}": ${result.message}`,
           };
         }
@@ -477,6 +700,8 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
            */
           return {
             ok: false,
+            // A product gap in how this profile KIND works, not an outage.
+            fault: 'CONFIG',
             why:
               `Auth profile "${profile.name}" is a ${profile.kind}, which produces a request header ` +
               'rather than a browser session, so a test cannot be run as that role yet.',
@@ -692,7 +917,203 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       }
     }
 
-    for (const [index, result] of run.results.entries()) {
+    /*
+     * ── The preflight, once per run, before any test ─────────────────────────
+     *
+     * Three questions, in the order it costs least to be wrong about them:
+     * what this image can execute at all (local `stat` calls), whether the base
+     * URL answers (one request, retried — see PREFLIGHT_PROBE_ATTEMPTS), and
+     * whether the identities this suite needs still sign in.
+     *
+     * The login probe is the run's OWN `resolveSession`, so the probe IS the
+     * login the suite was about to perform and the cache then satisfies every
+     * test behind that profile. A preflight that signed in separately would
+     * charge every authenticated run a second browser launch per profile to
+     * catch an occasional rotated password, which is a tax nobody agreed to.
+     *
+     * Identities are probed only for tests that could otherwise have run:
+     * driving a login for a test whose checkout is missing, or whose type has
+     * no tool on this image, buys a browser launch for a result that is already
+     * decided. That is also the existing behaviour this must not regress — see
+     * "does not log in for a test that could not have run anyway" in run.test.ts.
+     */
+    const selected = run.results.map((row) => ({
+      id: row.test.id,
+      type: row.test.type,
+      name: row.test.name,
+      authProfileId: row.test.authProfileId,
+    }));
+
+    /*
+     * Why this test cannot be attempted, or null. ONE implementation, called by
+     * both the unattemptable path above and the execution loop below — the two
+     * used to word the same fact differently, and the difference was visible to
+     * a customer: a CONTRACT test whose pact lives in a missing checkout got
+     * the per-type sentence in one path and the run-level one in the other.
+     *
+     * The repository comes first because its sentence names the TYPE and what
+     * that type does with a checkout, which is what a reader of one result
+     * needs; the preflight's repo check carries the run-level wording and is
+     * there for the gate line and the unattemptable decision.
+     *
+     * A LOGIN block is deliberately NOT returned here. A test whose role could
+     * not be signed in is recorded FAILED by the session path below, and that
+     * is a decision this change does not reverse: a skip does not block a gate,
+     * so a suite whose permission tests quietly stopped running would keep
+     * merging green. The login check still counts toward "could ANYTHING have
+     * been attempted", which is how a run whose single identity is broken
+     * reports ENVIRONMENT_UNAVAILABLE instead of a wall of red.
+     */
+    const notRunReason = (test: {
+      id: string;
+      type: TestType;
+      spec?: unknown;
+    }): { kind: NotRunKind; why: string } | null => {
+      if (testNeedsRepository(test) && !repoWorkspace) {
+        return {
+          kind: 'BLOCKED_BY_ENV',
+          why: repoUnavailableMessage(
+            test.type,
+            repoGap ?? 'No repository workspace was prepared for this run.',
+          ),
+        };
+      }
+      const block = preflight?.blocked.get(test.id) ?? null;
+      if (block === null || block.check === 'LOGIN') return null;
+      return { kind: block.kind, why: block.why };
+    };
+    preflight = await safePreflight({
+      runId: run.id,
+      baseUrl,
+      tests: selected,
+      /*
+       * The run's own plugin lookup, installed third-party plugins included.
+       * Asking the registry alone would report a type as unsupported that THIS
+       * project can run perfectly well through an installed plugin, and the
+       * preflight would then refuse tests it was about to execute.
+       */
+      hasPlugin: (type) => resolveTestPlugin(type, projectPlugins) !== null,
+      repo: needsRepo
+        ? {
+            available: repoWorkspace !== null,
+            /*
+             * Deliberately type-free, unlike the per-test sentence below: this
+             * detail describes the RUN's missing checkout and is used for the
+             * unattemptable decision and the gate line. The result rows keep
+             * `repoUnavailableMessage(test.type, …)`, which names the type and
+             * is the sentence a reader of one result needs.
+             */
+            why:
+              'This run needs a checkout of your repository and QAAI could not materialise one, ' +
+              `so the tests that execute inside it were not evaluated. ${
+                repoGap ?? 'No repository workspace was prepared for this run.'
+              }`,
+            testIds: run.results
+              .filter((row) => testNeedsRepository(row.test))
+              .map((row) => row.test.id),
+          }
+        : null,
+      signIn: async (profileId: string) => {
+        const session = await resolveSession(profileId);
+        return session.ok
+          ? { ok: true as const }
+          : { ok: false as const, fault: session.fault, why: session.why };
+      },
+    });
+
+    /*
+     * The frame the cockpit needs in order not to render a mystery. It is its
+     * own event type on the existing SSE channel, exactly as `plugin.fault` is
+     * — a new TYPE on plumbing that already works, rather than a new channel.
+     * Published only when something is actually wrong: a green preflight on
+     * every run is noise, and noise is how a signal gets filtered out.
+     */
+    const decision = preflight;
+    const troubles = decision.checks.filter((check) => check.outcome === 'UNAVAILABLE');
+    if (troubles.length > 0) {
+      publishEvent(orgId, {
+        runId: run.id,
+        type: 'run.environment',
+        data: {
+          ...(shard ? { shard: shard.index } : {}),
+          reason: decision.reason,
+          durationMs: decision.durationMs,
+          checks: troubles.map((check) => ({
+            name: check.name,
+            kind: check.kind,
+            detail: check.detail,
+          })),
+        },
+        at: new Date().toISOString(),
+      });
+      logger.warn(
+        { runId: run.id, shard: shard?.index, checks: troubles.map((c) => c.name) },
+        'environment preflight found problems',
+      );
+    }
+
+    /*
+     * Nothing in this slice could have been attempted. Executing it anyway
+     * would manufacture a failure per test for one cause, which is the defect
+     * this whole preflight exists to delete: the pass rate and the coverage
+     * number would both move, and the move would be about a VPN tunnel.
+     *
+     * Every result gets the typed reason instead, and the run reports ERRORED
+     * with ENVIRONMENT_UNAVAILABLE below — not PASSED over a suite of untouched
+     * placeholders, which is what a bare `return` here would have produced.
+     */
+    if (decision.unattemptable) {
+      /*
+       * `decision.gapKind` rather than a hard-coded BLOCKED_BY_ENV, which is
+       * what this fallback used to be. It is the kind the preflight's own
+       * per-test blocks already agree on, so a slice of LOAD tests on an image
+       * with no k6 reports a TOOLING gap at run level and not a lie about the
+       * customer's staging box. `BLOCKED_BY_ENV` remains the fallback for the
+       * one case `gapKind` cannot answer — a decision that says unattemptable
+       * with no blocks behind it, which is not reachable today and is the safer
+       * of the two to guess, since it points at the thing under test rather
+       * than claiming a hole in this deployment.
+       */
+      const gap = {
+        kind: decision.gapKind ?? ('BLOCKED_BY_ENV' as const),
+        why: decision.reason ?? 'The environment this run points at could not be used at all.',
+      };
+      runGap = gap;
+      for (const result of run.results) {
+        const reason = notRunReason(result.test) ?? gap;
+        counts.skipped += 1;
+        await prisma.testResult.update({
+          where: { id: result.id },
+          data: {
+            status: 'SKIPPED',
+            // The kind in the COLUMN as well as in the tag. See `stampNotRun`
+            // for why both, and why neither has a default.
+            notRunKind: reason.kind,
+            errorMessage: notRunMessage(reason.kind, reason.why),
+          },
+        });
+      }
+      logger.error(
+        { runId: run.id, shard: shard?.index, kind: gap.kind, reason: gap.why },
+        gap.kind === 'UNSUPPORTED'
+          ? 'run not attempted: this deployment cannot execute these tests'
+          : 'run not attempted: the environment is unavailable',
+      );
+    }
+
+    /*
+     * An unattemptable slice executes nothing — and the loop is SKIPPED rather
+     * than returned from, so the finalisation below still writes a terminal
+     * status, a gate result and a `run.finished` notification. A bare `return`
+     * here is the defect this file's own history records twice: the run sits at
+     * RUNNING for good, the cockpit's clock never stops, and the Slack message
+     * and the PR comment never arrive.
+     */
+    const toExecute: Array<[number, (typeof run.results)[number]]> = runGap
+      ? []
+      : [...run.results.entries()];
+
+    for (const [index, result] of toExecute) {
       const test = result.test;
 
       /*
@@ -713,16 +1134,52 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
        * workers. `finalizedAt` is checked alongside it so a shard that was
        * reaped as dead, and has since come back, stops instead of writing
        * results into a run that already reported.
+       *
+       * ── The stop request, which is the third reason to stop ───────────────
+       *
+       * `Run.stopRequestedAt` is written by three parties — the inline
+       * fail-fast check at the bottom of this loop, the 60-second sweep in
+       * schedule.ts that catches a fail-fast run whose worker died, and a
+       * person pressing stop in the cockpit — and until now NOTHING READ IT.
+       * Four surfaces promised the behaviour: `createRunSchema` accepts
+       * `failFast`, POST /runs reports it back, the columns and their migration
+       * exist, and POST /team/runs/:runId/stop told the caller the worker
+       * "checks between tests". It did not, so a fail-fast run ran all 5,000
+       * tests and a stop request was a row nobody obeyed.
+       *
+       * This poll is the single place that acts on it, whoever wrote it. One
+       * decision point rather than a `break` at each writer, because five
+       * shards and three writers must not be able to tell different stories
+       * about why a run stopped.
+       *
+       * `cancelled` STAYS FALSE for a stop request, and that is the whole care
+       * in this branch: a cancel recounts the result rows and finalises
+       * CANCELLED, while a stop request must finalise on its real counts —
+       * FAILED, with the failure that tripped it — per the schema comment on
+       * `Run.stopRequestedAt`.
        */
       const current = await prisma.run.findUnique({
         where: { id: run.id },
-        select: { status: true, finalizedAt: true },
+        select: { status: true, finalizedAt: true, stopRequestedAt: true, stopReason: true },
       });
-      if (current?.status === 'CANCELLED' || (shard && current?.finalizedAt)) {
+      if (
+        current?.status === 'CANCELLED' ||
+        current?.stopRequestedAt != null ||
+        (shard && current?.finalizedAt)
+      ) {
         cancelled = current?.status === 'CANCELLED';
+        stopRequested =
+          !cancelled && current?.stopRequestedAt != null
+            ? (current.stopReason ??
+              'This run was asked to stop early, and the request carried no reason.')
+            : null;
         logger.info(
-          { runId: run.id, completed: index, shard: shard?.index },
-          cancelled ? 'run cancelled; stopping' : 'run already finalised; stopping',
+          { runId: run.id, completed: index, shard: shard?.index, stopRequested },
+          cancelled
+            ? 'run cancelled; stopping'
+            : stopRequested
+              ? 'stop requested; not executing the rest of this slice'
+              : 'run already finalised; stopping',
         );
         /*
          * Break rather than return, on both paths. An unsharded cancel used to
@@ -768,8 +1225,12 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         await prisma.testResult.update({
           where: { id: result.id },
           data: {
+            // Tagged UNSUPPORTED rather than left as a bare sentence: "nobody
+            // built this yet" and "this cannot run here" were the same SKIPPED
+            // for the whole life of this file, and that is the distinction.
             status: 'SKIPPED',
-            errorMessage: reasonUnsupported(test.type),
+            notRunKind: 'UNSUPPORTED',
+            errorMessage: notRunMessage('UNSUPPORTED', reasonUnsupported(test.type)),
           },
         });
         logger.warn({ testId: test.id, type: test.type }, 'no runner plugin; skipping');
@@ -820,13 +1281,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
        * both are the same rule in different clothes: a test QAAI cannot run is
        * reported as not having run. Never as a pass.
        */
-      const repoMissing =
-        testNeedsRepository(test) && !repoWorkspace
-          ? repoUnavailableMessage(
-              test.type,
-              repoGap ?? 'No repository workspace was prepared for this run.',
-            )
-          : null;
+      const notRun = notRunReason(test);
 
       /*
        * The session this test runs under. A test that named a profile gets THAT
@@ -834,9 +1289,11 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
        * the run default, exactly as before.
        */
       let session: ResolvedSession;
-      if (repoMissing) {
+      if (notRun) {
         // Nothing is going to execute, so there is nothing to log into an
-        // application for.
+        // application for — whether the gap is a missing checkout, a dead base
+        // URL or a tool this image does not have. A browser launch for a result
+        // that is already decided is a launch nobody gets anything for.
         session = { ok: true, storageState: null };
       } else if (declaredProfileId) {
         session = await resolveSession(declaredProfileId);
@@ -851,6 +1308,8 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
          */
         session = {
           ok: false,
+          // The binding was deleted out from under the test: a suite defect.
+          fault: 'CONFIG',
           why:
             'This test is marked as requiring a signed-in role, and the auth profile it was ' +
             'bound to no longer exists — so it was not run rather than run signed out. ' +
@@ -945,17 +1404,31 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       attachAuthProfile(context, session.ok ? (declaredProfileId ?? defaultProfileId) : null);
 
       let execution: TestExecution;
-      if (repoMissing) {
+      if (notRun) {
         /*
-         * No checkout: INTEGRATION, UNIT_GEN and MUTATION all run a command
-         * inside the customer's repository, and there is not one. This
-         * is the same answer the run already gives for a missing plugin —
-         * SKIPPED with the reason — because it is the same kind of fact.
+         * QAAI could not attempt this one: no checkout to run the customer's
+         * command inside, a base URL that never answered, or a type whose tool
+         * is not on this image. SKIPPED with a TYPED reason — the same answer
+         * the run already gave for a missing plugin, except that the reason is
+         * now machine-readable, which is the half that was missing.
+         *
+         * The kind is the actionable part: `UNSUPPORTED` is fixed by installing
+         * something on the worker and `BLOCKED_BY_ENV` by fixing the thing
+         * under test, and a reader who cannot tell them apart cannot act on
+         * either.
          */
-        execution = syntheticExecution(test.id, 'SKIPPED', repoMissing);
+        execution = syntheticExecution(
+          test.id,
+          'SKIPPED',
+          notRunMessage(notRun.kind, notRun.why),
+          // The kind as DATA as well as in the tag, so `persistExecution` can
+          // write the column. Without it the one party that knows which of the
+          // four reasons applies would hand on only a string again.
+          notRun,
+        );
         logger.warn(
-          { testId: test.id, type: test.type, runId: run.id },
-          'repo-dependent test not evaluated: no repository workspace',
+          { testId: test.id, type: test.type, runId: run.id, kind: notRun.kind },
+          'test not evaluated: QAAI could not attempt it',
         );
       } else if (!session.ok) {
         /*
@@ -1031,6 +1504,58 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         quarantineInForce: quarantineSuppresses(test, new Date()),
       });
 
+      /*
+       * ── FAIL-FAST, at the first real failure ──────────────────────────────
+       *
+       * The sweep in schedule.ts already wrote this request once a minute, so
+       * the behaviour existed with up to sixty seconds of a 5,000-test suite
+       * still to run after the suite had already failed. Writing it here makes
+       * the stop immediate; the sweep stays, because it is the only thing that
+       * can request a stop for a fail-fast run whose worker died holding it.
+       *
+       * `failFastTripped` rather than a local rule, for the reason given at the
+       * import: two writers of one column must not be able to disagree about
+       * what trips it. It refuses a retry that passed (flaky, not broken) and a
+       * failure a quarantine in force has suppressed (switched off on purpose),
+       * which are the two ways this could otherwise end a run that still had
+       * real answers to give.
+       *
+       * The conditional UPDATE is the same one the sweep and
+       * POST /team/runs/:runId/stop use, so the first writer wins and the row
+       * names whoever actually stopped it. STATUS IS NOT TOUCHED here and
+       * `finalizedAt` is not either: both belong to the finalisation below, and
+       * writing them from the side is how a run comes to report a verdict twice.
+       *
+       * It does not break out of the loop. The poll at the top of the next
+       * iteration is what reads the request — including the request a SIBLING
+       * shard just wrote — and nothing else executes in between.
+       */
+      if (
+        run.failFast &&
+        failFastTripped(
+          {
+            status: execution.status,
+            retriedAndPassed: execution.retriedAndPassed,
+            test: {
+              quarantined: test.quarantined,
+              quarantineExpiresAt: test.quarantineExpiresAt,
+            },
+          },
+          new Date(),
+        )
+      ) {
+        const stop = await prisma.run.updateMany({
+          where: { id: run.id, stopRequestedAt: null, status: { in: ['QUEUED', 'RUNNING'] } },
+          data: { stopRequestedAt: new Date(), stopReason: failFastStopReason(test.name) },
+        });
+        if (stop.count > 0) {
+          logger.warn(
+            { runId: run.id, shard: shard?.index, testId: test.id, test: test.name },
+            'fail-fast tripped: stop requested',
+          );
+        }
+      }
+
       await updateFlakeStats({
         orgId,
         projectId: run.projectId,
@@ -1080,6 +1605,44 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     }
   }
 
+  /*
+   * A cancel stopped the loop part-way, so some of this slice's results are
+   * still sitting at the placeholder SKIPPED that run creation wrote. Stamping
+   * them CANCELLED is the difference between "a person stopped this" and "a
+   * worker died holding it" — the two facts that shared one SKIPPED, and the
+   * two that a reader needs to tell apart before deciding whether to re-run.
+   *
+   * One `updateMany`, and only over rows nothing has written to.
+   */
+  if (cancelled) {
+    await stampNotRun(
+      orgId,
+      run.id,
+      shard,
+      'CANCELLED',
+      'The run was cancelled before this test was reached.',
+    );
+  } else if (stopRequested) {
+    /*
+     * A stop request left the same untouched placeholders behind, and they get
+     * NOT_RUN rather than CANCELLED: nobody reached these, and nobody decided
+     * anything about them either. CANCELLED would say a person stopped the run,
+     * which is exactly the claim `Run.stopRequestedAt` is documented as NOT
+     * making — a fail-fast stop is a FAILED run that chose not to finish.
+     *
+     * NOT_RUN is also the weakest of the four kinds, which is the right
+     * strength here: the reason carries the sentence whoever requested the stop
+     * wrote, and this process knows nothing beyond it.
+     */
+    await stampNotRun(
+      orgId,
+      run.id,
+      shard,
+      'NOT_RUN',
+      `${stopRequested} This test was never reached.`,
+    );
+  }
+
   if (shard) {
     // This shard is done moving. Recorded before anything else, because the
     // completion rule below is a question about rows, and a shard that has
@@ -1089,7 +1652,28 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       // scopes itself on the orgId from the job.
       where: { orgId, runId: run.id, index: shard.index },
       data: {
-        status: cancelled ? 'CANCELLED' : runErrored ? 'FAILED' : 'COMPLETED',
+        /*
+         * A gap marks the shard FAILED, and that is deliberate rather than lazy
+         * reuse. `completeShardedRun` forces the RUN to ERRORED when any shard
+         * did not complete, which is exactly the verdict an unattemptable slice
+         * must produce — a shard that executed nothing and reported COMPLETED
+         * would let its siblings finalise the run as a clean pass over
+         * placeholder rows. The reason travels on the shard's own
+         * `errorMessage`, carrying the marker for the kind of gap it was, which
+         * is what lets `completeShardedRun` compose a run-level message that
+         * names the same cause.
+         *
+         * A shard that STOPPED EARLY reports COMPLETED, and that is a choice
+         * rather than an oversight. FAILED would force the whole run to ERRORED
+         * — "the run did not finish, so nothing was measured" — when a
+         * fail-fast stop is a run that measured exactly the failure it stopped
+         * on; CANCELLED would say a person abandoned it. There is no shard
+         * status for "stopped on purpose", so the fact lives where it can be
+         * read instead: `Run.stopRequestedAt`/`stopReason` on the run, the
+         * shard's own `skippedCount`, and a `[NOT_RUN]` tag with the reason on
+         * every row nobody reached.
+         */
+        status: cancelled ? 'CANCELLED' : runErrored || runGap ? 'FAILED' : 'COMPLETED',
         finishedAt: new Date(),
         heartbeatAt: new Date(),
         passedCount: counts.passed,
@@ -1097,7 +1681,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         flakyCount: counts.flaky,
         skippedCount: counts.skipped,
         quarantinedFailedCount: counts.quarantinedFailed,
-        errorMessage: runErrored,
+        errorMessage: runErrored ?? (runGap ? runGapMessage(runGap.kind, runGap.why) : null),
       },
     });
 
@@ -1140,11 +1724,302 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
      * cockpit renders, so they are what the summary is counted from, exactly as
      * `completeShardedRun` does it. A run that ran to the end keeps its own
      * counters: they are already the same numbers, without the extra query.
+     *
+     * A STOP REQUEST is the same shape and is counted the same way. Keeping the
+     * in-memory counters here would write `skippedCount: 0` onto a run with two
+     * SKIPPED results in it — the five columns would stop summing to the number
+     * of results, which is the invariant every surface's arithmetic rests on.
+     * Only the DENOMINATOR changes; the failure that tripped fail-fast is still
+     * counted as a failure, so the verdict is still FAILED.
      */
-    counts: cancelled ? await aggregateCounts(orgId, run.id) : counts,
-    errorMessage: runErrored,
-    forcedStatus: cancelled ? 'CANCELLED' : runErrored ? 'ERRORED' : null,
+    counts: cancelled || stopRequested ? await aggregateCounts(orgId, run.id) : counts,
+    /*
+     * An unattemptable run carries its marker and the reason, and ERRORED —
+     * which `runOutcome` already words as "the run did not finish, so nothing
+     * was measured" and already answers `passed: false` for. Not a green build,
+     * not a red one: the third state, which is the only honest verdict on a
+     * suite nobody could execute.
+     *
+     * The marker is applied HERE rather than deferred to `finalizeRun` (as the
+     * sharded path defers it) because this path is the one that knows: an
+     * unsharded run's slice IS the whole run, so `unattemptable: true` below is
+     * not a guess about the siblings' rows — there are none.
+     *
+     * A stop request deliberately adds NOTHING here. It is not a run-level
+     * error and must not read as one: the run finalises on its real counts, so
+     * the verdict is FAILED with the failure that tripped it, and the sentence
+     * lives on `Run.stopReason` where three surfaces already render it.
+     */
+    errorMessage: runErrored ?? (runGap ? runGapMessage(runGap.kind, runGap.why) : null),
+    forcedStatus: cancelled ? 'CANCELLED' : runErrored || runGap ? 'ERRORED' : null,
+    unattemptable: runGap !== null,
   });
+}
+
+/**
+ * Stamp a typed not-run reason onto results nothing has written to.
+ *
+ * `errorMessage: null` is the filter and it is the whole safety of this: a row
+ * carrying a message has been written by the execution loop (a plugin's own
+ * skip, a repository gap, an unsupported type) and must not be relabelled by a
+ * bulk update that knows less than the loop did. Only the untouched
+ * placeholders are claimed.
+ *
+ * Scoped to the shard when there is one — a cancel seen by shard 2 says nothing
+ * about shard 5's rows, which another worker is still executing.
+ *
+ * ── Why the kind is written TWICE ───────────────────────────────────────────
+ *
+ * `TestResult.notRunKind` is the queryable home: "how many of this month's
+ * skips were the environment's fault?" is a GROUP BY against a column and a
+ * regex against a message, and the second one is not an answer anybody gets.
+ * The TAG stays because it is what a surface renders, because the sentence
+ * after it is complete English, and because every row written before the column
+ * existed carries the tag and nothing else — so `parseNotRun` is still the only
+ * way to classify an old row. A reader holding both prefers the column.
+ *
+ * NEITHER HAS A DEFAULT. NULL and an absent tag both spell the same fifth
+ * state, "not recorded", and that is not `NOT_RUN`: NOT_RUN is a claim — the
+ * weakest of the four, but still a claim — and writing it where nothing made
+ * one would put a sentence in the database that no code produced.
+ */
+async function stampNotRun(
+  orgId: string,
+  runId: string,
+  shard: RunShardRef | null,
+  kind: NotRunKind,
+  why: string,
+): Promise<void> {
+  const stamped = await prisma.testResult.updateMany({
+    where: {
+      orgId,
+      runId,
+      /*
+       * SKIPPED, and the status filter is as load-bearing as the message one.
+       * Without it a cancel's bulk stamp would reach a PASSED row whose
+       * `errorMessage` is null — which is every passing test in the run — and
+       * write "the run was cancelled before this test was reached" onto results
+       * that were executed and passed. Rows the loop wrote are not this
+       * update's to relabel, and a pass is the most expensive one to lie about.
+       */
+      status: 'SKIPPED',
+      errorMessage: null,
+      ...(shard ? { shardIndex: shard.index } : {}),
+    },
+    data: { notRunKind: kind, errorMessage: notRunMessage(kind, why) },
+  });
+  if (stamped.count > 0) {
+    logger.info(
+      { runId, shard: shard?.index, kind, results: stamped.count },
+      'recorded why these results did not run',
+    );
+  }
+}
+
+/** A test, as the preflight needs to see it. */
+interface PreflightTest {
+  id: string;
+  type: TestType;
+  name: string;
+  authProfileId: string | null;
+}
+
+/**
+ * The preflight's answer, flattened into data this processor can act on.
+ *
+ * Deliberately NOT the runner's `EnvironmentPreflight` passed straight through.
+ * The execution loop needs one question answered per test — "can this be
+ * attempted, and if not, what do I write on it?" — and resolving that into a
+ * Map here keeps every call into the preflight API inside one try/catch. A
+ * preflight is an instrument: if the instrument breaks, the suite must execute
+ * exactly as it did before the instrument existed, and that promise is only
+ * keepable if there is no second call site to throw from halfway through.
+ */
+interface PreflightDecision {
+  /** Every check, for the live frame. Flattened to strings; nothing branches on it. */
+  checks: Array<{ name: string; kind: NotRunKind; outcome: string; detail: string }>;
+  durationMs: number;
+  /** testId → why it cannot be attempted. Empty on a clean preflight. */
+  blocked: Map<string, { kind: NotRunKind; why: string; check: string }>;
+  /** Nothing in this slice could be attempted. */
+  unattemptable: boolean;
+  /**
+   * WHICH kind of gap made it unattemptable, set only when `unattemptable`.
+   *
+   * `UNSUPPORTED` means every blocked test was blocked by something missing on
+   * THIS IMAGE; anything else means the thing under test is implicated. It is
+   * what picks the run-level marker, and it exists because those two reports go
+   * to different people — see `TOOLING_UNAVAILABLE_PREFIX`.
+   */
+  gapKind: NotRunKind | null;
+  /** One sentence, set only when `unattemptable`. */
+  reason: string | null;
+}
+
+/**
+ * The identities this suite actually needs, grouped by profile.
+ *
+ * Grouped rather than per test, because the probe is a LOGIN: thirty tests on
+ * one profile is one credential to check, and asking thirty times would be
+ * thirty browser launches against an app that is going to answer identically.
+ *
+ * `decided` drops tests whose result is already settled — their type has no
+ * tool on this image, or their checkout is missing. A login probe for those
+ * buys a browser launch and changes nothing, and preserving that is also the
+ * existing behaviour the suite guards ("does not log in for a test that could
+ * not have run anyway").
+ *
+ * A profile is named by its FIRST test's name rather than by the profile's own
+ * name, which the run processor does not have here. That is a worse sentence
+ * than it could be and is called out so nobody mistakes it for intent.
+ */
+export function requiredIdentities(
+  tests: readonly PreflightTest[],
+  decided: (test: PreflightTest) => boolean,
+): RequiredIdentity[] {
+  const byProfile = new Map<string, { label: string; testIds: string[] }>();
+  for (const test of tests) {
+    if (test.authProfileId === null || decided(test)) continue;
+    const entry = byProfile.get(test.authProfileId) ?? {
+      label: `the role "${test.name}" runs as`,
+      testIds: [],
+    };
+    entry.testIds.push(test.id);
+    byProfile.set(test.authProfileId, entry);
+  }
+  return [...byProfile].map(([profileId, entry]) => ({
+    profileId,
+    label: entry.label,
+    testIds: entry.testIds,
+  }));
+}
+
+/**
+ * The preflight, wrapped so it can never be the reason a run does not happen.
+ *
+ * This is the rule the whole feature rests on, and it is the same one
+ * `loadProjectPlugins` is written under: a preflight is an INSTRUMENT. If the
+ * instrument breaks, the suite executes exactly as it did before the instrument
+ * existed — a `TypeError` in a PATH probe must not cost a customer their CI
+ * run. So every failure here resolves to an empty, all-clear preflight, which
+ * blocks nothing and claims nothing, and says so in the log.
+ *
+ * Note what that means and does not mean: a BROKEN preflight produces the old
+ * behaviour (tests run, and a missing tool surfaces as the plugin's own ENOENT
+ * skip). It never produces a green run over tests nobody executed, because it
+ * never marks anything as not-run.
+ */
+async function safePreflight(args: {
+  runId: string;
+  baseUrl: string;
+  tests: readonly PreflightTest[];
+  hasPlugin: (type: TestType) => boolean;
+  repo: { available: boolean; why: string; testIds: readonly string[] } | null;
+  signIn: (profileId: string) => Promise<SessionProbeResult>;
+}): Promise<PreflightDecision> {
+  const types = [...new Set(args.tests.map((test) => test.type))];
+  try {
+    const runnability = await runnabilityFor(types, { hasPlugin: args.hasPlugin });
+    const unrunnable = new Set(
+      runnability.filter((entry) => entry.runnable === false).map((entry) => entry.type),
+    );
+    const repoBlocked = new Set(
+      args.repo && !args.repo.available ? args.repo.testIds : ([] as readonly string[]),
+    );
+
+    const preflight = await environmentPreflight({
+      baseUrl: args.baseUrl,
+      types,
+      runnability,
+      contributed: args.repo ? [repoWorkspaceCheck(args.repo)] : [],
+      identities: requiredIdentities(
+        args.tests,
+        (test) => unrunnable.has(test.type) || repoBlocked.has(test.id),
+      ),
+      signIn: args.signIn,
+    });
+
+    /*
+     * The per-test answer is RESOLVED HERE, into a plain Map, rather than asked
+     * of the runner once per test inside the loop. Two reasons, and the second
+     * one is the load-bearing one:
+     *
+     *  · the decision for a given test cannot change mid-suite, so asking it
+     *    1,000 times is 1,000 scans over the same handful of checks; and
+     *  · every call into the preflight API now lives inside this one
+     *    try/catch. That is what makes the fail-open promise above true in
+     *    practice: there is no second call site that can throw halfway through
+     *    the suite, after results have already been written.
+     */
+    const blocked = new Map<string, { kind: NotRunKind; why: string; check: string }>();
+    for (const test of args.tests) {
+      const block = environmentBlock(preflight, test);
+      if (block) blocked.set(test.id, { kind: block.kind, why: block.why, check: block.check });
+    }
+
+    const nothingRunnable = unattemptable(preflight, args.tests);
+    /*
+     * WHICH KIND of gap this is, decided from the per-test blocks rather than
+     * from the first UNAVAILABLE check.
+     *
+     * "Every blocked test was blocked by a missing TOOL" is the only condition
+     * under which this deployment, rather than the thing under test, is the
+     * thing to fix — and it is deliberately "every one of them", the same rule
+     * `completeShardedRun` applies to its shards: a slice where one type has no
+     * tool and the base URL is also dead is a run that failed for two reasons,
+     * and naming only the hole in our image would be the reassuring half of a
+     * true answer.
+     *
+     * The blocks honour the preflight's order of explanation (tooling before
+     * the base URL before the login), which is what makes this read the way a
+     * human would act: an image with no k6 will still have no k6 after the VPN
+     * is fixed.
+     */
+    const blockedKinds = new Set([...blocked.values()].map((block) => block.kind));
+    const gapKind: NotRunKind | null = !nothingRunnable
+      ? null
+      : blockedKinds.size === 1 && blockedKinds.has('UNSUPPORTED')
+        ? 'UNSUPPORTED'
+        : 'BLOCKED_BY_ENV';
+    return {
+      checks: preflight.checks.map((check) => ({
+        name: String(check.name),
+        kind: check.kind,
+        outcome: check.outcome,
+        detail: check.detail,
+      })),
+      durationMs: preflight.durationMs,
+      blocked,
+      unattemptable: nothingRunnable,
+      gapKind,
+      /*
+       * `preflight.reason` is the FIRST unavailable check's sentence, which is
+       * the right one to lead with while the blocks agree about what went
+       * wrong. When they do NOT — some tests blocked by a tool, others by the
+       * environment — leading with one of them would describe half the cause
+       * under a marker that names the other half, so the summary is used
+       * instead and it names up to three of them.
+       */
+      reason: nothingRunnable
+        ? blockedKinds.size > 1
+          ? preflightSummary(preflight)
+          : (preflight.reason ?? preflightSummary(preflight))
+        : null,
+    };
+  } catch (err) {
+    logger.error(
+      { err, runId: args.runId },
+      'the environment preflight itself failed; executing the suite as if it had not run',
+    );
+    return {
+      checks: [],
+      durationMs: 0,
+      blocked: new Map(),
+      unattemptable: false,
+      gapKind: null,
+      reason: null,
+    };
+  }
 }
 
 /**
@@ -1161,11 +2036,24 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
  * `durationMs` is zero because nothing was executed. Reporting an invented
  * duration here would put the test on the slowest-test list for work that never
  * happened.
+ *
+ * (The doc comment used to sit forty lines above the function, over
+ * `interface PreflightTest`, describing neither.)
  */
 function syntheticExecution(
   testId: string,
   status: 'SKIPPED' | 'FAILED',
   errorMessage: string,
+  /**
+   * The typed reason, when the caller has one.
+   *
+   * Threaded through rather than re-derived by `persistExecution` out of the
+   * message it was handed, because the caller holds the kind as DATA and the
+   * message is where it goes to become a string. Absent for the one caller that
+   * has no kind — a test whose auth profile would not sign in, which is a
+   * FAILED result and not a not-run at all — and absent is not `NOT_RUN`.
+   */
+  notRun?: { kind: NotRunKind; why: string },
 ): TestExecution {
   return {
     testId,
@@ -1178,6 +2066,7 @@ function syntheticExecution(
     traceKey: null,
     errorMessage,
     retriedAndPassed: false,
+    ...(notRun ? { notRun } : {}),
     findings: [],
   };
 }
@@ -1291,18 +2180,165 @@ async function finalizeRun(args: {
   };
   counts: RunCounts;
   errorMessage: string | null;
+  /**
+   * A run-level marker this function may hoist onto the front of
+   * `errorMessage`, but ONLY if the run turns out to have been unattemptable.
+   *
+   * The sharded path cannot decide that itself and used to decide it anyway: it
+   * hoisted ENVIRONMENT_UNAVAILABLE whenever every BROKEN shard was
+   * environmental, which is not the same question as whether the RUN was
+   * attemptable. Two shards, one env-dead and one that COMPLETED with a pass,
+   * produced a run that said ENVIRONMENT_UNAVAILABLE while its own gate line
+   * said part of the suite ran and `gateResult.passed` was true — a run
+   * contradicting itself in the one field a program reads.
+   *
+   * So the detail arrives plain and the marker arrives separately, and the
+   * prefix goes on only beside `unattemptable`, which is the meaning
+   * @qaai/shared documents for it.
+   */
+  gapMarker?: NotRunKind | null;
   /** Overrides the pass/fail verdict: the run was cancelled, or a shard died. */
   forcedStatus: 'CANCELLED' | 'ERRORED' | null;
+  /**
+   * The preflight concluded that NOTHING in this run could be attempted. Set by
+   * the processor, which is the only caller that knows; the sharded and
+   * dead-job paths leave it out and the environment facts are read back off the
+   * result rows instead, so all three paths report the same way.
+   */
+  unattemptable?: boolean;
 }): Promise<void> {
-  const { orgId, run, counts, errorMessage, forcedStatus } = args;
+  const { orgId, run, counts, forcedStatus } = args;
+  let errorMessage = args.errorMessage;
+
+  /*
+   * ONE read of the result rows, for three questions that must agree about
+   * them: the gate's evaluations, the environment summary, and (on the paths
+   * that recount) the counters. Two reads is how a gate came to be scored
+   * against a different set of rows than the counts were.
+   */
+  const rows = await readRunResults(orgId, run.id);
+  const environment = environmentSummary(rows);
+
+  /*
+   * Whether something asked this run to stop early, read off the row rather
+   * than carried in from the caller — for the reason the environment summary is
+   * derived from the result rows: a SHARD knows it stopped and not whether its
+   * siblings did, `failRunFromDeadJob` knows nothing at all, and all three
+   * paths have to report the same run. The request may have been written by the
+   * inline fail-fast check, by the sweep in schedule.ts, or by a person
+   * pressing stop in the cockpit; none of them is this function's business, and
+   * the sentence they wrote is what gets reported.
+   */
+  const stop = await prisma.run
+    .findUnique({ where: { id: run.id }, select: { stopRequestedAt: true, stopReason: true } })
+    .catch((err: unknown) => {
+      /*
+       * Logged rather than swallowed. A run must not fail to finalise because
+       * one read failed — the `updateMany` two statements down would fail too,
+       * so this is close to unreachable — but the frame below would then say
+       * `stopped: null` for a run that may well have been halted, and a
+       * "nothing happened" that is really "we could not look" is the one shape
+       * of silence this file exists to remove.
+       */
+      logger.warn(
+        { err, runId: run.id },
+        'could not read whether this run was asked to stop; the finished frame will not say',
+      );
+      return null;
+    });
+  const stopped =
+    stop?.stopRequestedAt != null
+      ? { at: stop.stopRequestedAt, reason: stop.stopReason ?? null }
+      : null;
 
   const gateResult = await evaluateRunGates(
     orgId,
-    run.id,
+    rows,
     run.projectId,
     run.gateRules,
     run.quarantineBudgetPercent,
   );
+
+  /*
+   * ── The environment, as a gate evaluation ────────────────────────────────
+   *
+   * BLOCK when nothing could be attempted: there is no evidence about this
+   * change, and a merge gate must not open on a run that did not happen. WARN
+   * when only part of the suite was blocked, or when failures were triaged as
+   * the environment's fault — a WARN is still rendered by the chat alert, the
+   * check summary, the CLI and the run page, and it does not hold a release
+   * hostage to one rotated password.
+   *
+   * Appended after `evaluateGates` rather than inside it because a project's
+   * own rule list must not be able to switch it off, which is the same reason
+   * the quarantine alarm is appended there. `passed` is recomputed from the
+   * evaluations, since `evaluateGates` could not see this one.
+   */
+  /*
+   * Derived when the caller did not say, so the three finalisation paths cannot
+   * disagree: a SHARD knows its own slice was unattemptable but not whether its
+   * siblings' were, and `failRunFromDeadJob` knows nothing at all. "Every row
+   * in the run is blocked or unsupported" is the same question asked of the
+   * rows, and the rows are the only place that holds the whole run.
+   */
+  const unattemptable =
+    args.unattemptable ??
+    (rows.length > 0 &&
+      environment.blockedByEnv.length + environment.unsupported.length === rows.length);
+
+  const environmentEvaluation = environmentGateEvaluation(environment, unattemptable);
+  if (environmentEvaluation) {
+    gateResult.evaluations.push(environmentEvaluation);
+    gateResult.passed = gateResult.evaluations.every((e) => e.action !== 'BLOCK');
+  }
+
+  /*
+   * The marker, now that `unattemptable` has been derived from the rows — the
+   * only place that holds the whole run. See `gapMarker` above for the
+   * self-contradicting run this ordering exists to prevent. A caller that
+   * passes no marker is unaffected: the unsharded path has already applied its
+   * own, because its slice IS the run.
+   */
+  if (args.gapMarker != null && errorMessage !== null && unattemptable) {
+    errorMessage = runGapMessage(args.gapMarker, errorMessage);
+  }
+
+  /*
+   * ── ENV_ISSUE, finally leading somewhere ─────────────────────────────────
+   *
+   * The fourth triage verdict has existed since the beginning and changed
+   * nothing: `BLOCKING_VERDICTS` is REAL_BUG alone, so an ENV_ISSUE never
+   * blocked the gate — and it did not have to, because the FAILED result had
+   * already put the run's status at FAILED through `counts.failed`. A board red
+   * from an expired credential was byte-identical to a board red from a bug.
+   *
+   * So when every failure that gates was triaged ENV_ISSUE, the run reports
+   * ERRORED-with-a-reason instead of FAILED. What is deliberately NOT done is
+   * rewriting the counters: `failedCount` still says three tests failed,
+   * because three tests did fail, and the five columns still sum to the number
+   * of results. Moving those failures into a sixth bucket would need a column
+   * this change does not own — see the report — and moving them into `skipped`
+   * is the same mistake in a kinder word that gates.ts already refuses for
+   * quarantine.
+   *
+   * Only when nobody has already decided: a cancel, a dead shard or an
+   * unattemptable run has a better answer than this one, and the `errorMessage`
+   * guard keeps this from overwriting theirs.
+   */
+  let forced = forcedStatus;
+  if (
+    forced === null &&
+    errorMessage === null &&
+    environment.envIssueFailures.length > 0 &&
+    environment.envIssueFailures.length >= environment.gatingFailures
+  ) {
+    forced = 'ERRORED';
+    errorMessage = environmentUnavailableMessage(
+      `All ${environment.gatingFailures} failing test(s) in this run were triaged as environment ` +
+        `issues rather than defects (${nameList(environment.envIssueFailures)}). The run is not a ` +
+        'verdict on your application; fix the environment and re-run.',
+    );
+  }
 
   /*
    * The verdict is NOT computed here any more.
@@ -1315,7 +2351,7 @@ async function finalizeRun(args: {
    * came to suppress the signal without stopping the gate. `runOutcome` is the
    * only function allowed to answer the question; see packages/runner/gates.ts.
    */
-  const outcome = runOutcome({ counts, gatePassed: gateResult.passed, forcedStatus });
+  const outcome = runOutcome({ counts, gatePassed: gateResult.passed, forcedStatus: forced });
   const status = outcome.status;
 
   /*
@@ -1407,11 +2443,67 @@ async function finalizeRun(args: {
         suppressedFailures: outcome.suppressedFailures,
         reason: outcome.reason,
       },
+      /*
+       * The environment's own line on the frame, nested for exactly the reason
+       * `verdict` is: `...counts` already spreads keys, and a top-level
+       * `blocked` or `unsupported` beside it is one rename away from silently
+       * replacing a count. A run that reports PASSED with eleven tests nobody
+       * could execute has to be able to SAY so live, not only once somebody
+       * opens the run page.
+       */
+      environment: {
+        unattemptable,
+        blockedByEnv: environment.blockedByEnv.length,
+        unsupported: environment.unsupported.length,
+        cancelled: environment.cancelled,
+        /*
+         * Two fields, because they were one and the one was wrong.
+         * `notReached` is rows tagged NOT_RUN — a dead shard's slice, or the
+         * tail of a run that stopped early — and `notRecorded` is rows carrying
+         * no reason at all. `notRecorded` keeps its name so the cockpit's
+         * existing read keeps working, and it now means what it says.
+         */
+        notReached: environment.notRun,
+        notRecorded: environment.untagged,
+        envIssueFailures: environment.envIssueFailures.length,
+      },
+      /*
+       * THE STOP, on the frame, and why it has to be on it.
+       *
+       * A stopped run finalises on its real counts, which is right for the case
+       * that writes the request most often: fail-fast trips on a real failure,
+       * so the run is FAILED and the verdict already says so. It is NOT the
+       * whole story for a person pressing stop on a suite that was green so far
+       * — that run reports PASSED with tests nobody executed, which is the hole
+       * this file's header already names for a partially-blocked environment,
+       * and the same honest remedy applies: a configurable MIN_ATTEMPTED_RATE
+       * gate rule, which needs a `GateRule` kind this change cannot add (see
+       * the handover). Until that exists the stop is PUBLISHED rather than
+       * pretended away — the frame carries that the run was halted, how many
+       * tests were never reached, and the sentence whoever halted it wrote.
+       */
+      stopped: stopped
+        ? { at: stopped.at.toISOString(), reason: stopped.reason, notReached: environment.notRun }
+        : null,
     },
     at: new Date().toISOString(),
   });
 
-  logger.info({ runId: run.id, status, ...counts, reason: outcome.reason }, 'run finished');
+  logger.info(
+    {
+      runId: run.id,
+      status,
+      ...counts,
+      reason: outcome.reason,
+      blockedByEnv: environment.blockedByEnv.length,
+      unsupported: environment.unsupported.length,
+      notReached: environment.notRun,
+      notRecorded: environment.untagged,
+      envIssueFailures: environment.envIssueFailures.length,
+      stopRequested: stopped !== null,
+    },
+    'run finished',
+  );
 }
 
 /**
@@ -1668,18 +2760,77 @@ async function completeShardedRun(args: {
   // but the run's verdict must not be: an incomplete suite cannot pass a gate.
   const broken = shards.filter((s) => s.status === 'ABANDONED' || s.status === 'FAILED');
 
-  const errorMessage =
-    broken.length > 0
-      ? `${broken.length} of ${shards.length} shards did not complete (${broken
-          .map((s) => `shard ${s.index}: ${s.errorMessage ?? s.status.toLowerCase()}`)
-          .join('; ')})`
+  /*
+   * ── The sharded run's own run-level marker ───────────────────────────────
+   *
+   * Composing the shards' messages buried the prefix mid-string — "2 of 2
+   * shards did not complete (shard 0: ENVIRONMENT_UNAVAILABLE: …)" — and a
+   * prefix in the middle of a sentence is not a prefix: nothing downstream
+   * could tell that a sharded run had been unattemptable, while the identical
+   * unsharded run said so in its first word. So when every shard that failed
+   * failed for THE SAME KIND of gap, the composed message carries that marker
+   * at the front and the per-shard detail follows it.
+   *
+   * "Every one of them, and the same one" rather than "any of them": a shard
+   * whose worker blew up alongside one whose environment was down is a run that
+   * failed for two reasons, and naming only the kinder one would be the
+   * reassuring half of a true answer. A shard with no k6 alongside one with a
+   * dead base URL is the same situation in a subtler form, and gets the same
+   * answer — the plain wording, with both sentences in it.
+   *
+   * The marker is HANDED TO `finalizeRun` rather than applied here, because
+   * whether the RUN was unattemptable is a question about its rows and this
+   * function cannot see them: see `gapMarker` on that function.
+   */
+  const brokenGaps = broken.map((s) => runGapReason(s.errorMessage));
+  const gapKinds = new Set(brokenGaps.map((gap) => gap?.kind ?? null));
+  const gapMarker: NotRunKind | null =
+    broken.length > 0 && gapKinds.size === 1 && !gapKinds.has(null)
+      ? (brokenGaps[0]?.kind ?? null)
       : null;
+  const shardDetail = broken
+    .map(
+      (s, i) =>
+        `shard ${s.index}: ${(gapMarker ? brokenGaps[i]?.reason : s.errorMessage) ?? s.status.toLowerCase()}`,
+    )
+    .join('; ');
+
+  const errorMessage =
+    broken.length === 0
+      ? null
+      : gapMarker
+        ? `${broken.length} of ${shards.length} shards could not be attempted (${shardDetail})`
+        : `${broken.length} of ${shards.length} shards did not complete (${shardDetail})`;
+
+  /*
+   * A dead or failed shard leaves its slice sitting at the placeholder SKIPPED,
+   * and that placeholder used to be indistinguishable from a test somebody
+   * deliberately skipped — the exact confusion the typed kinds exist to end.
+   * NOT_RUN is the honest label: nobody reached these, and this process cannot
+   * say why beyond what the shard's own `errorMessage` recorded.
+   *
+   * One `updateMany` per broken shard, over rows nothing has written to, after
+   * the counts were read (the status does not change, only the message, so the
+   * order costs nothing but is worth being deliberate about).
+   */
+  for (const dead of broken) {
+    await stampNotRun(
+      orgId,
+      run.id,
+      { index: dead.index, count: shards.length },
+      'NOT_RUN',
+      `Shard ${dead.index} did not complete, so this test was never reached. ${
+        dead.errorMessage ?? `The shard ended ${dead.status.toLowerCase()}.`
+      }`,
+    );
+  }
 
   await finalizeRun({
     orgId,
     run,
     counts,
     errorMessage,
+    gapMarker,
     forcedStatus: cancelled ? 'CANCELLED' : broken.length > 0 ? 'ERRORED' : null,
   });
 }
@@ -1839,6 +2990,14 @@ async function readRunResults(orgId: string, runId: string) {
       status: true,
       retriedAndPassed: true,
       durationMs: true,
+      /*
+       * The message, because it carries the typed not-run tag (see
+       * `notRunMessage` in @qaai/shared). Without it a SKIPPED row is just a
+       * skip again at finalisation, and "eleven tests were blocked by a dead
+       * staging box" could not be said on the frame, in the log, or on the
+       * gate — which is the whole defect this read exists to close.
+       */
+      errorMessage: true,
       test: {
         select: {
           name: true,
@@ -1853,6 +3012,177 @@ async function readRunResults(orgId: string, runId: string) {
       verdict: { select: { verdict: true, overriddenTo: true, reviewState: true } },
     },
   });
+}
+
+/**
+ * What the environment did to this run, read off the rows it produced.
+ *
+ * Derived from the PERSISTED results rather than carried in memory, and that is
+ * what lets all three finalisation paths say the same thing: the unsharded
+ * processor, `completeShardedRun` (where five workers each hold a fifth of the
+ * picture and none of them holds the run's) and `failRunFromDeadJob` (where the
+ * process that had the picture is gone). A field on an in-memory counter would
+ * be correct on exactly one of those three.
+ *
+ * `untagged` is the honesty field. A SKIPPED row with no tag is NOT scored as
+ * any kind — a plugin's own "k6 is not installed" skip still writes a bare
+ * sentence today, and rows written before the tag existed carry nothing. They
+ * are counted as unexplained rather than folded into the nearest category,
+ * because folding them in would invent the very distinction this is here to
+ * report.
+ */
+interface EnvironmentSummary {
+  /** Failures that GATE, quarantine-suppressed ones excluded. The denominator. */
+  gatingFailures: number;
+  /** Gating failures a human or the triage agent called the environment's fault. */
+  envIssueFailures: Array<{ testName: string }>;
+  blockedByEnv: Array<{ testName: string }>;
+  unsupported: Array<{ testName: string }>;
+  cancelled: number;
+  /**
+   * SKIPPED rows tagged NOT_RUN: nobody reached them, and nothing knows why
+   * beyond that.
+   *
+   * Its own field, and it used to be added to `untagged`, under a doc comment
+   * on that field saying "carrying no typed reason" — so the count of rows
+   * nothing had explained silently included the rows something HAD explained,
+   * and the comment contradicted the code three lines below it. They are
+   * different facts with different remedies: a dead shard's slice is a re-run,
+   * and an untagged skip is a writer that has not learned to tag yet.
+   */
+  notRun: number;
+  /**
+   * SKIPPED rows carrying no typed reason at all. Reported, never classified.
+   *
+   * A plugin's own "k6 is not installed" skip still writes a bare sentence
+   * today, and rows written before the tag existed carry nothing. Folding them
+   * into the nearest category would invent the very distinction this is here to
+   * report.
+   */
+  untagged: number;
+}
+
+function environmentSummary(
+  rows: readonly RunResultRow[],
+  now: Date = new Date(),
+): EnvironmentSummary {
+  const summary: EnvironmentSummary = {
+    gatingFailures: 0,
+    envIssueFailures: [],
+    blockedByEnv: [],
+    unsupported: [],
+    cancelled: 0,
+    notRun: 0,
+    untagged: 0,
+  };
+
+  for (const row of rows) {
+    const testName = row.test.name;
+
+    if (row.status === 'SKIPPED') {
+      const tag = parseNotRun(row.errorMessage);
+      if (tag === null) {
+        summary.untagged += 1;
+      } else if (tag.kind === 'BLOCKED_BY_ENV') {
+        summary.blockedByEnv.push({ testName });
+      } else if (tag.kind === 'UNSUPPORTED') {
+        summary.unsupported.push({ testName });
+      } else if (tag.kind === 'CANCELLED') {
+        summary.cancelled += 1;
+      } else {
+        /*
+         * NOT_RUN: recorded, and deliberately in no other bucket. "Nobody
+         * reached this" is weaker than every other claim here — but it IS a
+         * claim, which is why it no longer lands in `untagged` beside the rows
+         * nothing said anything about.
+         */
+        summary.notRun += 1;
+      }
+      continue;
+    }
+
+    if (row.status !== 'FAILED' && row.status !== 'TIMED_OUT') continue;
+    // A quarantine in force already keeps this failure out of `counts.failed`,
+    // so counting it here would double-suppress and let one quarantined
+    // environment failure decide the whole run's verdict.
+    if (quarantineSuppresses(row.test, now)) continue;
+
+    summary.gatingFailures += 1;
+    // A human override beats the model, always — the same rule the gate applies.
+    const verdict =
+      row.verdict?.reviewState === 'OVERRIDDEN'
+        ? (row.verdict.overriddenTo ?? row.verdict.verdict)
+        : (row.verdict?.verdict ?? null);
+    if (verdict === 'ENV_ISSUE') summary.envIssueFailures.push({ testName });
+  }
+
+  return summary;
+}
+
+/** Up to three names, then a count. Same shape, and same reason, as gates.ts. */
+function nameList(rows: ReadonlyArray<{ testName: string }>): string {
+  const head = rows.slice(0, ENVIRONMENT_NAMES_LISTED).map((r) => r.testName);
+  return rows.length > ENVIRONMENT_NAMES_LISTED
+    ? `${head.join(', ')} and ${rows.length - ENVIRONMENT_NAMES_LISTED} more`
+    : head.join(', ');
+}
+
+/**
+ * The environment's gate line, or null when there is nothing to say.
+ *
+ * BLOCK for an unattemptable run and WARN for everything else, which is the
+ * policy decision in this change and is worth stating plainly:
+ *
+ *  · BLOCK when NOTHING ran. There is no evidence about the change, so no merge
+ *    may open on the strength of this run. The status is ERRORED beside it, so
+ *    a reader sees "could not run" rather than "failed".
+ *  · WARN when only part of the suite was blocked. 400 passing tests are still
+ *    400 passing tests, and holding every release because one role's password
+ *    rotated is how a brake gets switched off by the people it protects. The
+ *    cost is named rather than hidden: such a run CAN still report PASSED with
+ *    tests nobody executed, and the honest remedy is a project-configurable
+ *    minimum-attempted rule in gates.ts — see the report.
+ *  · WARN for ENV_ISSUE failures, because `BLOCKING_VERDICTS` says ENV_ISSUE
+ *    "alerts but never gates" and this is the alert. The run's ERRORED status,
+ *    written above, is what keeps it out of the green column.
+ */
+function environmentGateEvaluation(
+  summary: EnvironmentSummary,
+  unattemptable: boolean,
+): GateResultEvaluation | null {
+  const notRun = summary.blockedByEnv.length + summary.unsupported.length;
+  if (notRun === 0 && summary.envIssueFailures.length === 0) return null;
+
+  const parts: string[] = [];
+  if (summary.blockedByEnv.length > 0) {
+    parts.push(
+      `${summary.blockedByEnv.length} test(s) could not be attempted because the environment was ` +
+        `not usable (${nameList(summary.blockedByEnv)})`,
+    );
+  }
+  if (summary.unsupported.length > 0) {
+    parts.push(
+      `${summary.unsupported.length} test(s) are of a type this deployment cannot execute ` +
+        `(${nameList(summary.unsupported)}) — install the missing tool on the worker`,
+    );
+  }
+  if (summary.envIssueFailures.length > 0) {
+    parts.push(
+      `${summary.envIssueFailures.length} failure(s) were triaged as environment issues rather ` +
+        `than defects (${nameList(summary.envIssueFailures)})`,
+    );
+  }
+
+  const action = unattemptable ? 'BLOCK' : 'WARN';
+  return {
+    rule: ENVIRONMENT_GATE_RULE(action),
+    passed: false,
+    action,
+    detail: unattemptable
+      ? `Environment — nothing in this run could be attempted: ${parts.join('; ')}. ` +
+        'There is no verdict here, so nothing may merge on the strength of it.'
+      : `Environment — ${parts.join('; ')}. None of this is a verdict on your application.`,
+  };
 }
 
 function tallyRows(rows: readonly RunResultRow[], now: Date = new Date()): RunCounts {
@@ -1952,6 +3282,25 @@ async function persistExecution(args: {
         durationMs: execution.durationMs,
         errorMessage: execution.errorMessage,
         retriedAndPassed: execution.retriedAndPassed,
+        /*
+         * WHY this result has nothing measured in it, as a queryable column.
+         *
+         * `execution.notRun` rather than a re-reading of the message: the
+         * producer holds the kind as data — the worker's own not-run branch
+         * threads it through `syntheticExecution`, and a PLUGIN can now declare
+         * its own ("k6 is not installed on this image") — and parsing it back
+         * out of a string it just formatted would be this file guessing at a
+         * fact it was handed.
+         *
+         * NULL when absent, and absent is NOT `NOT_RUN`. Undefined means the
+         * producer made no claim about why, which is the fifth state both this
+         * column and `parseNotRun` spell NULL; defaulting to NOT_RUN would put
+         * a claim in the database that nothing produced. Written explicitly on
+         * EVERY result for the reason `mutationColumns` is — a redelivered job
+         * re-persisting a result must clear a kind that no longer applies, and
+         * a column left out of the update keeps whatever it held before.
+         */
+        notRunKind: execution.notRun?.kind ?? null,
         network: execution.network as unknown as object,
         consoleLog: execution.console as unknown as object,
         videoKey: execution.videoKey,
@@ -2230,9 +3579,15 @@ export function utcDay(at: Date): Date {
   return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
 }
 
+/*
+ * Takes the ROWS rather than re-reading them. `finalizeRun` already needs the
+ * same read for the environment summary, and two reads of the same rows is how
+ * a gate came to be scored against a different set of results than the counts
+ * were computed from.
+ */
 async function evaluateRunGates(
   orgId: string,
-  runId: string,
+  results: readonly RunResultRow[],
   projectId: string,
   rawRules: unknown,
   budgetPercent?: number | null,
@@ -2240,7 +3595,6 @@ async function evaluateRunGates(
   const rules =
     Array.isArray(rawRules) && rawRules.length > 0 ? (rawRules as GateRule[]) : DEFAULT_GATE_RULES;
 
-  const results = await readRunResults(orgId, runId);
   const now = new Date();
 
   return evaluateGates(rules, {
@@ -2317,58 +3671,28 @@ async function quarantineHealthFor(
       }),
     ]);
 
-    const soonAt = new Date(now.getTime() + QUARANTINE_EXPIRY_WARNING_DAYS * 86_400_000);
-    const unboundedBefore = new Date(now.getTime() - QUARANTINE_MAX_DAYS * 86_400_000);
-
-    const expired: Array<{ testId: string; testName: string }> = [];
-    const expiringSoon: Array<{ testId: string; testName: string; expiresAt: Date }> = [];
-    const unbounded: Array<{ testId: string; testName: string; quarantinedAt: Date | null }> = [];
-
-    for (const test of quarantined) {
-      if (
-        !quarantineSuppresses(
-          { quarantined: true, quarantineExpiresAt: test.quarantineExpiresAt },
-          now,
-        )
-      ) {
-        expired.push({ testId: test.id, testName: test.name });
-        continue;
-      }
-      if (test.quarantineExpiresAt === null) {
-        /*
-         * A quarantine written before expiry existed. Only reported once it is
-         * OLDER than the window it would have had — a quarantine taken out this
-         * morning by a path that has not learned to stamp an expiry yet is not
-         * news, and reporting it would make this warning fire on every run of
-         * every install until every writer is updated.
-         */
-        if (test.quarantinedAt !== null && test.quarantinedAt < unboundedBefore) {
-          unbounded.push({
-            testId: test.id,
-            testName: test.name,
-            quarantinedAt: test.quarantinedAt,
-          });
-        }
-        continue;
-      }
-      if (test.quarantineExpiresAt <= soonAt) {
-        expiringSoon.push({
-          testId: test.id,
-          testName: test.name,
-          expiresAt: test.quarantineExpiresAt,
-        });
-      }
-    }
-
+    /*
+     * The classification is `quarantineHealthFrom`'s, not this file's.
+     *
+     * All four rules — expired, expiring soon, quarantined-with-no-expiry-and
+     * -old-enough-to-be-news, and the fact that the COUNT must not be taken
+     * from the capped list — were written out here and again in gates.ts for
+     * the post-triage re-score. Two copies that agree today are the dangerous
+     * state: nothing goes red when they drift, and a re-scored gate that had
+     * quietly stopped reporting an expiring quarantine would be a green-wash
+     * performed by the code that exists to stop one.
+     *
+     * The QUERIES stay here, because they are this caller's: the worker's
+     * client carries no tenancy extension, so the org scope is explicit above.
+     */
     return {
-      quarantine: {
+      quarantine: quarantineHealthFrom({
         totalTests,
         quarantinedCount: inForce,
         budgetPercent: budgetPercent ?? null,
-        expired,
-        expiringSoon,
-        unbounded,
-      },
+        rows: quarantined,
+        now,
+      }),
     };
   } catch (err) {
     logger.warn(

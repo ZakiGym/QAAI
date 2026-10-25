@@ -1,0 +1,108 @@
+-- A typed reason for a result that did not run: enum NotRunKind, and
+-- "TestResult"."notRunKind".
+--
+-- WHY THIS EXISTS
+--
+-- There was one SKIPPED, and four completely different facts were filed under
+-- it:
+--
+--   1. a placeholder row nobody ever reached — a dead shard, a lost queue job,
+--      a worker killed mid-suite;
+--   2. a test this DEPLOYMENT has no tool to execute (no k6, no Lighthouse, no
+--      Firefox);
+--   3. a test whose ENVIRONMENT was broken — the base URL did not answer, the
+--      only login no longer works, there was no repository checkout;
+--   4. a run somebody cancelled.
+--
+-- A reader could not tell "nobody has written this yet" from "this cannot run
+-- here", which means the skipped count answered no question at all — and the
+-- one question it is asked, every day, is "is this suite actually testing
+-- anything?". Two of the four (2 and 3) must be EXCLUDED from a pass rate and
+-- from a coverage denominator rather than scored as skips, because a test that
+-- could not be attempted is not evidence about the application in either
+-- direction. That exclusion was not expressible, so a dead staging box moved a
+-- coverage number.
+--
+-- WHY NOT A SIXTH "TestResultStatus"
+--
+-- The status column is read by the gate, the five run counters, the CLI's exit
+-- code, the GitHub check's conclusion, the JUnit writer and the coverage pass,
+-- and each of them switches on it. A sixth member would be a value all of them
+-- accept from the database and none of them renders — the drift this repo's
+-- `check:enums` guard exists to prevent. So the status stays SKIPPED and the
+-- REASON becomes its own column: nothing that reads the status changes
+-- behaviour, and anything that wants the distinction now has it.
+--
+-- WHY A COLUMN AND NOT THE TAG IT REPLACES
+--
+-- The kind has been riding at the head of "TestResult"."errorMessage" as
+-- `[BLOCKED_BY_ENV] the base URL did not answer` (`notRunMessage` /
+-- `parseNotRun` in @qaai/shared). That buys one ROW being classifiable and
+-- nothing else: you cannot `GROUP BY` a prefix, so "how many of this month's
+-- skips were the environment's fault?" had no cheap answer. This repo has
+-- already written the argument down once, in the migration that moved the
+-- mutation score out of a Step TITLE — data inside a string column cannot be
+-- trended, gated on or alerted on, and reading it back means a regex.
+--
+-- THE TAG IS NOT REMOVED, and that is not laziness. It is what a surface
+-- renders, the sentence after it is complete English, and it is ALL that every
+-- row written before today carries. `parseNotRun` therefore stays the only way
+-- to classify an old row; a reader holding both prefers the column.
+--
+-- NULL IS A FIFTH STATE, AND IT IS NOT "NOT_RUN"
+--
+-- NOT_RUN is a claim. It is the weakest of the four — "nothing was attempted
+-- and nothing says it could not be" — but it is still an assertion about what
+-- happened, and it is earned by a row a dead shard left behind. NULL is the
+-- absence of any claim: every historical row, and every row written by a path
+-- that has not learned to classify yet (notably the runner plugins, which
+-- return SKIPPED with a plain sentence when their tool is missing). Nothing may
+-- score NULL as NOT_RUN, and nothing may count it as a reason at all.
+--
+-- That is also the whole reason the column has NO DEFAULT. `DEFAULT 'NOT_RUN'`
+-- would write that claim onto every one of those rows at once, in one
+-- statement, with nobody able to tell afterwards which of them meant it.
+--
+-- APPLYING THIS ON A LIVE DATABASE
+--
+-- FORWARD: one CREATE TYPE on nothing, and one ADD COLUMN that is nullable
+-- with no default. PostgreSQL records a nullable no-default attribute in the
+-- catalogue and does not touch a single row — no rewrite, no long
+-- ACCESS EXCLUSIVE hold while 200 million rows are copied. "TestResult" is the
+-- largest table in the product (one row per test per run, for ever), so that
+-- property is the difference between a migration and an outage. The lock taken
+-- is still ACCESS EXCLUSIVE, but it is held for the catalogue write only, which
+-- is milliseconds — set a short `lock_timeout` and retry rather than queueing
+-- behind a long-running read.
+--
+-- No index is added. Nothing queries the column yet, and an index on a column
+-- that is NULL in every existing row would be a 99%-dead btree built under that
+-- same lock. When a dashboard does group by it, the index to add is
+-- `("orgId", "notRunKind") WHERE "notRunKind" IS NOT NULL`, built CONCURRENTLY
+-- and outside a migration transaction.
+--
+-- ROLLBACK — THE DIRECTION THAT ACTUALLY COSTS SOMETHING. Reverting is
+-- `ALTER TABLE "TestResult" DROP COLUMN "notRunKind";` followed by
+-- `DROP TYPE "NotRunKind";`, in that order, and it is NOT free:
+--
+--   · DROP COLUMN is itself catalogue-only and fast, but IT DESTROYS EVERY
+--     CLASSIFICATION WRITTEN SINCE THIS MIGRATION APPLIED, irreversibly. The
+--     tag on "errorMessage" is what makes that survivable — every writer of
+--     this column writes the tag too, so a rollback loses the queryability and
+--     not the fact. If a future change ever stops writing the tag, this
+--     migration stops being reversible without data loss, and that change owes
+--     a dump of the column before it ships.
+--   · DROP TYPE fails outright while any column anywhere still references
+--     NotRunKind, so the two statements cannot be reordered or run apart.
+--   · A rollback that drops the column while a NEWER deployment is still
+--     writing to it will error every insert that names it. Drain or roll back
+--     the application first; the column is additive going forward, which means
+--     it is subtractive going back, and the two are not symmetric.
+--
+-- NOT RUN by this change. `prisma migrate deploy` applies it.
+
+-- CreateEnum
+CREATE TYPE "NotRunKind" AS ENUM ('NOT_RUN', 'BLOCKED_BY_ENV', 'UNSUPPORTED', 'CANCELLED');
+
+-- AlterTable
+ALTER TABLE "TestResult" ADD COLUMN     "notRunKind" "NotRunKind";

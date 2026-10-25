@@ -7,45 +7,30 @@ import { relativeTime } from '../ui';
 import { Badge } from '../ui/layout';
 import { Button } from '../ui/Button';
 import { DiffRows } from './DiffRows';
+import {
+  appliesImmediately,
+  isRetirement,
+  riskOf,
+  verifyMeta,
+  verifyTone,
+  type Tone,
+} from './heal-risk';
 
 /**
  * One heal proposal, graded by risk.
  *
- * Risk is the most important thing on the card, because the three levels are
+ * Risk is the most important thing on the card, because the levels are
  * genuinely different decisions: a renamed selector is a rubber stamp, a
- * changed assertion means the test now checks something different, and a
- * structural change deserves reading like a colleague's pull request. So it
- * decides the chip colour, whether Apply is the primary action, and whether
- * applying asks first.
+ * changed assertion means the test now checks something different, a structural
+ * change deserves reading like a colleague's pull request — and a RETIREMENT is
+ * not a code change at all, it switches the test off. So it decides the chip
+ * colour, the words on the button, whether Apply is the primary action, and
+ * whether applying asks first.
+ *
+ * The vocabulary itself lives in heal-risk.ts, where a test can reach it.
  */
 
-type Tone = 'neutral' | 'accent' | 'pass' | 'fail' | 'flake';
-
-export const RISK: Record<string, { label: string; blurb: string; tone: Tone }> = {
-  SELECTOR_ONLY: {
-    label: 'Selector only',
-    blurb:
-      'Only a locator changed. No assertion was touched, so the test still checks the same thing.',
-    tone: 'pass',
-  },
-  ASSERTION_CHANGE: {
-    label: 'Assertion change',
-    blurb:
-      'An expected value changed — read this one. After applying, the test checks something different than before.',
-    tone: 'flake',
-  },
-  STRUCTURAL: {
-    label: 'Structural',
-    blurb:
-      'Steps were added, removed, or reordered. Review it as you would a colleague’s pull request.',
-    tone: 'fail',
-  },
-};
-
-export const riskOf = (level: string) => RISK[level] ?? RISK.STRUCTURAL!;
-
-/** Applying this one needs no second thought — and so gets no second dialog. */
-export const appliesImmediately = (heal: Heal) => heal.riskLevel === 'SELECTOR_ONLY';
+export { RISK, riskOf, appliesImmediately } from './heal-risk';
 
 const STATE_LABEL: Record<string, string> = {
   PROPOSED: 'Awaiting review',
@@ -53,6 +38,17 @@ const STATE_LABEL: Record<string, string> = {
   APPLIED: 'Applied',
   AUTO_APPLIED: 'Auto-applied',
   REJECTED: 'Rejected',
+  /** A newer proposal for the same test won; this one was never decided. */
+  SUPERSEDED: 'Superseded by a newer proposal',
+};
+
+/** Badge tones, by the tone name the risk/verification vocabulary uses. */
+const VERIFY_TEXT: Record<Tone, string> = {
+  neutral: 'text-ink-dim',
+  accent: 'text-accent',
+  pass: 'text-pass',
+  fail: 'text-fail',
+  flake: 'text-flake',
 };
 
 export interface HealCardProps {
@@ -70,6 +66,12 @@ export function HealCard({ heal, focused, busy, frozen, onApply, onReject }: Hea
   const risk = riskOf(heal.riskLevel);
   const immediate = appliesImmediately(heal);
   const stale = !heal.preview.applies;
+  /*
+   * A retirement has no diff by construction, so the diff view's honest empty
+   * state ("the proposal arrived without a diff") would read as a broken
+   * proposal. Its evidence is the server's own review sentence instead.
+   */
+  const retirement = isRetirement(heal) || heal.preview.kind === 'RETIREMENT';
 
   return (
     <section
@@ -125,14 +127,33 @@ export function HealCard({ heal, focused, busy, frozen, onApply, onReject }: Hea
         </p>
       )}
 
-      <DiffRows diff={heal.diff} />
+      {retirement ? (
+        /* No diff exists to show. What approval does, and which check the
+           server could and could not run, is the whole of the evidence. */
+        <>
+          {heal.preview.review && (
+            <p className="border-fail/40 text-ink mt-3 rounded-md border bg-[color-mix(in_srgb,var(--color-fail)_8%,transparent)] px-2.5 py-2 text-[12.5px] leading-relaxed">
+              {heal.preview.review}
+            </p>
+          )}
+          {heal.preview.checks && (
+            <p className="text-ink-faint text-micro mt-2">{heal.preview.checks}</p>
+          )}
+        </>
+      ) : (
+        <>
+          <DiffRows diff={heal.diff} />
 
-      {!stale && (heal.preview.fuzz ?? 0) > 0 && (
-        <p className="text-ink-faint text-micro mt-2">
-          The patch needs <span className="tabular-nums">{heal.preview.fuzz}</span> line(s) of fuzz
-          to fit — check the result.
-        </p>
+          {!stale && (heal.preview.fuzz ?? 0) > 0 && (
+            <p className="text-ink-faint text-micro mt-2">
+              The patch needs <span className="tabular-nums">{heal.preview.fuzz}</span> line(s) of
+              fuzz to fit — check the result.
+            </p>
+          )}
+        </>
       )}
+
+      <Verification heal={heal} />
 
       {heal.state === 'PROPOSED' ? (
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -143,13 +164,17 @@ export function HealCard({ heal, focused, busy, frozen, onApply, onReject }: Hea
             loading={busy}
             title={stale ? 'The diff no longer applies to this test' : undefined}
           >
-            {immediate ? 'Apply' : 'Apply — asks to confirm'}
+            {/* The button says what it does. `Apply` on a retirement was the
+                last thing a reviewer read before switching a test off. */}
+            {immediate ? risk.action : `${risk.action} — asks to confirm`}
           </Button>
           <Button variant="ghost" onClick={onReject} disabled={frozen} className="hover:text-fail">
             Reject
           </Button>
           <span className="text-ink-faint font-mono text-[10.5px]">
-            writes to {heal.test.filePath} · version recorded first
+            {retirement
+              ? `disables ${heal.test.name} · the code stays in your repository`
+              : `writes to ${heal.test.filePath} · version recorded first`}
           </span>
         </div>
       ) : (
@@ -161,5 +186,61 @@ export function HealCard({ heal, focused, busy, frozen, onApply, onReject }: Hea
         </p>
       )}
     </section>
+  );
+}
+
+/**
+ * "We applied this heal and then proved the test passes."
+ *
+ * The single most load-bearing sentence this feature produces, and the API has
+ * been computing it for every row — `verification: { state, claimsFixed, note,
+ * runId, at }` — while nothing read it.
+ *
+ * Three rules it follows, all three of them the difference between this block
+ * and a lie:
+ *
+ *  · A NULL state renders NOTHING (unless the server attached a note). Null
+ *    means nobody applied this proposal, so nothing was verified — it is not a
+ *    failed verification and must not be coloured like one.
+ *  · the PASS colour needs the server's own `claimsFixed`, which it sets for
+ *    exactly one case: a run executed the test after the patch was written and
+ *    it passed. See `verifyTone`.
+ *  · A state this build does not recognise says so (see `verifyMeta`) rather
+ *    than being read as "not verified".
+ */
+function Verification({ heal }: { heal: Heal }) {
+  const { verification } = heal;
+  const meta = verifyMeta(verification.state);
+  if (!meta && !verification.note) return null;
+  const tone = verifyTone(verification.claimsFixed, meta);
+
+  return (
+    <div className="border-line mt-3 border-t pt-2.5">
+      <p className="text-micro">
+        <span className={cn('font-mono font-semibold', VERIFY_TEXT[tone])}>
+          {/* "No verification recorded" and not "not verified": the second
+              reads as a check that ran and came back negative. */}
+          {meta ? meta.word : 'No verification recorded'}
+        </span>
+        {verification.at && (
+          <span className="text-ink-faint"> · {relativeTime(verification.at)}</span>
+        )}
+        {verification.runId && (
+          <>
+            <span className="text-ink-faint"> · </span>
+            <Link
+              href={`/runs/${verification.runId}`}
+              className="text-accent hover:underline"
+              title="The run that checked this heal"
+            >
+              open the verifying run →
+            </Link>
+          </>
+        )}
+      </p>
+      {verification.note && (
+        <p className="text-ink-dim text-micro mt-1 leading-relaxed">{verification.note}</p>
+      )}
+    </div>
   );
 }

@@ -21,10 +21,12 @@ import { emptyRunCounts, tallyResult } from '@qaai/runner';
 import { TEST_RESULT_STATUSES } from '@qaai/shared';
 import {
   DEFAULT_CACHE_WINDOW_HOURS,
+  FAIL_FAST_ENFORCED_BY_RUN_LOOP,
   MAX_CACHE_WINDOW_HOURS,
   cacheWindowMs,
   canonicalJson,
   decideCacheReuse,
+  failFastReason,
   groupPriorsByTest,
   isRealFailure,
   planCacheReuse,
@@ -572,5 +574,48 @@ describe('planFailFast', () => {
 
   it('is silent when nobody asked', () => {
     expect(planFailFast(false)).toMatchObject({ requested: false, enforced: false });
+  });
+
+  /*
+   * THE DEFECT THIS PINS. The sentence used to say the `Run.failFast` /
+   * `Run.stopRequestedAt` pair did not exist, and the doc comment above it said
+   * `Run` had no `failFast` column. Both exist and both are written — the
+   * scheduler sweep writes `stopRequestedAt`/`stopReason` at the first failure
+   * that counts — so the one field whose job is to explain itself was telling
+   * the reader the opposite of the truth, next to fields that were accurate.
+   */
+  it('does not claim the columns it is written against are missing', () => {
+    const reason = planFailFast(true).reason;
+    expect(reason).not.toMatch(/until those exist/i);
+    expect(reason).not.toMatch(/no `?Run\.failFast`? column/i);
+    // It names what IS recorded, so a reader does not go hunting for a
+    // migration that is already deployed.
+    expect(reason).toMatch(/Run\.failFast/);
+    expect(reason).toMatch(/Run\.stopRequestedAt/);
+  });
+
+  /*
+   * BOTH BRANCHES, because the one that is not live today is the one that will
+   * be wrong the day it goes live. `enforced` is a claim about code in another
+   * package; `FAIL_FAST_ENFORCED_BY_RUN_LOOP` is the single place that claim is
+   * made, and the test below is what stops the two drifting apart.
+   */
+  it('tells the truth for whichever state the run loop is actually in', () => {
+    expect(planFailFast(true).enforced).toBe(FAIL_FAST_ENFORCED_BY_RUN_LOOP);
+    expect(planFailFast(true).reason).toBe(failFastReason(FAIL_FAST_ENFORCED_BY_RUN_LOOP));
+
+    // Not enforced: it must say the run executes everything, and must NOT
+    // promise a stop.
+    expect(failFastReason(false)).toMatch(/will execute every selected test/i);
+    expect(failFastReason(false)).toMatch(/not actually stop early/i);
+
+    // Enforced: it must promise the stop, and must not still be hedging.
+    expect(failFastReason(true)).toMatch(/stops early at the first failure that counts/i);
+    expect(failFastReason(true)).not.toMatch(/every selected test/i);
+    // And it keeps the two exemptions, because a caller told "stops at the
+    // first failure" who then watches a flake stop their suite has been
+    // mis-sold the feature.
+    expect(failFastReason(true)).toMatch(/retry/i);
+    expect(failFastReason(true)).toMatch(/quarantine/i);
   });
 });

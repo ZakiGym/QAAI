@@ -60,8 +60,15 @@ vi.mock('../vault.js', () => ({
   },
 }));
 
-const { blockingGateRules, processDelivery, processNotify, renderMonitorAlert, renderRunAlert } =
-  await import('./notify.js');
+const {
+  blockingGateRules,
+  failureOwnerKey,
+  processDelivery,
+  processNotify,
+  renderMonitorAlert,
+  renderRunAlert,
+  suppressedCauseCount,
+} = await import('./notify.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -104,6 +111,17 @@ function fanOutDb(integrations: IntegrationRow[]): {
   const updatedIds: string[] = [];
 
   h.prisma = {
+    /*
+     * Routing defaults: a run with no failing results to route. The tests that
+     * are ABOUT routing replace these through routingDb() below. Without them
+     * the pre-routing tests would exercise the degradation path instead of the
+     * real one, which would pass for the wrong reason.
+     */
+    ownershipRule: { findMany: async () => [] },
+    testResult: { findMany: async () => [] },
+    triageVerdict: { update: async () => ({}), updateMany: async () => ({ count: 0 }) },
+    user: { findMany: async () => [] },
+    team: { findMany: async () => [] },
     integration: { findMany: async () => integrations },
     webhookDelivery: {
       upsert: async (args: {
@@ -856,5 +874,491 @@ describe('the monitor page is enriched from the run, but never blocked by it', (
       '🔴 checkout is down',
     );
     expect(h.log.some((l) => l.startsWith('warn:') && l.includes('paging anyway'))).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Routing: whose failure is this
+//
+// Ownership resolved in two READ paths before this (the digest's labels and
+// GET /team/ownership/resolve) and was never written onto the failure, so a red
+// run landed in a queue that belongs to everybody — which in practice means
+// nobody. These tests pin both halves: the label on the line somebody reads at
+// 3am, and the assignee on the verdict somebody opens the next morning.
+//
+// The sharpest assertion in here is the NEGATIVE one: an install that never
+// opted into ownership must hear NOTHING about it. A line reading "unowned"
+// under every failure is how an alert gets muted, and a muted alert is worse
+// than an unrouted one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** `OwnershipRule` rows, plus the verdict writes they produce. */
+function routingDb(opts: {
+  rules?: Array<Record<string, unknown>>;
+  results?: Array<Record<string, unknown>>;
+  teams?: Array<{ id: string; slug: string }>;
+  users?: Array<{ id: string; name: string | null; email: string }>;
+  throws?: boolean;
+  /**
+   * `RunFailureCluster.suppressed` count. Absent leaves the model OFF the fake
+   * client entirely, which is how "the read failed" is modelled — the
+   * processor must then claim nothing rather than report zero.
+   */
+  suppressed?: number;
+}): {
+  updates: Array<{ id: string; data: Record<string, unknown> }>;
+  manyUpdates: unknown[];
+  /** The args the failure read was issued with — the cap and its ordering. */
+  resultQuery: Array<Record<string, unknown>>;
+} {
+  const updates: Array<{ id: string; data: Record<string, unknown> }> = [];
+  const manyUpdates: unknown[] = [];
+  const resultQuery: Array<Record<string, unknown>> = [];
+  const db = h.prisma as Record<string, unknown>;
+
+  db.ownershipRule = {
+    findMany: async () => {
+      if (opts.throws) throw new Error('connection terminated');
+      return opts.rules ?? [];
+    },
+  };
+  db.testResult = {
+    findMany: async (args: Record<string, unknown> = {}) => {
+      resultQuery.push(args);
+      return opts.results ?? [];
+    },
+  };
+  if (opts.suppressed !== undefined) {
+    db.runFailureCluster = { count: async () => opts.suppressed };
+  } else {
+    delete db.runFailureCluster;
+  }
+  db.team = { findMany: async () => opts.teams ?? [] };
+  db.user = { findMany: async () => opts.users ?? [] };
+  db.triageVerdict = {
+    update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+      updates.push({ id: args.where.id, data: args.data });
+      return args.data;
+    },
+    updateMany: async (args: unknown) => {
+      manyUpdates.push(args);
+      return { count: 1 };
+    },
+  };
+
+  return { updates, manyUpdates, resultQuery };
+}
+
+const rule = (over: Record<string, unknown> = {}) => ({
+  id: 'rule1',
+  position: 0,
+  pathPattern: null,
+  testId: null,
+  suiteId: null,
+  feature: null,
+  ownerUserId: null,
+  ownerTeamId: null,
+  ...over,
+});
+
+const failingResult = (over: Record<string, unknown> = {}) => ({
+  id: 'res1',
+  test: {
+    id: 't1',
+    name: 'checkout applies a promo code',
+    filePath: 'specs/checkout.spec.ts',
+    suiteId: null,
+    feature: null,
+  },
+  verdict: { id: 'v1', ownerState: null },
+  ...over,
+});
+
+describe('the alert says whose failure it is', () => {
+  beforeEach(() => {
+    vi.stubEnv('WEB_PUBLIC_URL', 'https://app.qaai.test');
+  });
+
+  it('puts the owner on the failure line, where it is read', () => {
+    const text = renderRunAlert(
+      alertRun({
+        owners: new Map([
+          [
+            failureOwnerKey({
+              name: 'checkout applies a promo code',
+              filePath: 'specs/checkout.spec.ts',
+            }),
+            '@payments',
+          ],
+        ]),
+      }),
+    );
+
+    expect(text).toContain('• checkout applies a promo code — specs/checkout.spec.ts — @payments');
+  });
+
+  it('marks a failure no rule matched as unowned, rather than leaving it looking owned', () => {
+    const text = renderRunAlert(
+      alertRun({
+        failedCount: 2,
+        results: [
+          { status: 'FAILED', test: { name: 'a', filePath: 'specs/a.spec.ts' } },
+          { status: 'FAILED', test: { name: 'b', filePath: 'specs/b.spec.ts' } },
+        ],
+        owners: new Map([
+          [failureOwnerKey({ name: 'a', filePath: 'specs/a.spec.ts' }), '@payments'],
+          // PRESENT AND NULL: the rules were evaluated and none matched.
+          [failureOwnerKey({ name: 'b', filePath: 'specs/b.spec.ts' }), null],
+        ]),
+      }),
+    );
+
+    expect(text).toContain('• a — specs/a.spec.ts — @payments');
+    expect(text).toContain('• b — specs/b.spec.ts — unowned');
+  });
+
+  it('says NOT ROUTED, not unowned, for a failure the cap never looked at', () => {
+    /*
+     * The lie this stops. `routeFailuresToOwners` reads `MAX_FAILURES_ROUTED`
+     * failures and writes a key for every one of them — null included — so a
+     * key MISSING from the map means that failure was never looked at. Printing
+     * "unowned" for it reports a cap as a fact about the project's ownership
+     * rules, and the reader's conclusion ("nobody owns this") is the opposite
+     * of the truth ("we did not check").
+     */
+    const text = renderRunAlert(
+      alertRun({
+        failedCount: 2,
+        results: [
+          { status: 'FAILED', test: { name: 'a', filePath: 'specs/a.spec.ts' } },
+          { status: 'FAILED', test: { name: 'z', filePath: 'specs/z.spec.ts' } },
+        ],
+        owners: new Map([[failureOwnerKey({ name: 'a', filePath: 'specs/a.spec.ts' }), '@payments']]),
+        ownersCapped: true,
+      }),
+    );
+
+    expect(text).toContain('• z — specs/z.spec.ts — not routed');
+    expect(text).not.toContain('• z — specs/z.spec.ts — unowned');
+    // And the cap itself is disclosed, or "not routed" reads as a QAAI bug.
+    expect(text).toContain('only the first 500 failures were routed to an owner');
+  });
+
+  it('names a FLAKY failure and its owner — the status the routing writes but the alert dropped', () => {
+    /*
+     * THE DEFECT, in one test. `FAILING_STATUSES` includes FLAKY, so a flaky
+     * failure had `assigneeUserId` / `ownerState` / `assignedAt` written onto
+     * its verdict — and the run alert's own list was `FAILED || TIMED_OUT`, so
+     * the owner it had just recorded was never named. The person the row said
+     * to wake up was the one person the message did not mention.
+     */
+    const text = renderRunAlert(
+      alertRun({
+        failedCount: 0,
+        flakyCount: 1,
+        results: [{ status: 'FLAKY', test: { name: 'wobbly', filePath: 'specs/w.spec.ts' } }],
+        owners: new Map([
+          [failureOwnerKey({ name: 'wobbly', filePath: 'specs/w.spec.ts' }), '@payments'],
+        ]),
+      }),
+    );
+
+    // Tagged, because the counts line keeps flakes in their own column.
+    expect(text).toContain('• wobbly — specs/w.spec.ts (flaky) — @payments');
+  });
+
+  it('a monitor page lists hard failures only, so the bullets cannot outnumber the count', () => {
+    /*
+     * The one deliberate narrowing in the file, pinned so it cannot drift into
+     * the accidental kind. `run.failedCount` excludes FLAKY by construction
+     * (`tallyResult`, packages/runner/src/gates.ts), so listing a flaky test
+     * under "2 of 12 tests failing" would print three bullets under a two.
+     */
+    const text = renderMonitorAlert({
+      name: 'checkout smoke',
+      streak: 2,
+      runId: 'run9',
+      run: {
+        failedCount: 1,
+        passedCount: 11,
+        environment: { name: 'production' },
+        results: [
+          { status: 'FAILED', test: { name: 'can pay', filePath: 'specs/pay.spec.ts' } },
+          { status: 'FLAKY', test: { name: 'wobbly', filePath: 'specs/w.spec.ts' } },
+        ],
+      },
+    });
+
+    expect(text).toContain('production · 1 of 12 tests failing');
+    expect(text).toContain('• can pay — specs/pay.spec.ts');
+    expect(text).not.toContain('wobbly');
+  });
+
+  it('names muted causes when there are any, and claims nothing when the count is unavailable', () => {
+    /*
+     * A quiet run and a silenced run look identical in chat, and the second is
+     * the dangerous one. The line is a POSITIVE statement only: 0 (nothing
+     * muted) and null (the count could not be read) both render as silence, so
+     * the alert can never report a suppression number it did not measure.
+     */
+    const said = renderRunAlert(alertRun({ suppressedCauses: 3 }));
+    expect(said).toContain('🔇 3 causes muted — nothing was reported about them');
+
+    const one = renderRunAlert(alertRun({ suppressedCauses: 1 }));
+    expect(one).toContain('🔇 1 cause muted — nothing was reported about it');
+
+    for (const quiet of [
+      renderRunAlert(alertRun({ suppressedCauses: 0 })),
+      renderRunAlert(alertRun({ suppressedCauses: null })),
+      renderRunAlert(alertRun()),
+    ]) {
+      expect(quiet).not.toContain('🔇');
+      expect(quiet).not.toContain('muted');
+    }
+  });
+
+  it('says NOTHING about ownership in an install that never opted in', () => {
+    const silent = renderRunAlert(alertRun());
+    const alsoSilent = renderRunAlert(alertRun({ owners: new Map() }));
+
+    for (const text of [silent, alsoSilent]) {
+      expect(text).toContain('• checkout applies a promo code — specs/checkout.spec.ts');
+      // Ownership is opt-in. Nagging about an empty table is how the feature
+      // gets switched off.
+      expect(text).not.toContain('unowned');
+    }
+  });
+});
+
+describe('processNotify routes a finished run to its owners', () => {
+  const run = {
+    id: 'run1',
+    status: 'FAILED',
+    prNumber: null,
+    passedCount: 7,
+    failedCount: 1,
+    flakyCount: 0,
+    gateResult: null,
+    projectId: 'p1',
+    project: { name: 'Storefront' },
+    environment: { name: 'staging' },
+    results: [
+      {
+        status: 'FAILED',
+        test: { name: 'checkout applies a promo code', filePath: 'specs/checkout.spec.ts' },
+      },
+    ],
+  };
+  const finished = { orgId: 'org1', event: 'run.finished', payload: { runId: 'run1' } };
+
+  const textOf = (created: Array<Record<string, unknown>>): string =>
+    String((created[0] as { payload: { text: string } }).payload.text);
+
+  it('writes the owner onto the verdict AND names it in the alert', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/checkout/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    // `specs/checkout/**` does NOT match `specs/checkout.spec.ts` — one is a
+    // directory, the other a file. The alert must therefore say unowned, and
+    // the verdict must say NO_MATCH rather than carrying a null that reads as
+    // "nobody has looked".
+    expect(routing.updates).toHaveLength(1);
+    expect(routing.updates[0]!.id).toBe('v1');
+    expect(routing.updates[0]!.data).toMatchObject({
+      assigneeUserId: null,
+      assigneeTeamId: null,
+      ownerState: 'NO_MATCH',
+    });
+    expect(textOf(db.created)).toContain('unowned');
+  });
+
+  it('assigns the team whose pattern actually matches', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    expect(routing.updates[0]!.data).toMatchObject({
+      assigneeTeamId: 'team_payments',
+      assigneeUserId: null,
+      ownerState: 'OWNED',
+      ownerRuleId: 'rule1',
+    });
+    expect(textOf(db.created)).toContain('— @payments');
+  });
+
+  it('records NO_RULES in one statement, and leaves the alert quiet', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({ rules: [], results: [failingResult()] });
+
+    await processNotify(finished, 'j1');
+
+    // One updateMany, not N updates: the assignment is identical for every row
+    // and an install with no rules is the common case.
+    expect(routing.updates).toHaveLength(0);
+    expect(routing.manyUpdates).toHaveLength(1);
+    expect(routing.manyUpdates[0]).toMatchObject({
+      where: { id: { in: ['v1'] } },
+      data: { ownerState: 'NO_RULES', assigneeTeamId: null, assigneeUserId: null },
+    });
+    expect(textOf(db.created)).not.toContain('unowned');
+  });
+
+  it('does not re-stamp a verdict that was already routed', async () => {
+    stubFetch();
+    fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult({ verdict: { id: 'v1', ownerState: 'OWNED' } })],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    // A notify job is retried. `assignedAt` must record when the failure was
+    // routed, not how many times the queue hiccuped.
+    expect(routing.updates).toHaveLength(0);
+    expect(routing.manyUpdates).toHaveLength(0);
+  });
+
+  it('labels a failure whose verdict does not exist yet, and writes nothing for it', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult({ verdict: null })],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    // Triage has not landed yet: there is nowhere to put the assignee. The
+    // alert still names the owner, and the gap is logged rather than claimed.
+    expect(routing.updates).toHaveLength(0);
+    expect(textOf(db.created)).toContain('— @payments');
+    expect(h.log.some((l) => l.startsWith('info:') && l.includes('no triage verdict'))).toBe(true);
+  });
+
+  it('warns about a rule it could not evaluate instead of reporting unowned in silence', async () => {
+    stubFetch();
+    fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      // Stored when the validation was looser; it no longer compiles.
+      rules: [rule({ pathPattern: 'specs/[a-z]/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+    });
+
+    await processNotify(finished, 'j1');
+
+    expect(routing.updates[0]!.data).toMatchObject({ ownerState: 'RULES_UNUSABLE' });
+    expect(h.log.some((l) => l.includes('could not be evaluated'))).toBe(true);
+  });
+
+  it('pages anyway when the routing read fails — a page lost to a JOIN is the worse bug', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    routingDb({ throws: true, results: [failingResult()] });
+
+    await processNotify(finished, 'j1');
+
+    expect(db.created).toHaveLength(1);
+    expect(textOf(db.created)).toContain('❌ QAAI — 1 failed, 7 passed');
+    expect(h.log.some((l) => l.startsWith('warn:') && l.includes('could not route'))).toBe(true);
+  });
+
+  it('reads the failures to route in a fixed order, so a retry routes the same ones', async () => {
+    /*
+     * The cap without an order was the defect: past `MAX_FAILURES_ROUTED`,
+     * WHICH failures got an owner written onto their verdict was whatever
+     * Postgres returned — a different set on a replica, after a VACUUM, or on
+     * the job's second attempt, with the remainder reported to the reader as
+     * unowned. Oldest first, tie-broken by id, is what makes the routed set a
+     * decision instead of an accident.
+     */
+    stubFetch();
+    fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    const args = routing.resultQuery[0]!;
+    expect(args.orderBy).toEqual([{ createdAt: 'asc' }, { id: 'asc' }]);
+    expect(args.take).toBe(500);
+    // FLAKY is in the set that gets routed, which is why the alert has to name
+    // it too — see the renderer tests above.
+    expect(args.where).toMatchObject({ status: { in: ['FAILED', 'TIMED_OUT', 'FLAKY'] } });
+  });
+
+  it('counts the causes muted for this run and says so in the alert', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    routingDb({ results: [failingResult()], suppressed: 2 });
+
+    await processNotify(finished, 'j1');
+
+    expect(textOf(db.created)).toContain('🔇 2 causes muted');
+  });
+
+  it('says nothing about muting when that count could not be read', async () => {
+    // No `runFailureCluster` on the client at all. The alert still goes out and
+    // reports NO suppression number — never zero, which would be a
+    // measurement this process did not make.
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    (h.prisma as Record<string, unknown>).run = { findFirst: async () => run };
+    routingDb({ results: [failingResult()] });
+
+    await processNotify(finished, 'j1');
+
+    expect(db.created).toHaveLength(1);
+    expect(textOf(db.created)).not.toContain('🔇');
+    expect(h.log.some((l) => l.includes('could not read how many causes were muted'))).toBe(true);
+  });
+
+  it('returns NULL, not 0, when the suppression count could not be read', async () => {
+    /*
+     * Asserted on the FUNCTION rather than on the rendered text, and that is
+     * the point of the test existing at all. The chat line is a positive
+     * statement only, so null and 0 render identically — a `return 0` in that
+     * catch block would pass every assertion on the message while turning "we
+     * could not look" into the measurement "nothing was muted". That is the
+     * null-became-0 defect, and this is the only place it is visible.
+     */
+    (h.prisma as Record<string, unknown>).runFailureCluster = {
+      count: async () => {
+        throw new Error('connection terminated');
+      },
+    };
+    await expect(suppressedCauseCount('org1', 'run1')).resolves.toBeNull();
+
+    // And a real zero is a real zero, not conflated with the above.
+    (h.prisma as Record<string, unknown>).runFailureCluster = { count: async () => 0 };
+    await expect(suppressedCauseCount('org1', 'run1')).resolves.toBe(0);
   });
 });

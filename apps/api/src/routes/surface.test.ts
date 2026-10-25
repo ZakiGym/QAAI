@@ -193,6 +193,9 @@ vi.mock('../middleware/auth.js', async () => {
 type ModelName =
   | 'project'
   | 'user'
+  | 'team'
+  | 'ownershipRule'
+  | 'trackerIssue'
   | 'codebaseSnapshot'
   | 'flowMap'
   | 'test'
@@ -204,6 +207,9 @@ type ModelName =
 const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   project: new Set(['id', 'orgId', 'archivedAt']),
   user: new Set(['id', 'email']),
+  team: new Set(['id', 'orgId', 'slug']),
+  ownershipRule: new Set(['id', 'orgId', 'projectId']),
+  trackerIssue: new Set(['id', 'orgId', 'projectId', 'subject', 'causeKey']),
   codebaseSnapshot: new Set(['id', 'orgId', 'projectId']),
   flowMap: new Set(['id', 'orgId', 'projectId', 'version']),
   test: new Set(['id', 'orgId', 'projectId', 'disabledAt', 'filePath']),
@@ -250,14 +256,24 @@ function matchesWhere(model: ModelName, row: Row, where: Row, store: Store): boo
   });
 }
 
-function sortRows(rows: Row[], orderBy?: Row): Row[] {
+/**
+ * Ordering, including the ARRAY form (`[{ position: 'asc' }, { createdAt: 'asc' }]`)
+ * the ownership-rule query uses. A fake that read only the first clause of an
+ * array — or read the array as an object — would order rules by insertion and
+ * pass the last-match-wins test with no precedence in the resolver.
+ */
+function sortRows(rows: Row[], orderBy?: Row | Row[]): Row[] {
   if (!orderBy) return rows;
-  const [key, dir] = Object.entries(orderBy)[0] as [string, string];
+  const clauses = Array.isArray(orderBy) ? orderBy : [orderBy];
   return [...rows].sort((a, b) => {
-    const left = a[key] instanceof Date ? a[key].getTime() : a[key];
-    const right = b[key] instanceof Date ? b[key].getTime() : b[key];
-    if (left === right) return 0;
-    return (left < right ? -1 : 1) * (dir === 'desc' ? -1 : 1);
+    for (const clause of clauses) {
+      const [key, dir] = Object.entries(clause)[0] as [string, string];
+      const left = a[key] instanceof Date ? a[key].getTime() : a[key];
+      const right = b[key] instanceof Date ? b[key].getTime() : b[key];
+      if (left === right) continue;
+      return (left < right ? -1 : 1) * (dir === 'desc' ? -1 : 1);
+    }
+    return 0;
   });
 }
 
@@ -499,8 +515,14 @@ function analysisJson(): Row {
   };
 }
 
-/** Nodes carry no forms, so the form-axis caveat stays out of the fixture. */
-function flowMapJson(routes: string[]): Row {
+/**
+ * Nodes carry no forms, so the form-axis caveat stays out of the fixture.
+ *
+ * `features` is the Explorer's own grouping of crawled states, and it is what
+ * the rollups attribute a surface to. Empty by default, so every test that
+ * predates the rollups describes a project whose features are unknown.
+ */
+function flowMapJson(routes: string[], features: Row[] = []): Row {
   return {
     projectId: PROJECT,
     environmentId: 'env_1',
@@ -521,7 +543,7 @@ function flowMapJson(routes: string[]): Row {
     })),
     edges: [],
     journeys: [],
-    features: [],
+    features,
     exploredAt: '2026-01-01T00:00:00.000Z',
     truncatedReason: null,
   };
@@ -555,7 +577,10 @@ function seed(): Store {
       { id: PROJECT, orgId: ORG, name: 'Storefront', archivedAt: null },
       { id: OTHER_ORG_PROJECT, orgId: 'org_2', name: 'Someone else', archivedAt: null },
     ],
-    user: [{ id: 'user_1', email: 'qa@example.test' }],
+    user: [
+      { id: 'user_1', name: null, email: 'qa@example.test' },
+      { id: 'user_dana', name: 'Dana Ruiz', email: 'dana@example.test' },
+    ],
     codebaseSnapshot: [
       {
         id: 'snap_a',
@@ -594,6 +619,12 @@ function seed(): Store {
         createdAt: new Date('2026-02-01T00:00:00Z'),
       },
     ],
+    team: [
+      { id: 'team_payments', orgId: ORG, slug: 'payments', name: 'Payments' },
+      { id: 'team_search', orgId: ORG, slug: 'search', name: 'Search' },
+    ],
+    ownershipRule: [],
+    trackerIssue: [],
     coverageItem: [],
     coverageWaiver: [],
     coverageSnapshot: [],
@@ -1239,5 +1270,372 @@ describe('DELETE /surface/:projectId/waivers/:key', () => {
     );
     expect(status).toBe(404);
     expect(store.coverageWaiver).toHaveLength(1);
+  });
+});
+
+// ─── GET /surface/:projectId/rollups ─────────────────────────────────────────
+
+/**
+ * The cut the product is argued about in.
+ *
+ * What is being proven, in order of how expensive the bug would be:
+ *
+ *   1. A GROUP'S NUMBER IS THE GROUP'S NUMBER. The denominator of a feature
+ *      includes its GAPS, or "Payments is at 31%" becomes "Payments is at
+ *      100% of the parts of Payments we happen to have tested" — a number that
+ *      flatters the vendor on exactly the surface the customer is worried
+ *      about.
+ *   2. AN ITEM NOBODY CAN ATTRIBUTE IS ITS OWN BUCKET, never folded into
+ *      another group and never scored. Same for an item nobody owns.
+ *   3. THE OWNER COMES FROM THE ONE RESOLVER. A rule written for tests routes
+ *      gaps too, with the same precedence — because a team that said
+ *      `app/checkout/** → @payments` has already said who owns checkout.
+ *   4. A ZERO DENOMINATOR IS NULL, NOT 100%. A group whose only item is waived
+ *      has nothing to divide by, and either number would be a claim made out
+ *      of our own silence.
+ */
+describe('GET /surface/:projectId/rollups', () => {
+  const rule = (over: Row = {}): Row => ({
+    id: `rule_${store.ownershipRule.length + 1}`,
+    orgId: ORG,
+    projectId: PROJECT,
+    position: store.ownershipRule.length,
+    pathPattern: null,
+    testId: null,
+    suiteId: null,
+    feature: null,
+    ownerUserId: null,
+    ownerTeamId: null,
+    createdAt: new Date('2026-01-01T00:00:00Z'),
+    ...over,
+  });
+
+  /** The crawl grouped `/orders` under "Orders"; nothing else is grouped. */
+  function withCrawlFeature(): void {
+    store.flowMap[0]!.graph = flowMapJson(['/orders'], [{ name: 'Orders', nodeIds: ['node_0'] }]);
+  }
+
+  const featureGroup = (body: Row, label: string): Row =>
+    (body.byFeature as Row[]).find((group) => group.label === label)!;
+  const ownerGroup = (body: Row, label: string): Row =>
+    (body.byOwner as Row[]).find((group) => group.label === label)!;
+
+  it('cuts the same denominator by feature, gaps included', async () => {
+    withCrawlFeature();
+    const { status, body } = await get(`/surface/${PROJECT}/rollups`);
+
+    expect(status).toBe(200);
+    const orders = featureGroup(body, 'Orders');
+    expect(orders.totals).toMatchObject({ denominator: 1, covered: 1, uncovered: 0, percent: 100 });
+    expect(orders.sources).toEqual(['CRAWL']);
+    expect(orders.attributed).toBe(true);
+
+    // The other four items are not in the crawl's grouping and have no matched
+    // test, so no feature can be claimed for them — and they are counted as
+    // exactly that rather than attributed to the nearest-looking group.
+    const unknown = featureGroup(body, 'No feature attributed');
+    expect(unknown.attributed).toBe(false);
+    expect(unknown.totals).toMatchObject({ denominator: 4, covered: 0, uncovered: 4, percent: 0 });
+    // The honest bucket sorts last whatever its size: it is a statement about
+    // our knowledge, not a work item.
+    expect((body.byFeature as Row[]).at(-1)!.label).toBe('No feature attributed');
+
+    expect(body.attribution).toMatchObject({
+      items: 5,
+      featureFromCrawl: 1,
+      featureFromTests: 0,
+      featureUnattributed: 4,
+    });
+    // The headline the cut is a cut OF stays on the response.
+    expect(body.snapshot.totals.denominator).toBe(5);
+  });
+
+  it('falls back to the feature the matched tests agree on, and says which source it used', async () => {
+    // No crawl grouping at all: `/orders` is covered by t1, whose feature is
+    // "Orders", so the attribution comes from the test instead.
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    const orders = featureGroup(body, 'Orders');
+    expect(orders.sources).toEqual(['TESTS']);
+    expect(orders.totals.covered).toBe(1);
+    expect(body.attribution).toMatchObject({ featureFromCrawl: 0, featureFromTests: 1 });
+  });
+
+  it('attributes nothing when two matched tests disagree about the feature', async () => {
+    // Two tests cover `/orders` and file it under different features. Picking
+    // one would move a whole group's percentage on the strength of a coin toss,
+    // so neither wins and the item is counted as unattributed.
+    store.test.push({
+      id: 't2',
+      orgId: ORG,
+      projectId: PROJECT,
+      name: 'orders list paginates',
+      filePath: 'tests/orders-page.spec.ts',
+      code: "await page.goto('/orders');\nawait expect(next).toBeVisible();",
+      spec: null,
+      tags: [],
+      feature: 'Order management',
+      priority: 'P1',
+      type: 'E2E',
+      disabledAt: null,
+    });
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    expect((body.byFeature as Row[]).map((group) => group.label)).not.toContain('Orders');
+    expect((body.byFeature as Row[]).map((group) => group.label)).not.toContain('Order management');
+    const unknown = featureGroup(body, 'No feature attributed');
+    expect(unknown.totals).toMatchObject({ denominator: 5, covered: 1 });
+    expect(body.attribution).toMatchObject({ featureFromTests: 0, featureUnattributed: 5 });
+  });
+
+  it('routes a gap to its owner with the same rules that route a failure', async () => {
+    store.ownershipRule.push(
+      rule({ pathPattern: 'app/api/**', ownerTeamId: 'team_payments' }),
+      rule({ pathPattern: 'app/admin/**', ownerUserId: 'user_dana' }),
+    );
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    const payments = ownerGroup(body, '@payments');
+    // `POST /api/refunds` is declared in app/api/refunds/route.ts.
+    expect(payments.totals).toMatchObject({ denominator: 1, uncovered: 1, covered: 0, percent: 0 });
+    expect(payments.attributed).toBe(true);
+
+    const dana = ownerGroup(body, 'Dana Ruiz');
+    expect(dana.totals).toMatchObject({ denominator: 1, uncovered: 1 });
+
+    // Everything else is visibly unowned rather than quietly attributed.
+    const nobody = ownerGroup(body, 'Nobody owns this');
+    expect(nobody.attributed).toBe(false);
+    expect(nobody.totals.denominator).toBe(3);
+    expect(body.attribution).toMatchObject({
+      ownedItems: 2,
+      unownedItems: 3,
+      rulesEvaluated: 2,
+      rulesUnusable: [],
+    });
+  });
+
+  it('crosses the two axes, which is the sentence the feature exists for', async () => {
+    withCrawlFeature();
+    store.ownershipRule.push(rule({ pathPattern: 'app/orders/**', ownerTeamId: 'team_payments' }));
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    const orders = featureGroup(body, 'Orders');
+    expect(orders.owners).toEqual([
+      { key: 'TEAM:team_payments', label: '@payments', totals: expect.objectContaining({ percent: 100 }) },
+    ]);
+  });
+
+  it('matches a FEATURE rule through the feature it just attributed', async () => {
+    withCrawlFeature();
+    store.ownershipRule.push(rule({ feature: 'orders', ownerTeamId: 'team_search' }));
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    // The rule names a feature, the item's feature came from the crawl, and the
+    // two meet case-insensitively — the same comparison the test-side resolver
+    // makes.
+    expect(ownerGroup(body, '@search').totals.covered).toBe(1);
+  });
+
+  it('reports a rule it could not evaluate instead of reporting everything unowned', async () => {
+    store.ownershipRule.push(rule({ pathPattern: 'app/[a-z]/**', ownerTeamId: 'team_payments' }));
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    // Routing has silently STOPPED, and from the outside that is identical to a
+    // project nobody has assigned. This field is the only thing that says so.
+    expect(body.attribution.rulesUnusable).toHaveLength(1);
+    expect(body.attribution.ownedItems).toBe(0);
+  });
+
+  it('answers null, not 100%, for a group with nothing left to divide by', async () => {
+    store.ownershipRule.push(rule({ pathPattern: 'app/api/**', ownerTeamId: 'team_payments' }));
+    await call('POST', `/surface/${PROJECT}/recompute`, {});
+    await call('POST', `/surface/${PROJECT}/waivers`, {
+      key: 'ENDPOINT:POST /api/refunds',
+      reason: GOOD_REASON,
+    });
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    const payments = ownerGroup(body, '@payments');
+    expect(payments.totals).toMatchObject({ denominator: 0, covered: 0, waived: 1 });
+    // Not 0 and not 100: @payments owns one surface and the team has said, on
+    // the record, that it is not worth testing.
+    expect(payments.totals.percent).toBeNull();
+  });
+
+  it('narrows to one axis when asked, and never invents the other', async () => {
+    const feature = await get(`/surface/${PROJECT}/rollups?by=feature`);
+    expect(feature.body.byFeature).toBeDefined();
+    expect(feature.body.byOwner).toBeUndefined();
+
+    const owner = await get(`/surface/${PROJECT}/rollups?by=owner`);
+    expect(owner.body.byOwner).toBeDefined();
+    expect(owner.body.byFeature).toBeUndefined();
+
+    const bad = await get(`/surface/${PROJECT}/rollups?by=team`);
+    // An unknown value must not silently become the default: a caller asking
+    // for a cut they named wrongly gets told, not handed a different one.
+    expect(bad.status).toBe(400);
+  });
+
+  it('says which gaps are already on somebody’s board', async () => {
+    store.trackerIssue.push(
+      {
+        id: 'ti_1',
+        orgId: ORG,
+        projectId: PROJECT,
+        subject: 'COVERAGE_GAP',
+        causeKey: 'abc',
+        cause: 'feature=Payments kinds=* owner=*',
+        provider: 'GITHUB',
+        url: 'https://github.com/acme/storefront/issues/4',
+        key: 'acme/storefront#4',
+        title: '[QAAI] 1 untested surface in Payments — @payments',
+        ownerState: 'OWNED',
+        affectedCount: 1,
+        updatedAt: new Date('2026-02-01T00:00:00Z'),
+      },
+      {
+        id: 'ti_2',
+        orgId: ORG,
+        projectId: PROJECT,
+        subject: 'FAILURE',
+        causeKey: 'def',
+        cause: 'class=TimeoutError',
+        provider: 'GITHUB',
+        url: 'https://github.com/acme/storefront/issues/5',
+        key: 'acme/storefront#5',
+        title: 'something else',
+        ownerState: 'OWNED',
+        affectedCount: 3,
+        updatedAt: new Date('2026-02-02T00:00:00Z'),
+      },
+    );
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    // Only the coverage tickets: a failure's ticket is not an answer to "has
+    // this gap been reported?", and offering to file one twice is the
+    // forty-tickets defect wearing different clothes.
+    expect((body.filed as Row[]).map((row) => row.causeKey)).toEqual(['abc']);
+  });
+
+  it('reports how many coverage tickets exist when the list is only a page of them', async () => {
+    /*
+     * The cap is the point. `filed` is what the cockpit reads to decide whether
+     * a group's "file this" button has already been pressed, so a project past
+     * the limit was being told, flatly, that tickets it filed do not exist —
+     * and the button then offers to file a second ticket for a gap already on
+     * the board. `filedTruncated` is the flag that makes that impossible to
+     * miss; `filedTotal` is the number itself.
+     */
+    for (let index = 0; index < 101; index += 1) {
+      store.trackerIssue.push({
+        id: `ti_${index}`,
+        orgId: ORG,
+        projectId: PROJECT,
+        subject: 'COVERAGE_GAP',
+        causeKey: `cause_${index}`,
+        cause: `feature=F${index} kinds=* owner=*`,
+        provider: 'GITHUB',
+        url: `https://github.com/acme/storefront/issues/${index}`,
+        key: `acme/storefront#${index}`,
+        title: `[QAAI] untested surface ${index}`,
+        ownerState: 'NO_RULES',
+        affectedCount: 1,
+        updatedAt: new Date(Date.UTC(2026, 1, 1, 0, 0, index)),
+      });
+    }
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    expect((body.filed as Row[]).length).toBe(100);
+    expect(body.filedLimit).toBe(100);
+    expect(body.filedTotal).toBe(101);
+    expect(body.filedTruncated).toBe(true);
+  });
+
+  it('does not claim truncation when the whole set fits', async () => {
+    store.trackerIssue.push({
+      id: 'ti_only',
+      orgId: ORG,
+      projectId: PROJECT,
+      subject: 'COVERAGE_GAP',
+      causeKey: 'abc',
+      cause: 'feature=* kinds=* owner=*',
+      provider: 'GITHUB',
+      url: 'https://github.com/acme/storefront/issues/9',
+      key: 'acme/storefront#9',
+      title: '[QAAI] 1 untested surface',
+      ownerState: 'NO_RULES',
+      affectedCount: 1,
+      updatedAt: new Date('2026-02-01T00:00:00Z'),
+    });
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    expect(body.filedTotal).toBe(1);
+    expect(body.filedTruncated).toBe(false);
+  });
+
+  it('treats a whitespace-only feature as no feature at all', async () => {
+    /*
+     * `Test.feature` is free text, and a row holding `'   '` used to survive as
+     * `''`: truthy going into the "did any test name a feature?" check and
+     * falsy everywhere after it. The item therefore came out with
+     * `feature: ''` and `featureSource: null` — contradicting
+     * `AttributedItem`'s own documented invariant — and `rollUpCoverage`
+     * labelled the no-feature bucket with an empty string and marked it
+     * ATTRIBUTED, so a blank name in one test row turned the "we do not know"
+     * count into a named feature nobody can look up.
+     */
+    store.test[0]!.feature = '   ';
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    const labels = (body.byFeature as Row[]).map((group) => group.label);
+    expect(labels).not.toContain('');
+    expect(labels).toContain('No feature attributed');
+
+    const unknown = featureGroup(body, 'No feature attributed');
+    expect(unknown.attributed).toBe(false);
+    // All five items, the blank-featured one included, are unattributed.
+    expect(unknown.totals).toMatchObject({ denominator: 5, covered: 1 });
+    expect(body.attribution).toMatchObject({
+      featureFromCrawl: 0,
+      featureFromTests: 0,
+      featureUnattributed: 5,
+    });
+  });
+
+  it('treats a crawl feature group with a blank name as no grouping', async () => {
+    // Same rule on the crawl side: a group whose name is whitespace has not
+    // attributed its nodes, and must not out-rank the test-derived name.
+    store.flowMap[0]!.graph = flowMapJson(['/orders'], [{ name: '  ', nodeIds: ['node_0'] }]);
+
+    const { body } = await get(`/surface/${PROJECT}/rollups`);
+
+    expect((body.byFeature as Row[]).map((group) => group.label)).not.toContain('  ');
+    // The test-derived name wins instead, because the crawl named nothing.
+    expect(featureGroup(body, 'Orders').sources).toEqual(['TESTS']);
+    expect(body.attribution).toMatchObject({ featureFromCrawl: 0, featureFromTests: 1 });
+  });
+
+  it('requires tests:read and is a 404 across tenants', async () => {
+    expect((await get(`/surface/${OTHER_ORG_PROJECT}/rollups`)).status).toBe(404);
+    asActor({ scopes: ['tests:write'] });
+    expect((await get(`/surface/${PROJECT}/rollups`)).status).toBe(403);
+  });
+
+  it('does not write a snapshot — a cut is a read, like the report it cuts', async () => {
+    await get(`/surface/${PROJECT}/rollups`);
+    await get(`/surface/${PROJECT}/rollups`);
+    expect(store.coverageSnapshot).toEqual([]);
   });
 });

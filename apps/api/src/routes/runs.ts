@@ -8,11 +8,16 @@
  *
  *   changedPaths  select the tests the diff can reach (lib/impact.ts)
  *   useCache      report which of the skipped tests have a recent clean pass
- *   failFast      stop at the first real failure — accepted, not yet enforced
+ *   failFast      stop at the first real failure — now RECORDED on the run row,
+ *                 and still not enforced by the run loop. See FAIL_FAST_NOTE.
  *
  * Nothing about the default path changed: a POST that asks for none of them
  * loads the same column, queues the same job and executes the same suite it
  * always has.
+ *
+ * POST /runs/:runId/rerun-failures is the fourth thing here, and it is the one
+ * that makes the other three usable on a real suite: re-running 5,000 tests to
+ * re-check the 6 that failed is the reason nobody uses a re-run button twice.
  *
  * WHERE a run executes is decided here too, and it is a branch rather than an
  * option: `Environment.runnerPool` set means the suite is handed to the
@@ -22,6 +27,7 @@
  */
 
 import { Router } from 'express';
+import { z } from 'zod';
 import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 /*
  * The one definition of "did this run pass" (packages/runner/src/gates.ts).
@@ -32,7 +38,7 @@ import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
 import { quarantineSuppresses, runOutcome } from '@qaai/runner';
 import type { ShardAssignment, ShardPlan, ShardedRunJob, TestType } from '@qaai/shared';
 import { prisma, unscoped } from '../lib/prisma.js';
-import { badRequest, notFound, planLimit } from '../lib/errors.js';
+import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
 import { canStartRun, planFor } from '../lib/plan.js';
 import { startRun } from '../lib/start-run.js';
 import {
@@ -267,6 +273,34 @@ interface CacheReport {
  */
 const CACHE_EFFECT_NOTE =
   'Reuse applies only to tests the change cannot reach, which are already excluded from this run — so this did not shorten the run, it recorded what is known about the tests being skipped. Counting a reused pass as a result of this run needs TestResult.cacheKey and a reused-from marker, so that no view can show a cached pass as a fresh one.';
+
+/**
+ * What `failFast: true` now does, and what it still does not.
+ *
+ * It is RECORDED: `Run.failFast` is written from this endpoint, which nothing
+ * in the codebase did until now — the column, its migration, the stop endpoint
+ * (POST /team/runs/:runId/stop) and the two columns it writes all existed, and
+ * the flag that was supposed to arm them was dropped on the floor at the moment
+ * the run row was created. So the promise was broken one step earlier than
+ * anybody was looking.
+ *
+ * With the column written, the worker's 60-second sweep
+ * (`sweepFailFastStops` in apps/worker/src/processors/schedule.ts) finds a
+ * fail-fast run that has already had a real failure and writes
+ * `stopRequestedAt` / `stopReason` — the same columns, with the same
+ * first-writer-wins UPDATE, that a human pressing stop writes.
+ *
+ * WHAT IS STILL MISSING, stated here rather than discovered from a run that
+ * kept going: the between-tests poll in apps/worker/src/processors/run.ts reads
+ * `status` and `finalizedAt` and not `stopRequestedAt`, so the stop request is
+ * written and not yet obeyed. `planFailFast` therefore still reports
+ * `enforced: false`, and this note travels with it. Accepting a flag and
+ * silently doing nothing is how a caller comes to believe their runs stop early
+ * when every one of them has been running to the end; saying exactly which half
+ * works is the only honest shape while the other half is in another file.
+ */
+const FAIL_FAST_NOTE =
+  'Recorded on the run (Run.failFast), which is new — nothing wrote that column before, so the flag could not have been honoured by anything. The worker sweep now writes Run.stopRequestedAt and Run.stopReason at the first real failure of a fail-fast run, and the run page, the share page and the audit row all render them. The run loop itself does not yet READ stopRequestedAt between tests, so this run will still execute every selected test; `enforced` stays false until that poll in apps/worker/src/processors/run.ts reads the column alongside the cancellation check it already makes.';
 
 /**
  * Which of the skipped tests have a recent clean pass we can stand behind.
@@ -772,6 +806,18 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       prNumber: input.prNumber ?? null,
       totalCount: testIds.length,
       shardCount: grantedShards,
+      /*
+       * THE FLAG, WRITTEN. This line is the fix for "the column, the migration,
+       * the endpoint and the user-facing promise all exist; the consumer does
+       * not". The consumer could never have existed: `Run.failFast` defaulted
+       * to false on every row ever created, so a worker polling it would have
+       * found every run in the install asking to run to the end.
+       *
+       * `failFast.requested` and not `input.failFast`, so the one place that
+       * decides what the flag means (`planFailFast`) is also the one place the
+       * stored value comes from.
+       */
+      failFast: failFast.requested,
       // The durable record of which of the two dispatch paths owns this run.
       // Non-null means no queue job was enqueued for it, and the repair
       // endpoint refuses to create runner jobs for anything with it null.
@@ -915,7 +961,9 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       ...(cacheReport
         ? { cache: { considered: cacheReport.considered, reusable: cacheReport.reusable } }
         : {}),
-      ...(failFast.requested ? { failFast: { enforced: failFast.enforced } } : {}),
+      ...(failFast.requested
+        ? { failFast: { recorded: true, enforced: failFast.enforced } }
+        : {}),
     },
   });
 
@@ -963,10 +1011,21 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       ? { selection: { ...selectionReport, limits: { maxChangedPaths: MAX_CHANGED_PATHS } } }
       : {}),
     ...(cacheReport ? { cache: cacheReport } : {}),
-    // Echoed even though it changed nothing, precisely because it changed
-    // nothing: silently accepting a flag is how a caller comes to believe their
-    // runs stop early when every one of them has been running to the end.
-    ...(failFast.requested ? { failFast } : {}),
+    /*
+     * Echoed, with the two halves kept apart: `recorded` is now true and
+     * `enforced` is still false, and that pair is the literal truth rather than
+     * a contradiction. See FAIL_FAST_NOTE for which file closes the gap.
+     */
+    ...(failFast.requested
+      ? {
+          failFast: {
+            ...failFast,
+            recorded: true,
+            stopChannel: 'Run.stopRequestedAt',
+            note: FAIL_FAST_NOTE,
+          },
+        }
+      : {}),
     // Reported whenever the caller asked, including when the answer is "no".
     // Asking for 20 workers on a plan that allows 5 gets 5, and finding that
     // out from a wall-clock that did not improve is a terrible way to learn it.
@@ -988,6 +1047,393 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       : {}),
   });
 });
+
+
+// ─── POST /runs/:runId/rerun-failures (§5) ───────────────────────────────────
+
+/**
+ * Re-run only what failed.
+ *
+ * THE DEFECT, VERBATIM: "Re-run only the failures of a previous run — every
+ * re-run path re-executes the whole suite, which makes the loop unusable on a
+ * 5,000-test suite."
+ *
+ * Everything needed was already here. `POST /runs` takes `testIds`, the
+ * previous run's `TestResult` rows say exactly which tests failed, and nothing
+ * joined the two — so the only way to re-check six failures was to spend
+ * another 5,000 browser-minutes, and the answer arrived long after anyone was
+ * still looking at it. The whole close-the-loop story (fix, re-run, confirm)
+ * costs what the slowest part of it costs, and this was the slowest part by
+ * three orders of magnitude.
+ *
+ * ── WHAT IT COPIES FROM THE PREVIOUS RUN, AND WHY EACH ONE MATTERS ──────────
+ *
+ * The environment, and `baseUrlOverride` with it: re-running the failures of a
+ * preview-deploy run against the environment's default URL would be re-running
+ * them against a different application, and a green result from that is worse
+ * than no result. The commit, the branch and the PR number, because a re-run
+ * that loses its CI context cannot be reported back to the check that asked for
+ * it. The suite, so the run reads as a run of that suite. And `runnerPool`, so
+ * an enterprise's failures re-execute inside the same network the originals did
+ * — a re-run that quietly moved the work to QAAI's own workers would be the
+ * exact bug the dispatch branch above exists to prevent, arriving by a new door.
+ *
+ * The TRIGGER is MANUAL even when the parent was a SCHEDULE or a MONITOR. A
+ * human asked for this one, and labelling it as a monitor check would corrupt
+ * `recordMonitorResult`'s failure streak with a run nobody scheduled.
+ *
+ * ── A TEST THAT NO LONGER EXISTS ────────────────────────────────────────────
+ *
+ * Three different things, kept three different things, because each needs a
+ * different sentence:
+ *
+ *   DELETED. `TestResult.test` is `onDelete: Cascade`, so deleting a Test takes
+ *   its results with it — the failure cannot be re-run because the evidence of
+ *   it is gone too. That is invisible unless something counts: the endpoint
+ *   compares `Run.totalCount` (what the run recorded when it started) against
+ *   the result rows it can still read, and reports the difference as
+ *   `vanishedResults` with the reason. It is NEVER reported as zero failures.
+ *
+ *   DISABLED. The test row is there and `disabledAt` is set. It must not run —
+ *   every other selection path in this file excludes it — so it is excluded
+ *   here too, by name, in `excluded`.
+ *
+ *   NO LONGER RUNNABLE. The test moved under `fixtures/`, which holds test DATA
+ *   and no runnable code. Same treatment.
+ *
+ * If every failure falls into one of those, the response is a 409 naming them
+ * rather than an empty run or a 200 that looks like success. A re-run that
+ * executes nothing and reports PASSED is the single worst answer available
+ * here, and it is the one the obvious implementation gives.
+ */
+const rerunFailuresBody = z.object({
+  /**
+   * Whether to include tests that failed and then passed on retry.
+   *
+   * Off by default, and that is a judgement rather than caution: a
+   * `retriedAndPassed` result is the flake radar's input, not a failure anybody
+   * is waiting to re-check, and including them by default would make the common
+   * case ("re-run my 6 failures") silently re-run 40 tests on a flaky suite.
+   */
+  includeFlaky: z.boolean().optional(),
+  /** Arms `Run.failFast` on the re-run. See FAIL_FAST_NOTE. */
+  failFast: z.boolean().optional(),
+});
+
+/** One failure that will not be re-run, and the sentence saying why. */
+interface ExcludedFailure {
+  testId: string;
+  name: string;
+  why: string;
+}
+
+runsRouter.post(
+  '/:runId/rerun-failures',
+  requireRole('MEMBER'),
+  requireScope('runs:write'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const parsed = rerunFailuresBody.safeParse(req.body ?? {});
+    if (!parsed.success) throw badRequest(parsed.error.issues[0]?.message ?? 'Invalid body');
+    const includeFlaky = parsed.data.includeFlaky === true;
+
+    const previous = await prisma.run.findUnique({
+      where: { id: String(req.params.runId) },
+      select: {
+        id: true,
+        projectId: true,
+        environmentId: true,
+        suiteId: true,
+        status: true,
+        totalCount: true,
+        commitSha: true,
+        branch: true,
+        prNumber: true,
+        baseUrlOverride: true,
+        runnerPool: true,
+      },
+    });
+    if (!previous) throw notFound('Run');
+
+    /*
+     * A run still in flight has no final answer about which tests failed — the
+     * results are placeholders being filled in as they execute, so a re-run
+     * built from them now would re-run whatever had failed so far and miss the
+     * rest. Refused rather than guessed.
+     */
+    if (previous.status === 'QUEUED' || previous.status === 'RUNNING') {
+      throw badRequest(
+        `That run is still ${previous.status.toLowerCase()}. Wait for it to finish, or cancel it, before re-running its failures — the result rows are not final yet.`,
+      );
+    }
+
+    const results = await prisma.testResult.findMany({
+      where: { runId: previous.id },
+      // Execution order, so the failure that tripped fail-fast comes first and
+      // the excluded list reads in the order the run produced it.
+      orderBy: { createdAt: 'asc' },
+      select: {
+        testId: true,
+        status: true,
+        retriedAndPassed: true,
+        test: {
+          select: {
+            id: true,
+            name: true,
+            disabledAt: true,
+            filePath: true,
+            quarantined: true,
+            quarantineExpiresAt: true,
+          },
+        },
+      },
+    });
+
+    /*
+     * Result rows that are no longer there at all. See "A TEST THAT NO LONGER
+     * EXISTS" above: the cascade took them with their tests, so the only
+     * evidence left that they existed is the count the run recorded when it
+     * started. Clamped at zero because a run whose `totalCount` was never set
+     * (an older row) must not report a negative.
+     */
+    const vanishedResults = Math.max(0, previous.totalCount - results.length);
+
+    const failedStatuses = new Set(
+      includeFlaky ? ['FAILED', 'TIMED_OUT', 'FLAKY'] : ['FAILED', 'TIMED_OUT'],
+    );
+
+    const rerunIds: string[] = [];
+    const excluded: ExcludedFailure[] = [];
+    let retriedAndPassedSkipped = 0;
+    let quarantinedIncluded = 0;
+
+    for (const result of results) {
+      if (!failedStatuses.has(result.status)) continue;
+      /*
+       * A retry that passed is not a failure anybody is waiting to re-check.
+       * Counted rather than dropped silently: "6 failures, 3 of which passed on
+       * retry and were not re-run" is a different sentence from "3 failures",
+       * and a caller that wanted them has `includeFlaky`.
+       */
+      if (!includeFlaky && result.retriedAndPassed) {
+        retriedAndPassedSkipped += 1;
+        continue;
+      }
+
+      const test = result.test;
+      if (test.disabledAt) {
+        excluded.push({
+          testId: test.id,
+          name: test.name,
+          why: 'This test has been disabled since the run. Every selection path in this product excludes a disabled test, so re-running it here would be the one place a disabled test still executes.',
+        });
+        continue;
+      }
+      if (test.filePath.startsWith(FIXTURE_PREFIX)) {
+        excluded.push({
+          testId: test.id,
+          name: test.name,
+          why: `This test has moved under ${FIXTURE_PREFIX}, which holds test DATA and no runnable code. It cannot be executed and must not be queued as a test.`,
+        });
+        continue;
+      }
+
+      if (quarantineSuppresses(test, new Date())) quarantinedIncluded += 1;
+      rerunIds.push(test.id);
+    }
+
+    /*
+     * Nothing to do, and WHICH nothing. The three cases are genuinely
+     * different: a run with no failures at all is a question whose answer is
+     * "nothing failed", while a run whose every failure has been disabled,
+     * deleted or fixtured is a question this endpoint cannot answer and must
+     * not answer with a green run.
+     */
+    if (rerunIds.length === 0) {
+      const reasons: string[] = [];
+      if (excluded.length > 0) {
+        reasons.push(
+          `${excluded.length} failing test(s) can no longer run: ${excluded
+            .slice(0, 5)
+            .map((e) => e.name)
+            .join(', ')}`,
+        );
+      }
+      if (vanishedResults > 0) {
+        reasons.push(
+          `${vanishedResults} of the run's ${previous.totalCount} result(s) no longer exist, because deleting a test deletes its results — whatever those tests did cannot be re-run or even re-read`,
+        );
+      }
+      if (retriedAndPassedSkipped > 0) {
+        reasons.push(
+          `${retriedAndPassedSkipped} failure(s) passed on retry and were not included; send \`includeFlaky: true\` to re-run them`,
+        );
+      }
+
+      if (reasons.length === 0) {
+        /*
+         * 422 and not 409: the request was perfectly coherent and the run
+         * simply has no failures. A 409 would read as "try again", and there is
+         * nothing to try.
+         */
+        throw unprocessable(
+          'That run recorded no failures, so there is nothing to re-run. Its verdict is on GET /runs/:runId.',
+          { reran: 0, vanishedResults },
+        );
+      }
+      throw conflict(
+        `None of that run's failures can be re-run. ${reasons.join('. ')}.`,
+        { excluded, vanishedResults, retriedAndPassedSkipped },
+      );
+    }
+
+    const failFast = planFailFast(parsed.data.failFast === true);
+
+    /*
+     * Gate, create, count — through `startRun` like every other run-creating
+     * path, in `enforce` mode because this is HTTP. A re-run costs the same
+     * browser as the original and must take the same toll; the whole reason
+     * `startRun` exists is that six of seven paths used to forget.
+     */
+    const { run } = await startRun({
+      db: prisma,
+      orgId: actor.orgId,
+      mode: 'enforce',
+      unscope: unscoped,
+      data: {
+        orgId: actor.orgId,
+        projectId: previous.projectId,
+        environmentId: previous.environmentId,
+        suiteId: previous.suiteId,
+        trigger: 'MANUAL',
+        triggeredBy: actor.userId || null,
+        commitSha: previous.commitSha,
+        branch: previous.branch,
+        prNumber: previous.prNumber,
+        // The same application, not merely the same environment row. See the
+        // header: a preview-deploy run's failures belong to the preview URL.
+        baseUrlOverride: previous.baseUrlOverride,
+        totalCount: rerunIds.length,
+        failFast: failFast.requested,
+        // Never sharded. The point of this endpoint is that the set is small;
+        // splitting six tests across four workers spends three queue hops and
+        // three browser cold starts to save nothing.
+        shardCount: 1,
+        runnerPool: previous.runnerPool,
+        results: {
+          create: rerunIds.map((testId) => ({
+            orgId: actor.orgId,
+            testId,
+            status: 'SKIPPED' as const,
+            shardIndex: null,
+          })),
+        },
+      },
+    });
+
+    /*
+     * One dispatch path or the other, never both — the same branch POST /runs
+     * takes, and for the same reason: a run that is both enqueued and offered
+     * to on-prem agents executes its tests twice against one environment, with
+     * two sets of results racing to finalise it.
+     */
+    const onPremDispatch = previous.runnerPool
+      ? await dispatchOnPrem({
+          orgId: actor.orgId,
+          runId: run.id,
+          pool: previous.runnerPool,
+          testIds: rerunIds,
+          types: await prisma.test.findMany({
+            where: { id: { in: rerunIds } },
+            select: { id: true, type: true },
+          }),
+          shards: null,
+        })
+      : null;
+
+    const jobId = onPremDispatch
+      ? null
+      : await enqueue(
+          QUEUE_NAMES.run,
+          { orgId: actor.orgId, runId: run.id },
+          // Idempotent on the NEW run id: a double-clicked re-run button
+          // cannot execute the same slice twice.
+          { jobId: `run-${run.id}` },
+        );
+
+    await audit({
+      actor,
+      action: 'run.rerun-failures',
+      targetType: 'Run',
+      targetId: run.id,
+      metadata: {
+        ofRun: previous.id,
+        reran: rerunIds.length,
+        ofResults: results.length,
+        /*
+         * Recorded, because six months later this row is the only place that
+         * still remembers the re-run was a SUBSET. A run with 6 results that
+         * came from a suite of 5,000 reads as a catastrophically shrunken suite
+         * unless something says it was deliberate.
+         */
+        excluded: excluded.length,
+        vanishedResults,
+        retriedAndPassedSkipped,
+        includeFlaky,
+        ...(failFast.requested ? { failFast: { recorded: true } } : {}),
+        ...(onPremDispatch ? { dispatch: { target: 'on-prem', pool: onPremDispatch.pool } } : {}),
+      },
+    });
+
+    res.status(202).json({
+      run,
+      ...(jobId ? { jobId } : {}),
+      /** The previous run this was built from, so the pair is traceable. */
+      ofRun: previous.id,
+      /** How many tests this run will execute, out of what the original recorded. */
+      reran: rerunIds.length,
+      ofResults: results.length,
+      ofTotal: previous.totalCount,
+      /**
+       * The three honest absences. Every one is reported even when it is zero,
+       * because a caller comparing `reran` against the failures it expected
+       * needs somewhere to look, and a field that only appears when it is
+       * non-zero is a field nobody writes code against.
+       */
+      excluded,
+      vanishedResults,
+      retriedAndPassedSkipped,
+      /**
+       * Failures suppressed by a quarantine in force. They ARE re-run — the
+       * test is not broken-by-decree, its failure is just not allowed to gate —
+       * but a caller reading `reran: 6` deserves to know that two of the six
+       * cannot turn this run red however they end.
+       */
+      quarantinedIncluded,
+      ...(failFast.requested
+        ? {
+            failFast: {
+              ...failFast,
+              recorded: true,
+              stopChannel: 'Run.stopRequestedAt',
+              note: FAIL_FAST_NOTE,
+            },
+          }
+        : {}),
+      ...(onPremDispatch
+        ? {
+            dispatch: {
+              target: 'on-prem' as const,
+              pool: onPremDispatch.pool,
+              jobs: onPremDispatch.jobs,
+              runnersOnline: onPremDispatch.runnersOnline,
+              warning: onPremDispatch.warning,
+            },
+          }
+        : {}),
+    });
+  },
+);
 
 runsRouter.get('/', async (req, res) => {
   const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;

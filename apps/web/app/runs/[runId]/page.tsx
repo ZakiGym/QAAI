@@ -16,6 +16,13 @@ import { FailureSummary } from '../../../components/runs/FailureSummary';
 import { Terminal } from '../../../components/editor/Terminal';
 import { TriageRail } from '../../../components/runs/TriageRail';
 import { wallClock } from '../../../components/runs/format';
+import {
+  LIVE_EVENT_TYPES,
+  describeEvent,
+  reloadsRun,
+  type LiveLine,
+} from '../../../components/runs/live-events';
+import { gateAwaitsTriage, gateUnmeasuredCount, gateWord } from '../../../lib/gate';
 import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
 
 /**
@@ -31,23 +38,6 @@ import { usePaletteCommands } from '../../../components/shell/PaletteCommands';
  * that member's failing step, so one click lands on the evidence rather than on
  * a name.
  */
-
-/**
- * Turning a stream event into a line a person can read.
- *
- * This pane used to render `step {"testId":"cms6vrt5i0003…","index":1,…}` —
- * the raw event payload, straight from the wire. It is the one part of the app
- * a user watches while they wait, and it was showing them our internal schema.
- *
- * Returning null drops an event rather than printing a placeholder for it: an
- * unnamed frame adds noise to the only surface where noise actually costs
- * something, because the whole point is to glance at it and know what is
- * happening.
- */
-interface LiveLine {
-  text: string;
-  tone: string;
-}
 
 // ─── Shards ──────────────────────────────────────────────────────────────────
 
@@ -136,78 +126,6 @@ function shardElapsedMs(shard: RunShard, now: number): number | null {
   if (!shard.startedAt) return null;
   const end = shard.finishedAt ? new Date(shard.finishedAt).getTime() : now;
   return Math.max(0, end - new Date(shard.startedAt).getTime());
-}
-
-function describeEvent(label: string, data: Record<string, unknown>): LiveLine | null {
-  const str = (key: string): string | null =>
-    typeof data[key] === 'string' ? (data[key] as string) : null;
-  const num = (key: string): number | null =>
-    typeof data[key] === 'number' ? (data[key] as number) : null;
-
-  switch (label) {
-    case 'test.started': {
-      const name = str('name');
-      return name ? { text: `Running ${name}`, tone: 'bg-accent' } : null;
-    }
-    case 'test.finished': {
-      const name = str('name');
-      const status = str('status');
-      if (!name || !status) return null;
-      const ms = num('durationMs');
-      const took = ms === null ? '' : ms >= 1000 ? ` · ${(ms / 1000).toFixed(1)}s` : ` · ${ms}ms`;
-      const passed = status === 'PASSED';
-      return {
-        text: `${passed ? 'Passed' : status === 'SKIPPED' ? 'Skipped' : 'Failed'}: ${name}${took}`,
-        tone: passed ? 'bg-pass' : status === 'SKIPPED' ? 'bg-skip' : 'bg-fail',
-      };
-    }
-    case 'step': {
-      // Step titles are what the test actually did — "Click Add to cart" — and
-      // are the most useful thing in the stream.
-      const title = str('title');
-      if (!title) return null;
-      const status = str('status');
-      return {
-        text: title,
-        tone: status === 'FAILED' ? 'bg-fail' : status === 'PASSED' ? 'bg-pass' : 'bg-skip',
-      };
-    }
-    case 'verdict': {
-      const verdict = str('verdict');
-      return verdict
-        ? { text: `Triaged as ${verdict.toLowerCase().replace(/_/g, ' ')}`, tone: 'bg-flake' }
-        : null;
-    }
-    // Five workers interleaving their test lines is confusing without something
-    // saying how many there are and when each one is done.
-    case 'shard.started': {
-      const index = num('shard');
-      const total = num('shards');
-      const tests = num('tests');
-      if (index === null || total === null) return null;
-      return {
-        text: `Shard ${index} of ${total} started${tests === null ? '' : ` · ${tests} tests`}`,
-        tone: 'bg-accent',
-      };
-    }
-    case 'shard.finished': {
-      const index = num('shard');
-      const total = num('shards');
-      if (index === null || total === null) return null;
-      if (data.errored === true) {
-        return { text: `Shard ${index} of ${total} did not complete`, tone: 'bg-fail' };
-      }
-      const failed = num('failed') ?? 0;
-      return {
-        text: `Shard ${index} of ${total} finished${failed > 0 ? ` · ${failed} failed` : ''}`,
-        tone: failed > 0 ? 'bg-fail' : 'bg-pass',
-      };
-    }
-    case 'run.finished':
-      return { text: 'Run finished', tone: 'bg-accent' };
-    default:
-      return null;
-  }
 }
 
 /** A run in one of these states will never emit another event. */
@@ -371,18 +289,18 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
       } catch {
         /* a malformed frame is not worth surfacing */
       }
-      void load();
+      // Every frame but `log` reports a change the page renders off the run row,
+      // so every frame but `log` goes back for it. See NO_RELOAD.
+      if (reloadsRun(label)) void load();
     };
 
-    for (const type of [
-      'test.started',
-      'test.finished',
-      'step',
-      'verdict',
-      'shard.started',
-      'shard.finished',
-      'run.finished',
-    ]) {
+    /*
+     * One listener per published type, from the list that is checked against the
+     * API's own union — NOT a hand-written subset. A named SSE frame with no
+     * listener is DROPPED by the browser, so a type missing from here arrived
+     * nowhere and did not even trigger the refetch above.
+     */
+    for (const type of LIVE_EVENT_TYPES) {
       source.addEventListener(type, record(type));
     }
     return () => source.close();
@@ -480,23 +398,17 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
   const results = run.results ?? [];
 
   /*
-   * A failure that has not been triaged yet.
+   * "Has this gate been decided yet" is now asked of the GATE — see
+   * `gateAwaitsTriage` in lib/gate.ts, which is the definition
+   * packages/runner/src/gates.ts uses for the same question.
    *
-   * The default gate is BLOCK_ON_VERDICT REAL_BUG, so it is scored against
-   * verdicts — and a failure with no verdict is not a REAL_BUG verdict, so it
-   * finds nothing to block on and the gate comes back `passed: true`. On a run
-   * with real failures that renders a green "gate pass" beside "2 failed",
-   * which is the one thing this screen must never do.
-   *
-   * The run processor's own docstring says a run whose triage is in flight
-   * "reports its gate as provisional"; nothing ever implemented that word. This
-   * is it, on the surface where it is read. The gate value is not altered —
-   * GitHub's check conclusion already treats an un-triaged failure as
-   * actionable and fails — only the claim the badge makes about it.
+   * It used to be recomputed here from the RESULT rows ("is there a failure
+   * with no verdict"), which is a different question that agreed with the gate
+   * only on the common case: a project gating on coverage or pass rate rather
+   * than on verdicts had every un-triaged failure labelled PROVISIONAL even
+   * though no rule was waiting on triage, and a re-scored gate kept the word
+   * for as long as one verdict was missing.
    */
-  const awaitingTriage = results.some(
-    (r) => r.status !== 'PASSED' && r.status !== 'SKIPPED' && !r.verdict,
-  );
   const selected = results.find((r) => r.test.id === selectedTestId) ?? results[0] ?? null;
   const step = selected?.steps.find((s) => s.index === selectedStep) ?? null;
 
@@ -561,7 +473,7 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
           )}
         </span>
 
-        {run.gateResult && <GateChip gate={run.gateResult} provisional={awaitingTriage} />}
+        {run.gateResult && <GateChip gate={run.gateResult} />}
 
         <div className="ml-auto flex flex-wrap items-center gap-x-3.5 gap-y-2">
           <span className="font-mono text-[11.5px] tabular-nums whitespace-nowrap">
@@ -768,39 +680,65 @@ export default function CockpitPage({ params }: { params: Promise<{ runId: strin
 /**
  * The gate, as a word rather than a colour.
  *
- * `provisional` is the third state and the reason this is not a boolean: a gate
+ * PROVISIONAL is the third state and the reason this is not a boolean: a gate
  * scored against verdicts finds nothing to block on when nothing has been
  * triaged yet, and reports a pass. It is not a pass. It has not been decided.
+ * Asked of the gate's own evaluations (`gateAwaitsTriage`), which is the same
+ * question the re-scoring sweep asks, rather than inferred from the results.
+ *
+ * Two things the chip now says that the gate had been carrying unread:
+ *
+ *  · how many rules had NO INPUT. "4 of 6 rules measured" is the difference
+ *    between a gate that cleared six rules and a gate that cleared four and
+ *    could not look at two. The count comes from the evaluator's own
+ *    `unmeasured`, and the detail lines are printed as written — an UNMEASURED
+ *    evaluation's detail already begins "not measured — …".
+ *  · that it was RE-SCORED after triage, in the evaluator's own sentence.
+ *    `rescored.reason` names the generation and, when a green gate went red,
+ *    says so; the hand-written "Provisional" paragraph below is for a gate that
+ *    has NOT been re-scored yet, so a re-score replaces it rather than being
+ *    appended to it.
  */
-function GateChip({
-  gate,
-  provisional,
-}: {
-  gate: NonNullable<Run['gateResult']>;
-  provisional: boolean;
-}) {
-  const undecided = gate.passed && provisional;
+function GateChip({ gate }: { gate: NonNullable<Run['gateResult']> }) {
+  const word = gateWord(gate);
+  const unmeasured = gateUnmeasuredCount(gate);
   const detail = gate.evaluations.map((e) => e.detail).join('\n');
-  const word = undecided ? 'PROVISIONAL' : gate.passed ? 'PASS' : 'BLOCK';
-  const tone = undecided
-    ? 'text-flake bg-[color-mix(in_srgb,var(--color-flake)_12%,transparent)]'
-    : gate.passed
-      ? 'text-pass bg-[color-mix(in_srgb,var(--color-pass)_12%,transparent)]'
-      : 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]';
+  const rescored = gate.rescored ?? null;
+  const tone =
+    word === 'PROVISIONAL'
+      ? 'text-flake bg-[color-mix(in_srgb,var(--color-flake)_12%,transparent)]'
+      : word === 'PASS'
+        ? 'text-pass bg-[color-mix(in_srgb,var(--color-pass)_12%,transparent)]'
+        : 'text-fail bg-[color-mix(in_srgb,var(--color-fail)_12%,transparent)]';
+
+  const footnote = rescored
+    ? rescored.reason
+    : gateAwaitsTriage(gate)
+      ? 'Provisional: the gate is scored on triage verdicts and at least one rule is still waiting on them, so nothing has been cleared. It is not a pass.'
+      : null;
 
   return (
     <span
-      title={
-        undecided
-          ? `${detail}\n\nProvisional: the gate is scored on triage verdicts and at least one failure has not been triaged yet, so nothing has been cleared. It is not a pass.`
-          : detail
-      }
+      title={[
+        detail,
+        unmeasured > 0
+          ? `${gate.evaluations.length - unmeasured} of ${gate.evaluations.length} rules were measured. An unmeasured rule cannot block and is not a pass.`
+          : null,
+        footnote,
+      ]
+        .filter((part): part is string => part !== null && part !== '')
+        .join('\n\n')}
       className={cn(
         'shrink-0 rounded-sm px-2 py-[3px] font-mono text-[10.5px] font-semibold tracking-[0.06em] whitespace-nowrap',
         tone,
       )}
     >
       GATE — {word}
+      {/* Said on the chip and not only in the tooltip: a gate with unmeasured
+          rules is a gate nobody has to hover to distrust. */}
+      {unmeasured > 0 && (
+        <span className="font-normal opacity-70"> · {unmeasured} unmeasured</span>
+      )}
     </span>
   );
 }

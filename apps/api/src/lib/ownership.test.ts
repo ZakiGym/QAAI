@@ -19,15 +19,20 @@
 import { describe, expect, it } from 'vitest';
 import {
   OwnershipRuleError,
+  assignOwner,
+  consensusOwner,
   matchesPath,
   normalisePattern,
   normaliseRuleDraft,
   normaliseTestPath,
   ownerKey,
+  ownableSurface,
+  ownerLabel,
   resolveOwnership,
   resolveOwnershipFor,
+  verdictOwnerColumns,
 } from './ownership.js';
-import type { OwnableTest, OwnershipRuleInput } from './ownership.js';
+import type { OwnableTest, OwnerAssignment, OwnershipRuleInput } from './ownership.js';
 
 const rule = (over: Partial<OwnershipRuleInput> = {}): OwnershipRuleInput => ({
   id: 'rule_1',
@@ -290,5 +295,295 @@ describe('normaliseRuleDraft', () => {
     expect(() => normaliseRuleDraft({ pathPattern: '   ', ownerTeamId: 'team_1' })).toThrow(
       /one of pathPattern/,
     );
+  });
+});
+
+// ─── Assignment ──────────────────────────────────────────────────────────────
+
+/**
+ * The four kinds of nobody.
+ *
+ * `owner: null` is the answer in four different situations and only one of them
+ * is benign. The expensive bug this section guards is the one that cannot be
+ * seen: a rule that can no longer be evaluated reads, from outside, exactly
+ * like a suite nobody has assigned — so a team that believes it is being paged
+ * is not, and nothing anywhere says so. If `assignOwner` ever collapses
+ * RULES_UNUSABLE into NO_MATCH, these tests are what notices.
+ */
+describe('assignOwner names which kind of nobody', () => {
+  it('reports OWNED with the winning rule and its reason', () => {
+    const assignment = assignOwner(test(), [rule({ id: 'r1', pathPattern: 'tests/checkout/**' })]);
+
+    expect(assignment.state).toBe('OWNED');
+    expect(assignment.owner).toEqual({ kind: 'TEAM', teamId: 'team_payments' });
+    expect(assignment.ruleId).toBe('r1');
+    expect(assignment.note).toContain('tests/checkout/**');
+    expect(assignment.unusable).toEqual([]);
+  });
+
+  it('reports NO_RULES when nobody has opted in, without calling it a problem', () => {
+    const assignment = assignOwner(test(), []);
+
+    expect(assignment.state).toBe('NO_RULES');
+    expect(assignment.owner).toBeNull();
+    expect(assignment.note).toMatch(/Nobody has written an ownership rule/);
+  });
+
+  it('reports NO_MATCH, naming the path and the number of rules that missed it', () => {
+    const assignment = assignOwner(test({ filePath: 'tests/search/query.spec.ts' }), [
+      rule({ pathPattern: 'tests/checkout/**' }),
+      rule({ id: 'r2', pathPattern: 'tests/billing/**' }),
+    ]);
+
+    expect(assignment.state).toBe('NO_MATCH');
+    expect(assignment.note).toContain('tests/search/query.spec.ts');
+    expect(assignment.note).toContain('2 ownership rules');
+  });
+
+  it('reports RULES_UNUSABLE — the case that looks identical to NO_MATCH from outside', () => {
+    const assignment = assignOwner(test({ filePath: 'tests/search/query.spec.ts' }), [
+      rule({ id: 'r_bad', pathPattern: 'tests/[a-z]/**' }),
+    ]);
+
+    // The whole point: not NO_MATCH. Routing has STOPPED, which is a different
+    // fact and a different fix.
+    expect(assignment.state).toBe('RULES_UNUSABLE');
+    expect(assignment.note).toMatch(/could not be evaluated/);
+    expect(assignment.unusable.map((u) => u.ruleId)).toEqual(['r_bad']);
+  });
+
+  it('still warns about a broken rule when another rule DID match', () => {
+    const assignment = assignOwner(test(), [
+      rule({ id: 'r_bad', pathPattern: 'tests/[a-z]/**' }),
+      rule({ id: 'r_good', pathPattern: 'tests/checkout/**' }),
+    ]);
+
+    expect(assignment.state).toBe('OWNED');
+    // A project can route this test correctly and still have a rule that has
+    // quietly stopped routing twenty others.
+    expect(assignment.unusable).toHaveLength(1);
+    expect(assignment.note).toMatch(/could not be evaluated/);
+  });
+});
+
+describe('verdictOwnerColumns', () => {
+  it('writes BOTH ids on every assignment, so a re-route clears the old owner', () => {
+    const toTeam = verdictOwnerColumns(
+      assignOwner(test(), [rule({ pathPattern: 'tests/checkout/**' })]),
+    );
+    expect(toTeam).toMatchObject({ assigneeUserId: null, assigneeTeamId: 'team_payments' });
+
+    const toUser = verdictOwnerColumns(
+      assignOwner(test(), [
+        rule({ pathPattern: 'tests/checkout/**', ownerTeamId: null, ownerUserId: 'user_dana' }),
+      ]),
+    );
+    // The team id is null, not absent: a row that kept both would page whoever
+    // used to own it as well as whoever does.
+    expect(toUser).toMatchObject({ assigneeUserId: 'user_dana', assigneeTeamId: null });
+  });
+
+  it('carries the state and a bounded note for an unowned failure', () => {
+    const columns = verdictOwnerColumns(assignOwner(test(), []));
+    expect(columns.ownerState).toBe('NO_RULES');
+    expect(columns.assigneeUserId).toBeNull();
+    expect(columns.assigneeTeamId).toBeNull();
+    expect(columns.ownerNote.length).toBeLessThanOrEqual(1_000);
+    expect(columns.assignedAt).toBeInstanceOf(Date);
+  });
+});
+
+describe('consensusOwner', () => {
+  const owned = (teamId: string): OwnerAssignment => ({
+    state: 'OWNED',
+    owner: { kind: 'TEAM', teamId },
+    ruleId: 'r',
+    note: 'matched',
+    unusable: [],
+  });
+  const unowned = (state: 'NO_MATCH' | 'NO_RULES' | 'RULES_UNUSABLE'): OwnerAssignment => ({
+    state,
+    owner: null,
+    ruleId: null,
+    note: state,
+    unusable: [],
+  });
+
+  it('routes a unanimous cause to its owner', () => {
+    const consensus = consensusOwner([owned('team_payments'), owned('team_payments')]);
+    expect(consensus.state).toBe('OWNED');
+    expect(consensus.owner).toEqual({ kind: 'TEAM', teamId: 'team_payments' });
+  });
+
+  it('refuses to pick a winner when the members disagree', () => {
+    const consensus = consensusOwner([owned('team_payments'), owned('team_search')]);
+    // Naming one of two teams is worse than naming none: one ignores the
+    // ticket and the other closes it having fixed half the problem.
+    expect(consensus.state).toBe('SPLIT');
+    expect(consensus.owner).toBeNull();
+    expect(consensus.note).toContain('2 different owners');
+  });
+
+  it('lets unowned members ride along without vetoing the owner', () => {
+    const consensus = consensusOwner([owned('team_payments'), unowned('NO_MATCH')]);
+    expect(consensus.state).toBe('OWNED');
+    expect(consensus.note).toContain('1 of 2 are owned');
+  });
+
+  it('reports the worst reason when nobody owns any of them', () => {
+    const consensus = consensusOwner([unowned('NO_MATCH'), unowned('RULES_UNUSABLE')]);
+    // RULES_UNUSABLE is the one somebody has to act on, so it is the one the
+    // ticket says.
+    expect(consensus.state).toBe('RULES_UNUSABLE');
+  });
+});
+
+describe('ownableSurface', () => {
+  it('routes an untested route by the same path rules as a test', () => {
+    const assignment = assignOwner(
+      ownableSurface({ key: 'ROUTE:/checkout', file: 'app/checkout/page.tsx', feature: null }),
+      [rule({ pathPattern: 'app/checkout/**' })],
+    );
+    expect(assignment.owner).toEqual({ kind: 'TEAM', teamId: 'team_payments' });
+  });
+
+  it('matches a FEATURE rule when the item has an attributed feature', () => {
+    const assignment = assignOwner(
+      ownableSurface({ key: 'ENDPOINT:POST /api/refunds', file: null, feature: 'Payments' }),
+      [rule({ feature: 'payments' })],
+    );
+    expect(assignment.owner).toEqual({ kind: 'TEAM', teamId: 'team_payments' });
+  });
+
+  it('is unowned, not mis-owned, when the item has no file and no feature', () => {
+    const assignment = assignOwner(
+      ownableSurface({ key: 'ROUTE:/seen-only-by-the-crawl', file: null, feature: null }),
+      [rule({ pathPattern: 'app/**' })],
+    );
+    expect(assignment.state).toBe('NO_MATCH');
+    expect(assignment.owner).toBeNull();
+  });
+
+  /*
+   * The pattern above is unowned because `app/**` happens not to match an
+   * empty string. A CODEOWNERS CATCH-ALL does — `*` compiles to `[^/]*` — and
+   * a catch-all is line 1 of most CODEOWNERS files, so this is the case that
+   * decides whether "no file means no path owner" is a rule or an accident.
+   * The giveaway was the reason sentence, which read " matches *." with
+   * nothing in front of the verb.
+   *
+   * It must come out unowned. Every surface the crawl found and the source
+   * analysis never declared would otherwise land on the catch-all team's
+   * board, be filtered OUT of the `unowned: true` gap ticket, and count
+   * towards that team's percentage in the owner rollup — and a gap on the
+   * wrong team's board is worse than one on nobody's, because the wrong team
+   * closes it.
+   */
+  it('a CODEOWNERS catch-all does not own a surface that has no file at all', () => {
+    for (const pathPattern of ['*', '**/*', '*.ts']) {
+      const assignment = assignOwner(
+        ownableSurface({ key: 'ROUTE:/seen-only-by-the-crawl', file: null, feature: null }),
+        [rule({ pathPattern })],
+      );
+      expect(assignment.state, pathPattern).toBe('NO_MATCH');
+      expect(assignment.owner, pathPattern).toBeNull();
+    }
+  });
+
+  /*
+   * And the other half: a BROKEN rule must still be reported as unusable for
+   * such an item. Suppressing the match must not suppress the warning, or the
+   * guard above would hide the one state that means routing has stopped.
+   */
+  it('still reports a rule it cannot evaluate, even for an item with no file', () => {
+    const assignment = assignOwner(
+      ownableSurface({ key: 'ROUTE:/seen-only-by-the-crawl', file: null, feature: null }),
+      [rule({ pathPattern: 'app/[abc]/**' })],
+    );
+    expect(assignment.state).toBe('RULES_UNUSABLE');
+    expect(assignment.unusable).toHaveLength(1);
+  });
+});
+
+describe('ownerLabel', () => {
+  const directory = {
+    users: new Map([['user_dana', { name: 'Dana Ruiz', email: 'dana@acme.test' }]]),
+    teams: new Map([['team_payments', { slug: 'payments' }]]),
+  };
+
+  it('prints a team the way the digest does, so one owner reads as one owner', () => {
+    expect(ownerLabel({ kind: 'TEAM', teamId: 'team_payments' }, directory)).toBe('@payments');
+  });
+
+  it('falls back from a name to an email', () => {
+    expect(ownerLabel({ kind: 'USER', userId: 'user_dana' }, directory)).toBe('Dana Ruiz');
+    expect(
+      ownerLabel({ kind: 'USER', userId: 'u2' }, {
+        users: new Map([['u2', { name: null, email: 'qa@acme.test' }]]),
+        teams: new Map(),
+      }),
+    ).toBe('qa@acme.test');
+  });
+
+  it('says something true about a row that is gone, rather than rendering undefined', () => {
+    expect(ownerLabel({ kind: 'TEAM', teamId: 'gone' }, directory)).toBe('a deleted team');
+    expect(ownerLabel({ kind: 'USER', userId: 'gone' }, directory)).toBe('a deleted user');
+  });
+});
+
+// ─── The promoted vocabulary, still reachable from here ─────────────────────
+
+describe('the ownership vocabulary is re-exported, not just moved', () => {
+  /*
+   * `OwnershipState`, `IssueOwnerState`, `IssueSubject`, `OwnerRef` and
+   * `OwnerAssignment` were declared in lib/ownership.ts and now live in
+   * @qaai/shared, where the web app can name the state it renders. Three
+   * modules import them FROM this one — routes/surface.ts, routes/issues.ts and
+   * this test file — and a promotion without a re-export breaks all three for
+   * no reader's benefit: a module that resolves ownership is exactly where a
+   * caller looks for the words ownership is described in.
+   *
+   * Asserted on the VALUES because every one of them is the validated domain of
+   * a TEXT column: a member dropped or respelled in transit does not fail to
+   * compile, it fails to match a row somebody already wrote.
+   */
+  it('still exports the state lists, with the same members', async () => {
+    const here = await import('./ownership.js');
+    const shared = await import('@qaai/shared');
+
+    expect([...here.OWNERSHIP_STATES]).toEqual([
+      'OWNED',
+      'NO_RULES',
+      'NO_MATCH',
+      'RULES_UNUSABLE',
+    ]);
+    expect([...here.ISSUE_OWNER_STATES]).toEqual([...here.OWNERSHIP_STATES, 'SPLIT']);
+    expect([...here.ISSUE_SUBJECTS]).toEqual(['FAILURE', 'COVERAGE_GAP']);
+
+    // The same arrays, not a second copy that can drift from them.
+    expect(here.OWNERSHIP_STATES).toBe(shared.OWNERSHIP_STATES);
+    expect(here.ISSUE_OWNER_STATES).toBe(shared.ISSUE_OWNER_STATES);
+    expect(here.ISSUE_SUBJECTS).toBe(shared.ISSUE_SUBJECTS);
+  });
+
+  it('writes a state that `OWNERSHIP_STATES` contains, whatever happened', async () => {
+    const here = await import('./ownership.js');
+    const states = new Set<string>(here.OWNERSHIP_STATES);
+
+    for (const assignment of [
+      assignOwner(test({ filePath: 'tests/a.spec.ts' }), []),
+      assignOwner(test({ filePath: 'tests/a.spec.ts' }), [
+        rule({ pathPattern: 'nothing/**', ownerTeamId: 'team_payments' }),
+      ]),
+      assignOwner(test({ filePath: 'tests/a.spec.ts' }), [
+        rule({ pathPattern: 'tests/**', ownerTeamId: 'team_payments' }),
+      ]),
+    ]) {
+      // `TriageVerdict.ownerState` is a TEXT column with no enum behind it, so
+      // this list is the only thing standing between it and a value no reader
+      // switches on.
+      expect(states.has(assignment.state)).toBe(true);
+      expect(verdictOwnerColumns(assignment).ownerState).toBe(assignment.state);
+    }
   });
 });
