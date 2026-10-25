@@ -34,6 +34,17 @@ const TYPES = fileURLToPath(new URL('../../../packages/shared/src/types.ts', imp
 // be checkable would be the tail wagging the dog.
 const RUNNERS = fileURLToPath(new URL('../src/lib/runners.ts', import.meta.url));
 const SSO = fileURLToPath(new URL('../src/lib/sso.ts', import.meta.url));
+/*
+ * The enumeration vocabularies. They are in @qaai/shared but NOT in
+ * constants.ts or types.ts: `surface.ts` and `flow-map.ts` are the files whose
+ * readers consume them, and `scripts/check-wiring.ts` already treats
+ * `surface.ts` as the home of the surface vocabulary (SURFACE_VOCABULARY there
+ * diffs three of its lists against the Prisma enums). Dragging four more lists
+ * into constants.ts purely to be reachable from this script would be the tail
+ * wagging the dog — the same judgement the RUNNERS entry above records.
+ */
+const SURFACE = fileURLToPath(new URL('../../../packages/shared/src/surface.ts', import.meta.url));
+const FLOW_MAP = fileURLToPath(new URL('../../../packages/shared/src/flow-map.ts', import.meta.url));
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -48,7 +59,7 @@ const SSO = fileURLToPath(new URL('../src/lib/sso.ts', import.meta.url));
 const PAIRS: Array<{
   prismaEnum: string;
   tsConst: string;
-  source?: 'constants' | 'types' | 'runners' | 'sso';
+  source?: 'constants' | 'types' | 'runners' | 'sso' | 'surface' | 'flowMap';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -89,6 +100,51 @@ const PAIRS: Array<{
   // what `isNotRunKind` and `parseNotRun` validate against, so this entry
   // guards the read path as well as the write.
   { prismaEnum: 'NotRunKind', tsConst: 'NOT_RUN_KINDS' },
+  /*
+   * ── The enumeration denominator (§ coverage) ──────────────────────────────
+   *
+   * All four are written by the surface extractors and the crawl adjudicator,
+   * and all four are FILTERED ON by a reader, which is why each earned a
+   * database type rather than a TEXT column. That also makes each one a value a
+   * row may hold and TypeScript may not know about — the precise failure this
+   * script's docstring describes, where five TestType members sat un-migrated
+   * and invisible until an insert failed at run time.
+   */
+  // Which declarer put an item in the inventory. The one that makes an
+  // uncrawlable surface — a job, an email, a webhook receiver, a flag, a role,
+  // a locale — nameable at all, so that ABSENT stops masquerading as covered.
+  // Also the arbiter in `selectFlowMap`: an OBSERVED map outranks a DECLARED
+  // one regardless of version, which is what stops a source-derived flow map
+  // from displacing a real crawl.
+  { prismaEnum: 'SurfaceSource', tsConst: 'SURFACE_SOURCES', source: 'surface' },
+  // Whether a test may drive an item here. A value in the database that
+  // TypeScript cannot name would be an item the dark-surface report can neither
+  // count in the denominator nor list as held out — invisible in both
+  // directions, which is the one outcome this feature exists to prevent.
+  {
+    prismaEnum: 'SurfaceExercisability',
+    tsConst: 'SURFACE_EXERCISABILITIES',
+    source: 'surface',
+  },
+  // The dimension tables. `DIMENSION_AXIS` is a `Record` keyed on this union,
+  // so a seventh dimension in the database that TypeScript does not know about
+  // would be rows of cells with no axis to be counted on.
+  {
+    prismaEnum: 'SurfaceDimensionKind',
+    tsConst: 'SURFACE_DIMENSION_KINDS',
+    source: 'surface',
+  },
+  // Whether a crawl may be the denominator. The highest-stakes of the four: a
+  // state the database accepts and the selector cannot rank would fall through
+  // `selectFlowMap`'s acceptance ranking into the legacy-null arm and a
+  // degraded crawl would be promoted — which is exactly the defect that makes
+  // the coverage percentage go up on the day a customer's environment falls
+  // over.
+  {
+    prismaEnum: 'CrawlAcceptanceState',
+    tsConst: 'CRAWL_ACCEPTANCE_STATES',
+    source: 'flowMap',
+  },
 ];
 
 /*
@@ -142,13 +198,19 @@ const constants = readFileSync(CONSTANTS, 'utf8');
 const types = readFileSync(TYPES, 'utf8');
 const runners = readFileSync(RUNNERS, 'utf8');
 const sso = readFileSync(SSO, 'utf8');
-const SOURCES: Record<'constants' | 'types' | 'runners' | 'sso', { text: string; label: string }> =
-  {
-    constants: { text: constants, label: 'constants.ts' },
-    types: { text: types, label: 'types.ts' },
-    runners: { text: runners, label: 'lib/runners.ts' },
-    sso: { text: sso, label: 'lib/sso.ts' },
-  };
+const surface = readFileSync(SURFACE, 'utf8');
+const flowMap = readFileSync(FLOW_MAP, 'utf8');
+const SOURCES: Record<
+  'constants' | 'types' | 'runners' | 'sso' | 'surface' | 'flowMap',
+  { text: string; label: string }
+> = {
+  constants: { text: constants, label: 'constants.ts' },
+  types: { text: types, label: 'types.ts' },
+  runners: { text: runners, label: 'lib/runners.ts' },
+  sso: { text: sso, label: 'lib/sso.ts' },
+  surface: { text: surface, label: 'shared/surface.ts' },
+  flowMap: { text: flowMap, label: 'shared/flow-map.ts' },
+};
 const problems: string[] = [];
 
 for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIRS) {

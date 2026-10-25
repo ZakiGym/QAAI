@@ -9,11 +9,13 @@ import {
   ISSUE_SUBJECTS,
   OWNERSHIP_STATES,
   type CauseIdentity,
+  type EnvironmentSummary,
   type HealProposal,
   type OwnerAssignment,
   type TestExecution,
   type TriageVerdict,
 } from './types';
+import { resolveCrawlPolicy } from './flow-map';
 
 /**
  * The vocabularies this file now owns, pinned at the words they were promoted
@@ -274,5 +276,50 @@ describe('the promoted shapes', () => {
     // accepted and TypeScript could not name.
     expect(retire.riskLevel).toBe('RETIRE');
     expect(retire.diff).toBe('');
+  });
+});
+
+// ─── The crawl scope on the environment summary ─────────────────────────────
+
+/**
+ * `EnvironmentSummary.crawlPolicy`, and the three states it has to keep apart.
+ *
+ * This payload crosses the wire and is cached, so the absent case is not
+ * hypothetical: a web app holding a response from an older API has no
+ * `crawlPolicy` at all. "This payload predates the policy", "this environment
+ * never chose one" and "this environment chose these numbers" are three
+ * different sentences, and only the last one is something a customer can be
+ * held to when they argue about a coverage number.
+ */
+describe('EnvironmentSummary.crawlPolicy', () => {
+  function summary(over: Partial<EnvironmentSummary> = {}): EnvironmentSummary {
+    return {
+      id: 'env_1',
+      name: 'Production',
+      kind: 'PRODUCTION',
+      baseUrl: 'https://a.example.com',
+      ...over,
+    };
+  }
+
+  it('is absent on a payload that predates it, and that is not "no policy"', () => {
+    // A reader that cannot tell these apart would tell a customer their
+    // production crawl is unscoped when the truth is that this response is old.
+    expect(summary().crawlPolicy).toBeUndefined();
+  });
+
+  it('carries the resolved policy, including which fields anybody chose', () => {
+    const applied = resolveCrawlPolicy({ pageBudget: 50 });
+    const env = summary({ crawlPolicy: applied });
+    expect(env.crawlPolicy?.policy.pageBudget).toBe(50);
+    expect(env.crawlPolicy?.overridden).toEqual(['pageBudget']);
+    // Not defaulted: this environment made a decision. An environment that
+    // never chose reports `defaulted: true` with the same policy object, and
+    // the panel renders those differently.
+    expect(env.crawlPolicy?.defaulted).toBe(false);
+  });
+
+  it('reports a defaulted policy as defaulted rather than as a choice', () => {
+    expect(summary({ crawlPolicy: resolveCrawlPolicy(null) }).crawlPolicy?.defaulted).toBe(true);
   });
 });

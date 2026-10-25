@@ -611,6 +611,7 @@ model Project {
   digest            DigestSubscription?
   pluginEnablements PluginEnablement[]
   coverageItems     CoverageItem[]
+  surfaceDimensions SurfaceDimension[]
   coverageSnapshots CoverageSnapshot[]
   failureSignatures FailureSignature[]
   closureCampaigns  ClosureCampaign[]
@@ -621,20 +622,56 @@ model Project {
 }
 
 model Environment {
-  id         String          @id @default(cuid())
-  orgId      String
-  projectId  String
-  name       String
-  kind       EnvironmentKind
-  baseUrl    String
+  id          String          @id @default(cuid())
+  orgId       String
+  projectId   String
+  name        String
+  kind        EnvironmentKind
+  baseUrl     String
   /// The on-prem runner pool this environment executes on, or null for the
   /// cloud worker (ENTERPRISE). This is THE switch: a staging environment that
   /// never faces the internet cannot be reached from our infrastructure at all,
   /// so a run against it must be handed to an agent inside the customer's
   /// network instead of being enqueued on our own queue. See Run.runnerPool.
-  runnerPool String?
-  createdAt  DateTime        @default(now())
-  updatedAt  DateTime        @updatedAt
+  runnerPool  String?
+  /// CrawlPolicy — the auditable scope a crawl of this environment is permitted.
+  ///
+  /// ── THE DEFECT ──────────────────────────────────────────────────────────────
+  ///
+  /// `CrawlOptions.excludePatterns` has been declared in
+  /// packages/agent/src/crawler.ts since the beginning and is passed by NO
+  /// caller, so the scope of a PRODUCTION crawl is five regexes hard-coded in
+  /// that file and there is nothing a customer can read, review or change. A
+  /// production enumeration with no auditable scope is not something a security
+  /// reviewer signs off, which makes this a commercial problem and not only an
+  /// honesty one.
+  ///
+  /// ── WHY A COLUMN AND NOT AN ENVIRONMENT VARIABLE ───────────────────────────
+  ///
+  /// Same argument as `Project.quarantineBudgetPercent` and
+  /// `Project.coverageTargetPercent`: this governs what a browser DOES to a
+  /// customer's live application, so the brake has to be something the person
+  /// running this product can find, read and change — per environment, because
+  /// a seeded throwaway and a production site want opposite answers. An env var
+  /// would arm one answer for every environment in the install at once, which
+  /// is the opposite of a brake, and scripts/check-wiring.ts refuses one.
+  ///
+  /// ── WHY GLOBS AND NOT RegExp ────────────────────────────────────────────────
+  ///
+  /// A `RegExp` does not survive JSON — it serialises to `{}` — and this column
+  /// is JSON. Globs are also what a human can review in a panel: `/admin/**` is
+  /// readable and `^\/admin\/.*$` is not. The dialect's only implementation is
+  /// `matchesGlob` in packages/shared/src/flow-map.ts, so the panel's preview
+  /// and the crawler's decision cannot disagree.
+  ///
+  /// NULLABLE WITH NO DEFAULT: null means this environment never chose a
+  /// policy and the build's `DEFAULT_CRAWL_POLICY` applies, which
+  /// `resolveCrawlPolicy` reports as `defaulted: true`. An environment that
+  /// stored `{}` has ACCEPTED every default, and that is a decision somebody
+  /// made and can be held to. Defaulting the column would erase the difference.
+  crawlPolicy Json?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
 
   project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
   secrets      Secret[]
@@ -696,8 +733,22 @@ model AuthProfile {
 // Flow map & plan (§3.1)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Whether a crawl may be the denominator. Mirrors CRAWL_ACCEPTANCE_STATES in
+/// packages/shared/src/flow-map.ts; `check:enums` diffs them.
+///
+/// The three are not a quality score. ACCEPTED means measure against it.
+/// CANDIDATE means it is stored and visible and NOTHING measures against it,
+/// because a degraded crawl that replaces the denominator makes the coverage
+/// percentage go up. REJECTED means nothing usable was enumerated at all, so
+/// the previous map stands.
+enum CrawlAcceptanceState {
+  ACCEPTED
+  CANDIDATE
+  REJECTED
+}
+
 model FlowMap {
-  id              String   @id @default(cuid())
+  id              String  @id @default(cuid())
   orgId           String
   projectId       String
   environmentId   String
@@ -705,11 +756,85 @@ model FlowMap {
   /// Serialised FlowMap from packages/shared. Kept whole rather than normalised:
   /// it is written once per crawl, read as a unit, and diffed version-to-version.
   graph           Json
-  nodeCount       Int      @default(0)
-  edgeCount       Int      @default(0)
-  journeyCount    Int      @default(0)
+  nodeCount       Int     @default(0)
+  edgeCount       Int     @default(0)
+  journeyCount    Int     @default(0)
+  /// Kept: twenty readers render it, and it is the only such sentence on every
+  /// map already stored. Also not enough on its own — it can say "stopped
+  /// early" and never "at least 240 more URLs existed", which is what
+  /// `atLeastMoreUrls` below is for. A writer sets both.
   truncatedReason String?
-  createdAt       DateTime @default(now())
+
+  /// Which declarer produced this map. SurfaceSource, not a second vocabulary.
+  ///
+  /// ── THE DEFECT, AND IT IS THE WORST ONE IN THIS TABLE ───────────────────────
+  ///
+  /// `flowMapFromSource` in apps/worker/src/processors/analyze-source.ts writes
+  /// a map DERIVED FROM THE REPOSITORY with its own version number, and 13 of
+  /// the 16 readers select `findFirst({ where: { projectId }, orderBy: { version:
+  /// 'desc' } })`. So a source-derived map at v9 displaces a real crawl at v8
+  /// and the denominator silently becomes "whatever the route table says" —
+  /// with no forms, no states and no affordances. There was nothing on the row
+  /// to filter by; this is that something.
+  ///
+  /// `selectFlowMap` in packages/shared/src/flow-map.ts ranks an OBSERVED map
+  /// (CRAWL, TRAFFIC) above a DECLARED one REGARDLESS OF VERSION, because a
+  /// version is a sequence number and not evidence.
+  derivedFrom      SurfaceSource?
+  /// Whether this map may BE the denominator.
+  ///
+  /// A crawl run while the site was down, rate-limited or logged out returns a
+  /// small graph, is written as the newest version, and every reader picks it
+  /// up: the denominator collapses, the numerator does not, and the coverage
+  /// percentage goes UP on the day the customer's environment fell over, with
+  /// nobody told. A degraded crawl is therefore held as a CANDIDATE — stored,
+  /// visible and diffable, and not measured against until a human or a later
+  /// clean crawl resolves it.
+  ///
+  /// Null for every row written before adjudication existed. `selectFlowMap`
+  /// ranks null BETWEEN accepted and candidate: it is not evidence of health,
+  /// and it is not evidence of degradation either.
+  acceptance       CrawlAcceptanceState?
+  /// Why it is a CANDIDATE or was REJECTED, in the customer's words. Never set
+  /// for ACCEPTED, and never null for the other two — "degraded" with no reason
+  /// is a denominator nobody can audit.
+  acceptanceReason String?
+  /// ENUMERATION_OUTCOMES: CONVERGED, STOPPED or FAILED.
+  ///
+  /// Converged and stopped produce the same `nodeCount` and completely
+  /// different denominators, and "enumeration converged" is the most tempting
+  /// false sentence this feature has available — it is what every cap makes a
+  /// crawl look like from the inside. CONVERGED requires an empty frontier AND
+  /// no cap that bit; `enumerationOutcome` decides, deterministically.
+  ///
+  /// Text and not an enum, for the same reason as
+  /// `CoverageItem.unexercisableReason`: the domain is enforced at the producer.
+  convergence      String?
+  /// AT LEAST this many more distinct in-scope URLs existed and were not
+  /// enumerated.
+  ///
+  /// THE SINGLE MOST IMPORTANT COLUMN IN THE ENUMERATION SLICE. A truncated
+  /// crawl makes the coverage percentage go UP, so every cap is a lever that
+  /// silently flatters us; this is the number that makes the lever visible.
+  /// `unvisitedQueued + beyondDepth` — URLs we actually held in a queue or
+  /// actually saw past the depth limit, so it is a floor and not an estimate.
+  /// Refused URLs are NOT in it (they are known by name, in the graph's
+  /// exclusion ledger), off-origin URLs are not our surface, and unreachable
+  /// URLs are unknown rather than absent.
+  atLeastMoreUrls  Int?
+  /// How many URLs a policy rule refused. The report line "your crawl policy
+  /// refused 31 URLs", which today cannot be written at all: the crawler drops
+  /// them with no record, so a refused route and a route the application does
+  /// not serve are indistinguishable afterwards.
+  excludedCount    Int?
+  /// AppliedCrawlPolicy — the policy in force for THIS crawl, and which of its
+  /// fields anybody actually chose.
+  ///
+  /// A copy and not a join to `Environment.crawlPolicy` on purpose: the policy
+  /// moves, and the question a report answers is "what was this number measured
+  /// under", which the current policy cannot answer for a crawl from last month.
+  policyApplied    Json?
+  createdAt        DateTime              @default(now())
 
   project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
   environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
@@ -717,6 +842,17 @@ model FlowMap {
 
   @@unique([projectId, environmentId, version])
   @@index([orgId])
+  /// THE CORRECT READ, which no reader can currently make.
+  ///
+  /// `(projectId, environmentId)` are equalities on every correct read — an
+  /// environment filter is a MATCH and not a preference, because a staging
+  /// crawl is not a weaker measurement of production but a measurement of
+  /// something else. `acceptance` is the third equality (or a small IN list),
+  /// and `version` last so the btree can supply the ORDER BY scanned backwards
+  /// and the LIMIT stops early. The existing unique index cannot do this: it
+  /// has no `acceptance`, so filtering on it would mean reading every version
+  /// of the environment and sorting in memory.
+  @@index([projectId, environmentId, acceptance, version])
 }
 
 model TestPlan {
@@ -3074,6 +3210,66 @@ enum SurfaceStatus {
   WAIVED
 }
 
+/// Which declarer put an item in the inventory. Mirrors SURFACE_SOURCES in
+/// packages/shared/src/surface.ts; `check:enums` diffs them.
+///
+/// `SurfaceOrigin` above is the two-source summary — source analysis, or a
+/// crawl — and for two slices those were the only declarers that existed. That
+/// is also why every surface NEITHER can see was absent from the denominator
+/// rather than uncovered: a background job, an outbound email, a webhook
+/// receiver, a feature flag, a role, a locale, an error path, a download.
+/// Nothing crawls them and no route table declares them, so they were not
+/// UNCOVERED — they were not THERE, and absent flatters the number while
+/// uncovered lowers it.
+///
+/// REQUIREMENT, MANUAL and CATALOGUE are the three that can name an
+/// uncrawlable surface at all, which is the entire reason this enum exists.
+enum SurfaceSource {
+  CRAWL
+  SOURCE
+  SITEMAP
+  OPENAPI
+  TRAFFIC
+  REQUIREMENT
+  MANUAL
+  CATALOGUE
+}
+
+/// Whether a test can drive an item HERE, and the two reasons it cannot.
+///
+/// Not coverage, and never to be stored as coverage. An item in either of the
+/// last two states stays in the inventory, is counted, and is NAMED in the
+/// report — dropping it instead is the move that makes a coverage percentage go
+/// up, because the surfaces we cannot drive are the hardest ones.
+///
+/// UNEXERCISABLE is a statement about the ENVIRONMENT (give it a disposable
+/// account and it becomes exercisable). REFUSED is a statement about POLICY: we
+/// did not look, and nothing is claimed in either direction. A refused surface
+/// and a nonexistent surface must never be recorded the same way, which is
+/// exactly what packages/agent/src/crawler.ts does today — /logout, /delete-*,
+/// /destroy and __reset are dropped with no record at all.
+enum SurfaceExercisability {
+  EXERCISABLE
+  UNEXERCISABLE
+  REFUSED
+}
+
+/// The dimensions a surface item can be multiplied along. Mirrors
+/// SURFACE_DIMENSION_KINDS in packages/shared/src/surface.ts.
+///
+/// These six exist as strings inside one JSONB blob today — `requiresRoles` on
+/// a flow node, a locale list in a spec, a device name in a test title — and a
+/// string inside a blob cannot be counted, so "route × role × locale" has never
+/// been a denominator. There was nothing to divide by.
+enum SurfaceDimensionKind {
+  ROLE
+  LOCALE
+  DEVICE
+  FLAG
+  JOB
+  EMAIL
+}
+
 /// One testable thing in the customer's application.
 ///
 /// Rows, not a recomputed blob. The previous coverage implementation derived its
@@ -3104,6 +3300,48 @@ model CoverageItem {
   /// Kind-specific detail: a form's fields, an auth surface's kind.
   meta      Json          @default("{}")
 
+  /// SurfaceSource[] — every declarer that put this item in the inventory.
+  ///
+  /// NULLABLE WITH NO DEFAULT, and the three states are the contract: null
+  /// means this row predates the column and nobody recorded a declarer, `[]`
+  /// would mean we looked and found none (which is not a thing that can happen
+  /// to an item that exists), and a list is the fact. `origin` above stays and
+  /// is DERIVED from this with `originFromSources` — never set independently,
+  /// or an item's two provenance fields will disagree and only one of them is
+  /// on screen.
+  sources             Json?
+  /// Whether a test may drive it here. Null means nobody classified it, and
+  /// `exercisabilityCounts` deliberately COUNTS that case: reading "not
+  /// classified" as "not allowed" would drop most of an existing install's
+  /// denominator in one deploy and the percentage would jump with nothing to
+  /// explain it.
+  exercisability      SurfaceExercisability?
+  /// UNEXERCISABLE_REASONS — set only when exercisability is UNEXERCISABLE.
+  /// Text and not an enum: the domain is enforced at the producer
+  /// (`surfaceExerciseSchema`), exactly as `Project.closureApprovalPolicy` and
+  /// `MutationSurvivor.reason` are, so this does not add a sixth enum whose
+  /// only job is to need a drift guard.
+  unexercisableReason String?
+  /// The policy rule that refused it, when exercisability is REFUSED. Required
+  /// in spirit: "excluded by policy" with no rule named is indistinguishable
+  /// from a bug in our crawler, and a customer's only possible response to that
+  /// is to stop believing the number.
+  refusedByRule       String?
+  /// The sentence shown beside the state.
+  exerciseDetail      String?
+  /// The environment this item was OBSERVED in. Null for a source declaration,
+  /// which is environment-independent.
+  ///
+  /// Without it a staging-only route enters a production project's denominator
+  /// and is reported as an uncovered production gap — the same defect as the 13
+  /// flow-map readers that order by `version` across every environment.
+  environmentId       String?
+  /// DimensionCoordinate[] — the cell coordinates for a multi-axis item, as
+  /// `dimensionCellIdentity` encodes them into `key`. Carried separately so a
+  /// reader need not parse the key, and so a cell with no coordinates is
+  /// visibly wrong rather than quietly counted.
+  coordinates         Json?
+
   status  SurfaceStatus @default(UNCOVERED)
   /// SurfaceMatch[] — which tests cover it, and on what basis.
   matches Json          @default("[]")
@@ -3133,6 +3371,101 @@ model CoverageItem {
   @@index([projectId, kind, status])
   @@index([projectId, origin])
   @@index([projectId, retiredAt])
+  /// The environment-scoped denominator: "every item that applies to THIS
+  /// environment", which is the read every coverage number has to make and
+  /// could not. `environmentId` is null for the source-declared majority, and
+  /// a btree indexes nulls, so the `environmentId IS NULL OR environmentId = $1`
+  /// that a correct reader writes is answered from here.
+  @@index([projectId, environmentId])
+  /// The two held-out lists the report prints by name: "give us a disposable
+  /// account and we will test these 14" and "your crawl policy refused these
+  /// 31". Both are small slices of a large table, so the index is the
+  /// difference between a section and a sequential scan.
+  @@index([projectId, exercisability])
+}
+
+/// One value of one dimension: a role, a locale, a device, a flag, a job, an
+/// outbound email.
+///
+/// ── WHY A TABLE ─────────────────────────────────────────────────────────────
+///
+/// Because "route × role × locale" is the denominator no competitor in this
+/// market has, and it is not computable from strings in a blob. Today a role is
+/// a string in `FlowNode.requiresRoles` (which nothing ever writes a value
+/// into), a locale is a string in a localisation spec, a device is a string in
+/// a test title. None of those can be listed, counted, scoped to a project or
+/// traced to a declarer, so none of them can be part of a denominator.
+///
+/// ── WHY THE CROSS PRODUCT IS NOT THE ANSWER ─────────────────────────────────
+///
+/// 412 routes × 7 roles × 12 locales × 4 devices is 138,432, and printing that
+/// as a denominator would be both useless and false — it asserts that every
+/// role interacts with every locale on every route, which no declarer has said.
+/// `dimensionDenominator` in packages/shared/src/surface.ts counts DECLARED
+/// PAIRINGS and reports the cross product beside them, so the gap between what
+/// is possible and what anybody has actually asserted is visible rather than
+/// implied. `multiAxisDenominator` SUMS the dimensions and never multiplies
+/// them: a route × role cell and a route × locale cell are two things to test,
+/// not one combined thing.
+///
+/// ── WHY `available` IS A COLUMN ─────────────────────────────────────────────
+///
+/// A role we hold no credentials for makes every cell it appears in
+/// DIMENSION_UNAVAILABLE, and saying that is far better than reporting those
+/// cells as uncovered. "We cannot produce this role here" is a fact about our
+/// harness; "nobody tested this role" is a fact about the customer, and only
+/// one of them is true.
+model SurfaceDimension {
+  id        String               @id @default(cuid())
+  orgId     String
+  projectId String
+  kind      SurfaceDimensionKind
+  /// Identity within (project, kind), in the APPLICATION's own spelling.
+  ///
+  /// Never normalised on the way in. A role the app calls `Admin` and one it
+  /// calls `admin` are two roles until the customer says otherwise, and
+  /// case-folding here would merge two cells and shrink a denominator with
+  /// nothing to show for it. `dimensionCellIdentity` builds cell keys from this
+  /// value verbatim, so a change to it retires every cell it appears in.
+  key       String
+  label     String
+  source    SurfaceSource
+  /// The sentence that justifies the row, same contract as `CoverageItem`.
+  evidence  String
+  /// The value used when nothing selects one: the anonymous role, the default
+  /// locale, the desktop viewport, the flag's off state. At most one per
+  /// (project, kind) — enforced by the writer, because two defaults make
+  /// `dimensionDenominator`'s default-cell arithmetic ambiguous.
+  isDefault Boolean              @default(false)
+  /// Whether THIS install can actually produce the value. See the note above.
+  available Boolean              @default(true)
+  /// DimensionDetail — the discriminated union in packages/shared/src/surface.ts.
+  /// A locale's BCP-47 tag and text direction, a device's width and height, a
+  /// flag's variants, a job's trigger and schedule, an email's template id.
+  /// Flattened into one blob of strings none of those can be validated on the
+  /// way in or used to drive anything: a device with no width cannot be
+  /// emulated.
+  detail    Json
+  /// Repo-relative file, or a reference into the catalogue it was read from.
+  file      String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  /// Set when the reader stops finding it, rather than deleting the row — same
+  /// argument as `CoverageItem.retiredAt`. A role that disappears takes every
+  /// cell it was part of with it, and a vanishing denominator needs an audit
+  /// trail at least as much as a growing one.
+  retiredAt   DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One row per value per dimension per project. This is also what makes the
+  /// reader's upsert idempotent when two extractors find the same role.
+  @@unique([projectId, kind, key])
+  @@index([orgId])
+  /// "Every role in this project" — the per-dimension list, and the input to
+  /// every pairing count.
+  @@index([projectId, kind])
 }
 
 /// A recorded decision not to test something.

@@ -21,7 +21,33 @@ import {
   isSupportedPair,
   pairMessage,
 } from './constants';
-import { SELECTOR_STRATEGIES } from './flow-map';
+import {
+  ACCESS_OUTCOMES,
+  CRAWL_ACCEPTANCE_STATES,
+  CRAWL_CAPS,
+  CRAWL_DEGRADATIONS,
+  DEFAULT_CRAWL_POLICY,
+  ENUMERATION_OUTCOMES,
+  EXCLUSION_KINDS,
+  EXTERNAL_KINDS,
+  NODE_STATUS_CLASSES,
+  SELECTOR_STRATEGIES,
+} from './flow-map';
+/*
+ * The surface vocabularies, imported rather than restated — same argument as
+ * `FINDING_SEVERITIES` below. A `z.enum(['CRAWL', 'SOURCE', ...])` written out
+ * here would be a second copy of the declarer list, and the first thing a
+ * second copy does is stop matching: a source added to SURFACE_SOURCES and not
+ * to the schema is a declarer no customer can record, which is precisely the
+ * shape of the eight unsaveable gate kinds.
+ */
+import {
+  SURFACE_DIMENSION_KINDS,
+  SURFACE_EXERCISABILITIES,
+  SURFACE_KINDS,
+  SURFACE_SOURCES,
+  UNEXERCISABLE_REASONS,
+} from './surface';
 /*
  * The findings vocabulary, imported rather than restated. `MAX_FINDINGS` selects
  * on a severity and a kind, and a `z.enum` here that spelled its own four
@@ -2379,3 +2405,391 @@ export const performanceTestSpecSchema = z.object({
 });
 
 export type PerformanceTestSpec = z.infer<typeof performanceTestSpecSchema>;
+
+// ─── Enumeration: the crawl policy, the ledgers, and the dimension tables ────
+
+/**
+ * The write path for everything the enumeration slice stores, and the reason
+ * these are not optional nice-to-haves.
+ *
+ * Eight `GateRule` kinds existed in the TypeScript union and not in
+ * `gateRuleSchema` for two slices, which meant no customer could save one: the
+ * features were reachable only by hand-editing a database row, and
+ * `check:wiring` could not see it because a union member with no write path is
+ * not a disconnected FILE. Every vocabulary below therefore derives its
+ * `z.enum` FROM the exported array rather than restating the members, and the
+ * one discriminated union among them (`dimensionDetailSchema`) is checked
+ * against its `Record`-derived kind list by a run-time parity test in
+ * surface.test.ts.
+ */
+
+/**
+ * A path glob, as `matchesGlob` in flow-map.ts reads it.
+ *
+ * Must start with `/`: a glob of `admin/**` silently matches nothing, because
+ * the crawler tests it against `URL.pathname`, which always has a leading
+ * slash. A scope rule that matches nothing is worse than no rule — it looks
+ * applied in the panel and refuses nothing in the crawl.
+ */
+const pathGlob = z
+  .string()
+  .trim()
+  .min(1)
+  .max(300)
+  .regex(/^\//, 'a path glob must start with "/" — it is matched against URL.pathname');
+
+/** A query-parameter name. No `=`, no `&`, no whitespace. */
+const queryParamName = z
+  .string()
+  .trim()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9_.\-[\]]+$/, 'not a query parameter name');
+
+/** An absolute http(s) origin. Reuses the base-URL rule, then keeps the origin. */
+const originUrl = httpUrl.refine((value) => {
+  try {
+    const parsed = new URL(value);
+    return parsed.pathname === '/' || parsed.pathname === '';
+  } catch {
+    return false;
+  }
+}, 'an additional origin is a scheme, host and port — not a path');
+
+/**
+ * The environment's crawl policy.
+ *
+ * Every field has a default and every default is `DEFAULT_CRAWL_POLICY`'s, so
+ * `crawlPolicySchema.parse({})` is exactly the safe-for-production policy and
+ * there is no second place where a default is written down. A partial body is
+ * therefore accepted and completed, which is what the panel sends when a
+ * customer changes one number.
+ *
+ * The ceilings are not the defaults. `pageBudget` defaults to 1,000 and is
+ * capped at 100,000: the default is a judgement about a normal application and
+ * the cap is a refusal to let a typo enqueue a crawl that never finishes.
+ */
+export const crawlPolicySchema = z.object({
+  includeGlobs: z.array(pathGlob).max(200).default(DEFAULT_CRAWL_POLICY.includeGlobs),
+  excludeGlobs: z.array(pathGlob).max(200).default(DEFAULT_CRAWL_POLICY.excludeGlobs),
+  ignoredQueryParams: z
+    .array(queryParamName)
+    .max(100)
+    .default(DEFAULT_CRAWL_POLICY.ignoredQueryParams),
+  perTemplatePageBudget: z
+    .number()
+    .int()
+    .min(1)
+    .max(10_000)
+    .default(DEFAULT_CRAWL_POLICY.perTemplatePageBudget),
+  pageBudget: z.number().int().min(1).max(100_000).default(DEFAULT_CRAWL_POLICY.pageBudget),
+  maxDepth: z.number().int().min(1).max(100).default(DEFAULT_CRAWL_POLICY.maxDepth),
+  wallClockMillis: z
+    .number()
+    .int()
+    .min(1_000)
+    .max(6 * 60 * 60 * 1_000)
+    .default(DEFAULT_CRAWL_POLICY.wallClockMillis),
+  safeMethodsOnly: z.boolean().default(DEFAULT_CRAWL_POLICY.safeMethodsOnly),
+  allowDestructive: z.boolean().default(DEFAULT_CRAWL_POLICY.allowDestructive),
+  destructiveAllowGlobs: z
+    .array(pathGlob)
+    .max(200)
+    .default(DEFAULT_CRAWL_POLICY.destructiveAllowGlobs),
+  additionalOrigins: z.array(originUrl).max(20).default(DEFAULT_CRAWL_POLICY.additionalOrigins),
+});
+
+/**
+ * `allowDestructive` without a single allow glob is refused.
+ *
+ * The flag on its own grants nothing — `policyDecision` requires BOTH — so a
+ * customer who sets it and nothing else has configured a permission that does
+ * not apply and will reasonably believe destructive paths are now being
+ * covered. Refusing the body is the only way they find out at the moment they
+ * are looking at the panel rather than three weeks later in a report.
+ */
+export const updateCrawlPolicySchema = crawlPolicySchema.refine(
+  (policy) => !policy.allowDestructive || policy.destructiveAllowGlobs.length > 0,
+  {
+    message:
+      'allowDestructive needs at least one destructiveAllowGlobs pattern — the flag alone ' +
+      'grants nothing, and a permission that grants nothing is worse than none',
+    path: ['destructiveAllowGlobs'],
+  },
+);
+
+// ─── Flow-map honesty shapes ────────────────────────────────────────────────
+
+export const nodeStatusSchema = z.object({
+  /**
+   * Nullable and NOT defaulted to 200. A same-document SPA transition produces
+   * no response, and `shouldGenerateAgainst` refuses to write a happy-path test
+   * against a node whose status was never recorded. Defaulting here would
+   * convert "nobody looked" into "it answered 200" at the one boundary where
+   * that lie is cheapest to tell.
+   */
+  code: z.number().int().min(100).max(599).nullable(),
+  class: z.enum(NODE_STATUS_CLASSES),
+  isErrorPage: z.boolean(),
+});
+
+export const routeAccessSchema = z
+  .object({
+    role: z.string().trim().min(1).max(120).nullable(),
+    outcome: z.enum(ACCESS_OUTCOMES),
+    status: z.number().int().min(100).max(599).nullable(),
+    destinationRoute: z.string().max(2_000).nullable(),
+    basis: z.enum(['OBSERVED', 'DECLARED']),
+    observedAtIso: z.string().datetime().nullable(),
+  })
+  .refine((access) => access.basis !== 'DECLARED' || access.status === null, {
+    message:
+      'a DECLARED access outcome has no status — nobody made the request, and writing 403 ' +
+      'there reports a measurement that was never taken',
+    path: ['status'],
+  })
+  .refine((access) => access.outcome !== 'REDIRECTED' || access.destinationRoute !== null, {
+    message:
+      'a REDIRECTED outcome has to say where it landed, or it is indistinguishable from DENIED',
+    path: ['destinationRoute'],
+  });
+
+export const excludedPathSchema = z.object({
+  url: z.string().min(1).max(2_000),
+  route: z.string().max(2_000).nullable(),
+  kind: z.enum(EXCLUSION_KINDS),
+  /** Required and non-empty: a refusal with no rule is why this ledger exists. */
+  rule: z.string().min(1).max(300),
+  discoveredFrom: z.string().max(2_000).nullable(),
+});
+
+export const externalBoundarySchema = z.object({
+  kind: z.enum(EXTERNAL_KINDS),
+  /**
+   * An origin, enforced. A full URL here would store an IdP redirect's tenant,
+   * user hint and state token in a flow map that is rendered in a cockpit and
+   * exported on request, and no part of this product needs those values.
+   */
+  origin: originUrl,
+  fromRoute: z.string().max(2_000).nullable(),
+  samplePath: z
+    .string()
+    .max(2_000)
+    .regex(/^\/[^?#]*$/, 'a sample path is a path — no query string, no fragment')
+    .nullable(),
+  occurrences: z.number().int().min(1),
+});
+
+export const capBiteSchema = z.object({
+  cap: z.enum(CRAWL_CAPS),
+  limit: z.number().int().min(0),
+  bites: z.number().int().min(0),
+  /**
+   * Required, including when it is zero. An omitted `discarded` reads as "the
+   * cap cost nothing", and that is the exact claim a truncated crawl is not
+   * entitled to make.
+   */
+  discarded: z.number().int().min(0),
+  scope: z.string().max(2_000).nullable(),
+  reason: z.string().min(1).max(500),
+});
+
+export const frontierSchema = z
+  .object({
+    unvisitedQueued: z.number().int().min(0),
+    beyondDepth: z.number().int().min(0),
+    excluded: z.number().int().min(0),
+    offOrigin: z.number().int().min(0),
+    unreachable: z.number().int().min(0),
+    atLeastMoreUrls: z.number().int().min(0),
+    sample: z.array(z.string().min(1).max(2_000)).max(100),
+    sampleTruncated: z.boolean(),
+  })
+  .refine(
+    (frontier) => frontier.atLeastMoreUrls === frontier.unvisitedQueued + frontier.beyondDepth,
+    {
+      message:
+        'atLeastMoreUrls must equal unvisitedQueued + beyondDepth — it is a derived lower bound ' +
+        'on URLs we actually held, not an estimate a writer may choose',
+      path: ['atLeastMoreUrls'],
+    },
+  )
+  .refine(
+    (frontier) =>
+      !frontier.sampleTruncated ||
+      frontier.sample.length < frontier.atLeastMoreUrls + frontier.excluded,
+    {
+      message:
+        'sampleTruncated claims the sample is shorter than the frontier it came from, and it is not',
+      path: ['sampleTruncated'],
+    },
+  );
+
+export const crawlDegradationSchema = z.object({
+  kind: z.enum(CRAWL_DEGRADATIONS),
+  detail: z.string().min(1).max(500),
+  count: z.number().int().min(0),
+});
+
+export const crawlAcceptanceSchema = z
+  .object({
+    state: z.enum(CRAWL_ACCEPTANCE_STATES),
+    reasons: z.array(z.string().min(1).max(500)).max(50),
+    degradations: z.array(crawlDegradationSchema).max(50),
+    comparedToVersion: z.number().int().min(0).nullable(),
+    previousNodeCount: z.number().int().min(0).nullable(),
+  })
+  .refine((acceptance) => acceptance.state === 'ACCEPTED' || acceptance.reasons.length > 0, {
+    message:
+      'a CANDIDATE or REJECTED crawl must carry its reasons — "degraded" with no reason is a ' +
+      'denominator a customer cannot audit and will not believe',
+    path: ['reasons'],
+  });
+
+export const flowMapProvenanceSchema = z.object({
+  derivedFrom: z.enum(SURFACE_SOURCES),
+  acceptance: z.enum(CRAWL_ACCEPTANCE_STATES),
+  outcome: z.enum(ENUMERATION_OUTCOMES),
+});
+
+// ─── The surface registry ───────────────────────────────────────────────────
+
+export const surfaceExerciseSchema = z
+  .object({
+    state: z.enum(SURFACE_EXERCISABILITIES),
+    reason: z.enum(UNEXERCISABLE_REASONS).nullable().default(null),
+    rule: z.string().min(1).max(300).nullable().default(null),
+    detail: z.string().min(1).max(500),
+  })
+  .refine((exercise) => exercise.state !== 'UNEXERCISABLE' || exercise.reason !== null, {
+    message: 'UNEXERCISABLE needs a reason — "needs disposable data" is a remedy, a shrug is not',
+    path: ['reason'],
+  })
+  .refine((exercise) => exercise.state !== 'REFUSED' || exercise.rule !== null, {
+    message:
+      'REFUSED needs the rule that refused it, or a policy exclusion is indistinguishable from ' +
+      'a bug in our crawler',
+    path: ['rule'],
+  });
+
+export const dimensionCoordinateSchema = z.object({
+  dimension: z.enum(SURFACE_DIMENSION_KINDS),
+  /** The dimension row's `key`, in the application's own spelling. Never trimmed to lower case. */
+  value: z.string().min(1).max(200),
+});
+
+/**
+ * One item in the surface registry.
+ *
+ * `sources` is `.min(1)`: an item nobody declared has no business in a
+ * denominator, and this is the only validator between a MANUAL entry form and
+ * the row. `origin` is accepted but the server derives it with
+ * `originFromSources` — see the note on `SurfaceItem.sources`.
+ */
+export const surfaceItemSchema = z.object({
+  kind: z.enum(SURFACE_KINDS),
+  key: z.string().min(1).max(500),
+  label: z.string().min(1).max(500),
+  file: z.string().max(1_000).nullable().default(null),
+  line: z.number().int().min(1).nullable().default(null),
+  sources: z.array(z.enum(SURFACE_SOURCES)).min(1).max(8),
+  evidence: z.string().min(1).max(1_000),
+  detector: z.string().max(200).nullable().default(null),
+  exercise: surfaceExerciseSchema.nullable().default(null),
+  environmentId: z.string().min(1).max(64).nullable().default(null),
+  coordinates: z.array(dimensionCoordinateSchema).max(6).default([]),
+  meta: z.record(z.string(), z.unknown()).default({}),
+});
+
+/**
+ * The per-dimension detail, as a discriminated union.
+ *
+ * Twelve arms of `gateRuleSchema` and a `Record<GateRule['kind'], true>` exist
+ * because eight kinds could not be saved for two slices with nothing to notice.
+ * This union gets the same treatment from the start: `DIMENSION_DETAIL_KINDS`
+ * is compiler-enforced against the TypeScript union, and surface.test.ts
+ * asserts these options are exactly that list.
+ */
+export const dimensionDetailSchema = z.discriminatedUnion('dimension', [
+  z.object({
+    dimension: z.literal('ROLE'),
+    privileged: z.boolean(),
+    inheritsFrom: z.string().min(1).max(120).nullable().default(null),
+  }),
+  z.object({
+    dimension: z.literal('LOCALE'),
+    /** BCP-47 shape. Not a full registry check — `pt-BR`, `en`, `zh-Hant-TW`. */
+    tag: z
+      .string()
+      .min(2)
+      .max(35)
+      .regex(/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/, 'not a BCP-47 language tag'),
+    rtl: z.boolean(),
+  }),
+  z.object({
+    dimension: z.literal('DEVICE'),
+    widthPx: z.number().int().min(120).max(10_000),
+    heightPx: z.number().int().min(120).max(10_000),
+    touch: z.boolean(),
+    descriptor: z.string().min(1).max(120).nullable().default(null),
+  }),
+  z.object({
+    dimension: z.literal('FLAG'),
+    /**
+     * `.min(2)`: a flag with one variant changes nothing, so it is not a
+     * dimension — it is a constant, and counting it would add cells that cannot
+     * differ.
+     */
+    variants: z.array(z.string().min(1).max(120)).min(2).max(50),
+    defaultVariant: z.string().min(1).max(120).nullable().default(null),
+    provider: z.string().min(1).max(120).nullable().default(null),
+  }),
+  z.object({
+    dimension: z.literal('JOB'),
+    trigger: z.enum(['CRON', 'QUEUE', 'WEBHOOK', 'STARTUP', 'MANUAL']),
+    schedule: z.string().min(1).max(200).nullable().default(null),
+    publiclyTriggerable: z.boolean(),
+  }),
+  z.object({
+    dimension: z.literal('EMAIL'),
+    templateId: z.string().min(1).max(200),
+    sentBy: z.string().min(1).max(200).nullable().default(null),
+    transactional: z.boolean(),
+  }),
+]);
+
+/**
+ * One row of a dimension table.
+ *
+ * The cross-check between `kind` and `detail.dimension` is the whole point of
+ * having both: a LOCALE row carrying DEVICE detail would be a row no reader
+ * could render and no cell identity could be built from, and nothing else in
+ * the stack would catch it — Prisma stores the enum and the JSON
+ * independently.
+ */
+export const surfaceDimensionSchema = z
+  .object({
+    kind: z.enum(SURFACE_DIMENSION_KINDS),
+    key: z.string().min(1).max(200),
+    label: z.string().min(1).max(200),
+    source: z.enum(SURFACE_SOURCES),
+    evidence: z.string().min(1).max(1_000),
+    isDefault: z.boolean().default(false),
+    available: z.boolean().default(true),
+    detail: dimensionDetailSchema,
+    file: z.string().max(1_000).nullable().default(null),
+  })
+  .refine((row) => row.kind === row.detail.dimension, {
+    message: 'kind and detail.dimension disagree — one row cannot be two dimensions',
+    path: ['detail'],
+  })
+  .refine(
+    (row) =>
+      row.detail.dimension !== 'FLAG' ||
+      row.detail.defaultVariant === null ||
+      row.detail.variants.includes(row.detail.defaultVariant),
+    {
+      message: 'defaultVariant is not one of this flag’s variants',
+      path: ['detail', 'defaultVariant'],
+    },
+  );

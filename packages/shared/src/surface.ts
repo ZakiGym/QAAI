@@ -232,6 +232,55 @@ export interface SurfaceItem {
   detector: string | null;
   /** Kind-specific detail the cockpit renders — a form's fields, an auth kind. */
   meta?: Record<string, unknown>;
+
+  /*
+   * ─── Naming the invisible ──────────────────────────────────────────────────
+   *
+   * Every member below is OPTIONAL and distinguishes three states, exactly as
+   * `FormField`'s constraint capture does, because a `CoverageItem` row is
+   * STORED and every row written before this slice has none of them:
+   *
+   *   • absent    → this item predates the capture. Nobody classified it.
+   *   • null      → we looked and there is nothing to record.
+   *   • a value   → the recorded fact.
+   *
+   * Collapsing absent into a value is the specific failure this product cannot
+   * afford. "Nobody classified it" read as REFUSED drops the item from the
+   * denominator and raises the percentage; read as EXERCISABLE it claims a
+   * capability we have not got.
+   */
+
+  /**
+   * Every declarer that put this item in the inventory, newest first.
+   *
+   * `origin` above is the two-source summary and stays — 16 readers order and
+   * group by it. Derive it with `originFromSources` rather than setting both by
+   * hand, or the two will disagree about an item and only one of them will be
+   * on screen.
+   */
+  sources?: SurfaceSource[];
+  /**
+   * Whether a test may touch it here, and why not. An item whose surface
+   * nothing is permitted to drive is still COUNTED and NAMED — see
+   * `SURFACE_EXERCISABILITIES` for why dropping it instead is the move that
+   * makes a coverage number go up.
+   */
+  exercise?: SurfaceExercise | null;
+  /**
+   * The environment this item was observed in, when a crawl or traffic declared
+   * it. Null for a source declaration, which is environment-independent.
+   *
+   * Without it a staging-only route enters a production project's denominator
+   * and is reported as an uncovered production gap — the same defect as the 13
+   * flow-map readers that order by `version` across every environment.
+   */
+  environmentId?: string | null;
+  /**
+   * The dimension coordinates, for an item on a multi-axis kind. Parsed from
+   * `key` by `parseDimensionCellIdentity`; carried here so a reader does not
+   * have to parse, and so a cell with no coordinates is visibly wrong.
+   */
+  coordinates?: DimensionCoordinate[];
 }
 
 /** How a test came to be matched to an item — the audit trail for `COVERED`. */
@@ -309,6 +358,17 @@ export interface SurfaceItemCoverage {
   waiver?: SurfaceWaiver;
 }
 
+/**
+ * The exercisability of one coverage entry, read off the item.
+ *
+ * A function rather than a second field, so there is exactly one place that
+ * knows where the fact lives. `undefined` here means "never classified", which
+ * `exercisabilityCounts` deliberately counts — see the note there.
+ */
+export function exerciseOf(entry: SurfaceItemCoverage): SurfaceExercisability | null | undefined {
+  return entry.item.exercise?.state;
+}
+
 export interface SurfaceWaiver {
   reason: string;
   /** Who recorded it — a waiver with no owner is a silent exclusion. */
@@ -348,6 +408,695 @@ export function parseSurfaceKey(key: string): { kind: SurfaceKind; identity: str
   return { kind, identity };
 }
 
+// ─── Sources: WHICH DECLARER PUT IT IN THE INVENTORY ────────────────────────
+
+/**
+ * The declarer that put an item in the inventory.
+ *
+ * `SurfaceOrigin` above answers a two-source question — source analysis, or a
+ * crawl — because for two slices those were the only two declarers that
+ * existed. That is also why the whole class of surface that NEITHER can see
+ * was absent from the denominator rather than uncovered: a background job, an
+ * outbound email, a webhook receiver, a feature flag, a role, a locale, an
+ * error path, a download. Nothing crawls them and no route table declares
+ * them, so they were not UNCOVERED — they were not THERE.
+ *
+ * Absent and uncovered are opposite facts. Uncovered lowers the percentage and
+ * gets a line in the named list; absent raises it and gets nothing. Every
+ * silent omission in a coverage product moves the number the same way, which
+ * is why the declarer is now a stored field rather than an inference from two
+ * booleans.
+ *
+ * The eight members are the eight ways this product can learn that something
+ * exists, and they are deliberately ranked by what they PROVE:
+ *
+ *   · CRAWL and TRAFFIC are OBSERVATIONS. Something answered. The thing exists.
+ *   · SOURCE, SITEMAP and OPENAPI are DECLARATIONS a machine read. The repo
+ *     says it exists; it may be dead code.
+ *   · REQUIREMENT, MANUAL and CATALOGUE are DECLARATIONS A HUMAN MADE. A
+ *     requirement document, somebody typing it in, or a catalogue of jobs and
+ *     email templates the team maintains. These are the only declarers that can
+ *     name an uncrawlable surface at all, which is exactly why they exist.
+ */
+export const SURFACE_SOURCES = [
+  /** A crawl reached it. */
+  'CRAWL',
+  /** A source detector read it out of the repository. */
+  'SOURCE',
+  /** The application's own sitemap.xml listed it. */
+  'SITEMAP',
+  /** An OpenAPI/Swagger document declared the operation. */
+  'OPENAPI',
+  /** Real traffic was observed against it (a HAR, an access log, a proxy). */
+  'TRAFFIC',
+  /** A requirement, ticket or specification named it. */
+  'REQUIREMENT',
+  /** A human entered it. The only declarer for a surface nothing can read. */
+  'MANUAL',
+  /**
+   * A maintained catalogue the customer already has: the job registry, the
+   * email-template directory, the flag provider, the locale table. Machine
+   * read, like SOURCE, but out of a system rather than out of the repo.
+   */
+  'CATALOGUE',
+] as const;
+export type SurfaceSource = (typeof SURFACE_SOURCES)[number];
+
+export const SURFACE_SOURCE_LABELS: Record<SurfaceSource, string> = {
+  CRAWL: 'reached by a crawl',
+  SOURCE: 'declared in source',
+  SITEMAP: 'listed in sitemap.xml',
+  OPENAPI: 'declared in an OpenAPI document',
+  TRAFFIC: 'seen in real traffic',
+  REQUIREMENT: 'named in a requirement',
+  MANUAL: 'entered by hand',
+  CATALOGUE: 'listed in a catalogue',
+};
+
+/**
+ * The declarers that OBSERVED the thing answering, rather than reading a claim
+ * that it exists.
+ *
+ * Load-bearing in two places. `originFromSources` below derives the legacy
+ * SOURCE_ONLY/CRAWL_ONLY/BOTH from this split, so the two vocabularies cannot
+ * come to disagree; and `selectFlowMap` in flow-map.ts refuses to let a
+ * DECLARED map displace an OBSERVED one, which is the defect where a
+ * source-derived flow map at v9 silently replaced a real crawl at v8.
+ */
+export const OBSERVED_SOURCES: readonly SurfaceSource[] = ['CRAWL', 'TRAFFIC'];
+
+/** True when this declarer watched the thing answer. */
+export function isObservedSource(source: SurfaceSource): boolean {
+  return OBSERVED_SOURCES.includes(source);
+}
+
+/**
+ * The legacy three-valued origin, derived from the declarer set.
+ *
+ * Returns NULL for an empty set, and null is the point: an item whose
+ * declarers were never recorded has no origin, and defaulting it to BOTH (the
+ * flattering answer) or SOURCE_ONLY (the alarming one) would be a fact we
+ * invented. Every stored `CoverageItem` written before the `sources` column
+ * existed is in exactly that state.
+ */
+export function originFromSources(sources: readonly SurfaceSource[]): SurfaceOrigin | null {
+  if (sources.length === 0) return null;
+  const observed = sources.some(isObservedSource);
+  const declared = sources.some((source) => !isObservedSource(source));
+  if (observed && declared) return 'BOTH';
+  return observed ? 'CRAWL_ONLY' : 'SOURCE_ONLY';
+}
+
+// ─── Exercisability: can a test touch it AT ALL ──────────────────────────────
+
+/**
+ * Whether a test can exercise this item, and the two reasons it cannot.
+ *
+ * This is not coverage and must never be stored as coverage. An item QAAI
+ * cannot exercise is still IN THE INVENTORY — it is named, it is counted as a
+ * surface, and the report says why it is not in the coverage denominator.
+ * Dropping it instead is the move that makes the percentage go up, because the
+ * hardest surfaces are the ones that get dropped.
+ *
+ * Three states, and the distinction between the last two is the one that
+ * matters most:
+ *
+ *   EXERCISABLE    a test can drive it with the data and credentials we have.
+ *   UNEXERCISABLE  it exists and is testable in principle, but not SAFELY here:
+ *                  it ends the session, or it destroys data we cannot replace.
+ *                  Give it disposable data and it becomes exercisable — so this
+ *                  is a statement about the ENVIRONMENT, not about the surface.
+ *   REFUSED        policy excluded it. We did not look. Nothing is claimed
+ *                  about it in either direction.
+ *
+ * A REFUSED surface and a surface that DOES NOT EXIST must never be recorded
+ * the same way, which is the specific defect in the crawler today: /logout,
+ * /delete-*, /destroy and __reset are dropped with no record at all, so a route
+ * we refused is indistinguishable from a route the app does not serve.
+ */
+export const SURFACE_EXERCISABILITIES = ['EXERCISABLE', 'UNEXERCISABLE', 'REFUSED'] as const;
+export type SurfaceExercisability = (typeof SURFACE_EXERCISABILITIES)[number];
+
+export const SURFACE_EXERCISABILITY_LABELS: Record<SurfaceExercisability, string> = {
+  EXERCISABLE: 'a test can drive it here',
+  UNEXERCISABLE: 'needs disposable data — not safe to drive in this environment',
+  REFUSED: 'excluded by policy; never attempted',
+};
+
+/**
+ * Why an item is UNEXERCISABLE. A closed vocabulary because the report groups
+ * by it and because "needs disposable data" is a remedy a customer can act on,
+ * while a free-text sentence is one they can only read.
+ */
+export const UNEXERCISABLE_REASONS = [
+  /** Driving it logs the session out, so the rest of the crawl is anonymous. */
+  'SESSION_ENDING',
+  /** It deletes or cancels something we cannot restore. */
+  'DESTRUCTIVE',
+  /** It needs a record we are allowed to consume, and none is provisioned. */
+  'NEEDS_DISPOSABLE_DATA',
+  /** It charges money, sends mail to a real person, or calls a paid third party. */
+  'REAL_WORLD_SIDE_EFFECT',
+  /** We have no capability for it here: no CDP, no download sink, no mailbox. */
+  'CAPABILITY_UNAVAILABLE',
+  /** It needs a role, flag or locale this environment cannot produce. */
+  'DIMENSION_UNAVAILABLE',
+] as const;
+export type UnexercisableReason = (typeof UNEXERCISABLE_REASONS)[number];
+
+export const UNEXERCISABLE_REASON_LABELS: Record<UnexercisableReason, string> = {
+  SESSION_ENDING: 'ends the session',
+  DESTRUCTIVE: 'destroys data that cannot be restored here',
+  NEEDS_DISPOSABLE_DATA: 'needs a disposable record and none is provisioned',
+  REAL_WORLD_SIDE_EFFECT: 'has a real-world side effect — money, mail, a third party',
+  CAPABILITY_UNAVAILABLE: 'the capability it needs is not available here',
+  DIMENSION_UNAVAILABLE: 'needs a role, flag or locale this environment cannot produce',
+};
+
+/**
+ * Exercisabilities that keep an item in the INVENTORY and out of the COVERAGE
+ * denominator.
+ *
+ * Dividing by an item nothing is permitted to touch produces a permanent,
+ * unclosable gap, and a target nobody can reach gets gamed instead of met —
+ * the same argument that justifies `EXCLUDED_STATUSES`. The difference is the
+ * direction of the honesty requirement: a waiver is a decision the TEAM made
+ * and is shown next to the number, while these two are limits OUR harness has,
+ * so the report has to name them as our limits rather than their waivers.
+ */
+export const NON_DENOMINATOR_EXERCISABILITIES: readonly SurfaceExercisability[] = [
+  'UNEXERCISABLE',
+  'REFUSED',
+];
+
+/**
+ * Whether this entry's exercisability lets it into the coverage denominator.
+ *
+ * UNDEFINED COUNTS, and that is deliberate. Every `CoverageItem` row written
+ * before the column existed has no exercisability, and reading "nobody
+ * classified it" as "we are not allowed to touch it" would quietly drop most
+ * of an existing install's denominator in one deploy — the percentage would
+ * jump on the day of the migration and nothing would explain why.
+ */
+export function exercisabilityCounts(value: SurfaceExercisability | null | undefined): boolean {
+  if (value === null || value === undefined) return true;
+  return !NON_DENOMINATOR_EXERCISABILITIES.includes(value);
+}
+
+/**
+ * One item's exercisability, with the evidence for it.
+ *
+ * `rule` is required for REFUSED and is the whole point of the state: "excluded
+ * by policy" with no rule named is indistinguishable from a bug in the crawler,
+ * and the customer's only possible response to it is to distrust the number.
+ */
+export interface SurfaceExercise {
+  state: SurfaceExercisability;
+  /** Set when state is UNEXERCISABLE. */
+  reason?: UnexercisableReason | null;
+  /**
+   * The policy rule that refused it, when state is REFUSED — a rule id a human
+   * can look up in the environment's crawl policy, never a dumped regex.
+   */
+  rule?: string | null;
+  /** The sentence shown next to it. Always written, never defaulted to ''. */
+  detail: string;
+}
+
+// ─── Dimensions: the axes that were strings in a blob ───────────────────────
+
+/**
+ * The dimensions a surface item can be multiplied along.
+ *
+ * Today roles, locales, devices, flags, jobs and emails exist only as strings
+ * inside one JSONB blob — `requiresRoles` on a flow node, a locale list in a
+ * spec, a device name in a test title. A string inside a blob cannot be
+ * counted, so "route × role × locale" has never been a denominator: there was
+ * nothing to divide by. Each of these becomes a queryable row (model
+ * `SurfaceDimension`), scoped to an org and a project, carrying the source that
+ * declared it.
+ *
+ * Six and not twelve: these are the dimensions whose VALUES are enumerable
+ * independently of the pages they apply to. A component state or a data variant
+ * is a property of one item and belongs on that item, not in a shared table.
+ */
+export const SURFACE_DIMENSION_KINDS = [
+  'ROLE',
+  'LOCALE',
+  'DEVICE',
+  'FLAG',
+  'JOB',
+  'EMAIL',
+] as const;
+export type SurfaceDimensionKind = (typeof SURFACE_DIMENSION_KINDS)[number];
+
+export const SURFACE_DIMENSION_LABELS: Record<SurfaceDimensionKind, string> = {
+  ROLE: 'Roles',
+  LOCALE: 'Locales',
+  DEVICE: 'Devices and viewports',
+  FLAG: 'Feature flags',
+  JOB: 'Jobs, crons and webhook receivers',
+  EMAIL: 'Emails and notifications',
+};
+
+/**
+ * Which existing axis each dimension's cells land on.
+ *
+ * A `Record` keyed on the dimension union, so a seventh dimension breaks this
+ * line rather than quietly producing cells with no axis to be counted on. The
+ * mapping is also the reason this is an extension and not a fork: the twelve
+ * `SURFACE_KINDS` already named every one of these axes, and a dimension whose
+ * cells landed on a thirteenth kind would be a second denominator.
+ *
+ * JOB and EMAIL map to axes whose cells are not pairings at all — a job is a
+ * surface in its own right, not a route × job cell. They are in this table
+ * anyway because the question "how many jobs does this app have" needs the same
+ * enumerable, sourced, org-scoped row as the question "how many roles", and
+ * `dimensionDenominator` below is given no base keys for them.
+ */
+export const DIMENSION_AXIS: Record<SurfaceDimensionKind, SurfaceKind> = {
+  ROLE: 'ROLE_CELL',
+  LOCALE: 'DEVICE_LOCALE',
+  DEVICE: 'DEVICE_LOCALE',
+  FLAG: 'FLAG_COMBINATION',
+  JOB: 'BACKGROUND_JOB',
+  EMAIL: 'NOTIFICATION',
+};
+
+/**
+ * The per-dimension detail, as a discriminated union.
+ *
+ * ── Why a union and not a `Record<string, unknown>` ─────────────────────────
+ *
+ * Because the six are not the same shape and pretending they are is the defect
+ * item 2 of the register names. A locale has a BCP-47 tag and a text direction;
+ * a device has a width, a height and whether it is touch; a flag has variants
+ * and a default; a job has a trigger and a schedule; an email has a template id
+ * and what sends it. Flattened into one blob of strings, not one of those
+ * properties can be validated on the way in or filtered on the way out, and a
+ * device with no width cannot be used to drive anything.
+ *
+ * ── The write path, and the pattern this copies ─────────────────────────────
+ *
+ * This union HAS a write path (`dimensionDetailSchema` in schemas.ts is the
+ * only way a row is created), so it carries both halves of the guard that
+ * `GateRule` now has: `DIMENSION_DETAIL_PRESENT` is a
+ * `Record<DimensionDetail['dimension'], true>` the compiler refuses to let
+ * drift, and a run-time parity test in surface.test.ts compares that list
+ * against the zod union's own options. Two mechanisms because each catches what
+ * the other cannot — eight `GateRule` kinds were unsaveable by any customer for
+ * two slices precisely because only one existed.
+ */
+export type DimensionDetail =
+  | {
+      dimension: 'ROLE';
+      /**
+       * True for a role that can reach administrative surface. Not cosmetic: a
+       * route × role cell for a privileged role is where an authorization
+       * defect is worth finding, and the ranking has to come from somewhere
+       * other than the role's name.
+       */
+      privileged: boolean;
+      /** The role this one inherits from, when the app declares a hierarchy. */
+      inheritsFrom: string | null;
+    }
+  | {
+      dimension: 'LOCALE';
+      /** BCP-47 as the app spells it: `pt-BR`, not `pt_br`. */
+      tag: string;
+      /** RTL locales re-lay-out the page, so they are not a string swap. */
+      rtl: boolean;
+    }
+  | {
+      dimension: 'DEVICE';
+      widthPx: number;
+      heightPx: number;
+      touch: boolean;
+      /** Playwright device descriptor name, when it is one of theirs. */
+      descriptor: string | null;
+    }
+  | {
+      dimension: 'FLAG';
+      /** Every value this flag can take. `['on','off']` for a boolean flag. */
+      variants: string[];
+      /** The variant served when nothing overrides it. Null when unknown. */
+      defaultVariant: string | null;
+      /** The provider it is read from: LaunchDarkly, a table, an env var. */
+      provider: string | null;
+    }
+  | {
+      dimension: 'JOB';
+      /** How it starts: CRON, QUEUE, WEBHOOK, STARTUP, MANUAL. */
+      trigger: string;
+      /** Cron expression or queue name — whatever the trigger implies. */
+      schedule: string | null;
+      /** True for a receiver the public internet can reach. */
+      publiclyTriggerable: boolean;
+    }
+  | {
+      dimension: 'EMAIL';
+      /** The template identity, which is what a mailbox assertion matches on. */
+      templateId: string;
+      /** What sends it, in the customer's words. */
+      sentBy: string | null;
+      /** Transactional mail is testable; a marketing blast is usually waived. */
+      transactional: boolean;
+    };
+
+/**
+ * Every discriminant `DimensionDetail` has, as a run-time value. See the note
+ * on the union above: the compiler enforces this record, and surface.test.ts
+ * enforces the zod union against it.
+ */
+const DIMENSION_DETAIL_PRESENT: Record<DimensionDetail['dimension'], true> = {
+  ROLE: true,
+  LOCALE: true,
+  DEVICE: true,
+  FLAG: true,
+  JOB: true,
+  EMAIL: true,
+};
+
+export const DIMENSION_DETAIL_KINDS = Object.keys(DIMENSION_DETAIL_PRESENT) as ReadonlyArray<
+  DimensionDetail['dimension']
+>;
+
+/**
+ * One row of a dimension table.
+ *
+ * `key` is the identity and is scoped to (project, kind): two projects may both
+ * have an `ADMIN` role and they are different things. `label` is for people;
+ * `key` is what a cell identity is built from, so it must be the spelling the
+ * APPLICATION uses — never title-cased, never lower-cased on the way in. A role
+ * the app calls `Admin` and a role it calls `admin` are two roles until the
+ * customer says otherwise, and normalising them here would merge two cells and
+ * shrink a denominator silently.
+ */
+export interface SurfaceDimensionValue {
+  kind: SurfaceDimensionKind;
+  /** Identity within (project, kind). The app's own spelling. */
+  key: string;
+  label: string;
+  /** Which declarer put it in the table. */
+  source: SurfaceSource;
+  /** The sentence that justifies the row, same contract as `SurfaceItem`. */
+  evidence: string;
+  /**
+   * True for the value used when nothing selects one: the anonymous role, the
+   * default locale, the desktop viewport, the flag's off state. At most one per
+   * (project, kind) — enforced by the writer, because two defaults make
+   * `dimensionDenominator`'s default-cell arithmetic ambiguous.
+   */
+  isDefault: boolean;
+  /**
+   * Whether this environment can actually produce the value. A role we hold no
+   * credentials for is DIMENSION_UNAVAILABLE on every cell it appears in, and
+   * saying so is better than reporting those cells as uncovered.
+   */
+  available: boolean;
+  detail: DimensionDetail;
+  /** Repo-relative file or catalogue reference, when a reader found one. */
+  file?: string | null;
+}
+
+// ─── Cell identity: the key six writers must agree on ───────────────────────
+
+/**
+ * How a multi-axis cell's identity is spelled, and why it is a function.
+ *
+ * Several independent writers mint these — the role prober, the locale sweep,
+ * the flag enumerator, the manual entry form — and a cell is only diffable
+ * across runs if every one of them produces a byte-identical key. The format
+ * is deliberately readable, because customers paste these into waiver files:
+ *
+ *   /admin/billing|ROLE=VIEWER
+ *   /checkout|DEVICE=iphone-15|LOCALE=pt-BR
+ *
+ * Rules, all four of which are tested:
+ *
+ *   1. Coordinates are sorted by the dimension's position in
+ *      `SURFACE_DIMENSION_KINDS`, not alphabetically. Declaration order is
+ *      fixed in this file; alphabetical order of what a customer happens to
+ *      have configured is not, and re-sorting a key retires every cell and
+ *      mints a new one.
+ *   2. Values keep their case. See `SurfaceDimensionValue.key`.
+ *   3. `|`, `=` and `%` inside a base or a value are percent-encoded, so a
+ *      locale called `a=b` cannot forge a second coordinate.
+ *   4. One coordinate per dimension. Two LOCALE values in one cell is not a
+ *      cell, it is two, and this throws rather than silently keeping the last.
+ */
+export interface DimensionCoordinate {
+  dimension: SurfaceDimensionKind;
+  /** The `SurfaceDimensionValue.key`, not the label. */
+  value: string;
+}
+
+/** Percent-encodes only the three characters the format reserves. */
+function encodeCellPart(raw: string): string {
+  return raw.replace(/[%|=]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function decodeCellPart(raw: string): string {
+  return raw.replace(/%(25|7C|3D)/gi, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  );
+}
+
+/**
+ * The identity of one multi-axis cell. Pass it to {@link surfaceKey} with the
+ * axis from {@link DIMENSION_AXIS} to get the stored `CoverageItem.key`.
+ */
+export function dimensionCellIdentity(
+  base: string,
+  coordinates: readonly DimensionCoordinate[],
+): string {
+  if (base.length === 0) throw new Error('a dimension cell needs a base identity');
+  const seen = new Set<SurfaceDimensionKind>();
+  for (const coordinate of coordinates) {
+    if (seen.has(coordinate.dimension)) {
+      throw new Error(
+        `two ${coordinate.dimension} coordinates in one cell — that is two cells, not one`,
+      );
+    }
+    seen.add(coordinate.dimension);
+  }
+  const ordered = [...coordinates].sort(
+    (left, right) =>
+      SURFACE_DIMENSION_KINDS.indexOf(left.dimension) -
+      SURFACE_DIMENSION_KINDS.indexOf(right.dimension),
+  );
+  return [
+    encodeCellPart(base),
+    ...ordered.map((coordinate) => `${coordinate.dimension}=${encodeCellPart(coordinate.value)}`),
+  ].join('|');
+}
+
+/** Splits a cell identity back apart. Null when the string is not one of ours. */
+export function parseDimensionCellIdentity(
+  identity: string,
+): { base: string; coordinates: DimensionCoordinate[] } | null {
+  const parts = identity.split('|');
+  const rawBase = parts.shift();
+  if (rawBase === undefined || rawBase.length === 0) return null;
+
+  const coordinates: DimensionCoordinate[] = [];
+  for (const part of parts) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) return null;
+    const dimension = part.slice(0, separator) as SurfaceDimensionKind;
+    if (!SURFACE_DIMENSION_KINDS.includes(dimension)) return null;
+    const value = decodeCellPart(part.slice(separator + 1));
+    if (value.length === 0) return null;
+    coordinates.push({ dimension, value });
+  }
+  return { base: decodeCellPart(rawBase), coordinates };
+}
+
+// ─── The multi-axis denominator, which is NOT the cross product ─────────────
+
+/**
+ * How a multi-axis denominator is computed. The short answer: by COUNTING
+ * DECLARED PAIRINGS and reporting the cross product beside them, never by
+ * multiplying.
+ *
+ * ── Why the cross product is the wrong answer ───────────────────────────────
+ *
+ * 412 routes × 7 roles × 12 locales × 4 devices is 138,432 cells. Printing that
+ * as a denominator makes every real number look like a rounding error, and it
+ * is also false: it asserts that every role interacts with every locale on
+ * every route, which no source anywhere has declared. A vendor who multiplies
+ * is not measuring more of the app, they are dividing by a number they made up
+ * — and the percentage that falls out moves whenever a customer adds a locale,
+ * for no reason connected to their tests.
+ *
+ * ── What the answer is ──────────────────────────────────────────────────────
+ *
+ * A cell enters the denominator when a SOURCE DECLARED that the dimension
+ * changes this item's behaviour. `/admin/billing` declares a role requirement,
+ * so it has one cell per role in that declaration. `/pricing` declares none, so
+ * it has exactly one cell, at the default value, and that cell is counted
+ * SEPARATELY (`defaultCells`) so a reader can see how much of the axis is
+ * "nobody has said anything about this".
+ *
+ * Three numbers are therefore reported and none of them is derivable from the
+ * others:
+ *
+ *   declaredCells  pairings a declarer asserted. The real denominator.
+ *   defaultCells   bases with no declaration, counted once at the default.
+ *   crossProduct   bases × values. Reported so the gap between what is
+ *                  POSSIBLE and what is DECLARED is visible rather than
+ *                  implied — and so nobody has to guess whether we multiplied.
+ *
+ * ── The finding this produces ───────────────────────────────────────────────
+ *
+ * `unpairedValues` is the sentence a customer forwards: "no route anywhere
+ * declares the SUPPORT role". That is either a role nobody uses or an entire
+ * authorization surface nothing has ever looked at, and both are worth a
+ * meeting. It is only computable because the values are rows now.
+ */
+export interface DimensionDenominatorInput {
+  dimension: SurfaceDimensionKind;
+  /**
+   * Identities of the items that can be paired — normally the ROUTE and
+   * ENDPOINT axes. Empty for JOB and EMAIL, whose cells are not pairings.
+   */
+  baseKeys: readonly string[];
+  /** The dimension's values for this project, as rows. */
+  values: readonly string[];
+  /** The value used when nothing is declared, or null when there is none. */
+  defaultValue: string | null;
+  /**
+   * base identity → the values a declarer says change this item's behaviour.
+   * A base absent from the map has no declaration and contributes a default
+   * cell only.
+   */
+  declared: ReadonlyMap<string, readonly string[]>;
+}
+
+export interface DimensionDenominator {
+  dimension: SurfaceDimensionKind;
+  /** The `SURFACE_KINDS` axis these cells are counted on. */
+  axis: SurfaceKind;
+  /** Pairings a declarer asserted. */
+  declaredCells: number;
+  /** Bases with no declaration, counted once at the default value. */
+  defaultCells: number;
+  /** `declaredCells + defaultCells`. What to divide by. */
+  cells: number;
+  /** `baseKeys.length * values.length`. Never the denominator. */
+  crossProduct: number;
+  /** Bases a declarer said something about. */
+  pairedBases: number;
+  /** Bases nothing declared. */
+  unpairedBases: number;
+  /** Values no base declares and which are not the default. A finding. */
+  unpairedValues: string[];
+  /**
+   * Values a declaration named that the dimension table does not hold. Counted
+   * nowhere — a pairing against a value that does not exist is a dangling
+   * reference in OUR extractor, and inflating the denominator with it would
+   * hide our own error rate.
+   */
+  undeclaredValues: string[];
+  /** The sentence the report prints where a product would otherwise go. */
+  rule: string;
+}
+
+export function dimensionDenominator(input: DimensionDenominatorInput): DimensionDenominator {
+  const known = new Set(input.values);
+  const paired = new Set<string>();
+  const usedValues = new Set<string>();
+  const undeclared = new Set<string>();
+
+  let declaredCells = 0;
+  let defaultCells = 0;
+
+  for (const base of input.baseKeys) {
+    const declaration = input.declared.get(base);
+    /*
+     * Filtered against the dimension table on purpose, and the filter is what
+     * keeps `cells <= crossProduct` true. A declaration naming a value no row
+     * holds would otherwise push the denominator above the cross product, which
+     * is an arithmetic impossibility a reader would rightly refuse to believe.
+     */
+    const usable = (declaration ?? []).filter((value) => {
+      if (known.has(value)) return true;
+      undeclared.add(value);
+      return false;
+    });
+
+    if (usable.length > 0) {
+      paired.add(base);
+      declaredCells += new Set(usable).size;
+      for (const value of usable) usedValues.add(value);
+      continue;
+    }
+    // No usable declaration. One cell at the default, or none when the project
+    // has not said what its default is — inventing one would be inventing a
+    // measurement.
+    if (input.defaultValue !== null) defaultCells += 1;
+  }
+
+  const unpairedValues = input.values.filter(
+    (value) => !usedValues.has(value) && value !== input.defaultValue,
+  );
+
+  return {
+    dimension: input.dimension,
+    axis: DIMENSION_AXIS[input.dimension],
+    declaredCells,
+    defaultCells,
+    cells: declaredCells + defaultCells,
+    crossProduct: input.baseKeys.length * input.values.length,
+    pairedBases: paired.size,
+    unpairedBases: input.baseKeys.length - paired.size,
+    unpairedValues,
+    undeclaredValues: [...undeclared],
+    rule:
+      `${declaredCells} declared pairing(s) plus ${defaultCells} default cell(s); ` +
+      `the cross product would be ${input.baseKeys.length} × ${input.values.length} = ` +
+      `${input.baseKeys.length * input.values.length}, which is not what was counted`,
+  };
+}
+
+export interface MultiAxisDenominator {
+  /** The sum over dimensions. A SUM — see `rule`. */
+  cells: number;
+  /** The sum of each dimension's cross product, for the same comparison. */
+  crossProduct: number;
+  byDimension: DimensionDenominator[];
+  rule: string;
+}
+
+/**
+ * Rolls the per-dimension counts into one number by ADDING them.
+ *
+ * Adding, not multiplying, and this is the sentence the product has to be able
+ * to defend: a route × role cell and a route × locale cell are two separate
+ * things to test, so they add. A route × role × locale cell would be a third
+ * thing — and it only exists if some declarer said that role and locale
+ * interact on that route. Multiplying the dimensions together asserts that
+ * interaction for every combination, which is the lie the cross product tells.
+ *
+ * When a genuine three-way cell does exist, its identity carries all three
+ * coordinates (see `dimensionCellIdentity`) and it is one item on one axis —
+ * counted once, by the same arithmetic as everything else.
+ */
+export function multiAxisDenominator(parts: readonly DimensionDenominator[]): MultiAxisDenominator {
+  const cells = parts.reduce((running, part) => running + part.cells, 0);
+  const crossProduct = parts.reduce((running, part) => running + part.crossProduct, 0);
+  return {
+    cells,
+    crossProduct,
+    byDimension: [...parts],
+    rule:
+      `${cells} cell(s), summed across ${parts.length} dimension(s) and never multiplied: ` +
+      `a route × role cell and a route × locale cell are two things to test, not one ` +
+      `combined thing. A three-way cell is counted once, on one axis, when a declarer ` +
+      `says the dimensions interact.`,
+  };
+}
+
 // ─── Snapshots ───────────────────────────────────────────────────────────────
 
 /** Per-axis arithmetic. Every field is a count, so the division is checkable. */
@@ -360,6 +1109,23 @@ export interface SurfaceKindTotals {
   uncovered: number;
   unknown: number;
   waived: number;
+  /**
+   * Items held out of the denominator because OUR harness cannot drive them
+   * safely here, and items a policy rule refused.
+   *
+   * Optional, and for the same reason as `FormField.maxLength`: `byKind` is
+   * stored as JSON on every `CoverageSnapshot` ever written, and a snapshot
+   * from before this slice has not got these numbers. Absent means "this
+   * measurement did not classify exercisability"; 0 means "it did, and found
+   * none". A reader that cannot tell those apart will report an old install as
+   * having nothing unexercisable, which is a claim it has no evidence for.
+   *
+   * They are NOT part of `denominator`, and they are not part of `waived`
+   * either: a waiver is the team's decision, these two are our limits, and a
+   * report that merged them would blame the customer for our harness.
+   */
+  unexercisable?: number;
+  refused?: number;
   /**
    * `covered / denominator`, rounded to one decimal, or null when the
    * denominator is zero.
@@ -382,6 +1148,9 @@ export interface SurfaceSnapshotTotals {
   uncovered: number;
   unknown: number;
   waived: number;
+  /** Summed from the per-axis counts. Optional for the same stored-JSON reason. */
+  unexercisable?: number;
+  refused?: number;
   byKind: SurfaceKindTotals[];
   /** Items the source declares that no crawl has reached. */
   declaredNeverReached: number;
@@ -440,6 +1209,18 @@ export interface DarkSurfaceReport {
   unknown: SurfaceItemCoverage[];
   /** Waived items, so an exclusion is always visible next to the number. */
   waived: SurfaceItemCoverage[];
+  /**
+   * Items held out because this harness cannot drive them here, and items a
+   * policy rule refused. Two lists and not one: "give us a disposable account
+   * and we will test these 14" and "your crawl policy excluded these 31" are
+   * different sentences with different remedies, and the second one is the only
+   * place a reader ever learns that a refusal happened at all.
+   *
+   * They are listed for the same reason `unmeasuredKinds` is: an exclusion that
+   * appears nowhere is indistinguishable from a surface that does not exist.
+   */
+  unexercisable: SurfaceItemCoverage[];
+  refused: SurfaceItemCoverage[];
   /** Axes with no extractor, named so the gap in our own measurement is stated. */
   unmeasuredKinds: SurfaceKind[];
   /** True when more uncovered items exist than were returned. */
@@ -482,7 +1263,30 @@ export function totalsForKind(
   const waived = count('WAIVED');
   const covered = mine.filter((entry) => COVERED_STATUSES.includes(entry.status)).length;
   const excluded = mine.filter((entry) => EXCLUDED_STATUSES.includes(entry.status)).length;
-  const denominator = mine.length - excluded;
+
+  /*
+   * The second exclusion, and it is a different KIND of exclusion.
+   *
+   * `EXCLUDED_STATUSES` holds out what the team decided not to test.
+   * `NON_DENOMINATOR_EXERCISABILITIES` holds out what THIS HARNESS cannot drive
+   * here — a session-ending flow with no disposable account, a destructive
+   * endpoint, a path a policy rule refused. Both leave the item in the
+   * inventory and both are counted, separately, because the remedy differs:
+   * one is a conversation with the team and the other is work for us.
+   *
+   * A waived item is counted only once. Without the `&&` an item that is both
+   * waived and unexercisable would be subtracted twice and the denominator
+   * would come out below the number of items it was derived from — the kind of
+   * arithmetic error a customer reproduces in a spreadsheet and never trusts us
+   * again after.
+   */
+  const heldOut = mine.filter(
+    (entry) =>
+      !EXCLUDED_STATUSES.includes(entry.status) && !exercisabilityCounts(exerciseOf(entry)),
+  );
+  const unexercisable = heldOut.filter((entry) => exerciseOf(entry) === 'UNEXERCISABLE').length;
+  const refused = heldOut.filter((entry) => exerciseOf(entry) === 'REFUSED').length;
+  const denominator = mine.length - excluded - heldOut.length;
 
   return {
     kind,
@@ -492,6 +1296,8 @@ export function totalsForKind(
     uncovered: count('UNCOVERED'),
     unknown: count('UNKNOWN'),
     waived,
+    unexercisable,
+    refused,
     percent: coveragePercent(covered, denominator),
     measured: MEASURED_SURFACE_KINDS.includes(kind),
   };
@@ -507,8 +1313,17 @@ export function totalsForKind(
  * second is a fact about our product.
  */
 export function totalsForItems(items: readonly SurfaceItemCoverage[]): SurfaceSnapshotTotals {
+  /*
+   * `+ unexercisable + refused` in the keep-it predicate, because without them
+   * an unmeasured axis holding nothing BUT held-out items vanished from the
+   * report entirely: denominator 0, waived 0, filtered out. That is the exact
+   * shape of the bug this slice exists to end — the surfaces we cannot drive
+   * are the ones most worth naming, and they were the ones that disappeared.
+   */
   const byKind = SURFACE_KINDS.map((kind) => totalsForKind(kind, items)).filter(
-    (totals) => totals.measured || totals.denominator + totals.waived > 0,
+    (totals) =>
+      totals.measured ||
+      totals.denominator + totals.waived + (totals.unexercisable ?? 0) + (totals.refused ?? 0) > 0,
   );
 
   const measured = byKind.filter((totals) => totals.measured);
@@ -526,6 +1341,8 @@ export function totalsForItems(items: readonly SurfaceItemCoverage[]): SurfaceSn
     uncovered: sum((t) => t.uncovered),
     unknown: sum((t) => t.unknown),
     waived: sum((t) => t.waived),
+    unexercisable: sum((t) => t.unexercisable ?? 0),
+    refused: sum((t) => t.refused ?? 0),
     byKind,
     declaredNeverReached: items.filter((entry) => entry.item.origin === 'SOURCE_ONLY').length,
     reachedNeverDeclared: items.filter((entry) => entry.item.origin === 'CRAWL_ONLY').length,

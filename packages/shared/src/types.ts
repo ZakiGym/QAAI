@@ -19,6 +19,14 @@ import type {
 } from './constants';
 import type { RunJob } from './jobs';
 /*
+ * TYPE-ONLY, for the same reason as the `PerformanceMetric` import below:
+ * `schemas.ts` imports values out of this file, so a value import from a module
+ * that `schemas.ts` also imports would close the cycle. `verbatimModuleSyntax`
+ * erases this line, and the graph that executes stays schemas → flow-map →
+ * surface → constants with no edge back into here.
+ */
+import type { AppliedCrawlPolicy } from './flow-map';
+/*
  * The vitals vocabulary, imported rather than restated: `MAX_VITAL_BREACHES`
  * names a metric, and a gate that spelled its own six metric names would drift
  * from the plugin that measures them the first time a seventh is added.
@@ -82,6 +90,23 @@ export interface EnvironmentSummary {
   name: string;
   kind: EnvironmentKind;
   baseUrl: string;
+  /**
+   * The scope a crawl of this environment is permitted, resolved over the
+   * build's defaults — see `resolveCrawlPolicy` in flow-map.ts.
+   *
+   * On the SUMMARY and not only on the panel that edits it, because the one
+   * question a reader of a coverage number asks is "what was it allowed to
+   * look at", and until now the answer lived in five hard-coded regexes in
+   * packages/agent/src/crawler.ts that no customer could see, review or change.
+   * `CrawlOptions.excludePatterns` has existed the whole time and is passed by
+   * no caller.
+   *
+   * Optional, with the usual three states: absent means this payload predates
+   * the policy (an older API, a cached response), `defaulted: true` inside it
+   * means the environment never chose one, and anything else is a decision
+   * somebody made and can be held to.
+   */
+  crawlPolicy?: AppliedCrawlPolicy | null;
 }
 
 // ─── Runner contract (packages/runner) ───────────────────────────────────────

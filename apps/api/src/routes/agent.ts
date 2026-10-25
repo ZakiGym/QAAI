@@ -8,8 +8,13 @@
  */
 
 import { Router } from 'express';
-import { FIXTURE_PREFIX, QUEUE_NAMES, approvePlanSchema } from '@qaai/shared';
-import type { FlowMap, TestType } from '@qaai/shared';
+import {
+  FIXTURE_PREFIX,
+  QUEUE_NAMES,
+  SURFACE_DIMENSION_KINDS,
+  approvePlanSchema,
+} from '@qaai/shared';
+import type { FlowMap, SurfaceDimensionKind, TestType } from '@qaai/shared';
 import {
   applyHealDiff,
   auditTestsAgainstCrawl,
@@ -29,7 +34,13 @@ import type { OpenHeal, PostCheck } from '@qaai/agent';
  * reaches no runtime code across the workspace boundary.
  */
 import type { SuiteHealthTestInput } from '../../../../packages/agent/src/suite-health.js';
-import { startRun } from '../lib/start-run.js';
+import { effectivePlan, startRun } from '../lib/start-run.js';
+import {
+  budgetForEnvironment,
+  dimensionsForProject,
+  observationForEnvironment,
+  resumePointForEnvironment,
+} from '../lib/crawl-store.js';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { env } from '../env.js';
 import { badRequest, conflict, notFound, unprocessable } from '../lib/errors.js';
@@ -56,19 +67,75 @@ agentRouter.post('/projects/:projectId/explore', requireRole('MEMBER'), async (r
   });
   if (!environment || environment.projectId !== projectId) throw notFound('Environment');
 
-  const jobId = await enqueue(QUEUE_NAMES.explore, {
-    orgId: actor.orgId,
-    projectId,
-    environmentId,
-    requestedBy: actor.userId,
-    maxPages: Math.min(60, Number(req.body?.maxPages ?? 25)),
-    maxDepth: Math.min(6, Number(req.body?.maxDepth ?? 3)),
-    autoApprove: req.body?.autoApprove === true,
-  },
-  // One attempt. A crawl is expensive and NOT idempotent — it writes a new
-  // FlowMap version every run — so the default 3 retries silently re-crawled
-  // the customer's site three times whenever the plan step failed.
-  { attempts: 1 });
+  /*
+   * ── THE CRAWL BUDGET, AND THE TWO NUMBERS THAT ARE GONE ────────────────────
+   *
+   * This line used to read `Math.min(60, Number(req.body?.maxPages ?? 25))` and
+   * `Math.min(6, Number(req.body?.maxDepth ?? 3))`. Three web callers send 25
+   * and 3; nothing sent anything else; so every crawl of every application ever
+   * made by this product enumerated at most 25 states to a depth of 3, and the
+   * coverage percentage it produced was a percentage of that. A 412-route
+   * application reported "100% covered" over 25 of them. The cap was not a
+   * safety decision — safety is about what the crawl DOES, which the policy's
+   * `safeMethodsOnly`, `allowDestructive` and `excludeGlobs` govern — it was a
+   * "make the demo finish" decision that became the denominator.
+   *
+   * So the numbers are now OPTIONAL and UNCLAMPED here. Zero means "no
+   * override": the environment's own `Environment.crawlPolicy` decides, clamped
+   * by the org's plan ceiling, and `resolveCrawlBudget` reports every clamp
+   * with both numbers. An explicit request value is still honoured — that is
+   * the behaviour the three web callers have today — but it arrives as a POLICY
+   * OVERRIDE that the response names, instead of a constant nobody chose.
+   *
+   * `Number(undefined)` is NaN, which is neither `> 0` nor a usable budget, so
+   * an absent field and a garbage field both mean "no override" rather than
+   * silently becoming a cap. A negative or zero value means the same thing: a
+   * crawl that may visit no pages is not a budget anybody could have meant.
+   */
+  const askedPages = Number(req.body?.maxPages);
+  const askedDepth = Number(req.body?.maxDepth);
+  const maxPages = Number.isFinite(askedPages) && askedPages > 0 ? Math.floor(askedPages) : 0;
+  const maxDepth = Number.isFinite(askedDepth) && askedDepth > 0 ? Math.floor(askedDepth) : 0;
+
+  const { effective } = effectivePlan(
+    await unscoped(() =>
+      prisma.subscription.findUnique({
+        where: { orgId: actor.orgId },
+        select: { plan: true, status: true },
+      }),
+    ),
+    (
+      await unscoped(() =>
+        prisma.organization.findUnique({ where: { id: actor.orgId }, select: { plan: true } }),
+      )
+    )?.plan ?? null,
+  );
+
+  const [budget, resume] = await Promise.all([
+    budgetForEnvironment({
+      environmentId,
+      plan: effective,
+      overrides: { maxPages, maxDepth },
+    }),
+    resumePointForEnvironment({ projectId, environmentId }),
+  ]);
+
+  const jobId = await enqueue(
+    QUEUE_NAMES.explore,
+    {
+      orgId: actor.orgId,
+      projectId,
+      environmentId,
+      requestedBy: actor.userId,
+      maxPages,
+      maxDepth,
+      autoApprove: req.body?.autoApprove === true,
+    },
+    // One attempt. A crawl is expensive and NOT idempotent — it writes a new
+    // FlowMap version every run — so the default 3 retries silently re-crawled
+    // the customer's site three times whenever the plan step failed.
+    { attempts: 1 },
+  );
 
   await audit({
     actor,
@@ -78,8 +145,100 @@ agentRouter.post('/projects/:projectId/explore', requireRole('MEMBER'), async (r
     metadata: { environmentId, baseUrl: environment.baseUrl },
   });
 
-  res.status(202).json({ jobId, status: 'queued' });
+  /*
+   * THE APPLIED BUDGET, IN THE RESPONSE. Not decoration: these are the numbers
+   * that decide what the resulting percentage is a percentage OF, and the only
+   * moment a person is looking at this decision is the moment they ask for the
+   * crawl. `resume` is the other half — an application over the cap can only
+   * ever be fully enumerated by continuing, so whether this run continues the
+   * last one is a fact the requester should see rather than infer.
+   */
+  res.status(202).json({ jobId, status: 'queued', budget, resume });
 });
+
+/**
+ * The dimensions a multi-axis denominator is counted over.
+ *
+ * The READ PATH for the `SurfaceDimension` rows the Explorer writes. Without
+ * one the table is a write-only pile: `check:wiring` flags exactly that, and it
+ * is right to — a dimension nothing can surface cannot be reviewed, and an
+ * unreviewable denominator is the thing this whole slice is about.
+ */
+agentRouter.get('/projects/:projectId/dimensions', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  // `req.query.kind` can be an array or an object when a caller repeats or
+  // nests the parameter, and `String()` on either produces garbage that then
+  // fails the vocabulary check with an unreadable message. Only a plain string
+  // is a candidate; anything else is "not one of the kinds", which is what the
+  // guard below already says.
+  const rawKind = req.query.kind;
+  const kind = typeof rawKind === 'string' ? rawKind : undefined;
+  if (rawKind !== undefined && kind === undefined) {
+    throw badRequest(`kind must be one of ${SURFACE_DIMENSION_KINDS.join(', ')}`);
+  }
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+  if (kind !== undefined && !(SURFACE_DIMENSION_KINDS as readonly string[]).includes(kind)) {
+    throw badRequest(`kind must be one of ${SURFACE_DIMENSION_KINDS.join(', ')}`);
+  }
+
+  const dimensions = await dimensionsForProject(
+    projectId,
+    kind === undefined ? undefined : (kind as SurfaceDimensionKind),
+  );
+  res.json({ dimensions });
+});
+
+/**
+ * What the last crawl of an environment OBSERVED.
+ *
+ * The READ PATH for the observation report. The crawl records the endpoints the
+ * UI called, the routes it was bounced to, the runtime errors it logged, the
+ * export surfaces it found and the error paths it probed — and before this
+ * endpoint existed every one of those was computed during the crawl and
+ * discarded when the function returned, which is a feature indistinguishable
+ * from one that was never built.
+ *
+ * `null` is a real answer and the response says which: a flow map written
+ * before this slice carries no observation, and that must never be rendered as
+ * "the application made no calls".
+ */
+agentRouter.get(
+  '/projects/:projectId/environments/:environmentId/observation',
+  async (req, res) => {
+    const projectId = String(req.params.projectId);
+    const environmentId = String(req.params.environmentId);
+
+    const environment = await prisma.environment.findUnique({
+      where: { id: environmentId },
+      select: { id: true, projectId: true },
+    });
+    if (!environment || environment.projectId !== projectId) throw notFound('Environment');
+
+    const declared = await prisma.coverageItem.findMany({
+      where: { projectId, kind: 'ENDPOINT', retiredAt: null },
+      select: { key: true },
+    });
+    const found = await observationForEnvironment({
+      projectId,
+      environmentId,
+      declaredKeys: declared.map((row) => row.key),
+    });
+
+    if (found === null) {
+      res.json({
+        observation: null,
+        why: 'the newest flow map for this environment recorded no observation — re-crawl to collect one. This is NOT a statement that the application made no calls.',
+      });
+      return;
+    }
+    res.json({ flowMapVersion: found.version, observation: found.observation, why: null });
+  },
+);
 
 /**
  * Live crawl progress. The Explorer publishes under a synthetic run id because
@@ -506,7 +665,9 @@ agentRouter.get('/heals', async (req, res) => {
       // keeps its assertions in the spec and its `code` is an inert pointer
       // comment, so a gate handed the code alone would report a perfectly good
       // API test as asserting nothing.
-      test: { select: { id: true, name: true, filePath: true, code: true, type: true, spec: true } },
+      test: {
+        select: { id: true, name: true, filePath: true, code: true, type: true, spec: true },
+      },
     },
   });
 
