@@ -485,7 +485,7 @@ register<RecomputeCoverageJob>(RECOMPUTE_COVERAGE_QUEUE, 1, async (payload) => {
  * today and a confusing bug the day the two types grow a matching field.
  */
 register<PreflightJob>(PREFLIGHT_QUEUE, 1, async (payload) => {
-  const { probe, capabilities } = await ensureDeploymentCapabilities({
+  const { probe, capabilities, browsers, declared } = await ensureDeploymentCapabilities({
     ...(payload.deploymentKey === undefined ? {} : { deploymentKey: payload.deploymentKey }),
     ...(payload.orgId === undefined ? {} : { orgId: payload.orgId }),
     ...(payload.force === undefined ? {} : { force: payload.force }),
@@ -505,6 +505,37 @@ register<PreflightJob>(PREFLIGHT_QUEUE, 1, async (payload) => {
       checkedAt: probe.checkedAt,
       nonExecutable: capabilities.nonExecutable.length,
       notChecked: capabilities.notChecked.length,
+      /*
+       * The browser-matrix and declaration halves as FIELDS, not only as prose
+       * inside the sentence. The sentence is what an operator reads; a field is
+       * what a log index can GROUP BY, and "how many cells did this image
+       * refuse last week" is a question nobody can ask of a string.
+       *
+       * NULL AND NEVER 0 when the capability store could not be reached. The
+       * table arrives in a migration that is written and not applied, so the
+       * unreachable case is the normal one today — and a zero there would read
+       * as "this image refuses nothing", which is the most flattering possible
+       * reading of a question nobody got to ask.
+       */
+      /*
+       * ── AND NULL FOR THE REACHABLE-BUT-EMPTY TABLE TOO ──────────────────
+       *
+       * This field used to add the two refusal buckets up here. Those are 0
+       * when the capability table is REACHABLE AND EMPTY — nothing has been
+       * probed, so `resolveMatrixCell` answers NOT_CHECKED for every cell —
+       * and 0 reads as "this image refuses nothing", which is the same
+       * flattering non-answer the paragraph above refuses for the unreachable
+       * case. Same question, same shape: null. The sum now comes from
+       * `refusableCells`, which is the one place that rule lives, beside the
+       * buckets it is derived from and with a test over it.
+       *
+       * `browserCellsNotChecked` is the field that makes this readable, which
+       * is why it stays beside it: null with 19 not checked is "nobody asked",
+       * and 2 with 14 not checked is a real reading over the five that were.
+       */
+      browserCellsRefusable: browsers === null ? null : browsers.summary.refusableCells,
+      browserCellsNotChecked: browsers === null ? null : browsers.summary.notChecked.length,
+      declaredUnmintedProbed: declared.answered.length,
       why: probe.why,
     },
     capabilities.sentence,

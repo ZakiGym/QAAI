@@ -49,6 +49,17 @@ import { authProfileRequired, declaredAuthProfileId, suppliedAuthProfileId } fro
  * consumer, including this one, gets to decide which field to trust.
  */
 import { principalStorageStateFileName } from './principals.js';
+/*
+ * The worst-wins ranking, IMPORTED and not restated.
+ *
+ * This file carried its own private `STATUS_SEVERITY` with the same five
+ * numbers in it. Two implementations of one ranking is how a roll-up comes to
+ * disagree with a screen's sort, and a private copy is the worse half of that:
+ * no second reader could reach it, so nothing could have noticed the two
+ * drifting apart. `matrix.ts` says in its own comment that the harness should
+ * import this and delete its own; this is that.
+ */
+import { CELL_STATUS_SEVERITY } from './matrix.js';
 import { runSessions } from '@qaai/shared';
 import {
   botProtectionRemedy,
@@ -1285,15 +1296,6 @@ function outcomeFor(test: PwTest): TestOutcome {
       results.some((r) => r.status === 'failed' || r.status === 'timedOut'),
   };
 }
-
-/** Worst-wins, so one failing test is never masked by the ones that passed. */
-const STATUS_SEVERITY: Record<TestResultStatus, number> = {
-  TIMED_OUT: 4,
-  FAILED: 3,
-  FLAKY: 2,
-  PASSED: 1,
-  SKIPPED: 0,
-};
 
 function mapStatus(result: PwResult | undefined, retriedAndPassed: boolean): TestResultStatus {
   if (retriedAndPassed) return 'FLAKY';
@@ -3565,7 +3567,7 @@ export async function runPlaywrightSpec(
     let status: TestResultStatus = mapStatus(worst?.final, worst?.retriedAndPassed ?? false);
     for (const candidate of outcomes.slice(1)) {
       const candidateStatus = mapStatus(candidate.final, candidate.retriedAndPassed);
-      if (STATUS_SEVERITY[candidateStatus] > STATUS_SEVERITY[status]) {
+      if (CELL_STATUS_SEVERITY[candidateStatus] > CELL_STATUS_SEVERITY[status]) {
         worst = candidate;
         status = candidateStatus;
       }

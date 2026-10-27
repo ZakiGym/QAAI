@@ -12,6 +12,21 @@ import type {
   GapKind,
 } from '../lib/api';
 import { cn } from '../lib/cn';
+/*
+ * The obligation audit's reader. `groupObligations` is a pure function in
+ * apps/web/lib/obligation-audit.ts and is the ONLY thing that decides which of
+ * the four refusals a verdict belongs to — the markup below renders groups and
+ * makes no judgement of its own, because a second opinion about which refusals
+ * leave the coverage denominator is how a cap gets applied without being
+ * disclosed.
+ */
+import {
+  groupObligations,
+  obligationHeading,
+  obligationsNeedSaying,
+  ungroupedRefusals,
+  type ObligationAuditView,
+} from '../lib/obligation-audit';
 import { useProject } from './shell/ProjectContext';
 import { Button } from './ui/Button';
 import { EmptyState } from './ui/EmptyState';
@@ -68,6 +83,14 @@ export interface CoverageData {
   report: CoverageReport | null;
   /** testId → name, so "5 related tests" can name them. */
   testNames: Map<string, string>;
+  /**
+   * The obligation audit, or NULL when this deployment could not answer.
+   *
+   * NULL IS NOT "the policy is clean". It is a courtesy fetch beside the
+   * report, and `obligationsNeedSaying(null)` is false, so a deployment that
+   * cannot answer renders no panel rather than an all-clear nobody measured.
+   */
+  obligations: ObligationAuditView | null;
   loading: boolean;
   error: string | null;
   reload: () => Promise<void>;
@@ -81,6 +104,7 @@ export interface CoverageData {
 export function useCoverage(projectId: string | null, projectSettling: boolean): CoverageData {
   const [report, setReport] = useState<CoverageReport | null>(null);
   const [testNames, setTestNames] = useState<Map<string, string>>(new Map());
+  const [obligations, setObligations] = useState<ObligationAuditView | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -88,14 +112,23 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
     // Proposals come down with the report because they need no API key — they
     // are what /propose would write, before any model is involved — so the
     // preview is honest even on a deployment that cannot generate.
-    const [coverage, tests] = await Promise.all([
+    const [coverage, tests, audit] = await Promise.all([
       api<CoverageReport>(`/coverage/${id}?proposals=true`),
       // Names are a courtesy. If this fails the gaps still render, with ids.
       api<{ tests: Array<{ id: string; name: string }> }>(`/projects/${id}/tests`).catch(() => ({
         tests: [] as Array<{ id: string; name: string }>,
       })),
+      /*
+       * Also a courtesy, and it has to be: the obligation audit is a separate
+       * request against a separate column, and a deployment that cannot answer
+       * it must not take the gap list down with it. Resolved to NULL rather
+       * than to an empty audit — an empty audit would render as "every
+       * obligation in this policy can be closed", which is a reading nobody
+       * took.
+       */
+      api<ObligationAuditView>(`/coverage/${id}/obligations`).catch(() => null),
     ]);
-    return { coverage, names: new Map(tests.tests.map((t) => [t.id, t.name])) };
+    return { coverage, names: new Map(tests.tests.map((t) => [t.id, t.name])), audit };
   }, []);
 
   useEffect(() => {
@@ -112,10 +145,11 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
     setError(null);
     void (async () => {
       try {
-        const { coverage, names } = await fetchAll(projectId);
+        const { coverage, names, audit } = await fetchAll(projectId);
         if (cancelled) return;
         setReport(coverage);
         setTestNames(names);
+        setObligations(audit);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : 'Could not load the coverage report');
@@ -130,12 +164,13 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
 
   const reload = useCallback(async () => {
     if (!projectId) return;
-    const { coverage, names } = await fetchAll(projectId);
+    const { coverage, names, audit } = await fetchAll(projectId);
     setReport(coverage);
     setTestNames(names);
+    setObligations(audit);
   }, [projectId, fetchAll]);
 
-  return { report, testNames, loading: loading || projectSettling, error, reload };
+  return { report, testNames, obligations, loading: loading || projectSettling, error, reload };
 }
 
 // ─── The answer, before the list ─────────────────────────────────────────────
@@ -770,6 +805,101 @@ function CoverageSkeleton() {
   );
 }
 
+/**
+ * THE OBLIGATION AUDIT, WHICH NOBODY WAS TOLD ABOUT.
+ *
+ * `auditObligationPolicy` in packages/agent could already answer the nastiest
+ * question a coverage number raises — IS THERE AN OBLIGATION NO TEST TYPE CAN
+ * SATISFY? — and nothing in this product asked it. A project declaring, say,
+ * `ROUTE: ['DATABASE']` mints one permanently un-closeable obligation per
+ * route: the denominator grows, the numerator cannot, and the percentage falls
+ * for ever with no action anywhere that would raise it. The remedy is to edit
+ * the POLICY, and that is the one thing the report never suggested, because the
+ * report did not know the obligation was impossible.
+ *
+ * CORRECTNESS ONLY, no new visual language: this is the same SectionLabel, the
+ * same `<ul>` and the same type scale as the "tests whose coverage could not be
+ * read" block below it. The only change is that there are up to four labelled
+ * lists instead of one, in the order a reader should read them, each saying WHO
+ * OWNS IT — because "edit your policy", "install the tool" and "wait for us"
+ * are three different asks and the first is the only one actionable here.
+ *
+ * Rendered only when `obligationsNeedSaying` is true. Most projects have never
+ * stated their obligations — the column is nullable and the default owes
+ * nothing — and a panel that reported that on every coverage screen would be a
+ * nag that teaches people to skip the one time it matters.
+ */
+function ObligationPanel({ audit }: { audit: ObligationAuditView | null }) {
+  if (audit === null || !obligationsNeedSaying(audit)) return null;
+  const sections = groupObligations(audit);
+  const ungrouped = ungroupedRefusals(audit);
+
+  return (
+    <div className="mt-8">
+      {/* The heading is `obligationHeading`'s, not a template here: a count of
+          zero is the wrong headline for the two cases that render with nothing
+          listed, and that decision belongs where it can be tested. */}
+      <SectionLabel>{obligationHeading(audit)}</SectionLabel>
+      <p className="text-ink-dim text-row-sub mb-2">{audit.why}</p>
+
+      {/*
+        A stored policy that does not parse was read as NO policy, so the four
+        groups below are all empty and this sentence is the only signal left.
+        Printing it as part of the panel rather than as an error: the failure is
+        in the configuration, the suite is unaffected, and the number on screen
+        is over a denominator the customer did not configure.
+      */}
+      {audit.policy.unreadable && (
+        <p className="text-ink-dim text-row-sub mb-2">{audit.policy.why}</p>
+      )}
+
+      {sections.map((section) => (
+        <div key={section.refusal} className="mt-3">
+          <p className="text-ink-dim text-row-sub font-medium">{section.label}</p>
+          <p className="text-ink-faint text-row-sub mt-0.5">{section.note}</p>
+          {/*
+            THE FACT THAT MUST NOT MERGE. Three of the four refusals take the
+            obligation out of the denominator and so raise the percentage;
+            NO_PRODUCER does not, because the missing piece is ours. Without
+            this line a reader cannot tell which of the two they are looking at,
+            and would read every group as already accounted for.
+          */}
+          <p className="text-ink-faint text-meta mt-0.5">
+            {section.countsInDenominator
+              ? 'Counted as uncovered in the number above — not shed.'
+              : 'Out of the coverage denominator, with this reason.'}
+          </p>
+          <ul className="text-ink-faint text-row-sub mt-1 space-y-1">
+            {section.entries.map((verdict) => (
+              <li key={`${verdict.kind}:${verdict.type}`}>
+                <span className="text-ink-dim font-mono">
+                  {verdict.kind} → {verdict.type}
+                </span>{' '}
+                — {verdict.why}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+
+      {/*
+        A refusal this build has no group for. Printed rather than dropped: the
+        vocabulary lives in packages/agent, this file cannot import it, and the
+        API publishes whatever the agent declares — so a fifth refusal reaches
+        here with no code change on either side. Shortening the list silently
+        would be our own stale vocabulary acting as an undisclosed cap.
+      */}
+      {ungrouped.length > 0 && (
+        <p className="text-ink-dim text-row-sub mt-3">
+          {ungrouped.length} obligation reason(s) this page does not yet know how to explain:{' '}
+          <span className="font-mono">{ungrouped.join(', ')}</span>. Their obligations are NOT
+          listed above. Read GET /coverage/:projectId/obligations for the full adjudication.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function CoverageGaps({
   projectId,
   data,
@@ -777,7 +907,7 @@ export function CoverageGaps({
   projectId: string | null;
   data: CoverageData;
 }) {
-  const { report, testNames, loading, error, reload } = data;
+  const { report, testNames, obligations, loading, error, reload } = data;
   const toast = useToast();
   /*
    * Read here rather than taken as a prop: the empty state below has to tell an
@@ -941,6 +1071,13 @@ export function CoverageGaps({
           </ul>
         </div>
       )}
+
+      {/*
+        Right under the caveats, because an IMPOSSIBLE_FOR_AXIS obligation is a
+        reason not to trust the number AND the only one of them with an action
+        attached. The panel renders nothing at all for the common case.
+      */}
+      <ObligationPanel audit={obligations} />
 
       {report.unreadable.length > 0 && (
         <p className="text-ink-dim text-row-sub mt-4">

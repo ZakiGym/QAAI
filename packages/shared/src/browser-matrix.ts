@@ -716,11 +716,36 @@ function deviceKey(device: MatrixDevice | undefined): string {
   return parts.join('/');
 }
 
+/**
+ * The version segment of a browser key.
+ *
+ * ── `<` IS AN ANGLE BRACKET, AND THAT MADE A WHOLE RUN VANISH ───────────────
+ *
+ * The bounded window used to spell itself `>=120<130`, which reads perfectly
+ * and is a value BOTH ingest paths REFUSE: `variantDimension` in schemas.ts
+ * reserves angle brackets for strings that are EXACTLY a sentinel — the one
+ * thing that stops a producer forging "this dimension was not varied" — so the
+ * `<` in the middle of a composite is refused for the same reason
+ * `<unvaried>+dark` was.
+ *
+ * The cost was total and silent, identical to the two leaks repaired alongside
+ * it. `validateMeasurements` in apps/worker/src/processors/run.ts refuses a
+ * matrix WHOLE on its first bad cell, so a CROSS_BROWSER test declaring ANY
+ * bounded version window wrote ZERO variant rows for the entire run and said
+ * so in one log line — no red test, because the one test that drove a bounded
+ * window asserted the KEY and never put it through the schema that has to
+ * accept it.
+ *
+ * `..` because it is what a reader already means by it and it is in neither
+ * sentinel. NO STORED KEY MOVES: a key that reaches a column has been through
+ * that refinement, so no accepted key has ever held a `<`, and the UNBOUNDED
+ * form `>=120` — which has no bracket and is storable — is byte-identical.
+ */
 function versionKey(pin: BrowserVersionPin | undefined): string {
   if (!pin || pin.kind === 'UNPINNED') return UNVARIED;
   return pin.range.below === null
     ? `>=${pin.range.atLeast}`
-    : `>=${pin.range.atLeast}<${pin.range.below}`;
+    : `>=${pin.range.atLeast}..${pin.range.below}`;
 }
 
 /** The sentinel for an axis the cell expressed no opinion about. */
@@ -757,17 +782,108 @@ export function variantBrowserKey(cell: MatrixCell): string {
  * axes are what a VISUAL capture differs by and the table has exactly one column
  * for "how big and how rendered". Appended only when set, for the same
  * double-counting reason {@link deviceKey} records.
+ *
+ * ── A SENTINEL IS NEVER A SEGMENT OF A COMPOSITE KEY ────────────────────────
+ *
+ * The screen segment is dropped when it is the UNVARIED sentinel AND a
+ * rendering preference follows, so a cell that varies only the colour scheme
+ * keys as `dark` and not as `<unvaried>+dark`.
+ *
+ * That string was a live, silent defect rather than an ugly key.
+ * `variantDimension` in schemas.ts reserves angle brackets for values that are
+ * EXACTLY a sentinel — the one thing that stops a caller forging "this
+ * dimension was not varied" for a cell that was — so `<unvaried>+dark` is a
+ * value BOTH ingest paths REFUSE. And `validateMeasurements` refuses a matrix
+ * WHOLE on its first bad cell, there being no such thing as half a matrix. So a
+ * customer declaring a dark-mode cell lost every variant row of that run,
+ * including the cells that ran perfectly, to one log line and no red test.
+ *
+ * The repair is here and not in the refinement because `<unvaried>+dark` is
+ * self-contradictory on its own terms: it claims nobody varied the viewport and
+ * then names what varied. Teaching the refinement to accept a sentinel inside a
+ * composite would have reopened the forging hole it exists for. An absent
+ * screen segment already MEANS "the size was not varied", so nothing is lost.
+ *
+ * No stored key changes. A key that reaches a column has been through that
+ * refinement, so no accepted key has ever contained an angle bracket anywhere
+ * but as its whole value — the only strings this moves are ones nothing could
+ * store. `1280x800+dark` is byte-identical, and so is every key that names a
+ * device, which is all of VisualBaseline's: {@link baselineViewportKey} is
+ * only ever handed a cell from `floorCellFor`, which always sets one.
  */
 export function variantViewportKey(cell: MatrixCell): string {
-  const parts = [deviceKey(cell.device)];
-  if (cell.colourScheme !== undefined) parts.push(cell.colourScheme.toLowerCase());
+  const rendering: string[] = [];
+  if (cell.colourScheme !== undefined) rendering.push(cell.colourScheme.toLowerCase());
   if (cell.reducedMotion !== undefined) {
-    parts.push(cell.reducedMotion === 'REDUCE' ? 'reduced-motion' : 'full-motion');
+    rendering.push(cell.reducedMotion === 'REDUCE' ? 'reduced-motion' : 'full-motion');
   }
   if (cell.forcedColors !== undefined) {
-    parts.push(cell.forcedColors === 'ACTIVE' ? 'forced-colors' : 'no-forced-colors');
+    rendering.push(cell.forcedColors === 'ACTIVE' ? 'forced-colors' : 'no-forced-colors');
   }
-  return parts.join('+');
+
+  const screen = deviceKey(cell.device);
+  if (rendering.length === 0) return screen;
+  return screen === UNVARIED ? rendering.join('+') : [screen, ...rendering].join('+');
+}
+
+/**
+ * The `TestResultVariant.locale` value for this cell.
+ *
+ * ── TWO ZONES, ONE ROW, AND THE WHOLE MATRIX LOST ───────────────────────────
+ *
+ * The timezone lived in {@link matrixCellKey}, in the stored cell, and in
+ * NOTHING ELSE. The five-column identity a row is written under did not carry
+ * it: `variantKeyFor` built this column as `cell.locale ?? UNVARIED`, so two
+ * cells differing ONLY by zone were one row. `planMatrix`'s own duplicate check
+ * cannot see that, because it keys on `matrixCellKey`, which DOES include the
+ * timezone — the plan is two honest cells — so the loss landed at the far end:
+ * `planMeasurements` refuses a matrix WHOLE for a duplicated cell, so the run
+ * wrote ZERO variant rows behind one log line, and the worst-wins roll-up
+ * survived, so the run read as fine.
+ *
+ * `{ locales: [{ tag: 'en-US', timezone: 'America/New_York' },
+ * { tag: 'en-US', timezone: 'Pacific/Auckland' }] }` is VALID to
+ * `localizationSpecSchema` and is the single most natural thing a localisation
+ * matrix says — half of localisation bugs are date and currency formatting, and
+ * one locale in two zones is how you find them. It stored nothing at all. The
+ * same collision was reachable on the CROSS_BROWSER `timezones` axis.
+ *
+ * ── THE FOUR SHAPES, AND WHY `@` IS NOT NEW VOCABULARY ──────────────────────
+ *
+ * `@` is already the separator {@link variantBrowserKey} uses for a version
+ * pin, so a reader of these columns has seen it. Four shapes and no fifth:
+ *
+ *   · neither varied → `'<unvaried>'`             — the WHOLE value, a sentinel
+ *   · locale only    → `'en-US'`                  — byte-identical to before
+ *   · both           → `'en-US@America/New_York'`
+ *   · timezone only  → `'@America/New_York'`
+ *
+ * The first two are BYTE-IDENTICAL to what this column has always held, and
+ * that is the load-bearing half: no stored row is re-identified, so no
+ * historical cell moves and nobody re-approves anything.
+ *
+ * The timezone-only shape leads with the SEPARATOR and not with the sentinel,
+ * because `'<unvaried>@America/New_York'` is a value both ingest paths REFUSE.
+ * `variantDimension` in schemas.ts reserves an angle bracket for a value that is
+ * EXACTLY a sentinel — the one thing that stops a producer forging "nobody
+ * varied this axis" for a cell that did — and a bracket mid-composite is the
+ * `'<unvaried>+dark'` defect {@link variantViewportKey} records above, which
+ * cost a run of its own. An absent locale segment already MEANS the locale was
+ * not varied, so nothing is lost by dropping it.
+ *
+ * ── THE BOUND IS THE OTHER HALF OF THIS CHANGE ──────────────────────────────
+ *
+ * A tag is `.max(35)` and a zone `.max(64)` in every spec schema that declares
+ * one, so this column can now hold 100 characters where it used to hold 35.
+ * `testVariantKeySchema.locale` must be at least that wide or the widest legal
+ * pair is refused — the same total, silent loss, one bound further on. The
+ * widest-pair test in browser-matrix.test.ts derives those figures from the
+ * spec schemas rather than restating them, so tightening either goes red here
+ * instead of going quiet in production.
+ */
+export function variantLocaleKey(cell: MatrixCell): string {
+  if (cell.timezone === undefined) return cell.locale ?? UNVARIED;
+  return `${cell.locale ?? ''}@${cell.timezone}`;
 }
 
 /**
@@ -816,6 +932,30 @@ export function baselineViewportKey(cell: MatrixCell, state: InteractionState): 
  * byte-identical output. A `JSON.stringify` of the object would not: property
  * order is insertion order, and an optional field set to `undefined` is not the
  * same key as an absent one.
+ *
+ * ── WHERE THIS KEY AND THE ROW'S IDENTITY STILL DISAGREE ────────────────────
+ *
+ * This key keeps locale and timezone as SEPARATE segments while
+ * {@link variantLocaleKey} composes them with an `@`. On every well-formed tag
+ * the two now count the same four cell-borne axes, which is the point of that
+ * function: a difference this key can see is a difference the row can store.
+ *
+ * They disagree in two directions on a MALFORMED tag, because `locale` is
+ * unconstrained text — `z.string().min(2).max(35)` with no shape — in all three
+ * schemas that declare one, so a tag may carry either delimiter:
+ *
+ *   · a tag of `en@<a zone>` keys the same COLUMN as `en` plus that zone, and a
+ *     DIFFERENT key here, so a matrix holding both plans as two cells and then
+ *     loses the lot to `planMeasurements`' duplicate refusal;
+ *   · a tag of `en|US` with a zone of `x` keys the same KEY HERE as `en` with a
+ *     zone of `US|x`, and two different columns, so the planner drops one of
+ *     two cells the row could have told apart. That direction predates the
+ *     composite.
+ *
+ * Both are closed at the DOOR by a BCP-47 shape on the tag, not by a producer
+ * escaping a delimiter: a key that escapes is a key nobody can read back. The
+ * tag bounds live in schemas.ts, which this round does not own, so this is
+ * recorded here and reported rather than repaired.
  */
 export function matrixCellKey(cell: MatrixCell): string {
   return [
@@ -1625,39 +1765,78 @@ export function enumerateMatrix(
   const zones: ReadonlyArray<string | undefined> =
     axes.timezones && axes.timezones.length > 0 ? axes.timezones : [undefined];
 
-  const cells: MatrixCell[] = [];
-  for (const engine of engines) {
-    for (const channel of channels) {
-      for (const version of versions) {
-        for (const device of devices) {
-          for (const colourScheme of schemes) {
-            for (const reducedMotion of motions) {
-              for (const forcedColors of forced) {
-                for (const locale of locales) {
-                  for (const timezone of zones) {
-                    const cell: MatrixCell = {
-                      ...(engine !== undefined ? { engine } : {}),
-                      ...(channel !== undefined ? { channel } : {}),
-                      ...(version !== undefined ? { version } : {}),
-                      ...(device !== undefined ? { device } : {}),
-                      ...(colourScheme !== undefined ? { colourScheme } : {}),
-                      ...(reducedMotion !== undefined ? { reducedMotion } : {}),
-                      ...(forcedColors !== undefined ? { forcedColors } : {}),
-                      ...(locale !== undefined ? { locale } : {}),
-                      ...(timezone !== undefined ? { timezone } : {}),
-                    };
-                    cells.push(cell);
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
+  /*
+   * ── THE PRODUCT IS COUNTED, NEVER BUILT ─────────────────────────────────────
+   *
+   * This function used to materialise EVERY cell of the declared product in nine
+   * nested loops and only then ask which `maxCells` of them to keep. The widest
+   * declaration `matrixAxesSchema` ACCEPTS — 3 engines x 9 channels x 8 versions
+   * x 24 devices x 3 colour schemes x 2 motions x 2 forced-colours x 20 locales
+   * x 20 zones — is 24,883,200 cells, and keeping twelve of them cost about
+   * 3.7 GB and six seconds. The process does not throw on that: it aborts with
+   * "JavaScript heap out of memory", which is not catchable, so a worker sized
+   * for a few jobs at once dies with every OTHER organisation's job still on it.
+   * Reproduced at a 1 GB heap with a 14.9 million cell product. The plugins
+   * wired to this in the round before this one made it reachable from a spec a
+   * customer can POST, and nothing at the door bounds the product.
+   *
+   * A cell is a position in a mixed-radix number — the last axis the least
+   * significant digit, because the loops this replaces ran timezone innermost —
+   * so `cellAt(i)` decodes the i-th cell of that order without the other
+   * ones existing. The take below is then over INDICES, which is what it always
+   * was; only the cells it never kept stop being built.
+   *
+   * BYTE-IDENTICAL, which is the constraint that decides how this is written.
+   * Which cells a bitten cap loses is the SEED's business and a stored plan is
+   * compared run over run, so the shuffle below is the same arithmetic over the
+   * same indices, the keys of a cell are inserted in the same order, and a
+   * differential test in browser-matrix.test.ts holds this to the old
+   * implementation across axes, seeds and caps rather than to a spelling.
+   */
+  const axisLists: ReadonlyArray<ReadonlyArray<unknown>> = [
+    engines,
+    channels,
+    versions,
+    devices,
+    schemes,
+    motions,
+    forced,
+    locales,
+    zones,
+  ];
+  const declared = axisLists.reduce((product, list) => product * list.length, 1);
 
-  const declared = cells.length;
+  const cellAt = (index: number): MatrixCell => {
+    // Decode the digits last-axis-first, so axis 8 (timezone) varies fastest.
+    const digit: number[] = new Array<number>(axisLists.length);
+    let rest = index;
+    for (let axis = axisLists.length - 1; axis >= 0; axis -= 1) {
+      const radix = axisLists[axis]!.length;
+      digit[axis] = rest % radix;
+      rest = Math.floor(rest / radix);
+    }
+    const engine = engines[digit[0]!];
+    const channel = channels[digit[1]!];
+    const version = versions[digit[2]!];
+    const device = devices[digit[3]!];
+    const colourScheme = schemes[digit[4]!];
+    const reducedMotion = motions[digit[5]!];
+    const forcedColors = forced[digit[6]!];
+    const locale = locales[digit[7]!];
+    const timezone = zones[digit[8]!];
+    return {
+      ...(engine !== undefined ? { engine } : {}),
+      ...(channel !== undefined ? { channel } : {}),
+      ...(version !== undefined ? { version } : {}),
+      ...(device !== undefined ? { device } : {}),
+      ...(colourScheme !== undefined ? { colourScheme } : {}),
+      ...(reducedMotion !== undefined ? { reducedMotion } : {}),
+      ...(forcedColors !== undefined ? { forcedColors } : {}),
+      ...(locale !== undefined ? { locale } : {}),
+      ...(timezone !== undefined ? { timezone } : {}),
+    };
+  };
+
   if (maxCells <= 0) {
     return {
       cells: [],
@@ -1671,14 +1850,20 @@ export function enumerateMatrix(
       },
     };
   }
-  if (declared <= maxCells) return { cells, declared, capBite: null };
+  if (declared <= maxCells) {
+    // Under the cap, so building every cell IS building what was asked for.
+    return { cells: Array.from({ length: declared }, (_, i) => cellAt(i)), declared, capBite: null };
+  }
 
   // Fisher-Yates over INDICES, seeded, then sort the survivors back into
   // declared order. Shuffling the cells themselves and slicing would also be
   // deterministic and would return them in shuffled order, which is the one
   // property we do not want: the subset is the seed's business, the order is not.
   const rng = mulberry32(fnv1a32(seed));
-  const indices = cells.map((_, i) => i);
+  // A typed array: four bytes a position and off the V8 heap, where the cells
+  // this replaces were a hundred-odd bytes each and on it.
+  const indices = new Uint32Array(declared);
+  for (let i = 0; i < declared; i += 1) indices[i] = i;
   for (let i = indices.length - 1; i > 0; i -= 1) {
     const j = Math.floor(rng() * (i + 1));
     const a = indices[i]!;
@@ -1686,10 +1871,10 @@ export function enumerateMatrix(
     indices[i] = b;
     indices[j] = a;
   }
-  const kept = indices.slice(0, maxCells).sort((x, y) => x - y);
+  const kept = Array.from(indices.subarray(0, maxCells)).sort((x, y) => x - y);
 
   return {
-    cells: kept.map((i) => cells[i]!),
+    cells: kept.map((i) => cellAt(i)),
     declared,
     capBite: {
       cap: 'maxCells',

@@ -56,6 +56,8 @@ import {
   COVERAGE_CELL_KINDS,
   COVERAGE_DIMENSIONS,
   HEADLINE_SCOPE_KEY,
+  SURFACE_KINDS,
+  TEST_TYPES,
   attest,
   attestationPayload,
   attestationScopeLines,
@@ -63,12 +65,30 @@ import {
   deltaIsMeaningful,
   dimensionPercentAt,
   dimensionWasMeasured,
+  updateTypeObligationPolicySchema,
 } from '@qaai/shared';
-import { dimensionUnmeasuredDisclosures } from '@qaai/agent';
+/*
+ * `auditObligationPolicy` and `typesCovering` are the obligation audit, and
+ * they are imported from the PACKAGE ENTRY POINT rather than by a relative
+ * path into packages/agent/src — `export * from './coverage.js'` on the agent
+ * barrel is what makes that legal, and reaching past it would leave the parity
+ * guards in that package enforced on a file nobody imports as a package.
+ */
+import {
+  OBLIGATION_REFUSALS_OUT_OF_DENOMINATOR,
+  OBLIGATION_REFUSAL_LIST,
+  auditObligationPolicy,
+  dimensionUnmeasuredDisclosures,
+  typesCovering,
+} from '@qaai/agent';
+import type { ObligationAudit } from '@qaai/agent';
 import type {
   CoverageAttestation,
   CoverageDimensionKind,
+  DeploymentCapabilityStatus,
   DimensionMeasurement,
+  SurfaceKind,
+  TypeObligationPolicy,
 } from '@qaai/shared';
 import { quarantineSuppresses } from '@qaai/runner';
 import {
@@ -94,7 +114,9 @@ import {
   CRAWL_VERSION,
   computeCoverage,
   coverageProvenance,
+  deploymentCapabilityFacts,
   dimensionBreakdown,
+  loadTypeObligationPolicy,
   storeAttestation,
   storedAttestations,
   type ComputedCoverage,
@@ -2308,9 +2330,10 @@ coverageRouter.get(
  * repository declared `/:runId/report`, was mounted at `/`, and squatted at a
  * root path nothing asks for while the only URL anybody used 404'd.
  *
- * It needs no router-level ordering decision: `coverageRouter` carries no
- * router-level `requireAuth`, every route in it declares its own
- * `requireScope`, and this one does the same.
+ * It needs no router-level ordering decision of its own: `coverageRouter` DOES
+ * carry a router-level `requireAuth` (line 132), so every route in it is mounted
+ * below that guard and must NOT repeat it; each declares only its own
+ * `requireScope`.
  *
  * ── WHY THIS ENDPOINT EXISTS ────────────────────────────────────────────────
  *
@@ -2419,3 +2442,375 @@ coverageRouter.get('/:projectId/closure', requireScope('tests:read'), async (req
       'second: work already sitting on an approval screen, which must not be proposed again.',
   });
 });
+
+/*
+ * ── THE OBLIGATION AUDIT NOBODY ASKS ────────────────────────────────────────
+ *
+ * MOUNTED UNDER `/coverage` (see apps/api/src/index.ts: `app.use('/coverage',
+ * coverageRouter)`), so the full URLs are `GET /coverage/:projectId/obligations`
+ * and `PUT /coverage/:projectId/obligations`. Said here for the same reason the
+ * `/closure` block above says it: a router that declares a relative path and is
+ * mounted at the wrong prefix is a 404 with a comment swearing it works, and
+ * `check-wiring` cannot see it — the route IS reachable, just not at the URL
+ * everything uses.
+ *
+ * ORDERING, WHICH THE `/closure` COMMENT GETS WRONG AND THIS ONE DOES NOT:
+ * `coverageRouter` DOES carry a router-level guard — `coverageRouter.use(
+ * requireAuth)` at the top of this file — so these two routes are mounted
+ * BELOW it and must NOT repeat `requireAuth`. Adding it would run the session
+ * lookup twice per request, and the second run is the one that silently
+ * re-enters the tenant scope. They declare `requireScope` (and `requireRole`
+ * on the write) and nothing else, exactly like every other route here.
+ *
+ * ── WHY THIS ENDPOINT EXISTS ────────────────────────────────────────────────
+ *
+ * `auditObligationPolicy` in packages/agent/src/coverage.ts was correct,
+ * proven, and reached only from its own colocated test. Nothing in the coverage
+ * report, this API or the web app consulted it — which is this codebase's
+ * signature defect: a module can be right, fully tested, and called by nothing
+ * in production while every gate reports green, because a barrel export plus a
+ * colocated test satisfies the package-exports ratchet. "It has tests" is not a
+ * read path.
+ *
+ * What it adjudicates is the nastiest shape a coverage number can take: AN
+ * OBLIGATION NO TEST TYPE CAN SATISFY. A project that declares, say,
+ * `ROUTE: ['DATABASE']` mints one permanently un-closeable obligation — DATABASE
+ * covers the DATA_VARIANT axis and not the route axis, so the denominator grows,
+ * the numerator cannot, and the percentage falls for ever with no action that
+ * would raise it. On a 412-route project that is eternal debt whose only remedy
+ * is an edit to the POLICY, and the report never suggests it because the report
+ * does not know the obligation is impossible.
+ *
+ * So there are two endpoints and not one. The GET is the audit, which can only
+ * report a policy somebody already stored. The PUT is the DOOR, and it refuses
+ * a policy that would mint an un-closeable obligation — because telling a
+ * customer about eternal debt after they created it is strictly worse than
+ * declining to create it. Nothing wrote this column before this change, so the
+ * audit had no input a customer could produce and the read path would have been
+ * honest and permanently empty.
+ */
+
+/**
+ * What one axis owes, and what could ever discharge it.
+ *
+ * `satisfiable` and `coversButNotStorable` are TWO LISTS and not one, and the
+ * split is a defect this endpoint found rather than a refinement. `typesCovering`
+ * is derived from the declarations, which cover `ANY_TEST_TYPES` — thirty names,
+ * eleven of them `PENDING_TEST_TYPES` (DESKTOP, JOBS, PAYMENTS, …). A policy is
+ * validated by `typeObligationPolicySchema`, whose enum is `TEST_TYPES` — the
+ * twenty minted ones. So `typesCovering('BACKGROUND_JOB')` answers
+ * `INTEGRATION, JOBS, PUSH` and a policy can only name `INTEGRATION`: an editor
+ * that offered the raw list would offer two options whose PUT it then rejects,
+ * which is how `ROUTE: ['DATABASE']` gets typed in the first place.
+ *
+ * The pending ones are DISCLOSED rather than dropped, because "no type covers
+ * this axis" and "a type covers it and QAAI cannot hold a test of that type
+ * yet" have different owners — the second is our backlog, and hiding it would
+ * read as a finished answer.
+ */
+interface ObligationAxisView {
+  readonly kind: SurfaceKind;
+  /** What the stored policy says this axis owes. Empty when it says nothing. */
+  readonly declared: readonly string[];
+  /** Covers this axis AND a policy can name it. The editor's list. */
+  readonly satisfiable: readonly string[];
+  /** Covers this axis and the policy enum cannot name it. Shown, never offered. */
+  readonly coversButNotStorable: readonly string[];
+  /**
+   * False when NO storable type covers this axis at all.
+   *
+   * `FLAG_COMBINATION` is the live example: nothing in the whole declaration set
+   * covers it, so every obligation declared there is IMPOSSIBLE_FOR_AXIS on the
+   * day it is written. An axis with `closeable: false` must not be offered an
+   * obligation at all, which is why this is a field and not an inference.
+   */
+  readonly closeable: boolean;
+}
+
+/** Types a policy may name. `typesCovering` answers over a wider vocabulary. */
+const POLICY_NAMEABLE_TYPES: ReadonlySet<string> = new Set(TEST_TYPES);
+
+/** Per-axis view over `SURFACE_KINDS` — a constant, so the list is never partial. */
+function obligationAxes(policy: TypeObligationPolicy | null): ObligationAxisView[] {
+  return SURFACE_KINDS.map((kind) => {
+    const covering = typesCovering(kind);
+    const satisfiable = covering.filter((type) => POLICY_NAMEABLE_TYPES.has(type));
+    return {
+      kind,
+      declared: [...(policy?.byKind[kind] ?? [])],
+      satisfiable,
+      coversButNotStorable: covering.filter((type) => !POLICY_NAMEABLE_TYPES.has(type)),
+      closeable: satisfiable.length > 0,
+    };
+  });
+}
+
+/**
+ * The capability map `auditObligationPolicy` takes, and the disclosure with it.
+ *
+ * AN ABSENT KEY MEANS NOT_CHECKED, NEVER MISSING, and when
+ * `deploymentCapabilityFacts` cannot answer at all — the migration that mints
+ * `DeploymentCapability` is unapplied here — this supplies NO keys rather than
+ * guessing. That leaves every type NOT_CHECKED, which `capabilityCounts` keeps
+ * IN the denominator: dropping an unprobed type would let a deployment that
+ * never ran a preflight shed every obligation it could not prove it could run,
+ * and the percentage would rise for a probe nobody executed.
+ */
+async function obligationCapability(): Promise<{
+  map: Record<string, DeploymentCapabilityStatus>;
+  probed: boolean;
+  measuredAtIso: string | null;
+  why: string;
+}> {
+  const facts = await deploymentCapabilityFacts();
+  if (facts === null) {
+    return {
+      map: {},
+      probed: false,
+      measuredAtIso: null,
+      why:
+        'What this deployment can EXECUTE could not be read (the migration that mints ' +
+        'DeploymentCapability is not applied here), so every test type is treated as ' +
+        'NOT_CHECKED and every obligation stays IN the denominator. That is the conservative ' +
+        'direction and it must NOT be read as "every type is available".',
+    };
+  }
+  return {
+    map: Object.fromEntries(facts.facts.map((fact) => [fact.testType, fact.status])),
+    probed: facts.measuredAt !== null,
+    measuredAtIso: facts.measuredAt?.toISOString() ?? null,
+    why: facts.sentence,
+  };
+}
+
+/** The sentence that distinguishes "never configured" from "owes nothing". */
+function policyWhy(declared: boolean, unreadable: boolean): string {
+  if (unreadable) {
+    return (
+      'A policy IS stored on this project and it does not parse, so it was read as NO POLICY ' +
+      'rather than partially honoured — half a policy is a denominator the customer did not ' +
+      'configure. Nothing below is a finding about your application: re-save the policy.'
+    );
+  }
+  if (!declared) {
+    return (
+      'This project has never stated which test types its surfaces owe, so nothing is owed and ' +
+      'the audit below is empty. That is NOT the same as "considered it and owes nothing" — ' +
+      'PUT `{"byKind":{}}` to record that decision — and it is not a measurement of your suite.'
+    );
+  }
+  return (
+    'These obligations were declared by this project. Every one of them is in the TEST_TYPE ' +
+    'denominator unless a refusal below takes it out, each with the reason and the owner.'
+  );
+}
+
+/**
+ * The four refusals, their owners and their remedies, in the shape a screen can
+ * render without re-deriving any of it.
+ *
+ * `counted` IS the audit's own number and is not recomputed here: two places
+ * with their own opinion about which refusals leave the denominator is how a cap
+ * gets applied without being disclosed.
+ */
+function obligationPayload(args: {
+  projectId: string;
+  policy: TypeObligationPolicy | null;
+  unreadable: boolean;
+  audit: ObligationAudit;
+  capability: Awaited<ReturnType<typeof obligationCapability>>;
+}): Record<string, unknown> {
+  const { audit } = args;
+  const declared = args.policy !== null;
+  return {
+    projectId: args.projectId,
+    policy: {
+      declared,
+      unreadable: args.unreadable,
+      /** NULL for "never configured". `{}` for "considered it and owes nothing". */
+      byKind: args.policy?.byKind ?? null,
+      why: policyWhy(declared, args.unreadable),
+    },
+    /** The TEST_TYPE denominator this policy produces. */
+    counted: audit.counted,
+    verdicts: audit.verdicts,
+    /** Out of the denominator, each with its reason — never a silent drop. */
+    excluded: audit.excluded,
+    /**
+     * THE NUMBER TO READ FIRST, and the only one that is OUR configuration
+     * error rather than a fact about the application or a gap in QAAI. Non-zero
+     * means this project is carrying obligations no test type can ever satisfy.
+     */
+    impossible: audit.impossible,
+    /** Every refusal the audit can produce, so a zero reads as a real zero. */
+    refusals: OBLIGATION_REFUSAL_LIST,
+    /** Which of them leave the denominator. NO_PRODUCER deliberately does not. */
+    outOfDenominator: OBLIGATION_REFUSALS_OUT_OF_DENOMINATOR,
+    axes: obligationAxes(args.policy),
+    capability: {
+      probed: args.capability.probed,
+      measuredAtIso: args.capability.measuredAtIso,
+      why: args.capability.why,
+    },
+    why:
+      '`impossible` is the number to read first: an IMPOSSIBLE_FOR_AXIS obligation names a test ' +
+      'type that does not cover that axis, so it can NEVER be closed — the denominator grows, ' +
+      'the numerator cannot, and the percentage falls for ever with no action that would raise ' +
+      'it. It is a defect in THIS POLICY and the remedy is to edit it, which is why it is ' +
+      'reported apart from UNRUNNABLE_HERE (a fact about this deployment — install the tool) ' +
+      'and NO_PRODUCER (a gap in QAAI, which therefore STAYS in your denominator rather than ' +
+      'raising your number for our shortfall).',
+  };
+}
+
+/** The audit of the policy this project has stored. Deterministic and model-free. */
+coverageRouter.get(
+  '/:projectId/obligations',
+  requireScope('tests:read'),
+  async (req, res) => {
+    const projectId = String(req.params.projectId);
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    /*
+     * Existence is checked separately above because `loadTypeObligationPolicy`
+     * answers `{ policy: null }` for a project that does not exist AND for one
+     * that never configured a policy. Collapsing them would answer 200 with an
+     * empty audit for a project id that is a typo.
+     */
+    const [{ policy, unreadable }, capability] = await Promise.all([
+      loadTypeObligationPolicy(project.id),
+      obligationCapability(),
+    ]);
+
+    res.json(
+      obligationPayload({
+        projectId: project.id,
+        policy,
+        unreadable,
+        audit: auditObligationPolicy({ policy, capability: capability.map }),
+        capability,
+      }),
+    );
+  },
+);
+
+/**
+ * The write half — and the door that refuses eternal debt.
+ *
+ * A PUT of the whole object, which is `updateTypeObligationPolicySchema`'s own
+ * design: an obligation policy is read as a whole, and a partial update that
+ * left one axis from one revision beside another from a second would be a
+ * denominator nobody reviewed together.
+ *
+ * ── WHICH REFUSALS CLOSE THE DOOR, AND WHICH MUST NOT ──────────────────────
+ *
+ * Only the two that are PERMANENT. `IMPOSSIBLE_FOR_AXIS` and
+ * `NOT_A_DECLARED_TYPE` describe an obligation that no deployment, no install
+ * and no future producer can ever discharge, so accepting one would be writing
+ * a number that falls for ever into a customer's project. Those are refused
+ * with the verdicts attached, so the caller is told WHICH axis and WHICH type
+ * rather than being handed a 422 to guess at.
+ *
+ * `UNRUNNABLE_HERE` must NOT refuse: it is a fact about THIS IMAGE, the type is
+ * right for the axis, and the obligation returns the moment the tool is
+ * installed. Refusing on it would make a policy acceptable or not depending on
+ * which worker answered, and would let a laptop with no k6 forbid a LOAD
+ * obligation that production can run. `NO_PRODUCER` must not refuse either —
+ * the type is right and runnable and the missing piece is OURS, which is
+ * exactly why that obligation stays in the denominator rather than being shed.
+ *
+ * `requireRole('ADMIN')`, matching `PUT /projects/:projectId/gate-rules` and
+ * `PATCH /projects/:projectId`: this is the project's coverage denominator for
+ * everybody who reads the number, not one person's view of it.
+ */
+coverageRouter.put(
+  '/:projectId/obligations',
+  requireRole('ADMIN'),
+  requireScope('tests:write'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+    const input = updateTypeObligationPolicySchema.parse(req.body);
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    const capability = await obligationCapability();
+    /*
+     * Adjudicated BEFORE the write, against the incoming policy. A door that
+     * stored first and audited afterwards would report the eternal debt it had
+     * just created, which is the report this endpoint exists to make
+     * unnecessary.
+     */
+    const verdict = auditObligationPolicy({ policy: input, capability: capability.map });
+    const permanent = verdict.verdicts.filter(
+      (verdict) =>
+        verdict.refusal === 'IMPOSSIBLE_FOR_AXIS' || verdict.refusal === 'NOT_A_DECLARED_TYPE',
+    );
+
+    if (permanent.length > 0) {
+      throw unprocessable(
+        `${permanent.length} of these obligations could NEVER be closed by any test, so this ` +
+          'policy was not saved. Each one would grow the coverage denominator with no action ' +
+          'anywhere that could raise the numerator — the percentage would fall for ever and the ' +
+          'gap list would fill with items nobody can close. Read `axes[].satisfiable` on GET ' +
+          '/coverage/:projectId/obligations for the types that cover each surface kind.',
+        {
+          refused: permanent,
+          /*
+           * Returned so a client can repair the policy without a second
+           * round-trip, and so the refusal names the axis that has NO
+           * satisfiable type at all rather than only the type that was wrong.
+           */
+          axes: obligationAxes(input).filter((axis) => axis.declared.length > 0),
+        },
+      );
+    }
+
+    await prisma.project.update({
+      where: { id: project.id },
+      data: { typeObligationPolicy: input },
+    });
+
+    /*
+     * Audited because it changes a published number for everyone in the org.
+     * THE METADATA IS THE SHAPE AND NOT THE PROSE: axis names and type names
+     * only, both from closed vocabularies that this server owns, so nothing a
+     * customer wrote reaches the log line or the index behind it.
+     *
+     * The local reading is `verdict` and not `audit` on purpose: `audit` is the
+     * log writer imported at the top of this file, and a handler that shadowed
+     * it would be a silent hole in an append-only log rather than a type error.
+     */
+    await audit({
+      actor,
+      action: 'coverage.obligations.update',
+      targetType: 'Project',
+      targetId: project.id,
+      metadata: {
+        axes: Object.keys(input.byKind).sort(),
+        obligations: Object.fromEntries(
+          Object.entries(input.byKind).map(([kind, types]) => [kind, [...(types ?? [])].sort()]),
+        ),
+        counted: verdict.counted,
+      },
+    });
+
+    res.json(
+      obligationPayload({
+        projectId: project.id,
+        policy: input,
+        unreadable: false,
+        audit: verdict,
+        capability,
+      }),
+    );
+  },
+);

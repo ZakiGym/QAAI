@@ -68,6 +68,7 @@ import {
   BROWSER_ENGINES,
   BROWSER_PERMISSIONS,
   COLOUR_SCHEMES,
+  DEFAULT_ENGINE_KEY,
   DEVICE_PRESETS,
   FORCED_COLORS_MODES,
   INTERACTION_STATES,
@@ -594,9 +595,142 @@ export const matrixDeviceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('VIEWPORT'), viewport: explicitViewportSchema }).strict(),
 ]);
 
+/*
+ * ── A DELIMITER IN CUSTOMER TEXT FORGES A SEGMENT OF SOMEBODY ELSE'S KEY ────
+ *
+ * The locale tag and the IANA zone are the only cell fields that are free text,
+ * and both are CONCATENATED into keys. `variantLocaleKey` spells the variant
+ * row's locale column `tag@timezone`; `matrixCellKey` joins the cell's axes
+ * with `|`; and `variantDimension` reserves an angle bracket for a value that
+ * is EXACTLY a sentinel. So an unconstrained tag can spell one of those
+ * delimiters and two DIFFERENT cells collapse onto ONE key — this round's
+ * defect in a sixth costume, costing the same thing. All three directions were
+ * observed before this refusal existed:
+ *
+ *   `{locale: 'en@America/New_York'}` and `{locale: 'en', timezone:
+ *   'America/New_York'}` are two cells `matrixCellSchema` ACCEPTS; their
+ *   `matrixCellKey`s differ so they plan as two cells; and they produce ONE
+ *   locale column, so `planMeasurements` refuses the matrix WHOLE for a
+ *   duplicate cell. Zero variant rows for the run behind one `logger.warn`,
+ *   and a 400 on the whole batch on the agent path.
+ *
+ *   `{locale: 'en|US', timezone: 'x'}` and `{locale: 'en', timezone: 'US|x'}`
+ *   go the other way: ONE `matrixCellKey` from two different cells, so
+ *   `planMatrix` refuses the declaration as a duplicate that it is not.
+ *
+ *   A tag spelled `'<unvaried>'` IS the whole-value sentinel, so a cell that
+ *   DID vary the locale keys as one that did not; and a zone holding any other
+ *   bracket reaches `variantDimension` mid-composite, which is the forging hole
+ *   that refinement exists to close — refused there, at the cost of the matrix.
+ *
+ * REFUSED AT THE DOOR AND NOT ESCAPED IN THE PRODUCER. An escaped key is a key
+ * nobody can read back, and these two producers are how a human finds a row.
+ *
+ * FOUR CHARACTERS AND NOT A BCP-47 SHAPE, deliberately. A positive tag shape
+ * would also refuse `de_DE` and `en-US.UTF-8` — odd spellings of a real locale
+ * rather than forgeries — and refusing a spec a customer already stored loses
+ * exactly the rows this exists to save. These four are the ENTIRE vocabulary of
+ * the two key producers; nothing else about the tag is this schema's business.
+ * (The stricter `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$` further down this file is
+ * on a COVERAGE DIMENSION descriptor, which nothing hands to a browser.)
+ */
+const NO_KEY_DELIMITER = /^[^@|<>]*$/;
+const FORGES_A_KEY_SEGMENT =
+  '@, | and the angle brackets are the separators and sentinel brackets that the variant locale ' +
+  'column and the matrix cell key are built from, so a delimiter here spells a segment of another ' +
+  "cell's key: two different cells collapse onto one row and the write path then refuses the " +
+  'matrix whole';
+
+/** A BCP-47 tag, bounded and with the key delimiters refused. One spelling, four fields. */
+const localeTagField = () =>
+  z.string().min(2).max(35).regex(NO_KEY_DELIMITER, FORGES_A_KEY_SEGMENT);
+/** An IANA zone, same bound and same refusal. `min` differs per field, so it is applied by the caller. */
+const timezoneField = () => z.string().max(64).regex(NO_KEY_DELIMITER, FORGES_A_KEY_SEGMENT);
+
 /**
- * ONE CELL — and the three refusals are the whole reason this is a schema rather
- * than an interface.
+ * ONE CELL'S FIELDS, AND NOT ONE CELL'S RULES.
+ *
+ * ── WHY THE FIELDS ARE A SCHEMA OF THEIR OWN ────────────────────────────────
+ *
+ * There are two questions about a cell and they are not the same question:
+ * WHAT MAY A CUSTOMER DECLARE, and WHAT DID WE RESOLVE. {@link matrixCellSchema}
+ * answers the first by adding the three cross-field refusals below;
+ * {@link matrixCellEvidenceSchema} answers the second and is THIS object, with
+ * the same ten fields, the same per-field bounds and the same `.strict()`.
+ *
+ * ONE declaration of the fields and not two, because a second hand-written copy
+ * of ten bounds is exactly how a producer and a validator come to disagree —
+ * and a disagreement between those two is invisible: `validateMeasurements` in
+ * apps/worker/src/processors/run.ts refuses a matrix WHOLE on its first bad
+ * cell, so one refused cell writes ZERO variant rows for the entire run behind
+ * one `logger.warn`, and on the agent path apps/api/src/routes/runners.ts 400s
+ * a POST carrying a whole batch of results. Five such disagreements have been
+ * found one at a time; this is the one that cannot be reintroduced by adding a
+ * field to one copy.
+ *
+ * ANYTHING ADDED HERE APPLIES TO BOTH. A rule about what a customer may DECLARE
+ * goes on `matrixCellSchema`'s refinement chain, never here.
+ */
+export const matrixCellEvidenceSchema = z
+  .object({
+    /** Absent = the deployment's default engine, reported as `<default>`. */
+    engine: browserEngineSchema.optional(),
+    /** Absent = BUNDLED, which is Playwright's own build and is NOT Chrome. */
+    channel: browserChannelSchema.optional(),
+    version: browserVersionPinSchema.optional(),
+    device: matrixDeviceSchema.optional(),
+    colourScheme: colourSchemeSchema.optional(),
+    reducedMotion: reducedMotionSchema.optional(),
+    forcedColors: forcedColorsSchema.optional(),
+    /** BCP-47, with the key delimiters refused — see {@link NO_KEY_DELIMITER}. */
+    locale: localeTagField().optional(),
+    /** IANA zone. Absent = the host's, which is why a date test must name one. */
+    timezone: timezoneField().min(1).optional(),
+  })
+  .strict();
+
+/** The fields, shared by the declaration schema and the evidence schema. */
+type MatrixCellFields = z.infer<typeof matrixCellEvidenceSchema>;
+
+/*
+ * ── THE THREE DECLARATION RULES, AS NAMED PREDICATES ────────────────────────
+ *
+ * Hoisted out of the refinement bodies for one reason: the evidence side has to
+ * ASK whether the declaration rules would refuse a cell, and a second
+ * re-implementation of "does a Firefox beta exist" would be a second opinion
+ * about the same fact. The first thing a second opinion does is diverge, and
+ * the first divergence here is a cell one half stores and the other half
+ * refuses — see `channelExistsFor`'s own import note at the head of this file.
+ */
+const versionPinNamesItsEngine = (c: MatrixCellFields): boolean =>
+  c.version === undefined || c.version.kind === 'UNPINNED' || c.engine !== undefined;
+const channelNamesItsEngine = (c: MatrixCellFields): boolean =>
+  c.channel === undefined || c.channel === 'BUNDLED' || c.engine !== undefined;
+const channelExistsForItsEngine = (c: MatrixCellFields): boolean =>
+  c.engine === undefined || c.channel === undefined || channelExistsFor(c.engine, c.channel);
+
+/**
+ * Would the DECLARATION rules refuse this cell?
+ *
+ * Not a question about whether the cell is wrong — a cells-crossed matrix
+ * legitimately produces `{engine: 'firefox', channel: 'CHROME'}`, which is
+ * precisely the cell `MatrixCellStatus.UNSUPPORTED_COMBINATION` was minted for.
+ * It is the question the EVIDENCE cross-check on
+ * {@link testResultVariantCellSchema} asks in both directions.
+ */
+const declarationRulesRefuse = (c: MatrixCellFields): boolean =>
+  !versionPinNamesItsEngine(c) || !channelNamesItsEngine(c) || !channelExistsForItsEngine(c);
+
+/**
+ * ONE CELL A CUSTOMER MAY DECLARE — and the three refusals are the whole reason
+ * this is a schema rather than an interface.
+ *
+ * EVIDENCE DOES NOT COME THROUGH HERE. These three are rules about what may be
+ * ASKED FOR; a report of a cell that was RESOLVED goes through
+ * {@link matrixCellEvidenceSchema}, because a cell that resolved
+ * UNSUPPORTED_COMBINATION is by definition one REFUSAL 3 would reject, and
+ * re-applying a declaration rule to its evidence made that status unstorable
+ * for ever. See the cross-check on {@link testResultVariantCellSchema}.
  *
  * REFUSAL 1 — A PINNED VERSION WITH NO ENGINE. A version range is a claim about
  * ONE engine's release train: Chrome 120 and Firefox 120 are unrelated builds
@@ -618,47 +752,28 @@ export const matrixDeviceSchema = z.discriminatedUnion('kind', [
  * opinion about the same fact diverges, and the first divergence is a cell the
  * API accepts and the runner refuses.
  */
-export const matrixCellSchema = z
-  .object({
-    /** Absent = the deployment's default engine, reported as `<default>`. */
-    engine: browserEngineSchema.optional(),
-    /** Absent = BUNDLED, which is Playwright's own build and is NOT Chrome. */
-    channel: browserChannelSchema.optional(),
-    version: browserVersionPinSchema.optional(),
-    device: matrixDeviceSchema.optional(),
-    colourScheme: colourSchemeSchema.optional(),
-    reducedMotion: reducedMotionSchema.optional(),
-    forcedColors: forcedColorsSchema.optional(),
-    /** BCP-47. Absent = the engine's own, which is the image's locale. */
-    locale: z.string().min(2).max(35).optional(),
-    /** IANA zone. Absent = the host's, which is why a date test must name one. */
-    timezone: z.string().min(1).max(64).optional(),
-  })
-  .strict()
-  .refine((c) => c.version === undefined || c.version.kind === 'UNPINNED' || c.engine !== undefined, {
+export const matrixCellSchema = matrixCellEvidenceSchema
+  .refine(versionPinNamesItsEngine, {
     message:
       'this cell pins a browser version and names no engine. A version range is a claim about one ' +
       "engine's release train — Chrome 120 and Firefox 120 are unrelated builds — so an unanchored " +
       'range would be compared against whatever the deployment happened to launch',
     path: ['engine'],
   })
-  .refine((c) => c.channel === undefined || c.channel === 'BUNDLED' || c.engine !== undefined, {
+  .refine(channelNamesItsEngine, {
     message:
       'this cell names a channel and no engine. Every channel except BUNDLED is a chromium build, ' +
       'so a channel on an unanchored cell is either redundant or a contradiction and nothing can ' +
       'tell which',
     path: ['engine'],
   })
-  .refine(
-    (c) => c.engine === undefined || c.channel === undefined || channelExistsFor(c.engine, c.channel),
-    {
-      message:
-        'no build of that engine has that channel — there is no Firefox beta and no WebKit canary. ' +
-        'Accepting it would store a cell that resolves UNSUPPORTED_COMBINATION for ever, so the ' +
-        'suite would carry a test that can never execute and the matrix percentage would include it',
-      path: ['channel'],
-    },
-  );
+  .refine(channelExistsForItsEngine, {
+    message:
+      'no build of that engine has that channel — there is no Firefox beta and no WebKit canary. ' +
+      'Accepting it would store a cell that resolves UNSUPPORTED_COMBINATION for ever, so the ' +
+      'suite would carry a test that can never execute and the matrix percentage would include it',
+    path: ['channel'],
+  });
 
 /**
  * The axes a test declares, which the runner expands into cells.
@@ -683,8 +798,8 @@ export const matrixAxesSchema = z
     colourSchemes: z.array(colourSchemeSchema).max(3).optional(),
     reducedMotion: z.array(reducedMotionSchema).max(2).optional(),
     forcedColors: z.array(forcedColorsSchema).max(2).optional(),
-    locales: z.array(z.string().min(2).max(35)).max(20).optional(),
-    timezones: z.array(z.string().min(1).max(64)).max(20).optional(),
+    locales: z.array(localeTagField()).max(20).optional(),
+    timezones: z.array(timezoneField().min(1)).max(20).optional(),
   })
   .strict()
   .refine(
@@ -1346,10 +1461,26 @@ export const localizationSpecSchema = z.object({
   locales: z
     .array(
       z.object({
-        /** BCP-47, e.g. `de-DE`. */
-        tag: z.string().min(2).max(35),
-        /** IANA zone. Half of localisation bugs are date and currency formatting. */
-        timezone: z.string().max(64).optional(),
+        /** BCP-47, e.g. `de-DE`. The key delimiters are refused — see {@link NO_KEY_DELIMITER}. */
+        tag: localeTagField(),
+        /**
+         * IANA zone. Half of localisation bugs are date and currency formatting.
+         *
+         * `.min(1)`, AND THE FIELD WITHOUT IT COST THE WHOLE RUN. `timezoneField`
+         * leaves the floor to the caller (see its note), and this was the one of
+         * the four call sites that did not apply it: `{ tag: 'en-US', timezone:
+         * '' }` was VALID here and planned a cell the EVIDENCE schema then
+         * refused at `cell.matrixCell.timezone`, because the other two
+         * declaration surfaces and `matrixCellEvidenceSchema` all demand a
+         * character. `validateMeasurements` refuses a matrix WHOLE on its first
+         * bad cell, so one empty zone wrote ZERO variant rows for the entire run
+         * behind one `logger.warn`, and on the agent path
+         * apps/api/src/routes/runners.ts 400s the batch of results it arrived in.
+         * An empty zone is also not a zone: the generated Playwright project
+         * drops a falsy `timezoneId`, so the cell would have run in the host's
+         * zone and been filed under a name that claims otherwise.
+         */
+        timezone: timezoneField().min(1).optional(),
       }),
     )
     .min(1)
@@ -3702,9 +3833,93 @@ const variantDimension = (max: number, extraSentinels: readonly string[] = []) =
     );
 
 export const testVariantKeySchema = z.object({
-  browser: variantDimension(60).default(UNVARIED),
-  viewport: variantDimension(60).default(UNVARIED),
-  locale: variantDimension(40).default(UNVARIED),
+  /**
+   * `'<default>'` is a second legal sentinel here, for the same reason
+   * `'<anonymous>'` is one on `role` below: it is a REAL ANSWER and not a claim
+   * that nobody varied the axis. {@link variantBrowserKey} — the only producer
+   * of this column — returns it for a cell that expressed no opinion about the
+   * engine, which is what every LOCALIZATION cell is: a locale and a timezone
+   * name no browser.
+   *
+   * Without it this refinement refused the output of its own producer, and the
+   * cost was invisible. `validateMeasurements` refuses a matrix WHOLE on its
+   * first bad cell, so EVERY LOCALIZATION run wrote zero variant rows and said
+   * so in one log line — no red test, no disconnected module, nothing for a
+   * gate to catch. It went unnoticed for as long as it did because nothing in
+   * production emitted a variant until the matrix plugins were wired to
+   * `variantsFor`; the day they were, the defect arrived already live.
+   *
+   * It does not weaken what the refinement is for. `'<default>'` cannot forge
+   * "unvaried": `variantsFor` asks `variedAxes(cell)` — the cell's own
+   * authority — before it emits a row at all, so a genuinely unvaried cell is
+   * omitted there rather than admitted here.
+   */
+  /*
+   * ── 120 AND NOT 60, BECAUSE 60 REFUSED ITS OWN PRODUCER ──────────────────
+   *
+   * Both widths were set when these columns held an engine name and a `WxH`,
+   * and the matrix round widened what the two producers can emit without
+   * revisiting them. Measured, not estimated, against the widest cell
+   * `crossBrowserSpecSchema` ACCEPTS:
+   *
+   *   browser  — `chromium:CHROME_CANARY@>=<40 numerals>..<40 numerals>` is
+   *              107 characters, because `versionLiteral` is `.max(40)` at
+   *              both ends of a window and a channel name is up to 13.
+   *   viewport — `4000x4000/@<a double>x/touch/mobile/ua` plus
+   *              `+light+reduced-motion+no-forced-colors` reaches 90, because
+   *              `deviceScaleFactor` is an unrounded `z.number()` and a double
+   *              prints up to 24 characters.
+   *
+   * At 60 the cost was the whole run, silently: `validateMeasurements` refuses
+   * a matrix WHOLE on its first bad cell, so one such cell wrote ZERO variant
+   * rows and logged one line, and on the agent path
+   * apps/api/src/routes/runners.ts 400s the entire batch at the route boundary.
+   *
+   * SAFE TO RAISE, which is the only reason it is the repair: all five
+   * dimensions are plain `String` in schema.prisma — Postgres TEXT, no declared
+   * length — so nothing downstream was relying on 60, and no accepted key
+   * changes. Shortening either producer instead would have re-spelled keys that
+   * ARE storable today (`1280x800+reduced-motion` is 23 characters) and
+   * silently re-identified every historical cell holding one. 120 is the width
+   * `role` already uses, so it is not a new number, and the parity is pinned by
+   * a test that derives the worst case from the spec schema rather than
+   * restating these figures.
+   */
+  browser: variantDimension(120, [DEFAULT_ENGINE_KEY]).default(UNVARIED),
+  viewport: variantDimension(120).default(UNVARIED),
+  /*
+   * ── 120, BECAUSE THIS COLUMN NOW CARRIES THE TIMEZONE ─────────────────────
+   *
+   * The locale dimension holds `tag@timezone`, spelled with the SAME separator
+   * the browser dimension already uses for a version pin, so it is not new
+   * vocabulary. Four shapes and no fifth: neither axis varied -> `<unvaried>`;
+   * locale only -> `en-US`; both -> `en-US@America/New_York`; timezone only ->
+   * `@America/New_York`. NO ANGLE BRACKET MAY APPEAR INSIDE A COMPOSITE —
+   * `<unvaried>@America/New_York` is refused, because that is the forging hole
+   * `variantDimension`'s refinement exists to close and it stays closed.
+   *
+   * Timezone had to join the identity because without it the single most
+   * natural localisation matrix collides on one row: `locales: [{tag: 'en-US',
+   * timezone: 'America/New_York'}, {tag: 'en-US', timezone:
+   * 'Pacific/Auckland'}]` is VALID, plans two cells, and keyed two cells to ONE
+   * key — at which point `planMeasurements` refuses the matrix WHOLE for a
+   * duplicate cell and the run writes nothing.
+   *
+   * MEASURED, NOT ESTIMATED, and the ceiling is `matrixCellSchema`'s own:
+   * `locale` is `.max(35)` and `timezone` is `.max(64)`, so the widest key this
+   * column can be asked to hold is 35 + 1 + 64 = 100. 40 refused it from the
+   * second character of a composite. 120 is the width `browser`, `viewport` and
+   * `role` already use, so it is not a new number, and the figure above is
+   * pinned by a test that DERIVES the worst case from
+   * `matrixCellEvidenceSchema`'s own field bounds rather than restating 100.
+   *
+   * SAFE TO RAISE, same argument as the browser and viewport raise: the column
+   * is plain `String` in schema.prisma — Postgres TEXT, no declared length — so
+   * nothing downstream relied on 40 and no key that is accepted today changes.
+   * Shortening the producer instead would have re-spelled keys that ARE
+   * storable now and silently re-identified every historical cell holding one.
+   */
+  locale: variantDimension(120).default(UNVARIED),
   /**
    * `'<anonymous>'` is a real answer — it ran logged out — and {@link UNVARIED}
    * means nobody varied the role at all. Two sentinels because those are two
@@ -3761,6 +3976,18 @@ export const testMetricSchema = z
   });
 
 /**
+ * The ceiling on a cell's failure message.
+ *
+ * A named, exported number because the PRODUCER has to fit under it: a message
+ * over the bound is refused by this schema, `validateMeasurements` refuses a
+ * matrix WHOLE on its first bad cell, and a Playwright assertion message with
+ * its call log is routinely longer than this. The matrix plugins' `variantsFor`
+ * shortens a message to this length with a marker rather than hand the validator
+ * a string it must refuse — see `fitCellMessage` in packages/runner/src/matrix.ts.
+ */
+export const MAX_VARIANT_ERROR_MESSAGE = 5_000;
+
+/**
  * One variant result, with its own status and its own numbers.
  *
  * Bounded at 40 metrics per cell: the performance plugin emits six vitals, k6
@@ -3779,19 +4006,79 @@ export const testResultVariantSchema = z.object({
    */
   status: z.enum(TEST_RESULT_STATUSES),
   durationMs: z.number().int().min(0),
-  errorMessage: z.string().max(5_000).nullable().default(null),
+  errorMessage: z.string().max(MAX_VARIANT_ERROR_MESSAGE).nullable().default(null),
   retriedAndPassed: z.boolean().default(false),
   /**
    * Why this cell measured nothing. NULL IS A FIFTH STATE and it is NOT
    * `NOT_RUN` — the same contract as `TestResult.notRunKind`. `why` travels
    * with the kind because the kind alone ("UNSUPPORTED") is not a sentence a
    * customer can act on.
+   *
+   * ── THE BOUND IS 1,000 BECAUSE 500 REFUSED THIS SCHEMA'S OWN PRODUCER ─────
+   *
+   * `harnessSupport` in packages/runner/src/plugins/matrix.ts composes the
+   * refusal for a cell the generated Playwright project cannot express, and
+   * that sentence is 482 characters of template plus the names of the axes the
+   * cell varied. One axis fits in 500. TWO DO NOT: a cell varying colourScheme
+   * AND reducedMotion produces 509, and all six unhonourable axes produce 549.
+   *
+   * At 500 the cost was the same silent, total loss the `'<default>'` sentinel
+   * had. `validateMeasurements` in apps/worker/src/processors/run.ts refuses a
+   * matrix WHOLE on its first bad cell — there being no such thing as half a
+   * matrix — so a CROSS_BROWSER spec declaring `colourSchemes` beside
+   * `reducedMotion` wrote ZERO variant rows for the entire run and said so in
+   * one log line. The agent path is worse: apps/api/src/routes/runners.ts parses
+   * the whole batch through `z.array(testResultVariantSchema)` at the route
+   * boundary, so one such cell 400s a POST carrying up to fifty results and the
+   * verdicts go with it. No red test either way: every test that drove an
+   * unhonourable cell varied exactly one axis.
+   *
+   * RAISED RATHER THAN TRUNCATED, and raised rather than shortening the remedy.
+   * A `why` is composed into `errorMessage` as `[KIND] why`, and that field is
+   * bounded at 5,000 here, so 1,000 is nowhere near the column. Cutting the
+   * producer's sentence instead would have bought the same green gate by
+   * deleting the part that tells the customer which file to change — and it
+   * would need cutting again the next time an axis is added. The parity is
+   * pinned by a test instead: packages/runner/src/plugins/matrix.test.ts drives
+   * the all-axes cell, derived from `HARNESS_HONOURS` rather than hand-written,
+   * through this very schema.
    */
   notRun: z
-    .object({ kind: z.enum(NOT_RUN_KINDS), why: z.string().min(1).max(500) })
+    .object({ kind: z.enum(NOT_RUN_KINDS), why: z.string().min(1).max(1_000) })
     .nullable()
     .default(null),
   metrics: z.array(testMetricSchema).max(40).default([]),
+  /**
+   * The per-cell honesty evidence: the resolved cell, whether this deployment
+   * could run it, the remedy if not, and the assertions it did not make.
+   *
+   * ── WHY THIS LINE EXISTS, AND WHY IT IS `z.lazy` ───────────────────────────
+   *
+   * This object is a plain `z.object` and NOT `.strict()`, so an unknown key is
+   * SILENTLY DROPPED. apps/api/src/routes/runners.ts builds its own
+   * `executionSchema` from `z.array(testResultVariantSchema)`, so without this
+   * line an on-prem agent could report all five columns and the write would be
+   * five NULLs with no refusal and no log line. The worker reads the raw
+   * property BEFORE the strip to get around exactly that; the agent path has no
+   * such reader, so it needed the field admitted here instead. Until this
+   * landed, a customer's honesty columns depended on which runner they happened
+   * to run — the one property measurement-rows.ts exists to guarantee.
+   *
+   * `z.lazy` is load-bearing, not stylistic: `testResultVariantCellSchema` is
+   * declared some two thousand lines below this one in the same module, so a
+   * direct reference is a temporal-dead-zone throw at import time — which would
+   * take down every consumer of this file, not just this field.
+   *
+   * NULLABLE WITH A `null` DEFAULT, because absent is the fifth state. A
+   * producer that made no claim about a cell's runnability is not a producer
+   * claiming AVAILABLE, and `planMeasurements` writes all five columns as
+   * nothing-recorded for it while still writing the ROW — so the cell stays in
+   * the denominator.
+   */
+  cell: z
+    .lazy(() => testResultVariantCellSchema)
+    .nullable()
+    .default(null),
 });
 
 /**
@@ -5818,8 +6105,40 @@ export const testTypeDeclarationSchema = z
  */
 export const testResultVariantCellSchema = z
   .object({
-    /** The resolved cell. Its key must equal the stored browser/viewport pair. */
-    matrixCell: matrixCellSchema,
+    /**
+     * The RESOLVED cell. Its key must equal the stored browser/viewport pair.
+     *
+     * ── `matrixCellEvidenceSchema` AND NOT `matrixCellSchema` ───────────────
+     *
+     * EVIDENCE IS NOT A DECLARATION. `matrixCellSchema`'s three refinements are
+     * rules about what a CUSTOMER MAY ASK FOR; this field is a report of a cell
+     * that was RESOLVED, and one of the six things a cell can resolve to is
+     * UNSUPPORTED_COMBINATION — a status minted for exactly the cell those
+     * refinements refuse.
+     *
+     * It arrived live the day the matrix plugins were wired to `variantsFor`.
+     * A spec crossing engines with channels is VALID and produces cells no
+     * deployment can run: `{browsers: ['chromium'], matrix: {engines:
+     * ['firefox','chromium','webkit'], channels: ['CHROME','MSEDGE']}}` plans
+     * six cells, `resolveMatrixCell` resolves four of them
+     * UNSUPPORTED_COMBINATION with a remedy, the planner correctly refuses to
+     * RUN them and correctly emits a row saying so — and all four rows were
+     * then refused HERE at `cell.matrixCell.channel`. The cost was never four
+     * rows: `validateMeasurements` in apps/worker/src/processors/run.ts refuses
+     * a matrix WHOLE on its first bad cell, so the run wrote ZERO variant rows
+     * behind one `logger.warn`, and apps/api/src/routes/runners.ts parses the
+     * whole body through `z.array(testResultVariantSchema)`, so the same cell
+     * 400s a POST carrying a batch of results and the verdicts go with them.
+     * The one status that exists to record an impossible cell could not be
+     * recorded for any cell that was actually impossible.
+     *
+     * The bounds, the field list and `.strict()` are UNCHANGED — an unknown key
+     * in evidence is still a producer bug and is still refused. What is dropped
+     * is the three CROSS-FIELD declaration rules, and what replaces them is the
+     * two-way cross-check at the bottom of this schema, which keeps the one
+     * property they were protecting.
+     */
+    matrixCell: matrixCellEvidenceSchema,
     /** AVAILABLE for a cell that ran. The other five mean no evidence exists. */
     cellStatus: matrixCellStatusSchema,
     /** Null for AVAILABLE and NOT_CHECKED; required for the other four. */
@@ -5863,4 +6182,54 @@ export const testResultVariantCellSchema = z
       'a reason is given and nothing is listed as unasserted, so the row claims a hole it does not ' +
       'describe',
     path: ['notAsserted'],
-  });
+  })
+  /*
+   * ── THE CROSS-CHECK THAT REPLACES THE THREE DECLARATION REFINEMENTS ───────
+   *
+   * Dropping them from `matrixCell` above cannot be free. REFUSAL 3 —
+   * `channelExistsFor` — exists so that a cell which can NEVER EXECUTE is never
+   * counted in the numerator, and the evidence side has to keep that property
+   * on its own terms rather than inherit a rule written for a different
+   * question. So both directions are asserted, and they catch opposite lies.
+   * Both ask `declarationRulesRefuse`, which asks the same three predicates
+   * `matrixCellSchema` refines on — never a restatement of them.
+   */
+  .refine((v) => !declarationRulesRefuse(v.matrixCell) || v.cellStatus === 'UNSUPPORTED_COMBINATION', {
+    message:
+      'this cell is one the declaration rules refuse — a channel that no build of that engine has, ' +
+      'or a channel or version pin with no engine to anchor it — and the evidence claims some ' +
+      'other status for it. That is the storable lie: a cell that can never execute, recorded as ' +
+      'AVAILABLE, is a cell that can never fail sitting in the numerator for ever. ' +
+      'UNSUPPORTED_COMBINATION is the status minted for it',
+    path: ['cellStatus'],
+  })
+  /*
+   * THE OTHER DIRECTION, and it is the half that keeps the first one from being
+   * read as an iff. A cell the declaration rules ACCEPT may still resolve
+   * UNSUPPORTED_COMBINATION — a device preset this image cannot emulate, a
+   * released consumer build only a grid can serve — and that resolution has to
+   * stay storable, or this round's defect comes straight back wearing the
+   * opposite sign. What it may NOT be is unexplained: an impossible status on a
+   * possible cell, with nothing saying which part of the deployment could not
+   * express it, is either a resolver bug or a cell nobody can review.
+   *
+   * The remedy half deliberately overlaps the generic remedy refinement above,
+   * so this can never be the ONLY issue on a row — the value is the second
+   * diagnosis and the second path. That one points at `cellRemedy` ("you owe a
+   * next action"); this one points at `matrixCell` ("the status and the cell
+   * disagree, and the cell may be the thing that is wrong").
+   */
+  .refine(
+    (v) =>
+      v.cellStatus !== 'UNSUPPORTED_COMBINATION' ||
+      declarationRulesRefuse(v.matrixCell) ||
+      v.cellRemedy !== null,
+    {
+      message:
+        'the status says this combination does not exist, and the declaration rules would have ' +
+        'ACCEPTED this cell — so either the resolution is wrong about the cell, or a remedy has to ' +
+        'say which part of this deployment could not express it. A device preset the image cannot ' +
+        'emulate is a real UNSUPPORTED_COMBINATION; it is not one a reader can guess at',
+      path: ['matrixCell'],
+    },
+  );

@@ -30,6 +30,7 @@
  * fakes, including the two failure paths, which is why it has tests at all.
  */
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   ANONYMOUS_ROLE,
@@ -37,14 +38,20 @@ import {
   UNVARIED,
   baselineViewportKey,
   cellCounts,
+  crossBrowserSpecSchema,
+  localizationSpecSchema,
   planMeasurements,
+  testResultVariantSchema,
+  testVariantKeySchema,
   variantBrowserKey,
+  variantKeyOf,
   visualCaptureSchema,
 } from '@qaai/shared';
 import type {
   DeploymentBrowsers,
   InteractionState,
   MatrixCell,
+  MeasuredVariant,
   MeasurementParent,
   TestResultVariant,
 } from '@qaai/shared';
@@ -62,6 +69,7 @@ import {
   variantsFor,
 } from './matrix.js';
 import type { StateReachOutcome, VisualCapturePlan } from './matrix.js';
+import { crossBrowserPlan, localizationPlan } from './plugins/matrix.js';
 
 const SEED = 'run-7f3a';
 
@@ -131,6 +139,25 @@ describe('NOT_RUN_KIND_FOR_CELL', () => {
     expect(CELL_STATUS_SEVERITY.TIMED_OUT).toBeGreaterThan(CELL_STATUS_SEVERITY.FAILED);
     expect(CELL_STATUS_SEVERITY.FAILED).toBeGreaterThan(CELL_STATUS_SEVERITY.FLAKY);
     expect(CELL_STATUS_SEVERITY.PASSED).toBeGreaterThan(CELL_STATUS_SEVERITY.SKIPPED);
+  });
+
+  it('is the only worst-wins ranking in this package, which is the point of it', () => {
+    /*
+     * playwright-harness.ts held a PRIVATE `STATUS_SEVERITY` with the same five
+     * numbers, and the comment on {@link CELL_STATUS_SEVERITY} has always said
+     * the harness should import this and delete its own. Two implementations of
+     * one ranking is how a roll-up comes to disagree with a screen's sort, and a
+     * PRIVATE copy is the worse half: no second reader could reach it, so
+     * nothing could ever have noticed the two drifting. They agreed on the day
+     * they were merged, which is exactly why no behavioural test could tell
+     * them apart and why this assertion is about the SOURCE.
+     *
+     * Asserted by reading the file rather than by comparing two tables, because
+     * a test that compares them is a test that requires both to exist.
+     */
+    const harness = readFileSync(new URL('./playwright-harness.ts', import.meta.url), 'utf8');
+    expect(harness).toContain("import { CELL_STATUS_SEVERITY } from './matrix.js'");
+    expect(harness).not.toMatch(/const\s+STATUS_SEVERITY\s*[:=]/);
   });
 });
 
@@ -417,6 +444,126 @@ describe('variantsFor', () => {
       // The not-run sentence survives, tagged, in the one message column.
       expect(result.variants[2]?.errorMessage).toContain('[BLOCKED_BY_ENV]');
     }
+  });
+});
+
+// ─── The locale dimension, from the real plan to the write path ──────────────
+
+describe('a localisation matrix in two zones reaches the write path', () => {
+  /*
+   * ── A TEST THAT ASSERTS A KEY'S SPELLING DOES NOT ASSERT THAT THE KEY CAN BE
+   *    STORED ────────────────────────────────────────────────────────────────
+   *
+   * Five disagreements between the key producers and the write-path validator
+   * have now been found one at a time, and every one of them had a green test
+   * over it: the test asserted the key CHARACTER FOR CHARACTER and never put it
+   * through the schema that has to accept it. The cost is the same every time.
+   * `validateMeasurements` in apps/worker/src/processors/run.ts refuses a matrix
+   * WHOLE on its first bad cell, so one bad column writes ZERO variant rows for
+   * the entire run behind one `logger.warn` — and the worst-wins roll-up
+   * survives, so the run reads as fine — while on the agent path
+   * apps/api/src/routes/runners.ts parses the body through
+   * `z.array(testResultVariantSchema)` and 400s a whole batch of results.
+   *
+   * So these end at the validator, and they START AT THE REAL PLAN. The
+   * timezone collision was not reachable from a hand-made cell: it needs two
+   * cells that AGREE on the locale and differ on the zone, and the three
+   * tests that drove a matrix cell before this one each varied exactly one
+   * axis, which is why a green suite sat on top of a dimension the identity did
+   * not carry.
+   */
+  const context = { environment: 'env_1' } as const;
+
+  /** Every planned cell PASSED, so nothing here turns on a verdict. */
+  const drive = (planned: ReturnType<typeof planMatrix>): readonly MeasuredVariant[] => {
+    expect(planned.problems).toEqual([]);
+    const { variants, omitted } = variantsFor(
+      planned,
+      context,
+      planned.runnable.map((execution) => ({
+        cell: execution.cell,
+        status: 'PASSED' as const,
+        durationMs: 10,
+      })),
+    );
+    expect(omitted).toEqual([]);
+    return variants;
+  };
+
+  /**
+   * The chain BOTH ingest paths run, reported as zod PATHS and never as values:
+   * a locale tag and a zone are customer-authored text, and the one thing a
+   * failure here must not do is print them into a log or a diff.
+   */
+  const refusedPaths = (variants: readonly MeasuredVariant[]): string[] =>
+    variants.flatMap((variant) => {
+      const key = testVariantKeySchema.safeParse(variant.key);
+      const row = testResultVariantSchema.safeParse(variant);
+      return [
+        ...(key.success ? [] : key.error.issues.map((issue) => `key.${issue.path.join('.')}`)),
+        ...(row.success ? [] : row.error.issues.map((issue) => `variant.${issue.path.join('.')}`)),
+      ];
+    });
+
+  it('gives one locale in two zones two identities, and the write path takes both', () => {
+    const spec = {
+      locales: [
+        { tag: 'en-US', timezone: 'America/New_York' },
+        { tag: 'en-US', timezone: 'Pacific/Auckland' },
+      ],
+    };
+    // Through the spec schema first, so this is a declaration a customer can
+    // store and not a shape invented to be awkward. It is also the single most
+    // natural thing a localisation matrix says: half of localisation bugs are
+    // date and currency formatting, which one zone cannot exercise.
+    expect(localizationSpecSchema.safeParse(spec).success).toBe(true);
+
+    const variants = drive(localizationPlan(spec, SEED));
+    expect(variants).toHaveLength(2);
+    expect(variants.map((variant) => variant.key.locale)).toEqual([
+      'en-US@America/New_York',
+      'en-US@Pacific/Auckland',
+    ]);
+    // THE ASSERTION THE DEFECT FAILED. With the timezone outside the identity
+    // both rows keyed identically — two cells, ONE row — and `planMeasurements`
+    // refused the matrix whole for a duplicated cell.
+    expect(new Set(variants.map((variant) => variantKeyOf(variant.key))).size).toBe(2);
+    // The browser dimension stays `'<default>'`: a cell naming a locale and a
+    // zone names no engine, and that is a real answer rather than a gap.
+    expect(variants.map((variant) => variant.key.browser)).toEqual(['<default>', '<default>']);
+
+    expect(refusedPaths(variants)).toEqual([]);
+    expect(planMeasurements(PARENT, variants, []).ok).toBe(true);
+  });
+
+  it('does the same on the CROSS_BROWSER timezones axis', () => {
+    // The same collision from the other direction: `matrix.timezones` crossed
+    // with one locale is a product, not a pairing, and before the composite its
+    // cells differed only in a dimension no column held.
+    const spec = {
+      browsers: ['chromium' as const],
+      matrix: { locales: ['en-US'], timezones: ['America/New_York', 'Pacific/Auckland'] },
+    };
+    expect(crossBrowserSpecSchema.safeParse(spec).success).toBe(true);
+
+    const variants = drive(crossBrowserPlan(spec, SEED));
+    expect(variants).toHaveLength(2);
+    expect(new Set(variants.map((variant) => variant.key.locale)).size).toBe(2);
+    expect(refusedPaths(variants)).toEqual([]);
+    expect(planMeasurements(PARENT, variants, []).ok).toBe(true);
+  });
+
+  it('leaves a locale-only matrix keying exactly as it did before the composite', () => {
+    /*
+     * The half that decides whether this change is free: a declaration naming no
+     * zone must produce the column production already stored, byte for byte, or
+     * every historical row is re-identified and every trend over a locale
+     * breaks at the deploy.
+     */
+    const variants = drive(localizationPlan({ locales: [{ tag: 'ja-JP' }, { tag: 'ar-EG' }] }, SEED));
+    expect(variants.map((variant) => variant.key.locale)).toEqual(['ja-JP', 'ar-EG']);
+    expect(refusedPaths(variants)).toEqual([]);
+    expect(planMeasurements(PARENT, variants, []).ok).toBe(true);
   });
 });
 

@@ -44,6 +44,7 @@ import {
   parseVersionBound,
   resolveMatrixCell,
   variantBrowserKey,
+  variantLocaleKey,
   variantViewportKey,
   variedAxes,
   versionInRange,
@@ -73,6 +74,7 @@ import {
   reducedMotionSchema,
   stateUnreachedReasonSchema,
   testMatrixSchema,
+  testVariantKeySchema,
   visualCaptureSchema,
   visualTestSpecSchema,
 } from './schemas';
@@ -279,6 +281,53 @@ describe('the cell key says which axes were varied and which were not', () => {
     expect(variantViewportKey(explicit)).toBe('1280x800/notouch');
   });
 
+  it('never puts the unvaried sentinel inside a composite viewport key', () => {
+    /*
+     * `<unvaried>+dark` was the real output here, and it was a value BOTH
+     * ingest paths REFUSE: `variantDimension` reserves angle brackets for
+     * values that are EXACTLY a sentinel, which is the one thing stopping a
+     * caller forging "this dimension was not varied" for a cell that was. And
+     * `validateMeasurements` refuses a matrix WHOLE on its first bad cell, so a
+     * customer declaring a dark-mode cell lost every variant row of that run —
+     * including the cells that ran perfectly — to one log line and no red test.
+     *
+     * An absent screen segment already MEANS the size was not varied, so
+     * dropping the sentinel loses nothing and says nothing untrue.
+     */
+    expect(variantViewportKey({ colourScheme: 'DARK' })).toBe('dark');
+    expect(variantViewportKey({ reducedMotion: 'REDUCE' })).toBe('reduced-motion');
+    expect(variantViewportKey({ forcedColors: 'ACTIVE' })).toBe('forced-colors');
+    expect(variantViewportKey({ colourScheme: 'LIGHT', reducedMotion: 'NO_PREFERENCE' })).toBe(
+      'light+full-motion',
+    );
+    for (const cell of [
+      { colourScheme: 'DARK' } as MatrixCell,
+      { reducedMotion: 'REDUCE' } as MatrixCell,
+      { forcedColors: 'ACTIVE' } as MatrixCell,
+    ]) {
+      expect(variantViewportKey(cell)).not.toContain('<');
+    }
+  });
+
+  it('still keys a cell that names a screen byte-identically, sentinel or not', () => {
+    /*
+     * The positive control for the repair above, and the reason it is safe:
+     * every key that names a device is untouched, which is all of
+     * `VisualBaseline`'s — `baselineViewportKey` is only ever handed a cell from
+     * `floorCellFor`, which always sets one. A repair that moved these would
+     * have silently re-identified every approved baseline in the product.
+     */
+    const dark: MatrixCell = {
+      device: { kind: 'VIEWPORT', viewport: { width: 1280, height: 800 } },
+      colourScheme: 'DARK',
+    };
+    expect(variantViewportKey(dark)).toBe('1280x800+dark');
+    expect(baselineViewportKey(dark, 'DEFAULT')).toBe('1280x800+dark');
+    // And the no-preference cell keeps the bare sentinel as its WHOLE value,
+    // which the refinement accepts and which is what every pre-matrix row holds.
+    expect(variantViewportKey(UNVARIED_CELL)).toBe(UNVARIED);
+  });
+
   it('is byte-identical regardless of the order the fields were written in', () => {
     // `JSON.stringify` would not be: property order is insertion order, and an
     // optional field set to `undefined` is not the same key as an absent one.
@@ -293,7 +342,94 @@ describe('the cell key says which axes were varied and which were not', () => {
       channel: 'CHROME_BETA',
       version: { kind: 'RANGE', range: { atLeast: '130', below: '132', why: 'a flag' } },
     };
-    expect(variantBrowserKey(cell)).toBe('chromium:CHROME_BETA@>=130<132');
+    // `..` and not `<`: see `versionKey`. The `<` spelling was a value both
+    // ingest paths refused, and this assertion passed while every run of such a
+    // cell wrote nothing.
+    expect(variantBrowserKey(cell)).toBe('chromium:CHROME_BETA@>=130..132');
+  });
+
+  it('emits a key the WRITE PATH accepts for the widest cell a spec can declare', () => {
+    /*
+     * ── THE PARITY NOTHING ENFORCED, AND IT COST EVERY ROW OF A RUN ─────────
+     *
+     * These two functions are the ONLY producers of `TestResultVariant.browser`
+     * and `.viewport`, and `testVariantKeySchema` is the only consumer. Nothing
+     * put a key from the first through the second, so the matrix round widened
+     * what a cell can vary and left three values the write path refuses:
+     *
+     *   · `>=120<130` — the `<` is an angle bracket in the middle of a
+     *     composite, which `variantDimension` reserves for whole-value
+     *     sentinels. ANY bounded version window.
+     *   · a browser key of 105 characters against a bound of 60.
+     *   · a viewport key of 90 against the same 60.
+     *
+     * `validateMeasurements` refuses a matrix WHOLE on its first bad cell, so
+     * each of those wrote ZERO variant rows for the entire run behind one log
+     * line, and the agent path 400s the whole batch. The previous test asserts
+     * the key's SPELLING and passed throughout.
+     *
+     * The cell is built from the SPEC SCHEMA'S OWN CEILINGS — `versionLiteral`
+     * is `.max(40)` at both ends, `explicitViewportSchema` caps width and height
+     * at 4000, `deviceScaleFactor` is an unrounded double — and is parsed
+     * through `matrixCellSchema` first, so this is the widest cell a customer
+     * can actually store and not a shape invented to be long. Tighten a bound
+     * in schemas.ts and this goes red rather than production going quiet.
+     */
+    const fortyNumerals = '120.0.6099.109.1.2.3.4.5.6.7.8.9.10.11.1';
+    expect(fortyNumerals).toHaveLength(40);
+    const widest: MatrixCell = {
+      engine: 'chromium',
+      channel: 'CHROME_CANARY',
+      version: {
+        kind: 'RANGE',
+        range: { atLeast: fortyNumerals, below: '130.0.6099.109.1.2.3.4.5.6.7.8.9.10.11.1', why: 'a flag' },
+      },
+      device: {
+        kind: 'VIEWPORT',
+        viewport: {
+          width: 4000,
+          height: 4000,
+          // An unrounded double, because the schema permits one and this is
+          // what makes the segment as long as it can get.
+          deviceScaleFactor: 0.1 + 0.2,
+          hasTouch: true,
+          isMobile: true,
+          userAgent: 'QAAI',
+        },
+      },
+      colourScheme: 'LIGHT',
+      reducedMotion: 'REDUCE',
+      // NONE and not ACTIVE: `variantViewportKey` spells NONE as
+      // `no-forced-colors`, which is the longer of the two.
+      forcedColors: 'NONE',
+      locale: 'de-DE',
+      timezone: 'Europe/Berlin',
+    };
+    expect(matrixCellSchema.safeParse(widest).success).toBe(true);
+
+    const browser = variantBrowserKey(widest);
+    const viewport = variantViewportKey(widest);
+    /*
+     * No `<` anywhere but as a whole value. `variantDimension` tests for `<`
+     * alone and not for `>`, which is why `>=120` has always been storable and
+     * `>=120<130` never was — the bracket that can start a sentinel is the one
+     * that is reserved.
+     */
+    expect(browser).not.toContain('<');
+    expect(viewport).not.toContain('<');
+
+    const parsed = testVariantKeySchema.safeParse({
+      browser,
+      viewport,
+      locale: widest.locale,
+      role: UNVARIED,
+      environment: 'env-1',
+    });
+    // The PATHS, never the key text: a failure must name the dimension the way
+    // `validateMeasurements` does, not print a 100-character key into a diff.
+    expect(
+      parsed.success ? [] : parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'),
+    ).toEqual([]);
   });
 
   it('names only the axes a cell actually varied', () => {
@@ -305,6 +441,99 @@ describe('the cell key says which axes were varied and which were not', () => {
       'colourScheme',
       'timezone',
     ]);
+  });
+});
+
+describe('the locale dimension carries the timezone', () => {
+  /**
+   * The expression this column was built with before `variantLocaleKey`
+   * existed, held here as the thing the two unvaried shapes are compared
+   * AGAINST rather than a literal somebody typed. A literal pins the spelling
+   * of this test; this pins the spelling production has already stored, which
+   * is the half that decides whether a historical row keeps its identity.
+   */
+  const previousProducer = (cell: MatrixCell): string => cell.locale ?? UNVARIED;
+
+  it('is byte-identical to the old expression for every cell naming no timezone', () => {
+    const noZone: MatrixCell[] = [
+      UNVARIED_CELL,
+      { locale: 'en-US' },
+      { locale: 'ar-EG' },
+      { engine: 'chromium', colourScheme: 'DARK', locale: 'ja-JP' },
+    ];
+    for (const cell of noZone) {
+      expect(variantLocaleKey(cell)).toBe(previousProducer(cell));
+    }
+    // The two values that identity consists of, named once so a reader sees
+    // what byte-identity means here.
+    expect(variantLocaleKey(UNVARIED_CELL)).toBe(UNVARIED);
+    expect(variantLocaleKey({ locale: 'en-US' })).toBe('en-US');
+  });
+
+  it('spells both composites with the separator the browser key already uses', () => {
+    expect(variantLocaleKey({ locale: 'en-US', timezone: 'America/New_York' })).toBe(
+      'en-US@America/New_York',
+    );
+    expect(variantLocaleKey({ timezone: 'America/New_York' })).toBe('@America/New_York');
+  });
+
+  it('never puts a sentinel INSIDE a composite, which both ingest paths refuse', () => {
+    /*
+     * `'<unvaried>@America/New_York'` reads perfectly and stores nowhere.
+     * `variantDimension` reserves an angle bracket for a value that is EXACTLY
+     * a sentinel — the one thing that stops a producer claiming an axis was not
+     * varied when it was — so a bracket mid-composite is refused, and
+     * `validateMeasurements` refuses a matrix WHOLE on its first bad cell. That
+     * is the `'<unvaried>+dark'` defect of this round, one dimension over.
+     */
+    const timezoneOnly = variantLocaleKey({ timezone: 'America/New_York' });
+    expect(timezoneOnly).not.toContain('<');
+    expect(timezoneOnly.startsWith('@')).toBe(true);
+  });
+
+  it('emits a locale column the WRITE PATH accepts for the widest pair a spec declares', () => {
+    /*
+     * ── THE BOUND IS HALF OF THIS CHANGE, AND A SPELLING TEST CANNOT SEE IT ──
+     *
+     * The composite widened this column from a tag to a tag AND a zone, and the
+     * ceilings are the spec schemas' own: `locale` is `.max(35)` and `timezone`
+     * `.max(64)` on `matrixCellSchema`, on `matrixAxesSchema`'s two axes and on
+     * `localizationSpecSchema`. So the widest LEGAL pair is 100 characters,
+     * where the column used to hold 35 — and a column narrower than that
+     * refuses its own producer, which costs the whole matrix behind one log
+     * line exactly as the `'<unvaried>+dark'` and `'>=120<130'` leaks did.
+     *
+     * Derived from the schemas rather than restated, and parsed through
+     * `matrixCellSchema` first, so this is the widest cell a customer can
+     * actually store. Tighten either bound and this goes red instead of
+     * production going quiet.
+     */
+    const widest: MatrixCell = {
+      // A real tag and a real zone, padded to the ceiling rather than invented
+      // at it, so the shape stays recognisable to anyone reading the failure.
+      locale: 'en-Latn-US-u-ca-gregory-nu-latn'.padEnd(35, 'x'),
+      timezone: 'America/Argentina/ComodRivadavia'.padEnd(64, 'x'),
+    };
+    expect(widest.locale).toHaveLength(35);
+    expect(widest.timezone).toHaveLength(64);
+    expect(matrixCellSchema.safeParse(widest).success).toBe(true);
+
+    const locale = variantLocaleKey(widest);
+    expect(locale).toHaveLength(100);
+    expect(locale).not.toContain('<');
+
+    const parsed = testVariantKeySchema.safeParse({
+      browser: DEFAULT_ENGINE_KEY,
+      viewport: UNVARIED,
+      locale,
+      role: UNVARIED,
+      environment: 'env-1',
+    });
+    // The PATHS, never the value: a tag and a zone are customer-authored text,
+    // and `validateMeasurements` reports a zod path for that reason.
+    expect(
+      parsed.success ? [] : parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'),
+    ).toEqual([]);
   });
 });
 
@@ -601,6 +830,193 @@ describe('enumerating a matrix is deterministic and discloses its cap', () => {
     // nothing", which is a different and false sentence.
     expect(out.capBite?.atLeastMore).toBe(12);
     expect(out.capBite?.detail).toMatch(/configuration refusal/);
+  });
+});
+
+describe('enumerating a matrix builds only the cells it keeps', () => {
+  /*
+   * ── THE DEFECT, AND WHY THESE TWO TESTS AND NOT A STOPWATCH ─────────────────
+   *
+   * `enumerateMatrix` used to build EVERY cell of the declared product and only
+   * then pick `maxCells` of them. The widest declaration `matrixAxesSchema`
+   * accepts is 24,883,200 cells; keeping twelve cost ~3.7 GB, and at a 1 GB heap
+   * a 14.9 million cell product ABORTS the process ("JavaScript heap out of
+   * memory" — not catchable) with every other organisation's job still on that
+   * worker. Nothing at the door bounds the product, so a spec a customer can
+   * POST could do it.
+   *
+   * A TIMING OR HEAP ASSERTION WOULD BE FLAKY AND, ON A REVERT, WOULD TAKE THE
+   * TEST RUNNER DOWN WITH IT. So the guard is a COUNT of how many axis elements
+   * the function reads — deterministic, instant to fail, and a revert at this
+   * product size costs ~0.3 s and ~400 MB rather than the worker.
+   *
+   * The second test is the one that makes the first safe to believe: a function
+   * that read nothing could pass the count, so the output is held byte-identical
+   * to the implementation this replaced, which is kept below as a REFERENCE.
+   */
+
+  /** The implementation this replaced, verbatim in behaviour: build all, shuffle indices, keep. */
+  function referenceEnumerate(
+    axes: MatrixAxes,
+    options: { seed: string; maxCells: number },
+  ): { cells: MatrixCell[]; declared: number; capBite: unknown } {
+    const orOne = <T,>(list: readonly T[] | undefined): ReadonlyArray<T | undefined> =>
+      list && list.length > 0 ? list : [undefined];
+    const cells: MatrixCell[] = [];
+    for (const engine of orOne(axes.engines))
+      for (const channel of orOne(axes.channels))
+        for (const version of orOne(axes.versions))
+          for (const device of orOne(axes.devices))
+            for (const colourScheme of orOne(axes.colourSchemes))
+              for (const reducedMotion of orOne(axes.reducedMotion))
+                for (const forcedColors of orOne(axes.forcedColors))
+                  for (const locale of orOne(axes.locales))
+                    for (const timezone of orOne(axes.timezones))
+                      cells.push({
+                        ...(engine !== undefined ? { engine } : {}),
+                        ...(channel !== undefined ? { channel } : {}),
+                        ...(version !== undefined ? { version } : {}),
+                        ...(device !== undefined ? { device } : {}),
+                        ...(colourScheme !== undefined ? { colourScheme } : {}),
+                        ...(reducedMotion !== undefined ? { reducedMotion } : {}),
+                        ...(forcedColors !== undefined ? { forcedColors } : {}),
+                        ...(locale !== undefined ? { locale } : {}),
+                        ...(timezone !== undefined ? { timezone } : {}),
+                      });
+    const { seed, maxCells } = options;
+    const declared = cells.length;
+    if (maxCells <= 0) {
+      return {
+        cells: [],
+        declared,
+        capBite: {
+          cap: 'maxCells',
+          limit: maxCells,
+          taken: 0,
+          atLeastMore: declared,
+          detail: `maxCells is ${maxCells}, so none of the ${declared} declared cells was expanded. This is a configuration refusal, not a matrix with nothing in it.`,
+        },
+      };
+    }
+    if (declared <= maxCells) return { cells, declared, capBite: null };
+    let h = 0x811c9dc5;
+    for (let i = 0; i < seed.length; i += 1) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    let a = h >>> 0;
+    const rng = () => {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const indices = cells.map((_, i) => i);
+    for (let i = indices.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rng() * (i + 1));
+      [indices[i], indices[j]] = [indices[j]!, indices[i]!];
+    }
+    const kept = indices.slice(0, maxCells).sort((x, y) => x - y);
+    return {
+      cells: kept.map((i) => cells[i]!),
+      declared,
+      capBite: {
+        cap: 'maxCells',
+        limit: maxCells,
+        taken: kept.length,
+        atLeastMore: declared - kept.length,
+        detail: `the declared axes expand to ${declared} cells and the limit is ${maxCells}, so ${declared - kept.length} were not run. The subset is seeded on "${seed}", so the same seed takes the same cells — any percentage over these ${kept.length} is a percentage over a sample, not over the matrix.`,
+      },
+    };
+  }
+
+  const SOME_AXES: ReadonlyArray<MatrixAxes> = [
+    {},
+    { colourSchemes: ['DARK'] },
+    { engines: ['chromium', 'firefox', 'webkit'], locales: ['en-GB', 'de-DE'] },
+    {
+      engines: ['chromium', 'firefox'],
+      channels: ['BUNDLED', 'CHROME'],
+      versions: [{ kind: 'UNPINNED' }, { kind: 'RANGE', range: { atLeast: '120', below: null, why: 'w' } }],
+      devices: [
+        { kind: 'PRESET', preset: DEVICE_PRESET_LIST[0]! },
+        { kind: 'VIEWPORT', viewport: { width: 300, height: 400 } },
+      ],
+      colourSchemes: ['LIGHT', 'DARK', 'NO_PREFERENCE'],
+      reducedMotion: ['REDUCE', 'NO_PREFERENCE'],
+      forcedColors: ['ACTIVE'],
+      locales: ['en-GB', 'de-DE', 'ar-EG'],
+      timezones: ['UTC', 'Asia/Tokyo'],
+    },
+    // One axis only, at several sizes, so every digit position is the only one that moves.
+    { timezones: ['UTC', 'Asia/Tokyo', 'Europe/Berlin'] },
+    { locales: ['a1', 'b2', 'c3', 'd4', 'e5'] },
+    { forcedColors: ['ACTIVE', 'NONE'] },
+    { reducedMotion: ['REDUCE', 'NO_PREFERENCE'], engines: ['webkit'] },
+    { devices: [{ kind: 'VIEWPORT', viewport: { width: 200, height: 200 } }], channels: ['CHROME', 'MSEDGE'] },
+  ];
+
+  it('returns exactly what the build-everything implementation returned, for every seed and cap', () => {
+    let compared = 0;
+    let bitten = 0;
+    for (const axes of SOME_AXES) {
+      for (const seed of ['seed-a', 'run_0001', 'ünï-cødé', 'x']) {
+        for (const maxCells of [-3, 0, 1, 2, 5, 7, 12, 36, 37, 100, 100_000]) {
+          const expected = referenceEnumerate(axes, { seed, maxCells });
+          const actual = enumerateMatrix(axes, { seed, maxCells });
+          // JSON and not toEqual: property ORDER inside a cell is part of the
+          // contract, because a stored cell is compared as text.
+          expect(JSON.stringify(actual)).toBe(JSON.stringify(expected));
+          compared += 1;
+          if (expected.capBite !== null && maxCells > 0) bitten += 1;
+        }
+      }
+    }
+    // Non-vacuous: a corpus that never bit the cap would prove nothing about the take.
+    expect(compared).toBeGreaterThan(300);
+    expect(bitten).toBeGreaterThan(50);
+  });
+
+  it('reads a handful of axis elements for a million-cell product, never the product', () => {
+    // 3 x 9 x 8 x 24 x 3 x 2 x 2 x 20 x 1 = 1,244,160 cells. Wide enough that
+    // building them is unmistakable, small enough that a revert is survivable.
+    let reads = 0;
+    const counted = <T,>(values: readonly T[]): readonly T[] =>
+      new Proxy([...values], {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) reads += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+    const axes: MatrixAxes = {
+      engines: counted(BROWSER_ENGINE_LIST),
+      channels: counted(BROWSER_CHANNEL_LIST),
+      versions: counted(
+        Array.from({ length: 8 }, (_, i) => ({
+          kind: 'RANGE' as const,
+          range: { atLeast: String(100 + i), below: null, why: 'w' },
+        })),
+      ),
+      devices: counted(
+        Array.from({ length: 24 }, (_, i) => ({
+          kind: 'VIEWPORT' as const,
+          viewport: { width: 300 + i, height: 400 },
+        })),
+      ),
+      colourSchemes: counted(COLOUR_SCHEME_LIST),
+      reducedMotion: counted(REDUCED_MOTION_LIST),
+      forcedColors: counted(FORCED_COLORS_LIST),
+      locales: counted(Array.from({ length: 20 }, (_, i) => `xx-L${i}`)),
+      timezones: counted(['UTC']),
+    };
+
+    const out = enumerateMatrix(axes, { seed: 'seed', maxCells: 12 });
+
+    expect(out.declared).toBe(3 * 9 * 8 * 24 * 3 * 2 * 2 * 20);
+    expect(out.cells).toHaveLength(12);
+    // Nine axes read once per KEPT cell is the ceiling; building the product
+    // reads each axis element once per iteration, which is over a million.
+    expect(reads).toBeLessThanOrEqual(12 * 9);
   });
 });
 

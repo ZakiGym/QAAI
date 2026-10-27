@@ -26,8 +26,14 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import {
+  BROWSER_CAPABILITY_AXES,
   checkRequirement,
   checkRunnability,
+  deploymentProbeCells,
+  isBrowserCapabilityAxis,
+  probeDeploymentBrowsers,
+  resolveDeploymentCells,
+  summariseBrowserMatrix,
   compareVersions,
   guardProbeHost,
   parseVersion,
@@ -46,8 +52,19 @@ import {
   PREFLIGHT_PROBE_ATTEMPTS,
   TYPE_REQUIREMENTS,
 } from './preflight.js';
-import type { HostGuardIo, RunnabilityProbes, UrlProbeResult } from './preflight.js';
-import { TEST_TYPES } from '@qaai/shared';
+import type {
+  BrowserCapabilityProbes,
+  HostGuardIo,
+  RunnabilityProbes,
+  UrlProbeResult,
+} from './preflight.js';
+import {
+  BROWSER_CHANNEL_LIST,
+  DEVICE_PRESET_LIST,
+  MATRIX_CELL_STATUS_LIST,
+  TEST_TYPES,
+  resolveMatrixCell,
+} from '@qaai/shared';
 import type { TestType } from '@qaai/shared';
 
 const BASE = 'https://staging.example.com';
@@ -1219,5 +1236,241 @@ describe('spending a login only when it could tell us something', () => {
       now: () => Date.parse('2026-10-26T12:00:00.000Z'),
     });
     expect(fresh).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The browser capability: what `resolveMatrixCell` had nothing to resolve
+// against.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/*
+ * Every assertion below is about one of the two asymmetric ways a capability
+ * probe lies, because the statuses they produce have opposite blast radii:
+ *
+ *   ABSENT READ AS AVAILABLE — the deployment vouches for a browser it does not
+ *   have. The test launches, Playwright throws, and the failure is reported
+ *   against the customer's application.
+ *
+ *   ABSENT READ AS MISSING — the cell is REFUSED with an install line for a
+ *   browser that may well be installed somewhere this probe does not look.
+ *   "QAAI refused my Chrome" is the same defect as "QAAI refused my k6".
+ *
+ * NOT_CHECKED is the third answer and it is the honest one, so the omission of a
+ * key is asserted directly rather than through a status three layers up.
+ */
+
+const noBrowsers: BrowserCapabilityProbes = {
+  browserInstalled: () => null,
+  channelResolves: () => null,
+  devicePresetKnown: () => null,
+};
+
+describe('collecting what this deployment has to launch with', () => {
+  it('omits an axis member nothing could answer for, in either direction', async () => {
+    const probe = await probeDeploymentBrowsers(noBrowsers);
+
+    expect(probe.readings.length).toBeGreaterThan(0);
+    expect(probe.notProbed.length).toBe(probe.readings.length);
+    // Not `{ chromium: false }`, and not `{ chromium: true }`. Absent.
+    expect(probe.browsers.engines).toEqual({});
+    expect(probe.browsers.channels).toEqual({});
+    expect(probe.browsers.devicePresets).toEqual({});
+    expect(probe.why).toContain('ABSENT rather than as a yes or a no');
+  });
+
+  it('leaves an unprobed cell resolving NOT_CHECKED with no remedy', async () => {
+    /*
+     * The whole point of the omission. A fabricated `false` would make this
+     * MISSING and print `npx playwright install` to somebody whose image is
+     * fine; a fabricated `true` would make it AVAILABLE and launch nothing.
+     */
+    const probe = await probeDeploymentBrowsers(noBrowsers);
+    const resolved = resolveMatrixCell({ engine: 'chromium' }, probe.browsers);
+    expect(resolved.status).toBe('NOT_CHECKED');
+    expect(resolved.remedy).toBeNull();
+  });
+
+  it('records a probed engine, so AVAILABLE becomes reachable at all', async () => {
+    const probe = await probeDeploymentBrowsers({ ...noBrowsers, browserInstalled: () => true });
+    expect(probe.browsers.engines).toEqual({ chromium: true, firefox: true, webkit: true });
+    const resolved = resolveMatrixCell({ engine: 'webkit' }, probe.browsers);
+    expect(resolved.status).toBe('AVAILABLE');
+  });
+
+  it('records an engine that is genuinely absent as a refusal with the install line', async () => {
+    const probe = await probeDeploymentBrowsers({
+      ...noBrowsers,
+      browserInstalled: (engine) => engine !== 'webkit',
+    });
+    expect(probe.browsers.engines).toEqual({ chromium: true, firefox: true, webkit: false });
+    const resolved = resolveMatrixCell({ engine: 'webkit' }, probe.browsers);
+    expect(resolved.status).toBe('MISSING');
+    expect(resolved.remedy).toContain('playwright install');
+  });
+
+  it('never takes a reading for BUNDLED, which is not a browser on the host', async () => {
+    /*
+     * BUNDLED is Playwright's own build — `resolveMatrixCell` skips the channel
+     * check for it entirely — so a reading about it would be a reading about
+     * nothing, and a stored `BUNDLED: false` row would refuse every cell in the
+     * product.
+     */
+    const probe = await probeDeploymentBrowsers({ ...noBrowsers, channelResolves: () => true });
+    const channels = probe.readings.filter((reading) => reading.axis === 'CHANNEL');
+    expect(channels.length).toBeGreaterThan(0);
+    expect(channels.map((reading) => reading.name)).not.toContain('BUNDLED');
+    expect(probe.browsers.channels).not.toHaveProperty('BUNDLED');
+  });
+
+  it('answers a channel on a PATH hit and refuses to answer on a miss', async () => {
+    /*
+     * THE FALSE-NEGATIVE GUARD. Playwright resolves a channel by absolute
+     * per-platform paths — `/Applications/Google Chrome.app/…` on macOS,
+     * `/opt/google/chrome/chrome` on Linux — so a PATH miss is NOT evidence the
+     * browser is absent. If this ever answers `false`, every macOS deployment
+     * starts refusing Chrome cells and printing an install line for a browser
+     * the host already has.
+     */
+    const probe = await probeDeploymentBrowsers({
+      ...noBrowsers,
+      channelResolves: undefined,
+      onPath: (binary) => binary === 'google-chrome',
+    });
+
+    expect(probe.browsers.channels).toEqual({ CHROME: true });
+    const beta = probe.readings.find((reading) => reading.name === 'CHROME_BETA');
+    expect(beta?.installed).toBeNull();
+    expect(beta?.detail).toContain('not through PATH');
+  });
+
+  it('asks only questions a deployment can be blamed for', () => {
+    /*
+     * Each channel cell is paired with the engine it is a build OF, and no cell
+     * pins a version — so no cell this probe asks about can resolve
+     * UNSUPPORTED_COMBINATION ("is there a Firefox beta installed") or
+     * NEEDS_BROWSER_GRID. Those two are properties of a CUSTOMER's declared
+     * cell, and a probe that generated them would be reporting on its own
+     * question rather than on the image.
+     */
+    const everythingInstalled = {
+      engines: { chromium: true, firefox: true, webkit: true },
+      channels: Object.fromEntries(
+        BROWSER_CHANNEL_LIST.filter((channel) => channel !== 'BUNDLED').map((channel) => [
+          channel,
+          true,
+        ]),
+      ),
+      devicePresets: Object.fromEntries(DEVICE_PRESET_LIST.map((preset) => [preset, true])),
+    };
+    const resolved = resolveDeploymentCells(everythingInstalled);
+    expect(resolved.length).toBe(deploymentProbeCells().length);
+    expect(resolved.map((cell) => cell.status)).not.toContain('UNSUPPORTED_COMBINATION');
+    expect(resolved.map((cell) => cell.status)).not.toContain('NEEDS_BROWSER_GRID');
+    expect(new Set(resolved.map((cell) => cell.status))).toEqual(new Set(['AVAILABLE']));
+  });
+
+  it('emits every axis it declares, which is the run-time half of the record', () => {
+    // The compiler-enforced half is `BROWSER_CAPABILITY_AXIS_PRESENT` in the
+    // module. This catches the reverse: an axis declared and never probed, which
+    // would be a vocabulary entry nothing can ever store a row under.
+    const probed = new Set(BROWSER_CAPABILITY_AXES.map((axis) => axis));
+    return probeDeploymentBrowsers(noBrowsers).then((probe) => {
+      expect(new Set(probe.readings.map((reading) => reading.axis))).toEqual(probed);
+      for (const axis of BROWSER_CAPABILITY_AXES) expect(isBrowserCapabilityAxis(axis)).toBe(true);
+      expect(isBrowserCapabilityAxis('ENGINES')).toBe(false);
+    });
+  });
+});
+
+describe('summarising a resolved matrix by what a reader can do about it', () => {
+  const missing = resolveMatrixCell({ engine: 'webkit' }, { engines: { webkit: false } });
+  const unsupported = resolveMatrixCell({ engine: 'firefox', channel: 'CHROME_BETA' }, {});
+  const needsGrid = resolveMatrixCell(
+    {
+      engine: 'webkit',
+      version: { kind: 'RANGE', range: { atLeast: '17.0', below: null, why: 'a Safari 17 fix' } },
+    },
+    {},
+  );
+  const unprobed = resolveMatrixCell({ engine: 'chromium' }, {});
+
+  it('files the two statuses no install can fix away from the install advice', () => {
+    /*
+     * There is no Firefox beta to install anywhere on earth, and no install on
+     * this image is ever going to be Safari. An install line against either is
+     * advice that cannot be followed — and advice that cannot be followed is how
+     * a reader learns to ignore the whole report.
+     */
+    const summary = summariseBrowserMatrix([unsupported, needsGrid]);
+    expect(summary.impossibleHere.length).toBe(2);
+    expect(summary.installable).toEqual([]);
+    expect(summary.sentence).toContain('Not an install');
+    expect(summary.sentence).not.toContain('npx playwright install');
+    expect(summary.sentence).not.toContain('fixable here —');
+  });
+
+  it('does put the install line against the one that is an install', () => {
+    // The positive control for the test above: if the buckets were swapped, or
+    // collapsed, exactly one of the two would still pass.
+    const summary = summariseBrowserMatrix([missing]);
+    expect(summary.installable.length).toBe(1);
+    expect(summary.impossibleHere).toEqual([]);
+    expect(summary.sentence).toContain('npx playwright install');
+  });
+
+  it('keeps an unprobed cell out of `available` and says it stays in the denominator', () => {
+    const summary = summariseBrowserMatrix([unprobed]);
+    expect(summary.notChecked.length).toBe(1);
+    expect(summary.available).toEqual([]);
+    expect(summary.sentence).toContain('stay IN the denominator');
+  });
+
+  it('reports NULL refusable cells when nothing was probed, because 0 is a reading nobody took', () => {
+    /*
+     * ── A ZERO IS A REAL READING NOBODY TOOK ────────────────────────────────
+     *
+     * apps/worker/src/index.ts logs this number as `browserCellsRefusable` —
+     * the field an operator alerts on — and it already logged `null` when the
+     * capability store could not be REACHED, for the right reason: a zero
+     * there reads as "this image refuses nothing", the most flattering
+     * possible reading of a question nobody asked.
+     *
+     * A REACHABLE AND EMPTY table is the same question. Nothing has been
+     * probed, so every cell resolves NOT_CHECKED, both refusal buckets are
+     * empty, and the sum was 0 — indistinguishable from an image that WAS
+     * probed and refuses nothing. That is the normal state of a deployment
+     * between the capability migration landing and the first sweep running.
+     */
+    const summary = summariseBrowserMatrix([unprobed]);
+    expect(summary.refusableCells).toBeNull();
+    // And it is not null because the list was empty — an empty resolution set
+    // is also a question nobody asked.
+    expect(summariseBrowserMatrix([]).refusableCells).toBeNull();
+  });
+
+  it('reports a real 0 once any cell carries a reading, so a measurement is not discarded', () => {
+    /*
+     * THE OPPOSITE ERROR, and it is the easier one to make. If five cells were
+     * probed and none is refusable, 0 IS a reading — of those five — and
+     * nulling it because the rest are unprobed throws away a measurement
+     * somebody took. `notChecked` stays in the denominator either way, which is
+     * what makes a partial 0 readable.
+     */
+    const available = resolveMatrixCell({ engine: 'chromium' }, { engines: { chromium: true } });
+    expect(available.status).toBe('AVAILABLE');
+    expect(summariseBrowserMatrix([available, unprobed]).refusableCells).toBe(0);
+    // And it counts both refusal buckets, never just the installable one.
+    expect(summariseBrowserMatrix([missing, unsupported, unprobed]).refusableCells).toBe(2);
+  });
+
+  it('counts all six statuses, including the ones a probe cannot produce', () => {
+    const summary = summariseBrowserMatrix([missing, unsupported, needsGrid, unprobed]);
+    expect(Object.keys(summary.byStatus).sort()).toEqual([...MATRIX_CELL_STATUS_LIST].sort());
+    expect(summary.byStatus.MISSING).toBe(1);
+    expect(summary.byStatus.UNSUPPORTED_COMBINATION).toBe(1);
+    expect(summary.byStatus.NEEDS_BROWSER_GRID).toBe(1);
+    expect(summary.byStatus.NOT_CHECKED).toBe(1);
+    expect(summary.byStatus.AVAILABLE).toBe(0);
   });
 });

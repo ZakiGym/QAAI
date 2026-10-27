@@ -4055,6 +4055,321 @@ describe('the matrix writer', () => {
   });
 });
 
+/*
+ * ── THE FIVE HONESTY COLUMNS, END TO END THROUGH THIS PROCESSOR ────────────
+ *
+ * `matrixCell`, `cellStatus`, `cellRemedy`, `notAsserted` and
+ * `notAssertedReason` arrived with a migration, two Prisma enums, a write-path
+ * schema and four refinements — and NO WRITER. `testResultVariantCellSchema`
+ * was called by its own test and by nothing else, so every one of the five was
+ * NULL for ever and a pass with a hole in it was indistinguishable from a pass.
+ *
+ * These are about the whole chain a queued run job actually takes: the plugin's
+ * reported cell, through `validateMeasurements`, through the one shared row
+ * builder, into the insert.
+ */
+const BETA_DARK_CELL = {
+  browser: 'chromium:CHROME_BETA',
+  viewport: '1280x720+dark',
+  locale: '<unvaried>',
+  role: '<anonymous>',
+  environment: 'env_1',
+};
+
+/**
+ * The resolved cell `BETA_DARK_CELL`'s two keys are packed FROM — the channel
+ * into `browser` and the colour scheme into `viewport`, which is exactly the
+ * pair of axes those two TEXT columns cannot express on their own and therefore
+ * the reason `matrixCell` is a column at all.
+ *
+ * An EXPLICIT viewport rather than an unvaried one, and not for taste: the key
+ * `variantViewportKey` builds for a cell with a colour scheme and no device is
+ * `<unvaried>+dark`, and `testVariantKeySchema` refuses an angle bracket in
+ * anything that is not exactly a sentinel. A test keyed that way would be a test
+ * about a shape this ingest path cannot receive.
+ */
+const BETA_DARK_RESOLVED = {
+  engine: 'chromium',
+  channel: 'CHROME_BETA',
+  device: { kind: 'VIEWPORT', viewport: { width: 1280, height: 720 } },
+  colourScheme: 'DARK',
+};
+
+describe('the per-cell honesty columns', () => {
+  it('writes a resolved cell, its status and its remedy from what the plugin reported', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          key: BETA_DARK_CELL,
+          status: 'SKIPPED',
+          durationMs: 0,
+          /*
+           * A CELL THIS DEPLOYMENT COULD NOT RUN. Before this column it was
+           * SKIPPED and nothing else — indistinguishable from a placeholder
+           * nobody reached — so a matrix percentage counted a cell that can
+           * never fail. `notRunKind` cannot say it: that answers "this
+           * deployment cannot execute this TEST TYPE", and chromium ran fine.
+           */
+          cell: {
+            matrixCell: BETA_DARK_RESOLVED,
+            cellStatus: 'MISSING',
+            cellRemedy: 'Install the chrome-beta browser, or run `npx playwright install`.',
+          },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    expect(db.variantRows).toHaveLength(1);
+    const row = db.variantRows[0]!;
+    /*
+     * THE JSON CARRIES WHAT THE FIVE TEXT DIMENSIONS CANNOT. A channel and a
+     * colour scheme are packed into `browser` and `viewport` — which stay the
+     * identity and keep the six-column unique index doing its job — and this
+     * column is the detail behind that identity.
+     */
+    expect(row.matrixCell).toEqual(BETA_DARK_RESOLVED);
+    expect(row.cellStatus).toBe('MISSING');
+    expect(String(row.cellRemedy)).toContain('chrome-beta');
+    // The identity is untouched: the JSON never replaces the two keys.
+    expect(row.browser).toBe('chromium:CHROME_BETA');
+    expect(row.viewport).toBe('1280x720+dark');
+  });
+
+  it('writes what a PASSING cell did not assert, with the reason, beside the pass', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          key: BETA_DARK_CELL,
+          status: 'PASSED',
+          durationMs: 900,
+          /*
+           * THE HEADLINE DEFECT. Checkout could be clicked through and the
+           * money path could not be asserted — no 3DS, no decline, no webhook
+           * transition — and the result of clicking through it was a PASS. A
+           * pass with a non-empty `notAsserted` is a pass with a STATED HOLE in
+           * it, which the gate can refuse to count. A pass with nothing
+           * recorded is the lie.
+           */
+          cell: {
+            matrixCell: BETA_DARK_RESOLVED,
+            cellStatus: 'AVAILABLE',
+            notAsserted: ['the 3DS challenge', 'the webhook transition'],
+            notAssertedReason: 'PROVIDER_TEST_MODE_LIMIT',
+          },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    const row = db.variantRows[0]!;
+    expect(row.status).toBe('PASSED');
+    expect(row.notAsserted).toEqual(['the 3DS challenge', 'the webhook transition']);
+    /*
+     * THE REASON AS A GROUPABLE VALUE, not a sentence. "How often, across this
+     * project, did we fail to assert the webhook transition" is a GROUP BY, and
+     * a regex over prose cannot answer it.
+     */
+    expect(row.notAssertedReason).toBe('PROVIDER_TEST_MODE_LIMIT');
+    // AVAILABLE carries no remedy: there is nothing to fix.
+    expect(row.cellRemedy).toBeNull();
+  });
+
+  it('carries a reported cell through the parse instead of letting it be stripped', async () => {
+    /*
+     * THE MECHANISM OF THE ORIGINAL DEFECT, pinned.
+     *
+     * `testResultVariantSchema` is a plain `z.object` and not `.strict()`, so
+     * an unknown key is SILENTLY DROPPED rather than refused. A writer that
+     * built its row from `parsed.data` alone would therefore write five NULLs
+     * for a cell that reported all five values — no refusal, no log line, no
+     * way to tell it from a producer that said nothing.
+     *
+     * The repair was first a raw read of `variant.cell` BEFORE the parse, in
+     * this processor only. It is now a `cell` field ON that schema, so the key
+     * is no longer unknown and `parsed.data` carries it — which fixes the same
+     * defect on the AGENT path too, where nothing read around the strip and
+     * nothing could have.
+     *
+     * This assertion does not care which of the two it is, and that is the
+     * point of it: the row lands either way and only these five columns change,
+     * so it goes red for a producer whose evidence is dropped however it comes
+     * to be dropped.
+     */
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          key: BETA_DARK_CELL,
+          status: 'PASSED',
+          durationMs: 1,
+          cell: {
+            matrixCell: BETA_DARK_RESOLVED,
+            cellStatus: 'NOT_CHECKED',
+            notAsserted: ['the service worker was never reached'],
+            notAssertedReason: 'CAPABILITY_ABSENT',
+          },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    expect(db.variantRows).toHaveLength(1);
+    const row = db.variantRows[0]!;
+    expect(row.matrixCell).not.toBeUndefined();
+    expect(row.cellStatus).toBe('NOT_CHECKED');
+    expect(row.notAssertedReason).toBe('CAPABILITY_ABSENT');
+  });
+
+  it('records nothing rather than AVAILABLE when the plugin reported no cell', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', REPORTED_MATRIX);
+
+    await processRun(job());
+
+    for (const row of db.variantRows) {
+      /*
+       * ABSENT IS NOT AVAILABLE. Every plugin reporting a matrix today sends no
+       * cell, and defaulting the status would assert that every one of their
+       * cells ran — a claim nothing produced, in the flattering direction.
+       */
+      expect(row.cellStatus).toBeNull();
+      expect(row.cellRemedy).toBeNull();
+      expect(row.notAssertedReason).toBeNull();
+      /*
+       * `undefined`, not null, and only for the Json column: Prisma writes SQL
+       * NULL for a column an INSERT does not name, and a JS `null` in a
+       * nullable Json write means the JSON *value* null instead. See
+       * `VariantRow.matrixCell`.
+       */
+      expect(row.matrixCell).toBeUndefined();
+      // `[]` is the column's floor, not a claim — `String[] @default([])` has
+      // no null — which is why `cellStatus IS NULL` is the honest signal.
+      expect(row.notAsserted).toEqual([]);
+    }
+    /*
+     * AND THE ROWS ARE STILL THERE. An unmeasured cell stays IN the
+     * denominator; dropping it would let a deployment shed every cell it could
+     * not prove it could run and raise the percentage for a probe nobody ran.
+     */
+    expect(db.variantRows).toHaveLength(2);
+  });
+
+  it('refuses cell evidence it cannot store, names only the FIELD, and keeps the result', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          key: BETA_DARK_CELL,
+          status: 'PASSED',
+          durationMs: 1,
+          /*
+           * A hole with no reason. Refused by `testResultVariantCellSchema`,
+           * which this processor reaches THROUGH `testResultVariantSchema.cell`
+           * — a failure suppressed without being counted is the defect, and the
+           * reason is what makes it a count.
+           */
+          cell: {
+            matrixCell: BETA_DARK_RESOLVED,
+            cellStatus: 'AVAILABLE',
+            notAsserted: ['the settlement webhook, and a phrase no log may echo'],
+          },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    // ALL OR NOTHING, as for every other refusal on this path.
+    expect(db.variantRows).toHaveLength(0);
+    // THE RESULT STILL LANDS: a reporting problem must never cost a run its
+    // verdict.
+    expect(db.results[0]!.status).toBe('PASSED');
+
+    const refusal = h.warned.find((line) => line.msg.startsWith('measurements refused'))!;
+    expect(refusal).toBeDefined();
+    /*
+     * The refusal names the nested FIELD, which is what a reader needs and is
+     * the only thing a path can carry. It used to read 'per-cell evidence that
+     * is not valid' from a second parse this file did BEFORE the variant schema
+     * stripped the key — necessary while the schema had no such field, and
+     * unreachable once it got one, since the second parse ran the same value
+     * through the same schema. One parse refuses it now, on both ingest paths
+     * rather than only this one.
+     */
+    expect(String(refusal.fields.reason)).toContain('not a valid variant');
+    expect(String(refusal.fields.reason)).toContain('cell.');
+    /*
+     * THE FIELD, NEVER ITS CONTENTS. A remedy and an unasserted assertion are
+     * producer-supplied text rendered in the run report and readable back by a
+     * customer's agent; one of them carrying a token, a cookie or a
+     * storageState value would be published by a writer that echoed it, and
+     * truncated and hashed both count as leaks. zod's issue PATHS are field
+     * names, which cannot forge a line or carry a secret.
+     */
+    expect(String(refusal.fields.reason)).toContain('notAssertedReason');
+    expect(String(refusal.fields.reason)).not.toContain('no log may echo');
+  });
+
+  it('refuses a resolved cell that disagrees with the row identity', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          // The key says chrome-beta in dark; the cell says plain webkit. One
+          // row describing two cells, and the matrix view groups on the key —
+          // so it would render this cell's channel against another's results.
+          key: BETA_DARK_CELL,
+          status: 'PASSED',
+          durationMs: 1,
+          cell: { matrixCell: { engine: 'webkit' }, cellStatus: 'AVAILABLE' },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    expect(db.variantRows).toHaveLength(0);
+    const refusal = h.warned.find((line) => line.msg.startsWith('measurements refused'))!;
+    expect(String(refusal.fields.reason)).toContain('whose own identity is');
+  });
+
+  it('refuses a verdict on a cell that could not run, rather than counting it', async () => {
+    const db = fakeDb({ results: [resultFor('t1')] });
+    h.measurements.set('t1', {
+      variants: [
+        {
+          key: BETA_DARK_CELL,
+          status: 'PASSED',
+          durationMs: 1,
+          /*
+           * A percentage that includes cells which can never fail is a lie in
+           * the customer's favour, and a PASS on a cell whose channel is not
+           * installed is that lie at the row level. SKIPPED is the only honest
+           * verdict, and `cellStatus` is what says why.
+           */
+          cell: {
+            matrixCell: BETA_DARK_RESOLVED,
+            cellStatus: 'NEEDS_BROWSER_GRID',
+            cellRemedy: 'Run this cell on a hosted grid.',
+          },
+        },
+      ],
+    });
+
+    await processRun(job());
+
+    expect(db.variantRows).toHaveLength(0);
+    const refusal = h.warned.find((line) => line.msg.startsWith('measurements refused'))!;
+    expect(String(refusal.fields.reason)).toContain('no evidence was');
+  });
+});
+
 describe('replacing a reported matrix', () => {
   it('deletes before it inserts, both tables, inside the result transaction', async () => {
     const db = fakeDb({ results: [resultFor('t1')] });

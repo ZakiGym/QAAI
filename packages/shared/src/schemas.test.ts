@@ -5,6 +5,10 @@ import {
   createTestSchema,
   freshnessDaysSchema,
   gateRuleSchema,
+  localizationSpecSchema,
+  matrixAxesSchema,
+  matrixCellEvidenceSchema,
+  matrixCellSchema,
   planItemSchema,
   suiteHealthSnapshotSchema,
   testCoverageEdgeSchema,
@@ -16,6 +20,29 @@ import {
 } from './schemas';
 import { FINDING_KINDS, FINDING_SEVERITIES, GATE_RULE_KINDS, UNVARIED, type GateRule } from './types';
 import { DEFAULT_COVERAGE_FRESHNESS_DAYS } from './coverage-tiers';
+/*
+ * The browser half's OWNER, imported as the VALUE rather than restated. The
+ * point of the test below is that this schema accepts the string its own
+ * producer emits, so a hand-written `'<default>'` here would pass while the two
+ * halves drifted — which is the whole failure mode.
+ */
+import { DEFAULT_ENGINE_KEY, matrixCellKey, variantBrowserKey, variantLocaleKey } from './browser-matrix';
+/*
+ * The WRITE PATH, imported so the delimiter tests below END AT IT rather than
+ * at a key's spelling. `planMeasurements` is all-or-nothing, which is why one
+ * forged column costs every row of the run and not the one it forged.
+ */
+import { planMeasurements } from './measurement-rows';
+/*
+ * The CHANNEL CATALOGUE'S OWNER, imported as values rather than hand-written.
+ * The impossible cell below is SEARCHED FOR in the vocabulary — the first
+ * engine/channel pair `channelExistsFor` denies — instead of being spelled
+ * `firefox` + `CHROME` here. A hand-written pair is a test that keeps passing
+ * after the catalogue changes under it, and the thing it is testing is a
+ * disagreement between two halves of the catalogue.
+ */
+import { BROWSER_CHANNELS, BROWSER_ENGINES, channelExistsFor } from './browser-matrix';
+import type { BrowserChannel, BrowserEngine } from './browser-matrix';
 /*
  * The sentinel's OWNER. schemas.ts restates the literal because it cannot
  * import this module — auth-profiles.ts imports `authProfileConfigSchema` back
@@ -470,6 +497,486 @@ describe('testVariantKeySchema', () => {
     expect(testVariantKeySchema.safeParse({ locale: '<all>' }).success).toBe(false);
     expect(testVariantKeySchema.safeParse({ browser: 'chromium' }).success).toBe(true);
   });
+
+  it('accepts the no-engine sentinel its own producer emits, on browser only', () => {
+    /*
+     * `variantBrowserKey` returns `'<default>'` for a cell that expressed no
+     * opinion about the engine, which is what every LOCALIZATION cell is — a
+     * locale and a timezone name no browser. This schema refused it, so EVERY
+     * LOCALIZATION run wrote ZERO variant rows: `validateMeasurements` refuses a
+     * matrix whole on its first bad cell and logs one line, so there was no red
+     * test, no disconnected module and nothing for a gate to see. The refusal
+     * was invisible until the matrix plugins were wired to `variantsFor`, at
+     * which point it arrived already live.
+     *
+     * It is accepted on `browser` and NOWHERE ELSE, for the same reason
+     * `'<anonymous>'` is accepted on `role` and nowhere else: a sentinel is a
+     * fact about one axis, and admitting it everywhere would hand every other
+     * dimension a second way to spell "nobody looked".
+     */
+    expect(testVariantKeySchema.parse({ browser: DEFAULT_ENGINE_KEY }).browser).toBe(
+      DEFAULT_ENGINE_KEY,
+    );
+    expect(testVariantKeySchema.parse({ browser: variantBrowserKey({}) }).browser).toBe(
+      DEFAULT_ENGINE_KEY,
+    );
+    for (const dimension of ['viewport', 'locale', 'role', 'environment'] as const) {
+      expect(
+        testVariantKeySchema.safeParse({ [dimension]: DEFAULT_ENGINE_KEY }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('accepts all four shapes the locale dimension can hold, and no composite sentinel', () => {
+    /*
+     * ── THE LOCALE DIMENSION CARRIES THE TIMEZONE ───────────────────────────
+     *
+     * Spelled with `@`, which is already the separator the browser dimension
+     * uses for a version pin, so it is not new vocabulary. Timezone had to join
+     * the identity because without it the single most natural localisation
+     * matrix collides on one row: two cells differing only in timezone keyed to
+     * ONE key, and `planMeasurements` then refuses the matrix WHOLE for a
+     * duplicate cell — the same total, silent loss as every other defect in
+     * this family.
+     *
+     * FOUR SHAPES AND NO FIFTH, pinned here so the producer and this validator
+     * cannot each have their own idea of what a timezone-only cell looks like.
+     * The first two are BYTE-IDENTICAL to what was stored before the timezone
+     * joined, which is the whole reason the separator was not put at the front:
+     * a re-spelling would re-identify every historical cell.
+     */
+    for (const shape of [UNVARIED, 'en-US', 'en-US@America/New_York', '@America/New_York']) {
+      expect(testVariantKeySchema.safeParse({ locale: shape }).success).toBe(true);
+    }
+    /*
+     * AND THE HOLE STAYS SHUT. An angle bracket is reserved for a WHOLE-value
+     * sentinel; inside a composite it is a forgery — `<unvaried>@...` would
+     * read as "nobody varied the locale" on a cell that varied it, which is
+     * exactly what `variantDimension`'s refinement exists to prevent.
+     */
+    expect(testVariantKeySchema.safeParse({ locale: `${UNVARIED}@America/New_York` }).success).toBe(
+      false,
+    );
+  });
+
+  it('holds the widest locale@timezone the CELL SCHEMA can produce', () => {
+    /*
+     * ── 40 WAS THE SAME DEFECT AS 60 ON THE BROWSER DIMENSION ───────────────
+     *
+     * The bound was set when this column held a bare BCP-47 tag. Now that it
+     * holds `tag@timezone`, the ceiling is `matrixCellEvidenceSchema`'s own —
+     * and 40 refused it from the first long zone name, which costs the whole
+     * run: `validateMeasurements` refuses a matrix WHOLE on its first bad cell,
+     * and apps/api/src/routes/runners.ts 400s the entire batch.
+     *
+     * DERIVED FROM THE FIELD BOUNDS AND NOT RESTATED. The two numbers are read
+     * off the cell schema, so tightening or widening either one moves this test
+     * instead of leaving it asserting a figure that used to be true. A
+     * hand-written 100 here is the parallel copy this whole round is about.
+     */
+    const localeMax = matrixCellEvidenceSchema.shape.locale.unwrap().maxLength;
+    const timezoneMax = matrixCellEvidenceSchema.shape.timezone.unwrap().maxLength;
+    // A bound that was REMOVED must not read as zero: `null` here would make
+    // the "worst case" the empty string and this would pass over nothing.
+    expect(localeMax).not.toBeNull();
+    expect(timezoneMax).not.toBeNull();
+
+    const widest = `${'a'.repeat(localeMax ?? 0)}@${'b'.repeat(timezoneMax ?? 0)}`;
+    const dimensionMax = testVariantKeySchema.shape.locale.unwrap().maxLength;
+    expect(dimensionMax).not.toBeNull();
+    expect(dimensionMax ?? 0).toBeGreaterThanOrEqual(widest.length);
+
+    // Through the validator, not just against the number: the bound is one of
+    // three checks on this dimension and only the parse runs all of them.
+    const parsed = testVariantKeySchema.safeParse({ locale: widest });
+    // The PATH, never the value — a 100-character customer-authored key does
+    // not belong in a diff, and `validateMeasurements` reports the same way.
+    expect(parsed.success ? [] : parsed.error.issues.map((issue) => issue.path.join('.'))).toEqual(
+      [],
+    );
+  });
+});
+
+/**
+ * THE IMPOSSIBLE CELL, found in the catalogue rather than written down.
+ *
+ * The first engine/channel pair `channelExistsFor` denies — there is no Firefox
+ * beta and no WebKit canary. A cells-crossed spec produces one of these
+ * legitimately: `{browsers: ['chromium'], matrix: {engines: ['firefox',
+ * 'chromium', 'webkit'], channels: ['CHROME', 'MSEDGE']}}` is VALID and plans
+ * six cells, four of which no deployment on earth can run.
+ */
+const impossibleCell: { engine: BrowserEngine; channel: BrowserChannel } | null = (() => {
+  for (const engine of BROWSER_ENGINES) {
+    for (const channel of BROWSER_CHANNELS) {
+      if (!channelExistsFor(engine, channel)) return { engine, channel };
+    }
+  }
+  return null;
+})();
+
+/** The zod paths of a refusal, never the values — the way `validateMeasurements` reports. */
+const refusalPaths = (result: { success: boolean; error?: { issues: Array<{ path: PropertyKey[] }> } }) =>
+  result.success ? [] : (result.error?.issues ?? []).map((issue) => issue.path.join('.') || '(root)');
+
+describe('matrixCellEvidenceSchema ⇄ matrixCellSchema', () => {
+  /*
+   * ── EVIDENCE IS NOT A DECLARATION, AND CONFUSING THE TWO COST EVERY ROW ───
+   *
+   * `testResultVariantCellSchema.matrixCell` declared `matrixCellSchema`, which
+   * re-applied all three of that schema's DECLARATION refinements to a report
+   * of a cell that had already been RESOLVED. So the evidence row for a cell
+   * that resolved UNSUPPORTED_COMBINATION — the status minted for exactly this
+   * cell — was refused at `cell.matrixCell.channel`, and the status could never
+   * be stored for any cell that was actually impossible.
+   *
+   * The cost was never the one row. `validateMeasurements` in
+   * apps/worker/src/processors/run.ts refuses a matrix WHOLE on its first bad
+   * cell, so the run wrote ZERO variant rows behind one `logger.warn` — no red
+   * test, no disconnected module, nothing for a gate to report — and
+   * apps/api/src/routes/runners.ts parses the whole body through
+   * `z.array(testResultVariantSchema)`, so the same cell 400s a POST carrying a
+   * batch of results and takes the verdicts with it.
+   *
+   * These tests END AT THE VALIDATOR the two ingest paths share, which is the
+   * lesson of the five defects before this one: a test that asserts a cell's
+   * SPELLING does not assert that the cell can be STORED.
+   */
+  it('has an impossible pair to test with at all', () => {
+    // If the catalogue ever made every channel exist for every engine, every
+    // test below would pass over nothing. Said out loud rather than skipped.
+    expect(impossibleCell).not.toBeNull();
+  });
+
+  it('keeps refusing the impossible cell on the DECLARATION path', () => {
+    // Dropping the refinements from the evidence schema must not weaken the
+    // schema a CUSTOMER declares through: a suite carrying a test that can
+    // never execute is a matrix percentage with an unfailable cell in it.
+    expect(refusalPaths(matrixCellSchema.safeParse(impossibleCell))).toContain('channel');
+  });
+
+  it('accepts the same cell as EVIDENCE, because it was resolved and not asked for', () => {
+    expect(matrixCellEvidenceSchema.safeParse(impossibleCell).success).toBe(true);
+  });
+
+  it('still refuses an unknown key in evidence, because that is a producer bug', () => {
+    /*
+     * `.strict()` survives. The three cross-field rules are what evidence does
+     * not inherit; a field nobody declared is not a resolution, it is a writer
+     * sending a column that does not exist — and a silently dropped one is how
+     * five honesty columns became five NULLs on the agent path.
+     */
+    expect(
+      refusalPaths(matrixCellEvidenceSchema.safeParse({ ...impossibleCell, engien: 'firefox' })),
+    ).toContain('(root)');
+  });
+
+  it('carries the same per-field bounds, because a second copy is how they drift', () => {
+    // Derived from the declaration schema's own answer rather than restated:
+    // the two schemas are built from ONE field list, and this is what says so.
+    expect(matrixCellEvidenceSchema.safeParse({ locale: 'e' }).success).toBe(false);
+    expect(matrixCellSchema.safeParse({ locale: 'e' }).success).toBe(false);
+    expect(matrixCellEvidenceSchema.safeParse({ timezone: 'x'.repeat(65) }).success).toBe(false);
+    expect(matrixCellSchema.safeParse({ timezone: 'x'.repeat(65) }).success).toBe(false);
+  });
+});
+
+describe('a delimiter in a locale tag or a zone forges a key segment', () => {
+  /*
+   * ── THE SIXTH COSTUME OF THIS ROUND'S DEFECT, AND IT COSTS THE SAME ───────
+   *
+   * The locale tag and the IANA zone are the only cell fields that are free
+   * text, and both are CONCATENATED into keys: `variantLocaleKey` spells the
+   * variant row's locale column `tag@timezone` and `matrixCellKey` joins the
+   * cell's axes with `|`. While both fields were unbounded text, a tag could
+   * spell either delimiter and TWO DIFFERENT CELLS collapsed onto ONE key.
+   *
+   * The two halves below are both needed and they are not the same assertion.
+   * The FIRST proves the refusal is not vacuous — that the forgery really did
+   * collide, asked of the producers themselves rather than of a key I typed.
+   * The SECOND proves the door now refuses it. Without the first this describe
+   * would keep passing if `variantLocaleKey` stopped using `@`; without the
+   * second it would pass with the hole wide open.
+   */
+  const forgedPair = { locale: 'en@America/New_York' };
+  const honestPair = { locale: 'en', timezone: 'America/New_York' };
+
+  it('would have collided: two different cells, one locale column', () => {
+    // Asked of the PRODUCER, so this cannot drift from the separator in use.
+    expect(variantLocaleKey(forgedPair)).toBe(variantLocaleKey(honestPair));
+    // And they are genuinely two cells, which is why the collision was not
+    // caught one level up: `planMatrix`'s duplicate check sees two keys.
+    expect(matrixCellKey(forgedPair)).not.toBe(matrixCellKey(honestPair));
+  });
+
+  it('would have cost the matrix WHOLE, not the one row', () => {
+    /*
+     * The price, stated by the write path itself. `planMeasurements` is
+     * all-or-nothing on purpose, so one forged column means ZERO variant rows
+     * for the entire run — behind one `logger.warn` on the worker path, and a
+     * 400 over a whole batch of results on the agent path.
+     */
+    const rowFor = (cell: { locale: string; timezone?: string }) => ({
+      key: {
+        browser: DEFAULT_ENGINE_KEY,
+        viewport: UNVARIED,
+        locale: variantLocaleKey(cell),
+        role: 'admin',
+        environment: 'env_1',
+      },
+      status: 'PASSED' as const,
+      durationMs: 1,
+      errorMessage: null,
+      retriedAndPassed: false,
+      notRun: null,
+      metrics: [],
+    });
+    const plan = planMeasurements(
+      { orgId: 'o', projectId: 'p', runId: 'r', testId: 't', testResultId: 'tr' },
+      [rowFor(forgedPair), rowFor(honestPair)],
+      [],
+    );
+    expect(plan.ok).toBe(false);
+  });
+
+  it('refuses the forgery at the door, on both fields and in both directions', () => {
+    /*
+     * A tag and a zone are CUSTOMER-AUTHORED TEXT, so every assertion here is
+     * on a zod PATH and never on the value — the rule `validateMeasurements`
+     * follows, and the reason a refusal message may not carry the string.
+     */
+    expect(refusalPaths(matrixCellSchema.safeParse(forgedPair))).toContain('locale');
+    expect(refusalPaths(matrixCellSchema.safeParse({ locale: 'en|US' }))).toContain('locale');
+    expect(refusalPaths(matrixCellSchema.safeParse({ timezone: 'US|x' }))).toContain('timezone');
+    // The EVIDENCE side too: a per-field shape is a bound and not a
+    // cross-field declaration rule, so it belongs on the shared field list.
+    expect(refusalPaths(matrixCellEvidenceSchema.safeParse(forgedPair))).toContain('locale');
+  });
+
+  it('refuses a tag that IS the sentinel, which is the whole-value forgery', () => {
+    /*
+     * `'<unvaried>'` is 10 characters, so `.min(2).max(35)` admitted it — and
+     * `variantLocaleKey` returns a bare tag unchanged, so a cell that DID vary
+     * the locale keyed as one that did not. `variantDimension` could not catch
+     * it: the value is EXACTLY the sentinel, which is the one spelling that
+     * refinement has to allow.
+     */
+    expect(refusalPaths(matrixCellSchema.safeParse({ locale: UNVARIED }))).toContain('locale');
+    expect(localizationSpecSchema.safeParse({ locales: [{ tag: UNVARIED }] }).success).toBe(false);
+  });
+
+  it('refuses it on every axis that reaches a cell, and not on the one that does not', () => {
+    // Four declaration surfaces expand into cells — the cell itself, the two
+    // widened axes, and the LOCALIZATION pairing — and a hole in any one of
+    // them is the whole hole. Asserted per surface because they are four
+    // separate field declarations sharing one spelling.
+    expect(matrixAxesSchema.safeParse({ locales: ['en@x'] }).success).toBe(false);
+    expect(matrixAxesSchema.safeParse({ timezones: ['US|x'] }).success).toBe(false);
+    expect(localizationSpecSchema.safeParse({ locales: [forgedPair.locale].map((tag) => ({ tag })) }).success).toBe(false);
+    expect(
+      localizationSpecSchema.safeParse({ locales: [{ tag: 'en', timezone: 'US|x' }] }).success,
+    ).toBe(false);
+  });
+
+  it('keeps accepting an odd spelling of a real locale, because that is not a forgery', () => {
+    /*
+     * NARROW ON PURPOSE. A positive BCP-47 shape would also refuse these, and
+     * every one of them is a real locale somebody has already stored — so
+     * refusing them would lose exactly the rows this refusal exists to save.
+     * The four refused characters are the ENTIRE vocabulary of the two key
+     * producers; nothing else about the tag is this schema's business.
+     */
+    for (const cell of [
+      { locale: 'de_DE' },
+      { locale: 'en-US.UTF-8' },
+      { locale: 'en-Latn-US-u-ca-gregory' },
+      { locale: 'zh-Hant-TW', timezone: 'Asia/Taipei' },
+      { locale: 'ar-EG', timezone: 'Africa/Cairo' },
+    ]) {
+      expect(matrixCellSchema.safeParse(cell).success).toBe(true);
+    }
+  });
+});
+
+describe('a value a declaration surface accepts is a value the evidence can store', () => {
+  /*
+   * ── THE SEVENTH COSTUME, AND IT WAS A FLOOR ──────────────────────────────
+   *
+   * The write-path property in packages/runner is derived from the spec
+   * schemas' CEILINGS, and every one of the six defects before this one was a
+   * ceiling or a spelling. This one was the other end: `localizationSpecSchema`
+   * let a pairing declare `timezone: ''`, the three other surfaces and
+   * `matrixCellEvidenceSchema` demand a character, so the plan built a cell
+   * the evidence then refused at `cell.matrixCell.timezone`. `validateMeasurements`
+   * refuses a matrix WHOLE on its first bad cell, so that one empty string
+   * wrote ZERO variant rows for the entire run behind one `logger.warn`.
+   *
+   * Asserted as a SUBSET rather than as one more spelling: for every value in a
+   * pool that sits on or past each field's floor and ceiling, if ANY surface
+   * that declares a locale or a zone accepts it, the evidence must accept it
+   * too. A fifth surface, or a sixth field added to one copy, is caught here
+   * without anybody remembering this file.
+   */
+  const POOL = ['', 'x', 'xx', ' ', 'z'.repeat(34), 'z'.repeat(35), 'z'.repeat(36), 'z'.repeat(64), 'z'.repeat(65)];
+
+  const asLocale = {
+    'a LOCALIZATION pairing tag': (v: string) =>
+      localizationSpecSchema.safeParse({ locales: [{ tag: v }] }).success,
+    'the CROSS_BROWSER locales axis': (v: string) => matrixAxesSchema.safeParse({ locales: [v] }).success,
+    'the declared cell': (v: string) => matrixCellSchema.safeParse({ locale: v }).success,
+  };
+  const asZone = {
+    'a LOCALIZATION pairing zone': (v: string) =>
+      localizationSpecSchema.safeParse({ locales: [{ tag: 'en-US', timezone: v }] }).success,
+    'the CROSS_BROWSER timezones axis': (v: string) =>
+      matrixAxesSchema.safeParse({ timezones: [v] }).success,
+    'the declared cell': (v: string) => matrixCellSchema.safeParse({ timezone: v }).success,
+  };
+
+  it('stores every locale tag that any declaration surface accepts', () => {
+    for (const [surface, accepts] of Object.entries(asLocale)) {
+      for (const value of POOL) {
+        if (!accepts(value)) continue;
+        expect(
+          matrixCellEvidenceSchema.safeParse({ locale: value }).success,
+          `${surface} accepts a ${value.length}-character tag the evidence refuses`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('stores every zone that any declaration surface accepts', () => {
+    for (const [surface, accepts] of Object.entries(asZone)) {
+      for (const value of POOL) {
+        if (!accepts(value)) continue;
+        expect(
+          matrixCellEvidenceSchema.safeParse({ timezone: value }).success,
+          `${surface} accepts a ${value.length}-character zone the evidence refuses`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it('refuses an EMPTY zone on a LOCALIZATION pairing, by path and never by value', () => {
+    const result = localizationSpecSchema.safeParse({ locales: [{ tag: 'en-US', timezone: '' }] });
+    expect(result.success).toBe(false);
+    expect(refusalPaths(result)).toContain('locales.0.timezone');
+    // The three places that already agreed, pinned so a "fix" that loosens the
+    // evidence to match the pairing is red here and not quiet.
+    expect(matrixAxesSchema.safeParse({ timezones: [''] }).success).toBe(false);
+    expect(matrixCellEvidenceSchema.safeParse({ timezone: '' }).success).toBe(false);
+  });
+
+  it('still accepts a pairing that names no zone at all, which is not an empty one', () => {
+    expect(localizationSpecSchema.safeParse({ locales: [{ tag: 'en-US' }] }).success).toBe(true);
+    expect(
+      localizationSpecSchema.safeParse({ locales: [{ tag: 'en-US', timezone: 'x' }] }).success,
+    ).toBe(true);
+  });
+});
+
+describe('testResultVariantSchema cell evidence cross-check', () => {
+  const row = { key: { browser: 'firefox' }, status: 'SKIPPED' as const, durationMs: 0 };
+  /** Everything a refused cell owes beside the status: a remedy and its hole. */
+  const refusedCellFields = {
+    cellRemedy: 'Drop the channel from that cell, or move it to a chromium cell.',
+    notAsserted: ['every assertion this test makes — the cell was not run'],
+    notAssertedReason: 'CAPABILITY_ABSENT' as const,
+  };
+
+  it('STORES the evidence for an impossible cell — the whole point of the status', () => {
+    /*
+     * The row `variantsFor` emits for one of the four unrunnable cells of the
+     * crossed spec, parsed through the chain BOTH ingest paths run. Before the
+     * repair this was `cell.matrixCell.channel` and the entire run's rows went
+     * with it.
+     */
+    const parsed = testResultVariantSchema.safeParse({
+      ...row,
+      cell: {
+        matrixCell: impossibleCell,
+        cellStatus: 'UNSUPPORTED_COMBINATION',
+        ...refusedCellFields,
+      },
+    });
+    expect(refusalPaths(parsed)).toEqual([]);
+    expect(parsed.success && parsed.data.cell?.cellStatus).toBe('UNSUPPORTED_COMBINATION');
+    expect(parsed.success && parsed.data.cell?.matrixCell).toEqual(impossibleCell);
+  });
+
+  it('refuses an impossible cell recorded as AVAILABLE — the storable lie', () => {
+    /*
+     * HALF ONE OF THE CROSS-CHECK, and the direction the dropped
+     * `channelExistsFor` refinement was protecting: a cell that can NEVER
+     * EXECUTE, recorded as having run, is a cell that can never fail sitting in
+     * the numerator for ever. The refinement is gone from the evidence schema;
+     * the property is not.
+     */
+    expect(
+      refusalPaths(
+        testResultVariantSchema.safeParse({
+          ...row,
+          cell: { matrixCell: impossibleCell, cellStatus: 'AVAILABLE' },
+        }),
+      ),
+    ).toEqual(['cell.cellStatus']);
+  });
+
+  it('refuses an impossible cell recorded as MISSING, which sends a reader shopping', () => {
+    // Collapsing UNSUPPORTED_COMBINATION into MISSING tells a customer to
+    // install a build that was never published. Four statuses, four next
+    // actions; this cell has exactly one of them.
+    expect(
+      refusalPaths(
+        testResultVariantSchema.safeParse({
+          ...row,
+          cell: { matrixCell: impossibleCell, cellStatus: 'MISSING', ...refusedCellFields },
+        }),
+      ),
+    ).toEqual(['cell.cellStatus']);
+  });
+
+  it('refuses UNSUPPORTED_COMBINATION on a declarable cell with nothing to explain it', () => {
+    /*
+     * HALF TWO, the opposite direction: an impossible STATUS on a POSSIBLE
+     * cell. `{engine: 'chromium'}` is a cell every deployment can declare, so a
+     * resolution saying the combination does not exist is either a resolver bug
+     * or a fact only a remedy can carry. The path is `cell.matrixCell` and not
+     * `cell.cellRemedy`: the second diagnosis is that the CELL may be the thing
+     * that is wrong, which the generic remedy refusal beside it cannot say.
+     */
+    expect(
+      refusalPaths(
+        testResultVariantSchema.safeParse({
+          ...row,
+          cell: { matrixCell: { engine: 'chromium' }, cellStatus: 'UNSUPPORTED_COMBINATION' },
+        }),
+      ),
+    ).toContain('cell.matrixCell');
+  });
+
+  it('accepts UNSUPPORTED_COMBINATION on a declarable cell that says why', () => {
+    /*
+     * THE ESCAPE HATCH, and it is why half one is not written as an iff. A
+     * device preset this image cannot emulate, or a released consumer build
+     * only a hosted grid can serve, is a REAL UNSUPPORTED_COMBINATION on a cell
+     * the declaration rules happily accept. Tightening half one into "only
+     * impossible cells may carry this status" would make that resolution
+     * unstorable, which is this round's defect wearing the opposite sign.
+     */
+    expect(
+      refusalPaths(
+        testResultVariantSchema.safeParse({
+          ...row,
+          cell: {
+            matrixCell: { engine: 'webkit', device: { kind: 'PRESET', preset: 'IPAD_PRO_11' } },
+            cellStatus: 'UNSUPPORTED_COMBINATION',
+            ...refusedCellFields,
+          },
+        }),
+      ),
+    ).toEqual([]);
+  });
 });
 
 describe('testResultVariantSchema', () => {
@@ -504,6 +1011,48 @@ describe('testResultVariantSchema', () => {
     };
     expect(
       testResultVariantSchema.safeParse({ ...cell, metrics: Array(41).fill(metric) }).success,
+    ).toBe(false);
+  });
+
+  it('admits the per-cell evidence, because the agent ingest path has no reader', () => {
+    /*
+     * This object is a plain `z.object` and NOT `.strict()`, so an unknown key
+     * is SILENTLY DROPPED. apps/api/src/routes/runners.ts builds its
+     * `executionSchema` from this schema, so without the `cell` field an
+     * on-prem agent could report all five honesty columns and the write would
+     * be five NULLs — no refusal, no log line, and a customer's honesty
+     * columns depending on which runner happened to run the test. The worker
+     * reads the raw property BEFORE the strip to get around exactly that; the
+     * agent path has no such reader, so the field had to be admitted here.
+     */
+    const reported = testResultVariantSchema.parse({
+      ...cell,
+      cell: { matrixCell: { engine: 'webkit' }, cellStatus: 'MISSING', cellRemedy: 'install it' },
+    });
+    expect(reported.cell).not.toBeNull();
+    expect(reported.cell?.cellStatus).toBe('MISSING');
+    expect(reported.cell?.matrixCell).toEqual({ engine: 'webkit' });
+  });
+
+  it('leaves the evidence NULL rather than reading absence as AVAILABLE', () => {
+    // Absent is the fifth state. A producer that made no claim about a cell's
+    // runnability is not a producer claiming it ran, and `planMeasurements`
+    // still writes the ROW for it so the cell stays in the denominator.
+    expect(testResultVariantSchema.parse(cell).cell).toBeNull();
+  });
+
+  it('still refuses a stated hole with no reason, through the nested schema', () => {
+    /*
+     * The refinements with teeth live on `testResultVariantCellSchema` and this
+     * path must not bypass them — `z.lazy` could easily have been written as a
+     * loose `z.record` to dodge the temporal dead zone, and the result would
+     * have been a field that accepts anything on the one path nobody re-checks.
+     */
+    expect(
+      testResultVariantSchema.safeParse({
+        ...cell,
+        cell: { matrixCell: {}, cellStatus: 'AVAILABLE', notAsserted: ['the money state'] },
+      }).success,
     ).toBe(false);
   });
 });

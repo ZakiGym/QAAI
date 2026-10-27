@@ -94,3 +94,13 @@ export { documentPlugin } from './plugins/document.js';
 export { pwaPlugin } from './plugins/pwa.js';
 export { pushPlugin } from './plugins/push.js';
 export { emailPlugin } from './plugins/email.js';
+/*
+ * The money path. PUBLIC for one concrete reason beyond symmetry with the five
+ * lines above it: the worker is what installs the checkout, gateway-mode,
+ * money-state and webhook adapters through `setPaymentsDeps`, and it lives in a
+ * package that cannot reach this one except through this file. A plugin whose
+ * surfaces can only be installed from inside its own package is a plugin that
+ * runs for ever against the `unavailable*` defaults — reporting SKIPPED with a
+ * remedy, honestly, and measuring nothing.
+ */
+export { paymentsPlugin, setPaymentsDeps } from './plugins/payments.js';

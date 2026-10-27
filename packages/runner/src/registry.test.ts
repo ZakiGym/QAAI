@@ -155,10 +155,13 @@ describe('a plugin whose TestType is not minted yet', () => {
     // the test yet" are different sentences with different remedies.
     //
     // WIDENED FROM FIVE TO TEN when this round's six test types were
-    // registered, and the list is pinned EXACTLY on purpose: it is the gap
-    // ledger, so a plugin joining or a type being minted must change this line
-    // deliberately rather than drift. This assertion is what caught the
-    // registration, which is the point of pinning it.
+    // registered, and TO ELEVEN when the PAYMENTS plugin landed — the money
+    // path, which had a declaration, a funnel precondition and a fourteen-kind
+    // spec schema and no plugin to execute any of it. The list is pinned
+    // EXACTLY on purpose: it is the gap ledger, so a plugin joining or a type
+    // being minted must change this line deliberately rather than drift. This
+    // assertion is what caught both registrations, which is the point of
+    // pinning it.
     //
     // 'EMAIL' is the one entry that is NOT merely awaiting a mint: unlike its
     // nine siblings it is in neither TEST_TYPES nor PENDING_TEST_TYPES, so it
@@ -172,6 +175,7 @@ describe('a plugin whose TestType is not minted yet', () => {
       'EMAIL',
       'JOBS',
       'LINKS',
+      'PAYMENTS',
       'PUSH',
       'PWA',
       'SEO',

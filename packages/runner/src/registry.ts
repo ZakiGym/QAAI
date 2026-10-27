@@ -62,6 +62,14 @@ import { documentPlugin } from './plugins/document.js';
 import { pushPlugin } from './plugins/push.js';
 import { pwaPlugin } from './plugins/pwa.js';
 /*
+ * THE MONEY PATH, which arrived in the same state as the six above and is the
+ * most expensive instance of it. PAYMENTS had a declaration, a funnel
+ * precondition in the Explorer and a fourteen-kind spec schema whose only
+ * non-test reader was the declaration's own test — a complete write path to a
+ * test type that could not run. This import is what makes it REACHED.
+ */
+import { paymentsPlugin } from './plugins/payments.js';
+/*
  * EMAIL is the one whose NAME is a problem, recorded here rather than fixed
  * silently. `emailPlugin.type` is the literal `'EMAIL'`, and `'EMAIL'` is in
  * NEITHER `TEST_TYPES` nor `PENDING_TEST_TYPES` — so unlike its five siblings
@@ -204,6 +212,17 @@ const PENDING_PLUGINS: Readonly<Record<string, PendingPlugin>> = {
    * percentage from counting a test that can never run.
    */
   PUSH: pushPlugin,
+  /*
+   * PAYMENTS — 3DS, declines, webhook transitions, refunds, partial capture:
+   * the money path, which could be clicked through and could not be asserted.
+   * The plugin is STRUCTURALLY incapable of a live-mode charge (no interface it
+   * holds has a field for a provider key, and `testMode` is re-asserted at run
+   * time off an untyped view), and it REFUSES rather than guessing when a
+   * gateway's mode was never established — a refusal that is recorded as a
+   * refusal rather than as a missing capability, so a reader can count the
+   * times QAAI declined to touch somebody's money.
+   */
+  PAYMENTS: paymentsPlugin,
   /*
    * EMAIL — a transactional message's own delivery and content, as opposed to
    * EMAIL_OTP, which drives a sign-in. See the import note: this key is the one

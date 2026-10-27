@@ -81,6 +81,7 @@
 
 import {
   ANONYMOUS_ROLE,
+  MAX_VARIANT_ERROR_MESSAGE,
   NEVER_CAPTURABLE_UNREACHED_REASONS,
   UNVARIED,
   baselineViewportKey,
@@ -89,6 +90,7 @@ import {
   matrixCellKey,
   resolveMatrixCell,
   variantBrowserKey,
+  variantLocaleKey,
   variantViewportKey,
   variedAxes,
 } from '@qaai/shared';
@@ -100,11 +102,13 @@ import type {
   MatrixCell,
   MatrixCellResolution,
   MatrixCellStatus,
+  MeasuredVariant,
   NotRunKind,
   StateUnreachedReason,
   TestResultStatus,
   TestResultVariant,
   TestVariantKey,
+  UnassertedReason,
 } from '@qaai/shared';
 
 // ─── Which NotRunKind a refused cell gets ────────────────────────────────────
@@ -494,12 +498,25 @@ export interface VariantContext {
 /**
  * The five-dimension key for one cell.
  *
- * Browser and viewport come from `variantBrowserKey` and `variantViewportKey`,
- * which are the ONLY producers of those two strings in the product — the reason
- * the matrix widened without adding a column to the largest table in it. Locale
- * comes off the cell, and an absent one is `UNVARIED` rather than the image's
- * actual locale: reporting the host's locale for a cell that expressed no opinion
- * about locale would be claiming a dimension nobody varied.
+ * Browser, viewport and locale come from `variantBrowserKey`,
+ * `variantViewportKey` and `variantLocaleKey`, which are the ONLY producers of
+ * those three strings in the product — the reason the matrix widened without
+ * adding a column to the largest table in it. An unvaried locale is `UNVARIED`
+ * rather than the image's actual locale: reporting the host's locale for a cell
+ * that expressed no opinion about locale would be claiming a dimension nobody
+ * varied.
+ *
+ * THE LOCALE COLUMN WAS BUILT HERE, AS `cell.locale ?? UNVARIED`, AND THAT COST
+ * EVERY ROW OF A LOCALISATION RUN. It carried no timezone, so one locale in two
+ * zones — which is the most natural thing a localisation matrix says — was ONE
+ * row: `planMatrix`'s duplicate check keys on `matrixCellKey`, which does
+ * include the zone, so the plan was two honest cells, and `planMeasurements`
+ * then refused the matrix WHOLE for a duplicated cell. Zero variant rows, one
+ * log line, and a roll-up verdict that still read as fine. The expression is
+ * gone from this file rather than extended in it: a dimension with two
+ * producers is a key that comes to disagree with itself, and
+ * `variantLocaleKey` is now the one that owns the four shapes and the
+ * byte-identity of the two that already existed.
  *
  * `role` defaults to `ANONYMOUS_ROLE` and NOT to `UNVARIED`, and the two are
  * genuinely different: "nobody varied the role" and "this ran as a logged-out
@@ -511,9 +528,98 @@ export function variantKeyFor(cell: MatrixCell, context: VariantContext): TestVa
   return {
     browser: variantBrowserKey(cell),
     viewport: variantViewportKey(cell),
-    locale: cell.locale ?? UNVARIED,
+    locale: variantLocaleKey(cell),
     role: context.role ?? ANONYMOUS_ROLE,
     environment: context.environment,
+  };
+}
+
+/**
+ * The ceiling on a cell's failure message, which is `testResultVariantSchema`'s
+ * own bound and is imported rather than restated.
+ *
+ * Asked of the schema because a second copy of the number is how the producer
+ * and the validator drift apart, and the cost of drift here is not one bad row:
+ * `validateMeasurements` refuses a matrix WHOLE on its first bad cell.
+ */
+const CELL_MESSAGE_LIMIT = MAX_VARIANT_ERROR_MESSAGE;
+
+/**
+ * A failure message, made to fit the row it is stored on.
+ *
+ * ── THE DEFECT THIS CLOSES, WHICH WAS TRIGGERED BY A FAILURE ────────────────
+ *
+ * A Playwright assertion message carries its own call log and, for a strict-mode
+ * violation or an ARIA snapshot diff, the outerHTML of every element it matched.
+ * That is routinely over five thousand characters, and `errorMessage` on a
+ * variant row is bounded at five thousand. The harness hands the plugin that
+ * message untouched, so the first cell that FAILED with a long message made the
+ * whole variant list unstorable: `validateMeasurements` refused the matrix, and
+ * every passing cell's row went with the one failing cell's — one log line, no
+ * red test, and it happened exactly when a cell was red, which is the only time
+ * a per-cell row was worth having.
+ *
+ * SHORTENED AND SAID SO, never silently: the marker names the original length,
+ * so a reader of the row knows the sentence stops short and why. The head is the
+ * part kept because an assertion message states what failed first and logs how
+ * it got there afterwards.
+ */
+export function fitCellMessage(message: string | null | undefined): string | null {
+  if (message === null || message === undefined) return null;
+  if (message.length <= CELL_MESSAGE_LIMIT) return message;
+  const marker = ` … [shortened from ${message.length} characters to fit this cell's row]`;
+  return `${message.slice(0, CELL_MESSAGE_LIMIT - marker.length)}${marker}`;
+}
+
+/**
+ * What a cell that DID NOT RUN did not assert, in the keystone's vocabulary.
+ *
+ * ── THE ZERO THAT WAS A READING NOBODY TOOK ─────────────────────────────────
+ *
+ * `evidenceFor` used to write `notAsserted: []` on EVERY row, and its own
+ * comment called that "a claim, not a placeholder: a cell either ran the spec or
+ * did not". The claim is true for a cell that ran. It was ALSO written for a
+ * cell the harness refused — a dark-mode cell, a device cell, a channel cell —
+ * which executed NOTHING and is stored beside `status: SKIPPED`. On the five
+ * honesty columns an empty `notAsserted` means "this cell made every assertion
+ * the test contains", so a refused cell was recorded as having asserted
+ * everything, and a reader asking the question those columns exist for ("did
+ * this cell assert everything?") got YES for a cell that asserted nothing. An
+ * empty list is a zero, and the honest answer for a cell that never executed is
+ * the whole test, with the reason it did not.
+ *
+ * ── WHICH REASON, AND WHY IT IS DERIVED AND NOT COPIED FROM THE KIND ────────
+ *
+ * `NotRunKind` says what to DO about it and `UnassertedReason` says whose gap it
+ * is, and the two do not line up one-to-one: `UNSUPPORTED` covers both a build
+ * that exists nowhere (no Firefox beta — not ours, nothing to install) and a
+ * field this runner's Playwright project does not carry yet (ours, work).
+ *
+ *   · the deployment cannot run the cell at all (`cellCounts` is false —
+ *     MISSING, WRONG_VERSION, UNSUPPORTED_COMBINATION, NEEDS_BROWSER_GRID)
+ *                                          → CAPABILITY_ABSENT
+ *   · the cell COUNTS but was refused as UNSUPPORTED → this runner cannot express
+ *     the axis, which is QAAI's missing work   → NOT_IMPLEMENTED
+ *   · the cell COUNTS, was planned, and no outcome ever came back
+ *                                          → SURFACE_UNREACHED
+ *
+ * The sentence is a fixed template and quotes no customer text: it lands on a
+ * column a report prints.
+ */
+export function unassertedForUnrunCell(
+  resolution: MatrixCellResolution,
+  kind: NotRunKind,
+): { readonly assertion: string; readonly reason: UnassertedReason } {
+  const reason: UnassertedReason = !cellCounts(resolution.status)
+    ? 'CAPABILITY_ABSENT'
+    : kind === 'UNSUPPORTED'
+      ? 'NOT_IMPLEMENTED'
+      : 'SURFACE_UNREACHED';
+  return {
+    assertion:
+      `every assertion this test makes — the cell was not run (${kind}), so nothing was ` +
+      'asserted in it, and an empty list here would have claimed the opposite',
+    reason,
   };
 }
 
@@ -527,7 +633,19 @@ export interface CellOutcome {
 }
 
 export interface VariantsResult {
-  readonly variants: readonly TestResultVariant[];
+  /**
+   * `MeasuredVariant` and not `TestResultVariant`, because this function is the
+   * one producer in the product that already holds a full
+   * {@link MatrixCellResolution} for every cell and used to emit none of it.
+   *
+   * The five honesty columns on `TestResultVariant` — matrixCell, cellStatus,
+   * cellRemedy, notAsserted, notAssertedReason — had a migration, a schema with
+   * four refinements, a row builder and an index, and NO WRITER, so all five
+   * were NULL for ever and a pass with a hole in it was indistinguishable from
+   * a pass. The evidence was sitting right here on `plan.runnable` and
+   * `plan.refused`. The widening is the whole write path.
+   */
+  readonly variants: readonly MeasuredVariant[];
   /**
    * Cells that produced NO row, each with the reason.
    *
@@ -571,7 +689,7 @@ export function variantsFor(
   context: VariantContext,
   outcomes: readonly CellOutcome[],
 ): VariantsResult {
-  const variants: TestResultVariant[] = [];
+  const variants: MeasuredVariant[] = [];
   const omitted: Array<{ cell: MatrixCell; why: string }> = [];
   const byKey = new Map<string, CellOutcome>();
   for (const outcome of outcomes) byKey.set(matrixCellKey(outcome.cell), outcome);
@@ -579,7 +697,46 @@ export function variantsFor(
   const identityVaried =
     (context.role !== undefined && context.role !== UNVARIED) || context.environment !== UNVARIED;
 
-  const emit = (cell: MatrixCell, build: () => TestResultVariant): void => {
+  /**
+   * The cell evidence for one row, taken from the RESOLUTION and never from the
+   * verdict.
+   *
+   * "Could this deployment run this cell" and "what did running it conclude"
+   * are different questions, and deriving the first from the second is how a
+   * refused cell collapses back into an ordinary SKIPPED. `planMeasurements`
+   * refuses a verdict on a cell that could not run, in either direction — a
+   * PASSED on an unexercisable cell is a cell that can never fail counted in
+   * the numerator, and a FAILED is a defect reported against the customer's
+   * application because OUR image lacks a browser. Both refusals agree with
+   * this function by construction: a refused cell is emitted as SKIPPED below,
+   * and `variantKeyFor` derives both text keys from the SAME cell, so the
+   * identity/detail cross-check cannot disagree with itself.
+   *
+   * `notAsserted` is empty for a cell that RAN, and that is a claim, not a
+   * placeholder: a cell of a cross-browser or localisation matrix ran the whole
+   * spec under its `use` block, so there is no assertion it suppressed. It is
+   * NOT empty for a cell that did not run — `unrun` carries the row's typed
+   * not-run and {@link unassertedForUnrunCell} turns it into the whole test and
+   * the reason. An empty list on a row stored beside `status: SKIPPED` would say
+   * the opposite of what happened: that a cell which executed nothing made
+   * every assertion.
+   */
+  const evidenceFor = (
+    cell: MatrixCell,
+    resolution: MatrixCellResolution,
+    unrun: NotRunKind | null,
+  ): NonNullable<MeasuredVariant['cell']> => {
+    const unasserted = unrun === null ? null : unassertedForUnrunCell(resolution, unrun);
+    return {
+      matrixCell: cell,
+      cellStatus: resolution.status,
+      cellRemedy: resolution.remedy,
+      notAsserted: unasserted === null ? [] : [unasserted.assertion],
+      notAssertedReason: unasserted === null ? null : unasserted.reason,
+    };
+  };
+
+  const emit = (cell: MatrixCell, build: () => MeasuredVariant): void => {
     if (variedAxes(cell).length === 0 && !identityVaried) {
       omitted.push({
         cell,
@@ -618,6 +775,7 @@ export function variantsFor(
             'this cell was planned and attempted and no outcome came back for it, so nothing is ' +
             'known about it in either direction. It is not a pass and it is not a failure.',
         },
+        cell: evidenceFor(execution.cell, execution.resolution, 'NOT_RUN'),
       }));
       continue;
     }
@@ -625,9 +783,11 @@ export function variantsFor(
       key: variantKeyFor(execution.cell, context),
       status: outcome.status,
       durationMs: outcome.durationMs,
-      errorMessage: outcome.errorMessage ?? null,
+      // Fitted to the row, never passed through: see `fitCellMessage`.
+      errorMessage: fitCellMessage(outcome.errorMessage),
       retriedAndPassed: outcome.retriedAndPassed ?? false,
       notRun: null,
+      cell: evidenceFor(execution.cell, execution.resolution, null),
     }));
   }
 
@@ -645,6 +805,12 @@ export function variantsFor(
       errorMessage: null,
       retriedAndPassed: false,
       notRun: refusal.notRun,
+      /*
+       * The refusal's own resolution, which is the reason the five columns
+       * exist: this is the row that says "this deployment cannot run WebKit,
+       * here is the remedy" rather than counting a cell nobody could exercise.
+       */
+      cell: evidenceFor(refusal.cell, refusal.resolution, refusal.notRun.kind),
     }));
   }
 

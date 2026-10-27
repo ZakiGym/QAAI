@@ -55,6 +55,12 @@ import type { Principal, PrincipalSession, RunPrincipalSessions } from './princi
  * constants.ts instead.
  */
 import type { PerformanceMetric } from './schemas';
+/*
+ * TYPE ONLY — see `TestExecution.variants`. ./measurement-rows.ts imports
+ * `UNVARIED` from here as a VALUE, so this edge runs against that one and is
+ * safe only because `import type` is erased at compile time.
+ */
+import type { MeasuredVariant } from './measurement-rows';
 
 // ─── Identity & tenancy ──────────────────────────────────────────────────────
 
@@ -285,8 +291,29 @@ export interface TestExecution {
    * duplicates the result — absent means "this execution was not varied", and
    * a single synthetic row would make an unvaried run indistinguishable from a
    * one-browser matrix somebody configured on purpose.
+   *
+   * ── WHY THE ELEMENT IS `MeasuredVariant` AND NOT `TestResultVariant` ───────
+   *
+   * `MeasuredVariant` is `TestResultVariant` plus the OPTIONAL per-cell
+   * evidence — the resolved cell, whether this deployment could run it, the
+   * remedy if not, and the assertions it did not make — so every existing
+   * producer keeps compiling and keeps meaning what it meant.
+   *
+   * Widened because the alternative is a field that exists at RUN TIME and not
+   * in the TYPE. A plugin could emit the evidence, both ingest paths would
+   * validate and store it, and the next author of a matrix plugin would read
+   * this declaration, see nowhere to put it, and emit nothing — which is how
+   * the five honesty columns came to have a schema, a row builder, an index and
+   * no writer in the first place. A producer cannot report what the type it
+   * returns will not hold.
+   *
+   * IMPORTED AS A TYPE ONLY, and it must stay that way. ./measurement-rows.ts
+   * imports `UNVARIED` from THIS file as a value, so this edge is the other
+   * direction: a `import type` is erased and harmless, and turning it into a
+   * value import would close a real cycle in the module everything else here
+   * depends on.
    */
-  variants?: TestResultVariant[] | null;
+  variants?: MeasuredVariant[] | null;
 }
 
 /**

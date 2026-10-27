@@ -65,8 +65,40 @@
 
 import { accessSync, constants as fsConstants, existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
-import { TEST_TYPES } from '@qaai/shared';
-import type { NotRunKind, TestType } from '@qaai/shared';
+import {
+  BROWSER_CHANNEL_LIST,
+  BROWSER_ENGINE_LIST,
+  CHANNEL_ENGINE,
+  DEVICE_PRESET_LIST,
+  MATRIX_CELL_STATUS_LIST,
+  PLAYWRIGHT_CHANNEL,
+  PLAYWRIGHT_DEVICE,
+  TEST_TYPES,
+  resolveMatrixCell,
+} from '@qaai/shared';
+import type {
+  BrowserChannel,
+  DeploymentBrowsers,
+  DevicePreset,
+  MatrixCell,
+  MatrixCellResolution,
+  MatrixCellStatus,
+  NotRunKind,
+  TestType,
+} from '@qaai/shared';
+/*
+ * The cell-status → NotRunKind split, imported rather than re-derived.
+ *
+ * `summariseBrowserMatrix` below has to know which of the six statuses have a
+ * remedy somebody can carry out on this machine and which do not, and that
+ * decision already exists in ./matrix.ts as `NOT_RUN_KIND_FOR_CELL`. A second
+ * copy here is how the matrix planner and the preflight come to disagree about
+ * whether NEEDS_BROWSER_GRID is an install problem — and the day they disagreed,
+ * one of them would be telling a customer to run `npx playwright install` for a
+ * browser build that does not exist. No cycle: matrix.ts imports @qaai/shared
+ * and nothing from this file.
+ */
+import { NOT_RUN_KIND_FOR_CELL } from './matrix.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tunables. Exported constants, deliberately not environment variables: a brake
@@ -1833,3 +1865,537 @@ export function preflightSummary(pre: EnvironmentPreflight): string {
  * runnability report can never silently describe eighteen of nineteen types.
  */
 export const ALL_TEST_TYPES: readonly TestType[] = TEST_TYPES;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE BROWSER CAPABILITY PROBE — the collector `DeploymentBrowsers` was
+// declared for and never got.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ── THE DEFECT THIS SECTION CLOSES ──────────────────────────────────────────
+ *
+ * `DeploymentBrowsers` in packages/shared/src/browser-matrix.ts is the fact
+ * every browser/device cell is resolved against, and its own header names THIS
+ * FILE as the collector: "the one thin adapter that actually stats a browser
+ * install lives in packages/runner/src/preflight.ts, which already has a probe
+ * budget and a cache around it". That adapter did not exist. Nothing anywhere
+ * built a `DeploymentBrowsers`, so every `resolveMatrixCell` call in the product
+ * was made against `{}` — and NOT_CHECKED was not merely the usual answer, it
+ * was the ONLY answer the function could ever give, for every cell, on every
+ * deployment, for ever. A resolver with six statuses and one reachable outcome
+ * reports nothing, and the honest-looking word NOT_CHECKED is what hid it.
+ *
+ * ── THE TWO WAYS TO GET THIS WRONG, WHICH ARE NOT SYMMETRIC ─────────────────
+ *
+ *  · ABSENT BECOMING AVAILABLE. A probe that could not tell, recorded as "yes",
+ *    is a cell this deployment vouches for and cannot run: the test launches,
+ *    Playwright throws, and the run reports a failure against the customer's
+ *    application for a browser we never had. That is the expensive one.
+ *  · ABSENT BECOMING MISSING. A probe that could not tell, recorded as "no", is
+ *    a cell REFUSED on this deployment with an install line for something that
+ *    may already be installed somewhere this probe does not look. "QAAI refused
+ *    my Chrome" is the same class of defect as "QAAI refused my k6", and this
+ *    file already made that argument once about version windows.
+ *
+ * So every reading is TRI-STATE and an unanswered one is OMITTED from the
+ * capability rather than defaulted in either direction — which is exactly the
+ * contract `DeploymentBrowsers` documents ("EVERY FIELD IS OPTIONAL AND ABSENT
+ * MEANS NOT PROBED") and the reason that interface is three optional maps.
+ *
+ * ── AND IT STILL NEVER LAUNCHES ANYTHING ────────────────────────────────────
+ *
+ * The standing promise in this file's header holds here: an engine is an
+ * `existsSync` against a path Playwright computes, a device preset is a lookup
+ * in a registry object Playwright exports, and a channel is a `stat` per PATH
+ * entry. No browser is started. Which is also why no version is read — see
+ * {@link probeDeploymentBrowsers} on the one field this probe deliberately
+ * leaves empty.
+ */
+
+/** Which axis of the matrix a single reading is about. */
+export type BrowserCapabilityAxis = 'ENGINE' | 'CHANNEL' | 'DEVICE_PRESET';
+
+/*
+ * The compiler-enforced presence record, the same half of the pattern every
+ * vocabulary with a write path carries in this repository: a fourth axis is a
+ * build error here rather than a reading that falls through a `default:` and is
+ * stored under a name no reader knows how to interpret. The run-time half is in
+ * the test beside this file, which asserts the prober emits every axis.
+ *
+ * It is NOT a Prisma enum, and that is a decision rather than an omission: a
+ * Prisma enum needs its TypeScript twin in packages/shared/src/constants.ts and
+ * its pair in apps/api/scripts/check-enums.ts, neither of which this slice owns,
+ * and `check:enums` fails a value with no twin. The stored column is TEXT,
+ * validated on the way in against this union and on the way out against the
+ * shared vocabularies. The exact lines to promote it are in this round's
+ * handover.
+ */
+const BROWSER_CAPABILITY_AXIS_PRESENT: Record<BrowserCapabilityAxis, true> = {
+  ENGINE: true,
+  CHANNEL: true,
+  DEVICE_PRESET: true,
+};
+
+export const BROWSER_CAPABILITY_AXES = Object.keys(
+  BROWSER_CAPABILITY_AXIS_PRESENT,
+) as ReadonlyArray<BrowserCapabilityAxis>;
+
+/** Narrows an untrusted string — a stored row, a payload — to an axis. */
+export function isBrowserCapabilityAxis(value: unknown): value is BrowserCapabilityAxis {
+  return (
+    typeof value === 'string' && (BROWSER_CAPABILITY_AXES as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * One member of one axis, as the probe answered — or did not.
+ *
+ * `installed: null` is a first-class reading and the one that must survive to
+ * storage as an ABSENCE. `detail` says what was looked at, never what was
+ * assumed, and carries no path from the environment: a `detail` is rendered into
+ * reports beside the capability sentence.
+ */
+export interface BrowserCapabilityReading {
+  readonly axis: BrowserCapabilityAxis;
+  /** The name from the SHARED vocabulary — `chromium`, `CHROME_BETA`, `IPHONE_14`. */
+  readonly name: string;
+  /** `null` means NOT PROBED, and is never rounded to either boolean. */
+  readonly installed: boolean | null;
+  readonly detail: string;
+}
+
+/**
+ * The probes, injected, so this is testable with no Playwright and no filesystem.
+ *
+ * It EXTENDS `RunnabilityProbes` rather than redeclaring `onPath` and
+ * `browserInstalled`, so one probe object serves both halves of a preflight and
+ * the engine answer a caller injects cannot differ between them.
+ */
+export interface BrowserCapabilityProbes extends RunnabilityProbes {
+  /**
+   * Does Playwright's device registry hold this descriptor? `null` = could not
+   * tell. A `false` here is a real and useful answer — the remedy is "upgrade
+   * Playwright or write an explicit viewport", and `resolveMatrixCell` says so.
+   */
+  devicePresetKnown?: (preset: DevicePreset) => boolean | null | Promise<boolean | null>;
+  /**
+   * Does this CHANNEL resolve on this host? `null` = could not tell, which is
+   * what the default answers most of the time, on purpose. See
+   * {@link CHANNEL_PATH_CANDIDATES}.
+   */
+  channelResolves?: (channel: BrowserChannel) => boolean | null;
+}
+
+export interface BrowserCapabilityProbe {
+  /** Every member of every axis, answered or not. The full picture, in order. */
+  readonly readings: readonly BrowserCapabilityReading[];
+  /** The answered readings only, in the shape `resolveMatrixCell` consumes. */
+  readonly browsers: DeploymentBrowsers;
+  /** The readings that came back `null`. Reported, so the gap is disclosed. */
+  readonly notProbed: readonly BrowserCapabilityReading[];
+  /** One sentence for an operator. Printable verbatim. */
+  readonly why: string;
+}
+
+/**
+ * The command names the vendors' own packages put on PATH, per channel.
+ *
+ * ── WHY A PATH MISS IS `null` AND NOT `false` ───────────────────────────────
+ *
+ * Playwright does not resolve a channel through PATH. It looks in absolute,
+ * per-platform locations — `/Applications/Google Chrome.app/…` on macOS,
+ * `/opt/google/chrome/chrome` and `/usr/bin/google-chrome` on Linux, Program
+ * Files on Windows — so a channel that is not on PATH is NOT a channel that is
+ * absent, and reporting one as MISSING would print an install line to somebody
+ * who has the browser installed. A PATH HIT, on the other hand, is real
+ * evidence, and the claim stays the weaker true one this file always makes:
+ * the command resolves, and nothing was launched.
+ *
+ * The two CANARY channels have no candidates at all, and that empty list is the
+ * sharpest version of the rule: Google and Microsoft publish no Linux canary, so
+ * an answer of `false` would make `resolveMatrixCell` emit
+ * "Install the chrome-canary browser" for a build that does not exist for this
+ * platform — advice that cannot be followed, which is the precise thing
+ * UNSUPPORTED_COMBINATION and NEEDS_BROWSER_GRID exist to keep out of the
+ * report. Whether a cell naming CANARY is servable at all is a question for a
+ * device farm, not for a `stat`, so this probe does not answer it.
+ *
+ * BUNDLED is empty for a different reason: it is Playwright's own build, not a
+ * browser on the host, and `resolveMatrixCell` skips the channel check entirely
+ * for it. A reading for BUNDLED would be a reading about nothing.
+ */
+const CHANNEL_PATH_CANDIDATES: Record<BrowserChannel, readonly string[]> = {
+  BUNDLED: [],
+  CHROME: ['google-chrome', 'google-chrome-stable'],
+  CHROME_BETA: ['google-chrome-beta'],
+  CHROME_DEV: ['google-chrome-unstable', 'google-chrome-dev'],
+  CHROME_CANARY: [],
+  MSEDGE: ['microsoft-edge', 'microsoft-edge-stable'],
+  MSEDGE_BETA: ['microsoft-edge-beta'],
+  MSEDGE_DEV: ['microsoft-edge-dev'],
+  MSEDGE_CANARY: [],
+};
+
+/*
+ * Process-lifetime cache, for the same reason `browserCache` above has one: the
+ * device registry is a frozen object inside an installed module and a 500-test
+ * suite must not import Playwright seventeen times to read it. Not
+ * invalidatable, like its two neighbours — the tests inject their own probe.
+ */
+const devicePresetCache = new Map<DevicePreset, boolean | null>();
+
+/**
+ * Is this device preset in Playwright's registry?
+ *
+ * A property lookup on the `devices` object, which is a plain data table in the
+ * installed module — no launch, no spawn, no path computation. A throw (no
+ * Playwright, a bundler that stubbed it, a version with no `devices` export)
+ * answers `null`: the one answer that neither refuses a cell nor vouches for it.
+ *
+ * `hasOwnProperty` rather than a truthiness check, because `devices` is an
+ * ordinary object and a prototype hit would answer `true` for a descriptor named
+ * `constructor` — a cell key is customer-supplied text in the general case, and
+ * a probe that answered AVAILABLE for `constructor` would be a capability
+ * invented out of a prototype chain.
+ */
+async function devicePresetKnownDefault(preset: DevicePreset): Promise<boolean | null> {
+  const cached = devicePresetCache.get(preset);
+  if (cached !== undefined) return cached;
+
+  let answer: boolean | null = null;
+  try {
+    const playwright = (await import('playwright')) as unknown as {
+      devices?: Record<string, unknown>;
+    };
+    const registry = playwright.devices;
+    if (registry && typeof registry === 'object') {
+      answer = Object.prototype.hasOwnProperty.call(registry, PLAYWRIGHT_DEVICE[preset]);
+    }
+  } catch {
+    answer = null;
+  }
+
+  devicePresetCache.set(preset, answer);
+  return answer;
+}
+
+/** The default channel probe: a PATH hit is `true`, and everything else is `null`. */
+function channelResolvesDefault(
+  channel: BrowserChannel,
+  onPath: (binary: string) => boolean | null,
+): boolean | null {
+  for (const candidate of CHANNEL_PATH_CANDIDATES[channel]) {
+    if (onPath(candidate) === true) return true;
+  }
+  return null;
+}
+
+/**
+ * Probe every axis member this build knows about, once.
+ *
+ * ── `versions` IS LEFT EMPTY, AND THAT IS THE HONEST SHAPE ──────────────────
+ *
+ * `DeploymentBrowsers.versions` exists and this probe writes nothing into it, so
+ * a cell that PINS a browser version resolves NOT_CHECKED with the reason
+ * "no version was read for chromium/BUNDLED" — which is true. Reading a browser
+ * version means EXECUTING a browser, which this module promises not to do, and
+ * the alternative was worse than a gap: a fabricated or mis-parsed reading would
+ * produce WRONG_VERSION against a browser that works, and WRONG_VERSION is a
+ * REFUSAL. Nobody has established a browser version floor in this repository
+ * either — the same empty-on-purpose default, for the same reason, as the
+ * version-free `TYPE_REQUIREMENTS` above. When somebody wants it, the adapter
+ * belongs beside `binaryVersion` in the worker, which already owns the one place
+ * allowed to spawn.
+ */
+export async function probeDeploymentBrowsers(
+  probes: BrowserCapabilityProbes = {},
+): Promise<BrowserCapabilityProbe> {
+  const readings: BrowserCapabilityReading[] = [];
+  const engines: Record<string, boolean> = {};
+  const channels: Record<string, boolean> = {};
+  const devicePresets: Record<string, boolean> = {};
+
+  for (const engine of BROWSER_ENGINE_LIST) {
+    const answer = await (probes.browserInstalled
+      ? probes.browserInstalled(engine)
+      : browserInstalledDefault(engine));
+    if (answer !== null) engines[engine] = answer;
+    readings.push({
+      axis: 'ENGINE',
+      name: engine,
+      installed: answer,
+      detail:
+        answer === null
+          ? `whether Playwright's ${engine} is downloaded could not be determined here, so it is not recorded either way`
+          : answer
+            ? `Playwright's ${engine} is on disk`
+            : `Playwright's ${engine} is not downloaded — run: ${PLAYWRIGHT_INSTALL}`,
+    });
+  }
+
+  const onPath = probes.onPath ?? onPathDefault;
+  for (const channel of BROWSER_CHANNEL_LIST) {
+    // BUNDLED is Playwright's own build, not a browser on the host. See
+    // CHANNEL_PATH_CANDIDATES.
+    if (CHANNEL_ENGINE[channel] === null) continue;
+    const answer = probes.channelResolves
+      ? probes.channelResolves(channel)
+      : channelResolvesDefault(channel, onPath);
+    if (answer !== null) channels[channel] = answer;
+    const launcher = PLAYWRIGHT_CHANNEL[channel] ?? channel;
+    readings.push({
+      axis: 'CHANNEL',
+      name: channel,
+      installed: answer,
+      detail:
+        answer === null
+          ? `the ${launcher} channel was not probed: Playwright resolves a channel by absolute per-platform paths, not through PATH, so a PATH miss is not evidence it is absent`
+          : answer
+            ? `a ${launcher} command resolves on PATH (not launched, so "it runs" is not claimed)`
+            : `the ${launcher} channel did not resolve on this host`,
+    });
+  }
+
+  for (const preset of DEVICE_PRESET_LIST) {
+    const answer = await (probes.devicePresetKnown
+      ? probes.devicePresetKnown(preset)
+      : devicePresetKnownDefault(preset));
+    if (answer !== null) devicePresets[preset] = answer;
+    readings.push({
+      axis: 'DEVICE_PRESET',
+      name: preset,
+      installed: answer,
+      detail:
+        answer === null
+          ? `Playwright's device registry could not be read here, so "${PLAYWRIGHT_DEVICE[preset]}" is not recorded either way`
+          : answer
+            ? `"${PLAYWRIGHT_DEVICE[preset]}" is in Playwright's device registry`
+            : `Playwright's device registry on this deployment has no descriptor named "${PLAYWRIGHT_DEVICE[preset]}"`,
+    });
+  }
+
+  const notProbed = readings.filter((reading) => reading.installed === null);
+  /*
+   * The three maps are accumulated as `Record<string, boolean>` because a key is
+   * only ever written from the shared vocabulary lists in the loops above. What
+   * a reader has to be able to trust is the SHAPE: only ANSWERED members are
+   * present, so an absent key means not probed — which is the contract
+   * `DeploymentBrowsers` documents and the reason its three maps are optional.
+   */
+  const browsers: DeploymentBrowsers = { engines, channels, devicePresets };
+
+  return {
+    readings,
+    browsers,
+    notProbed,
+    why:
+      `${readings.length - notProbed.length} of ${readings.length} browser-matrix axis members were ` +
+      `answered on this deployment; ${notProbed.length} could not be probed and are recorded as ` +
+      'ABSENT rather than as a yes or a no. No browser version was read, so a cell that pins one ' +
+      'resolves NOT_CHECKED — no browser was launched to ask.',
+  };
+}
+
+/**
+ * The cells this probe can actually answer for, one per axis member.
+ *
+ * ── EVERY QUESTION IN HERE IS COHERENT, BY CONSTRUCTION ─────────────────────
+ *
+ * Each channel is paired with the engine it is a build OF (`CHANNEL_ENGINE`),
+ * never with an arbitrary one, so no cell this function produces can resolve
+ * UNSUPPORTED_COMBINATION — "is there a Firefox beta installed" is a question
+ * with no meaningful answer and asking it would put a status in the report that
+ * says more about the question than about the deployment. No cell pins a
+ * version, so none resolves NEEDS_BROWSER_GRID either. Both statuses are
+ * properties of a CUSTOMER's declared cell, which is why
+ * {@link summariseBrowserMatrix} still handles them.
+ *
+ * BUNDLED gets no cell of its own: the bare `{ engine }` cells above already ARE
+ * the bundled build, and `resolveMatrixCell` treats an absent channel as BUNDLED.
+ */
+export function deploymentProbeCells(): readonly MatrixCell[] {
+  const cells: MatrixCell[] = BROWSER_ENGINE_LIST.map((engine) => ({ engine }));
+  for (const channel of BROWSER_CHANNEL_LIST) {
+    const engine = CHANNEL_ENGINE[channel];
+    if (engine === null) continue;
+    cells.push({ engine, channel });
+  }
+  for (const preset of DEVICE_PRESET_LIST) {
+    cells.push({ device: { kind: 'PRESET', preset } });
+  }
+  return cells;
+}
+
+/**
+ * Resolve a cell set against a collected capability.
+ *
+ * One line, and it exists so there is ONE place the product turns a stored
+ * capability into cell verdicts. `resolveMatrixCell` takes a defaulted `{}`
+ * second argument, which is the correct and dangerous default: a caller that
+ * forgets it gets NOT_CHECKED for everything and a report that looks fine.
+ * Requiring it here means a caller has to have the capability in hand.
+ */
+export function resolveDeploymentCells(
+  browsers: DeploymentBrowsers,
+  cells: readonly MatrixCell[] = deploymentProbeCells(),
+): readonly MatrixCellResolution[] {
+  return cells.map((cell) => resolveMatrixCell(cell, browsers));
+}
+
+/**
+ * What the resolved cells add up to, split by WHAT A READER CAN DO ABOUT IT.
+ *
+ * ── THE SPLIT IS THE POINT, AND IT IS NOT "PASS / FAIL" ─────────────────────
+ *
+ * Four buckets, because the six statuses answer to four different sentences:
+ *
+ *   available      — probed, and this image can run it.
+ *   installable    — MISSING or WRONG_VERSION: there is a command somebody can
+ *                    run on this machine, and the resolution carries it.
+ *   impossibleHere — UNSUPPORTED_COMBINATION or NEEDS_BROWSER_GRID: THERE IS NO
+ *                    INSTALL. No build of Firefox has a beta channel, and no
+ *                    amount of installing is ever going to be Safari. Printing
+ *                    an install line against one of these is advice that cannot
+ *                    be followed, and advice that cannot be followed is how a
+ *                    reader learns to ignore the whole report.
+ *   notChecked     — nobody asked. Not a verdict in either direction, and it
+ *                    STAYS IN the denominator: a cell dropped for want of a
+ *                    probe would raise a percentage nobody measured. That is the
+ *                    rule `UNEXERCISABLE_CELL_STATUSES` states, and this
+ *                    function holds no second opinion about it.
+ *
+ * The classification DELEGATES to `NOT_RUN_KIND_FOR_CELL` in ./matrix.ts rather
+ * than re-deciding: that `Record` is already the one place the product decides
+ * which statuses have a local remedy, a seventh status is a compile error there,
+ * and two copies would eventually disagree.
+ */
+export interface BrowserMatrixSummary {
+  readonly byStatus: Readonly<Record<MatrixCellStatus, number>>;
+  readonly available: readonly MatrixCellResolution[];
+  /** A remedy a human can carry out HERE. The resolution's own `remedy` says what. */
+  readonly installable: readonly MatrixCellResolution[];
+  /** No install fixes these. Never reported with an install line. */
+  readonly impossibleHere: readonly MatrixCellResolution[];
+  readonly notChecked: readonly MatrixCellResolution[];
+  /**
+   * HOW MANY CELLS THIS IMAGE WOULD REFUSE — and NULL, never 0, when nothing
+   * was probed.
+   *
+   * `installable + impossibleHere` is the number an operator alerts on, and
+   * apps/worker/src/index.ts logged exactly that sum as a field. It already
+   * logged `null` for the case where the capability store could not be reached,
+   * with the right reason attached: a zero there "would read as 'this image
+   * refuses nothing', which is the most flattering possible reading of a
+   * question nobody got to ask".
+   *
+   * THE REACHABLE-BUT-EMPTY CASE IS THE SAME QUESTION AND WAS GETTING 0.
+   * `resolveMatrixCell` answers NOT_CHECKED for every cell when the deployment
+   * reported nothing, so an empty capability table puts every cell in
+   * `notChecked` and leaves both refusal buckets at length 0 — and the sum is
+   * 0, indistinguishable from an image that was probed and refuses nothing.
+   * That is a zero nobody read, and it is the normal state of a deployment
+   * between the migration landing and the first sweep running.
+   *
+   * NULL ONLY WHEN NO CELL CARRIES A READING, which is the other half of the
+   * rule and the easier one to get wrong in the opposite direction. If five
+   * cells were probed and none of them is refusable, 0 IS a reading — of those
+   * five — and nulling it because the other fourteen are unprobed would discard
+   * a measurement somebody took. `notChecked` stays in the denominator either
+   * way, which is what makes a partial 0 readable: the two fields are only
+   * meaningful side by side, and that is why they are logged side by side.
+   */
+  readonly refusableCells: number | null;
+  /** One sentence for an operator, with the counts and the first few names. */
+  readonly sentence: string;
+}
+
+/** Bounded at three names plus a count — the shape `names()` in gates.ts uses. */
+function someNames(resolutions: readonly MatrixCellResolution[]): string {
+  const names = resolutions.map((resolution) => resolution.key);
+  return names.length > 3
+    ? `${names.slice(0, 3).join(', ')} …and ${names.length - 3} more`
+    : names.join(', ');
+}
+
+export function summariseBrowserMatrix(
+  resolutions: readonly MatrixCellResolution[],
+): BrowserMatrixSummary {
+  /*
+   * Seeded from `MATRIX_CELL_STATUS_LIST`, which is itself derived from a
+   * compiler-enforced presence record in @qaai/shared — so every status is a key
+   * here without this file keeping a parallel list that could go one member
+   * stale. A status with no entry would read as `undefined` in a report, which
+   * is the kind of blank a reader fills in as zero.
+   */
+  const byStatus = Object.fromEntries(
+    MATRIX_CELL_STATUS_LIST.map((status) => [status, 0]),
+  ) as Record<MatrixCellStatus, number>;
+
+  const available: MatrixCellResolution[] = [];
+  const installable: MatrixCellResolution[] = [];
+  const impossibleHere: MatrixCellResolution[] = [];
+  const notChecked: MatrixCellResolution[] = [];
+
+  for (const resolution of resolutions) {
+    byStatus[resolution.status] += 1;
+    const kind = NOT_RUN_KIND_FOR_CELL[resolution.status];
+    if (kind === null) {
+      // The two statuses that RUN. AVAILABLE is a measurement; NOT_CHECKED is an
+      // attempt made with no evidence behind it, and they may not be added up.
+      (resolution.status === 'NOT_CHECKED' ? notChecked : available).push(resolution);
+    } else if (kind === 'BLOCKED_BY_ENV') {
+      installable.push(resolution);
+    } else {
+      impossibleHere.push(resolution);
+    }
+  }
+
+  const parts = [
+    `${resolutions.length} browser/device cells were resolved against what this deployment reported: ` +
+      `${available.length} available, ${installable.length} fixable here, ` +
+      `${impossibleHere.length} that no install on this image can ever serve, ` +
+      `${notChecked.length} not probed.`,
+  ];
+  if (installable.length > 0) {
+    parts.push(
+      `Fixable here: ${someNames(installable)} — ${installable[0]!.remedy ?? 'see the cell detail'}.`,
+    );
+  }
+  if (impossibleHere.length > 0) {
+    /*
+     * The resolution's OWN remedy, verbatim, and never an install line: these
+     * are the cells whose answer is a hosted grid, a device farm, or a different
+     * cell. `resolveMatrixCell` already writes the right sentence for both
+     * statuses; repeating it in this file's words is how it would drift into an
+     * install.
+     */
+    parts.push(
+      `Not an install: ${someNames(impossibleHere)} — ${impossibleHere[0]!.remedy ?? 'see the cell detail'}.`,
+    );
+  }
+  if (notChecked.length > 0) {
+    parts.push(
+      `${notChecked.length} cell(s) were never probed: NOT_CHECKED is not a verdict about this ` +
+        'image in either direction, and those cells stay IN the denominator — a cell dropped for ' +
+        'want of a probe would raise a percentage nobody measured.',
+    );
+  }
+
+  /*
+   * A cell CARRIES A READING when something was concluded about it — available,
+   * fixable here, or impossible here. With none of those, every cell is
+   * NOT_CHECKED and the refusal count is a zero nobody took; see the field's
+   * own note on {@link BrowserMatrixSummary}.
+   */
+  const read = available.length + installable.length + impossibleHere.length;
+
+  return {
+    byStatus,
+    available,
+    installable,
+    impossibleHere,
+    notChecked,
+    refusableCells: read === 0 ? null : installable.length + impossibleHere.length,
+    sentence: parts.join(' '),
+  };
+}

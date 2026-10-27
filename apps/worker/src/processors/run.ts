@@ -79,16 +79,28 @@ import {
   parseNotRun,
   planMeasurements,
   testMetricSchema,
+  /*
+   * The variant validator, which now carries the per-cell evidence too.
+   *
+   * `testResultVariantCellSchema` existed, with both its pairings, and NOTHING
+   * CALLED IT — which is why `matrixCell`, `cellStatus`, `cellRemedy`,
+   * `notAsserted` and `notAssertedReason` were five NULLs for ever. It is
+   * reached from here still, but THROUGH this schema rather than beside it:
+   * `testResultVariantSchema.cell` references it, so one parse admits the
+   * evidence on BOTH ingest paths — this one and the on-prem agent's in
+   * apps/api/src/routes/runners.ts, which is built from the same validator and
+   * which silently dropped the field while this file read around it.
+   */
   testResultVariantSchema,
   variantKeyOf,
 } from '@qaai/shared';
 import type {
   GridIntegrationKind,
+  MeasuredVariant,
   MeasurementPlan,
   NotRunKind,
   RunShardRef,
   TestMetric,
-  TestResultVariant,
 } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
 import { open as openSecret } from '../vault.js';
@@ -3378,8 +3390,8 @@ function cellIdFor(ids: ReadonlyMap<string, string>, variantKey: string): string
  */
 function validateMeasurements(
   execution: TestExecution,
-): { ok: true; variants: TestResultVariant[]; metrics: TestMetric[] } | { ok: false; why: string } {
-  const variants: TestResultVariant[] = [];
+): { ok: true; variants: MeasuredVariant[]; metrics: TestMetric[] } | { ok: false; why: string } {
+  const variants: MeasuredVariant[] = [];
   for (const [index, variant] of (execution.variants ?? []).entries()) {
     const parsed = testResultVariantSchema.safeParse(variant);
     /*
@@ -3390,6 +3402,44 @@ function validateMeasurements(
     if (!parsed.success) {
       return { ok: false, why: `cell ${index} is not a valid variant: ${issuePathsOf(parsed)}` };
     }
+
+    /*
+     * ── THE PER-CELL EVIDENCE, OWNED BY THE SCHEMA AND NOT RE-READ HERE ────
+     *
+     * This branch used to read `variant.cell` off the raw object BEFORE the
+     * parse and validate it separately, and it had to:
+     * `testResultVariantSchema` is a plain `z.object` and not `.strict()`, so
+     * an unknown key is SILENTLY DROPPED. A plugin could report all five
+     * honesty columns and `parsed.data` would not carry them — five NULLs
+     * written with no refusal and no log line.
+     *
+     * The field is now ON that schema, so `parsed.data.cell` IS the validated
+     * evidence and the second read became unreachable: it parsed the same value
+     * against the same schema, so its refusal branch could only have fired if a
+     * schema disagreed with itself. A dead branch under a comment swearing it
+     * is the defence is worse than no branch, so it is gone.
+     *
+     * WHAT THE MOVE BUYS, which is the reason for it: the AGENT path.
+     * apps/api/src/routes/runners.ts builds its `executionSchema` from this
+     * same validator, and before the field existed an on-prem agent's reported
+     * cell was dropped on the floor there with nothing reading around it. One
+     * schema now admits it on both paths, which is the single property
+     * measurement-rows.ts exists to guarantee: a customer's honesty columns
+     * must not depend on which runner happened to run the test.
+     *
+     * The refusal is unchanged in every respect that matters. A malformed cell
+     * still costs the MEASUREMENTS and nothing else — the result, its steps and
+     * its findings persist, because a reporting problem must never cost a run
+     * its verdict — and it is still named by FIELD and never by content: the
+     * path is now `cell.notAssertedReason` rather than a second sentence, and a
+     * zod issue path is field names and array indices, which cannot carry a
+     * remedy sentence or an unasserted assertion into a log line.
+     *
+     * ABSENT IS NOT AVAILABLE. The field defaults to `null`, which means the
+     * producer made no claim about this cell's runnability or its holes — the
+     * fifth state every one of the five columns spells NULL — and the row is
+     * still written, so the cell stays in the denominator.
+     */
     variants.push(parsed.data);
   }
 
@@ -3616,6 +3666,14 @@ async function persistExecution(args: {
     const inserted =
       cells.length > 0
         ? await tx.testResultVariant.createManyAndReturn({
+            /*
+             * The planned rows, every column included and none of them
+             * rewritten here — the five honesty ones among them. `matrixCell`
+             * is `undefined` rather than null on a cell nobody reported
+             * evidence for, which on an INSERT is the column's default and so
+             * is SQL NULL; `VariantRow`'s own note has the whole argument and
+             * the warning for anybody who makes this an upsert.
+             */
             data: cells,
             select: {
               id: true,

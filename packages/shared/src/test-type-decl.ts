@@ -583,15 +583,27 @@ export const TEST_TYPE_DECLARATIONS: Readonly<Record<TestType, TestTypeDeclarati
        * `visualTestSpecSchema` now carries `matrix`, `states` and
        * `environment`, and `runVisualMatrix` / `planVisualCaptures` /
        * `recordCapture` in packages/runner/src/matrix.ts implement all three.
-       * `plugins/visual.ts` calls NONE of them: it reads `spec.viewport`, and
-       * writes its baseline under a hard-coded `browser: 'chromium'`. An empty
-       * `knownUnasserted` beside that is the worst available combination — a
-       * stored 12-cell matrix would be accepted, one cell would be captured,
-       * and the row would be green.
+       * An empty `knownUnasserted` beside that is the worst available
+       * combination — a stored 12-cell matrix would be accepted, one cell would
+       * be captured, and the row would be green.
+       *
+       * REWORDED, because the half of it that named CAUSES went out of date the
+       * moment the plugin was wired. `plugins/visual.ts` now DOES call
+       * `planVisualCaptures` and `recordCapture`, and its baseline key comes
+       * from `baselineViewportKey`/`variantBrowserKey` rather than a hard-coded
+       * `'chromium'`. The HOLE is unchanged and is now stated as a hole rather
+       * than as a list of uncalled functions: one captured pair, because
+       * `RunContext.visualBaseline` holds ONE image and
+       * `TestExecution.newBaseline` is ONE row, so there is nowhere a second
+       * cell's reference could be fetched from or approved into.
+       *
+       * A `knownUnasserted` entry whose stated cause is false is worse than a
+       * vague one: a reader checks the cause, finds it wrong, and discounts the
+       * entry — which is how a real hole gets closed on paper.
        */
       {
         assertion:
-          'any cell of a declared matrix other than the first — plugins/visual.ts reads spec.viewport and writes browser: \'chromium\', and calls none of runVisualMatrix, planVisualCaptures or recordCapture',
+          'any cell of a declared matrix other than the floor cell in DEFAULT — plugins/visual.ts captures ONE (cell, state) pair, because RunContext.visualBaseline holds one image and TestExecution.newBaseline is one row; every other declared pair is reported with its reason rather than captured',
         reason: 'NOT_IMPLEMENTED',
       },
       {

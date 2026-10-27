@@ -23,7 +23,11 @@
  * already survived a whole slice behind one in this repository.
  */
 
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { probeDeploymentBrowsers } from '@qaai/runner';
 import { TEST_TYPES } from '@qaai/shared';
 import type { TestType } from '@qaai/shared';
 import { DeploymentCapabilityStatus } from '../../../api/src/generated/prisma/enums.js';
@@ -57,9 +61,13 @@ vi.mock('../context.js', () => {
 });
 
 const {
+  BROWSER_CAPABILITY_ROW_BUDGET,
   CAPABILITY_FRESH_MS,
   CAPABILITY_STATUS_KINDS,
   capabilityFacts,
+  declaredTypeRunnability,
+  deploymentBrowserCapabilities,
+  probeDeploymentBrowserCapability,
   SELF_DEPLOYMENT_KEY,
   capabilityExecutable,
   capabilityRowFor,
@@ -796,5 +804,509 @@ describe('handing the capability set to the coverage denominator', () => {
     expect(facts.every((f) => f.status === 'NOT_CHECKED')).toBe(true);
     expect(facts[0]!.detail).toContain('stays in the coverage denominator');
     expect(facts.every((f) => capabilityExecutable(f.status))).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The browser capability — the half `resolveMatrixCell` had nothing to resolve
+// against.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/*
+ * The trap here is the mirror image of the one above, and it is worth naming
+ * because the two pull in opposite directions:
+ *
+ *   · For the TYPE rows, the dangerous read of an empty table is "all nineteen
+ *     are executable" — a pass meaning "we did not check".
+ *   · For the BROWSER rows, the dangerous read of an empty table is "no engine
+ *     is installed" — a refusal of the whole matrix on a perfectly healthy
+ *     image, with an install line attached.
+ *
+ * Both are the same defect: a missing measurement rendered as a measurement. So
+ * these tests assert the ABSENCE of a key, not a status three layers up, and
+ * they assert that a row which can no longer be answered for is REMOVED rather
+ * than left vouching for a browser nobody can see any more.
+ */
+
+interface BrowserRow {
+  deploymentKey: string;
+  orgId: string | null;
+  axis: string;
+  name: string;
+  installed: boolean;
+  detail: string;
+  checkedAt: Date;
+}
+
+function browserRow(over: Partial<BrowserRow> = {}): BrowserRow {
+  return {
+    deploymentKey: SELF_DEPLOYMENT_KEY,
+    orgId: null,
+    axis: 'ENGINE',
+    name: 'chromium',
+    installed: true,
+    detail: "Playwright's chromium is on disk",
+    checkedAt: new Date('2026-10-26T12:00:00.000Z'),
+    ...over,
+  };
+}
+
+/**
+ * The browser store, which HONOURS `select`, `orderBy` and `take`.
+ *
+ * `select` for the reason the store above gives: a select-blind fake makes
+ * deleting `checkedAt: true` from the reader's query undetectable, and
+ * `checkedAt` is the field that makes a stale reading visible as stale. `take`
+ * because the reader's budget is a real behaviour — a fake that ignored it would
+ * let the truncation branch rot — and `orderBy` because a budget without an
+ * order is a capability assembled out of whatever sorted first.
+ */
+function browserStore(initial: BrowserRow[] = []) {
+  const rows = [...initial];
+  const selects: Array<Record<string, boolean>> = [];
+  const upserts: Array<{ axis: string; name: string; installed: boolean }> = [];
+  const deletes: Array<{ axis: string; name: string }> = [];
+
+  return {
+    rows,
+    selects,
+    upserts,
+    deletes,
+    delegate: {
+      findMany: async (args: {
+        where?: { deploymentKey?: string };
+        select?: Record<string, boolean>;
+        orderBy?: unknown;
+        take?: number;
+      }) => {
+        if (args.select) selects.push(args.select);
+        let matched = rows.filter(
+          (r) => !args.where?.deploymentKey || r.deploymentKey === args.where.deploymentKey,
+        );
+        matched = [...matched].sort(
+          (a, b) => a.axis.localeCompare(b.axis) || a.name.localeCompare(b.name),
+        );
+        if (args.take !== undefined) matched = matched.slice(0, args.take);
+        if (!args.select) return matched.map((r) => ({ ...r }));
+        return matched.map((r) => {
+          const projected: Record<string, unknown> = {};
+          for (const [field, wanted] of Object.entries(args.select!)) {
+            if (wanted) projected[field] = (r as unknown as Record<string, unknown>)[field];
+          }
+          return projected;
+        });
+      },
+      upsert: async (args: {
+        where: { deploymentKey_axis_name: { deploymentKey: string; axis: string; name: string } };
+        create: Partial<BrowserRow>;
+        update: Partial<BrowserRow>;
+      }) => {
+        const key = args.where.deploymentKey_axis_name;
+        upserts.push({ axis: key.axis, name: key.name, installed: args.create.installed === true });
+        const existing = rows.find(
+          (r) =>
+            r.deploymentKey === key.deploymentKey && r.axis === key.axis && r.name === key.name,
+        );
+        if (existing) Object.assign(existing, args.update);
+        else rows.push(browserRow(args.create));
+        return existing ?? rows[rows.length - 1]!;
+      },
+      deleteMany: async (args: {
+        where: { deploymentKey?: string; OR?: Array<{ axis: string; name: string }> };
+      }) => {
+        const wanted = args.where.OR ?? [];
+        const doomed = rows.filter(
+          (r) =>
+            (!args.where.deploymentKey || r.deploymentKey === args.where.deploymentKey) &&
+            wanted.some((w) => w.axis === r.axis && w.name === r.name),
+        );
+        for (const row of doomed) {
+          deletes.push({ axis: row.axis, name: row.name });
+          rows.splice(rows.indexOf(row), 1);
+        }
+        return { count: doomed.length };
+      },
+    },
+  };
+}
+
+/** Engines answered, channels and devices unanswerable. The common shape. */
+const enginesOnly = {
+  ...everything,
+  channelResolves: () => null,
+  devicePresetKnown: () => null,
+};
+
+describe('writing what this deployment has to launch with', () => {
+  it('writes a row only for a member the probe actually answered for', async () => {
+    const db = browserStore();
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const result = await probeDeploymentBrowserCapability({ io, probes: enginesOnly });
+
+    expect(result.written.map((r) => `${r.axis}/${r.name}`).sort()).toEqual([
+      'ENGINE/chromium',
+      'ENGINE/firefox',
+      'ENGINE/webkit',
+    ]);
+    // Not a row saying `installed: false` for every channel and preset, which
+    // would refuse the whole matrix on an image that has the browsers.
+    expect(db.rows.every((r) => r.axis === 'ENGINE')).toBe(true);
+    expect(result.notProbed.length).toBeGreaterThan(0);
+  });
+
+  it('removes a stored reading the moment nothing can answer for it any more', async () => {
+    /*
+     * THE ANTI-STALENESS HALF, and it only works by deleting. A retained
+     * `installed = true` for a browser that has since been removed from the
+     * image would keep vouching for it for ever, because the probe that used to
+     * answer no longer writes anything at all for that member. Leaving it is
+     * exactly the cached AVAILABLE this whole file argues against.
+     */
+    const db = browserStore([browserRow({ axis: 'ENGINE', name: 'webkit', installed: true })]);
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const result = await probeDeploymentBrowserCapability({
+      io,
+      probes: { ...enginesOnly, browserInstalled: (engine) => (engine === 'webkit' ? null : true) },
+    });
+
+    expect(result.cleared).toBe(1);
+    expect(db.deletes).toEqual(expect.arrayContaining([{ axis: 'ENGINE', name: 'webkit' }]));
+    expect(db.rows.find((r) => r.name === 'webkit')).toBeUndefined();
+  });
+
+  it('writes the reading it took, with the time it took it', async () => {
+    const db = browserStore();
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    await probeDeploymentBrowserCapability({
+      io,
+      probes: { ...enginesOnly, browserInstalled: (engine) => engine === 'chromium' },
+    });
+
+    const chromium = db.rows.find((r) => r.name === 'chromium');
+    const firefox = db.rows.find((r) => r.name === 'firefox');
+    expect(chromium?.installed).toBe(true);
+    expect(chromium?.checkedAt).toEqual(NOW);
+    // A real `false` IS written: "Playwright's firefox is not downloaded" is a
+    // measurement, and its remedy is an install that works.
+    expect(firefox?.installed).toBe(false);
+    expect(firefox?.detail).toContain('not downloaded');
+  });
+});
+
+describe('reading the browser capability back', () => {
+  it('treats an empty table as nobody having probed, not as an image with no browsers', async () => {
+    const db = browserStore();
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const set = await deploymentBrowserCapabilities();
+
+    expect(set.measuredAt).toBeNull();
+    expect(set.browsers.engines).toEqual({});
+    // The dangerous implementation refuses the whole matrix here, with an
+    // install line attached to every cell.
+    expect(set.summary.installable).toEqual([]);
+    expect(set.summary.impossibleHere).toEqual([]);
+    expect(set.summary.notChecked.length).toBe(set.cells.length);
+    expect(set.sentence).toContain('No engine, channel or device preset has been probed');
+    expect(set.sentence).toContain('stay IN the denominator');
+  });
+
+  it('rebuilds the exact shape resolveMatrixCell consumes', async () => {
+    const db = browserStore([
+      browserRow({ axis: 'ENGINE', name: 'chromium', installed: true }),
+      browserRow({ axis: 'ENGINE', name: 'webkit', installed: false }),
+      browserRow({ axis: 'CHANNEL', name: 'CHROME', installed: true }),
+      browserRow({ axis: 'DEVICE_PRESET', name: 'IPHONE_14', installed: true }),
+    ]);
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const set = await deploymentBrowserCapabilities();
+
+    expect(set.browsers).toEqual({
+      engines: { chromium: true, webkit: false },
+      channels: { CHROME: true },
+      devicePresets: { IPHONE_14: true },
+    });
+    const statusOf = (
+      predicate: (cell: (typeof set.cells)[number]['cell']) => boolean,
+    ): string | undefined => set.cells.find((resolution) => predicate(resolution.cell))?.status;
+    const bare = (engine: string) => (cell: (typeof set.cells)[number]['cell']) =>
+      cell.engine === engine && cell.channel === undefined && cell.device === undefined;
+
+    expect(statusOf(bare('chromium'))).toBe('AVAILABLE');
+    expect(statusOf(bare('webkit'))).toBe('MISSING');
+    expect(statusOf((cell) => cell.channel === 'CHROME')).toBe('AVAILABLE');
+    // Never probed, so never a verdict — not MISSING, which would refuse it.
+    expect(statusOf(bare('firefox'))).toBe('NOT_CHECKED');
+    expect(set.summary.byStatus.MISSING).toBe(1);
+  });
+
+  it('asks for the fields it reads, so deleting one from the query is detectable', async () => {
+    const db = browserStore([browserRow()]);
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    await deploymentBrowserCapabilities();
+
+    // `checkedAt` especially: without it `measuredAt` is silently null and a
+    // stale reading becomes indistinguishable from a fresh one.
+    expect(db.selects[0]).toEqual({
+      axis: true,
+      name: true,
+      installed: true,
+      detail: true,
+      checkedAt: true,
+    });
+  });
+
+  it('reports the oldest reading, so freshness cannot be read off the newest row', async () => {
+    const old = new Date('2026-10-20T00:00:00.000Z');
+    const db = browserStore([
+      browserRow({ name: 'chromium', checkedAt: new Date('2026-10-26T00:00:00.000Z') }),
+      browserRow({ name: 'firefox', checkedAt: old }),
+    ]);
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    expect((await deploymentBrowserCapabilities()).measuredAt).toEqual(old);
+  });
+
+  it('rejects a stored reading this build cannot interpret rather than coercing it', async () => {
+    /*
+     * `axis` and `name` are TEXT, so a newer build — or a renamed device preset
+     * — can leave a row no vocabulary here contains. Coercing it would put a
+     * reading under a key that means something else; dropping it in silence
+     * would make the capability look complete while one of its members was
+     * quietly unprobed.
+     */
+    const db = browserStore([
+      browserRow({ axis: 'ENGINES', name: 'chromium' }),
+      browserRow({ axis: 'ENGINE', name: 'netscape' }),
+      browserRow({ axis: 'ENGINE', name: 'chromium' }),
+    ]);
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const set = await deploymentBrowserCapabilities();
+
+    expect(set.rejected).toHaveLength(2);
+    expect(set.browsers.engines).toEqual({ chromium: true });
+    expect(set.sentence).toContain('REJECTED rather than interpreted');
+    expect(set.sentence).toContain('read as NOT PROBED');
+  });
+
+  it('says the read budget bit instead of assembling a capability out of a prefix', async () => {
+    const db = browserStore(
+      Array.from({ length: BROWSER_CAPABILITY_ROW_BUDGET + 1 }, (_unused, i) =>
+        browserRow({ axis: 'ENGINE', name: `pad-${String(i).padStart(4, '0')}` }),
+      ),
+    );
+    h.prisma = { deploymentBrowserCapability: db.delegate };
+
+    const set = await deploymentBrowserCapabilities();
+
+    expect(set.truncated).toBe(true);
+    expect(set.sentence).toContain('INCOMPLETE');
+    expect(set.sentence).toContain('rather than as absent');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The declaration bridge: the eleven types the prober's own table cannot hold.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('probing the types the requirement table cannot hold', () => {
+  it('answers for the pending types whose plugins shipped', async () => {
+    /*
+     * Before this, `TYPE_REQUIREMENTS` being a `Record` over the nineteen minted
+     * types meant `checkRunnability` could not be ASKED about CHAOS, DOCUMENT,
+     * PWA or PUSH — not "unknown", not "pending": the call did not typecheck,
+     * while each of those had a registered plugin.
+     */
+    const declared = await declaredTypeRunnability({ probes: everything });
+
+    const names = declared.answered.map((entry) => entry.type);
+    expect(names).toEqual(expect.arrayContaining(['CHAOS', 'DOCUMENT', 'PWA', 'PUSH']));
+    for (const entry of declared.answered) expect(entry.reason.length).toBeGreaterThan(0);
+  });
+
+  it('asks about the minted nineteen nowhere, because the other half owns them', async () => {
+    // Two answers to one question is how one of them starts being wrong, and the
+    // wrong one is whichever the reader is not looking at. `requirementParity`
+    // is the guard that the two tables agree about the nineteen.
+    const declared = await declaredTypeRunnability({ probes: everything });
+    for (const minted of TEST_TYPES) {
+      expect(declared.answered.map((entry) => entry.type)).not.toContain(minted);
+    }
+  });
+
+  it('refuses a registered plugin with no declaration, and says what is missing', async () => {
+    const declared = await declaredTypeRunnability({ probes: everything });
+
+    const email = declared.refused.find((entry) => entry.type === 'EMAIL');
+    expect(email).toBeDefined();
+    // UNKNOWN rather than nothing: API and SECURITY_SMOKE genuinely need
+    // nothing, and reporting the two the same way would hide a real gap.
+    expect(email?.why).toContain('PENDING_TEST_TYPES');
+  });
+
+  it('stores nothing for a pending type, and says that in the sentence', async () => {
+    const declared = await declaredTypeRunnability({ probes: everything });
+
+    expect(declared.sentence).toContain('No row is stored');
+    expect(declared.sentence).toContain('in a coverage denominator');
+  });
+
+  it('discloses a demoted channel and points at the thing that does answer for it', async () => {
+    /*
+     * `asProbeRequirement` demotes a declared CHANNEL requirement to UNPROBED
+     * because this prober asks Playwright which ENGINES are installed. The
+     * demotion is only honest if the thing it points at can answer — so every
+     * demoted channel must be a member the browser capability probe asks about.
+     * A channel demoted to a prober that does not cover it is a disclosure
+     * pointing at nobody.
+     */
+    const declared = await declaredTypeRunnability({ probes: everything });
+    const probe = await probeDeploymentBrowsers(enginesOnly);
+    const asked = new Set(
+      probe.readings.filter((r) => r.axis === 'CHANNEL').map((reading) => reading.name),
+    );
+
+    expect(declared.demotedChannels.length).toBeGreaterThan(0);
+    for (const entry of declared.demotedChannels) {
+      expect(entry.channels.length).toBeGreaterThan(0);
+      for (const channel of entry.channels) expect(asked.has(channel)).toBe(true);
+    }
+    expect(declared.sentence).toContain('declare a browser CHANNEL this prober cannot see');
+  });
+
+  it('never writes a type the TestType column cannot hold', async () => {
+    const db = store();
+    h.prisma = { deploymentCapability: db.delegate };
+
+    await probeDeploymentCapabilities({ io, probes: everything });
+
+    // The enum holds the nineteen. A pending type has no value to be stored
+    // under, by design, and inventing one is the first step toward counting a
+    // test nobody can create.
+    const written = db.upserts.map((u) => u.create.testType as TestType);
+    expect(written.length).toBe(TEST_TYPES.length);
+    for (const testType of written) expect(TEST_TYPES).toContain(testType);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The one line an operator reads.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the sentence the preflight job logs', () => {
+  it('carries all three facts, because its one caller logs one string', async () => {
+    const types = store();
+    const browsers = browserStore();
+    h.prisma = {
+      deploymentCapability: types.delegate,
+      deploymentBrowserCapability: browsers.delegate,
+    };
+
+    const result = await ensureDeploymentCapabilities({ io, probes: enginesOnly });
+
+    expect(result.browsers).not.toBeNull();
+    expect(result.capabilities.sentence).toContain('test types');
+    expect(result.capabilities.sentence).toContain('browser/device cells');
+    expect(result.capabilities.sentence).toContain('declared-but-unminted test type');
+    expect(result.declared.answered.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the nineteen type rows when the browser store cannot be reached', async () => {
+    /*
+     * The table arrives in a migration this round WRITES and does not APPLY, so
+     * a worker on this build against a database where `prisma migrate deploy`
+     * has not run throws on the first browser upsert. Losing the type rows over
+     * that would be far worse than not having the browser capability — and the
+     * report must say NOT MEASURED rather than anything about the image.
+     */
+    const types = store();
+    h.prisma = { deploymentCapability: types.delegate };
+
+    const result = await ensureDeploymentCapabilities({ io, probes: enginesOnly });
+
+    expect(result.probe.rows.length).toBe(TEST_TYPES.length);
+    expect(result.browsers).toBeNull();
+    expect(result.capabilities.sentence).toContain('NOT MEASURED');
+    expect(h.log.some((entry) => entry.level === 'error')).toBe(true);
+    // The database's own error text never reaches a string that is rendered into
+    // a coverage report or a PR comment.
+    expect(result.capabilities.sentence).not.toContain('deploymentBrowserCapability');
+  });
+
+  it('warns when the two requirement tables disagree about a minted type', async () => {
+    const types = store();
+    const browsers = browserStore();
+    h.prisma = {
+      deploymentCapability: types.delegate,
+      deploymentBrowserCapability: browsers.delegate,
+    };
+
+    await probeDeploymentCapabilities({
+      io,
+      probes: everything,
+      parity: () => [{ type: 'LOAD', only: ['preflight:BINARY:k6'] }],
+    });
+
+    const warned = h.log.find((entry) => entry.level === 'warn');
+    expect(warned?.msg).toContain('disagree');
+    // A capability row computed from one of two answers is exactly the state
+    // where the wrong one is whichever the reader is not looking at.
+    expect(JSON.stringify(warned?.obj)).toContain('LOAD');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The migration.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('the migration that adds the browser capability table', () => {
+  /*
+   * ── ASSERTED AGAINST A PREDECESSOR PINNED BY NAME, NEVER BY POSITION ──────
+   *
+   * A test that reads the migrations folder and expects its own to sort LAST
+   * goes red the moment the next round lands one, and a red check with no
+   * available remedy is a check people start skipping.
+   */
+  const MIGRATIONS = fileURLToPath(new URL('../../../api/prisma/migrations', import.meta.url));
+  const PREDECESSOR = '20261027090000_browser_matrix_cells_and_unasserted_honesty';
+  const MINE = '20261027120000_deployment_browser_capability';
+
+  it('sorts after the migration that added the cells it resolves', () => {
+    const dirs = readdirSync(MIGRATIONS).filter((name) => /^\d{14}_/.test(name));
+    expect(dirs).toContain(PREDECESSOR);
+    expect(dirs).toContain(MINE);
+    // Prisma applies in lexicographic order, and this table is useless before
+    // the MatrixCellStatus enum and the cell columns exist.
+    expect(MINE > PREDECESSOR).toBe(true);
+  });
+
+  it('shares its timestamp with no other migration', () => {
+    // Two directories on one timestamp is an ordering nobody controls: which
+    // applies first depends on the rest of the name.
+    const stamps = readdirSync(MIGRATIONS)
+      .filter((name) => /^\d{14}_/.test(name))
+      .map((name) => name.slice(0, 14));
+    expect(new Set(stamps).size).toBe(stamps.length);
+  });
+
+  it('creates the table with the columns that make absence mean "not probed"', () => {
+    const sql = readFileSync(join(MIGRATIONS, MINE, 'migration.sql'), 'utf8');
+    expect(sql).toContain('CREATE TABLE "DeploymentBrowserCapability"');
+    // Both NOT NULL: a row exists only when the probe answered, so there is no
+    // third state in either column — the missing row is the third state.
+    expect(sql).toContain('"installed" BOOLEAN NOT NULL');
+    expect(sql).toContain('"checkedAt" TIMESTAMP(3) NOT NULL');
+    expect(sql).toContain(
+      'CREATE UNIQUE INDEX "DeploymentBrowserCapability_deploymentKey_axis_name_key"',
+    );
+    // No new enum: a Prisma value with no TypeScript twin fails `check:enums`,
+    // and the twin lives in a file this slice does not own.
+    expect(sql).not.toContain('CREATE TYPE');
   });
 });

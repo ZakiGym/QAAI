@@ -389,7 +389,14 @@ export interface ComputedCoverage {
  * disclosed, rather than being partially honoured: half a policy is a
  * denominator the customer did not configure.
  */
-async function loadTypeObligationPolicy(
+/*
+ * EXPORTED so there is ONE reader of `Project.typeObligationPolicy` in this
+ * app. `GET/PUT /coverage/:projectId/obligations` adjudicates that column and
+ * needs exactly this function's two-field answer — a second copy in the route
+ * would be a second opinion about what an unparseable policy means, and the
+ * whole correctness of that endpoint is that `unreadable` is NOT `null`.
+ */
+export async function loadTypeObligationPolicy(
   projectId: string,
 ): Promise<{ policy: TypeObligationPolicy | null; unreadable: boolean }> {
   const row = await prisma.project.findUnique({

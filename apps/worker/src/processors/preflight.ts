@@ -59,10 +59,38 @@
  *    reaches it — not truncated, not hashed, not down an error path.
  */
 
-import { ALL_TEST_TYPES, checkRunnability } from '@qaai/runner';
-import type { RunnabilityProbes, TypeRunnability } from '@qaai/runner';
-import { SELF_DEPLOYMENT, TEST_TYPES, capabilityCounts } from '@qaai/shared';
-import type { TestType } from '@qaai/shared';
+import {
+  ALL_TEST_TYPES,
+  CHANNEL_REQUIREMENTS_DEMOTED,
+  checkRunnability,
+  declaredRequirements,
+  declaredRunnability,
+  isBrowserCapabilityAxis,
+  probeDeploymentBrowsers,
+  requirementParity,
+  resolveDeploymentCells,
+  summariseBrowserMatrix,
+  undeclaredPluginTypes,
+} from '@qaai/runner';
+import type {
+  BrowserCapabilityAxis,
+  BrowserCapabilityProbes,
+  BrowserCapabilityReading,
+  BrowserMatrixSummary,
+  RunnabilityProbes,
+  TypeRunnability,
+} from '@qaai/runner';
+import {
+  BROWSER_CHANNEL_LIST,
+  BROWSER_ENGINE_LIST,
+  DEVICE_PRESET_LIST,
+  PENDING_TEST_TYPES,
+  SELF_DEPLOYMENT,
+  TEST_TYPES,
+  capabilityCounts,
+  isTestType,
+} from '@qaai/shared';
+import type { DeploymentBrowsers, MatrixCellResolution, TestType } from '@qaai/shared';
 import { DeploymentCapabilityStatus } from '../../../api/src/generated/prisma/enums.js';
 import { logger, prisma } from '../context.js';
 
@@ -352,10 +380,33 @@ export interface ProbeCapabilitiesArgs {
   /** Null for the cloud image, which belongs to no org. A runner pool belongs to one. */
   orgId?: string | null;
   io?: CapabilityIo;
-  probes?: RunnabilityProbes;
+  /*
+   * The probes for BOTH halves of the preflight: the tool/engine lookups
+   * `checkRunnability` makes and the channel and device-registry lookups the
+   * browser capability makes. One object rather than two, because
+   * `BrowserCapabilityProbes` extends `RunnabilityProbes` precisely so an
+   * injected engine answer cannot differ between the two halves — a deployment
+   * reporting chromium present to one probe and absent to the other is a pair of
+   * stored rows that contradict each other.
+   */
+  probes?: BrowserCapabilityProbes;
   /** Bypass the freshness window. The run processor never passes this; an operator can. */
   force?: boolean;
   freshMs?: number;
+  /**
+   * Where the two requirement tables disagree, injected so both branches can be
+   * driven.
+   *
+   * Defaults to `requirementParity` from the registry's declaration bridge,
+   * which compares `TYPE_REQUIREMENTS` (what this probe reads) against
+   * `TEST_TYPE_DECLARATIONS` (what the keystone says a type needs) and is empty
+   * today. It is consulted HERE, at the moment the rows are written, because a
+   * disagreement means the stored capability for that type was computed from one
+   * of two tables and the other one says something else — and whichever is wrong
+   * is the one the reader is not looking at. A test asserts the list is empty; an
+   * operator needs to be told the day it is not.
+   */
+  parity?: () => Array<{ type: TestType; only: string[] }>;
 }
 
 export interface ProbeCapabilitiesResult {
@@ -474,6 +525,27 @@ export async function probeDeploymentCapabilities(
     { deploymentKey, probed: rows.length, nonExecutable: counts },
     'deployment capabilities probed',
   );
+
+  /*
+   * The rows above were computed from `TYPE_REQUIREMENTS`. If the declaration
+   * says something different for the same type, one of the two is wrong and this
+   * deployment now holds a stored verdict derived from the one nobody is reading.
+   * Bounded at three names plus a count, the shape `names()` in gates.ts uses: a
+   * warning nobody can read is not a warning.
+   */
+  const disagreements = (args.parity ?? requirementParity)();
+  if (disagreements.length > 0) {
+    const named = disagreements.slice(0, 3).map((entry) => `${entry.type} (${entry.only.join(', ')})`);
+    logger.warn(
+      {
+        deploymentKey,
+        types: disagreements.length,
+        disagreements: named,
+      },
+      'the prober’s requirement table and the type declarations disagree, so these capability rows ' +
+        'were written from one of two answers',
+    );
+  }
 
   return {
     deploymentKey,
@@ -731,18 +803,492 @@ export function capabilityFacts(
   });
 }
 
+// ─── The browser capability: the second thing nothing collected ─────────────
+
 /**
- * The two calls a caller makes together: probe if stale, then read the set back.
+ * ── WHY THIS IS A SECOND TABLE AND NOT A COLUMN ─────────────────────────────
+ *
+ * `DeploymentCapability` answers "can this image run a VISUAL test at all".
+ * This answers "can it run that test in Chrome Beta, on an iPhone 14, pinned to
+ * a released Safari version" — the axes of `resolveMatrixCell`, which is a
+ * different grain and a different vocabulary. Nothing collected it: every
+ * `resolveMatrixCell` call in the product resolved against an empty
+ * `DeploymentBrowsers`, so NOT_CHECKED was not merely the usual answer — it was
+ * the only answer six statuses could ever produce.
+ *
+ * ── A ROW EXISTS ONLY WHEN THE PROBE ANSWERED ───────────────────────────────
+ *
+ * The opposite arrangement from the type rows above, and deliberately so. There,
+ * all nineteen types get a row every pass, NOT_CHECKED included, because the
+ * denominator must always be complete. Here the missing row IS the NOT_CHECKED:
+ * `DeploymentBrowsers` documents "EVERY FIELD IS OPTIONAL AND ABSENT MEANS NOT
+ * PROBED", and most of the 27 axis members are genuinely unanswerable on a given
+ * host — Playwright resolves a browser channel by absolute per-platform paths, so
+ * a PATH miss is not evidence of absence. Writing `installed = false` for those
+ * would REFUSE a cell on a machine that has the browser.
+ *
+ * ── AND A READING THAT STOPPED BEING ANSWERABLE IS DELETED ──────────────────
+ *
+ * Not left to rot. A retained `installed = true` for a browser that has since
+ * been removed from the image is exactly the stale AVAILABLE this whole file
+ * argues against, and here it would survive indefinitely because the probe that
+ * used to answer no longer writes anything. So an unanswered member's row is
+ * removed in the same pass, which turns it back into the honest NOT_CHECKED.
+ *
+ * ── NO FRESHNESS CACHE, ON PURPOSE ──────────────────────────────────────────
+ *
+ * The type probe has one because it may spawn a `--version` per binary. This
+ * probe is an `existsSync` per engine, a `stat` per PATH entry per channel, and
+ * one property lookup per device preset in a module that is already imported —
+ * cheaper than the cache check it would be skipping. A cache is this feature's
+ * documented failure mode, so the half that does not need one does not get one.
+ */
+
+/** How many rows one deployment's capability read will look at. */
+export const BROWSER_CAPABILITY_ROW_BUDGET = 256;
+
+/** The vocabulary each axis's `name` must belong to, on the way in and out. */
+const AXIS_VOCABULARY: Record<BrowserCapabilityAxis, readonly string[]> = {
+  ENGINE: BROWSER_ENGINE_LIST,
+  CHANNEL: BROWSER_CHANNEL_LIST,
+  DEVICE_PRESET: DEVICE_PRESET_LIST,
+};
+
+export interface BrowserProbeResult {
+  deploymentKey: string;
+  /** The answered readings, each of which was written. */
+  written: readonly BrowserCapabilityReading[];
+  /** Readings that came back `null`: no row, and any previous row removed. */
+  notProbed: readonly BrowserCapabilityReading[];
+  /** How many stale rows were removed because nothing can answer for them now. */
+  cleared: number;
+  checkedAt: Date;
+  why: string;
+}
+
+/**
+ * Probe the browser axes and write a row per ANSWERED member.
+ *
+ * No `$transaction`, for the same reason the type rows have none: every row
+ * carries its own `checkedAt`, a partial write is a readable picture rather than
+ * a corrupt one, and wrapping them would put the delegate on a transaction
+ * client — a different and easily mis-faked shape.
+ */
+export async function probeDeploymentBrowserCapability(
+  args: ProbeCapabilitiesArgs = {},
+): Promise<BrowserProbeResult> {
+  const deploymentKey = args.deploymentKey ?? SELF_DEPLOYMENT_KEY;
+  const io = args.io ?? defaultCapabilityIo();
+  const checkedAt = io.now();
+
+  const probe = await probeDeploymentBrowsers(args.probes ?? {});
+
+  for (const reading of probe.readings) {
+    // `null` is not a reading. It is the absence of one, and the absence of a
+    // row is how this table says so.
+    if (reading.installed === null) continue;
+    await prisma.deploymentBrowserCapability.upsert({
+      where: {
+        deploymentKey_axis_name: { deploymentKey, axis: reading.axis, name: reading.name },
+      },
+      create: {
+        deploymentKey,
+        orgId: args.orgId ?? null,
+        axis: reading.axis,
+        name: reading.name,
+        installed: reading.installed,
+        detail: reading.detail,
+        checkedAt,
+      },
+      update: {
+        installed: reading.installed,
+        detail: reading.detail,
+        checkedAt,
+      },
+    });
+  }
+
+  let cleared = 0;
+  if (probe.notProbed.length > 0) {
+    /*
+     * The anti-staleness half. Scoped to this deployment key and to the exact
+     * (axis, name) pairs this pass could not answer for — never a blanket
+     * delete, which would wipe a reading another build of this image legitimately
+     * took.
+     */
+    const removed = await prisma.deploymentBrowserCapability.deleteMany({
+      where: {
+        deploymentKey,
+        OR: probe.notProbed.map((reading) => ({ axis: reading.axis, name: reading.name })),
+      },
+    });
+    cleared = removed.count;
+  }
+
+  const written = probe.readings.filter((reading) => reading.installed !== null);
+  logger.info(
+    { deploymentKey, written: written.length, notProbed: probe.notProbed.length, cleared },
+    'deployment browser capability probed',
+  );
+
+  return {
+    deploymentKey,
+    written,
+    notProbed: probe.notProbed,
+    cleared,
+    checkedAt,
+    why: probe.why,
+  };
+}
+
+/** A stored reading that no vocabulary in this build can interpret. */
+export interface RejectedBrowserRow {
+  axis: string;
+  name: string;
+  why: string;
+}
+
+export interface BrowserCapabilitySet {
+  deploymentKey: string;
+  /** Exactly what was stored, in the shape `resolveMatrixCell` consumes. */
+  browsers: DeploymentBrowsers;
+  /** The probe's own cells, resolved against it. */
+  cells: readonly MatrixCellResolution[];
+  summary: BrowserMatrixSummary;
+  /** Oldest `checkedAt` across the rows, or NULL when nothing has been probed. */
+  measuredAt: Date | null;
+  /** Rows this build cannot interpret. Reported, never silently skipped. */
+  rejected: readonly RejectedBrowserRow[];
+  /** True when the row budget bit, so the capability below is INCOMPLETE. */
+  truncated: boolean;
+  /** Printable verbatim. */
+  sentence: string;
+}
+
+/**
+ * The door `resolveMatrixCell` is fed from.
+ *
+ * ── AN EMPTY TABLE IS NOT A DEPLOYMENT WITH NO BROWSERS ─────────────────────
+ *
+ * Same trap as `deploymentCapabilities` above, with the opposite sign. There the
+ * dangerous implementation reports everything executable; here it would be
+ * reporting every engine ABSENT, which refuses the whole matrix on a healthy
+ * image. Neither happens, because the maps are built only from rows that exist:
+ * no row means the key is absent, an absent key means NOT_CHECKED, and
+ * NOT_CHECKED refuses nothing and claims nothing.
+ *
+ * ── A ROW THIS BUILD CANNOT READ IS REJECTED, NOT COERCED ───────────────────
+ *
+ * `axis` is TEXT and `name` is TEXT (see the model's note on why), so a row
+ * written by a newer build — or by a renamed device preset — can hold a name no
+ * vocabulary here contains. Such a row is REPORTED in `rejected` and left out of
+ * the capability. Coercing it would put a reading under a key that means
+ * something else; dropping it silently would make a capability look complete
+ * while a member of it was quietly unprobed.
+ */
+export async function deploymentBrowserCapabilities(
+  args: { deploymentKey?: string } = {},
+): Promise<BrowserCapabilitySet> {
+  const deploymentKey = args.deploymentKey ?? SELF_DEPLOYMENT_KEY;
+
+  /*
+   * `take` one over the budget so the truncation is DETECTABLE. The real
+   * vocabulary is 27 members, so this bites only if something has written rows
+   * under names this build does not know — and a capability silently assembled
+   * from the first 256 of 9,000 rows would be a measurement of whatever sorted
+   * first.
+   */
+  const rows = await prisma.deploymentBrowserCapability.findMany({
+    where: { deploymentKey },
+    select: { axis: true, name: true, installed: true, detail: true, checkedAt: true },
+    orderBy: [{ axis: 'asc' }, { name: 'asc' }],
+    take: BROWSER_CAPABILITY_ROW_BUDGET + 1,
+  });
+  const truncated = rows.length > BROWSER_CAPABILITY_ROW_BUDGET;
+  const considered = truncated ? rows.slice(0, BROWSER_CAPABILITY_ROW_BUDGET) : rows;
+
+  const engines: Record<string, boolean> = {};
+  const channels: Record<string, boolean> = {};
+  const devicePresets: Record<string, boolean> = {};
+  const rejected: RejectedBrowserRow[] = [];
+  let measuredAt: Date | null = null;
+
+  for (const row of considered) {
+    if (!isBrowserCapabilityAxis(row.axis)) {
+      rejected.push({
+        axis: row.axis,
+        name: row.name,
+        why: 'the axis is not one this build knows about (ENGINE, CHANNEL, DEVICE_PRESET)',
+      });
+      continue;
+    }
+    if (!AXIS_VOCABULARY[row.axis].includes(row.name)) {
+      rejected.push({
+        axis: row.axis,
+        name: row.name,
+        why: `no ${row.axis} by that name exists in this build's browser vocabulary`,
+      });
+      continue;
+    }
+    const target =
+      row.axis === 'ENGINE' ? engines : row.axis === 'CHANNEL' ? channels : devicePresets;
+    target[row.name] = row.installed;
+    if (measuredAt === null || row.checkedAt < measuredAt) measuredAt = row.checkedAt;
+  }
+
+  const browsers: DeploymentBrowsers = {
+    engines,
+    channels,
+    devicePresets,
+    /*
+     * `versions` is deliberately absent rather than `{}`: no browser version is
+     * read anywhere in this product (reading one means launching a browser — see
+     * `probeDeploymentBrowsers`), so a cell that PINS a version must resolve
+     * NOT_CHECKED. An empty map and an absent one resolve identically here, and
+     * the absent one is the one that cannot be mistaken for a reading.
+     */
+  };
+
+  const cells = resolveDeploymentCells(browsers);
+  const summary = summariseBrowserMatrix(cells);
+
+  const head =
+    measuredAt === null
+      ? 'No engine, channel or device preset has been probed on this deployment, so every ' +
+        'browser-matrix cell resolves NOT_CHECKED. That is not a verdict about this image in ' +
+        'either direction, and those cells stay IN the denominator.'
+      : `${summary.sentence} Measured at ${measuredAt.toISOString()}.`;
+  const caveats = [
+    rejected.length > 0
+      ? ` ${rejected.length} stored reading(s) were REJECTED rather than interpreted: ` +
+        `${rejected
+          .slice(0, 3)
+          .map((entry) => `${entry.axis}/${entry.name}`)
+          .join(', ')}. Those axis members read as NOT PROBED.`
+      : '',
+    truncated
+      ? ` The ${BROWSER_CAPABILITY_ROW_BUDGET}-row read budget bit, so this capability is ` +
+        'INCOMPLETE and the members it did not reach read as NOT PROBED rather than as absent.'
+      : '',
+  ].join('');
+
+  return {
+    deploymentKey,
+    browsers,
+    cells,
+    summary,
+    measuredAt,
+    rejected,
+    truncated,
+    sentence: `${head}${caveats}`,
+  };
+}
+
+// ─── The declaration bridge: the eleven types the prober could not see ──────
+
+/**
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * `TYPE_REQUIREMENTS` in packages/runner/src/preflight.ts is a `Record` over the
+ * nineteen MINTED types, so `checkRunnability` — the call above, the one that
+ * writes every stored row — cannot be ASKED about CHAOS, DOCUMENT, PWA, PUSH,
+ * EMAIL or the six other pending types. Each of those shipped a registered
+ * plugin, and the prober could not see any of them: not "unknown", not
+ * "pending", the call did not typecheck. The registry's declaration bridge
+ * (`declaredRunnability`, `declaredRequirements`, `CHANNEL_REQUIREMENTS_DEMOTED`)
+ * answers for all thirty by reading the keystone's declarations instead, and
+ * before this function existed every one of those exports was called from a test
+ * file and nowhere else — correct, tested, and reached by nothing in production,
+ * which is this codebase's signature defect.
+ *
+ * ── WHY NOTHING HERE IS STORED ──────────────────────────────────────────────
+ *
+ * `DeploymentCapability.testType` is the Prisma `TestType` enum, which holds the
+ * nineteen. A pending type has no value to be stored under, by design — minting
+ * one is a four-edit change in files this slice does not own, and the three
+ * guards that make a half-mint unshippable are the reason the eleven are pending
+ * rather than broken. So this is a REPORT, not a write: the runnability of a
+ * pending type is logged with the rest of the preflight and travels to an
+ * operator in the capability sentence. It deliberately does NOT enter a
+ * denominator — these types are not in `TEST_TYPES`, so no obligation anywhere
+ * is counted against them, and inventing a row for one would be the first step
+ * toward counting a test nobody can create.
+ *
+ * ── AND THE MINTED NINETEEN ARE NOT ASKED TWICE ─────────────────────────────
+ *
+ * Only the not-minted names go through here. The nineteen are answered by
+ * `checkRunnability` above, and `requirementParity` is the guard that the two
+ * tables agree about them; asking both would be two answers to one question, and
+ * the day they differed this file would hold both.
+ */
+export interface DeclaredTypeReadiness {
+  /** A pending or unregistered type NAME. Never a minted `TestType`. */
+  type: string;
+  runnable: boolean | null;
+  reason: string;
+}
+
+export interface DeclaredRunnabilitySet {
+  /** Types with a declaration, probed against this image. */
+  answered: readonly DeclaredTypeReadiness[];
+  /** Types with a registered plugin and NO declaration, with the reason. */
+  refused: readonly { type: string; why: string }[];
+  /**
+   * Declared CHANNEL requirements the prober cannot see, per type.
+   *
+   * The disclosure half of `asProbeRequirement`'s demotion: the prober asks
+   * Playwright which ENGINES are installed, so a declared "needs Chrome Beta" is
+   * demoted to UNPROBED rather than refused. Surfaced HERE, beside the browser
+   * capability above, because that capability is the thing that DOES answer for
+   * a channel — the two halves of one question, which were in two files with no
+   * caller in common.
+   */
+  demotedChannels: readonly { type: string; channels: readonly string[] }[];
+  sentence: string;
+}
+
+export async function declaredTypeRunnability(
+  args: { probes?: RunnabilityProbes } = {},
+): Promise<DeclaredRunnabilitySet> {
+  /*
+   * Every type name that is NOT minted: the eleven pending ones plus any plugin
+   * whose type string no declaration describes at all (`'EMAIL'` is exactly that
+   * today). Deduplicated, and filtered through `isTestType` so a name that gets
+   * minted later leaves this list the moment it does, rather than being answered
+   * twice.
+   */
+  const asked = [...new Set([...PENDING_TEST_TYPES, ...undeclaredPluginTypes()])].filter(
+    (type) => !isTestType(type),
+  );
+
+  const report = await declaredRunnability(asked, { probes: args.probes });
+  const answered: DeclaredTypeReadiness[] = report.map((entry) => ({
+    // `entry.type` is typed `TestType` by a cast the registry documents as
+    // narrow and load-bearing; for these names it holds a pending string. It is
+    // read here as the string it is, and never written to a typed column.
+    type: entry.type,
+    runnable: entry.runnable,
+    reason: entry.reason,
+  }));
+
+  /*
+   * What `declaredRunnability` DROPPED. It answers only for names with a
+   * declaration and returns the rest silently, so the difference is computed
+   * here rather than inferred — a type that vanishes between the question and
+   * the answer is the kind of gap that reads as "fine".
+   */
+  const answeredNames = new Set(answered.map((entry) => entry.type));
+  const refused = asked
+    .filter((type) => !answeredNames.has(type))
+    .map((type) => ({ type, why: declaredRequirements(type).why }));
+
+  const demotedChannels = CHANNEL_REQUIREMENTS_DEMOTED();
+
+  const runnable = answered.filter((entry) => entry.runnable === true).length;
+  const blocked = answered.filter((entry) => entry.runnable === false).length;
+  const unresolved = answered.filter((entry) => entry.runnable === null).length;
+
+  const parts = [
+    `${answered.length} declared-but-unminted test type(s) were probed on this deployment: ` +
+      `${runnable} runnable, ${blocked} blocked, ${unresolved} not established either way. ` +
+      'No row is stored for any of them — the Prisma `TestType` enum does not hold a pending ' +
+      'type — and none of them is in a coverage denominator, so nothing is counted against a ' +
+      'test nobody can create yet.',
+  ];
+  if (refused.length > 0) {
+    parts.push(
+      `${refused.length} registered plugin type(s) could not be probed at all: ` +
+        `${refused
+          .slice(0, 3)
+          .map((entry) => entry.type)
+          .join(', ')}. What they need is UNKNOWN rather than nothing.`,
+    );
+  }
+  if (demotedChannels.length > 0) {
+    parts.push(
+      `${demotedChannels.length} type(s) declare a browser CHANNEL this prober cannot see ` +
+        `(${demotedChannels
+          .slice(0, 3)
+          .map((entry) => `${entry.type}: ${entry.channels.join(', ')}`)
+          .join('; ')}): it asks Playwright which ENGINES are installed. The browser capability ` +
+        'above is what answers for a channel.',
+    );
+  }
+
+  return { answered, refused, demotedChannels, sentence: parts.join(' ') };
+}
+
+// ─── The one call the job makes ─────────────────────────────────────────────
+
+/**
+ * Probe if stale, probe the browsers, then read both sets back.
  *
  * Exists so the ordering cannot be got wrong at the call site. Reading before
  * probing on a cold deployment returns the honest-but-useless "nothing has been
  * probed" set, and the run that triggered it would then count obligations it
  * could have excluded.
+ *
+ * ── THE SENTENCE IS COMPOSED HERE, AND THAT IS NOT COSMETIC ─────────────────
+ *
+ * `capabilities.sentence` comes back carrying all three facts — the test types,
+ * the browser matrix, the declared-but-unminted types — because this function's
+ * one production caller (the `PREFLIGHT_QUEUE` registration in
+ * apps/worker/src/index.ts) logs exactly one string, and a fact returned in a
+ * field nobody prints is a fact nobody has. `deploymentCapabilities` and
+ * `deploymentBrowserCapabilities` each keep their own single-purpose sentence
+ * for callers that want one of the two.
+ *
+ * ── THE BROWSER HALF MAY NOT TAKE THE TYPE HALF DOWN ────────────────────────
+ *
+ * Its table arrives in a migration this round WRITES and does not APPLY, so a
+ * worker running this build against a database where `prisma migrate deploy` has
+ * not run yet will throw on the first upsert. Losing the nineteen type rows over
+ * that would be a far worse outcome than not having the browser capability, so
+ * the failure is caught, reported as NOT MEASURED — never as a verdict about the
+ * image — and the error goes to the log and NOT into the sentence, which is
+ * rendered into reports.
  */
-export async function ensureDeploymentCapabilities(
-  args: ProbeCapabilitiesArgs = {},
-): Promise<{ probe: ProbeCapabilitiesResult; capabilities: CapabilitySet }> {
+export async function ensureDeploymentCapabilities(args: ProbeCapabilitiesArgs = {}): Promise<{
+  probe: ProbeCapabilitiesResult;
+  capabilities: CapabilitySet;
+  browsers: BrowserCapabilitySet | null;
+  declared: DeclaredRunnabilitySet;
+}> {
   const probe = await probeDeploymentCapabilities(args);
   const capabilities = await deploymentCapabilities({ deploymentKey: probe.deploymentKey });
-  return { probe, capabilities };
+
+  let browsers: BrowserCapabilitySet | null = null;
+  let browserSentence =
+    'The browser-matrix capability was NOT MEASURED on this deployment: its store could not be ' +
+    'reached. Every matrix cell therefore resolves NOT_CHECKED, which is not a verdict about this ' +
+    'image in either direction.';
+  try {
+    await probeDeploymentBrowserCapability(args);
+    browsers = await deploymentBrowserCapabilities({ deploymentKey: probe.deploymentKey });
+    browserSentence = browsers.sentence;
+  } catch (err) {
+    // The error class and message go to the operator's log. They do not go into
+    // the sentence: that string is rendered into coverage reports and PR
+    // comments, and a database error text is neither a fact about the image nor
+    // something this file controls the contents of.
+    logger.error(
+      { err, deploymentKey: probe.deploymentKey },
+      'the browser-matrix capability could not be probed or read; the test-type capability rows ' +
+        'were written and are unaffected',
+    );
+  }
+
+  const declared = await declaredTypeRunnability({
+    ...(args.probes === undefined ? {} : { probes: args.probes }),
+  });
+
+  return {
+    probe,
+    capabilities: {
+      ...capabilities,
+      sentence: [capabilities.sentence, browserSentence, declared.sentence].join(' '),
+    },
+    browsers,
+    declared,
+  };
 }

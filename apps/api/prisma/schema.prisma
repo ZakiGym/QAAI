@@ -4952,6 +4952,91 @@ model DeploymentCapability {
   @@index([deploymentKey, status])
 }
 
+/// WHICH BROWSERS, CHANNELS AND DEVICE PRESETS THIS DEPLOYMENT ACTUALLY HAS.
+///
+/// The sibling of `DeploymentCapability`, one axis member at a time instead of
+/// one test type at a time. `DeploymentBrowsers` in
+/// packages/shared/src/browser-matrix.ts is the fact `resolveMatrixCell` resolves
+/// every browser/device cell against, and nothing collected it: every cell in
+/// the product resolved against an empty capability, so NOT_CHECKED was not the
+/// usual answer, it was the ONLY answer six statuses could ever produce. These
+/// rows are what that function now reads.
+///
+/// ── ABSENCE IS THE CARRIER OF "NOT PROBED", WHICH IS WHY THERE IS NO
+///    `installed` NULL AND NO `checkedAt` NULL ──────────────────────────────
+///
+/// A row exists only when the probe ANSWERED. `installed` is NOT NULL and
+/// `checkedAt` is NOT NULL, and that is deliberately different from
+/// `DeploymentCapability`, where a NOT_CHECKED row is written for every type so
+/// the nineteen are always all present. Here the vocabulary is 27 axis members
+/// across three shared lists, and most of them are unanswerable on a given host
+/// — Playwright resolves a browser CHANNEL by absolute per-platform paths, so a
+/// PATH miss is not evidence of absence. Writing `installed = false` for those
+/// would refuse a cell on a machine that has the browser, and writing a
+/// NOT_CHECKED row for each would be 27 rows of nothing per deployment. So the
+/// missing row IS the NOT_CHECKED, which is exactly what `DeploymentBrowsers`
+/// documents: "EVERY FIELD IS OPTIONAL AND ABSENT MEANS NOT PROBED".
+///
+/// The reader (`deploymentBrowserCapabilities` in
+/// apps/worker/src/processors/preflight.ts) therefore never fabricates a `false`,
+/// and the writer DELETES a member's row when the probe stops being able to
+/// answer for it — a stale `installed = true` for a browser that has since been
+/// removed from the image is the same lie `DeploymentCapability.checkedAt`
+/// exists to kill.
+///
+/// `axis` is TEXT and not an enum on purpose: a Prisma enum needs its TypeScript
+/// twin in packages/shared/src/constants.ts and its pair in
+/// apps/api/scripts/check-enums.ts — neither owned by the slice that added this
+/// — and `check:enums` fails a value with no twin. The three values are
+/// `'ENGINE'`, `'CHANNEL'` and `'DEVICE_PRESET'`, validated by
+/// `isBrowserCapabilityAxis` in packages/runner/src/preflight.ts on the way in
+/// and against the shared browser vocabularies on the way out; a row whose
+/// `name` no longer appears in them is REJECTED by the reader rather than
+/// resolved into a capability nobody can interpret.
+model DeploymentBrowserCapability {
+  id String @id @default(cuid())
+
+  /// Null for the cloud image, which belongs to no org. A runner pool belongs to
+  /// one — the same contract, and the same reason, as on DeploymentCapability.
+  orgId String?
+  /// `'<self>'` for this image; `pool:<name>` for a customer's own runner pool.
+  /// A sentinel rather than a nullable column because the unique key is below
+  /// and PostgreSQL treats NULLs there as DISTINCT, which would let one probe be
+  /// written twice and stop the upsert being idempotent.
+  deploymentKey String @default("<self>")
+
+  /// `ENGINE` | `CHANNEL` | `DEVICE_PRESET`. See the note above on why this is
+  /// TEXT.
+  axis String
+  /// The name from the SHARED vocabulary — `chromium`, `CHROME_BETA`,
+  /// `IPHONE_14` — and never Playwright's own descriptor string. A stored
+  /// `'iPhone 15 Pro'` breaks the moment the registry renames it, which is the
+  /// same argument `DEVICE_PRESETS` makes for existing at all.
+  name String
+
+  /// The reading. A row is only written when the probe answered, so there is no
+  /// third state in this column — the absence of the row is the third state.
+  installed Boolean
+
+  /// What was LOOKED AT, never what was assumed. Rendered into the capability
+  /// sentence an operator reads, so: NEVER A CREDENTIAL, and never a path out of
+  /// the environment.
+  detail String
+
+  /// When the probe ran. NOT NULL, because a row without a reading is not
+  /// written at all — the age of the answer is part of the answer.
+  checkedAt DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([deploymentKey, axis, name])
+  @@index([orgId])
+  /// "what can this deployment's browser matrix serve" — the read
+  /// `resolveMatrixCell` is handed.
+  @@index([deploymentKey, installed])
+}
+
 /// THE SIGNED, DATED, SCOPED EXPORT — the artefact a buyer is handed.
 ///
 /// ── WHY THE SCOPE COLUMNS HAVE NO DEFAULTS ──────────────────────────────────
