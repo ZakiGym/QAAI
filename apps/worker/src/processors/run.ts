@@ -69,15 +69,27 @@ import {
   attachRunWorkspace,
 } from '../../../../packages/runner/src/run-workspace.js';
 import {
+  FIXTURE_PREFIX,
+  GRID_INTEGRATION_KINDS,
+  RUN_SHARD_TERMINAL,
+  UNVARIED,
   environmentUnavailableMessage,
   environmentUnavailableReason,
   notRunMessage,
   parseNotRun,
-  FIXTURE_PREFIX,
-  GRID_INTEGRATION_KINDS,
-  RUN_SHARD_TERMINAL,
+  planMeasurements,
+  testMetricSchema,
+  testResultVariantSchema,
+  variantKeyOf,
 } from '@qaai/shared';
-import type { GridIntegrationKind, NotRunKind, RunShardRef } from '@qaai/shared';
+import type {
+  GridIntegrationKind,
+  MeasurementPlan,
+  NotRunKind,
+  RunShardRef,
+  TestMetric,
+  TestResultVariant,
+} from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
 import { open as openSecret } from '../vault.js';
 import type {
@@ -1494,7 +1506,16 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
 
       await persistExecution({
         orgId,
-        runId: run.id,
+        projectId: run.projectId,
+        /*
+         * `runId` and `testId` COME FROM THE PARENT ROW, which is the row this
+         * loop is already holding — not from `execution`, whose `testId` is the
+         * producer's claim about which test it ran. The two tables denormalise
+         * both columns and never update them, so whatever is written here is
+         * the only answer their reads will ever get.
+         */
+        runId: result.runId,
+        testId: result.testId,
         testResultId: result.id,
         execution,
         uploaded,
@@ -3275,15 +3296,137 @@ export function mutationColumns(data: MutationRunData | null | undefined): {
   };
 }
 
+/**
+ * The inserted cell's id, or an exception.
+ *
+ * Reached only if a reading survived `planMeasurements` naming a cell that was
+ * not inserted — which this file's own code cannot produce, because the orphan
+ * refusal in there is exactly that check. So it is deliberately loud: the only
+ * alternative is `variantId: null`, which would file one cell's measurement
+ * under the whole test and report it as a measured fact about the test. A loud
+ * failure beats a quiet lie.
+ *
+ * The key is safe to name — `variantKeyOf` produced it, so it is JSON-escaped.
+ */
+function cellIdFor(ids: ReadonlyMap<string, string>, variantKey: string): string {
+  const id = ids.get(variantKey);
+  if (id === undefined) {
+    throw new Error(`no inserted cell for ${variantKey}; refusing to file it under the whole test`);
+  }
+  return id;
+}
+
+/**
+ * The reported matrix and readings, validated — or a counted refusal.
+ *
+ * The AGENT path gets this for free: `executionSchema` in
+ * apps/api/src/routes/runners.ts is built from these same two validators, so
+ * both ingest paths admit exactly the same shapes. That is the whole reason it
+ * is done here too rather than trusting the in-process producer: a plugin is
+ * still a producer, a third-party plugin is an UNTRUSTED one, and a customer's
+ * matrix must not depend on which runner happened to run the test.
+ *
+ * A malformed report costs its MEASUREMENTS and nothing else. The result, its
+ * steps and its findings are still persisted, because a reporting problem must
+ * never cost a run its verdict — and the refusal is counted and named in the
+ * log, which is the only channel this side has, there being no caller to
+ * answer with a 400.
+ *
+ * Validated ELEMENT BY ELEMENT and then refused WHOLE. A partially stored
+ * matrix is indistinguishable from a narrower matrix somebody configured, so
+ * there is no half-write here: the first bad cell refuses all of them.
+ */
+function validateMeasurements(
+  execution: TestExecution,
+): { ok: true; variants: TestResultVariant[]; metrics: TestMetric[] } | { ok: false; why: string } {
+  const variants: TestResultVariant[] = [];
+  for (const [index, variant] of (execution.variants ?? []).entries()) {
+    const parsed = testResultVariantSchema.safeParse(variant);
+    /*
+     * The PATHS, never the values. A dimension is free text and a metric name
+     * is customer-supplied; both land in a log line here, and zod's issue
+     * paths are field names and array indices, which cannot forge one.
+     */
+    if (!parsed.success) {
+      return { ok: false, why: `cell ${index} is not a valid variant: ${issuePathsOf(parsed)}` };
+    }
+    variants.push(parsed.data);
+  }
+
+  const metrics: TestMetric[] = [];
+  for (const [index, metric] of (execution.metrics ?? []).entries()) {
+    const parsed = testMetricSchema.safeParse(metric);
+    if (!parsed.success) {
+      return { ok: false, why: `reading ${index} is not a valid metric: ${issuePathsOf(parsed)}` };
+    }
+    metrics.push(parsed.data);
+  }
+
+  return { ok: true, variants, metrics };
+}
+
+/** Which FIELDS a parse objected to, with none of their contents. */
+function issuePathsOf(parsed: {
+  error: { issues: ReadonlyArray<{ path: PropertyKey[] }> };
+}): string {
+  const paths = parsed.error.issues.slice(0, 5).map((issue) => issue.path.join('.') || '(root)');
+  const extra = parsed.error.issues.length - paths.length;
+  return extra > 0 ? `${paths.join(', ')} (+${extra} more)` : paths.join(', ');
+}
+
 async function persistExecution(args: {
   orgId: string;
+  /**
+   * The run's project, for `TestMetricSample.projectId` — which carries the
+   * trend index `(projectId, name, createdAt)`, the read that table exists for.
+   * Threaded in rather than looked up here, because the caller already holds
+   * the run row and a second read could disagree with it.
+   */
+  projectId: string;
   runId: string;
+  /** Copied from the parent `TestResult` row, never from the execution. */
+  testId: string;
   testResultId: string;
   execution: TestExecution;
   uploaded: Array<{ key: string; contentType: string }>;
   expiresAt: Date;
 }): Promise<void> {
-  const { orgId, runId, testResultId, execution, uploaded, expiresAt } = args;
+  const { orgId, projectId, runId, testId, testResultId, execution, uploaded, expiresAt } = args;
+
+  /*
+   * ── THE MATRIX AND THE READINGS, DECIDED BEFORE THE TRANSACTION OPENS ─────
+   *
+   * Planned out here so a refusal costs nothing: no partial write, and no
+   * rollback of a result that was perfectly good. `planMeasurements` is the
+   * same function the on-prem agent's POST calls, over the same validated
+   * shapes, so the two ingest paths write the same rows for the same input.
+   */
+  const validated = validateMeasurements(execution);
+  const plan: MeasurementPlan = validated.ok
+    ? planMeasurements(
+        { orgId, projectId, runId, testId, testResultId },
+        validated.variants,
+        validated.metrics,
+      )
+    : { ok: false, why: validated.why };
+  if (!plan.ok) {
+    /*
+     * COUNTED AND NAMED, not swallowed. There is no caller to hand a 400 to, so
+     * the log is the disclosure: how many cells and readings were reported, and
+     * the one sentence saying why none of them could be stored. Silence here
+     * would be a matrix that vanished and read afterwards as "not varied".
+     */
+    logger.warn(
+      {
+        runId,
+        testId,
+        cellsReported: execution.variants?.length ?? 0,
+        readingsReported: execution.metrics?.length ?? 0,
+        reason: plan.why,
+      },
+      'measurements refused: the result, its steps and its findings were still stored',
+    );
+  }
 
   await prisma.$transaction(async (tx) => {
     await tx.testResult.update({
@@ -3390,6 +3533,76 @@ async function persistExecution(args: {
           mutator: mutant.mutator.slice(0, 200),
           detail: mutant.detail?.slice(0, 2000) ?? null,
           reason: mutant.reason,
+        })),
+      });
+    }
+
+    /*
+     * ── THE MATRIX AND THE READINGS ───────────────────────────────────────
+     *
+     * The same writes the on-prem agent's POST makes, in the same order, from
+     * the same planned rows — see apps/api/src/routes/runners.ts. Two ingest
+     * paths that drift are how one customer's matrix comes to disagree with
+     * another's, so the row building is one shared block and only the plumbing
+     * around it differs.
+     *
+     * REPLACE, NOT APPEND, in the same transaction as the steps and findings:
+     * a retried run job must not double a cell or a reading, and a doubled
+     * cell would be refused by `TestResultVariant_cell_key` and take the whole
+     * result's write down with it.
+     *
+     * The readings are deleted FIRST and explicitly. They cascade from their
+     * CELL, so a whole-test reading — `variantId: null` by design — has nothing
+     * to cascade from and would outlive a variant-only delete, leaving the last
+     * attempt's number beside this attempt's cells.
+     *
+     * Both deletes run even when there is nothing to write, including when the
+     * report was REFUSED above, which is the half that matters: a test that
+     * stopped reporting a matrix must stop having one rather than keep serving
+     * the previous attempt's cells for ever. Same argument as the survivor rows.
+     */
+    await tx.testMetricSample.deleteMany({ where: { testResultId } });
+    await tx.testResultVariant.deleteMany({ where: { testResultId } });
+
+    const cells = plan.ok ? plan.variants : [];
+    const readings = plan.ok ? plan.readings : [];
+
+    /*
+     * `createManyAndReturn`, because the readings need each cell's id and
+     * nothing else can supply it. Mapped back by the five dimensions the insert
+     * RETURNED and never by position: relying on insert order would
+     * mis-attribute every reading the first time it did not hold, silently.
+     */
+    const inserted =
+      cells.length > 0
+        ? await tx.testResultVariant.createManyAndReturn({
+            data: cells,
+            select: {
+              id: true,
+              browser: true,
+              viewport: true,
+              locale: true,
+              role: true,
+              environment: true,
+            },
+          })
+        : [];
+    const idByCell = new Map(inserted.map((cell) => [variantKeyOf(cell), cell.id]));
+
+    if (readings.length > 0) {
+      await tx.testMetricSample.createMany({
+        data: readings.map((reading) => ({
+          ...reading,
+          /*
+           * NULL for a whole-test reading, the cell's id for a cell's — and
+           * `variantKey` is written in BOTH cases, carrying '<unvaried>' for
+           * the first. The id is the join, the key is the identity, and the
+           * unique index is over the key because a unique over the nullable id
+           * would treat every whole-test reading as distinct and insert the
+           * same metric once per run for ever.
+           */
+          variantId:
+            reading.variantKey === UNVARIED ? null : cellIdFor(idByCell, reading.variantKey),
         })),
       });
     }

@@ -223,6 +223,210 @@ export interface TestExecution {
    * apps/worker/src/processors/run.ts.
    */
   mutation?: MutationRunData | null;
+
+  /**
+   * EVERY OTHER NUMBER THIS RUN PRODUCED, as data rather than as prose.
+   *
+   * ── The defect, which `mutation` above only half fixed ────────────────────
+   *
+   * The mutation score got five scalar columns because it is the one metric no
+   * competitor ships. Every OTHER number a plugin produces still survives only
+   * interpolated into a step TITLE: LCP, CLS and INP from the performance
+   * plugin, k6's p95 and error rate, the visual plugin's diff ratio, the
+   * accessibility plugin's violation count. "Is this project's LCP getting
+   * worse?" is unanswerable without a regex over a string column, so none of
+   * them can be trended, gated on or alerted on — and `MAX_VITAL_BREACHES` and
+   * `MAX_P95_LATENCY_MS` are gate rules that exist, are saveable, and have no
+   * stored number to read.
+   *
+   * A LIST AND NOT A FIXED SET OF COLUMNS, which is the opposite choice to
+   * `mutation` and deliberately so. The mutation score is ONE known metric with
+   * a known denominator and a trend query the `(testId, createdAt)` index
+   * already serves. This is an open channel for whatever a plugin measures —
+   * including plugins that do not exist yet — so the shape has to be a row per
+   * reading. `TestMetricSample` is where they land.
+   *
+   * Optional and nullable, exactly like `mutation` and `newBaseline` above and
+   * for the same reason: it is a plugin-produced extra the WORKER persists,
+   * because the runner has no database access by design. Every plugin that
+   * measures nothing leaves it undefined and keeps compiling.
+   */
+  metrics?: TestMetric[] | null;
+
+  /**
+   * ONE ROW PER (BROWSER × VIEWPORT × LOCALE × ROLE × ENVIRONMENT) THIS TEST
+   * ACTUALLY RAN IN.
+   *
+   * ── The defect ────────────────────────────────────────────────────────────
+   *
+   * `TestResult` is unique on `(runId, testId)` and the harness reduces a
+   * multi-variant execution WORST-WINS into that single row. So "this test
+   * passes in Chromium and fails in WebKit" is stored as "this test failed",
+   * and the sentence "covered in WebKit and in de-DE" is not merely unsaid, it
+   * is unmeasurable. The `DEVICE_LOCALE` and `ROLE_CELL` axes of the
+   * denominator have no per-variant evidence to rest on at all.
+   *
+   * THE WORST-WINS ROLL-UP STAYS EXACTLY AS IT IS. Every existing reader of
+   * `TestResult.status` keeps the contract it was written against; this is
+   * ADDITIONAL evidence underneath it, not a replacement. A run with no
+   * variation leaves this undefined rather than writing one variant row that
+   * duplicates the result — absent means "this execution was not varied", and
+   * a single synthetic row would make an unvaried run indistinguishable from a
+   * one-browser matrix somebody configured on purpose.
+   */
+  variants?: TestResultVariant[] | null;
+}
+
+/**
+ * Which cell of the matrix one result came from.
+ *
+ * ── EVERY FIELD IS REQUIRED, AND NONE OF THEM IS NULLABLE ───────────────────
+ *
+ * Five dimensions, five strings, and the absence of a dimension is spelled with
+ * a SENTINEL rather than with null. The reason is the same one
+ * `RouteAccessCell.role` records and is worth restating because it is the
+ * quietest possible database defect: the persisted row's identity is a unique
+ * index over these five columns, PostgreSQL treats every NULL as DISTINCT from
+ * every other NULL, and so a nullable dimension would make the row that matters
+ * most — the default cell, the one almost every test runs in — re-insert on
+ * every single run and be counted once per run.
+ *
+ * {@link UNVARIED} is that sentinel. `role` has a SECOND legitimate one,
+ * `'<anonymous>'`, which is `ANONYMOUS_ROLE` in auth-profiles.ts and is NOT
+ * redeclared here — "nobody varied the role" and "this ran as a logged-out
+ * visitor" are different facts, only one of them is a claim about the
+ * application, and the second one already has an owner that `roleKey` and every
+ * `RouteAccessCell` row agree on. A second constant with the same value would
+ * be two vocabularies for one sentinel, which is how the two halves of a key
+ * come to disagree.
+ */
+export interface TestVariantKey {
+  /** `chromium`, `webkit`, `firefox` — the runner's own spelling. */
+  browser: string;
+  /** `1280x720`, `iphone-14` — whatever the harness was told to emulate. */
+  viewport: string;
+  /** BCP-47 as the app spells it: `pt-BR`, not `pt_br`. */
+  locale: string;
+  /** The role the test executed as. {@link ANONYMOUS_ROLE} for logged out. */
+  role: string;
+  /** The environment id this cell ran against. */
+  environment: string;
+}
+
+/**
+ * "This dimension was not varied."
+ *
+ * Angle brackets because no browser, locale or environment id can contain them,
+ * so the sentinel cannot collide with a real value — the same trick, and the
+ * same reasoning, as `'<anonymous>'`.
+ */
+export const UNVARIED = '<unvaried>';
+
+/**
+ * One cell of the matrix, with its own status and its own numbers.
+ *
+ * `status` here is the status of THAT CELL, not of the test. The worst of these
+ * is what `TestResult.status` holds, and the two must never be reconciled by
+ * overwriting one with the other: a reader asking "did this pass?" wants the
+ * roll-up, and a reader asking "where did this pass?" wants these rows.
+ */
+export interface TestResultVariant {
+  key: TestVariantKey;
+  status: TestResultStatus;
+  durationMs: number;
+  /** The cell's own failure, when this cell is the one that failed. */
+  errorMessage: string | null;
+  /** §5 — a retry that passes is not a pass, per cell as well as per test. */
+  retriedAndPassed: boolean;
+  /**
+   * Why this cell has nothing measured in it. Same four reasons and the same
+   * fifth state as `TestExecution.notRun`: ABSENT IS NOT `NOT_RUN`, and
+   * defaulting it would put a claim in the database that no plugin made.
+   */
+  notRun?: { kind: NotRunKind; why: string } | null;
+  /**
+   * Numbers measured in THIS cell. A p95 from a de-DE WebKit run and one from a
+   * Chromium en-US run are two measurements, and averaging them produces a
+   * figure neither cell ever reported.
+   */
+  metrics?: TestMetric[] | null;
+}
+
+/**
+ * Which way is better for a metric.
+ *
+ * A `Record`-keyed union rather than a sign convention or a boolean named
+ * `higherIsBetter`, because a gate has to be able to say "fail if this got
+ * worse" for both kinds of number without a caller remembering which way round
+ * CLS runs. Stored per sample and not looked up from a table of known metric
+ * names: the channel is open, a plugin that does not exist yet will emit a
+ * metric this repo has never heard of, and a lookup table would default it to
+ * one direction and gate the wrong way.
+ */
+export const METRIC_DIRECTIONS = ['HIGHER_IS_BETTER', 'LOWER_IS_BETTER'] as const;
+export type MetricDirection = (typeof METRIC_DIRECTIONS)[number];
+
+/**
+ * What a metric's number is measured in.
+ *
+ * Deliberately a short, closed list of UNITS rather than of metric names. Nine
+ * units cover every number the plugins produce today and leave the metric NAME
+ * free-form, which is the split that lets a new plugin add a reading without a
+ * migration while still making the value comparable and renderable. A unitless
+ * reading is `RATIO` (CLS, a visual diff fraction) or `SCORE` (a Lighthouse-style
+ * index) — never an empty string, because "unit unknown" renders as a bare
+ * number beside numbers that have units, and a bare number is the thing a
+ * reader misreads.
+ */
+export const METRIC_UNITS = [
+  'MILLISECONDS',
+  'SECONDS',
+  'BYTES',
+  'COUNT',
+  'PERCENT',
+  'RATIO',
+  'SCORE',
+  'REQUESTS_PER_SECOND',
+  'PIXELS',
+] as const;
+export type MetricUnit = (typeof METRIC_UNITS)[number];
+
+/**
+ * One numeric reading, from one plugin, about one test — or one cell of it.
+ *
+ * ── `value: number | null`, AND NULL IS THE WHOLE POINT ───────────────────
+ *
+ * Null means WE TRIED TO MEASURE THIS AND COULD NOT: the tool was absent, the
+ * trace had no entry for the metric, the k6 summary was truncated. It does NOT
+ * mean zero. The distinction is the same one `mutationScore` already draws and
+ * it inverts the signal in exactly the same way — an LCP of 0 ms is a page that
+ * painted instantly, a p95 of 0 is a load test that never ran, and a visual
+ * diff ratio of 0 is a pixel-perfect match. A product that writes 0 for "not
+ * measured" reports its own blind spots as its best results.
+ *
+ * So a null value carries a REQUIRED reason. A null with no reason would be a
+ * row nobody can act on and nobody can distinguish from a writer's bug, which
+ * is why `testMetricSchema` refuses it.
+ */
+export interface TestMetric {
+  /**
+   * The metric's identity, in the plugin's own spelling: `lcp`, `cls`, `inp`,
+   * `http_req_duration_p95`, `visual_diff_ratio`. Stable across runs or there
+   * is no trend, so it is never derived from a step title.
+   */
+  name: string;
+  /** NULL MEANS NOT MEASURED. See the note above; there is no 0 for that. */
+  value: number | null;
+  /** Required exactly when `value` is null. */
+  unavailableReason: string | null;
+  unit: MetricUnit;
+  direction: MetricDirection;
+  /**
+   * The cell this reading belongs to, or absent for a reading about the whole
+   * test. Absent and {@link UNVARIED}-filled are the same claim here, and the
+   * persisted row normalises to the sentinel so its unique index holds.
+   */
+  variant?: TestVariantKey | null;
 }
 
 /**
@@ -1305,4 +1509,178 @@ export interface AgentCallRecord extends TokenUsage {
   subjectId: string | null;
   durationMs: number;
   at: string;
+}
+
+// ─── Suite health over time (§ measurement) ──────────────────────────────────
+
+/**
+ * One stored reading of how much the suite itself is worth.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * `Test.flakeRate` is a single Float OVERWRITTEN on every run, and the
+ * suite-health score is recomputed per request from whatever is current. So rot
+ * has no DIRECTION. "Is this suite getting worse?" is the premise of the entire
+ * suite-health lens and it was unanswerable: a suite that had been degrading for
+ * three weeks looked exactly like one that flaked this morning, and there was
+ * nothing for a release to be diffed against.
+ *
+ * `TestFlakeHistory` fixed the PER-TEST half — one row per test per UTC day. It
+ * cannot answer the suite question, and not for want of a GROUP BY: the
+ * suite-level numbers are not aggregates of per-test flake at all. Weak
+ * assertions, duplicates, obsolete tests and quarantine budget are properties of
+ * the SUITE, computed by `packages/agent/src/suite-health.ts` from test SOURCE,
+ * and nothing has ever stored one of them.
+ *
+ * ── EVERY MEASUREMENT HERE IS NULLABLE, AND NONE OF THEM DEFAULTS TO 0 ──────
+ *
+ * This is the rule the whole file turns on, so it is stated once here and
+ * enforced on every field below. A `weakAssertions: 0` means the scanner looked
+ * at every test and found none — the best possible result. A snapshot whose
+ * scan never ran, or was truncated by a budget, or could not parse the
+ * language, has NO number, and writing 0 for that is the single most flattering
+ * lie this product could tell about itself. `score` obeys the same rule: null is
+ * "not computed", and a 0 would read as a suite with no value whatsoever.
+ */
+export interface SuiteHealthSnapshotData {
+  /** Tests considered. Null when the scan did not complete. */
+  testCount: number | null;
+  /** Tests currently quarantined — suppressed signal, not absent signal. */
+  quarantinedCount: number | null;
+  /**
+   * Tests over the flake threshold at the moment of the reading. Null when the
+   * reading did not look at flake rates, which is NOT "none are flaky".
+   */
+  flakyCount: number | null;
+  /** Tests whose assertions the analyser rated too weak to be evidence. */
+  weakAssertionCount: number | null;
+  /** Near-duplicate tests: cost with no added coverage. */
+  duplicateCount: number | null;
+  /** Tests the analyser believes assert against surface that no longer exists. */
+  obsoleteCount: number | null;
+  /** Pass rate across the run this reading was taken from, 0-100. */
+  passRatePercent: number | null;
+  /** Median and p95 test duration, for the "is the suite getting slower" read. */
+  medianDurationMs: number | null;
+  p95DurationMs: number | null;
+  /**
+   * The composite, 0-100. NULL WHEN IT WAS NOT COMPUTED — see the note above.
+   * Carried with its inputs because a composite nobody can decompose is a
+   * number nobody can argue with, which is the same as a number nobody
+   * believes.
+   */
+  score: number | null;
+}
+
+/**
+ * A stored suite-health reading, with everything a reader needs to trust it.
+ *
+ * `caveats` is not optional and is never defaulted to an empty array by a
+ * writer that did not consider it: every cap that BIT — a scan budget, a file
+ * take, a parse that failed on a dialect — has to arrive here as a sentence, or
+ * the score is a measurement of an unstated subset.
+ */
+export interface SuiteHealthSnapshot {
+  id: string | null;
+  projectId: string;
+  createdAtIso: string;
+  /** The commit this was measured against, when the caller knew it. */
+  commitSha: string | null;
+  /** The run it was taken from, for the pass-rate and duration halves. */
+  runId: string | null;
+  data: SuiteHealthSnapshotData;
+  /** Things a reader must know before trusting the numbers. */
+  caveats: string[];
+  /** Changes whenever the answer could change. */
+  fingerprint: string;
+}
+
+// ─── Owner-declared criticality and scope (§ measurement) ────────────────────
+
+/**
+ * How much a surface matters, as its OWNER says rather than as a regex guesses.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * Risk ranking is an English money-word regex, and it is `\b`-bounded, so
+ * `/pay_now` and `/checkoutConfirm` both miss — the two highest-risk route
+ * spellings in the sample are exactly the two it cannot see. Worse, a code
+ * comment invited the customer to "tell us so" with nowhere in the product to
+ * do it. This vocabulary is that somewhere.
+ *
+ * Four levels and not a 1-10 score, because a number invites arithmetic across
+ * surfaces and the only question this answers is which list a gap goes on.
+ */
+export const COVERAGE_CRITICALITIES = ['CRITICAL', 'HIGH', 'NORMAL', 'LOW'] as const;
+export type CoverageCriticality = (typeof COVERAGE_CRITICALITIES)[number];
+
+export const COVERAGE_CRITICALITY_LABELS: Record<CoverageCriticality, string> = {
+  CRITICAL: 'money, auth or data loss',
+  HIGH: 'core workflow',
+  NORMAL: 'ordinary surface',
+  LOW: 'cosmetic or internal',
+};
+
+/** The weight each level contributes when a report ranks gaps. */
+export const COVERAGE_CRITICALITY_WEIGHT: Record<CoverageCriticality, number> = {
+  CRITICAL: 8,
+  HIGH: 4,
+  NORMAL: 1,
+  LOW: 0.25,
+};
+
+/** One owner-declared statement about one glob of surface. */
+export interface CoverageScopeRule {
+  /**
+   * A glob over surface keys or route templates: `ROUTE:/admin/**`,
+   * `/checkout*`. Matched against `SurfaceItem.key` and its label, so a
+   * customer can write either and does not have to learn our key format to
+   * use the feature.
+   */
+  pattern: string;
+  /** Why this rule exists. A scope rule with no reason is a silent exclusion. */
+  reason: string;
+}
+
+/**
+ * What the customer owns about their own measurement.
+ *
+ * ── OUT OF SCOPE IS NOT WAIVED, AND THE DIFFERENCE IS DELIBERATE ────────────
+ *
+ * A `CoverageWaiver` is a decision about ONE item, with an owner and an expiry,
+ * and it is listed beside the number every time the number is shown.
+ * `outOfScope` is a standing statement that a whole region of the application —
+ * an internal admin tool, a vendored iframe, a deprecated area behind a flag —
+ * is not part of what this project is measuring at all. Both leave the
+ * denominator; they leave it for different reasons, and merging them would mean
+ * either a per-item waiver with no owner or a glob with a single expiry date.
+ *
+ * Every rule still carries a reason, every excluded item is still COUNTED and
+ * NAMED in the report's held-out lists, and `maxOutOfScopePercent` exists
+ * because a scope configuration that can exclude everything is a coverage
+ * number its own owner can set to 100.
+ */
+export interface CoverageConfig {
+  /**
+   * Per-glob criticality, most specific last — a later rule wins, which is the
+   * convention every ignore-file in existence already uses.
+   */
+  criticality: Array<CoverageScopeRule & { level: CoverageCriticality }>;
+  /** Globs the customer declares are not part of this project's surface. */
+  outOfScope: CoverageScopeRule[];
+  /**
+   * Extra weight for a glob when ranking gaps, multiplying the criticality
+   * weight. Null for the ordinary case; a number so a team can say "our
+   * checkout matters four times as much as the level alone implies".
+   */
+  weights: Array<CoverageScopeRule & { multiplier: number }>;
+  /**
+   * The ceiling on how much of the denominator `outOfScope` may remove, as a
+   * percentage. The brake on the one setting in this product a customer could
+   * otherwise use to make their own coverage number say anything. When the
+   * rules would exceed it, the reader reports the cap AS A COUNT AND AS A
+   * REASON and keeps the items in the denominator rather than silently applying
+   * half the configuration.
+   */
+  maxOutOfScopePercent: number;
 }

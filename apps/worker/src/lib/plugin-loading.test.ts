@@ -566,6 +566,35 @@ function fakeWorld(rows: Array<EnabledPluginRow & { enabled: boolean }>): {
       deleteMany: async () => ({ count: 0 }),
       createMany: async () => ({ count: 0 }),
     },
+    /*
+     * The same trap as `mutationSurvivor` above, one slice later, and it bit:
+     * `persistExecution` clears the measurement rows on EVERY result — both
+     * deletes run even when the execution reported no matrix, so that a cell
+     * from a previous attempt cannot outlive the attempt that produced it.
+     * That makes both delegates reachable on every run, and without them the
+     * call threw, the outer catch turned it into a run-level error, and this
+     * file's 'runs the suite anyway' test failed as ERRORED — a test about
+     * PLUGIN LOADING reporting a measurement-ingest fault, with the real cause
+     * nowhere in the log. A delegate used inside `$transaction` has to be on
+     * `tx`; at the top level it changes nothing here.
+     *
+     * `createManyAndReturn` ECHOES the rows it is handed rather than returning
+     * `[]`. The writer maps the inserted ids back onto the readings that named
+     * each cell and throws when one is missing, so a stub that swallowed its
+     * input would turn a silent fake into a spurious 500 the day a test in this
+     * file does report a matrix.
+     */
+    testResultVariant: {
+      deleteMany: async () => ({ count: 0 }),
+      createManyAndReturn: async (args: { data: Array<Record<string, unknown>> }) =>
+        args.data.map((row, index) => ({ ...row, id: `variant${index + 1}` })),
+    },
+    testMetricSample: {
+      deleteMany: async () => ({ count: 0 }),
+      createMany: async (args: { data: Array<Record<string, unknown>> }) => ({
+        count: args.data.length,
+      }),
+    },
   };
 
   h.prisma = {

@@ -418,7 +418,8 @@ Coverage options (qaai coverage, full detail in \`qaai coverage\` with no args):
                       Default status is UNCOVERED, which is the point of it.
 
 Reporters (repeatable, and composable with --junit):
-  --reporter <name>   junit | allure | testrail
+  --reporter <name>   junit | allure | testrail  (sarif, evidence-pack: exist, but
+                      are rendered by @qaai/runner, not by this CLI)
   --reporter-out <p>  Where the --reporter before it writes. Defaults:
                       junit -> junit.xml, allure -> allure-results/ (a
                       directory), testrail -> uploaded, no file written

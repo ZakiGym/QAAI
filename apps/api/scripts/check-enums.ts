@@ -74,6 +74,21 @@ const API_SURFACE = fileURLToPath(
 const AUTH_PROFILES = fileURLToPath(
   new URL('../../../packages/shared/src/auth-profiles.ts', import.meta.url),
 );
+/*
+ * The measurement vocabulary: the coverage ladder and where an edge's evidence
+ * came from. In @qaai/shared and NOT in constants.ts for the same reason as the
+ * six above — `coverage-tiers.ts` holds the rank table, the per-source ceiling
+ * and the promotion rule beside the vocabulary, and it also holds nothing else,
+ * so dragging two lists into constants.ts would separate them from the only
+ * code that interprets them.
+ *
+ * The metric channel's two enums are NOT here: `METRIC_UNITS` and
+ * `METRIC_DIRECTIONS` live in types.ts, beside `TestMetric`, which is the shape
+ * a plugin returns. They are paired below with `source: 'types'`.
+ */
+const COVERAGE_TIERS_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/coverage-tiers.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -97,10 +112,26 @@ const PAIRS: Array<{
     | 'flowMap'
     | 'requirements'
     | 'apiSurface'
-    | 'authProfiles';
+    | 'authProfiles'
+    | 'coverageTiers';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
+  /*
+   * Whether a test passed, which is the enum the ENTIRE product's pass/fail
+   * arithmetic is built on — and it had no drift guard for the life of this
+   * repo. Found by the durable half of
+   * `check-enums.measurement.test.ts` ("pair every enum the new models
+   * store"), which went red because "TestResultVariant"."status" stores it:
+   * exactly the same class of finding as `AuthProfileKind`, which that
+   * mechanism caught one round earlier.
+   *
+   * Unlike `AuthProfileKind` it can go straight in. Its five labels have been
+   * deployed since the init migration and this round adds none, so all three
+   * sources — schema.prisma, constants.ts and the live database — agree today
+   * and the LIVE half is not blocked on a deploy.
+   */
+  { prismaEnum: 'TestResultStatus', tsConst: 'TEST_RESULT_STATUSES' },
   { prismaEnum: 'Verdict', tsConst: 'VERDICTS' },
   { prismaEnum: 'Language', tsConst: 'LANGUAGES' },
   { prismaEnum: 'RunShardStatus', tsConst: 'RunShardStatus', source: 'types', kind: 'union' },
@@ -364,6 +395,47 @@ const PAIRS: Array<{
     tsConst: 'SURFACE_DRIFT_COMPARABILITIES',
     source: 'constants',
   },
+  /*
+   * ── The measurement (§ coverage) ──────────────────────────────────────────
+   *
+   * Four, and all four are filtered on, which is what earned each one a
+   * database type instead of a TEXT column — and is therefore exactly what
+   * makes each one a value a row may hold and TypeScript may not know about.
+   *
+   * The reason to be strict about these four specifically: every one of them
+   * participates in deciding the HEADLINE NUMBER. The enumeration enums decide
+   * what is in the denominator; these decide what is in the numerator and how
+   * strong it is, and a value that falls through a switch here does not produce
+   * an obviously-wrong screen — it produces a plausible percentage that is
+   * wrong, which is the one failure mode a coverage product cannot survive.
+   */
+  // The ladder. THE highest-stakes member of the four: `COVERAGE_TIER_RANK` is
+  // a `Record` keyed on this union, so a sixth rung in the database that
+  // TypeScript cannot name would have NO RANK — `tierAtLeast` would throw or,
+  // worse, compare `undefined` and answer false, which silently demotes every
+  // item at that rung and makes the number fall for a reason nobody can find.
+  // A rung MISSING from the Prisma enum is the mirror and is worse: the rung
+  // exists in every report and no row can store it, so the writer fails at run
+  // time on an insert.
+  { prismaEnum: 'CoverageTier', tsConst: 'COVERAGE_TIERS', source: 'coverageTiers' },
+  // Where an edge's evidence came from. `COVERAGE_EDGE_SOURCE_CEILING` is also a
+  // `Record` keyed on this union, and it is the single line that stops a regex
+  // claiming PASSING. A fourth source the database accepts and TypeScript cannot
+  // name would have no ceiling at all.
+  {
+    prismaEnum: 'CoverageEdgeSource',
+    tsConst: 'COVERAGE_EDGE_SOURCES',
+    source: 'coverageTiers',
+  },
+  // What a metric is measured in. A unit a row holds and TypeScript cannot name
+  // renders as a bare number beside numbers that have units, which is the thing
+  // a reader misreads — and `MetricUnit` is on the write path for every vital,
+  // every k6 threshold and every visual diff ratio the product will ever store.
+  { prismaEnum: 'MetricUnit', tsConst: 'METRIC_UNITS', source: 'types' },
+  // Which way is better. Two members, and a gate reads it to decide whether a
+  // number going UP is a regression: a direction the database accepts and
+  // TypeScript cannot name is a gate that fires backwards.
+  { prismaEnum: 'MetricDirection', tsConst: 'METRIC_DIRECTIONS', source: 'types' },
 ];
 
 /*
@@ -467,6 +539,7 @@ const flowMap = readFileSync(FLOW_MAP, 'utf8');
 const requirements = readFileSync(REQUIREMENTS, 'utf8');
 const apiSurface = readFileSync(API_SURFACE, 'utf8');
 const authProfiles = readFileSync(AUTH_PROFILES, 'utf8');
+const coverageTiers = readFileSync(COVERAGE_TIERS_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -476,7 +549,8 @@ const SOURCES: Record<
   | 'flowMap'
   | 'requirements'
   | 'apiSurface'
-  | 'authProfiles',
+  | 'authProfiles'
+  | 'coverageTiers',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -488,6 +562,7 @@ const SOURCES: Record<
   requirements: { text: requirements, label: 'shared/requirements.ts' },
   apiSurface: { text: apiSurface, label: 'shared/api-surface.ts' },
   authProfiles: { text: authProfiles, label: 'shared/auth-profiles.ts' },
+  coverageTiers: { text: coverageTiers, label: 'shared/coverage-tiers.ts' },
 };
 const problems: string[] = [];
 

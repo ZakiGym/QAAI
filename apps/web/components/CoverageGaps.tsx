@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../lib/api';
 import type {
+  CoverageAxisReading,
   CoverageFormSummary,
   CoverageGap,
   CoverageProposeResult,
@@ -140,64 +141,120 @@ export function useCoverage(projectId: string | null, projectSettling: boolean):
 // ─── The answer, before the list ─────────────────────────────────────────────
 
 /**
- * One dimension of the crawl, as a share of itself.
+ * One axis, as a share of ITSELF, from the server's own reading of it.
  *
- * A total of zero renders as "none found" rather than 0%: a crawl that turned
- * up no forms is not a suite that fails to test them, and a dead-empty bar
- * saying 0% is the single most misread thing this screen could draw.
+ * No division happens here any more. `reading.percent` and
+ * `reading.provenPercent` arrive computed by `coverageAxisReadings` in
+ * packages/agent, which is also what the CLI, a CI gate and a badge read — a
+ * `Math.round((covered / total) * 100)` in this component is a second
+ * implementation of the one division this product sells, and two
+ * implementations are two percentages.
+ *
+ * `measured: false` renders "none found" rather than 0%: a crawl that turned up
+ * no forms is not a suite that fails to test them, and a dead-empty bar saying
+ * 0% is the single most misread thing this screen could draw.
  */
-function Dimension({ label, covered, total }: { label: string; covered: number; total: number }) {
-  const pct = total === 0 ? null : Math.round((covered / total) * 100);
+function Dimension({ reading }: { reading: CoverageAxisReading }) {
   return (
     <div>
       <p className="text-meta text-ink-faint mb-1.5 font-mono tracking-[0.08em] uppercase">
-        {label}{' '}
-        {pct === null ? (
+        {reading.label}{' '}
+        {!reading.measured || reading.provenPercent === null ? (
           <span className="text-ink-faint">none found</span>
         ) : (
-          <span className="text-ink tabular-nums">{pct}%</span>
+          <span className="text-ink tabular-nums">{reading.provenPercent}%</span>
         )}
       </p>
       <span className="bg-surface-2 block h-1 overflow-hidden rounded-full">
-        {pct !== null && (
-          <span className="bg-accent block h-full rounded-full" style={{ width: `${pct}%` }} />
+        {reading.provenPercent !== null && (
+          <span
+            className="bg-accent block h-full rounded-full"
+            style={{ width: `${reading.provenPercent}%` }}
+          />
         )}
       </span>
+      {/*
+        The weight is on screen beside the number because the headline is a
+        weighted mean and a weight nobody can see is a weight nobody can argue
+        with — which is exactly how CONTROL came to be 80% of the old figure
+        without anybody deciding it should be.
+      */}
+      {reading.measured && (
+        <p className="text-ink-faint text-row-sub mt-1">
+          {reading.covered} of {reading.denominator} · weight{' '}
+          <span className="tabular-nums">{reading.weight}</span>
+          {reading.mentionOnly > 0 && (
+            <>
+              {' '}
+              · <span className="tabular-nums">{reading.mentionOnly}</span> on a mention only
+            </>
+          )}
+        </p>
+      )}
     </div>
   );
 }
 
 /**
- * The lead: the answer as a sentence, then the four ratios it is made of.
+ * The lead: the answer as a BOUND, then each axis's own ratio.
  *
- * The percentage is asserted-over-proven across every dimension the crawl
- * measured, which is the only honest way to state it — coverage here is against
- * what the application demonstrably does, not against lines of code, and the
- * sentence under the number says so because people assume otherwise.
+ * ── WHAT THIS COMPONENT USED TO DO, AND WHY IT WAS WRONG ────────────────────
+ *
+ *     const proven = t.routes + t.journeys + t.forms + t.affordances;
+ *     const asserted = t.routesVisited + t.journeysWalked + …;
+ *     const pct = Math.round((asserted / proven) * 100);
+ *
+ * Four denominators added together. A crawl finds a few dozen routes, a handful
+ * of journeys, a few forms — and one affordance per clickable thing on every
+ * page, which is thousands. So CONTROL silently became roughly 80% of the
+ * headline; nobody decided that, it is what happens when you add a count of
+ * pages to a count of buttons. A code comment that merely named four labels
+ * once moved the quoted number from 2% to 11%, because the axis dominating the
+ * sum changed. And because it lived here, the number could not leave the page:
+ * no CLI, CI gate, badge or digest could obtain it.
+ *
+ * It is now computed once in packages/agent and arrives on `report.headline`.
+ * THIS COMPONENT DOES NO ARITHMETIC. Every figure below is rendered from a
+ * field, which is what makes the screen and a CI gate quote the same number.
  */
 function CoverageHeadline({ report }: { report: CoverageReport }) {
   const t = report.totals;
-  const proven = t.routes + t.journeys + t.forms + t.affordances;
-  const asserted = t.routesVisited + t.journeysWalked + t.formsExercised + t.affordancesUsed;
-  const pct = proven === 0 ? null : Math.round((asserted / proven) * 100);
+  const head = report.headline;
   const unreadable = t.tests - t.testsWithReadableRoutes;
 
   return (
     <>
       <p className="font-display text-[28px] leading-[1.25] font-semibold">
-        {pct === null ? (
+        {head.lowerPercent === null ? (
           'The crawl proved nothing this report can measure against.'
         ) : (
           <>
-            <span className="tabular-nums">{pct}%</span> of proven behaviour is asserted.
+            <span className="tabular-nums">{head.lowerPercent}%</span> of proven behaviour is
+            asserted
+            {head.upperPercent !== null && head.upperPercent !== head.lowerPercent && (
+              <>
+                , at most <span className="tabular-nums">{head.upperPercent}%</span>
+              </>
+            )}
+            .
           </>
         )}
       </p>
       <p className="text-ink-dim text-body-sm mt-2">
-        The crawler proved <span className="tabular-nums">{t.routes}</span> states and{' '}
-        <span className="tabular-nums">{t.journeys + t.forms + t.affordances}</span> actions; the
-        suite asserts <span className="tabular-nums">{asserted}</span> of them. Coverage is against
-        what the app can do — not lines of code
+        {/*
+          The LOWER edge is the headline, and the sentence says why there are
+          two: one percentage conflating proven and plausible is the thing a
+          customer quotes back at us, so the edge they quote has to be the one
+          that is defensible item by item.
+        */}
+        {head.lowerPercent !== null && (
+          <>
+            The lower figure counts only coverage established by a route literal or a quoted label;
+            the upper one also counts a bare substring mention, which the form and control matchers
+            accept on purpose. Quote the lower one.{' '}
+          </>
+        )}
+        Coverage is against what the app can do — not lines of code
         {report.flowMapVersion !== null && (
           <>
             {' '}
@@ -209,17 +266,60 @@ function CoverageHeadline({ report }: { report: CoverageReport }) {
       </p>
 
       {/*
-       * ROUTES / JOURNEYS / FORMS / CONTROLS, not the reference's ROUTES /
-       * FORMS / ROLES / A11Y: the coverage endpoint measures these four and
-       * says nothing about roles or accessibility, and a bar with no number
-       * behind it is worse than a bar that is missing.
+       * One block per axis, each a fraction of itself, each with its published
+       * weight on screen. Four percentages and a stated formula, rather than
+       * one percentage made of four incommensurable counts.
        */}
       <div className="mt-6 grid grid-cols-2 gap-x-5 gap-y-4 sm:grid-cols-4">
-        <Dimension label="Routes" covered={t.routesVisited} total={t.routes} />
-        <Dimension label="Journeys" covered={t.journeysWalked} total={t.journeys} />
-        <Dimension label="Forms" covered={t.formsExercised} total={t.forms} />
-        <Dimension label="Controls" covered={t.affordancesUsed} total={t.affordances} />
+        {head.axes.map((reading) => (
+          <Dimension key={reading.axis} reading={reading} />
+        ))}
       </div>
+
+      <p className="text-ink-faint text-row-sub mt-4">{head.formula}</p>
+
+      {head.renormalised && (
+        <p className="text-ink-dim text-row-sub mt-2">
+          {head.unmeasuredAxes.join(', ').toLowerCase()} enumerated nothing, so{' '}
+          {head.unmeasuredAxes.length === 1 ? 'its weight was' : 'their weights were'} spread over
+          the other axes rather than counted as 0%.
+        </p>
+      )}
+
+      {/*
+        How old the number is, always. A cached figure that does not say its own
+        age is a figure nobody can defend in the meeting it was brought to.
+      */}
+      <p className="text-ink-faint text-row-sub mt-2">
+        Computed{' '}
+        {report.cache.ageMs < 1000 ? (
+          'just now'
+        ) : (
+          <>
+            <span className="tabular-nums">{Math.round(report.cache.ageMs / 1000)}</span>s ago
+          </>
+        )}
+        {report.cache.hit && ' (cached)'}. Invalidated by any change to {report.cache.keyedOn}.
+      </p>
+
+      {report.ledger.coveredOnlyByQuarantined > 0 && (
+        <p className="text-ink-dim text-row-sub mt-2">
+          <span className="text-flake">Read this first:</span>{' '}
+          <span className="tabular-nums">{report.ledger.coveredOnlyByQuarantined}</span> item
+          {report.ledger.coveredOnlyByQuarantined === 1 ? ' is' : 's are'} covered only by a
+          quarantined test, whose result is suppressed from every gate. They are counted as gaps
+          here, because a test nothing gates on is not coverage.
+        </p>
+      )}
+
+      {report.provenance !== null && report.provenance.live > 0 && (
+        <p className="text-ink-faint text-row-sub mt-2">
+          <span className="tabular-nums">{report.provenance.runConfirmed}</span> of{' '}
+          <span className="tabular-nums">{report.provenance.live}</span> test-to-surface links have
+          been confirmed by a run. The rest prove a test NAMES the item, not that anything executed
+          it.
+        </p>
+      )}
 
       {unreadable > 0 && (
         <p className="text-ink-dim text-row-sub mt-4">

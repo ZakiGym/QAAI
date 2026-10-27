@@ -55,6 +55,14 @@ import {
   FORM_FIELD_SEMANTICS,
   UNEXERCISABLE_REASON_LABELS,
   controlsFromFlowMap,
+  /*
+   * The ONE division in this repo. Imported rather than reimplemented so the
+   * zero-denominator rule — percent is NULL, never 0 and never 100 — holds for
+   * the gap report's axes exactly as it holds for the surface snapshot's. A
+   * second `Math.round((a / b) * 100)` here is how the two screens would come
+   * to disagree about an empty project.
+   */
+  coveragePercent,
   exclusionsByRule,
 } from '@qaai/shared';
 import type {
@@ -65,6 +73,7 @@ import type {
   Selector,
   SurfaceExercisability,
   SurfaceExercise,
+  TestResultStatus,
   TestType,
   UnexercisableReason,
 } from '@qaai/shared';
@@ -114,7 +123,24 @@ export type Confidence = 'HIGH' | 'MEDIUM' | 'LOW';
 /** Caps. Each one protects the process; each one is reported when it bites. */
 const MAX_CODE_CHARS = 400_000;
 const MAX_NODES = 2000;
-const MAX_GAPS = 300;
+/**
+ * The hard ceiling on gaps RETURNED by one call.
+ *
+ * Was 300, and 300 was the bug. "Name the uncovered 38%" is this product's core
+ * promise, and a project with 800 untested controls could never see past the
+ * first 300 of them — the list was not merely short, it was unreachable,
+ * because the slice ran BEFORE the caller's `kind` and `minScore` filters were
+ * applied in apps/api/src/routes/coverage.ts. A reader filtering for
+ * UNSUBMITTED_FORM got the forms that happened to fall inside the top 300 by
+ * score and no indication that any others existed.
+ *
+ * So the analysis ceiling and the PAGE SIZE are now two different numbers. This
+ * is the ceiling: high enough that the route can page the whole list with a
+ * cursor, and still a ceiling, because a report is a response body and 20,000
+ * scored gaps with their evidence is not one. `totals.gaps` is exact either
+ * way, and the caveat names this cap whenever it bites.
+ */
+const MAX_GAPS = 5_000;
 const MAX_AFFORDANCE_GAPS = 40;
 const MAX_EVIDENCE_TESTS = 5;
 /** Refusals read off a flow map. Deduped by route first, so this is routes. */
@@ -353,6 +379,16 @@ export interface CoverageInput {
    * anonymously while claiming to cover the page behind the wall.
    */
   authProfiles?: AuthProfileChoice[];
+  /**
+   * The latest result per test, so coverage can be more than a claim about
+   * source. See {@link CoverageExecutionFact}.
+   *
+   * UNDEFINED means this caller did not ask the database and every ledger row
+   * reports `execution: null`. `[]` means it asked and nothing in this project
+   * has ever run, which is a different and much louder finding. The two are
+   * never merged: not measured is null, never a verdict.
+   */
+  executions?: CoverageExecutionFact[];
 }
 
 // ─── Outputs ─────────────────────────────────────────────────────────────────
@@ -565,6 +601,23 @@ export interface CoverageReport {
    * this product can obtain, because a human wrote it down.
    */
   reverse: ReverseReconciliation;
+  /**
+   * THE HEADLINE, per axis and as a published weighted bound.
+   *
+   * Here rather than in a component, which is the whole of register item 2: a
+   * percentage computed in React exists for the length of one render, so a
+   * CLI, a CI gate, a badge and a digest each had to reinvent it — and four
+   * reinventions of one number is four numbers. `headline.axes` carries each
+   * axis's own fraction over its own denominator; nothing adds them.
+   */
+  headline: CoverageHeadline;
+  /**
+   * The item-level ledger: what IS covered, by which tests, and whether those
+   * tests have run. The gap list is the absence; this is the presence, and
+   * without it "which tests cover /checkout?" had no answer anywhere in the
+   * product.
+   */
+  ledger: CoverageLedger;
   /** Changes whenever the answer could change. POST /propose checks it. */
   fingerprint: string;
 }
@@ -2004,6 +2057,715 @@ function describeDropped(dropped: BoundaryExpansion['dropped'], maxEntries = 4):
   }.`;
 }
 
+// ─── The headline, and the four denominators it must not add together ───────
+
+/**
+ * THE DEFECT THIS SECTION EXISTS TO END.
+ *
+ * The headline percentage was computed in a React component, like this:
+ *
+ *     const proven = t.routes + t.journeys + t.forms + t.affordances;
+ *     const asserted = t.routesVisited + t.journeysWalked + …;
+ *     const pct = Math.round((asserted / proven) * 100);
+ *
+ * Four denominators added together to make one fraction. Three things follow,
+ * and all three of them are wrong in the direction that flatters whoever is
+ * demoing:
+ *
+ * 1. THE WEIGHTS WERE AN ACCIDENT OF ROW COUNT. A crawl of a real application
+ *    finds a few dozen routes, a handful of journeys, a few forms — and one
+ *    affordance per clickable thing on every page, which is thousands. So
+ *    CONTROL silently became ~80% of the figure. Nobody decided that. It is
+ *    what happens when you add a count of pages to a count of buttons.
+ * 2. IT MOVED FOR REASONS THAT WERE NOT MEASUREMENTS. A code comment that
+ *    merely named four labels once moved the quoted number from 2% to 11%,
+ *    because the axis that dominated the sum changed.
+ * 3. NO CONSUMER OUTSIDE THE BROWSER COULD OBTAIN IT. It existed for the
+ *    length of one render. A CLI, a CI gate, a badge, a Slack digest and a
+ *    pull-request check all have to quote the same number as the screen, and
+ *    none of them could even read this one.
+ *
+ * So: every axis reports its OWN fraction over its OWN denominator, and the
+ * headline is a DEFINED, PUBLISHED, WEIGHTED MEAN of those fractions — never a
+ * ratio of summed counts. The weights are in {@link COVERAGE_AXIS_WEIGHT},
+ * printed in the payload, and the formula is in
+ * {@link coverageHeadlineFormula} so the number on the screen and the number
+ * in a CI gate are the same arithmetic over the same published constants.
+ */
+export const COVERAGE_AXES = ['ROUTE', 'JOURNEY', 'FORM', 'CONTROL'] as const;
+export type CoverageAxis = (typeof COVERAGE_AXES)[number];
+
+export const COVERAGE_AXIS_LABELS: Record<CoverageAxis, string> = {
+  ROUTE: 'routes',
+  JOURNEY: 'journeys',
+  FORM: 'forms',
+  CONTROL: 'controls',
+};
+
+/**
+ * WHAT ONE ITEM ON EACH AXIS IS, in the payload beside the figure.
+ *
+ * Printed rather than assumed, because the whole defect above is that four
+ * different units were added up. A reader who can see that one CONTROL is one
+ * button on one page and one JOURNEY is an entire checkout can tell at a glance
+ * why the two cannot share a denominator — and that is the sentence the old
+ * arithmetic made unsayable.
+ */
+export const COVERAGE_AXIS_UNIT: Record<CoverageAxis, string> = {
+  ROUTE: 'one application state the crawl reached',
+  JOURNEY: 'one multi-step outcome the Explorer named',
+  FORM: 'one state change a user can submit',
+  CONTROL: 'one affordance on one page',
+};
+
+/**
+ * THE PUBLISHED WEIGHTS. An editorial choice, stated as one.
+ *
+ * These are not measured and nothing in this repo pretends they are. They are
+ * a deliberate answer to the question the old sum answered by accident, and the
+ * reasoning is: weight by WHAT ONE ITEM COSTS A USER WHEN IT IS BROKEN, which
+ * runs opposite to how numerous the items are.
+ *
+ *   · JOURNEY highest — one untested journey is one whole outcome a customer
+ *     pays for that nothing checks end to end.
+ *   · ROUTE next — a state the application can be in, and the spine the other
+ *     three hang off.
+ *   · FORM next — a state CHANGE, so what breaks there is somebody's data,
+ *     but a form sits on a route that is already counted.
+ *   · CONTROL lowest, at a tenth — one button. It is also the axis with by far
+ *     the most rows, and giving the most numerous axis the smallest weight is
+ *     the explicit correction of the defect in this section's header. A tenth
+ *     rather than zero because an unclicked "Delete account" is a real finding;
+ *     it must be able to move the number, just not to be the number.
+ *
+ * SUMS TO 1, and `coverageHeadline` asserts it at run time rather than
+ * trusting this comment — a weight table that silently stopped summing to 1
+ * would make the headline drift without any axis moving, which is the same
+ * class of defect as the sum it replaces.
+ */
+export const COVERAGE_AXIS_WEIGHT: Record<CoverageAxis, number> = {
+  JOURNEY: 0.35,
+  ROUTE: 0.3,
+  FORM: 0.25,
+  CONTROL: 0.1,
+};
+
+/**
+ * The formula, in the payload, in one place, so no consumer invents a second.
+ *
+ * A FUNCTION AND NOT A CONSTANT, so the sentence is built from
+ * {@link COVERAGE_AXIS_WEIGHT} every time it is printed. A hand-written
+ * "JOURNEY 0.35, ROUTE 0.30, …" is prose that silently contradicts the code
+ * under it the moment somebody edits one weight — the easiest of this
+ * product's forbidden lies to commit by accident, and the worst place to
+ * commit it is the one sentence that tells a customer how their number was
+ * made. A const evaluated once at import would be derived and still frozen at
+ * whatever the table said when the module loaded.
+ */
+export function coverageHeadlineFormula(): string {
+  return (
+    'Each axis is covered/denominator for ITS OWN items. The headline is the ' +
+    'weighted mean of those per-axis percentages — ' +
+    COVERAGE_AXES.map((axis) => `${axis} ${COVERAGE_AXIS_WEIGHT[axis]}`).join(', ') +
+    ' — renormalised over the axes the crawl actually enumerated. It is NOT ' +
+    '(sum of covered) / (sum of denominators): routes, journeys, forms and ' +
+    'controls are four different units and adding their counts makes the most ' +
+    'numerous axis the answer.'
+  );
+}
+
+/** Why two numbers and not one. In the payload for the same reason. */
+export const COVERAGE_BOUND_RULE =
+  'lowerPercent counts only coverage established by a route or journey ' +
+  'LITERAL the extractor read out of the test, or a form or control label ' +
+  'quoted in the test source. upperPercent additionally counts coverage ' +
+  'established by a bare substring mention, which the form and control ' +
+  'matchers do deliberately — a false "nobody tests your signup form" is the ' +
+  'claim that makes a team close the tab. Quote lowerPercent. It is the edge ' +
+  'that is defensible item by item.';
+
+/**
+ * How an axis's numerator was established. Per axis, because the matchers are
+ * asymmetric on purpose (see rule 1 in this file's header): a route either
+ * appears in a spec or it does not, and a form has no literal to be strict
+ * about.
+ */
+export type CoverageAxisEvidence = 'LITERAL' | 'MENTION';
+
+export const COVERAGE_AXIS_EVIDENCE: Record<CoverageAxis, CoverageAxisEvidence> = {
+  ROUTE: 'LITERAL',
+  JOURNEY: 'LITERAL',
+  FORM: 'MENTION',
+  CONTROL: 'MENTION',
+};
+
+/** One axis's reading of itself. Never combined with another's counts. */
+export interface CoverageAxisReading {
+  axis: CoverageAxis;
+  label: string;
+  /** What one item is. Printed so two axes are visibly not the same unit. */
+  unit: string;
+  /** This axis's items. NOT addable to another axis's. */
+  denominator: number;
+  /** Items this axis's matcher counts as covered, on any evidence. */
+  covered: number;
+  /**
+   * The subset of `covered` established WITHOUT a bare substring mention. The
+   * lower edge of the interval is built from these and nothing else.
+   */
+  provenCovered: number;
+  /** `covered - provenCovered`. Named rather than left to subtraction. */
+  mentionOnly: number;
+  /** NULL — never 0, never 100 — when this axis enumerated nothing. */
+  percent: number | null;
+  /** The same division over `provenCovered`. NULL on a zero denominator. */
+  provenPercent: number | null;
+  /** How this axis's matcher works. See COVERAGE_AXIS_EVIDENCE. */
+  evidence: CoverageAxisEvidence;
+  /** The published weight. Constant, and here so a reader need not look it up. */
+  weight: number;
+  /**
+   * The weight this axis carried in THIS headline, after renormalising over
+   * the axes that enumerated anything. NULL when the axis is unmeasured and
+   * therefore carried none — not 0, because 0 is a weight somebody chose.
+   */
+  effectiveWeight: number | null;
+  /** False when `denominator` is 0: the crawl found no items of this kind. */
+  measured: boolean;
+}
+
+/** The headline, as a bound, with its formula and its weights attached. */
+export interface CoverageHeadline {
+  /**
+   * THE NUMBER TO QUOTE. Proven coverage only, as a weighted mean of the
+   * per-axis `provenPercent`. NULL when no axis enumerated anything.
+   */
+  lowerPercent: number | null;
+  /** The same mean over `percent`, so the generous matchers are visible. */
+  upperPercent: number | null;
+  /** "34–61%", or null when nothing was measured. Never "0%" for unmeasured. */
+  range: string | null;
+  /** The field a consumer must quote, named in the payload. */
+  quotes: 'lowerPercent';
+  formula: string;
+  boundRule: string;
+  /** The published table, so a disagreement is about the weights and not the code. */
+  weights: Record<CoverageAxis, number>;
+  axes: CoverageAxisReading[];
+  measuredAxes: CoverageAxis[];
+  /** Axes the crawl enumerated nothing for. NOT 0% — see the surface rule. */
+  unmeasuredAxes: CoverageAxis[];
+  /** True when an unmeasured axis made the weights be rescaled. Disclosed. */
+  renormalised: boolean;
+  /** The refusal, in the payload, so no consumer reintroduces the old sum. */
+  notASumOfDenominators: string;
+  why: string;
+}
+
+/** The per-axis counts this report derives, as the only input to the headline. */
+export interface CoverageAxisCounts {
+  denominator: number;
+  covered: number;
+  /** Must be <= `covered`. `coverageAxisReadings` refuses otherwise. */
+  provenCovered: number;
+}
+
+/**
+ * Build one reading per axis.
+ *
+ * Refuses a `provenCovered` above `covered`, and a `covered` above
+ * `denominator`, rather than clamping either. A clamp here would turn a
+ * counting bug upstream into a plausible-looking percentage, and a plausible
+ * wrong number is the only kind this product cannot survive.
+ */
+export function coverageAxisReadings(
+  counts: Record<CoverageAxis, CoverageAxisCounts>,
+): CoverageAxisReading[] {
+  const measured = COVERAGE_AXES.filter((axis) => counts[axis].denominator > 0);
+  const weightOfMeasured = measured.reduce((sum, axis) => sum + COVERAGE_AXIS_WEIGHT[axis], 0);
+
+  return COVERAGE_AXES.map((axis): CoverageAxisReading => {
+    const { denominator, covered, provenCovered } = counts[axis];
+    if (covered > denominator) {
+      throw new Error(
+        `coverage axis ${axis}: covered ${covered} exceeds its denominator ${denominator}`,
+      );
+    }
+    if (provenCovered > covered) {
+      throw new Error(
+        `coverage axis ${axis}: provenCovered ${provenCovered} exceeds covered ${covered}`,
+      );
+    }
+    const isMeasured = denominator > 0;
+    return {
+      axis,
+      label: COVERAGE_AXIS_LABELS[axis],
+      unit: COVERAGE_AXIS_UNIT[axis],
+      denominator,
+      covered,
+      provenCovered,
+      mentionOnly: covered - provenCovered,
+      percent: coveragePercent(covered, denominator),
+      provenPercent: coveragePercent(provenCovered, denominator),
+      evidence: COVERAGE_AXIS_EVIDENCE[axis],
+      weight: COVERAGE_AXIS_WEIGHT[axis],
+      effectiveWeight:
+        isMeasured && weightOfMeasured > 0
+          ? Math.round((COVERAGE_AXIS_WEIGHT[axis] / weightOfMeasured) * 1000) / 1000
+          : null,
+      measured: isMeasured,
+    };
+  });
+}
+
+/** The weighted mean of one field across the measured axes, or null. */
+function weightedMean(
+  readings: readonly CoverageAxisReading[],
+  pick: (reading: CoverageAxisReading) => number | null,
+): number | null {
+  let weight = 0;
+  let total = 0;
+  for (const reading of readings) {
+    const value = pick(reading);
+    // An unmeasured axis is not 0% — it is absent from the mean entirely, and
+    // `renormalised` below says so. Treating it as 0 would make a crawl that
+    // found no forms look like a suite that tests none of them.
+    if (value === null || reading.effectiveWeight === null) continue;
+    weight += reading.effectiveWeight;
+    total += reading.effectiveWeight * value;
+  }
+  if (weight <= 0) return null;
+  return Math.round((total / weight) * 10) / 10;
+}
+
+/**
+ * The headline, from the readings and nothing else.
+ *
+ * Pure, synchronous, and in this package rather than in a component, which is
+ * the whole of register item 2: a number a CLI cannot obtain is a number six
+ * other consumers have to reinvent, and six reinventions of one percentage is
+ * six percentages.
+ */
+export function coverageHeadline(readings: readonly CoverageAxisReading[]): CoverageHeadline {
+  /*
+   * The weight table is asserted here rather than trusted.
+   *
+   * A table that silently stopped summing to 1 would move the headline without
+   * any axis moving — the same class of defect as the sum this replaces, and
+   * exactly as invisible. Checked against the DECLARED weights, not the
+   * renormalised ones, because renormalising is the legitimate case.
+   */
+  const declared = COVERAGE_AXES.reduce((sum, axis) => sum + COVERAGE_AXIS_WEIGHT[axis], 0);
+  if (Math.abs(declared - 1) > 1e-9) {
+    throw new Error(
+      `COVERAGE_AXIS_WEIGHT must sum to 1; it sums to ${declared}. The headline is a weighted mean and a table that does not sum to 1 moves it without any axis moving.`,
+    );
+  }
+
+  const measuredAxes = readings.filter((r) => r.measured).map((r) => r.axis);
+  const unmeasuredAxes = readings.filter((r) => !r.measured).map((r) => r.axis);
+  const lowerPercent = weightedMean(readings, (r) => r.provenPercent);
+  const upperPercent = weightedMean(readings, (r) => r.percent);
+
+  /*
+   * ── THE RATCHET HOLE RENORMALISING OPENS, REPORTED AS A NUMBER ────────────
+   *
+   * An unmeasured axis must not count as 0% — that rule is right, and dropping
+   * it from the mean is the correct implementation of it. The consequence is
+   * not harmless: the number RISES when the ENUMERATOR gets worse. Measured on
+   * a 20-route fixture, journeys and forms both sitting at 0%: stop enumerating
+   * those two and the headline goes from 15.5% to 38.8%, because 0.6 of the
+   * published weight left the mean and the two surviving axes were rescaled to
+   * carry it. Nothing about the suite changed. A crawler regression reads as a
+   * 23-point improvement.
+   *
+   * `renormalised: true` was the only warning, and a boolean is not a number.
+   * So the SHARE OF THE PUBLISHED WEIGHT this figure actually rests on goes in
+   * the sentence — a cap that bit, reported as a count and a reason, exactly as
+   * every other truncation in this file is — together with the one thing a
+   * reader is most likely to get wrong, which is comparing it against a figure
+   * measured over a different set of axes.
+   */
+  const weightCarried =
+    Math.round(measuredAxes.reduce((sum, axis) => sum + COVERAGE_AXIS_WEIGHT[axis], 0) * 1000) /
+    1000;
+
+  const why =
+    measuredAxes.length === 0
+      ? 'No axis enumerated anything, so there is no denominator and no percentage. This is NOT 0% coverage — it is a crawl that proved nothing to measure against.'
+      : `Weighted mean of ${measuredAxes.length} of ${COVERAGE_AXES.length} axes (${measuredAxes.map((axis) => `${COVERAGE_AXIS_LABELS[axis]} ${readings.find((r) => r.axis === axis)?.provenPercent ?? 0}%`).join(', ')}).` +
+        (unmeasuredAxes.length > 0
+          ? ` ${unmeasuredAxes.map((axis) => COVERAGE_AXIS_LABELS[axis]).join(', ')} enumerated nothing, so ${unmeasuredAxes.length === 1 ? 'its weight was' : 'their weights were'} redistributed over the rest rather than counted as 0%. This figure therefore rests on ${weightCarried} of the published weight of 1, rescaled to fill it: it is NOT comparable with a figure measured over a different set of axes, and it RISES if enumeration of a low-scoring axis stops.`
+          : ` All ${COVERAGE_AXES.length} axes enumerated something, so the full published weight of 1 is carried and no rescaling was applied.`);
+
+  return {
+    lowerPercent,
+    upperPercent,
+    range:
+      lowerPercent === null || upperPercent === null
+        ? null
+        : lowerPercent === upperPercent
+          ? `${lowerPercent}%`
+          : `${lowerPercent}–${upperPercent}%`,
+    quotes: 'lowerPercent',
+    formula: coverageHeadlineFormula(),
+    boundRule: COVERAGE_BOUND_RULE,
+    weights: COVERAGE_AXIS_WEIGHT,
+    axes: [...readings],
+    measuredAxes,
+    unmeasuredAxes,
+    renormalised: unmeasuredAxes.length > 0 && measuredAxes.length > 0,
+    notASumOfDenominators:
+      'This figure is a weighted mean of four per-axis percentages. Do not ' +
+      'recompute it as (routesVisited + journeysWalked + formsExercised + ' +
+      'affordancesUsed) / (routes + journeys + forms + affordances): that is ' +
+      'four denominators added together, and it makes controls — the most ' +
+      'numerous axis by an order of magnitude — roughly 80% of the answer.',
+    why,
+  };
+}
+
+// ─── Execution, and the three parts of the product that disagreed ───────────
+
+/**
+ * What a run told us about a test, as the only execution input this analysis
+ * sees.
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * Every number above was derived from test SOURCE and nothing else. So a test
+ * that always fails, a test that has never been executed, and a test the gates
+ * suppress entirely all closed a gap identically. Three parts of this product
+ * then disagreed about the same test: the coverage report called its route
+ * covered, `packages/runner/src/gates.ts` excluded it from every rule, and
+ * suite health counted it as a liability. A measurement that three of your own
+ * screens contradict is not a measurement.
+ *
+ * ── WHAT IS AND IS NOT FIXED BY THIS ────────────────────────────────────────
+ *
+ * A FAILING TEST IS STILL COVERAGE. Covered and failing are two facts, and
+ * pass/fail is the run report's job, not the denominator's. `ran` below is
+ * therefore satisfied by a FAILED result, deliberately, and this must not be
+ * "fixed" into a lower number.
+ *
+ * A QUARANTINED TEST IS NOT COVERAGE. This is the one that changes a number.
+ * A quarantined test's result is suppressed from every gate, so coverage
+ * attributed to it is coverage nothing will ever check — the item keeps the
+ * fact that somebody wrote a test for it and stops counting as exercised.
+ *
+ * A RETRY PASS IS NOT A PASS (§5), and is carried for the same reason: it is
+ * the run report's grade, not the denominator's, so it is recorded on the
+ * ledger row rather than used to withhold coverage.
+ *
+ * ── ABSENT IS NOT FAILED ────────────────────────────────────────────────────
+ *
+ * `CoverageInput.executions` being UNDEFINED means this caller did not ask the
+ * database, and every ledger row then reports `execution: null` — not "never
+ * ran". An EMPTY ARRAY means it asked and no test in this project has ever
+ * produced a result, which is a real and different finding. Not measured is
+ * null, never 0, and never a verdict.
+ */
+export interface CoverageExecutionFact {
+  testId: string;
+  runId: string;
+  /** The runner's own vocabulary. See TEST_RESULT_STATUSES in @qaai/shared. */
+  status: TestResultStatus;
+  /** When this result was recorded, ISO-8601. Compared, so "latest" is answerable. */
+  atIso: string;
+  /** §5 — a retry that passes is not a pass. Recorded, not used to withhold. */
+  retriedAndPassed?: boolean;
+  /**
+   * Whether this test's quarantine is IN FORCE — the caller's answer, from
+   * `quarantineSuppresses` in @qaai/runner, not a read of `Test.quarantined`.
+   * An expired quarantine gates again, and this package cannot import the
+   * runner, so the question is answered on the way in.
+   */
+  quarantined?: boolean;
+}
+
+/**
+ * The honest reading of one item's execution evidence, in the vocabulary
+ * `SURFACE_STATUSES` already uses.
+ *
+ * COVERED means a matched test was observed to run. ASSERTED_NOT_RUN means one
+ * exists and has not been. The two words are deliberately the same two
+ * `packages/shared/src/surface.ts` uses, because a second definition of covered
+ * inside one product is a second percentage.
+ */
+export interface CoverageItemExecution {
+  /** A non-quarantined matched test produced a terminal, non-SKIPPED result. */
+  ran: boolean;
+  /** The newest matched result by timestamp. Pass or fail — both are coverage. */
+  lastStatus: TestResultStatus | null;
+  lastRunId: string | null;
+  /** Matched tests whose quarantine is in force. Their results gate nothing. */
+  quarantinedTestIds: string[];
+  /** Matched tests that only passed after a retry. §5: not a pass. */
+  retryPassTestIds: string[];
+  status: 'COVERED' | 'ASSERTED_NOT_RUN';
+  why: string;
+}
+
+/**
+ * One covered item, and which tests cover it.
+ *
+ * ── WHY THE REPORT CARRIED ONLY GAPS ────────────────────────────────────────
+ *
+ * `CoverageReport.gaps` is the absence. It was the ENTIRE item-level content of
+ * this report, which made three questions unanswerable: "which tests cover
+ * /checkout?", "what is tested nine times?" and "what is held up by exactly one
+ * test?". The first is the traceability matrix an auditor asks for; the third
+ * is the single most useful risk signal in a suite, because an item covered by
+ * one test is one `.skip` away from being a gap.
+ */
+export interface CoverageLedgerItem {
+  axis: CoverageAxis;
+  /** `AXIS:subject`, stable for a given subject, so a client can hold it. */
+  key: string;
+  title: string;
+  route: string | null;
+  /** Covering tests, capped at MAX_LEDGER_TESTS_PER_ITEM. `testCount` is exact. */
+  testIds: string[];
+  /** EXACT, and never capped. The authority for any arithmetic. */
+  testCount: number;
+  /** True when `testIds` is shorter than `testCount`. */
+  testIdsTruncated: boolean;
+  /** How this axis's matcher established the link. See COVERAGE_AXIS_EVIDENCE. */
+  evidence: CoverageAxisEvidence;
+  /** NULL when the caller supplied no executions — not "never ran". */
+  execution: CoverageItemExecution | null;
+}
+
+/** Per item, so a reader can see the long tail and not just the ranked head. */
+export const MAX_LEDGER_ITEMS = 2_000;
+export const MAX_LEDGER_TESTS_PER_ITEM = 10;
+
+/**
+ * The item-level ledger, with every cap that bit reported as a count AND as a
+ * reason.
+ *
+ * `total` is the number of covered items, uncapped. `returned` is what fits.
+ * A reader that measured `items.length` and called it the covered count would
+ * report 2,000 for a project with 19,000, which is the precise shape of a cap
+ * that bit unreported.
+ */
+export interface CoverageLedger {
+  items: CoverageLedgerItem[];
+  /** EXACT count of covered items across all four axes. Never capped. */
+  total: number;
+  returned: number;
+  truncated: boolean;
+  /** Items whose only coverage is a single test. One `.skip` from a gap. */
+  singleTested: number;
+  /** Items with four or more covering tests. The other end of the same tail. */
+  overTested: number;
+  /**
+   * Items a quarantined test is the ONLY cover for.
+   *
+   * These are NOT in `total` and have NO row in `items`. A suppressed result
+   * gates nothing, so such an item is not covered: it is reported as a GAP,
+   * and this count is how a reader learns the gap is a suppression rather than
+   * a missing test. `total` counts ledger rows, and these have none.
+   *
+   * THE COMMENT HERE USED TO SAY THEY WERE "counted in `total` — somebody did
+   * write a test". They are not, and never were: `buildLedger` takes `total`
+   * from `rows.length`, and an item whose only cover is quarantined never gets
+   * a row (its own doc note two fields down says exactly that — "such an item
+   * is not covered, so it has no ledger row"). A fixture with one quarantined
+   * cover reports `total: 15` for 15 rows and `coveredOnlyByQuarantined: 1`
+   * pointing at nothing in `items`. A reader who believed the old sentence
+   * would have subtracted this count out of `total` and undercounted their own
+   * coverage — a doc comment contradicting the code under it, which is one of
+   * the lies this product cannot afford.
+   */
+  coveredOnlyByQuarantined: number;
+  /** NULL when the caller supplied no executions at all. Not 0. */
+  neverRun: number | null;
+  capsThatBit: string[];
+  rule: string;
+}
+
+/**
+ * The newest-first reading of the facts for one item's covering tests.
+ *
+ * Returns null when `facts` is undefined, which is the "nobody asked the
+ * database" case and must not be rendered as a verdict.
+ */
+export function readItemExecution(
+  testIds: readonly string[],
+  byTest: ReadonlyMap<string, CoverageExecutionFact> | null,
+): CoverageItemExecution | null {
+  if (byTest === null) return null;
+
+  let latest: CoverageExecutionFact | null = null;
+  let ran = false;
+  const quarantinedTestIds: string[] = [];
+  const retryPassTestIds: string[] = [];
+
+  for (const testId of testIds) {
+    const fact = byTest.get(testId);
+    if (!fact) continue;
+    if (fact.quarantined === true) {
+      quarantinedTestIds.push(testId);
+      // Deliberately NOT counted towards `ran`, and deliberately still
+      // allowed to win `lastStatus` below: the result exists and a reader is
+      // entitled to see it. What it may not do is make the item exercised.
+      continue;
+    }
+    if (fact.retriedAndPassed === true) retryPassTestIds.push(testId);
+    // SKIPPED is not a run: a skipped test asserted nothing. A FAILED one did.
+    if (fact.status !== 'SKIPPED') ran = true;
+    if (!latest || fact.atIso > latest.atIso) latest = fact;
+  }
+
+  const status = ran ? 'COVERED' : 'ASSERTED_NOT_RUN';
+  const why = ran
+    ? `a matched test ran and reported ${latest?.status ?? 'a terminal status'}${retryPassTestIds.length > 0 ? `; ${retryPassTestIds.length} of them only passed on a retry, which §5 does not count as a pass` : ''}`
+    : quarantinedTestIds.length > 0
+      ? `${quarantinedTestIds.length} matched test${quarantinedTestIds.length === 1 ? ' is' : 's are'} quarantined, so ${quarantinedTestIds.length === 1 ? 'its result' : 'their results'} gate nothing and cannot make this item exercised`
+      : 'a matched test exists and no run has executed it — written is not run';
+
+  return { ran, lastStatus: latest?.status ?? null, lastRunId: latest?.runId ?? null, quarantinedTestIds, retryPassTestIds, status, why };
+}
+
+/** Four zero denominators: the shape of a project with no readable crawl. */
+const EMPTY_AXIS_COUNTS: Record<CoverageAxis, CoverageAxisCounts> = {
+  ROUTE: { denominator: 0, covered: 0, provenCovered: 0 },
+  JOURNEY: { denominator: 0, covered: 0, provenCovered: 0 },
+  FORM: { denominator: 0, covered: 0, provenCovered: 0 },
+  CONTROL: { denominator: 0, covered: 0, provenCovered: 0 },
+};
+
+export const COVERAGE_LEDGER_RULE =
+  '`total` is the exact number of covered items and is never capped. `items` ' +
+  'is capped at MAX_LEDGER_ITEMS and `testIds` at MAX_LEDGER_TESTS_PER_ITEM — ' +
+  'use `total` and `testCount` for any arithmetic, and read `capsThatBit` ' +
+  'before concluding a list is complete. `execution: null` means no caller ' +
+  'asked the database; it does NOT mean the test never ran.';
+
+/**
+ * The ledger for a report with nothing in it.
+ *
+ * `neverRun` is NULL when no execution map was supplied and 0 when one was and
+ * there is nothing to count — the same distinction `execution: null` draws per
+ * row, kept at the aggregate so a consumer cannot read "0 never ran" off a
+ * report that never asked.
+ */
+function emptyLedger(byTest: ReadonlyMap<string, CoverageExecutionFact> | null): CoverageLedger {
+  return {
+    items: [],
+    total: 0,
+    returned: 0,
+    truncated: false,
+    singleTested: 0,
+    overTested: 0,
+    /*
+     * 0 and not null, deliberately: there is no readable crawl, so there are no
+     * items of any kind, so none of them is covered only by a suppressed test.
+     * That is a fact about an empty denominator and not a measurement withheld.
+     */
+    coveredOnlyByQuarantined: 0,
+    neverRun: byTest === null ? null : 0,
+    capsThatBit: [],
+    rule: COVERAGE_LEDGER_RULE,
+  };
+}
+
+/**
+ * Assemble the ledger, applying both caps and reporting each one that bit.
+ *
+ * `total` is taken from the input array's length BEFORE the slice, so the cap
+ * cannot change the count it is a cap on. That ordering is the whole guard: a
+ * reader measuring `items.length` on a 19,000-item project would otherwise
+ * report 2,000 covered items and no indication that it had been truncated.
+ */
+function buildLedger(
+  rows: readonly CoverageLedgerItem[],
+  byTest: ReadonlyMap<string, CoverageExecutionFact> | null,
+  /**
+   * Items whose ONLY cover is a quarantined test.
+   *
+   * PASSED IN, and not derived from `rows`, because it cannot be: such an item
+   * is not covered, so it has no ledger row — it is a GAP. Deriving it from the
+   * rows is what the first version of this field did, and the count could never
+   * be anything but zero. A field that cannot fire is worse than no field: it
+   * reads as a positive measurement of "none of your coverage is suppressed".
+   */
+  coveredOnlyByQuarantined: number,
+): CoverageLedger {
+  const total = rows.length;
+  const capsThatBit: string[] = [];
+
+  const perItemTruncated = rows.filter((row) => row.testIdsTruncated).length;
+  if (perItemTruncated > 0) {
+    capsThatBit.push(
+      `MAX_LEDGER_TESTS_PER_ITEM (${MAX_LEDGER_TESTS_PER_ITEM}) bit on ${perItemTruncated} item(s): their \`testIds\` list is partial. \`testCount\` on each row is exact and is the field to count.`,
+    );
+  }
+
+  /*
+   * Ranked by how FEW tests cover an item, then by key.
+   *
+   * Deliberately not alphabetical and not most-tested-first: when the cap bites
+   * it must keep the rows a reader needs, and an item held up by exactly one
+   * test is one `.skip` away from being a gap. Sorting the other way would
+   * spend the whole budget on the well-tested tail.
+   */
+  const ranked = [...rows].sort(
+    (left, right) => left.testCount - right.testCount || left.key.localeCompare(right.key),
+  );
+  const items = ranked.slice(0, MAX_LEDGER_ITEMS);
+  if (total > items.length) {
+    capsThatBit.push(
+      `MAX_LEDGER_ITEMS (${MAX_LEDGER_ITEMS}) bit: ${total} items are covered and the ${items.length} with the fewest covering tests are listed. \`total\` is exact.`,
+    );
+  }
+
+  return {
+    items,
+    total,
+    returned: items.length,
+    truncated: total > items.length,
+    // Over the WHOLE set and not the returned page, so the two risk figures
+    // describe the project rather than the slice that fitted.
+    singleTested: rows.filter((row) => row.testCount === 1).length,
+    overTested: rows.filter((row) => row.testCount >= 4).length,
+    coveredOnlyByQuarantined,
+    neverRun:
+      byTest === null
+        ? null
+        : rows.filter((row) => row.execution !== null && !row.execution.ran).length,
+    capsThatBit,
+    rule: COVERAGE_LEDGER_RULE,
+  };
+}
+
+/**
+ * Is this needle written as a QUOTED STRING in the test source, rather than
+ * merely appearing somewhere in it?
+ *
+ * The strict half of the FORM and CONTROL interval. `mentions` is a bare
+ * substring check, on purpose — see rule 2 in this file's header — but a bare
+ * substring is also how a control labelled "Save" is matched by the word
+ * "saved" in an unrelated assertion. A label inside quotes is somebody having
+ * typed `getByRole('button', { name: 'Delete account' })`, which is evidence of
+ * a different order, so it is what the LOWER edge of the bound is built from.
+ *
+ * Deliberately not a parse: this runs over a capped, lower-cased haystack and
+ * must stay linear. A quote character on either side is the whole test, and it
+ * is checked as a necessary condition for the lower bound rather than as proof
+ * of a locator.
+ */
+function quotesLiteral(facts: TestFacts, needle: string): boolean {
+  const trimmed = needle.trim().toLowerCase();
+  if (trimmed.length < 3) return false;
+  return (
+    facts.haystack.includes(`'${trimmed}'`) ||
+    facts.haystack.includes(`"${trimmed}"`) ||
+    facts.haystack.includes(`\`${trimmed}\``)
+  );
+}
+
 /**
  * A value as a human should read it in a step.
  *
@@ -2073,6 +2835,14 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
        * UNAVAILABLE for exactly this input.
        */
       reverse: reverseReconcile({ enumerated: null, tests: input.tests }),
+      /*
+       * Every denominator is 0, so every percentage is NULL and the headline
+       * is NULL — not 0%. "0% of your application is covered" and "we have
+       * never looked at your application" are different sentences, and only
+       * one of them is about the customer.
+       */
+      headline: coverageHeadline(coverageAxisReadings(EMPTY_AXIS_COUNTS)),
+      ledger: emptyLedger(input.executions === undefined ? null : new Map()),
       fingerprint: fingerprintOf(crawl.version, input.tests, []),
     };
   }
@@ -2092,6 +2862,103 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
   }
 
   const routeGapConfidence: Confidence = unknowns.length > 0 ? 'MEDIUM' : 'HIGH';
+
+  /*
+   * ── EXECUTION, AND THE ONE PLACE A QUARANTINED TEST STOPS COUNTING ────────
+   *
+   * `byTest` is NULL when the caller passed no `executions`, which keeps every
+   * ledger row's `execution` null rather than asserting "never ran" about a
+   * database nobody queried.
+   *
+   * `coveringFacts` is the subset of `facts` whose tests may close a gap. A
+   * quarantined test is excluded from it, and that is the one change in this
+   * function that moves a number: its result is suppressed from every gate, so
+   * coverage attributed to it is coverage nothing will ever check. Three parts
+   * of this product used to disagree about exactly these tests — the coverage
+   * report called their routes covered, gates.ts excluded them from every rule,
+   * and suite health counted them as a liability.
+   *
+   * `facts` itself is UNCHANGED and still supplies evidence, related test ids
+   * and the unknown bucket: the finding is "your only test for /refunds is
+   * quarantined", which needs that test named, not hidden.
+   *
+   * When `executions` is absent this is `facts` and the whole function behaves
+   * exactly as it did before — the input is additive by construction.
+   */
+  const byTest: Map<string, CoverageExecutionFact> | null =
+    input.executions === undefined
+      ? null
+      : new Map(
+          [...input.executions]
+            // Newest last, so the final write per test wins and "the latest
+            // result" does not depend on the caller's array order.
+            .sort((left, right) => left.atIso.localeCompare(right.atIso))
+            .map((fact) => [fact.testId, fact]),
+        );
+
+  const quarantinedTestIds = new Set<string>(
+    [...(byTest?.values() ?? [])].filter((fact) => fact.quarantined === true).map((f) => f.testId),
+  );
+  const coveringFacts =
+    quarantinedTestIds.size === 0
+      ? facts
+      : facts.filter((fact) => !quarantinedTestIds.has(fact.input.id));
+
+  if (quarantinedTestIds.size > 0) {
+    caveats.push(
+      `${quarantinedTestIds.size} test${quarantinedTestIds.size === 1 ? ' is' : 's are'} quarantined, so ${quarantinedTestIds.size === 1 ? 'its result is' : 'their results are'} suppressed from every gate and ${quarantinedTestIds.size === 1 ? 'it does' : 'they do'} not count as coverage here. Items whose only cover is quarantined appear as gaps and are counted in \`ledger.coveredOnlyByQuarantined\`.`,
+    );
+  }
+  if (input.executions === undefined) {
+    caveats.push(
+      'No run results were supplied to this analysis, so every covered item reports `execution: null` — not "never run". Written is not run, and this report cannot tell you which of the two applies.',
+    );
+  }
+
+  /** Rows for the item-level ledger, filled as each axis is measured. */
+  const ledgerRows: CoverageLedgerItem[] = [];
+
+  /**
+   * Items that WOULD be covered but for a quarantine.
+   *
+   * Counted at each numerator, which is the only place the two predicates — "a
+   * test matches" and "a test that gates anything matches" — are both in scope.
+   * Every one of these is reported as a gap, correctly, and this count is how a
+   * reader learns that the gap is a suppression rather than a missing test.
+   */
+  let suppressedOnly = 0;
+  /** Zero cost when nothing is quarantined: the second predicate is not run. */
+  const countIfSuppressedOnly = (wouldMatch: () => boolean): void => {
+    if (quarantinedTestIds.size > 0 && wouldMatch()) suppressedOnly += 1;
+  };
+
+  /** One covered item, with its covering tests read once. */
+  const ledgerRow = (
+    axis: CoverageAxis,
+    key: string,
+    title: string,
+    route: string | null,
+    covering: readonly TestFacts[],
+  ): void => {
+    const ids = [...new Set(covering.map((fact) => fact.input.id))];
+    ledgerRows.push({
+      axis,
+      key,
+      title,
+      route,
+      testIds: ids.slice(0, MAX_LEDGER_TESTS_PER_ITEM),
+      testCount: ids.length,
+      testIdsTruncated: ids.length > MAX_LEDGER_TESTS_PER_ITEM,
+      evidence: COVERAGE_AXIS_EVIDENCE[axis],
+      /*
+       * Read over ALL matched tests including the quarantined ones, which is
+       * why `visitorsOf` and not `coveringOf` feeds this at the call sites that
+       * can: the row's job is to say WHY an item is where it is, and "the two
+       * tests that cover this are both quarantined" is that sentence.
+       */
+      execution: readItemExecution(ids, byTest),
+    });
+  };
 
   /*
    * The roles available to a generated test. Not passing any is a legitimate
@@ -2175,13 +3042,38 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     }
   }
 
-  /** Which tests visit a given crawled route. */
+  /**
+   * Which tests visit a given crawled route — ALL of them, quarantined
+   * included. This is the evidence view, used for `relatedTestIds`, for
+   * adjacency and for the ledger's execution reading.
+   */
   const visitorsOf = (route: string): TestFacts[] =>
     facts.filter((f) => f.routes.some((r) => routeVisits(r, route)));
 
+  /**
+   * Which tests may CLOSE a gap on this route. `visitorsOf` minus the
+   * quarantined ones. Every numerator below is built from this and every
+   * evidence sentence from `visitorsOf`, and keeping the two apart is what
+   * lets the report say "your only test for this is suppressed" instead of
+   * either counting it or losing it.
+   */
+  const coveringOf = (route: string): TestFacts[] =>
+    coveringFacts.filter((f) => f.routes.some((r) => routeVisits(r, route)));
+
   const gaps: CoverageGap[] = [];
   const visitedRoutes = new Set<string>();
-  for (const node of routes) if (visitorsOf(node.route).length > 0) visitedRoutes.add(node.route);
+  for (const node of routes) {
+    const covering = coveringOf(node.route);
+    if (covering.length === 0) {
+      countIfSuppressedOnly(() => visitorsOf(node.route).length > 0);
+      continue;
+    }
+    visitedRoutes.add(node.route);
+    // The ledger row carries EVERY visitor, so a route covered by one live
+    // test and two quarantined ones reports all three with the quarantine
+    // named — the numerator above has already counted only the live one.
+    ledgerRow('ROUTE', `ROUTE:${node.route}`, node.title || node.route, node.route, visitorsOf(node.route));
+  }
 
   // ── 1 & 2. Routes nobody visits ────────────────────────────────────────────
   for (const node of routes) {
@@ -2348,11 +3240,26 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     const ordered = journeyRoutes.get(journey.id) ?? [];
     if (ordered.length === 0) continue;
 
-    const walkers = facts.filter((f) =>
+    // `coveringFacts`, so a journey walked only by a quarantined test is a
+    // gap. The `walkers` list below is used for nothing but the count, so
+    // there is no evidence sentence here to lose by narrowing it.
+    const walkers = coveringFacts.filter((f) =>
       ordered.every((route) => f.routes.some((r) => routeVisits(r, route))),
+    );
+    countIfSuppressedOnly(
+      () =>
+        walkers.length === 0 &&
+        facts.some((f) => ordered.every((route) => f.routes.some((r) => routeVisits(r, route)))),
     );
     if (walkers.length > 0) {
       journeysWalked += 1;
+      ledgerRow(
+        'JOURNEY',
+        `JOURNEY:${journey.id}`,
+        journey.name,
+        ordered[0] ?? null,
+        facts.filter((f) => ordered.every((route) => f.routes.some((r) => routeVisits(r, route)))),
+      );
       continue;
     }
 
@@ -2449,18 +3356,51 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
   // thing to be wrong about, so we would rather miss a real gap than invent one.
   let totalForms = 0;
   let formsExercised = 0;
+  /** The subset of `formsExercised` the lower edge of the bound may count. */
+  let formsProven = 0;
   for (const node of routes) {
     for (const form of node.forms) {
       totalForms += 1;
-      const submitMentioned =
-        form.submitLabel !== null && facts.some((f) => mentions(f, form.submitLabel!));
-      const fieldMentioned = facts.some(
-        (f) =>
-          /\.(fill|type|selectOption|setInputFiles|check|press)\s*\(/.test(f.input.code ?? '') &&
-          form.fields.some((field) => mentions(f, field.label)),
-      );
-      if (submitMentioned || fieldMentioned) {
+      /*
+       * The exerciser test, not merely the fact that one exists.
+       *
+       * This was two `facts.some(...)` calls that threw the matching test away,
+       * which is why the report could never answer "which test submits this
+       * form". Holding the list costs nothing and is what the ledger row and
+       * the lower edge of the bound are both built from.
+       */
+      const exercisesForm = (f: TestFacts): boolean =>
+        (form.submitLabel !== null && mentions(f, form.submitLabel)) ||
+        (/\.(fill|type|selectOption|setInputFiles|check|press)\s*\(/.test(f.input.code ?? '') &&
+          form.fields.some((field) => mentions(f, field.label)));
+      const exercisers = coveringFacts.filter(exercisesForm);
+      countIfSuppressedOnly(() => exercisers.length === 0 && facts.some(exercisesForm));
+      if (exercisers.length > 0) {
         formsExercised += 1;
+        /*
+         * THE STRICT HALF OF THE INTERVAL for this axis.
+         *
+         * A form has no literal to be strict about, so the matcher above is a
+         * bare substring check by design. The lower edge demands more: the
+         * label has to be QUOTED in the source AND the same test has to declare
+         * this form's route. Either alone is the generous reading — a test
+         * mentioning the word "email" somewhere in the suite is how every form
+         * in a product ends up reported as exercised.
+         */
+        const proven = exercisers.some(
+          (f) =>
+            f.routes.some((r) => routeVisits(r, node.route)) &&
+            ((form.submitLabel !== null && quotesLiteral(f, form.submitLabel)) ||
+              form.fields.some((field) => quotesLiteral(f, field.label))),
+        );
+        if (proven) formsProven += 1;
+        ledgerRow(
+          'FORM',
+          `FORM:${node.route}#${form.name}`,
+          `${form.name} on ${node.route}`,
+          node.route,
+          exercisers,
+        );
         continue;
       }
 
@@ -2531,16 +3471,33 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
     nodes: routes.map((n) => ({ route: n.route, affordances: n.affordances })),
   });
   let affordancesUsed = 0;
+  /** The subset of `affordancesUsed` the lower edge of the bound may count. */
+  let affordancesProven = 0;
   const affordanceGaps: CoverageGap[] = [];
 
   for (const locator of allControls) {
-    const used = facts.some(
-      (f) =>
-        (mentions(f, locator.label) || mentions(f, locator.expression)) &&
-        f.routes.some((route) => routeVisits(route, locator.route)),
-    );
-    if (used) {
+    // Same change as the form axis: hold the users rather than asking whether
+    // any exists, so the ledger can name them and the bound can grade them.
+    const usesControl = (f: TestFacts): boolean =>
+      (mentions(f, locator.label) || mentions(f, locator.expression)) &&
+      f.routes.some((route) => routeVisits(route, locator.route));
+    const users = coveringFacts.filter(usesControl);
+    countIfSuppressedOnly(() => users.length === 0 && facts.some(usesControl));
+    if (users.length > 0) {
       affordancesUsed += 1;
+      // Route co-location is already required above, so the strict bar here is
+      // the label written as a quoted string — `getByRole('button', { name:
+      // 'Delete account' })` rather than the word "delete" appearing anywhere.
+      if (users.some((f) => quotesLiteral(f, locator.label) || quotesLiteral(f, locator.expression))) {
+        affordancesProven += 1;
+      }
+      ledgerRow(
+        'CONTROL',
+        `CONTROL:${locator.route}#${locator.expression}`,
+        `${locator.label || locator.expression} on ${locator.route}`,
+        locator.route,
+        users,
+      );
       continue;
     }
     // Links are left to the route gaps above: "nobody clicks this link" and
@@ -2917,8 +3874,89 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
   const limit = Math.min(input.limit ?? MAX_GAPS, MAX_GAPS);
   const returned = gaps.slice(0, limit);
   if (gaps.length > returned.length) {
-    caveats.push(`${gaps.length} gaps found; the ${returned.length} highest-ranked are returned.`);
+    /*
+     * A cap that bit, named as a count AND a reason, and naming the field that
+     * is still exact.
+     *
+     * `totals.gaps` is the uncapped number and `gapsReturned` is what fitted.
+     * A reader measuring `gaps.length` on a project over either cap would
+     * report the cap as the finding — and MAX_GAPS is a hard ceiling the
+     * caller's `limit` cannot raise, which is the half that used to go unsaid.
+     */
+    caveats.push(
+      `${gaps.length} gaps found; the ${returned.length} highest-ranked are returned (requested limit ${input.limit ?? 'unset'}, hard ceiling MAX_GAPS ${MAX_GAPS}). \`totals.gaps\` is the exact count — do not measure \`gaps.length\`.`,
+    );
   }
+
+  /*
+   * ── THE HEADLINE, PER AXIS, WITH ITS DENOMINATORS KEPT APART ──────────────
+   *
+   * Four readings and one published weighted mean. The counts handed over are
+   * the same four pairs the old React sum used; what has changed is that each
+   * pair stays a fraction of itself and the combination is a decision somebody
+   * made in `COVERAGE_AXIS_WEIGHT` rather than a consequence of how many
+   * buttons the crawl found.
+   *
+   * ROUTE and JOURNEY pass their covered count as `provenCovered` unchanged:
+   * both match on a route literal the extractor read out of the test, so there
+   * is no generous reading of them to separate out. FORM and CONTROL carry the
+   * two counts the loops above kept apart.
+   */
+  const axisReadings = coverageAxisReadings({
+    ROUTE: {
+      denominator: routes.length,
+      covered: visitedRoutes.size,
+      provenCovered: visitedRoutes.size,
+    },
+    JOURNEY: {
+      denominator: crawl.journeys.length,
+      covered: journeysWalked,
+      provenCovered: journeysWalked,
+    },
+    FORM: { denominator: totalForms, covered: formsExercised, provenCovered: formsProven },
+    CONTROL: {
+      denominator: allControls.length,
+      covered: affordancesUsed,
+      provenCovered: affordancesProven,
+    },
+  });
+  const headline = coverageHeadline(axisReadings);
+  const ledger = buildLedger(ledgerRows, byTest, suppressedOnly);
+
+  /*
+   * ── THE ONE ASYMMETRY IN THIS NUMERATOR, SAID OUT LOUD ────────────────────
+   *
+   * A QUARANTINED cover is excluded from every axis numerator above
+   * (`coveringFacts`). A NEVER-RUN cover is not. So an item matched only by a
+   * test no run has ever executed is counted as covered by every percentage in
+   * `headline`, while its own ledger row says ASSERTED_NOT_RUN and its `why`
+   * reads "written is not run". Two surfaces of one report, one item, two
+   * answers — reproducible with a single test that declares a route and has no
+   * TestResult: the ROUTE axis counts it and `ledger.neverRun` counts it too.
+   *
+   * This caveat does not fix that. It makes it a stated number instead of a
+   * silent one, because the alternative — quietly leaving it out — is a
+   * percentage that attributes coverage to a test that never ran with nothing
+   * on the response saying so. Excluding it from the numerator needs a
+   * disclosed counter of its own (`coveredOnlyByQuarantined`'s doc note says
+   * why a derived one would always read zero: such items have no ledger row),
+   * and it moves the headline for every install, so it is not something to
+   * slip in behind a caveat.
+   *
+   * Guarded on `!== null`: null means no caller asked the database, and a
+   * sentence about never-run tests would be a verdict on a question nobody put.
+   */
+  if (ledger.neverRun !== null && ledger.neverRun > 0) {
+    caveats.push(
+      `${ledger.neverRun} of the ${ledger.total} covered items are matched ONLY by tests that no run has executed — the ledger reports each as ASSERTED_NOT_RUN ("written is not run"), and every axis percentage above nevertheless counts them as covered. So these figures measure what the suite DECLARES, not what has been observed to run. Quarantined covers ARE excluded from the numerator; never-run covers are not. Subtract \`ledger.neverRun\` before quoting this as observed coverage.`,
+    );
+  }
+
+  caveats.push(
+    headline.lowerPercent === null
+      ? headline.why
+      : `Headline ${headline.range} — quote ${headline.lowerPercent}%. ${headline.why}`,
+  );
 
   return {
     crawled: true,
@@ -2945,6 +3983,8 @@ export function analyzeCoverage(input: CoverageInput): CoverageReport {
       refusedSurfaces,
     },
     reverse,
+    headline,
+    ledger,
     fingerprint: fingerprintOf(crawl.version, input.tests, gaps),
   };
 }

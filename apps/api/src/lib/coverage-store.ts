@@ -70,6 +70,14 @@ import {
   type SurfaceSourceAsked,
   type TestExecutionFact,
 } from '@qaai/agent';
+/*
+ * THE ONE QUESTION EVERY GATE, COUNTER AND CHECK MUST ASK, imported rather than
+ * reimplemented. A null expiry is a quarantine written before expiry existed
+ * and is honoured; an expired one gates again. Reading `Test.quarantined`
+ * directly here would have made this file the fourth place in the product with
+ * its own opinion about whether a suppression is in force.
+ */
+import { quarantineSuppresses } from '@qaai/runner';
 import { Prisma } from '../generated/prisma/client.js';
 import { prisma } from './prisma.js';
 import { toCoverageInputs } from '../routes/coverage.js';
@@ -490,15 +498,83 @@ async function loadObservedItems(projectId: string): Promise<{
  * matcher then decides what each one means for coverage, which is its job and
  * not this function's.
  */
-async function loadExecutions(projectId: string): Promise<TestExecutionFact[]> {
-  const results = await prisma.testResult.findMany({
-    where: { test: { projectId } },
-    orderBy: { createdAt: 'desc' },
-    select: { testId: true, runId: true, status: true, createdAt: true },
-    // Bounded: a long-lived project has more results than anyone needs read
-    // here, and the newest-first order means the cap only ever drops history.
-    take: 20_000,
-  });
+/**
+ * The executions, plus whether the quarantine half of them could be read.
+ *
+ * TWO FIELDS AND NOT ONE, for the usual reason: "no test is quarantined" and
+ * "we could not find out which tests are quarantined" produce the same empty
+ * set and have opposite consequences. The second one means a suppressed test
+ * may be counted as coverage, which moves the number in the FLATTERING
+ * direction — so it is reported as a caveat beside the figure rather than
+ * being allowed to look like the first.
+ */
+interface LoadedExecutions {
+  facts: TestExecutionFact[];
+  /** Null when the read succeeded. The error's message when it did not. */
+  quarantineUnavailable: string | null;
+}
+
+async function loadExecutions(projectId: string): Promise<LoadedExecutions> {
+  /*
+   * ── THE JOIN THAT WAS MISSING, AND WHAT IT COSTS TO LEAVE IT OUT ──────────
+   *
+   * `quarantined` and `quarantineExpiresAt` live on Test, not on TestResult, so
+   * a query over results alone cannot tell whether the result it just read is
+   * one any gate will ever look at. Without them a quarantined test closed a
+   * gap here while `packages/runner/src/gates.ts` excluded it from every rule —
+   * two screens in one product giving opposite answers about one test.
+   *
+   * `retriedAndPassed` is on the result and is read for the same round: §5 says
+   * a retry pass is not a pass, and it is carried to the ledger rather than used
+   * to withhold coverage, because covered-and-flaky are two facts.
+   */
+  const [results, quarantineRead] = await Promise.all([
+    prisma.testResult.findMany({
+      where: { test: { projectId } },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        testId: true,
+        runId: true,
+        status: true,
+        createdAt: true,
+        retriedAndPassed: true,
+      },
+      // Bounded: a long-lived project has more results than anyone needs read
+      // here, and the newest-first order means the cap only ever drops history.
+      take: 20_000,
+    }),
+    /*
+     * FAULT-ISOLATED, because this is a NEW query on an old path.
+     *
+     * `computeCoverage` is called by the surface route, the gate, the worker
+     * and this file's own recompute. A query that one of those callers'
+     * environments cannot answer must not take the measurement down — and it
+     * must not quietly succeed as an empty set either, because empty means
+     * "nothing is suppressed" and that is the flattering answer.
+     */
+    prisma.test
+      .findMany({
+        where: { projectId, quarantined: true },
+        select: { id: true, quarantined: true, quarantineExpiresAt: true },
+      })
+      .then((rows) => ({ rows, error: null as string | null }))
+      .catch((error: unknown) => ({
+        rows: [] as Array<{ id: string; quarantined: boolean; quarantineExpiresAt: Date | null }>,
+        error: error instanceof Error ? error.message : String(error),
+      })),
+  ]);
+  const quarantines = quarantineRead.rows;
+
+  /*
+   * `quarantineSuppresses`, not `quarantined`. An EXPIRED quarantine gates
+   * again, so reading the boolean would keep withholding coverage from a test
+   * whose suppression ran out — the number would then be wrong in the
+   * pessimistic direction, which is still wrong.
+   */
+  const now = new Date();
+  const suppressed = new Set(
+    quarantines.filter((test) => quarantineSuppresses(test, now)).map((test) => test.id),
+  );
 
   const latest = new Map<string, TestExecutionFact>();
   for (const result of results) {
@@ -512,13 +588,34 @@ async function loadExecutions(projectId: string): Promise<TestExecutionFact[]> {
         status: result.status,
         atIso: result.createdAt.toISOString(),
         everPassed: result.status === 'PASSED',
+        quarantined: suppressed.has(result.testId),
+        retriedAndPassed: result.retriedAndPassed,
       });
       continue;
     }
     // Older rows contribute nothing but history. They may not touch `status`.
     if (result.status === 'PASSED') existing.everPassed = true;
   }
-  return [...latest.values()];
+
+  /*
+   * A quarantined test with NO result at all still has to be reported, because
+   * "its only test is suppressed" and "its only test has never run" are
+   * different findings and the matcher can only tell them apart if the fact
+   * reaches it. SKIPPED with no run id is the honest shape: nothing was
+   * observed, and the quarantine is why nothing will be.
+   */
+  for (const id of suppressed) {
+    if (latest.has(id)) continue;
+    latest.set(id, {
+      testId: id,
+      runId: '',
+      status: 'SKIPPED',
+      atIso: new Date(0).toISOString(),
+      everPassed: false,
+      quarantined: true,
+    });
+  }
+  return { facts: [...latest.values()], quarantineUnavailable: quarantineRead.error };
 }
 
 /** Waivers, keyed by surface key, with their owner attached. */
@@ -1044,13 +1141,28 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
   const result = analyseSurfaceCoverage({
     items: inventory.items,
     tests: coverageInputs,
-    executions,
+    executions: executions.facts,
     waivers,
   });
 
   // Both sets of caveats, inventory first: what the denominator is made of
   // comes before what the division could not see.
   const caveats = [...inventory.caveats, ...result.caveats];
+
+  if (executions.quarantineUnavailable !== null) {
+    /*
+     * A CAP THAT BIT, AND IT BIT IN THE FLATTERING DIRECTION.
+     *
+     * Without the quarantine read, a test whose result every gate suppresses
+     * is counted here as ordinary coverage — which is exactly the state this
+     * round set out to fix. An empty quarantine set and an unreadable one are
+     * the same shape and opposite facts, so the second one says so beside the
+     * number rather than looking like the first.
+     */
+    caveats.push(
+      `Quarantine could not be read for this project (${executions.quarantineUnavailable}), so any test whose result the gates suppress has been counted here as ordinary coverage. That makes this percentage a CEILING rather than a measurement: a quarantined test gates nothing, so coverage attributed to it is coverage nothing will ever check.`,
+    );
+  }
 
   /*
    * The component inventory, written and read back.
@@ -1238,6 +1350,219 @@ async function persist(input: {
   }
 
   /*
+   * ── THE PROVENANCE EDGES ──────────────────────────────────────────────────
+   *
+   * `CoverageItem.matches` is a JSON blob that is replaced wholesale on every
+   * recompute, so it can say WHICH tests cover an item and nothing else: no
+   * identity, no history, no record of HOW the link was established, and — the
+   * expensive part — no way for a link to be retired with an audit trail
+   * instead of simply vanishing. `TestCoverageEdge` is the addressable version
+   * of the same fact, and this is its write path.
+   *
+   * EVERY EDGE THIS FUNCTION WRITES IS `source: 'STATIC'`, TIER `DECLARED`.
+   * That is not a placeholder, it is the ceiling: the matcher upstream is a
+   * regex over test source, which can prove a string appears in a spec and
+   * cannot prove the spec is reachable, enabled, wired into a suite or ever
+   * executed. `COVERAGE_EDGE_SOURCE_CEILING` in @qaai/shared's coverage-tiers
+   * pins STATIC at DECLARED for exactly that reason, and a writer here that
+   * promoted its own edges past it would be the one lie this table exists to
+   * prevent. NAVIGATED and above need an instrumentation producer that does not
+   * exist anywhere in this product yet.
+   *
+   * ONE EDGE PER (item, test, STATIC). A RUNTIME or SPEC edge for the same pair
+   * is a different row by the unique index and is never touched here —
+   * `upsert` and a scoped `retiredAt` sweep, never `deleteMany`, so a producer
+   * this function knows nothing about cannot have its rows removed by a
+   * recompute of the static ones.
+   */
+  /*
+   * ── FAULT-ISOLATED, AND THE FAILURE IS DISCLOSED ──────────────────────────
+   *
+   * The migration that mints `TestCoverageEdge` is written and UNAPPLIED in
+   * this tree, so the delegate exists on the generated client and the TABLE
+   * does not: every statement below throws until somebody deploys. The
+   * inventory and the snapshot are the deliverable and are already written, so
+   * an unavailable provenance table must cost the AUDIT TRAIL and not the
+   * measurement.
+   *
+   * What it must never do is fail quietly. The reason goes onto the snapshot's
+   * own caveats, beside the number, because "we recorded no provenance for this
+   * figure" is a fact about how defensible the figure is.
+   */
+  const edgeWrite = await persistCoverageEdges({ orgId, projectId, entries, seenKeys });
+  if (edgeWrite.failed > 0) {
+    /*
+     * A COUNT AND A REASON, both. A provenance write that quietly missed rows
+     * is a provenance table that will later report fewer links than the
+     * measurement was built from — and because retirement is skipped on a
+     * partial write (see below), it is also a table whose stale rows nobody
+     * swept. Neither is something to discover from a dashboard.
+     */
+    snapshot.caveats.push(
+      `Coverage provenance was NOT fully recorded for this snapshot: ${edgeWrite.failed} of ${edgeWrite.attempted} test-to-surface link(s) could not be written (${edgeWrite.firstError ?? 'no error reported'}). The percentage above is unaffected — what is missing is the per-link audit trail that says HOW each test came to be matched to each item, and the history that lets a link be retired rather than silently vanish. Retirement of stale links was skipped for this run, because a partial write followed by "retire everything I did not write" is how an audit trail deletes itself.`,
+    );
+  }
+
+  return finishSnapshot({ orgId, projectId, snapshot, seenKeys, mayRetire });
+}
+
+/**
+ * The write path for `TestCoverageEdge` — see the call site for why it is
+ * fault-isolated, and the comment there for why every edge it writes is
+ * STATIC/DECLARED.
+ */
+/** What the edge write managed, so a partial one can be disclosed. */
+interface CoverageEdgeWriteResult {
+  attempted: number;
+  written: number;
+  failed: number;
+  /**
+   * The first error's message, which is how a table that does not exist at all
+   * is told apart from one row failing a foreign key. The two have the same
+   * shape in the counts and completely different remedies.
+   */
+  firstError: string | null;
+}
+
+async function persistCoverageEdges(input: {
+  orgId: string;
+  projectId: string;
+  entries: SurfaceItemCoverage[];
+  seenKeys: string[];
+}): Promise<CoverageEdgeWriteResult> {
+  const { orgId, projectId, entries, seenKeys } = input;
+  const edgeRows = await prisma.coverageItem.findMany({
+    where: { projectId, key: { in: seenKeys } },
+    select: { id: true, key: true },
+  });
+  const itemIdByKey = new Map(edgeRows.map((row) => [row.key, row.id]));
+  const liveTestIds = new Set(
+    entries.flatMap((entry) => entry.matches.map((match) => match.testId)),
+  );
+  const writtenEdgeIds: string[] = [];
+  let failed = 0;
+  let firstError: string | null = null;
+
+  for (const entry of entries) {
+    const itemId = itemIdByKey.get(entry.item.key);
+    // An item whose upsert did not land this round (a chunk that failed) has
+    // no id to hang an edge off. Skipping is correct: the next recompute
+    // writes both, and a half-written edge pointing at nothing is worse.
+    if (itemId === undefined) continue;
+    for (const match of entry.matches) {
+      if (!liveTestIds.has(match.testId)) continue;
+      const data = {
+        orgId,
+        projectId,
+        tier: 'DECLARED' as const,
+        /*
+         * The reason the tier is not higher, in the row, so a reader does not
+         * have to know the ceiling table to interpret a wall of DECLARED.
+         */
+        cappedBy: 'STATIC_EVIDENCE_ONLY',
+        /*
+         * Confidence BY HOW THE MATCH WAS MADE, under STATIC's 0.8 ceiling
+         * which `testCoverageEdgeSchema` enforces. A route literal read
+         * verbatim out of a spec and a four-character field name found
+         * somewhere in a file are not the same evidence, and collapsing them
+         * to one number is what makes a generous matcher indistinguishable
+         * from a strict one.
+         */
+        confidence: match.basis === 'LITERAL' ? 0.8 : match.basis === 'NORMALISED' ? 0.6 : 0.4,
+        evidence: match.evidence,
+        // NULL, not a run id. There is no run behind a static match, and
+        // `testCoverageEdgeSchema` refuses a tier above DECLARED without one.
+        lastConfirmedRunId: null,
+        lastConfirmedAt: null,
+        // Re-seeing a retired edge un-retires it, exactly as an item does.
+        retiredAt: null,
+      };
+      try {
+        const edge = await prisma.testCoverageEdge.upsert({
+          where: {
+            itemId_testId_source: { itemId, testId: match.testId, source: 'STATIC' },
+          },
+          create: { ...data, itemId, testId: match.testId, source: 'STATIC' },
+          update: data,
+          select: { id: true },
+        });
+        writtenEdgeIds.push(edge.id);
+      } catch (error) {
+        /*
+         * Per edge, and COUNTED rather than swallowed.
+         *
+         * The inventory and the snapshot are the deliverable and are already
+         * written; a test deleted between the match and this write fails its
+         * foreign key, and taking the whole recompute down for a provenance row
+         * would cost the measurement to save the audit trail of it.
+         *
+         * But the first version of this block caught and discarded, and that
+         * made the one case that matters invisible: the TABLE NOT EXISTING at
+         * all — which is the state of every deployment until this round's
+         * migration is applied — failed every edge silently and reported a
+         * clean snapshot. A failure nothing reports is a failure nobody fixes,
+         * so the count and the first message both travel out of here.
+         */
+        failed += 1;
+        firstError ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+
+  /*
+   * RETIRE the static edges this computation did not produce, and ONLY those.
+   *
+   * Scoped three ways: to this project, to `source: 'STATIC'` (this function's
+   * own rows), and — the load-bearing one — skipped entirely unless every edge
+   * it tried to write landed. A partial write followed by "retire everything I
+   * did not write" is the edge-level version of the retirement catastrophe
+   * decision 4 in this file's header describes.
+   */
+  const attemptedEdges = entries.reduce(
+    (count, entry) =>
+      count + entry.matches.filter((match) => liveTestIds.has(match.testId)).length,
+    0,
+  );
+  if (writtenEdgeIds.length === attemptedEdges) {
+    try {
+      await prisma.testCoverageEdge.updateMany({
+        where: {
+          projectId,
+          source: 'STATIC',
+          retiredAt: null,
+          ...(writtenEdgeIds.length > 0 ? { id: { notIn: writtenEdgeIds } } : {}),
+        },
+        data: { retiredAt: new Date() },
+      });
+    } catch (error) {
+      // Counted as a failure of the whole write, because a sweep that did not
+      // run leaves links claiming to be live that this computation did not
+      // find — which is the direction that OVERSTATES coverage provenance.
+      failed += 1;
+      firstError ??= error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  return { attempted: attemptedEdges, written: writtenEdgeIds.length, failed, firstError };
+
+}
+
+/**
+ * Retirement and the snapshot row — the tail of `persist`, lifted out whole so
+ * that the edge writer above could be fault-isolated without putting a second
+ * copy of this in the file. Not reordered: retirement still runs after the
+ * upserts and before the snapshot, which is what makes the snapshot's counts
+ * agree with the rows it was computed from.
+ */
+async function finishSnapshot(input: {
+  orgId: string;
+  projectId: string;
+  snapshot: SurfaceSnapshot;
+  seenKeys: string[];
+  mayRetire: boolean;
+}): Promise<string> {
+  const { orgId, projectId, snapshot, seenKeys, mayRetire } = input;
+  /*
    * Retire, never delete — and only when the union was complete.
    *
    * See decision 4 in the header. `notIn: seenKeys` is "everything this
@@ -1291,6 +1616,95 @@ async function persist(input: {
 // ─── Reading back ────────────────────────────────────────────────────────────
 
 /** The stored snapshot trend, newest first. What makes a gate's delta meaningful. */
+/**
+ * ── THE READ SIDE OF `TestCoverageEdge` ─────────────────────────────────────
+ *
+ * Provenance, aggregated: how many (test → item) links this project holds, by
+ * what kind of evidence, at what rung, and how many have been retired.
+ *
+ * WHY AN AGGREGATE AND NOT A LIST. The per-item list is already on the item —
+ * `CoverageItem.matches` — and a second per-item list would be a second answer.
+ * What no surface in the product could state before this is the SHAPE of the
+ * evidence behind a coverage figure: "every one of your 1,240 links is a regex
+ * over test source and none has been confirmed by a run" is the sentence that
+ * tells a buyer what the percentage beside it is worth, and it is a sentence
+ * about the whole project rather than about any one route.
+ *
+ * `retired` is reported and NOT filtered out. An edge that stopped being found
+ * is how coverage falls with an audit trail; hiding it would make the table
+ * look like it only ever grows.
+ *
+ * RETURNS `null` WHEN THE TABLE IS NOT THERE. The migration that mints it is
+ * written and unapplied in this tree, and `null` is "this deployment cannot
+ * answer", which must not render as "no provenance exists" — an empty
+ * aggregate would read as a project with no evidence behind its number, which
+ * is the opposite of the truth and is the worse of the two wrong answers.
+ */
+export interface CoverageProvenance {
+  /** One row per (source, tier) pair that exists. Zero pairs are absent, not 0. */
+  byEvidence: Array<{ source: string; tier: string; live: number }>;
+  live: number;
+  retired: number;
+  /**
+   * Links whose evidence is a regex over test source and nothing else. Equal to
+   * `live` until an instrumentation producer exists, which is the honest
+   * reading and not a bug.
+   */
+  staticOnly: number;
+  /** Links a run confirmed. 0 today, everywhere, and that is the finding. */
+  runConfirmed: number;
+  why: string;
+}
+
+export async function coverageProvenance(projectId: string): Promise<CoverageProvenance | null> {
+  let rows: Array<{ source: string; tier: string; retiredAt: Date | null; lastConfirmedRunId: string | null }>;
+  try {
+    rows = await prisma.testCoverageEdge.findMany({
+      where: { projectId },
+      // Named, so dropping one from this select is a type error at every use
+      // below rather than a field that quietly reads as undefined.
+      select: { source: true, tier: true, retiredAt: true, lastConfirmedRunId: true },
+      // Bounded for the same reason as the result read above. The aggregate is
+      // over what fitted, and `why` says so when the cap bit.
+      take: MAX_PROVENANCE_EDGES,
+    });
+  } catch {
+    // The table does not exist on this deployment (the migration is written
+    // and unapplied). Not an empty answer — no answer.
+    return null;
+  }
+
+  const live = rows.filter((row) => row.retiredAt === null);
+  const pairs = new Map<string, number>();
+  for (const row of live) {
+    const key = `${row.source}\u0000${row.tier}`;
+    pairs.set(key, (pairs.get(key) ?? 0) + 1);
+  }
+
+  const capped = rows.length === MAX_PROVENANCE_EDGES;
+  return {
+    byEvidence: [...pairs.entries()]
+      .map(([key, count]) => {
+        const [source = '', tier = ''] = key.split('\u0000');
+        return { source, tier, live: count };
+      })
+      .sort((left, right) => right.live - left.live || left.source.localeCompare(right.source)),
+    live: live.length,
+    retired: rows.length - live.length,
+    staticOnly: live.filter((row) => row.source === 'STATIC').length,
+    runConfirmed: live.filter((row) => row.lastConfirmedRunId !== null).length,
+    why:
+      `${live.length} live link(s); ${live.filter((row) => row.lastConfirmedRunId !== null).length} confirmed by a run. ` +
+      'A link with no run behind it proves a test NAMES this item, not that anything executed it.' +
+      (capped
+        ? ` The read was capped at MAX_PROVENANCE_EDGES (${MAX_PROVENANCE_EDGES}), so at least one more exists and these counts are a lower bound.`
+        : ''),
+  };
+}
+
+/** Bounded for the same reason the result read is. A cap that bites is reported. */
+const MAX_PROVENANCE_EDGES = 50_000;
+
 export async function snapshotTrend(projectId: string, limit = 30) {
   return prisma.coverageSnapshot.findMany({
     where: { projectId },

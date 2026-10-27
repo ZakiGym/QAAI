@@ -84,3 +84,19 @@ export * from './api-surface';
  * Passes this barrel's standing test: zod, local modules, no `node:` builtin.
  */
 export * from './auth-profiles';
+/*
+ * The one row builder both result-ingest paths call, so that a customer's
+ * variant matrix and metric readings do not depend on whether they ran the
+ * on-prem agent or the cloud worker.
+ *
+ * Public API because that is the ONLY thing that makes the two doors provably
+ * the same: apps/api's runners route and apps/worker's run processor cannot
+ * import each other, and for one slice this builder was duplicated byte for
+ * byte in both of them, held together by a test that read both files off disk.
+ * A builder half of whose callers cannot import it is how one customer's matrix
+ * comes to disagree with another's.
+ *
+ * Passes this barrel's standing test: types, pure arithmetic and string
+ * building, no zod and no `node:` builtin.
+ */
+export * from './measurement-rows';

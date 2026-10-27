@@ -54,6 +54,8 @@ import { surfaceRouter } from './routes/surface.js';
 import { apiSurfaceRouter } from './routes/api-surface.js';
 import { requirementsRouter } from './routes/requirements.js';
 import { manualCasesRouter } from './routes/manual-cases.js';
+import { codeCoverageRouter } from './routes/code-coverage.js';
+import { measurementsRouter } from './routes/measurements.js';
 import { domDiffRouter } from './routes/dom-diff.js';
 import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
@@ -96,6 +98,17 @@ app.use(
 // The GitHub webhook is HMAC-verified over the RAW body, so it must not be
 // JSON-parsed first. Mounted ahead of the global parser for that reason alone.
 app.use('/webhooks', express.raw({ type: 'application/json', limit: '2mb' }));
+/*
+ * The line-coverage ingest, and the only route with its own body limit.
+ *
+ * body-parser skips once `req._body` is set, so a router-level parser mounted
+ * AFTER the global one below cannot raise the limit — it has to be ahead of it.
+ * A real Istanbul `coverage-final.json` for a mid-sized application is well
+ * over 2mb, so without this line `CODE_COVERAGE_CAPS.payloadBytes` (16MB) is an
+ * allowance nobody could use and the ingest's true ceiling would be 2mb while
+ * advertising eight times that.
+ */
+app.use('/code-coverage', express.json({ limit: '16mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -225,6 +238,29 @@ app.use(surfaceRouter);
 app.use(apiSurfaceRouter);
 app.use(requirementsRouter);
 app.use(manualCasesRouter);
+/*
+ * Line coverage from the customer's own CI. Root-mounted for the same reason
+ * as the four above: `code-coverage.ts` declares its own full paths
+ * (`/code-coverage/:projectId`, `/files`, `/uncovered`, `/patch`), so a prefix
+ * here would serve them at `/code-coverage/code-coverage/:projectId`.
+ *
+ * This is the OTHER HALF of the measurement. Everything else in this process
+ * answers "which crawled surface does a test MENTION"; these four paths answer
+ * "which lines did a suite EXECUTE", which is what a buyer means by coverage.
+ */
+app.use(codeCoverageRouter);
+/*
+ * The READ side of the two measurement tables, beside the other measurement
+ * routers. Prefix-mounted (unlike codeCoverageRouter just above) because
+ * `measurements.ts` declares bare paths — `/:projectId/matrix`,
+ * `/:projectId/metrics` — so the prefix is what gives them a namespace at all.
+ *
+ * The variant matrix and the metric trend are the two reads `TestResultVariant`
+ * and `TestMetricSample` were shipped without: both tables and four indexes
+ * existed with nothing selecting from them, which `scripts/check-wiring.ts`
+ * reported as DISCONNECTED.
+ */
+app.use('/measurements', measurementsRouter);
 app.use('/dom-diff', domDiffRouter);
 app.use('/repro', reproRouter);
 app.use('/suite-health', suiteHealthRouter);

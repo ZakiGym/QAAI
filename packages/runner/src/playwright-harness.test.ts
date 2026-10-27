@@ -28,12 +28,29 @@ import {
   challengeNote,
   challengeSignalIn,
   CHALLENGE_SIGNALS,
+  collectRuntimeObservation,
   extraHttpHeadersSource,
   missingRoleSession,
+  observedNetworkEntries,
+  observedSurface,
+  OBSERVATION_STATES,
+  parseObservationLines,
   resolveEnvironmentHeaders,
   runPlaywrightSpec,
+  runtimeFindings,
+  runtimeObserverEpilogue,
+  RUNTIME_FINDING_CAP,
+  RUNTIME_INVARIANTS,
+  RUNTIME_OBSERVATION_CAPS,
+  RUNTIME_OBSERVER_MARKER,
+  RUNTIME_VOCABULARY_PRESENCE,
+  specUsesBrowser,
   storageStateFileName,
+  urlTemplate,
   type EnvironmentAccessPolicy,
+  type RuntimeFindingResult,
+  type RuntimeObservation,
+  type RuntimeObservationSource,
 } from './playwright-harness.js';
 import { attachAuthProfile } from './run-workspace.js';
 
@@ -549,5 +566,989 @@ describe('the extraHTTPHeaders the generated config carries', () => {
 
   it('is an empty object when nothing is configured, so the config stays valid', () => {
     expect(extraHttpHeadersSource([])).toBe('{  }');
+  });
+});
+
+/*
+ * ── Runtime observation ─────────────────────────────────────────────────────
+ *
+ * THE DEFECT: `TestExecution.network` was `[]` on every path and `findings` was
+ * `[]` on all three, so the only question the product could answer was "which
+ * crawled surface does a test MENTION" — a regex over test source — and a GREEN
+ * test over a THROWING application was reported as covered and healthy.
+ *
+ * None of these tests launch a browser or touch the network. The harness takes
+ * its observation through {@link RuntimeObservationSource}, and the whole
+ * classification layer is pure functions over NDJSON, so a fake satisfies the
+ * seam in one line and every rule below is pinned against hand-written records.
+ * The one thing a fake cannot prove — that the injected epilogue compiles and
+ * that Chromium really emits these events — was verified against a live
+ * Chromium while this was written, and the facts it established are recorded in
+ * the comments on the code (`responseEnd` is -1 at the response event; the JSON
+ * reporter emits no `pw:api` steps at all).
+ */
+
+/** NDJSON, as the injected observer writes it: one JSON object per line. */
+function nd(...records: ReadonlyArray<Record<string, unknown>>): string[] {
+  return records.map((record) => JSON.stringify(record));
+}
+
+const ATTACH = { t: 'attach', test: 'checkout › pays', variant: 'chromium' };
+
+function surfaceOf(lines: readonly string[], baseUrl = 'https://app.test'): RuntimeObservation {
+  const { records, malformed } = parseObservationLines(lines);
+  return observedSurface(records, {
+    testId: 'test_1',
+    baseUrl,
+    malformed,
+    availability: { state: 'OBSERVED', reason: null },
+  });
+}
+
+function findingsOf(
+  lines: readonly string[],
+  specCode = 'await expect(page).toHaveURL("/ok");',
+  baseUrl = 'https://app.test',
+): RuntimeFindingResult {
+  const { records } = parseObservationLines(lines);
+  return runtimeFindings(records, { baseUrl, specCode });
+}
+
+describe('the runtime vocabulary', () => {
+  it('declares every invariant once, in all four places', () => {
+    /*
+     * The pattern this codebase enforces for a vocabulary with a write path.
+     * Eight GateRule kinds once shipped unsaveable for two slices because only
+     * the compiler-enforced half of this existed, and `check:wiring` cannot see
+     * that class of defect. The `Record<RuntimeInvariant, …>` maps are the
+     * compile-time half — a ninth invariant that forgets its code does not
+     * compile — and this is the run-time half: the maps and the array agree,
+     * member for member, with no extras in either direction.
+     */
+    const invariants = [...RUNTIME_INVARIANTS];
+    expect(new Set(invariants).size).toBe(invariants.length);
+    expect(Object.keys(RUNTIME_VOCABULARY_PRESENCE.invariants).sort()).toEqual(
+      [...invariants].sort(),
+    );
+
+    const states = [...OBSERVATION_STATES];
+    expect(new Set(states).size).toBe(states.length);
+    expect(Object.keys(RUNTIME_VOCABULARY_PRESENCE.states).sort()).toEqual([...states].sort());
+  });
+
+  it('gives every invariant a distinct, prefixed, filterable code', () => {
+    /*
+     * Driven through the PUBLIC path — one record per invariant — rather than
+     * read off the private map, so this also proves each invariant is actually
+     * reachable from an observation. All eight are carried under the SECURITY
+     * FindingKind because `FINDING_KINDS` has no RUNTIME member, so a gate
+     * configured on SECURITY has to be able to tell a page error from a missing
+     * CSP header: the `runtime.` prefix and a DISTINCT code per invariant are
+     * what make that possible, and two invariants sharing a code would also
+     * silently merge two families in the dedupe above.
+     */
+    const page = 'https://app.test/checkout';
+    const req = (status: number, url = 'https://app.test/api/x', from = page) => ({
+      t: 'req',
+      method: 'GET',
+      url,
+      status,
+      rt: 'fetch',
+      nav: false,
+      chain: [],
+      from,
+    });
+    const drivers: Array<Record<string, unknown>> = [
+      { t: 'pageerror', name: 'TypeError', message: 'threw', from: page },
+      { t: 'pageerror', name: 'Error', message: 'Uncaught (in promise) nope', from: page },
+      { t: 'console', level: 'error', text: 'a plain console error', from: page },
+      { t: 'reqfail', method: 'GET', url: 'https://app.test/api/y', err: 'net::ERR', from: page },
+      req(404),
+      req(500),
+      req(200, 'http://cdn.insecure.test/a.png'),
+      {
+        t: 'console',
+        level: 'error',
+        text: 'Refused to load: it violates the following Content Security Policy directive',
+        from: page,
+      },
+    ];
+
+    const codes = new Set(
+      drivers.flatMap((driver) => findingsOf(nd(ATTACH, driver)).findings.map((f) => f.code)),
+    );
+    expect(codes.size).toBe(RUNTIME_INVARIANTS.length);
+    expect([...codes].every((code) => code.startsWith('runtime.'))).toBe(true);
+
+    // Every one of them lands on a kind the Finding type actually has.
+    for (const driver of drivers) {
+      for (const finding of findingsOf(nd(ATTACH, driver)).findings) {
+        expect(finding.kind).toBe('SECURITY');
+        expect(finding.location).not.toBe('');
+      }
+    }
+  });
+});
+
+describe('url templates', () => {
+  it('replaces identifiers and keeps real route words', () => {
+    const t = (raw: string) => urlTemplate(raw, 'https://app.test').template;
+    expect(t('https://app.test/orders/12345')).toBe('/orders/:id');
+    expect(t('https://app.test/u/550e8400-e29b-41d4-a716-446655440000/edit')).toBe('/u/:id/edit');
+    expect(t('https://app.test/m/clh3k2j1x0000qwertyuiopas')).toBe('/m/:id');
+    /*
+     * The mutation this kills: an eager id pattern. If `checkout` or `settings`
+     * matched, every route would collapse into `/:id` and the runtime surface
+     * would look complete because the extractor got WORSE — which is exactly
+     * what the UNKNOWN-is-not-a-gap rule exists to prevent elsewhere.
+     */
+    expect(t('https://app.test/checkout')).toBe('/checkout');
+    expect(t('https://app.test/settings/billing')).toBe('/settings/billing');
+    expect(t('https://app.test/api/v2/members')).toBe('/api/v2/members');
+  });
+
+  it('DROPS the query string, because a query string holds credentials', () => {
+    const { template, hadQuery } = urlTemplate(
+      'https://app.test/reset?token=SUPERSECRET&email=a@b.c',
+      'https://app.test',
+    );
+    expect(template).toBe('/reset');
+    expect(template).not.toContain('SUPERSECRET');
+    // Reported, not just done: the caller turns `hadQuery` into a disclosed
+      // count, because a silently truncated URL is still a silent cap.
+    expect(hadQuery).toBe(true);
+  });
+
+  it('keeps the host when the call left the application', () => {
+    // "This test called Stripe" is a different and more interesting fact than
+    // "this test called /v1/charges".
+    expect(urlTemplate('https://api.stripe.com/v1/charges', 'https://app.test').template).toBe(
+      'https://api.stripe.com/v1/charges',
+    );
+    expect(urlTemplate('https://app.test/v1/charges', 'https://app.test').template).toBe(
+      '/v1/charges',
+    );
+  });
+
+  it('never leaves a query on a URL it could not parse', () => {
+    const { template } = urlTemplate('::not a url::?token=SUPERSECRET', '');
+    expect(template).not.toContain('SUPERSECRET');
+    expect(template).not.toContain('?');
+  });
+});
+
+describe('the observed surface', () => {
+  it('records the navigation the test performed, with its redirect chain', () => {
+    const surface = surfaceOf(
+      nd(
+        ATTACH,
+        {
+          t: 'req',
+          method: 'GET',
+          url: 'https://app.test/start',
+          status: 302,
+          rt: 'document',
+          nav: true,
+          chain: [],
+          from: '',
+        },
+        {
+          t: 'req',
+          method: 'GET',
+          url: 'https://app.test/checkout',
+          status: 200,
+          rt: 'document',
+          nav: true,
+          chain: ['https://app.test/start'],
+          from: '',
+        },
+      ),
+    );
+
+    /*
+     * THE REDIRECT FOLD. Playwright reports a redirected navigation TWICE —
+     * once as the 302 and again as the 200 carrying the 302 in its
+     * `redirectedFrom()` chain. The mutation this kills is counting both:
+     * that reports two navigations where the test made one, and puts an
+     * intermediate hop into the surface as if the test had landed on it.
+     */
+    expect(surface.navigations).toHaveLength(1);
+    expect(surface.navigations[0]).toMatchObject({
+      redirectChain: ['/start'],
+      finalUrl: '/checkout',
+      status: 200,
+    });
+    // Both hops are still in the REQUEST list — the fold is about navigations,
+    // not about pretending the 302 never happened.
+    expect(surface.requests.map((request) => request.template)).toEqual(['/start', '/checkout']);
+  });
+
+  it('keeps a redirect the browser never followed, instead of folding it away', () => {
+    // An off-site hand-off: the 302 appears in nobody's chain, and dropping it
+    // would lose the last thing the test did.
+    const surface = surfaceOf(
+      nd(ATTACH, {
+        t: 'req',
+        method: 'GET',
+        url: 'https://app.test/sso',
+        status: 302,
+        rt: 'document',
+        nav: true,
+        chain: [],
+        from: '',
+      }),
+    );
+    expect(surface.navigations.map((n) => n.finalUrl)).toEqual(['/sso']);
+  });
+
+  it('records a client-side route change, with NO status rather than a made-up one', () => {
+    const surface = surfaceOf(nd(ATTACH, { t: 'nav', url: 'https://app.test/cart/items' }));
+    expect(surface.navigations).toHaveLength(1);
+    expect(surface.navigations[0]?.finalUrl).toBe('/cart/items');
+    // An SPA push has no HTTP response of its own. 200 here would be invented.
+    expect(surface.navigations[0]?.status).toBeNull();
+  });
+
+  it('ignores about:blank, which is where every context starts', () => {
+    expect(surfaceOf(nd(ATTACH, { t: 'nav', url: 'about:blank' })).navigations).toEqual([]);
+  });
+
+  it('attributes everything to the test AND the variant', () => {
+    const surface = surfaceOf(
+      nd(
+        { t: 'attach', test: 'a', variant: 'chromium' },
+        { t: 'ctl', action: 'click', locator: "getByRole('button')" },
+        { t: 'attach', test: 'a', variant: 'firefox' },
+        { t: 'ctl', action: 'click', locator: "getByRole('button')" },
+      ),
+    );
+    /*
+     * The same click in two browsers is two observations, not one with a count
+     * of two: a control that works in chromium and throws in firefox is the
+     * whole point of running a matrix, and collapsing the variant would hide it.
+     */
+    expect(surface.controls).toHaveLength(2);
+    expect(surface.controls.map((c) => c.variant).sort()).toEqual(['chromium', 'firefox']);
+    expect(surface.attribution).toHaveLength(2);
+  });
+
+  it('names an unnamed project `default` rather than the empty string', () => {
+    // Measured: `testInfo.project.name` is '' when the config declares no
+    // projects, and '' is not a variant a reader can act on.
+    const surface = surfaceOf(nd({ t: 'attach', test: 'a', variant: '' }, { t: 'nav', url: 'https://app.test/x' }));
+    expect(surface.navigations[0]?.variant).toBe('default');
+  });
+
+  it('records the locator that resolved a control, and counts repeats', () => {
+    const surface = surfaceOf(
+      nd(
+        ATTACH,
+        { t: 'ctl', action: 'click', locator: "getByRole('button', { name: 'Pay' })" },
+        { t: 'ctl', action: 'click', locator: "getByRole('button', { name: 'Pay' })" },
+        { t: 'ctl', action: 'fill', locator: "locator('#amount')" },
+      ),
+    );
+    expect(surface.controls).toHaveLength(2);
+    expect(surface.controls[0]).toMatchObject({
+      action: 'click',
+      locator: "getByRole('button', { name: 'Pay' })",
+      count: 2,
+    });
+    expect(surface.controls[1]?.action).toBe('fill');
+  });
+
+  it('attaches a measured duration, and leaves an unmeasurable one NULL', () => {
+    const surface = surfaceOf(
+      nd(
+        ATTACH,
+        {
+          t: 'req',
+          method: 'POST',
+          url: 'https://app.test/api/pay',
+          status: 200,
+          rt: 'fetch',
+          nav: false,
+          chain: [],
+          from: 'https://app.test/checkout',
+        },
+        { t: 'timing', method: 'POST', url: 'https://app.test/api/pay', ms: 37 },
+        /*
+         * The SAME method and the SAME url as the timed request above, on
+         * purpose: with a different method the correlation key never collides
+         * and the guard below is never exercised. The first version of this
+         * test used GET here, and the mutation that drops the
+         * `status === null` guard SURVIVED it.
+         */
+        {
+          t: 'reqfail',
+          method: 'POST',
+          url: 'https://app.test/api/pay',
+          err: 'net::ERR_ABORTED',
+          from: 'https://app.test/checkout',
+        },
+        { t: 'ws', url: 'wss://app.test/live' },
+      ),
+    );
+
+    const paid = surface.requests.find((r) => r.status === 200);
+    expect(paid?.ms).toBe(37);
+    const failed = surface.requests.find((r) => r.transport === 'OTHER');
+    expect(failed?.method).toBe('POST');
+    expect(failed?.ms).toBeNull();
+
+    /*
+     * THE MUTATION THIS KILLS: correlating a duration onto a request that never
+     * completed. A failed request and a WebSocket emit no `requestfinished`, so
+     * neither has a duration — and borrowing the successful POST's 37ms for the
+     * failed GET to the SAME URL would invent a measurement for a request that
+     * did not happen. Null, not zero, and not a neighbour's number.
+     */
+    for (const request of surface.requests) {
+      if (request.status === null) expect(request.ms).toBeNull();
+    }
+  });
+
+  it('discloses the query strings it dropped, as a count and a reason', () => {
+    const surface = surfaceOf(
+      nd(ATTACH, {
+        t: 'req',
+        method: 'GET',
+        url: 'https://app.test/reset?token=SUPERSECRET',
+        status: 200,
+        rt: 'fetch',
+        nav: false,
+        chain: [],
+        from: 'https://app.test/',
+      }),
+    );
+    const cap = surface.caps.find((c) => c.kind === 'query');
+    expect(cap?.dropped).toBe(1);
+    expect(cap?.reason).toMatch(/token|session id/);
+    expect(JSON.stringify(surface)).not.toContain('SUPERSECRET');
+  });
+
+  it('SUMS the browser-side cap across the tests in a file, once per kind', () => {
+    /*
+     * A spec file holds many tests and each one writes its own cap line. The
+     * mutation this kills is appending a cap entry per line: the reader then
+     * sees the same ceiling reported four times with four partial counts, and
+     * no single number saying how much of the defect list is missing.
+     */
+    const surface = surfaceOf(
+      nd(
+        { t: 'attach', test: 'one', variant: 'chromium' },
+        { t: 'cap', k: 'console', limit: 100, dropped: 7 },
+        { t: 'attach', test: 'two', variant: 'chromium' },
+        { t: 'cap', k: 'console', limit: 100, dropped: 5 },
+      ),
+    );
+    const console = surface.caps.filter((c) => c.kind === 'console');
+    expect(console).toHaveLength(1);
+    expect(console[0]?.dropped).toBe(12);
+    expect(console[0]?.limit).toBe(100);
+    expect(console[0]?.reason).toContain('12');
+  });
+
+  it('says nothing about a cap that did not bite', () => {
+    // Zero dropped is not a cap that bit, and a warning for it would train the
+    // reader to ignore the ones that did.
+    const surface = surfaceOf(nd(ATTACH, { t: 'cap', k: 'console', limit: 100, dropped: 0 }));
+    expect(surface.caps).toEqual([]);
+  });
+
+  it('counts every line it could not read, and drops to PARTIAL', () => {
+    const surface = surfaceOf([
+      JSON.stringify(ATTACH),
+      'not json at all',
+      '{"t":"unknown-kind"}',
+      JSON.stringify({ t: 'nav', url: 'https://app.test/x' }),
+    ]);
+    expect(surface.navigations).toHaveLength(1);
+    expect(surface.availability.state).toBe('PARTIAL');
+    const cap = surface.caps.find((c) => c.kind === 'malformed');
+    expect(cap?.dropped).toBe(2);
+    // PARTIAL and not OBSERVED: a truncated observation file and a quiet
+    // application look identical from the outside, and only this tells them apart.
+    expect(surface.availability.reason).toMatch(/unreadable/);
+  });
+
+  it('caps its own distinct records and discloses the overflow', () => {
+    const many = [
+      ATTACH,
+      ...Array.from({ length: RUNTIME_OBSERVATION_CAPS.ctl + 9 }, (_unused, index) => ({
+        t: 'ctl',
+        action: 'click',
+        locator: `locator('#b${index}')`,
+      })),
+    ];
+    const surface = surfaceOf(nd(...many));
+    expect(surface.controls).toHaveLength(RUNTIME_OBSERVATION_CAPS.ctl);
+    const cap = surface.caps.find((c) => c.kind === 'ctl');
+    expect(cap?.dropped).toBe(9);
+    expect(cap?.limit).toBe(RUNTIME_OBSERVATION_CAPS.ctl);
+  });
+});
+
+describe('runtime-invariant findings', () => {
+  it('reports a throwing application on a test whose assertions PASSED', () => {
+    /*
+     * THE WHOLE POINT OF REQUIREMENT 2. The test is green; the page threw. Both
+     * are facts and both get reported. `status` is never touched by a finding —
+     * the same rule leaks.ts follows — so a green run stays green and stops
+     * being described as healthy.
+     */
+    const { findings } = findingsOf(
+      nd(ATTACH, {
+        t: 'pageerror',
+        name: 'TypeError',
+        message: "Cannot read properties of undefined (reading 'total')",
+        from: 'https://app.test/checkout',
+      }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      code: 'runtime.page-error',
+      severity: 'SERIOUS',
+      location: '/checkout',
+    });
+    expect(findings[0]?.message).toContain('TypeError');
+  });
+
+  it('does NOT report a 4xx the test deliberately asserts on', () => {
+    /*
+     * THE FALSE FINDING THIS PREVENTS. A negative test — "a member cannot
+     * delete another member's booking" — drives the app until it gets a 403 and
+     * then asserts on it. The 403 is the PASS CONDITION. Reporting it as a
+     * defect on a green test is how a team learns to ignore everything QAAI
+     * says, so the suppression is deliberate, and it is DISCLOSED rather than
+     * silent: a suppressed finding nobody is told about is also a lie.
+     */
+    const lines = nd(ATTACH, {
+      t: 'req',
+      method: 'DELETE',
+      url: 'https://app.test/api/bookings/77',
+      status: 403,
+      rt: 'fetch',
+      nav: false,
+      chain: [],
+      from: 'https://app.test/bookings',
+    });
+
+    const asserted = findingsOf(lines, 'expect(response.status()).toBe(403);');
+    expect(asserted.findings).toEqual([]);
+    const disclosure = asserted.caps.find((c) => c.reason.includes('403'));
+    expect(disclosure?.dropped).toBe(1);
+    expect(disclosure?.reason).toMatch(/NOT reported/);
+
+    // And the same 403 in a test that says nothing about 403 IS a finding —
+    // the mutation "suppress every 4xx" would make this one disappear.
+    const unasserted = findingsOf(lines, 'await expect(page).toHaveURL("/bookings");');
+    expect(unasserted.findings).toHaveLength(1);
+    expect(unasserted.findings[0]?.code).toBe('runtime.http-4xx');
+  });
+
+  it('reports LOW CONFIDENCE rather than a confident finding it cannot stand behind', () => {
+    /*
+     * With no spec source there is no way to tell a deliberate 403 from a
+     * defect. The instruction is explicit: report low confidence rather than a
+     * false finding. So the finding survives — losing it would hide a real 500
+     * — at the floor severity and with the reason in the message, where the
+     * reader sees it.
+     */
+    const { findings } = findingsOf(
+      nd(ATTACH, {
+        t: 'req',
+        method: 'GET',
+        url: 'https://app.test/api/x',
+        status: 500,
+        rt: 'fetch',
+        nav: false,
+        chain: [],
+        from: 'https://app.test/',
+      }),
+      '',
+    );
+    expect(findings[0]?.severity).toBe('MINOR');
+    expect(findings[0]?.message).toContain('LOW CONFIDENCE');
+
+    // With a readable spec the same 500 is SERIOUS. The mutation "always report
+    // low confidence" would make every real 500 look like a guess.
+    const readable = findingsOf(
+      nd(ATTACH, {
+        t: 'req',
+        method: 'GET',
+        url: 'https://app.test/api/x',
+        status: 500,
+        rt: 'fetch',
+        nav: false,
+        chain: [],
+        from: 'https://app.test/',
+      }),
+      'await page.goto("/");',
+    );
+    expect(readable.findings[0]?.severity).toBe('SERIOUS');
+    expect(readable.findings[0]?.message).not.toContain('LOW CONFIDENCE');
+  });
+
+  it('does not report one defect twice when the browser narrates it', () => {
+    /*
+     * Measured against Chromium: a non-2xx subresource produces BOTH a response
+     * event and a console error reading "Failed to load resource: the server
+     * responded with a status of 500". Emitting both doubles the apparent
+     * finding count of any app with one flaky endpoint. The echo is suppressed
+     * and the suppression is disclosed.
+     */
+    const { findings, caps } = findingsOf(
+      nd(
+        ATTACH,
+        {
+          t: 'req',
+          method: 'POST',
+          url: 'https://app.test/api/pay',
+          status: 500,
+          rt: 'fetch',
+          nav: false,
+          chain: [],
+          from: 'https://app.test/checkout',
+        },
+        {
+          t: 'console',
+          level: 'error',
+          text: 'Failed to load resource: the server responded with a status of 500 (Internal Server Error)',
+          from: 'https://app.test/checkout',
+        },
+      ),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.code).toBe('runtime.http-5xx');
+    expect(caps.find((c) => c.reason.includes('restating'))?.dropped).toBe(1);
+  });
+
+  it('classifies a CSP violation and a mixed-content block out of console text', () => {
+    /*
+     * Both reach the harness ONLY as console text. `securitypolicyviolation` is
+     * the documented DOM event for CSP, and reading it would mean injecting a
+     * binding — an observable global — into the customer's own application to
+     * measure it. This file will not do that, so the console text is the source
+     * and the limitation is stated rather than hidden.
+     */
+    const { findings } = findingsOf(
+      nd(
+        ATTACH,
+        {
+          t: 'console',
+          level: 'error',
+          text: "Refused to load the script 'https://evil.test/a.js' because it violates the following Content Security Policy directive",
+          from: 'https://app.test/',
+        },
+        {
+          t: 'console',
+          level: 'error',
+          text: 'Mixed Content: The page was loaded over HTTPS but requested an insecure resource',
+          from: 'https://app.test/',
+        },
+      ),
+    );
+    expect(findings.map((f) => f.code)).toEqual([
+      'runtime.csp-violation',
+      'runtime.mixed-content',
+    ]);
+    expect(findings.every((f) => f.severity === 'SERIOUS')).toBe(true);
+  });
+
+  it('finds mixed content STRUCTURALLY, even when the browser logged nothing', () => {
+    // Stronger than the text match above and independent of it: an http://
+    // subresource pulled into an https:// document is mixed content whatever
+    // Chromium chose to say about it.
+    const { findings } = findingsOf(
+      nd(ATTACH, {
+        t: 'req',
+        method: 'GET',
+        url: 'http://cdn.insecure.test/logo.png',
+        status: 200,
+        rt: 'image',
+        nav: false,
+        chain: [],
+        from: 'https://app.test/checkout',
+      }),
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.code).toBe('runtime.mixed-content');
+
+    // And an http:// resource on an http:// page is not mixed content. The
+    // mutation "any http:// request is mixed content" would file a finding on
+    // every local development run.
+    expect(
+      findingsOf(
+        nd(ATTACH, {
+          t: 'req',
+          method: 'GET',
+          url: 'http://cdn.insecure.test/logo.png',
+          status: 200,
+          rt: 'image',
+          nav: false,
+          chain: [],
+          from: 'http://app.test/checkout',
+        }),
+        'await page.goto("/");',
+        'http://app.test',
+      ).findings,
+    ).toEqual([]);
+  });
+
+  it('labels an unhandled rejection when, and only when, the text says so', () => {
+    /*
+     * Measured: Playwright delivers an unhandled promise rejection through
+     * `pageerror` with NO marker distinguishing it from an uncaught throw. So
+     * the specific label is only claimed when the message carries it, and an
+     * unlabelled rejection is reported as a page error — a correct severity
+     * under a coarser code, rather than a guess dressed up as a fact.
+     */
+    const rejected = findingsOf(
+      nd(ATTACH, {
+        t: 'pageerror',
+        name: 'Error',
+        message: 'Uncaught (in promise) Error: checkout failed',
+        from: 'https://app.test/',
+      }),
+    );
+    expect(rejected.findings[0]?.code).toBe('runtime.unhandled-rejection');
+
+    const thrown = findingsOf(
+      nd(ATTACH, {
+        t: 'pageerror',
+        name: 'Error',
+        message: 'checkout failed',
+        from: 'https://app.test/',
+      }),
+    );
+    expect(thrown.findings[0]?.code).toBe('runtime.page-error');
+  });
+
+  it('reports a request that never completed, with no status invented for it', () => {
+    const { findings } = findingsOf(
+      nd(ATTACH, {
+        t: 'reqfail',
+        method: 'GET',
+        url: 'https://app.test/api/slow',
+        err: 'net::ERR_CONNECTION_REFUSED',
+        from: 'https://app.test/',
+      }),
+    );
+    expect(findings[0]).toMatchObject({
+      code: 'runtime.request-failed',
+      location: 'GET /api/slow',
+    });
+    expect(findings[0]?.message).toContain('net::ERR_CONNECTION_REFUSED');
+  });
+
+  it('ignores a console warning, and reports a console error', () => {
+    const warned = findingsOf(
+      nd(ATTACH, { t: 'console', level: 'warning', text: 'deprecated', from: 'https://app.test/' }),
+    );
+    expect(warned.findings).toEqual([]);
+    const errored = findingsOf(
+      nd(ATTACH, { t: 'console', level: 'error', text: 'boom', from: 'https://app.test/' }),
+    );
+    expect(errored.findings).toHaveLength(1);
+  });
+
+  it('dedupes with a count, and caps each invariant with the overflow disclosed', () => {
+    const noisy = [
+      ATTACH,
+      ...Array.from({ length: 3 }, () => ({
+        t: 'console',
+        level: 'error',
+        text: 'the same error again',
+        from: 'https://app.test/',
+      })),
+      ...Array.from({ length: RUNTIME_FINDING_CAP + 4 }, (_unused, index) => ({
+        t: 'console',
+        level: 'error',
+        text: `distinct error ${index}`,
+        from: 'https://app.test/',
+      })),
+    ];
+    const { findings, caps } = findingsOf(nd(...noisy));
+
+    expect(findings.find((f) => f.message.startsWith('the same error again'))?.message).toContain(
+      'seen 3×',
+    );
+    expect(findings).toHaveLength(RUNTIME_FINDING_CAP);
+    // An undisclosed truncation of a DEFECT LIST is the one cap this product
+    // may never apply quietly.
+    const cap = caps.find((c) => c.limit === RUNTIME_FINDING_CAP);
+    expect(cap?.dropped).toBeGreaterThan(0);
+    expect(cap?.reason).toContain('not listed');
+  });
+
+  it('never carries a body, a header, a cookie or a typed value', () => {
+    /*
+     * Asserted over a hostile record set rather than trusted to a comment. The
+     * observer records the ACTION and the LOCATOR of a `fill`, never its
+     * argument, because a login test types a password — and a query string is
+     * dropped before it is ever written.
+     */
+    const lines = nd(
+      ATTACH,
+      {
+        t: 'req',
+        method: 'POST',
+        url: 'https://app.test/login?next=/admin&token=SECRET_QUERY',
+        status: 200,
+        rt: 'fetch',
+        nav: false,
+        chain: [],
+        from: 'https://app.test/login',
+      },
+      { t: 'ctl', action: 'fill', locator: "getByLabel('Password')" },
+    );
+    const blob = JSON.stringify({ surface: surfaceOf(lines), found: findingsOf(lines) });
+    expect(blob).not.toContain('SECRET_QUERY');
+    expect(blob).not.toContain('next=');
+    // The locator survives — it is in the customer's own test source already.
+    expect(blob).toContain("getByLabel('Password')");
+  });
+});
+
+describe('the network pane the cockpit reads', () => {
+  it('carries no response body, ever', () => {
+    const { entries } = observedNetworkEntries(
+      surfaceOf(
+        nd(ATTACH, {
+          t: 'req',
+          method: 'POST',
+          url: 'https://app.test/api/pay',
+          status: 500,
+          rt: 'fetch',
+          nav: false,
+          chain: [],
+          from: 'https://app.test/',
+        }),
+      ),
+    );
+    expect(entries).toHaveLength(1);
+    // Null and not '' — an empty string reads as "the body was empty", which is
+    // a claim about the response. This observer never looked.
+    expect(entries[0]?.responseBodySnippet).toBeNull();
+    expect(entries[0]).toMatchObject({ method: 'POST', url: '/api/pay', status: 500 });
+  });
+
+  it('counts the entries whose 0 is not a measurement', () => {
+    /*
+     * `NetworkEntry.durationMs` is a non-nullable number, so an unmeasured
+     * duration has to be written as 0 — and a 0 nobody explained is the "null
+     * that became 0" this product cannot ship. So the unmeasured ones are
+     * counted and the count is disclosed by the caller.
+     */
+    const { entries, untimed } = observedNetworkEntries(
+      surfaceOf(
+        nd(
+          ATTACH,
+          {
+            t: 'req',
+            method: 'GET',
+            url: 'https://app.test/a',
+            status: 200,
+            rt: 'fetch',
+            nav: false,
+            chain: [],
+            from: 'https://app.test/',
+          },
+          { t: 'timing', method: 'GET', url: 'https://app.test/a', ms: 12 },
+          { t: 'ws', url: 'wss://app.test/live' },
+        ),
+      ),
+    );
+    expect(entries.find((e) => e.url === '/a')?.durationMs).toBe(12);
+    expect(untimed).toBe(1);
+  });
+});
+
+describe('what the harness says when it did not watch', () => {
+  const lines = nd(ATTACH, { t: 'nav', url: 'https://app.test/x' });
+
+  async function collect(
+    source: RuntimeObservationSource,
+    notApplicable: string | null = null,
+  ): Promise<Awaited<ReturnType<typeof collectRuntimeObservation>>> {
+    return collectRuntimeObservation({
+      testId: 'test_1',
+      dir: '/fake/observations',
+      baseUrl: 'https://app.test',
+      specCode: 'await page.goto("/x");',
+      source,
+      notApplicable,
+    });
+  }
+
+  it('reports UNAVAILABLE, never "clean", when the observer wrote nothing', async () => {
+    /*
+     * THE LIE THIS REFUSES. A test whose app threw four exceptions and a test
+     * QAAI could not watch both produce `findings: []`. Only this field tells
+     * them apart, so an absent observer says UNAVAILABLE with its reason and the
+     * reason says in words that it is not a verdict on the application.
+     */
+    const { observation, console } = await collect({ read: async () => null });
+    expect(observation.availability.state).toBe('UNAVAILABLE');
+    expect(observation.availability.reason).toMatch(/NOT a statement that the application/);
+    expect(console.some((entry) => entry.text.includes('UNAVAILABLE'))).toBe(true);
+  });
+
+  it('distinguishes "it watched and saw nothing" from "it did not watch"', async () => {
+    // `[]` and `null` out of the source are different claims and only one of
+    // them is "we did not measure". Collapsing them is the whole defect.
+    const empty = await collect({ read: async () => [] });
+    expect(empty.observation.availability.state).toBe('OBSERVED');
+    expect(empty.observation.availability.reason).toBeNull();
+    expect(empty.observation.requests).toEqual([]);
+  });
+
+  it('reports NOT_APPLICABLE for a spec that drives no browser', async () => {
+    const { observation } = await collect(
+      { read: async () => null },
+      'this spec references no page',
+    );
+    expect(observation.availability.state).toBe('NOT_APPLICABLE');
+    expect(observation.availability.reason).toBe('this spec references no page');
+  });
+
+  it('never lets an observation problem change a verdict', async () => {
+    // An observer that throws must degrade to UNAVAILABLE, not propagate: a
+    // reporting problem must never lose a run.
+    const { observation, findings } = await collect({
+      read: async () => {
+        throw new Error('disk gone');
+      },
+    });
+    expect(observation.availability.state).toBe('UNAVAILABLE');
+    expect(findings).toEqual([]);
+  });
+
+  it('folds a real observation through the same seam', async () => {
+    const { observation, findings } = await collect({ read: async () => lines });
+    expect(observation.availability.state).toBe('OBSERVED');
+    expect(observation.navigations.map((n) => n.finalUrl)).toEqual(['/x']);
+    expect(findings).toEqual([]);
+  });
+});
+
+describe('the observer injected into the spec', () => {
+  const source = runtimeObserverEpilogue('/tmp/run-1/observations');
+
+  it('is skipped entirely for a spec that drives no browser', () => {
+    /*
+     * The epilogue destructures the `page` fixture and requesting `page`
+     * LAUNCHES A BROWSER. Injecting it into an API-only spec would add a
+     * browser launch the test never asked for and would fail it outright on a
+     * worker with no Chromium — so such a spec is left byte-identical.
+     */
+    expect(specUsesBrowser('test("x", async ({ page }) => { await page.goto("/"); });')).toBe(true);
+    expect(specUsesBrowser('test("x", async ({ context }) => {});')).toBe(true);
+    expect(specUsesBrowser('test("x", async ({ request }) => { await request.get("/api"); });')).toBe(
+      false,
+    );
+  });
+
+  it('records the ACTION and the LOCATOR of a fill, never its argument', () => {
+    // A login test types a password. The patched method writes `action` and
+    // `String(this)` and then calls through with `...args` untouched — the
+    // arguments are never serialised.
+    expect(source).toContain("__qaaiWrite({ t: 'ctl', action: action, locator: String(this)");
+    expect(source).toContain('return original.apply(this, args);');
+    /*
+     * Asserted over the CODE, with the comments stripped: the first version of
+     * this check matched the very comment that explains why args[0] is not
+     * recorded, so it would have passed over an implementation that recorded
+     * it. `args` now has to appear exactly twice — the parameter and the
+     * call-through — which leaves no third site able to serialise it.
+     */
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(code).not.toMatch(/args\[0\]|JSON\.stringify\(args/);
+    expect(code.match(/\bargs\b/g)).toEqual(['args', 'args']);
+  });
+
+  it('reaches the locator prototype through the PUBLIC api', () => {
+    // Not `playwright-core/lib/client/locator.js`: an internal path is not an
+    // entry point and breaks on a patch release. This one is reachable from
+    // `page.locator()`, which is documented.
+    expect(source).toContain("Object.getPrototypeOf(page.locator('html'))");
+    expect(source).not.toContain('playwright-core/lib');
+  });
+
+  it('strips the query string before anything reaches disk', () => {
+    // Done in the browser process, not on the way out: a token must not exist
+    // in a file in between, even for the moment before the harness reads it.
+    expect(source).toContain('function __qaaiSafeUrl');
+    expect(source).toContain("const cut = text.indexOf('?');");
+  });
+
+  it('cannot fail the test it is observing', () => {
+    /*
+     * Every listener body, the writer and the patch are wrapped. A throw out of
+     * QAAI's own injected code would be reported as a defect in the customer's
+     * application, which is the worst failure mode available here.
+     */
+    expect(source.split('} catch {}').length - 1).toBeGreaterThanOrEqual(8);
+    expect(source).toContain("/* Observation must never fail a customer's test. */");
+  });
+
+  it('resets its counters per TEST, so one file does not double-count a cap', () => {
+    expect(source).toContain('__qaaiObs.counts = { nav: 0, req: 0, ctl: 0, console: 0 };');
+    expect(source).toContain("__qaaiObserveTest.afterEach");
+  });
+
+  it('inlines the directory as a string literal rather than a new env var', () => {
+    /*
+     * `har.ts` passes its report directory the same way. An environment
+     * variable would be new configuration for something that is not
+     * configurable, and the path is QAAI's own temp directory — but it is still
+     * JSON-stringified, because a path that becomes source code and is
+     * interpolated bare is arbitrary code inside the customer's own run.
+     */
+    const hostile = runtimeObserverEpilogue('a"; process.exit(1); //');
+    const subscript = /dir: (".*?"),\n/.exec(hostile)?.[1];
+    expect(subscript).toBeDefined();
+    expect(JSON.parse(subscript as string)).toBe('a"; process.exit(1); //');
+    expect(hostile).not.toContain('a"; process.exit(1); //,');
+  });
+
+  it('carries the caps it enforces, so the browser side and this file agree', () => {
+    expect(source).toContain(JSON.stringify(RUNTIME_OBSERVATION_CAPS));
+    expect(source).toContain(RUNTIME_OBSERVER_MARKER);
+  });
+
+  it('writes one file per process, because Playwright loads a spec many times', () => {
+    // Playwright loads the spec in the collection process AND in every worker.
+    // Two writers on one path interleave half-lines, which the parser would
+    // then count as malformed — real data lost to a filename.
+    expect(source).toContain("'obs-' + process.pid + '-' + Date.now() + '.ndjson'");
+  });
+});
+
+describe('the paths that never reach a browser', () => {
+  it('says on the RESULT that an unexecuted spec observed nothing', async () => {
+    /*
+     * `findings: []` on a refusal must not read as "no defects found". The
+     * refusal already explains why the test did not run; this adds, in the
+     * channel the reader is already looking at, that nothing below is a
+     * statement about the application.
+     */
+    const execution = await runPlaywrightSpec(context(), test('prof_admin'));
+    expect(execution.status).toBe('FAILED');
+    expect(execution.findings).toEqual([]);
+    expect(execution.console.map((entry) => entry.text).join('\n')).toMatch(
+      /Runtime observation NOT_APPLICABLE: The spec was not executed/,
+    );
+  });
+
+  it('says the same when the environment was never reached', async () => {
+    const execution = await runPlaywrightSpec(context(), test(null), {
+      access: { provider: 'TURNSTILE', bypassMode: 'NOT_CONFIGURED' },
+    });
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.console.map((entry) => entry.text).join('\n')).toMatch(
+      /Runtime observation NOT_APPLICABLE: The environment was never reached/,
+    );
   });
 });

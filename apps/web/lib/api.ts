@@ -422,6 +422,130 @@ export interface CoverageUnknown {
   sample: string | null;
 }
 
+export type CoverageAxis = 'ROUTE' | 'JOURNEY' | 'FORM' | 'CONTROL';
+
+/** One axis's reading of ITSELF. Never added to another axis's counts. */
+export interface CoverageAxisReading {
+  axis: CoverageAxis;
+  label: string;
+  /** What one item on this axis is. Rendered, so two axes are visibly not one unit. */
+  unit: string;
+  denominator: number;
+  covered: number;
+  /** The subset established without a bare substring mention. */
+  provenCovered: number;
+  mentionOnly: number;
+  /** NULL — never 0, never 100 — when this axis enumerated nothing. */
+  percent: number | null;
+  provenPercent: number | null;
+  evidence: 'LITERAL' | 'MENTION';
+  weight: number;
+  effectiveWeight: number | null;
+  measured: boolean;
+}
+
+/**
+ * THE HEADLINE, COMPUTED SERVER-SIDE.
+ *
+ * It used to be computed in `CoverageGaps.tsx` as
+ * `(routesVisited + journeysWalked + formsExercised + affordancesUsed) /
+ * (routes + journeys + forms + affordances)` — four denominators added
+ * together, which made controls roughly 80% of the figure because a crawl finds
+ * one affordance per clickable thing on every page. It also meant the number
+ * existed for the length of one render, so no CLI, CI gate, badge or digest
+ * could obtain it.
+ *
+ * Now it arrives on the wire as a published weighted bound. This component
+ * RENDERS it and does no arithmetic on it: a second implementation here is a
+ * second percentage.
+ */
+export interface CoverageHeadline {
+  /** THE NUMBER TO QUOTE. Proven coverage only. NULL when nothing was measured. */
+  lowerPercent: number | null;
+  /** The same mean including the deliberately generous form/control matchers. */
+  upperPercent: number | null;
+  /** "34–61%", or null. Never "0%" for an unmeasured project. */
+  range: string | null;
+  quotes: 'lowerPercent';
+  formula: string;
+  boundRule: string;
+  weights: Record<CoverageAxis, number>;
+  axes: CoverageAxisReading[];
+  measuredAxes: CoverageAxis[];
+  unmeasuredAxes: CoverageAxis[];
+  renormalised: boolean;
+  notASumOfDenominators: string;
+  why: string;
+}
+
+/** One covered item and the tests that cover it — the traceability half. */
+export interface CoverageLedgerItem {
+  axis: CoverageAxis;
+  key: string;
+  title: string;
+  route: string | null;
+  testIds: string[];
+  /** EXACT and never capped. The field to count. */
+  testCount: number;
+  testIdsTruncated: boolean;
+  evidence: 'LITERAL' | 'MENTION';
+  /** NULL means no caller asked the database — NOT "never ran". */
+  execution: {
+    ran: boolean;
+    lastStatus: string | null;
+    lastRunId: string | null;
+    quarantinedTestIds: string[];
+    retryPassTestIds: string[];
+    status: 'COVERED' | 'ASSERTED_NOT_RUN';
+    why: string;
+  } | null;
+}
+
+export interface CoverageLedger {
+  items: CoverageLedgerItem[];
+  total: number;
+  returned: number;
+  truncated: boolean;
+  /** Items one `.skip` away from being a gap. */
+  singleTested: number;
+  overTested: number;
+  coveredOnlyByQuarantined: number;
+  /** NULL when no executions were supplied. Not 0. */
+  neverRun: number | null;
+  capsThatBit: string[];
+  rule: string;
+}
+
+/** How old the figure on screen is. Present on a hit AND on a miss. */
+export interface CoverageCacheState {
+  hit: boolean;
+  computedAtIso: string;
+  ageMs: number;
+  ttlMs: number;
+  keyedOn: string;
+  why: string;
+}
+
+/** The window on the filtered gap list. `matched` is exact; `gaps.length` is not. */
+export interface CoveragePage {
+  matched: number;
+  returned: number;
+  limit: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  rule: string;
+}
+
+/** What kind of evidence the coverage links rest on. NULL when unanswerable. */
+export interface CoverageProvenance {
+  byEvidence: Array<{ source: string; tier: string; live: number }>;
+  live: number;
+  retired: number;
+  staticOnly: number;
+  runConfirmed: number;
+  why: string;
+}
+
 export interface CoverageReport {
   /** False when there is no readable flow map — then we know nothing about the app. */
   crawled: boolean;
@@ -446,9 +570,15 @@ export interface CoverageReport {
     gaps: number;
     gapsReturned: number;
   };
+  headline: CoverageHeadline;
+  ledger: CoverageLedger;
+  cache: CoverageCacheState;
+  page: CoveragePage;
+  /** NULL when this deployment cannot answer — not "no evidence exists". */
+  provenance: CoverageProvenance | null;
   fingerprint: string;
   filtered: boolean;
-  limits: { maxProposalsPerRequest: number };
+  limits: { maxProposalsPerRequest: number; maxPageSize: number };
 }
 
 export interface CoverageProposeResult {

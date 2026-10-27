@@ -1035,6 +1035,110 @@ describe('the headline arithmetic', () => {
   });
 });
 
+// ─── Quarantine: a suppressed result is not coverage ────────────────────────
+
+/**
+ * The defect: this matcher counted a quarantined test's PASSED result
+ * identically to a live one, while `packages/runner/src/gates.ts` excluded it
+ * from every rule and suite health counted it as a liability. Three surfaces of
+ * one product giving opposite answers about one test.
+ *
+ * The rule: the item keeps its MATCH — somebody did write a test, and erasing
+ * that would be the opposite error — and stops being COVERED. That is exactly
+ * the DECLARED rung of the coverage ladder, which `surfaceStatusForTier` maps
+ * onto ASSERTED_NOT_RUN.
+ */
+describe('analyseSurfaceCoverage — a quarantined test is not coverage', () => {
+  const passing = (over: Partial<TestExecutionFact> = {}): TestExecutionFact => ({
+    testId: 'tst_1',
+    runId: 'run_1',
+    status: 'PASSED',
+    atIso: '2026-10-20T00:00:00.000Z',
+    ...over,
+  });
+
+  it('refuses to call an item COVERED on a suppressed pass', () => {
+    const live = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing()],
+    });
+    expect(live.entries[0]?.status).toBe('COVERED');
+
+    const suppressed = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing({ quarantined: true })],
+    });
+    expect(suppressed.entries[0]?.status).toBe('ASSERTED_NOT_RUN');
+    expect(suppressed.entries[0]?.verification.executed).toBe(false);
+  });
+
+  it('keeps the match, so the finding names the test rather than hiding it', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing({ quarantined: true })],
+    });
+    // The item is not covered AND the test is still listed: "your only test for
+    // this is suppressed" is the finding, which needs both halves.
+    expect(result.entries[0]?.matches).toHaveLength(1);
+    expect(result.entries[0]?.matches[0]?.testId).toBe('tst_1');
+    expect(result.entries[0]?.verification.lastStatus).toBe('PASSED');
+    expect(result.entries[0]?.verification.everPassed).toBe(true);
+  });
+
+  it('reports the count, because an item that silently stopped being covered is the same defect as one that silently started', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing({ quarantined: true })],
+    });
+    expect(result.caveats.join(' ')).toContain('matched by a quarantined test');
+    expect(result.caveats.join(' ')).toContain('no unquarantined cover');
+  });
+
+  it('stays COVERED when a second, live test also matches', () => {
+    const result = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ id: 'tst_1', routes: ['/orders/1'] }), test_({ id: 'tst_2', routes: ['/orders/2'] })],
+      executions: [passing({ quarantined: true }), passing({ testId: 'tst_2' })],
+    });
+    expect(result.entries[0]?.status).toBe('COVERED');
+    // Still disclosed: one of the two covers gates nothing.
+    expect(result.caveats.join(' ')).toContain('also matched by a test that is not');
+  });
+
+  it('changes the fingerprint, so a quarantine is a change in the answer', () => {
+    const before = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing()],
+    });
+    const after = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing({ quarantined: true })],
+    });
+    expect(after.fingerprint).not.toBe(before.fingerprint);
+  });
+
+  it('behaves exactly as before for an execution that does not mention quarantine', () => {
+    const absent = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing()],
+    });
+    const explicit = run({
+      items: [ROUTE_ITEM],
+      tests: [test_({ routes: ['/orders/1'] })],
+      executions: [passing({ quarantined: false })],
+    });
+    expect(absent.fingerprint).toBe(explicit.fingerprint);
+    expect(absent.totals.percent).toBe(explicit.totals.percent);
+  });
+});
+
 describe('rankUncovered', () => {
   it('puts auth surfaces first and source-only items before crawl-only ones', () => {
     const items: SurfaceItem[] = [

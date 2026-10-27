@@ -235,6 +235,13 @@ function crawl(): Row {
 interface Store {
   project: Row[];
   test: Row[];
+  /**
+   * `TestResult` rows. The report joins them so a test that never ran, one
+   * that always fails and one that is quarantined stop closing a gap
+   * identically — so a fake with no results is the "nobody has ever run this
+   * suite" case and has to be a real, seedable one rather than an omission.
+   */
+  testResult: Row[];
   flowMap: Row[];
   authProfile: Row[];
   /** `TestPlan` rows this request created, with their nested items. */
@@ -249,6 +256,7 @@ function install(over: Partial<Store> = {}): void {
   store = {
     project: [{ id: 'proj_1', orgId: 'org_1' }],
     test: [],
+    testResult: [],
     flowMap: [
       {
         id: 'fm_1',
@@ -275,7 +283,46 @@ function install(over: Partial<Store> = {}): void {
         return { id: found.id };
       },
     },
-    test: { findMany: async () => store.test.map((row) => ({ ...row })) },
+    test: {
+      /*
+       * HONOURS `select`, like every other delegate in this fake.
+       *
+       * The route reads Test twice with two different selects — the full
+       * coverage set, and `{id, quarantined, quarantineExpiresAt}` for the
+       * quarantine join — and a select-blind fake would make deleting
+       * `quarantineExpiresAt` from the second query undetectable, which is
+       * exactly the class of defect that survived a whole slice here before.
+       */
+      findMany: async (args: Row = {}) =>
+        store.test
+          .filter((row) => (args.where?.quarantined === true ? row.quarantined === true : true))
+          .map((row) => pick(row, args.select as Record<string, true> | undefined)),
+      aggregate: async () => ({
+        _count: { id: store.test.length },
+        _max: {
+          updatedAt: store.test.reduce<Date | null>((newest, row) => {
+            const at = row.updatedAt as Date | undefined;
+            if (!at) return newest;
+            return newest === null || at > newest ? at : newest;
+          }, null),
+        },
+      }),
+    },
+    testResult: {
+      findMany: async (args: Row = {}) =>
+        [...store.testResult]
+          // The route depends on newest-first: the FIRST sighting of a test is
+          // taken as its latest result, so a fake that ignored `orderBy` would
+          // let an older row win and the assertion would pass for the wrong
+          // reason.
+          .sort((left, right) =>
+            String(right.createdAt?.toISOString?.() ?? '').localeCompare(
+              String(left.createdAt?.toISOString?.() ?? ''),
+            ),
+          )
+          .map((row) => pick(row, args.select as Record<string, true> | undefined)),
+      count: async () => store.testResult.length,
+    },
     flowMap: { findFirst: async () => ({ ...store.flowMap[0] }) },
     authProfile: { findMany: async () => store.authProfile.map((row) => ({ ...row })) },
     testPlan: {
@@ -326,6 +373,24 @@ function install(over: Partial<Store> = {}): void {
   };
 }
 
+/**
+ * `select`, honoured. Returns the whole row when no select is given, exactly as
+ * Prisma does, and ONLY the named keys when one is.
+ *
+ * A fake that ignores `select` makes dropping a field from a query undetectable
+ * — the handler reads `row.retriedAndPassed`, the fake hands back every column
+ * it holds, and a select that no longer asks for it passes anyway. Two defects
+ * survived a whole slice in this repo behind select-blind fakes.
+ */
+function pick(row: Row, select: Record<string, true> | undefined): Row {
+  if (!select) return { ...row };
+  const out: Row = {};
+  for (const key of Object.keys(select)) {
+    if (select[key] === true) out[key] = row[key];
+  }
+  return out;
+}
+
 /** The items of the LATEST plan this request created. */
 const planItems = (): Row[] => (store.plans[store.plans.length - 1]?.items ?? []) as Row[];
 const closure = (gapId: string, projectId = 'proj_1'): Row | undefined =>
@@ -334,7 +399,7 @@ const closure = (gapId: string, projectId = 'proj_1'): Row | undefined =>
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
-const { coverageRouter } = await import('./coverage.js');
+const { coverageRouter, resetCoverageCache } = await import('./coverage.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 
 const app = express();
@@ -387,6 +452,14 @@ beforeEach(() => {
   h.env.ANTHROPIC_API_KEY = '';
   h.closureThrows = null;
   install();
+  /*
+   * The report cache is module-level and keyed on the project's INPUTS, so two
+   * tests that seed the same shape would have the second served the first's
+   * report — and the suite would pass or fail depending on the order vitest
+   * happened to run them in. Clearing it is what makes every test below a
+   * statement about its own fixture.
+   */
+  resetCoverageCache();
 });
 
 // ─── (a) The provenance the request used to throw away ───────────────────────
@@ -551,5 +624,298 @@ describe('a human proposing tests for gaps', () => {
 
     expect(planItems()).toHaveLength(1);
     expect(store.closures.size).toBe(1);
+  });
+});
+
+// ─── (c) The page, cut AFTER the filters ─────────────────────────────────────
+
+/**
+ * Register item 8. `limit` was passed straight into `analyzeCoverage`, which
+ * sliced the ranked list BEFORE this handler applied `kind` and `minScore`. A
+ * project with 800 untested controls could never name more than 300 of them,
+ * and a filtered list was wrong as well as short: a reader asking for
+ * UNSUBMITTED_FORM got whichever forms fell inside the top 300 by score, with
+ * no indication that any others existed.
+ */
+describe('paging the uncovered list', () => {
+  const get = (query = '') => call('GET', `/coverage/proj_1${query}`);
+
+  it('reports the filtered count, not the length of the page', async () => {
+    const all = await get();
+    const total = (all.body.totals as Row).gaps as number;
+    expect(total).toBeGreaterThan(2);
+
+    const paged = await get('?limit=2');
+    expect((paged.body.gaps as Row[]).length).toBe(2);
+    // `matched` is the whole filtered list; `gaps.length` is the window.
+    expect((paged.body.page as Row).matched).toBe(total);
+    expect((paged.body.page as Row).returned).toBe(2);
+    expect((paged.body.page as Row).hasMore).toBe(true);
+  });
+
+  it('applies the kind filter BEFORE the page, so the filtered list is complete', async () => {
+    const all = await get('?limit=1');
+    const firstKind = String(((all.body.gaps as Row[])[0] ?? {}).kind);
+
+    const filtered = await get(`?kind=${firstKind}&limit=1`);
+    const matched = (filtered.body.page as Row).matched as number;
+    const everyOfThatKind = ((await get()).body.gaps as Row[]).filter(
+      (gap) => gap.kind === firstKind,
+    ).length;
+    // The count the caller is told is the count of gaps OF THAT KIND, which is
+    // only true if the filter ran before the slice.
+    expect(matched).toBe(everyOfThatKind);
+  });
+
+  it('walks the whole list with nextCursor, and says when it has ended', async () => {
+    const total = ((await get()).body.totals as Row).gaps as number;
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    // Bounded by `total + 1` so a cursor that never advances fails the test
+    // rather than hanging it.
+    for (let page = 0; page <= total; page += 1) {
+      const { status, body } = await get(`?limit=1${cursor ? `&cursor=${cursor}` : ''}`);
+      expect(status).toBe(200);
+      for (const gap of body.gaps as Row[]) seen.push(String(gap.id));
+      cursor = ((body.page as Row).nextCursor as string | null) ?? null;
+      if (cursor === null) break;
+    }
+    expect(cursor).toBeNull();
+    expect(seen.length).toBe(total);
+    expect(new Set(seen).size).toBe(total);
+  });
+
+  it('refuses a cursor that is not in the current filtered list', async () => {
+    const { status, body } = await get('?cursor=gap_that_never_existed');
+    // NOT an empty page: an unknown cursor means the report moved under the
+    // caller, and `[]` reads exactly like "you have reached the end".
+    expect(status).toBe(409);
+    expect(JSON.stringify(body)).toMatch(/cursor/i);
+  });
+
+  it('says in the payload that the filters run before the page', async () => {
+    const { body } = await get();
+    expect(String((body.page as Row).rule)).toContain('BEFORE this page is cut');
+  });
+
+  it('builds proposals for the page only, not for every gap in the project', async () => {
+    const { body } = await get('?limit=1&proposals=true');
+    const gaps = body.gaps as Row[];
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]).toHaveProperty('proposal');
+  });
+});
+
+// ─── (d) The number's age, always on the response ───────────────────────────
+
+describe('the cached report says how old it is', () => {
+  it('reports a miss on the first read and a hit on the second', async () => {
+    const first = await call('GET', '/coverage/proj_1');
+    expect((first.body.cache as Row).hit).toBe(false);
+    expect((first.body.cache as Row).ageMs).toBe(0);
+
+    const second = await call('GET', '/coverage/proj_1');
+    expect((second.body.cache as Row).hit).toBe(true);
+    expect(String((second.body.cache as Row).computedAtIso)).toMatch(/^\d{4}-/);
+  });
+
+  it('recomputes when a test lands, without waiting for a TTL', async () => {
+    await call('GET', '/coverage/proj_1');
+    // The entry is keyed on the project's INPUTS, not on a clock: a team that
+    // writes a test must see the number move, which is the only thing this
+    // screen is for.
+    store.test.push({
+      id: 'tst_new',
+      orgId: 'org_1',
+      projectId: 'proj_1',
+      name: 'new',
+      filePath: 'specs/new.spec.ts',
+      code: null,
+      spec: null,
+      tags: [],
+      feature: null,
+      priority: 'IMPORTANT',
+      type: 'E2E',
+      authProfileId: null,
+      authProfileRequired: false,
+      disabledAt: null,
+      updatedAt: new Date(),
+    });
+    const after = await call('GET', '/coverage/proj_1');
+    expect((after.body.cache as Row).hit).toBe(false);
+    expect(String((after.body.cache as Row).why)).toContain('inputs that have since changed');
+  });
+
+  it('recomputes on ?cache=false, and says that is why', async () => {
+    await call('GET', '/coverage/proj_1');
+    const forced = await call('GET', '/coverage/proj_1?cache=false');
+    expect((forced.body.cache as Row).hit).toBe(false);
+    expect(String((forced.body.cache as Row).why)).toContain('?cache=false');
+  });
+
+  it('names the inputs that invalidate it, so the age is interpretable', async () => {
+    const { body } = await call('GET', '/coverage/proj_1');
+    expect(String((body.cache as Row).keyedOn)).toContain('TestResult count');
+  });
+});
+
+// ─── (e) The quarantine join, end to end through the route ──────────────────
+
+describe('the report joins TestResult, so three screens stop disagreeing', () => {
+  /** A test that covers `/products`, with a result and an optional quarantine. */
+  function seedCoveringTest(over: Row = {}): void {
+    store.test.push({
+      id: 'tst_cov',
+      orgId: 'org_1',
+      projectId: 'proj_1',
+      name: 'cart',
+      filePath: 'specs/cart.spec.ts',
+      code: `await page.goto('/cart');`,
+      spec: null,
+      tags: [],
+      feature: null,
+      priority: 'IMPORTANT',
+      type: 'E2E',
+      authProfileId: null,
+      authProfileRequired: false,
+      disabledAt: null,
+      updatedAt: new Date('2026-10-02T00:00:00.000Z'),
+      quarantined: false,
+      quarantineExpiresAt: null,
+      ...over,
+    });
+    store.testResult.push({
+      id: 'res_1',
+      orgId: 'org_1',
+      testId: 'tst_cov',
+      runId: 'run_1',
+      status: 'PASSED',
+      retriedAndPassed: false,
+      createdAt: new Date('2026-10-03T00:00:00.000Z'),
+    });
+  }
+
+  const gapRoutes = (body: Row): string[] =>
+    (body.gaps as Row[]).filter((gap) => gap.kind === 'UNVISITED_ROUTE').map((gap) => String(gap.route));
+
+  it('closes the gap for a live test that ran', async () => {
+    seedCoveringTest();
+    const { body } = await call('GET', '/coverage/proj_1?limit=300');
+    expect(gapRoutes(body)).not.toContain('/cart');
+  });
+
+  it('leaves the gap open when that same test is quarantined', async () => {
+    seedCoveringTest({ quarantined: true });
+    const { body } = await call('GET', '/coverage/proj_1?limit=300');
+    // The result is suppressed from every gate rule, so coverage attributed to
+    // it is coverage nothing will ever check.
+    expect(gapRoutes(body)).toContain('/cart');
+    expect((body.ledger as Row).coveredOnlyByQuarantined).toBe(1);
+  });
+
+  it('closes it again once the quarantine has EXPIRED, because an expired one gates', async () => {
+    seedCoveringTest({
+      quarantined: true,
+      quarantineExpiresAt: new Date('2020-01-01T00:00:00.000Z'),
+    });
+    const { body } = await call('GET', '/coverage/proj_1?limit=300');
+    expect(gapRoutes(body)).not.toContain('/cart');
+  });
+
+  it('names the covering test on the ledger row', async () => {
+    seedCoveringTest();
+    const { body } = await call('GET', '/coverage/proj_1?limit=300');
+    const row = (body.ledger as Row).items as Row[];
+    const products = row.find((item) => item.key === 'ROUTE:/cart');
+    expect(products?.testIds).toEqual(['tst_cov']);
+    expect((products?.execution as Row).lastStatus).toBe('PASSED');
+  });
+});
+
+// ─── (f) Provenance: null is not an empty aggregate ─────────────────────────
+
+describe('the provenance aggregate', () => {
+  it('answers NULL rather than zeroes when the table cannot be read', async () => {
+    // This fake holds no `testCoverageEdge` delegate, which is the same state
+    // as a deployment where the migration has not been applied. "We cannot
+    // answer" must not render as "this project has no evidence behind its
+    // number", which is the opposite of the truth.
+    const { body } = await call('GET', '/coverage/proj_1');
+    expect(body.provenance).toBeNull();
+  });
+});
+
+// ─── (g) The mount, and the parser ordering it depends on ───────────────────
+
+/**
+ * ── WHY THIS LIVES IN THIS FILE ─────────────────────────────────────────────
+ *
+ * `apps/api/src/index.ts` has no test anywhere in this repo: every router test
+ * builds its own express app, so nothing proves a router is mounted and a
+ * mutation that deletes `app.use(codeCoverageRouter)` is caught only by
+ * `npx tsx scripts/check-wiring.ts` — a gate, not a test. I own index.ts's
+ * mounting this round and not an index test, so the assertion goes here, with
+ * the reason, rather than nowhere.
+ *
+ * It reads the SOURCE. That is the same mechanism `apps/api/scripts/
+ * check-enums.ts` uses, and it is the only one available: importing index.ts
+ * starts a server, a Redis connection and a metrics registry.
+ */
+describe('the code-coverage router is mounted, and its body limit is reachable', () => {
+  const indexSource = async (): Promise<string> => {
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    return readFile(fileURLToPath(new URL('../index.ts', import.meta.url)), 'utf8');
+  };
+
+  it('mounts it at the root, because the router declares its own full paths', async () => {
+    const source = await indexSource();
+    expect(source).toContain("import { codeCoverageRouter } from './routes/code-coverage.js';");
+    // No prefix: a prefix here would serve `/code-coverage/:projectId` at
+    // `/code-coverage/code-coverage/:projectId`.
+    expect(source).toContain('app.use(codeCoverageRouter);');
+    expect(source).not.toContain("app.use('/code-coverage', codeCoverageRouter)");
+  });
+
+  it('puts the 16mb parser BEFORE the global 2mb one, or the limit is unreachable', async () => {
+    const source = await indexSource();
+    const scoped = source.indexOf("app.use('/code-coverage', express.json({ limit: '16mb' }))");
+    const global = source.indexOf("app.use(express.json({ limit: '2mb' }))");
+    expect(scoped).toBeGreaterThan(-1);
+    expect(global).toBeGreaterThan(-1);
+    /*
+     * body-parser SKIPS once `req._body` is set, so a router-level parser
+     * mounted after the global one can never raise the limit. Get this order
+     * wrong and `CODE_COVERAGE_CAPS.payloadBytes` (16MB) is an allowance
+     * nobody can use while the door advertises eight times its real ceiling —
+     * a cap that bit without being disclosed, in the one place a customer's
+     * real `coverage-final.json` lands.
+     */
+    expect(scoped).toBeLessThan(global);
+  });
+});
+
+describe('the kind filter’s vocabulary comes from GAP_KINDS', () => {
+  it('accepts every kind the analysis can emit, including the destructive class', async () => {
+    const { GAP_KINDS } = await import('@qaai/agent');
+    for (const kind of GAP_KINDS) {
+      const { status, body } = await call('GET', `/coverage/proj_1?kind=${kind}`);
+      // A hand-written copy of this list had already drifted:
+      // UNEXERCISABLE_SURFACE was in GAP_KINDS and not in the filter's set, so
+      // filtering for the one class whose members are selected FOR being
+      // destructive answered 400 "unknown gap kind" against a report that can
+      // contain them.
+      expect({ kind, status }).toEqual({ kind, status: 200 });
+      expect(body.page).toBeDefined();
+    }
+  });
+
+  it('still refuses a name that is in no vocabulary at all', async () => {
+    const { status, body } = await call('GET', '/coverage/proj_1?kind=NOT_A_KIND');
+    // A typo'd filter that silently returned nothing reads exactly like "you
+    // have no gaps of that kind", which is the one wrong answer this endpoint
+    // can give.
+    expect(status).toBe(400);
+    expect(JSON.stringify(body)).toContain('NOT_A_KIND');
   });
 });

@@ -31,6 +31,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { allureReporter } from '../../runner/src/reporters/allure.js';
 import { testrailReporter } from '../../runner/src/reporters/testrail.js';
 /*
+ * The registry itself, so the mirrored name list below cannot drift from it.
+ * Crossing the package boundary is permitted HERE and nowhere else in this
+ * package: a test file is excluded from `tsconfig.build.json` and never reaches
+ * the published tarball. See the header of report.ts.
+ */
+import { REPORTERS } from '../../runner/src/reporters/index.js';
+/*
  * The two things the CLI re-implements because it may not import them, and
  * which therefore have to be asserted equal to the originals here: the
  * quarantine sentence, and the expiry rule that decides who gets it.
@@ -38,7 +45,10 @@ import { testrailReporter } from '../../runner/src/reporters/testrail.js';
 import { QUARANTINE_NOTE as RUNNER_QUARANTINE_NOTE } from '../../runner/src/reporters/types.js';
 import { quarantineSuppresses } from '../../runner/src/gates.js';
 import {
+  CLI_RENDERABLE_REPORTERS,
+  CLI_UNAVAILABLE_REPORTERS,
   QUARANTINE_NOTE,
+  REPORTER_NAMES,
   ReportError,
   caseIdsFor,
   emitReports,
@@ -243,6 +253,106 @@ describe('parseReporterArgs', () => {
   it('finds nothing when nothing was asked for', () => {
     expect(parseReporterArgs(['--env', 'e1', '--junit', 'r.xml'])).toEqual([]);
   });
+
+  /**
+   * A REGISTERED REPORTER THIS CLI CANNOT WRITE IS REFUSED BY NAME, NOT DENIED.
+   *
+   * `sarif` and `evidence-pack` are real, selectable reporters. "Unknown
+   * reporter 'sarif'" would be a false statement that sends a user off to build
+   * a SARIF exporter QAAI already has, so the refusal has to be the other
+   * sentence — and the two must stay distinguishable, which is what the
+   * negative assertion on /Unknown reporter/ is for.
+   */
+  it('refuses a reporter that exists but cannot be rendered here, and says which', () => {
+    for (const name of Object.keys(CLI_UNAVAILABLE_REPORTERS)) {
+      let message = '';
+      try {
+        parseReporterArgs(['--reporter', name]);
+      } catch (err) {
+        message = err instanceof Error ? err.message : String(err);
+      }
+      expect(message, name).toMatch(new RegExp(`The '${name}' reporter exists`));
+      // NOT the unknown-name sentence. Collapsing the two is the defect.
+      expect(message, name).not.toMatch(/Unknown reporter/);
+      // And it says where the format can be had, rather than only that it cannot.
+      expect(message, name).toContain('@qaai/runner');
+      // Plus what IS renderable, so the refusal is actionable in one read.
+      expect(message, name).toContain('junit, allure, testrail');
+    }
+  });
+
+  it('still refuses a name nobody has ever heard of, with the other sentence', () => {
+    expect(() => parseReporterArgs(['--reporter', 'sarifff'])).toThrow(
+      /Unknown reporter 'sarifff'/,
+    );
+    // The unknown-name list offers every RECOGNISED name, including the two
+    // that are refused above: a user who typed `sarifff` meant `sarif`, and a
+    // list that omitted it would not help them.
+    expect(() => parseReporterArgs(['--reporter', 'sarifff'])).toThrow(/sarif/);
+  });
+
+  it('refuses an unavailable name even in the middle of a comma list', () => {
+    expect(() => parseReporterArgs(['--reporter', 'allure,sarif,testrail'])).toThrow(
+      /The 'sarif' reporter exists/,
+    );
+  });
+});
+
+// ─── 2b. The name lists cannot drift ─────────────────────────────────────────
+
+/**
+ * The published CLI mirrors the registry's names because it may not import it
+ * at run time (see the header of report.ts). This is the parity test that makes
+ * the mirror safe — and it is the one that was missing: `sarif` and
+ * `evidence-pack` were registered in @qaai/runner and absent from this list,
+ * so `--reporter sarif` answered "Unknown reporter".
+ */
+describe('the CLI name list mirrors the runner registry', () => {
+  const registryNames = REPORTERS.map((reporter) => reporter.name);
+
+  it('recognises every reporter the registry offers', () => {
+    expect([...REPORTER_NAMES].sort()).toEqual([...registryNames].sort());
+  });
+
+  it('classifies every recognised name as renderable here or not, exactly once', () => {
+    const renderable = new Set<string>(CLI_RENDERABLE_REPORTERS);
+    const unavailable = new Set(Object.keys(CLI_UNAVAILABLE_REPORTERS));
+
+    for (const name of REPORTER_NAMES) {
+      // Exactly one of the two, so a name can never be both offered and
+      // refused — or, worse, neither, which is how it reaches `emitOne` with
+      // no branch of its own.
+      expect([renderable.has(name), unavailable.has(name)].filter(Boolean), name).toHaveLength(1);
+    }
+    expect(renderable.size + unavailable.size).toBe(REPORTER_NAMES.length);
+  });
+
+  it('gives every unavailable reporter a reason a user can act on', () => {
+    for (const [name, reason] of Object.entries(CLI_UNAVAILABLE_REPORTERS)) {
+      expect(registryNames, name).toContain(name);
+      expect(reason.length, name).toBeGreaterThan(40);
+      expect(reason, name).toContain('@qaai/runner');
+    }
+  });
+
+  /**
+   * THE HELP TEXT AND THE RESOLVABLE NAMES CANNOT DRIFT.
+   *
+   * index.ts is read as a FILE and not imported: it carries a shebang, holds
+   * `HELP` as a module-local const, and self-invokes `main()`, so importing it
+   * would run the CLI inside the test process.
+   */
+  it('documents every recognised reporter in the --reporter help line', () => {
+    const source = readFileSync(new URL('./index.ts', import.meta.url).pathname, 'utf8');
+    const start = source.indexOf('  --reporter <name>');
+    expect(start).toBeGreaterThan(-1);
+    // The flag's own entry: from its line to the next flag's.
+    const entry = source.slice(start, source.indexOf('  --reporter-out', start));
+
+    for (const name of REPORTER_NAMES) {
+      expect(entry, `--reporter help text does not mention '${name}'`).toContain(name);
+    }
+  });
 });
 
 describe('readTestRailRunId', () => {
@@ -385,9 +495,9 @@ describe('runReportFromApi and quarantine', () => {
 
   it('turns a suppressed failure into the quarantined status, and a timeout too', () => {
     expect(runReportFromApi({ results: [result()] }).tests[0]!.status).toBe('quarantined');
-    expect(
-      runReportFromApi({ results: [result({ status: 'TIMED_OUT' })] }).tests[0]!.status,
-    ).toBe('quarantined');
+    expect(runReportFromApi({ results: [result({ status: 'TIMED_OUT' })] }).tests[0]!.status).toBe(
+      'quarantined',
+    );
   });
 
   it('leaves a quarantined test that did not fail exactly as it was', () => {
@@ -400,7 +510,8 @@ describe('runReportFromApi and quarantine', () => {
       'passed',
     );
     expect(
-      runReportFromApi({ results: [result({ status: 'SKIPPED', durationMs: 0 })] }).tests[0]!.status,
+      runReportFromApi({ results: [result({ status: 'SKIPPED', durationMs: 0 })] }).tests[0]!
+        .status,
     ).toBe('skipped');
     expect(runReportFromApi({ results: [result({ status: 'FLAKY' })] }).tests[0]!.status).toBe(
       'flaky',
@@ -651,6 +762,41 @@ describe('emitReports', () => {
     TESTRAIL_USER: 'qa@acme.com',
     TESTRAIL_API_KEY: 'k3y',
   };
+
+  /**
+   * A NAME WITH NO RENDERER FAILS. IT DOES NOT POST TO TESTRAIL.
+   *
+   * `emitOne` used to end with the TestRail branch and no `if`, so any request
+   * that reached it without matching `junit` or `allure` rendered a TestRail
+   * payload and tried to upload it. That was harmless only while the name list
+   * held exactly the three names with branches; it became live the moment the
+   * list grew to recognise the reporters this CLI cannot render.
+   *
+   * The request is hand-made on purpose. `parseReporterArgs` refuses these
+   * names, so this is the only way to arrive the way the bug would: through a
+   * caller that built the list some other way.
+   */
+  it('fails loudly on a reporter it has no renderer for, and uploads nothing', async () => {
+    let fetched = 0;
+    const { outcomes, failures } = await emitReports({
+      report: withFailures,
+      requests: [{ name: 'sarif', out: join(dir, 'qaai.sarif') }],
+      env: credentials,
+      testRailRunId: 4821,
+      fetchJunitXml: async () => '',
+      fetchImpl: async () => {
+        fetched += 1;
+        return new Response('{}', { status: 200 });
+      },
+    });
+
+    expect(outcomes).toEqual([]);
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toMatch(/no renderer in this CLI for the 'sarif' reporter/);
+    // The two things the fall-through did that nobody asked for.
+    expect(fetched, 'a reporter with no renderer must not reach TestRail').toBe(0);
+    expect(readdirSync(dir)).toEqual([]);
+  });
 
   it('writes the server’s JUnit bytes unaltered', async () => {
     const xml = '<?xml version="1.0" encoding="UTF-8"?>\n<testsuites/>\n';

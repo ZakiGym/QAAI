@@ -18,6 +18,9 @@ import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import type {
   ConsoleEntry,
   ExecutableTest,
+  Finding,
+  FindingKind,
+  FindingSeverity,
   NetworkEntry,
   RunContext,
   StepResult,
@@ -178,6 +181,13 @@ interface Workspace {
    * {@link createWorkspace}.
    */
   storageStatePath: string | null;
+  /**
+   * Where the injected runtime observer writes its NDJSON, or null when no
+   * observer was injected because the spec drives no browser. Inside the run
+   * directory, so `cleanup` removes it with everything else — the observation
+   * is read out before the workspace goes.
+   */
+  observeDir: string | null;
   cleanup: () => Promise<void>;
 }
 
@@ -843,8 +853,27 @@ async function createWorkspace(
 
   const specPath = safeSpecPath(dir, test.filePath);
   await mkdir(dirname(specPath), { recursive: true });
-  // `plan.code` is `test.code` verbatim unless the run asked for determinism.
-  await writeFile(specPath, plan.code, 'utf8');
+
+  /*
+   * The runtime observer is appended LAST, after determinism has had its turn
+   * at the code: `plan.code` is `test.code` verbatim unless the run asked for
+   * determinism, and the observer must watch whatever is actually going to run.
+   *
+   * A spec that drives no browser is left byte-identical. The epilogue
+   * destructures the `page` fixture, and requesting `page` LAUNCHES A BROWSER —
+   * so injecting it into an API-only spec would add a browser launch the test
+   * never asked for, and would fail it outright on a worker with no Chromium.
+   */
+  let observeDir: string | null = null;
+  if (specUsesBrowser(plan.code)) {
+    observeDir = join(dir, 'observations');
+    await mkdir(observeDir, { recursive: true });
+  }
+  await writeFile(
+    specPath,
+    observeDir === null ? plan.code : `${plan.code}${runtimeObserverEpilogue(observeDir)}`,
+    'utf8',
+  );
 
   await writeFile(
     join(dir, 'playwright.config.ts'),
@@ -896,6 +925,7 @@ async function createWorkspace(
     outputDir,
     reportPath: join(dir, 'report.json'),
     storageStatePath,
+    observeDir,
     cleanup: () => rm(dir, { recursive: true, force: true }),
   };
 }
@@ -1140,6 +1170,1810 @@ function toConsoleEntries(result: PwResult | undefined): ConsoleEntry[] {
   return out;
 }
 
+// ─── Runtime observation: what the test ACTUALLY did ─────────────────────────
+
+/*
+ * THE DEFECT THIS SECTION EXISTS TO REMOVE.
+ *
+ * Until this existed, `TestExecution.network` was filled with `[]` on every one
+ * of this harness's paths and `findings` with `[]` on all three — so the only
+ * question the product could answer was "which crawled surface does a test
+ * MENTION", a regex over test source. "A test mentions /checkout" and "a test
+ * reached /checkout and called POST /api/pay" are different claims, and only the
+ * second one is coverage. Four separate confirmed defects traced back to those
+ * two empty arrays.
+ *
+ * It also removes a quieter one: a GREEN test over a THROWING application was
+ * reported as covered and healthy. The assertions passed; the page threw a
+ * TypeError, logged four console errors and got a 500 from POST /api/pay, and
+ * nothing in the product knew. Those signals are free — the browser already
+ * emits them — and this section turns them into Findings whether the test
+ * passed or failed.
+ *
+ * ── HOW IT OBSERVES, and why not the other three ways ───────────────────────
+ *
+ * This harness shells out to the real Playwright CLI (see the file header), so
+ * it holds no `page` of its own. Three sources were measured against a live
+ * Chromium before this was written, and two of them do not work:
+ *
+ *  - THE JSON REPORT carries no page events and, measured on Playwright 1.62,
+ *    NO `pw:api` STEPS AT ALL: a spec that calls `page.goto`, `click` and
+ *    `fill` produces `results[0].steps === []`. So locators cannot come from
+ *    the reporter, which is why `collectUserSteps` is left exactly as it was.
+ *  - THE TRACE has everything, and is a zip this package has no reader for, and
+ *    `trace: 'retain-on-failure'` deletes it on the runs requirement 2 cares
+ *    about most — the ones that PASSED.
+ *  - `recordHar` in `contextOptions` writes ONE path per config, and a spec file
+ *    holds many tests, each with its own context. Last-test-wins silently loses
+ *    every other test's network, which is worse than not measuring.
+ *
+ * So observation is an EPILOGUE appended to the spec inside the throwaway run
+ * workspace — the same mechanism `har.ts` already uses for hermetic replay, and
+ * for the same reason: it is the only place with a `page`. The spec QAAI stores
+ * and exports stays a plain Playwright spec with no QAAI import in it.
+ *
+ * ── THE SPLIT THAT KEEPS THIS TESTABLE ──────────────────────────────────────
+ *
+ * The injected code is DUMB on purpose: it forwards raw events as NDJSON and
+ * counts what it dropped. Every classification decision — what is a finding,
+ * what is a duplicate, what is a deliberate 403, what a URL template is — lives
+ * in the pure functions below and is unit-tested against fake NDJSON with no
+ * browser and no network. {@link RuntimeObservationSource} is the one seam that
+ * touches the disk, and a fake satisfies it in one line.
+ *
+ * ── WHAT IS NEVER RECORDED ──────────────────────────────────────────────────
+ *
+ * No request body, no response body, no header value, no cookie, and no value
+ * passed to `fill`/`type` — the ACTION and the LOCATOR are recorded, never the
+ * keystrokes, because a login test types a password. Query strings are stripped
+ * from every URL before it is written, because a reset link is a credential.
+ * `observationCarriesNoSecrets` asserts this over a hostile record set rather
+ * than trusting the reader of this comment.
+ */
+
+/** Stamped into the injected source so a compile error in it is attributable. */
+export const RUNTIME_OBSERVER_MARKER = 'qaai-runtime-observer';
+
+/**
+ * Per-test ceilings, applied INSIDE the browser process.
+ *
+ * A chatty single-page app emits thousands of console errors from one render
+ * loop. Without a cap the NDJSON grows without bound and the finding list
+ * becomes unreadable; with an UNDISCLOSED cap, QAAI would silently truncate a
+ * defect list, which is the one thing a defect list may never do. So every cap
+ * that BIT is reported as a count and a reason — see {@link ObservedCap} — and
+ * the counts come from the browser process, which is the only place that knows
+ * how many it threw away.
+ */
+export const RUNTIME_OBSERVATION_CAPS = {
+  /** Document navigations recorded per test. */
+  nav: 50,
+  /** Requests recorded per test, before dedupe. */
+  req: 400,
+  /** Control interactions recorded per test. */
+  ctl: 200,
+  /** Browser console entries recorded per test. */
+  console: 100,
+} as const;
+
+export type ObservationCapKind = keyof typeof RUNTIME_OBSERVATION_CAPS;
+
+/**
+ * Findings per invariant, applied harness-side AFTER dedupe.
+ *
+ * Separate from the browser-side caps above because they measure different
+ * things: those bound what was recorded, this bounds what is reported. Both are
+ * disclosed; a reader who sees twenty `runtime.console-error` findings needs to
+ * know whether that was all of them.
+ */
+export const RUNTIME_FINDING_CAP = 20;
+
+/** The eight runtime invariants every browser test is checked against. */
+export const RUNTIME_INVARIANTS = [
+  'PAGE_ERROR',
+  'UNHANDLED_REJECTION',
+  'CONSOLE_ERROR',
+  'REQUEST_FAILED',
+  'HTTP_CLIENT_ERROR',
+  'HTTP_SERVER_ERROR',
+  'MIXED_CONTENT',
+  'CSP_VIOLATION',
+] as const;
+export type RuntimeInvariant = (typeof RUNTIME_INVARIANTS)[number];
+
+/**
+ * Compiler-enforced presence: a ninth invariant that forgets its severity, its
+ * kind or its code does not compile.
+ *
+ * This is the pattern this codebase enforces for any vocabulary with a write
+ * path, and it is here because eight GateRule kinds once shipped unsaveable for
+ * two slices with only half of it in place. The run-time half — that these four
+ * records and the array agree, member for member — is
+ * `every runtime invariant is declared once, in all four places` in the tests.
+ */
+const RUNTIME_INVARIANT_PRESENT: Record<RuntimeInvariant, true> = {
+  PAGE_ERROR: true,
+  UNHANDLED_REJECTION: true,
+  CONSOLE_ERROR: true,
+  REQUEST_FAILED: true,
+  HTTP_CLIENT_ERROR: true,
+  HTTP_SERVER_ERROR: true,
+  MIXED_CONTENT: true,
+  CSP_VIOLATION: true,
+};
+
+/** Stable dedupe ids. `runtime.` prefixed so a gate can filter the family. */
+const RUNTIME_INVARIANT_CODE: Record<RuntimeInvariant, string> = {
+  PAGE_ERROR: 'runtime.page-error',
+  UNHANDLED_REJECTION: 'runtime.unhandled-rejection',
+  CONSOLE_ERROR: 'runtime.console-error',
+  REQUEST_FAILED: 'runtime.request-failed',
+  HTTP_CLIENT_ERROR: 'runtime.http-4xx',
+  HTTP_SERVER_ERROR: 'runtime.http-5xx',
+  MIXED_CONTENT: 'runtime.mixed-content',
+  CSP_VIOLATION: 'runtime.csp-violation',
+};
+
+const RUNTIME_INVARIANT_SEVERITY: Record<RuntimeInvariant, FindingSeverity> = {
+  // An uncaught exception is a defect whether or not the assertions noticed.
+  PAGE_ERROR: 'SERIOUS',
+  UNHANDLED_REJECTION: 'SERIOUS',
+  // A console error is often a symptom rather than the defect, so it ranks
+  // below the exception that may have caused it.
+  CONSOLE_ERROR: 'MODERATE',
+  REQUEST_FAILED: 'MODERATE',
+  // A 4xx is frequently the application behaving correctly about a bad request,
+  // which is why this one is MODERATE and why the deliberate-assertion filter
+  // below exists at all. A 5xx is never correct.
+  HTTP_CLIENT_ERROR: 'MODERATE',
+  HTTP_SERVER_ERROR: 'SERIOUS',
+  MIXED_CONTENT: 'SERIOUS',
+  CSP_VIOLATION: 'SERIOUS',
+};
+
+/**
+ * KNOWN TAXONOMY GAP, stated here rather than hidden in the mapping.
+ *
+ * `FINDING_KINDS` has five members — ACCESSIBILITY, SECURITY, PERFORMANCE,
+ * LOCALIZATION, VISUAL — and the Prisma `FindingKind` enum has the same five.
+ * NONE of them means "the application threw, logged an error or returned a 500
+ * while a test drove it". CSP and mixed content are genuinely SECURITY. The
+ * other six are carried under SECURITY because a `Finding` must name a kind and
+ * there is no honest one yet; their `code` is `runtime.*` so they remain
+ * filterable, and a `RUNTIME` member is in this round's handover. When it lands,
+ * only this record changes.
+ *
+ * Written as a per-member map and not a default so that the compromise is
+ * visible at every one of the six sites rather than implied once.
+ */
+const RUNTIME_INVARIANT_KIND: Record<RuntimeInvariant, FindingKind> = {
+  PAGE_ERROR: 'SECURITY',
+  UNHANDLED_REJECTION: 'SECURITY',
+  CONSOLE_ERROR: 'SECURITY',
+  REQUEST_FAILED: 'SECURITY',
+  HTTP_CLIENT_ERROR: 'SECURITY',
+  HTTP_SERVER_ERROR: 'SECURITY',
+  MIXED_CONTENT: 'SECURITY',
+  CSP_VIOLATION: 'SECURITY',
+};
+
+/**
+ * Whether this test's runtime behaviour was observed, and when it was not, WHY.
+ *
+ * `UNAVAILABLE` is the state that matters: it is what an absent observer must
+ * report, and it must never collapse into "nothing happened". A test whose app
+ * threw four exceptions and a test QAAI could not watch look identical from the
+ * outside — zero findings — and only this field tells them apart.
+ */
+export const OBSERVATION_STATES = [
+  'OBSERVED',
+  'PARTIAL',
+  'UNAVAILABLE',
+  'NOT_APPLICABLE',
+] as const;
+export type ObservationState = (typeof OBSERVATION_STATES)[number];
+
+const OBSERVATION_STATE_PRESENT: Record<ObservationState, true> = {
+  OBSERVED: true,
+  PARTIAL: true,
+  UNAVAILABLE: true,
+  NOT_APPLICABLE: true,
+};
+
+export interface ObservationAvailability {
+  state: ObservationState;
+  /** A sentence a reader can act on. Never null unless the state is OBSERVED. */
+  reason: string | null;
+}
+
+/** A ceiling that BIT, as a count and a reason. Never one without the other. */
+export interface ObservedCap {
+  kind: ObservationCapKind | 'finding' | 'query' | 'malformed' | 'unreadable';
+  /** The ceiling, or null for `query`/`malformed`, which drop rather than cap. */
+  limit: number | null;
+  dropped: number;
+  reason: string;
+}
+
+/** Which identity produced an observation: the test, and the project variant. */
+export interface ObservationAttribution {
+  test: string;
+  /** The Playwright project. `default` when the run declared no projects. */
+  variant: string;
+}
+
+export interface ObservedNavigation extends ObservationAttribution {
+  /** Every hop before the final one, in order. Empty when nothing redirected. */
+  redirectChain: string[];
+  /** Where the browser settled, as a template. */
+  finalUrl: string;
+  status: number | null;
+}
+
+export const OBSERVED_TRANSPORTS = [
+  'DOCUMENT',
+  'XHR',
+  'FETCH',
+  'WEBSOCKET',
+  'SSE',
+  'OTHER',
+] as const;
+export type ObservedTransport = (typeof OBSERVED_TRANSPORTS)[number];
+
+export interface ObservedRequest extends ObservationAttribution {
+  method: string;
+  /** `/orders/:id`, never `/orders/8f21?token=…`. See {@link urlTemplate}. */
+  template: string;
+  status: number | null;
+  transport: ObservedTransport;
+  /**
+   * How long the request took, or NULL when the browser had no timing for it.
+   * Null and not zero: see {@link positiveMs}.
+   */
+  ms: number | null;
+  /** How many times this test hit this method+template+status triple. */
+  count: number;
+}
+
+export interface ObservedControl extends ObservationAttribution {
+  /** The Playwright action that ran: `click`, `fill`, `selectOption`. */
+  action: string;
+  /**
+   * The locator that resolved it, verbatim from Playwright's own
+   * `Locator.toString()` — `getByRole('button', { name: 'Pay' })`. Never the
+   * value typed into it.
+   */
+  locator: string;
+  count: number;
+}
+
+/** One test's runtime-observed surface. The evidence under RUNTIME coverage. */
+export interface RuntimeObservation {
+  testId: string;
+  availability: ObservationAvailability;
+  /** Every (test, variant) pair that reported. Empty when nothing did. */
+  attribution: ObservationAttribution[];
+  navigations: ObservedNavigation[];
+  requests: ObservedRequest[];
+  controls: ObservedControl[];
+  /** Every cap that bit. Empty means none did, not "we did not check". */
+  caps: ObservedCap[];
+}
+
+// ─── The NDJSON the injected observer writes ─────────────────────────────────
+
+/**
+ * Deliberately narrow and deliberately short-keyed: these lines are written one
+ * `appendFileSync` at a time from inside a test, and the shape is ours on both
+ * ends. Parsed structurally rather than with zod because a malformed line must
+ * be COUNTED and skipped, never thrown — losing a whole test's observation to
+ * one bad line is a worse outcome than reporting nine records and one drop.
+ */
+interface ObsAttach {
+  t: 'attach';
+  test: string;
+  variant: string;
+}
+interface ObsNav {
+  t: 'nav';
+  url: string;
+}
+interface ObsReq {
+  t: 'req';
+  method: string;
+  url: string;
+  status: number | null;
+  rt: string;
+  nav: boolean;
+  chain: string[];
+  /** The document URL the request was made from, for the mixed-content check. */
+  from: string;
+}
+
+/**
+ * How long a request took, as a record of its own.
+ *
+ * MEASURED, not guessed — and measured on the only event that has it. At the
+ * `response` event `request.timing().responseEnd` is -1 and only `responseStart`
+ * is populated; `responseEnd` lands at `requestfinished`. (Measured against
+ * Chromium 1.62, not inferred from the docs.) Reporting `responseStart` as a
+ * duration would have labelled time-to-first-byte as the whole request, so the
+ * timing comes from the later event and is correlated back by method+template.
+ *
+ * A request that never finished — still in flight when the context closed, or
+ * failed outright — emits no `requestfinished` and therefore no record here,
+ * which is how its duration stays NULL instead of becoming 0.
+ */
+interface ObsTiming {
+  t: 'timing';
+  method: string;
+  url: string;
+  ms: number;
+}
+interface ObsReqFail {
+  t: 'reqfail';
+  method: string;
+  url: string;
+  err: string;
+  from: string;
+}
+interface ObsConsole {
+  t: 'console';
+  level: string;
+  text: string;
+  from: string;
+}
+interface ObsPageError {
+  t: 'pageerror';
+  name: string;
+  message: string;
+  from: string;
+}
+interface ObsWebSocket {
+  t: 'ws';
+  url: string;
+}
+interface ObsControl {
+  t: 'ctl';
+  action: string;
+  locator: string;
+}
+interface ObsCap {
+  t: 'cap';
+  k: string;
+  limit: number;
+  dropped: number;
+}
+/**
+ * An observation file that EXISTED and could not be read.
+ *
+ * Written by the reader, not by the browser, and it is the only record here
+ * that QAAI produces about itself. Without it an unreadable file contributed
+ * zero lines, the parser counted zero malformed, and the result came back
+ * OBSERVED with no requests and no caps — a test whose application threw four
+ * exceptions looking identical to one whose evidence QAAI dropped on the floor.
+ * Measured: the file source returned an empty array and the availability read
+ * OBSERVED. That is the pass that means we did not check, inside the very
+ * section built to remove it.
+ */
+interface ObsUnreadable {
+  t: 'unreadable';
+  file: string;
+}
+
+type ObsRecord =
+  | ObsAttach
+  | ObsNav
+  | ObsReq
+  | ObsReqFail
+  | ObsConsole
+  | ObsPageError
+  | ObsWebSocket
+  | ObsControl
+  | ObsTiming
+  | ObsCap
+  | ObsUnreadable;
+
+/** One record plus the attribution in force when it was written. */
+export interface StampedRecord {
+  record: ObsRecord;
+  who: ObservationAttribution;
+}
+
+/** The attribution used for records that arrived before any `attach` line. */
+const UNATTRIBUTED: ObservationAttribution = { test: '(unattributed)', variant: 'default' };
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function str(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function strList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [];
+}
+
+function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * A duration, or null.
+ *
+ * Playwright reports -1 for a timing it does not have, and -1 must not become a
+ * duration and must not become 0 either: "not measured" is null here and stays
+ * null all the way to the disclosure in {@link observedNetworkEntries}.
+ */
+function positiveMs(value: unknown): number | null {
+  const parsed = num(value);
+  return parsed === null || parsed < 0 ? null : Math.round(parsed);
+}
+
+/**
+ * NDJSON in, stamped records out, with every line we could not read counted.
+ *
+ * `malformed` is returned rather than logged because it is the difference
+ * between "this test made no requests" and "this test's observation file was
+ * truncated", and a reader of the result has to be able to tell.
+ */
+export function parseObservationLines(lines: readonly string[]): {
+  records: StampedRecord[];
+  malformed: number;
+} {
+  const records: StampedRecord[] = [];
+  let malformed = 0;
+  let who = UNATTRIBUTED;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      malformed += 1;
+      continue;
+    }
+    if (!isObject(parsed)) {
+      malformed += 1;
+      continue;
+    }
+
+    const t = parsed['t'];
+    switch (t) {
+      case 'attach': {
+        // Attribution is positional: every record after this line belongs to
+        // this test until the next `attach`. A worker runs one test at a time,
+        // which is what makes that sound — `workers: 1` in CONFIG_TEMPLATE, and
+        // one file per process so two workers cannot interleave into one file.
+        who = {
+          test: str(parsed['test'], UNATTRIBUTED.test),
+          variant: str(parsed['variant']) || 'default',
+        };
+        records.push({ record: { t: 'attach', ...who }, who });
+        break;
+      }
+      case 'nav':
+        records.push({ record: { t: 'nav', url: str(parsed['url']) }, who });
+        break;
+      case 'req':
+        records.push({
+          record: {
+            t: 'req',
+            method: str(parsed['method'], 'GET'),
+            url: str(parsed['url']),
+            status: num(parsed['status']),
+            rt: str(parsed['rt']),
+            nav: parsed['nav'] === true,
+            chain: strList(parsed['chain']),
+            from: str(parsed['from']),
+          },
+          who,
+        });
+        break;
+      case 'reqfail':
+        records.push({
+          record: {
+            t: 'reqfail',
+            method: str(parsed['method'], 'GET'),
+            url: str(parsed['url']),
+            err: str(parsed['err']),
+            from: str(parsed['from']),
+          },
+          who,
+        });
+        break;
+      case 'console':
+        records.push({
+          record: {
+            t: 'console',
+            level: str(parsed['level']),
+            text: str(parsed['text']),
+            from: str(parsed['from']),
+          },
+          who,
+        });
+        break;
+      case 'pageerror':
+        records.push({
+          record: {
+            t: 'pageerror',
+            name: str(parsed['name'], 'Error'),
+            message: str(parsed['message']),
+            from: str(parsed['from']),
+          },
+          who,
+        });
+        break;
+      case 'ws':
+        records.push({ record: { t: 'ws', url: str(parsed['url']) }, who });
+        break;
+      case 'timing': {
+        const ms = positiveMs(parsed['ms']);
+        if (ms === null) {
+          // -1 is Playwright for "no timing". It is dropped rather than stored,
+          // so nothing downstream can mistake it for a duration.
+          malformed += 1;
+          break;
+        }
+        records.push({
+          record: { t: 'timing', method: str(parsed['method'], 'GET'), url: str(parsed['url']), ms },
+          who,
+        });
+        break;
+      }
+      case 'ctl':
+        records.push({
+          record: { t: 'ctl', action: str(parsed['action']), locator: str(parsed['locator']) },
+          who,
+        });
+        break;
+      case 'unreadable':
+        records.push({ record: { t: 'unreadable', file: str(parsed['file']) }, who });
+        break;
+      case 'cap': {
+        const limit = num(parsed['limit']);
+        const dropped = num(parsed['dropped']);
+        if (limit === null || dropped === null) {
+          malformed += 1;
+          break;
+        }
+        records.push({ record: { t: 'cap', k: str(parsed['k']), limit, dropped }, who });
+        break;
+      }
+      default:
+        malformed += 1;
+    }
+  }
+
+  return { records, malformed };
+}
+
+// ─── URL templates ───────────────────────────────────────────────────────────
+
+/**
+ * Is this path segment an identifier rather than a route?
+ *
+ * Deliberately CONSERVATIVE. Over-eager matching collapses `/checkout` and
+ * `/settings` into `:id` and the whole runtime surface becomes one route, which
+ * would make the coverage denominator look complete because the extractor got
+ * worse — precisely the failure mode the UNKNOWN rule exists to prevent. So
+ * only shapes that cannot be a hand-written route match: digits, a uuid, hex of
+ * 24 characters or more, a cuid, and a long mixed-case token.
+ *
+ * What that LEAVES is the known cost, and it is the cost in the safe direction:
+ * a short opaque id like `/receipt/8f21` is not collapsed, so one route per
+ * receipt reaches the surface instead of one `/receipt/:id`. Over-eager
+ * matching would be the expensive mistake — it collapses `/checkout` and
+ * `/settings` into `:id` and makes the denominator look complete because the
+ * extractor got worse.
+ */
+function isIdSegment(segment: string): boolean {
+  if (/^\d+$/.test(segment)) return true;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(segment)) return true;
+  if (/^[0-9a-f]{24,}$/i.test(segment)) return true;
+  if (/^c[a-z0-9]{24,}$/.test(segment)) return true;
+  if (segment.length >= 16 && /\d/.test(segment) && /[a-z]/.test(segment) && /[A-Z]/.test(segment))
+    return true;
+  return false;
+}
+
+/**
+ * A URL as a stable template, with the query string GONE.
+ *
+ * The query is not truncated or masked, it is dropped, and the drop is counted
+ * and disclosed: a password-reset link, a signed download, an OAuth code and a
+ * session token all live in query strings, and this value is written to an
+ * artifact, stored on the execution and rendered in the cockpit. The path is
+ * what the surface denominator is keyed on anyway.
+ *
+ * Same-origin URLs become a path (`/orders/:id`); cross-origin keeps its host
+ * (`https://api.stripe.com/v1/charges`), because "this test called Stripe" is a
+ * different and more interesting fact than "this test called /v1/charges".
+ */
+export function urlTemplate(raw: string, baseUrl: string): { template: string; hadQuery: boolean } {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw, baseUrl || undefined);
+  } catch {
+    // Not a URL we can read. Returned verbatim but truncated, and never with a
+    // `?` left on it — an unparseable string is the one case where dropping the
+    // query cannot be done structurally.
+    const cut = raw.split('?')[0] ?? raw;
+    return { template: cut.slice(0, 300), hadQuery: cut.length !== raw.length };
+  }
+
+  /*
+   * A scheme with no host has an OPAQUE origin, which `URL` reports as the
+   * literal string "null" — so `about:blank` came out of here as "nullblank",
+   * a template that is not a URL, not a route and not anything a reader could
+   * act on. Those schemes are returned as themselves instead: `about:blank` is
+   * where every browser context starts, and the caller filters it by name.
+   */
+  if (!/^(?:https?|wss?):$/.test(parsed.protocol))
+    return {
+      template: `${parsed.protocol}${parsed.pathname}`.slice(0, 300),
+      hadQuery: parsed.search !== '' || parsed.hash !== '',
+    };
+
+  const hadQuery = parsed.search !== '' || parsed.hash !== '';
+  const path =
+    parsed.pathname
+      .split('/')
+      .map((segment) => (isIdSegment(segment) ? ':id' : segment))
+      .join('/') || '/';
+
+  let sameOrigin = false;
+  try {
+    sameOrigin = baseUrl !== '' && new URL(baseUrl).origin === parsed.origin;
+  } catch {
+    sameOrigin = false;
+  }
+
+  return { template: (sameOrigin ? path : `${parsed.origin}${path}`).slice(0, 300), hadQuery };
+}
+
+// ─── Building the observed surface ───────────────────────────────────────────
+
+function transportFor(resourceType: string): ObservedTransport {
+  switch (resourceType) {
+    case 'document':
+      return 'DOCUMENT';
+    case 'xhr':
+      return 'XHR';
+    case 'fetch':
+      return 'FETCH';
+    case 'websocket':
+      return 'WEBSOCKET';
+    case 'eventsource':
+      return 'SSE';
+    default:
+      return 'OTHER';
+  }
+}
+
+/** A key that keeps two tests', and two variants', observations apart. */
+function whoKey(who: ObservationAttribution): string {
+  return `${who.test}\u0000${who.variant}`;
+}
+
+/**
+ * The records for one test, folded into navigations, requests and controls.
+ *
+ * ── THE REDIRECT FOLD ──────────────────────────────────────────────────────
+ *
+ * Playwright reports a redirected navigation TWICE: once as the 302 for
+ * `/start`, and again as the 200 for `/checkout` carrying `/start` in its
+ * `redirectedFrom()` chain. Counting both would report two navigations where
+ * the test performed one, and would put an intermediate hop in the surface as
+ * if the test had landed there. So a 3xx document request is folded away — but
+ * only when its URL actually appears in another request's chain. A redirect to
+ * an origin the browser never loaded (an off-site hand-off) appears in no
+ * chain, and dropping it would lose the last thing the test did.
+ */
+export function observedSurface(
+  stamped: readonly StampedRecord[],
+  options: {
+    testId: string;
+    baseUrl: string;
+    malformed: number;
+    availability: ObservationAvailability;
+  },
+): RuntimeObservation {
+  const attribution: ObservationAttribution[] = [];
+  const seenWho = new Set<string>();
+  const navigations = new Map<string, ObservedNavigation>();
+  const requests = new Map<string, ObservedRequest>();
+  const controls = new Map<string, ObservedControl>();
+  /* Summed per kind, not appended per record: a spec file holds many tests and
+   * each one writes its own cap line, so appending would report the same
+   * ceiling four times with four partial counts instead of once with the
+   * total. */
+  const browserCaps = new Map<ObservationCapKind, { limit: number; dropped: number }>();
+  const caps: ObservedCap[] = [];
+  const unreadable: string[] = [];
+  let queryDropped = 0;
+  let navDropped = 0;
+  let reqDropped = 0;
+  let ctlDropped = 0;
+
+  const tpl = (raw: string): string => {
+    const { template, hadQuery } = urlTemplate(raw, options.baseUrl);
+    if (hadQuery) queryDropped += 1;
+    return template;
+  };
+
+  // Every URL that is an intermediate hop of some other request, so the fold
+  // described above can tell a swallowed 302 from a terminal one.
+  const hops = new Set<string>();
+  for (const { record } of stamped) {
+    if (record.t === 'req') for (const url of record.chain) hops.add(url);
+  }
+
+  /* `framenavigated` URLs, kept until the end: an SPA route change emits one
+   * with no document request behind it, and that is a navigation the test
+   * really performed. Folded in last so a client-side hop never displaces the
+   * HTTP-backed record of the same URL, which carries a status. */
+  const clientNavs: Array<{ url: string; who: ObservationAttribution }> = [];
+
+  /* Durations, keyed by who+method+template, first one wins. Correlated rather
+   * than carried on the request record because the only event that HAS the
+   * duration fires after the one that has the status. */
+  const timings = new Map<string, number>();
+
+  const addRequest = (
+    who: ObservationAttribution,
+    entry: Omit<ObservedRequest, 'test' | 'variant' | 'count'>,
+    discriminator: string,
+  ): void => {
+    const key = `${whoKey(who)}\u0000${entry.method}\u0000${entry.template}\u0000${discriminator}`;
+    const existing = requests.get(key);
+    if (existing) {
+      existing.count += 1;
+      return;
+    }
+    if (requests.size >= RUNTIME_OBSERVATION_CAPS.req) {
+      reqDropped += 1;
+      return;
+    }
+    requests.set(key, { ...who, ...entry, count: 1 });
+  };
+
+  for (const { record, who } of stamped) {
+    // `cap` and `unreadable` are QAAI talking about itself, not a test
+    // reporting. Attributing them would invent a test/variant pair.
+    if (record.t !== 'cap' && record.t !== 'unreadable' && !seenWho.has(whoKey(who))) {
+      seenWho.add(whoKey(who));
+      attribution.push(who);
+    }
+
+    switch (record.t) {
+      case 'req': {
+        const transport = transportFor(record.rt);
+        const template = tpl(record.url);
+
+        /* An intermediate 3xx is folded away ONLY when another request names it
+         * as a hop. A redirect the browser never followed to a loaded page —
+         * an off-site hand-off — appears in no chain, and dropping it would
+         * lose the last thing the test did. */
+        const swallowed =
+          record.status !== null &&
+          record.status >= 300 &&
+          record.status < 400 &&
+          hops.has(record.url);
+
+        if (record.nav && transport === 'DOCUMENT' && !swallowed) {
+          const key = `${whoKey(who)}\u0000${template}`;
+          if (!navigations.has(key)) {
+            if (navigations.size >= RUNTIME_OBSERVATION_CAPS.nav) navDropped += 1;
+            else
+              navigations.set(key, {
+                ...who,
+                redirectChain: record.chain.map(tpl),
+                finalUrl: template,
+                status: record.status,
+              });
+          }
+        }
+
+        addRequest(
+          who,
+          { method: record.method, template, status: record.status, transport, ms: null },
+          String(record.status ?? 'null'),
+        );
+        break;
+      }
+      case 'reqfail':
+        // A failed request has no status and no timing, and null is the honest
+        // value for both: zero would say the server answered instantly with
+        // status zero.
+        addRequest(
+          who,
+          {
+            method: record.method,
+            template: tpl(record.url),
+            status: null,
+            transport: 'OTHER',
+            ms: null,
+          },
+          'failed',
+        );
+        break;
+      case 'ws':
+        addRequest(
+          who,
+          {
+            method: 'GET',
+            template: tpl(record.url),
+            // The handshake's 101 is not on this channel, so it is not claimed.
+            status: null,
+            transport: 'WEBSOCKET',
+            ms: null,
+          },
+          'ws',
+        );
+        break;
+      case 'nav':
+        clientNavs.push({ url: record.url, who });
+        break;
+      case 'timing': {
+        const key = `${whoKey(who)}\u0000${record.method}\u0000${tpl(record.url)}`;
+        if (!timings.has(key)) timings.set(key, record.ms);
+        break;
+      }
+      case 'ctl': {
+        const locator = record.locator.slice(0, 300);
+        const key = `${whoKey(who)}\u0000${record.action}\u0000${locator}`;
+        const existing = controls.get(key);
+        if (existing) existing.count += 1;
+        else if (controls.size >= RUNTIME_OBSERVATION_CAPS.ctl) ctlDropped += 1;
+        else controls.set(key, { ...who, action: record.action, locator, count: 1 });
+        break;
+      }
+      case 'unreadable':
+        unreadable.push(record.file);
+        break;
+      case 'cap': {
+        if (!isCapKind(record.k)) break;
+        const running = browserCaps.get(record.k) ?? { limit: record.limit, dropped: 0 };
+        running.dropped += record.dropped;
+        browserCaps.set(record.k, running);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  /*
+   * Durations attached only where a RESPONSE was observed. A failed request and
+   * a WebSocket both have `status: null` and neither emits `requestfinished`,
+   * so neither has a duration — and borrowing one from a same-URL request that
+   * did succeed would invent a measurement for a request that never completed.
+   */
+  for (const request of requests.values()) {
+    if (request.ms !== null || request.status === null) continue;
+    const found = timings.get(
+      `${whoKey({ test: request.test, variant: request.variant })}\u0000${request.method}\u0000${request.template}`,
+    );
+    if (found !== undefined) request.ms = found;
+  }
+
+  for (const { url, who } of clientNavs) {
+    const template = tpl(url);
+    // `about:blank` is where every context starts; it is not a surface.
+    if (template === '' || template.startsWith('about:')) continue;
+    const key = `${whoKey(who)}\u0000${template}`;
+    if (navigations.has(key)) continue;
+    if (navigations.size >= RUNTIME_OBSERVATION_CAPS.nav) {
+      navDropped += 1;
+      continue;
+    }
+    navigations.set(key, {
+      ...who,
+      redirectChain: [],
+      finalUrl: template,
+      // A client-side route change has no HTTP response of its own. NULL says
+      // "no status was observed"; any number here would be invented.
+      status: null,
+    });
+  }
+
+  for (const [kind, { limit, dropped }] of browserCaps) {
+    if (dropped > 0)
+      caps.push({
+        kind,
+        limit,
+        dropped,
+        reason: `the browser-side ${kind} ceiling of ${limit} per test was reached, so ${dropped} further ${kind} record(s) were never written`,
+      });
+  }
+  const harnessSide: Array<[ObservationCapKind, number]> = [
+    ['nav', navDropped],
+    ['req', reqDropped],
+    ['ctl', ctlDropped],
+  ];
+  for (const [kind, dropped] of harnessSide) {
+    if (dropped > 0)
+      caps.push({
+        kind,
+        limit: RUNTIME_OBSERVATION_CAPS[kind],
+        dropped,
+        reason: `${dropped} distinct ${kind} observation(s) are missing from this surface; the ceiling is ${RUNTIME_OBSERVATION_CAPS[kind]} per test`,
+      });
+  }
+
+  if (queryDropped > 0)
+    caps.push({
+      kind: 'query',
+      limit: null,
+      dropped: queryDropped,
+      reason: `${queryDropped} observed URL(s) carried a query string or fragment, which was dropped before recording because it can hold a token, a reset link or a session id`,
+    });
+
+  if (options.malformed > 0)
+    caps.push({
+      kind: 'malformed',
+      limit: null,
+      dropped: options.malformed,
+      reason: `${options.malformed} observation line(s) could not be read and were skipped, so this surface is incomplete`,
+    });
+
+  if (unreadable.length > 0)
+    caps.push({
+      kind: 'unreadable',
+      limit: null,
+      dropped: unreadable.length,
+      reason: `${unreadable.length} observation file(s) were written by the observer and could NOT be read back (${unreadable.slice(0, 3).join(', ')}): whatever this test did while they were being written is not in this surface, and its absence here is not evidence that it did nothing`,
+    });
+
+  /*
+   * PARTIAL for an unreadable FILE as well as an unreadable LINE. The state is
+   * the only thing that tells a reader "this is incomplete", and a lost file
+   * loses strictly more than a lost line.
+   */
+  const incomplete = options.malformed + unreadable.length;
+
+  return {
+    testId: options.testId,
+    availability:
+      incomplete > 0 && options.availability.state === 'OBSERVED'
+        ? {
+            state: 'PARTIAL',
+            reason:
+              [
+                options.malformed > 0 ? `${options.malformed} observation line(s)` : null,
+                unreadable.length > 0
+                  ? `${unreadable.length} whole observation file(s)`
+                  : null,
+              ]
+                .filter((part): part is string => part !== null)
+                .join(' and ') +
+              ' were unreadable; what is reported here is only what parsed',
+          }
+        : options.availability,
+    attribution,
+    navigations: [...navigations.values()],
+    requests: [...requests.values()],
+    controls: [...controls.values()],
+    caps,
+  };
+}
+
+function isCapKind(value: string): value is ObservationCapKind {
+  return Object.prototype.hasOwnProperty.call(RUNTIME_OBSERVATION_CAPS, value);
+}
+
+// ─── Runtime-invariant findings ──────────────────────────────────────────────
+
+/**
+ * Status codes this spec appears to ASSERT ON, and whether we could look.
+ *
+ * ── THE FALSE FINDING THIS PREVENTS ────────────────────────────────────────
+ *
+ * A negative test — "a member cannot delete another member's booking" — drives
+ * the app until it gets a 403 and then asserts on it. The 403 is the PASS
+ * CONDITION. Reporting it as a defect on a green test is how a team learns to
+ * ignore everything QAAI says, so it is the one false positive this file is
+ * most careful about.
+ *
+ * The signal is the spec's own source: any 4xx/5xx literal in it. Deliberately
+ * crude in the SAFE direction — it suppresses a 403 finding whenever `403`
+ * appears anywhere in the test, including in a comment. Missing a real finding
+ * costs one defect; a confident false one costs the product's credibility.
+ *
+ * `readable: false` means there was no source to look at, and the caller then
+ * reports LOW CONFIDENCE rather than a finding it cannot stand behind.
+ *
+ * Note what does NOT need suppressing: a status asserted through
+ * `request.get()` on Playwright's APIRequestContext never reaches `page`'s
+ * events at all, so those negative tests were never a source of false findings.
+ */
+export function assertedStatuses(specCode: string): {
+  statuses: ReadonlySet<number>;
+  readable: boolean;
+} {
+  if (specCode.trim() === '') return { statuses: new Set(), readable: false };
+  const statuses = new Set<number>();
+  for (const match of specCode.matchAll(/\b([45]\d{2})\b/g)) {
+    const code = Number(match[1]);
+    if (code >= 400 && code <= 599) statuses.add(code);
+  }
+  return { statuses, readable: true };
+}
+
+/**
+ * A console error that is the browser narrating a network event we already
+ * recorded.
+ *
+ * Chromium logs `Failed to load resource: the server responded with a status of
+ * 500 (Internal Server Error)` for every non-2xx subresource — measured, not
+ * assumed. Emitting both that and the 500 itself reports one defect twice and
+ * doubles the apparent finding count of any app with a flaky endpoint.
+ */
+function isNetworkEcho(text: string): boolean {
+  return /^Failed to load resource/i.test(text);
+}
+
+/**
+ * Which invariant a console error text is, when it is more specific than
+ * "console error".
+ *
+ * CSP violations and mixed-content blocks reach the harness ONLY as console
+ * text — `securitypolicyviolation` would need a binding injected into the page
+ * under test, and this file refuses to add an observable global to a customer's
+ * application to measure it. Unhandled rejections are the same story in
+ * reverse: Playwright delivers them through `pageerror` with no marker
+ * distinguishing them from an uncaught throw, so the only honest label comes
+ * from the text when the text carries one.
+ */
+function invariantFromConsoleText(text: string): RuntimeInvariant {
+  if (/content security policy|refused to (?:load|execute|connect|frame)/i.test(text))
+    return 'CSP_VIOLATION';
+  if (/mixed content/i.test(text)) return 'MIXED_CONTENT';
+  if (/unhandled (?:promise )?rejection|uncaught \(in promise\)/i.test(text))
+    return 'UNHANDLED_REJECTION';
+  return 'CONSOLE_ERROR';
+}
+
+interface FindingDraft {
+  invariant: RuntimeInvariant;
+  location: string;
+  detail: string;
+  /** False when the deliberate-assertion filter could not be applied. */
+  confident: boolean;
+}
+
+export interface RuntimeFindingResult {
+  findings: Finding[];
+  /** Capped families and suppressed signals, as counts with reasons. */
+  caps: ObservedCap[];
+  /** Console errors worth putting on the result, after echo removal. */
+  console: ConsoleEntry[];
+}
+
+/**
+ * Every runtime invariant this test's browser broke, whether it passed or not.
+ *
+ * A finding here is NOT a verdict on the test: `status` is untouched, exactly as
+ * `leaks.ts` leaves it. A green test over a throwing app now carries SERIOUS
+ * findings and still reports PASSED, because the assertions really did pass and
+ * the exception really did happen — two facts, both reported.
+ */
+export function runtimeFindings(
+  stamped: readonly StampedRecord[],
+  options: { baseUrl: string; specCode: string },
+): RuntimeFindingResult {
+  const { statuses: asserted, readable } = assertedStatuses(options.specCode);
+  const drafts: FindingDraft[] = [];
+  const consoleOut: ConsoleEntry[] = [];
+  const caps: ObservedCap[] = [];
+  let suppressedByAssertion = 0;
+  let suppressedEcho = 0;
+  let consoleDropped = 0;
+
+  const tpl = (raw: string): string => urlTemplate(raw, options.baseUrl).template;
+
+  for (const { record } of stamped) {
+    switch (record.t) {
+      case 'pageerror':
+        drafts.push({
+          // `message` is the only place a rejection is ever labelled; see
+          // `invariantFromConsoleText`.
+          invariant: invariantFromConsoleText(record.message) === 'UNHANDLED_REJECTION'
+            ? 'UNHANDLED_REJECTION'
+            : 'PAGE_ERROR',
+          location: tpl(record.from),
+          detail: `${record.name}: ${record.message}`.slice(0, 500),
+          confident: true,
+        });
+        break;
+      case 'console': {
+        if (record.level !== 'error') break;
+        if (isNetworkEcho(record.text)) {
+          suppressedEcho += 1;
+          break;
+        }
+        if (consoleOut.length < RUNTIME_OBSERVATION_CAPS.console)
+          consoleOut.push({
+            level: 'error',
+            text: `Browser console error at ${tpl(record.from)}: ${record.text.slice(0, 500)}`,
+            at: new Date().toISOString(),
+          });
+        else consoleDropped += 1;
+        drafts.push({
+          invariant: invariantFromConsoleText(record.text),
+          location: tpl(record.from),
+          detail: record.text.slice(0, 500),
+          confident: true,
+        });
+        break;
+      }
+      case 'reqfail':
+        drafts.push({
+          invariant: 'REQUEST_FAILED',
+          location: `${record.method} ${tpl(record.url)}`,
+          detail: `the request did not complete (${record.err})`,
+          confident: true,
+        });
+        break;
+      case 'req': {
+        const status = record.status;
+        if (status === null || status < 400) {
+          // A plain http:// subresource loaded from an https:// document is
+          // mixed content whatever the status was, and this is the structural
+          // check rather than the console-text one — it fires even when the
+          // browser logged nothing.
+          if (isMixedContent(record.from, record.url))
+            drafts.push({
+              invariant: 'MIXED_CONTENT',
+              location: `${record.method} ${tpl(record.url)}`,
+              detail: `loaded over http:// from the https:// document at ${tpl(record.from)}`,
+              confident: true,
+            });
+          break;
+        }
+        if (asserted.has(status)) {
+          suppressedByAssertion += 1;
+          break;
+        }
+        drafts.push({
+          invariant: status >= 500 ? 'HTTP_SERVER_ERROR' : 'HTTP_CLIENT_ERROR',
+          location: `${record.method} ${tpl(record.url)}`,
+          detail: `responded ${status}`,
+          // The whole basis for calling a 4xx/5xx unintended is that the spec
+          // did not mention it. With no spec to read, that basis is gone.
+          confident: readable,
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (suppressedByAssertion > 0)
+    caps.push({
+      kind: 'finding',
+      limit: null,
+      dropped: suppressedByAssertion,
+      reason: `${suppressedByAssertion} 4xx/5xx response(s) were NOT reported because this spec's source names that status (${[...asserted].sort((a, b) => a - b).join(', ')}), so the test appears to assert on it deliberately`,
+    });
+  if (suppressedEcho > 0)
+    caps.push({
+      kind: 'finding',
+      limit: null,
+      dropped: suppressedEcho,
+      reason: `${suppressedEcho} console error(s) were the browser restating a response status already reported above, and were not counted twice`,
+    });
+  if (consoleDropped > 0)
+    caps.push({
+      kind: 'console',
+      limit: RUNTIME_OBSERVATION_CAPS.console,
+      dropped: consoleDropped,
+      reason: `${consoleDropped} further browser console error(s) are not listed on this result; the ceiling is ${RUNTIME_OBSERVATION_CAPS.console} per test`,
+    });
+
+  return { findings: foldFindings(drafts, caps), caps, console: consoleOut };
+}
+
+/** `http://` pulled into an `https://` document. */
+function isMixedContent(documentUrl: string, requestUrl: string): boolean {
+  return /^https:\/\//i.test(documentUrl) && /^http:\/\//i.test(requestUrl);
+}
+
+/**
+ * Drafts folded into findings: deduped on invariant+location+detail, counted,
+ * and capped per invariant with the overflow disclosed.
+ *
+ * A low-confidence draft is not dropped and is not reported as a confident
+ * finding either — it is reported one severity step down with the reason in the
+ * message, which is the whole of the instruction "report low confidence rather
+ * than a false finding".
+ */
+function foldFindings(drafts: readonly FindingDraft[], caps: ObservedCap[]): Finding[] {
+  const grouped = new Map<string, { draft: FindingDraft; count: number }>();
+  for (const draft of drafts) {
+    const key = `${draft.invariant}\u0000${draft.location}\u0000${draft.detail}`;
+    const existing = grouped.get(key);
+    if (existing) existing.count += 1;
+    else grouped.set(key, { draft, count: 1 });
+  }
+
+  const perInvariant = new Map<RuntimeInvariant, number>();
+  const findings: Finding[] = [];
+  let dropped = 0;
+
+  for (const { draft, count } of grouped.values()) {
+    const seen = perInvariant.get(draft.invariant) ?? 0;
+    if (seen >= RUNTIME_FINDING_CAP) {
+      dropped += 1;
+      continue;
+    }
+    perInvariant.set(draft.invariant, seen + 1);
+
+    const severity = RUNTIME_INVARIANT_SEVERITY[draft.invariant];
+    findings.push({
+      kind: RUNTIME_INVARIANT_KIND[draft.invariant],
+      // One step down, never out: MINOR is the floor.
+      severity: draft.confident ? severity : 'MINOR',
+      code: RUNTIME_INVARIANT_CODE[draft.invariant],
+      message:
+        `${draft.detail}${count > 1 ? ` (seen ${count}×)` : ''}` +
+        (draft.confident
+          ? ''
+          : ' — LOW CONFIDENCE: this spec’s source was not available, so QAAI could not tell whether the test asserts on this status deliberately'),
+      location: draft.location,
+      helpUrl: null,
+    });
+  }
+
+  if (dropped > 0)
+    caps.push({
+      kind: 'finding',
+      limit: RUNTIME_FINDING_CAP,
+      dropped,
+      reason: `${dropped} further distinct runtime finding(s) are not listed; the ceiling is ${RUNTIME_FINDING_CAP} per invariant per test`,
+    });
+
+  return findings;
+}
+
+/**
+ * The observed requests, as the cockpit's network pane reads them.
+ *
+ * `NetworkEntry.durationMs` is a non-nullable `number`, and this observer does
+ * not always have one — a cached response and a request still in flight when
+ * the context closed both report -1 from `request.timing()`. Zero would be a
+ * measurement claim ("instantaneous"), so the unmeasured ones are COUNTED and
+ * the count is returned for disclosure rather than quietly rendered as 0. The
+ * type wants widening to `number | null`; that edit is in this round's handover.
+ *
+ * `responseBodySnippet` is always null, because no body is ever captured.
+ */
+export function observedNetworkEntries(observation: RuntimeObservation): {
+  entries: NetworkEntry[];
+  untimed: number;
+} {
+  let untimed = 0;
+  const entries = observation.requests.map((request) => {
+    if (request.ms === null) untimed += 1;
+    return {
+      method: request.method,
+      url: request.template,
+      status: request.status,
+      durationMs: request.ms ?? 0,
+      responseBodySnippet: null,
+    };
+  });
+  return { entries, untimed };
+}
+
+/**
+ * The observed network, plus the one disclosure it owes.
+ *
+ * Kept together because the entries and the count of UNTIMED entries must never
+ * be reported apart: `durationMs` reads 0 for a request the browser gave no
+ * timing for, and a 0 nobody explained is exactly the "null that became 0" this
+ * product cannot ship.
+ */
+function observedNetwork(
+  observation: RuntimeObservation,
+  existing: NetworkEntry[] | undefined,
+): { network: NetworkEntry[]; disclosures: ConsoleEntry[] } {
+  const { entries, untimed } = observedNetworkEntries(observation);
+  return {
+    network: [...(existing ?? []), ...entries],
+    disclosures:
+      untimed > 0
+        ? [
+            {
+              level: 'warn',
+              text: `Observation cap (timing): ${untimed} observed request(s) have NO measured duration — a failed request, a WebSocket, or one still in flight when the context closed emits no completion event to measure. Their durationMs reads 0 because the field cannot hold null; it is NOT a measurement.`,
+              at: new Date().toISOString(),
+            },
+          ]
+        : [],
+  };
+}
+
+/** Caps and availability, said out loud on the result's console pane. */
+export function observationDisclosures(
+  observation: RuntimeObservation,
+  extra: readonly ObservedCap[] = [],
+): ConsoleEntry[] {
+  const at = new Date().toISOString();
+  const out: ConsoleEntry[] = [];
+
+  if (observation.availability.state !== 'OBSERVED')
+    out.push({
+      level: 'warn',
+      text: `Runtime observation ${observation.availability.state}: ${observation.availability.reason ?? 'no reason recorded'}`,
+      at,
+    });
+  else
+    out.push({
+      level: 'log',
+      text: `Runtime observation: ${observation.navigations.length} navigation(s), ${observation.requests.length} request(s), ${observation.controls.length} control interaction(s) across ${observation.attribution.length} test/variant pair(s).`,
+      at,
+    });
+
+  for (const cap of [...observation.caps, ...extra])
+    out.push({ level: 'warn', text: `Observation cap (${cap.kind}): ${cap.reason}`, at });
+
+  return out;
+}
+
+// ─── The injected observer ───────────────────────────────────────────────────
+
+/**
+ * Does this spec drive a browser at all?
+ *
+ * Asked because the epilogue destructures the `page` fixture, and requesting
+ * `page` LAUNCHES A BROWSER. An API-only Playwright spec that uses only
+ * `request` would gain a browser launch it never asked for — slower, and able
+ * to fail on a worker with no Chromium installed. So a spec with no browser in
+ * it is left completely alone and reports NOT_APPLICABLE, which is not a gap.
+ */
+export function specUsesBrowser(code: string): boolean {
+  return /\b(?:page|context|browser)\b/.test(code);
+}
+
+/**
+ * The source appended to the spec inside the run workspace.
+ *
+ * Three rules it obeys, each one a defect it would otherwise cause:
+ *
+ *  1. IT CANNOT FAIL THE TEST. Every listener body and the writer are wrapped,
+ *     and a throw from the observer would be a QAAI bug reported as a defect in
+ *     the customer's application.
+ *  2. IT RECORDS NO VALUE. `fill` and `type` record the action and the locator
+ *     and never the arguments — a login test types a password.
+ *  3. IT CAPS ITSELF AND SAYS WHAT IT DROPPED. The `cap` line is written in
+ *     `afterEach` whether or not anything was dropped above zero, so a reader
+ *     can never mistake a truncated list for a complete one.
+ *
+ * The locator instrumentation patches the prototype reached through the PUBLIC
+ * api — `Object.getPrototypeOf(page.locator('html'))` — not an internal
+ * `playwright-core/lib/...` path, and calls through to the original every time.
+ * It is the only way to learn WHICH locator resolved a click: Playwright emits
+ * no event for an action, and the JSON reporter on 1.62 emits no `pw:api` steps
+ * at all. It runs in the throwaway spawned process and nothing else loads from
+ * that workspace.
+ */
+export function runtimeObserverEpilogue(dir: string): string {
+  const caps = JSON.stringify(RUNTIME_OBSERVATION_CAPS);
+  return `
+
+/* ── injected by QAAI: runtime observation (${RUNTIME_OBSERVER_MARKER}) ──────
+ * Not part of your test. This block exists only inside the temporary run
+ * workspace — the spec QAAI stores and exports stays a plain Playwright spec
+ * with no QAAI import in it. It records what the test DID (navigations,
+ * requests, control interactions) and what the application did wrong while it
+ * did it (page errors, console errors, failed requests, 4xx/5xx). It never
+ * records a body, a header, a cookie or a typed value, and it never throws.
+ */
+import { test as __qaaiObserveTest } from '@playwright/test';
+import { appendFileSync as __qaaiAppend } from 'node:fs';
+import { join as __qaaiJoin } from 'node:path';
+
+const __qaaiObs = {
+  dir: ${JSON.stringify(dir)},
+  caps: ${caps},
+  file: null,
+  counts: { nav: 0, req: 0, ctl: 0, console: 0 },
+  dropped: { nav: 0, req: 0, ctl: 0, console: 0 },
+  timed: Object.create(null),
+  patched: false,
+};
+
+function __qaaiWrite(record) {
+  try {
+    if (__qaaiObs.file === null) {
+      // One file per process: Playwright loads this spec in the collection
+      // process as well as in every worker, and two writers on one path
+      // interleave half-lines. Created lazily so the collection process, which
+      // runs no hooks, leaves no empty file behind.
+      __qaaiObs.file = __qaaiJoin(__qaaiObs.dir, 'obs-' + process.pid + '-' + Date.now() + '.ndjson');
+    }
+    __qaaiAppend(__qaaiObs.file, JSON.stringify(record) + '\\n');
+  } catch {
+    /* Observation must never fail a customer's test. */
+  }
+}
+
+function __qaaiTake(kind) {
+  if (__qaaiObs.counts[kind] >= __qaaiObs.caps[kind]) {
+    __qaaiObs.dropped[kind] += 1;
+    return false;
+  }
+  __qaaiObs.counts[kind] += 1;
+  return true;
+}
+
+/* Query strings are dropped HERE, before anything is written, so a token in one
+ * never reaches disk even if the run crashes before the harness reads it. */
+function __qaaiSafeUrl(url) {
+  try {
+    const text = String(url);
+    const cut = text.indexOf('?');
+    const hash = text.indexOf('#');
+    const end = cut === -1 ? hash : hash === -1 ? cut : Math.min(cut, hash);
+    return (end === -1 ? text : text.slice(0, end)).slice(0, 300);
+  } catch {
+    return '';
+  }
+}
+
+function __qaaiAttachPage(page) {
+  try {
+    const where = () => __qaaiSafeUrl(page.url());
+
+    page.on('console', (message) => {
+      try {
+        if (message.type() !== 'error') return;
+        if (!__qaaiTake('console')) return;
+        __qaaiWrite({ t: 'console', level: 'error', text: String(message.text()).slice(0, 2000), from: where() });
+      } catch {}
+    });
+
+    page.on('pageerror', (error) => {
+      try {
+        __qaaiWrite({
+          t: 'pageerror',
+          name: String(error && error.name ? error.name : 'Error'),
+          message: String(error && error.message ? error.message : error).slice(0, 2000),
+          from: where(),
+        });
+      } catch {}
+    });
+
+    page.on('requestfailed', (request) => {
+      try {
+        if (!__qaaiTake('req')) return;
+        const failure = request.failure();
+        __qaaiWrite({
+          t: 'reqfail',
+          method: request.method(),
+          url: __qaaiSafeUrl(request.url()),
+          err: failure && failure.errorText ? String(failure.errorText).slice(0, 200) : 'unknown',
+          from: where(),
+        });
+      } catch {}
+    });
+
+    page.on('response', (response) => {
+      try {
+        const request = response.request();
+        const navigation = request.isNavigationRequest();
+        if (!__qaaiTake(navigation ? 'nav' : 'req')) return;
+        /* The redirect chain, oldest hop first. Playwright reports the 302 as
+         * its own response AND as this request's redirectedFrom(); the harness
+         * folds the duplicate away, it is not dropped here, because a redirect
+         * the browser never followed to a loaded page is still a real hop. */
+        const chain = [];
+        for (let hop = request.redirectedFrom(); hop; hop = hop.redirectedFrom()) {
+          chain.unshift(__qaaiSafeUrl(hop.url()));
+          if (chain.length >= 20) break;
+        }
+        const url = __qaaiSafeUrl(request.url());
+        /* Remembered so the requestfinished listener only writes a duration
+         * for a request whose response we actually recorded. That bounds the
+         * timing lines by the request cap without spending the cap on them. */
+        __qaaiObs.timed[request.method() + ' ' + url] = true;
+        __qaaiWrite({
+          t: 'req',
+          method: request.method(),
+          url,
+          status: response.status(),
+          rt: request.resourceType(),
+          nav: navigation,
+          chain,
+          from: where(),
+        });
+      } catch {}
+    });
+
+    /* The ONLY event with a complete duration on it: at the response event
+     * timing().responseEnd is -1 and only responseStart (time to first byte)
+     * is set. Measured against Chromium, not read off the docs. A request that
+     * never finishes never arrives here, which is how its duration stays
+     * null rather than becoming zero. */
+    page.on('requestfinished', (request) => {
+      try {
+        const url = __qaaiSafeUrl(request.url());
+        if (!__qaaiObs.timed[request.method() + ' ' + url]) return;
+        let ms = -1;
+        try {
+          ms = request.timing().responseEnd;
+        } catch {}
+        /* -1 is "no timing". It is not written at all, rather than written as a
+         * number that would read as a measurement. */
+        if (!(ms >= 0)) return;
+        __qaaiWrite({ t: 'timing', method: request.method(), url, ms });
+      } catch {}
+    });
+
+    page.on('framenavigated', (frame) => {
+      try {
+        if (frame !== page.mainFrame()) return;
+        __qaaiWrite({ t: 'nav', url: __qaaiSafeUrl(frame.url()) });
+      } catch {}
+    });
+
+    page.on('websocket', (socket) => {
+      try {
+        if (!__qaaiTake('req')) return;
+        __qaaiWrite({ t: 'ws', url: __qaaiSafeUrl(socket.url()) });
+      } catch {}
+    });
+  } catch {}
+}
+
+const __QAAI_ACTIONS = [
+  'click', 'dblclick', 'fill', 'press', 'pressSequentially', 'check', 'uncheck',
+  'selectOption', 'setInputFiles', 'hover', 'tap', 'type', 'clear', 'dragTo',
+  'selectText', 'focus',
+];
+
+function __qaaiPatchLocators(page) {
+  if (__qaaiObs.patched) return;
+  __qaaiObs.patched = true;
+  try {
+    const proto = Object.getPrototypeOf(page.locator('html'));
+    for (const action of __QAAI_ACTIONS) {
+      const original = proto[action];
+      if (typeof original !== 'function') continue;
+      proto[action] = function (...args) {
+        try {
+          /* The locator, never the arguments: args[0] of fill() is the value. */
+          if (__qaaiTake('ctl')) {
+            __qaaiWrite({ t: 'ctl', action: action, locator: String(this).slice(0, 300) });
+          }
+        } catch {}
+        return original.apply(this, args);
+      };
+    }
+  } catch {}
+}
+
+__qaaiObserveTest.beforeEach(async ({ page, context }, testInfo) => {
+  try {
+    /* Per TEST, not per file. A spec file holds many tests and each one writes
+     * its own cap line in afterEach; without this reset the second test would
+     * report the first one's drops again and the harness would sum the same
+     * truncation twice. */
+    __qaaiObs.counts = { nav: 0, req: 0, ctl: 0, console: 0 };
+    __qaaiObs.dropped = { nav: 0, req: 0, ctl: 0, console: 0 };
+    __qaaiObs.timed = Object.create(null);
+    __qaaiWrite({
+      t: 'attach',
+      test: testInfo.titlePath.join(' › '),
+      variant: testInfo.project.name,
+    });
+    __qaaiPatchLocators(page);
+    __qaaiAttachPage(page);
+    /* A test that opens a second tab or a popup gets it observed too. */
+    context.on('page', __qaaiAttachPage);
+  } catch {}
+});
+
+__qaaiObserveTest.afterEach(async () => {
+  try {
+    for (const kind of Object.keys(__qaaiObs.dropped)) {
+      __qaaiWrite({ t: 'cap', k: kind, limit: __qaaiObs.caps[kind], dropped: __qaaiObs.dropped[kind] });
+    }
+  } catch {}
+});
+`;
+}
+
+/**
+ * The one seam that touches the disk.
+ *
+ * Returns null for UNAVAILABLE — the observer never ran, or wrote nothing — and
+ * an array (possibly empty, meaning "it ran and saw nothing") otherwise. That
+ * distinction is the whole point of the interface: `[]` and `null` are
+ * different claims and only one of them is "we did not measure".
+ */
+export interface RuntimeObservationSource {
+  read(dir: string): Promise<readonly string[] | null>;
+}
+
+/** The real adapter: NDJSON files the injected observer left in the workspace. */
+export const fileObservationSource: RuntimeObservationSource = {
+  async read(dir) {
+    let names: string[];
+    try {
+      names = (await readdir(dir)).filter((name) => name.endsWith('.ndjson'));
+    } catch {
+      return null;
+    }
+    if (names.length === 0) return null;
+    // Sorted so two workers' files fold in a stable order, which keeps the
+    // observation byte-identical across reruns of the same run.
+    names.sort();
+    const lines: string[] = [];
+    for (const name of names) {
+      try {
+        lines.push(...(await readFile(join(dir, name), 'utf8')).split('\n'));
+      } catch {
+        /*
+         * A file that EXISTED and could not be read is reported as such, in the
+         * one channel this interface has: a line the parser turns into an
+         * `unreadable` record, which becomes a disclosed cap and a PARTIAL
+         * state. It used to be swallowed by this catch with a comment claiming
+         * the parser would notice — the parser cannot notice a file it was
+         * never handed, and the result came back OBSERVED with nothing in it.
+         */
+        lines.push(JSON.stringify({ t: 'unreadable', file: name }));
+      }
+    }
+    return lines;
+  },
+};
+
+/** An observation that measured nothing, and says which of the reasons applies. */
+function unobserved(testId: string, state: ObservationState, reason: string): RuntimeObservation {
+  return {
+    testId,
+    availability: { state, reason },
+    attribution: [],
+    navigations: [],
+    requests: [],
+    controls: [],
+    caps: [],
+  };
+}
+
+/**
+ * Read the workspace's observation dir and fold it into one test's surface.
+ *
+ * Never throws: an observation problem must not change a test's verdict, so
+ * every failure becomes an UNAVAILABLE with its reason instead.
+ */
+export async function collectRuntimeObservation(options: {
+  testId: string;
+  dir: string | null;
+  baseUrl: string;
+  specCode: string;
+  source: RuntimeObservationSource;
+  /** Why the observer was never injected, when it was not. */
+  notApplicable?: string | null;
+}): Promise<{ observation: RuntimeObservation; findings: Finding[]; console: ConsoleEntry[] }> {
+  /*
+   * EVERY un-observed return carries its disclosure. Returning the reason on
+   * the observation and an EMPTY console was the shape this function shipped
+   * with for exactly one test run: the reason then existed only in an artifact
+   * nobody opens, and the result said `findings: []` with nothing beside it to
+   * stop that reading as "no defects found". That is the "pass that means we
+   * did not check", so `silent` does not exist as a code path here.
+   */
+  const unwatched = (state: ObservationState, reason: string) => {
+    const observation = unobserved(options.testId, state, reason);
+    return { observation, findings: [], console: observationDisclosures(observation) };
+  };
+
+  if (options.notApplicable) return unwatched('NOT_APPLICABLE', options.notApplicable);
+
+  if (options.dir === null)
+    return unwatched(
+      'UNAVAILABLE',
+      'QAAI could not create the observation directory for this run, so nothing was watched.',
+    );
+
+  let lines: readonly string[] | null;
+  try {
+    lines = await options.source.read(options.dir);
+  } catch (err) {
+    lines = null;
+    void err;
+  }
+
+  if (lines === null)
+    return unwatched(
+      'UNAVAILABLE',
+      'The runtime observer wrote nothing. Either no browser test ran in this spec, or the injected observer did not load — this is NOT a statement that the application behaved correctly.',
+    );
+
+  const { records, malformed } = parseObservationLines(lines);
+  const observation = observedSurface(records, {
+    testId: options.testId,
+    baseUrl: options.baseUrl,
+    malformed,
+    availability: { state: 'OBSERVED', reason: null },
+  });
+  const result = runtimeFindings(records, {
+    baseUrl: options.baseUrl,
+    specCode: options.specCode,
+  });
+
+  return {
+    observation,
+    findings: result.findings,
+    console: [...result.console, ...observationDisclosures(observation, result.caps)],
+  };
+}
+
+/**
+ * Writes the observed surface where it will outlive the run.
+ *
+ * The same shape as `recordDeterminism`, and wrapped for the same reason: a
+ * reporting problem must never lose a run. This is the WRITE PATH for the
+ * runtime surface; the read path is the artifact store, and the typed seam on
+ * `TestExecution` that the coverage pipeline wants is in this round's handover.
+ */
+async function recordObservation(
+  ctx: RunContext,
+  test: ExecutableTest,
+  observation: RuntimeObservation,
+): Promise<void> {
+  /*
+   * NOT_APPLICABLE writes no artifact. A spec that drives no browser — an
+   * API-only Playwright spec, or the order-dependence specs in
+   * determinism.test.ts — has no runtime surface to store, and a file per such
+   * test saying "this spec has no browser" is noise in the artifact store that
+   * nobody will ever open. Nothing is hidden by the skip: the state and its
+   * reason are already on the result's own console pane, where the reader is,
+   * via `observationDisclosures`. Every other state DOES get its artifact,
+   * UNAVAILABLE included — "we could not watch" is a fact worth keeping.
+   */
+  if (observation.availability.state === 'NOT_APPLICABLE') {
+    ctx.logger.debug('runtime observation not applicable', {
+      testId: test.id,
+      reason: observation.availability.reason,
+    });
+    return;
+  }
+
+  ctx.logger.info('runtime observation', {
+    testId: test.id,
+    state: observation.availability.state,
+    navigations: observation.navigations.length,
+    requests: observation.requests.length,
+    controls: observation.controls.length,
+    caps: observation.caps.length,
+  });
+  try {
+    await ctx.artifacts.put(
+      `${test.id}_runtime-surface.json`,
+      Buffer.from(`${JSON.stringify(observation, null, 2)}\n`, 'utf8'),
+      'application/json',
+    );
+  } catch (err) {
+    ctx.logger.warn('runtime observation upload failed', { testId: test.id, err: String(err) });
+  }
+}
+
+/** Pins the four vocabularies to their arrays; see the records' own comments. */
+export const RUNTIME_VOCABULARY_PRESENCE = {
+  invariants: RUNTIME_INVARIANT_PRESENT,
+  states: OBSERVATION_STATE_PRESENT,
+} as const;
+
 export interface HarnessOptions {
   /** Reported on the TestExecution; lets smoke reuse this harness verbatim. */
   network?: NetworkEntry[];
@@ -1162,6 +2996,12 @@ export interface HarnessOptions {
    * the only caller positioned to read the row.
    */
   access?: EnvironmentAccessPolicy | null;
+  /**
+   * Where the runtime observation is read back from. Defaults to the real
+   * workspace reader; a test injects a fake and exercises every classification
+   * rule with no browser and no network.
+   */
+  observationSource?: RuntimeObservationSource;
 }
 
 /**
@@ -1278,7 +3118,18 @@ export async function runPlaywrightSpec(
       durationMs: Date.now() - startedWithoutRole,
       steps: [],
       network: options.network ?? [],
-      console: [],
+      /*
+       * The spec was never executed, so `findings: []` below has to be read as
+       * "nothing was watched" and not as "the application behaved". That is
+       * what this line says, on the result, where the reader is.
+       */
+      console: observationDisclosures(
+        unobserved(
+          test.id,
+          'NOT_APPLICABLE',
+          'The spec was not executed (no session for the role it runs as), so no runtime behaviour was observed and no finding below is a statement about the application.',
+        ),
+      ),
       videoKey: null,
       traceKey: null,
       errorMessage:
@@ -1327,7 +3178,16 @@ export async function runPlaywrightSpec(
       durationMs: Date.now() - startedWithoutRole,
       steps: [],
       network: options.network ?? [],
-      console: headerDisclosures(resolvedHeaders),
+      console: [
+        ...headerDisclosures(resolvedHeaders),
+        ...observationDisclosures(
+          unobserved(
+            test.id,
+            'NOT_APPLICABLE',
+            'The environment was never reached, so no runtime behaviour was observed and no finding below is a statement about the application.',
+          ),
+        ),
+      ],
       videoKey: null,
       traceKey: null,
       errorMessage: blocked.message,
@@ -1372,6 +3232,31 @@ export async function runPlaywrightSpec(
   );
   const startedAt = Date.now();
 
+  /**
+   * The runtime observation for this run, read out of the workspace before it
+   * is removed.
+   *
+   * Called on every path that got as far as spawning Playwright, including the
+   * one where no report came back: a run that crashed halfway still observed
+   * what it did before it crashed, and throwing that away is throwing away the
+   * most useful evidence available about why it crashed.
+   */
+  const readObservation = () =>
+    collectRuntimeObservation({
+      testId: test.id,
+      dir: ws.observeDir,
+      baseUrl: ctx.baseUrl,
+      // The CUSTOMER's source, not `plan.code` — the deliberate-4xx filter asks
+      // "does this test assert on a 403", and the injected epilogue is not the
+      // test.
+      specCode: test.code,
+      source: options.observationSource ?? fileObservationSource,
+      notApplicable:
+        ws.observeDir === null
+          ? `"${test.name}" references no Playwright page, context or browser, so no browser was launched and none was observed. This is not a gap in the application.`
+          : null,
+    });
+
   /** Appends the seed to whatever the failure already said, never replacing it. */
   const withHint = (message: string | null): string | null => {
     if (!hint) return message;
@@ -1407,7 +3292,23 @@ export async function runPlaywrightSpec(
         durationMs: Date.now() - startedAt,
         steps: [],
         network: options.network ?? [],
-        console: [...accessConsole, ...determinismConsole],
+        console: [
+          ...accessConsole,
+          ...determinismConsole,
+          /*
+           * UNAVAILABLE and not NOT_APPLICABLE: the spec asked for a browser
+           * and the browser was missing. That is a capability this worker does
+           * not have, which is a different sentence from "there was nothing to
+           * observe".
+           */
+          ...observationDisclosures(
+            unobserved(
+              test.id,
+              'UNAVAILABLE',
+              `${engine} is not installed on this worker, so nothing was executed and nothing was observed.`,
+            ),
+          ),
+        ],
         videoKey,
         traceKey,
         // No determinism hint here on purpose: nothing was evaluated, so a seed
@@ -1423,13 +3324,24 @@ export async function runPlaywrightSpec(
     // No report at all means the spec did not compile or Playwright itself
     // failed — an ENV_ISSUE in triage terms, not a test failure.
     if (!report) {
+      // Partial observation is the point here: a spec that timed out mid-flight
+      // still named the routes it reached and the 500 it got, and that is the
+      // most useful evidence there is about a run with no report.
+      const crashed = await readObservation();
+      await recordObservation(ctx, test, crashed.observation);
+      const observedCrash = observedNetwork(crashed.observation, options.network);
       return {
         testId: test.id,
         status: outcome.timedOut ? 'TIMED_OUT' : 'FAILED',
         durationMs: Date.now() - startedAt,
         steps: [],
-        network: options.network ?? [],
-        console: [...accessConsole, ...determinismConsole],
+        network: observedCrash.network,
+        console: [
+          ...accessConsole,
+          ...determinismConsole,
+          ...crashed.console,
+          ...observedCrash.disclosures,
+        ],
         videoKey,
         traceKey,
         errorMessage: withHint(
@@ -1438,7 +3350,7 @@ export async function runPlaywrightSpec(
             : `Playwright produced no report.\n${stripAnsi(outcome.stderr || outcome.stdout).slice(0, 4000)}`,
         ),
         retriedAndPassed: false,
-        findings: [],
+        findings: crashed.findings,
       };
     }
 
@@ -1495,20 +3407,36 @@ export async function runPlaywrightSpec(
       return message ? `${message}\n\n${note}` : note;
     };
 
+    /*
+     * A GREEN TEST OVER A THROWING APPLICATION. These findings are attached
+     * whatever `status` says and `status` is not touched by them — the
+     * assertions really did pass and the page really did throw, and those are
+     * two facts, both of which get reported. Same rule leaks.ts follows.
+     */
+    const runtime = await readObservation();
+    await recordObservation(ctx, test, runtime.observation);
+    const observedRun = observedNetwork(runtime.observation, options.network);
+
     return {
       testId: test.id,
       status,
       durationMs: Date.now() - startedAt,
       steps: toStepResults(userSteps, screenshotKeys, failingIndex === -1 ? null : failingIndex),
-      network: options.network ?? [],
-      console: [...accessConsole, ...determinismConsole, ...toConsoleEntries(last)],
+      network: observedRun.network,
+      console: [
+        ...accessConsole,
+        ...determinismConsole,
+        ...toConsoleEntries(last),
+        ...runtime.console,
+        ...observedRun.disclosures,
+      ],
       videoKey,
       traceKey,
       // "Your suite fails in THIS order, here is the seed" is the whole feature.
       // A green run does not need it; a red one is useless without it.
       errorMessage: status === 'PASSED' ? errorMessage : withChallenge(withHint(errorMessage)),
       retriedAndPassed,
-      findings: [],
+      findings: runtime.findings,
     };
   } finally {
     await ws.cleanup();

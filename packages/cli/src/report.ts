@@ -150,7 +150,62 @@ export interface ReporterRequest {
   out: string | null;
 }
 
-export const REPORTER_NAMES = ['junit', 'allure', 'testrail'] as const;
+/**
+ * The reporters this CLI can produce ITSELF.
+ *
+ * Mirrored from `REPORTERS` in packages/runner/src/reporters/index.ts, for the
+ * reason in the header: the published CLI may not import across the package
+ * boundary. `report.test.ts` — a test file, excluded from the build, so it MAY
+ * cross it — asserts this list against the registry's own names, so a reporter
+ * added there and forgotten here goes red.
+ */
+export const CLI_RENDERABLE_REPORTERS = ['junit', 'allure', 'testrail'] as const;
+
+/**
+ * Reporters that EXIST and that this CLI cannot render, with the reason.
+ *
+ * ── WHY THEY ARE LISTED RATHER THAN LEFT UNKNOWN ────────────────────────────
+ *
+ * `sarif` and `evidence-pack` are registered, selectable reporters. Answering
+ * `--reporter sarif` with "Unknown reporter 'sarif'" would be false, and a user
+ * who read that would reasonably conclude QAAI has no SARIF output and go and
+ * build one. So the name is RECOGNISED and the refusal says what is actually
+ * true: the format exists, this binary cannot write it, and here is where it
+ * can be had.
+ *
+ * ── WHY THEY ARE NOT MIRRORED LIKE ALLURE AND TESTRAIL ──────────────────────
+ *
+ * The two mirrored renderers below are ~110 lines each and a drift test holds
+ * them to the originals. These are 900 and 1,021 lines, and one of them SIGNS
+ * its output: a second implementation of a signed compliance pack is a second
+ * set of digests over bytes a mirror produced, which is worse than not having
+ * it here at all — a customer would hand an auditor a pack whose signature
+ * covers the mirror's idea of the evidence.
+ *
+ * The end state is a server-rendered document, exactly as `--reporter junit`
+ * already works: one writer of those bytes, fetched. See `needsFromOtherFiles`
+ * in the report for the route that would do it.
+ */
+export const CLI_UNAVAILABLE_REPORTERS: Readonly<Record<string, string>> = {
+  sarif:
+    'the SARIF reporter lives in @qaai/runner and the published CLI ships with no dependencies, ' +
+    'so it cannot render SARIF itself. Run it from the runner, or ask the API for the document.',
+  'evidence-pack':
+    'the evidence pack is rendered and SIGNED by @qaai/runner, and the published CLI ships with ' +
+    'no dependencies. A mirrored implementation would sign its own bytes rather than the ' +
+    "runner's, so it is refused here instead. Run it from the runner.",
+};
+
+/**
+ * Every reporter name this CLI RECOGNISES — renderable or not.
+ *
+ * This is the list `--help` is asserted against, so a reporter that exists and
+ * is undocumented goes red, and the one that documents the refusal above.
+ */
+export const REPORTER_NAMES = [
+  ...CLI_RENDERABLE_REPORTERS,
+  ...(Object.keys(CLI_UNAVAILABLE_REPORTERS) as readonly string[]),
+] as const;
 
 /**
  * `--reporter <name> [--reporter-out <path>]`, repeatable.
@@ -161,8 +216,11 @@ export const REPORTER_NAMES = ['junit', 'allure', 'testrail'] as const;
  * binds to the `--reporter` before it, which is the only reading that stays
  * unambiguous once there is more than one.
  *
- * Refuses an unknown name up front. This runs BEFORE the suite is queued, so a
- * typo costs a second rather than a ten-minute run whose results go nowhere.
+ * Refuses an unknown name up front, AND a known-but-unavailable one. This runs
+ * BEFORE the suite is queued, so either costs a second rather than a ten-minute
+ * run whose results go nowhere — which is the same reason the two refusals are
+ * worded differently: "we have never heard of this" and "this exists and we
+ * cannot write it from here" send a reader to completely different places.
  */
 export function parseReporterArgs(args: string[]): ReporterRequest[] {
   const requests: ReporterRequest[] = [];
@@ -178,7 +236,14 @@ export function parseReporterArgs(args: string[]): ReporterRequest[] {
       for (const raw of value.split(',')) {
         const name = raw.trim().toLowerCase();
         if (!name) continue;
-        if (!(REPORTER_NAMES as readonly string[]).includes(name)) {
+        const unavailable = CLI_UNAVAILABLE_REPORTERS[name];
+        if (unavailable !== undefined) {
+          throw new ReportError(
+            `The '${name}' reporter exists but this CLI cannot produce it: ${unavailable} ` +
+              `Renderable from here: ${CLI_RENDERABLE_REPORTERS.join(', ')}.`,
+          );
+        }
+        if (!(CLI_RENDERABLE_REPORTERS as readonly string[]).includes(name)) {
           throw new ReportError(
             `Unknown reporter '${raw.trim()}'. Available: ${REPORTER_NAMES.join(', ')}.`,
           );
@@ -339,9 +404,7 @@ export function runReportFromApi(run: ApiRunPayload, options: { url?: string } =
      */
     const suppressible = reported === 'failed' || reported === 'timedOut';
     const status: ReporterStatus =
-      suppressible && result.test && quarantineInForce(result.test, now)
-        ? 'quarantined'
-        : reported;
+      suppressible && result.test && quarantineInForce(result.test, now) ? 'quarantined' : reported;
     const raw = result.durationMs;
     const timed =
       typeof raw === 'number' &&
@@ -984,6 +1047,29 @@ async function emitOne(request: ReporterRequest, context: EmitContext): Promise<
       uploaded: null,
       warnings: [...document.warnings, ...stale],
     };
+  }
+
+  /*
+   * ── EXPLICIT, AND NOT THE FALL-THROUGH IT USED TO BE ──────────────────────
+   *
+   * TestRail was the `if`-less tail of this function, so ANY name that reached
+   * here with no branch of its own rendered a TestRail payload and tried to
+   * upload it. That was latent while `REPORTER_NAMES` held exactly the three
+   * names with branches; it became a live trap the moment the list grew to
+   * cover the reporters this CLI cannot render. A run that asked for SARIF and
+   * silently posted results into a TestRail run is the worst failure in this
+   * module's vocabulary — it is a reporter publishing something nobody asked
+   * for, to somewhere nobody named.
+   *
+   * `parseReporterArgs` already refuses those names, so the throw below should
+   * be unreachable. It is here because "should be unreachable" is exactly what
+   * was true of the fall-through.
+   */
+  if (request.name !== 'testrail') {
+    throw new ReportError(
+      `no renderer in this CLI for the '${request.name}' reporter. This is a bug: the name passed ` +
+        `argument parsing and then matched nothing. Renderable from here: ${CLI_RENDERABLE_REPORTERS.join(', ')}.`,
+    );
   }
 
   const document = renderTestRail(context.report, context.testRailRunId);

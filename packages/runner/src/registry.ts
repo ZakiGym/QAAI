@@ -30,6 +30,8 @@ import { mobilePlugin } from './plugins/mobile.js';
 import { performancePlugin } from './plugins/performance.js';
 import { desktopPlugin } from './plugins/desktop.js';
 import { jobsPlugin } from './plugins/jobs.js';
+import { linksPlugin } from './plugins/links.js';
+import { seoPlugin } from './plugins/seo.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -64,12 +66,20 @@ const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
 /*
  * ── Plugins whose TestType is not minted yet ────────────────────────────────
  *
- * The usual gap in this table is a type with no plugin. These two are the
+ * The usual gap in this table is a type with no plugin. These four are the
  * mirror image: a complete, tested plugin for a type `TEST_TYPES` does not
- * contain. Both cover a whole class of customer that scores zero today —
- * desktop shells (Electron/Tauri/WebView), and the `BACKGROUND_JOB` surface
- * kind the inventory has counted since it was built while nothing could
- * execute one.
+ * contain. Each covers a whole class of defect that scores zero today —
+ * desktop shells (Electron/Tauri/WebView); the `BACKGROUND_JOB` surface kind
+ * the inventory has counted since it was built while nothing could execute
+ * one; the link and asset edges the crawler discovers and nothing ever asked
+ * to resolve; and the metadata layer — title, canonical, hreflang, Open Graph,
+ * JSON-LD, robots/sitemap consistency — that was absent from the product
+ * entirely.
+ *
+ * LINKS and SEO are the cheap wide pair: no model, no browser, deterministic,
+ * and they apply to every URL a crawl reached. They are PENDING for exactly
+ * the same reason as the other two and not for want of anything in this
+ * package.
  *
  * `TestType` is the union behind a Postgres enum, `createTestSchema`, the
  * cockpit's filter chips and `NEW_TEST_TEMPLATES`, and minting a member means
@@ -95,6 +105,8 @@ type PendingPlugin = Omit<RunnerPlugin, 'type'> & { readonly type: string };
 const PENDING_PLUGINS: Readonly<Record<string, PendingPlugin>> = {
   DESKTOP: desktopPlugin,
   JOBS: jobsPlugin,
+  LINKS: linksPlugin,
+  SEO: seoPlugin,
 };
 
 /**

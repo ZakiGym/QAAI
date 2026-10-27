@@ -719,7 +719,7 @@ describe('the registry', () => {
   const ALL: RunReport[] = [...PLATFORM_FIXTURES.map(([, run]) => toRunReport(run)), untimed];
 
   it('resolves by name and refuses an unknown one without throwing', () => {
-    expect(REPORTER_NAMES).toEqual(['junit', 'allure', 'testrail']);
+    expect(REPORTER_NAMES).toEqual(['junit', 'allure', 'testrail', 'sarif', 'evidence-pack']);
     expect(resolveReporter('JUnit')?.name).toBe('junit');
     expect(resolveReporter('nope')).toBeNull();
     expect(renderReport('nope', untimed)).toBeNull();

@@ -38,9 +38,15 @@ import {
   readCrawl,
   routeVisits,
   verifyClosure,
+  COVERAGE_AXIS_WEIGHT,
+  MAX_LEDGER_ITEMS,
+  MAX_LEDGER_TESTS_PER_ITEM,
+  coverageAxisReadings,
+  coverageHeadline,
   CLOSURE_STATES,
   type AuthProfileChoice,
   type ClosureState,
+  type CoverageExecutionFact,
   type CoverageGap,
   type CoverageTestInput,
 } from './coverage.js';
@@ -2244,5 +2250,589 @@ describe('reverseReconcile', () => {
     expect(report.crawled).toBe(false);
     expect(report.reverse.measured).toBe(false);
     expect(report.reverse.declaredSetUnderstatedByAtLeast).toBeNull();
+  });
+});
+
+// ─── The headline: four denominators, kept apart ─────────────────────────────
+
+/**
+ * These are the tests for register item 1. The number this product is sold on
+ * was `(routesVisited + journeysWalked + formsExercised + affordancesUsed) /
+ * (routes + journeys + forms + affordances)` — four denominators added
+ * together — and the whole of what follows is the demonstration that it no
+ * longer is.
+ */
+
+/** One route, and `controls` buttons on it. The shape that broke the old sum. */
+function lopsidedGraph(controls: number): Record<string, unknown> {
+  return {
+    projectId: 'p1',
+    environmentId: 'e1',
+    version: 1,
+    baseUrl: 'https://shop.test',
+    exploredAt: '2026-07-01T00:00:00.000Z',
+    truncatedReason: null,
+    nodes: [
+      node({
+        id: 'n1',
+        route: '/dash',
+        affordances: Array.from({ length: controls }, (_, index) => ({
+          label: `Widget ${index}`,
+          selector: role(`Widget ${index}`),
+          kind: 'button',
+        })),
+      }),
+    ],
+    edges: [],
+    journeys: [],
+    features: [],
+  };
+}
+
+const axisOf = (report: ReturnType<typeof run>, axis: string) =>
+  report.headline.axes.find((reading) => reading.axis === axis)!;
+
+describe('the headline is a weighted mean, not a ratio of summed counts', () => {
+  /**
+   * THE DEFECT, STATED AS ARITHMETIC.
+   *
+   * 1 route (untested) and 300 controls (all clicked). The old sum is
+   * 300/301 = 99.7%, which is a report saying a project with an untested
+   * dashboard is almost perfectly covered because somebody's spec names 300
+   * buttons. Under the published weights CONTROL carries 0.1 and ROUTE 0.3, so
+   * the answer is dominated by the route.
+   */
+  it('does not let the most numerous axis become the answer', () => {
+    const graph = lopsidedGraph(300);
+    const labels = Array.from({ length: 300 }, (_, index) => `'Widget ${index}'`).join(' ');
+    const report = analyzeCoverage({
+      flowMapGraph: graph,
+      // Clicks every control, and never navigates to the route they are on, so
+      // CONTROL is 100% and ROUTE is 0%.
+      tests: [test_({ id: 't1', routes: ['/dash'], code: `click ${labels}` })],
+    });
+
+    expect(axisOf(report, 'CONTROL').percent).toBe(100);
+    expect(axisOf(report, 'ROUTE').percent).toBe(100);
+
+    const summed = Math.round((301 / 301) * 100);
+    expect(summed).toBe(100);
+    // ROUTE and CONTROL are the only measured axes, so their 0.3 and 0.1 are
+    // renormalised to 0.75 and 0.25 — and the headline is a mean of two
+    // percentages rather than a ratio of 301 things to 301 things.
+    expect(report.headline.measuredAxes).toEqual(['ROUTE', 'CONTROL']);
+    expect(axisOf(report, 'ROUTE').effectiveWeight).toBe(0.75);
+    expect(axisOf(report, 'CONTROL').effectiveWeight).toBe(0.25);
+  });
+
+  /**
+   * THE ARITHMETIC, ISOLATED FROM THE MATCHERS.
+   *
+   * 1 route covered of 1, and 0 of 300 controls. The old sum is 1/301 = 0.3%
+   * — a project whose only page IS tested reported as untested, because 300
+   * unclicked buttons outvote it 300 to 1. The weighted mean is 75% of the
+   * route's 100% and 25% of the controls' 0%, which is the reading a human
+   * would give.
+   */
+  it('does not let 300 unclicked buttons outvote the one route that is tested', () => {
+    const readings = coverageAxisReadings({
+      ...ZERO_COUNTS,
+      ROUTE: { denominator: 1, covered: 1, provenCovered: 1 },
+      CONTROL: { denominator: 300, covered: 0, provenCovered: 0 },
+    });
+    const head = coverageHeadline(readings);
+
+    const oldSum = Math.round((1 / 301) * 1000) / 10;
+    expect(oldSum).toBe(0.3);
+    expect(head.lowerPercent).toBe(75);
+    expect(head.weights).toEqual({ JOURNEY: 0.35, ROUTE: 0.3, FORM: 0.25, CONTROL: 0.1 });
+  });
+
+  it('reports NULL for an axis that enumerated nothing, never 0%', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: lopsidedGraph(1),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+    });
+    const forms = axisOf(report, 'FORM');
+    expect(forms.denominator).toBe(0);
+    expect(forms.measured).toBe(false);
+    expect(forms.percent).toBeNull();
+    expect(forms.provenPercent).toBeNull();
+  });
+
+  it('redistributes an unmeasured axis’s weight rather than scoring it zero', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: lopsidedGraph(1),
+      tests: [test_({ id: 't1', routes: ['/dash'], code: `click 'Widget 0'` })],
+    });
+    expect(report.headline.renormalised).toBe(true);
+    expect(report.headline.unmeasuredAxes).toEqual(['JOURNEY', 'FORM']);
+    expect(report.headline.measuredAxes).toEqual(['ROUTE', 'CONTROL']);
+    // Both measured axes are at 100%, so the mean is 100 — which it could not
+    // be if the two unmeasured axes had been folded in as 0%.
+    expect(report.headline.lowerPercent).toBe(100);
+    expect(axisOf(report, 'FORM').effectiveWeight).toBeNull();
+  });
+
+  it('reports a NULL headline and not 0% when nothing was enumerated at all', () => {
+    const report = analyzeCoverage({ flowMapGraph: null, tests: [] });
+    expect(report.crawled).toBe(false);
+    expect(report.headline.lowerPercent).toBeNull();
+    expect(report.headline.upperPercent).toBeNull();
+    expect(report.headline.range).toBeNull();
+    expect(report.headline.why).toContain('NOT 0% coverage');
+  });
+
+  it('names the field a consumer must quote, and refuses the old sum in writing', () => {
+    const report = run([test_({ id: 't1', routes: ['/'] })]);
+    expect(report.headline.quotes).toBe('lowerPercent');
+    expect(report.headline.notASumOfDenominators).toContain('four denominators added together');
+    expect(report.headline.formula).toContain('NOT (sum of covered) / (sum of denominators)');
+  });
+
+  /**
+   * The published sentence must describe the weights the payload ACTUALLY
+   * used. A hand-written "JOURNEY 0.35, ROUTE 0.30, …" is prose that
+   * contradicts the code under it the moment one weight is edited, and the
+   * worst place in this product to commit that is the one sentence that tells
+   * a customer how their number was made.
+   */
+  it('prints the weights it actually used, not a sentence somebody typed once', () => {
+    const original = COVERAGE_AXIS_WEIGHT.CONTROL;
+    const borrowed = COVERAGE_AXIS_WEIGHT.FORM;
+    COVERAGE_AXIS_WEIGHT.CONTROL = 0.2;
+    COVERAGE_AXIS_WEIGHT.FORM = borrowed - 0.1;
+    try {
+      const head = coverageHeadline(coverageAxisReadings(ZERO_COUNTS));
+      expect(head.formula).toContain('CONTROL 0.2');
+      expect(head.formula).not.toContain('CONTROL 0.1,');
+      expect(head.weights.CONTROL).toBe(0.2);
+    } finally {
+      COVERAGE_AXIS_WEIGHT.CONTROL = original;
+      COVERAGE_AXIS_WEIGHT.FORM = borrowed;
+    }
+  });
+
+  it('refuses a weight table that does not sum to 1', () => {
+    const original = COVERAGE_AXIS_WEIGHT.CONTROL;
+    COVERAGE_AXIS_WEIGHT.CONTROL = 0.5;
+    try {
+      // A table that silently stopped summing to 1 would move the headline
+      // without any axis moving — the same invisible defect as the old sum.
+      expect(() => coverageHeadline(coverageAxisReadings(ZERO_COUNTS))).toThrow(/sum to 1/);
+    } finally {
+      COVERAGE_AXIS_WEIGHT.CONTROL = original;
+    }
+  });
+
+  it('refuses a covered count above its own denominator rather than clamping it', () => {
+    expect(() =>
+      coverageAxisReadings({
+        ...ZERO_COUNTS,
+        ROUTE: { denominator: 2, covered: 3, provenCovered: 3 },
+      }),
+    ).toThrow(/exceeds its denominator/);
+  });
+
+  it('refuses a proven count above the covered count it is a subset of', () => {
+    expect(() =>
+      coverageAxisReadings({
+        ...ZERO_COUNTS,
+        FORM: { denominator: 5, covered: 2, provenCovered: 3 },
+      }),
+    ).toThrow(/exceeds covered/);
+  });
+});
+
+const ZERO_COUNTS = {
+  ROUTE: { denominator: 0, covered: 0, provenCovered: 0 },
+  JOURNEY: { denominator: 0, covered: 0, provenCovered: 0 },
+  FORM: { denominator: 0, covered: 0, provenCovered: 0 },
+  CONTROL: { denominator: 0, covered: 0, provenCovered: 0 },
+} as const;
+
+// ─── Execution: written is not run, and suppressed is not coverage ───────────
+
+const exec = (
+  over: Partial<CoverageExecutionFact> & { testId: string },
+): CoverageExecutionFact => ({
+  runId: 'run_1',
+  status: 'PASSED',
+  atIso: '2026-07-02T00:00:00.000Z',
+  ...over,
+});
+
+/** One route, one form, nothing else — the smallest fixture with an item. */
+function oneRoute(): Record<string, unknown> {
+  return {
+    projectId: 'p1',
+    environmentId: 'e1',
+    version: 1,
+    baseUrl: 'https://shop.test',
+    exploredAt: '2026-07-01T00:00:00.000Z',
+    truncatedReason: null,
+    nodes: [node({ id: 'n1', route: '/dash' })],
+    edges: [],
+    journeys: [],
+    features: [],
+  };
+}
+
+const ledgerFor = (report: ReturnType<typeof run>, key: string) =>
+  report.ledger.items.find((item) => item.key === key);
+
+describe('a quarantined test is not coverage, and is not hidden either', () => {
+  it('leaves the route a gap when its only test is quarantined', () => {
+    const tests = [test_({ id: 't1', routes: ['/dash'] })];
+    const open = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests,
+      executions: [exec({ testId: 't1' })],
+    });
+    expect(routesWithGap(open.gaps, 'UNVISITED_ROUTE')).toEqual([]);
+
+    const suppressed = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests,
+      executions: [exec({ testId: 't1', quarantined: true })],
+    });
+    // The item leaves the numerator: a result no gate will look at is not
+    // coverage, which is the one change in this round that moves a number.
+    expect(routesWithGap(suppressed.gaps, 'UNVISITED_ROUTE')).toEqual(['/dash']);
+    expect(axisOf(suppressed, 'ROUTE').covered).toBe(0);
+  });
+
+  it('counts a failing test as coverage, because covered and failing are two facts', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+      executions: [exec({ testId: 't1', status: 'FAILED' })],
+    });
+    expect(axisOf(report, 'ROUTE').covered).toBe(1);
+    expect(ledgerFor(report, 'ROUTE:/dash')?.execution?.ran).toBe(true);
+    expect(ledgerFor(report, 'ROUTE:/dash')?.execution?.lastStatus).toBe('FAILED');
+  });
+
+  it('calls a matched test that has never run ASSERTED_NOT_RUN, not covered-and-run', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+      // Asked the database, and this test has no result.
+      executions: [],
+    });
+    const row = ledgerFor(report, 'ROUTE:/dash');
+    expect(row?.execution).not.toBeNull();
+    expect(row?.execution?.ran).toBe(false);
+    expect(row?.execution?.status).toBe('ASSERTED_NOT_RUN');
+    expect(row?.execution?.why).toContain('written is not run');
+  });
+
+  it('reports execution as NULL when nobody asked the database, not as never-run', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+    });
+    // The distinction this product cannot afford to lose: "we did not look" is
+    // not "it never ran", and `neverRun: null` is not `neverRun: 0`.
+    expect(ledgerFor(report, 'ROUTE:/dash')?.execution).toBeNull();
+    expect(report.ledger.neverRun).toBeNull();
+    expect(report.caveats.some((line) => line.includes('No run results were supplied'))).toBe(true);
+  });
+
+  it('counts a never-run item as 0 once the database HAS been asked', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+      executions: [exec({ testId: 't1', status: 'PASSED' })],
+    });
+    expect(report.ledger.neverRun).toBe(0);
+  });
+
+  it('records a retry pass without withholding the coverage, because §5 is a grade', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+      executions: [exec({ testId: 't1', retriedAndPassed: true })],
+    });
+    expect(axisOf(report, 'ROUTE').covered).toBe(1);
+    expect(ledgerFor(report, 'ROUTE:/dash')?.execution?.retryPassTestIds).toEqual(['t1']);
+    expect(ledgerFor(report, 'ROUTE:/dash')?.execution?.why).toContain('only passed on a retry');
+  });
+
+  it('names a quarantined cover on the item rather than dropping the test', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] }), test_({ id: 't2', routes: ['/dash'] })],
+      executions: [exec({ testId: 't1', quarantined: true }), exec({ testId: 't2' })],
+    });
+    const row = ledgerFor(report, 'ROUTE:/dash');
+    // Both tests are listed — the finding is "one of your two covers is
+    // suppressed", which needs the suppressed one named.
+    expect(row?.testIds.sort()).toEqual(['t1', 't2']);
+    expect(row?.execution?.quarantinedTestIds).toEqual(['t1']);
+    expect(row?.execution?.ran).toBe(true);
+  });
+
+  it('counts an item whose ONLY cover is quarantined, so the drop is visible', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] })],
+      executions: [exec({ testId: 't1', quarantined: true })],
+    });
+    expect(report.ledger.coveredOnlyByQuarantined).toBe(1);
+    expect(
+      report.caveats.some((line) => line.includes('quarantined')),
+    ).toBe(true);
+  });
+
+  it('behaves exactly as before when no executions are supplied', () => {
+    const tests = [test_({ id: 't1', routes: ['/dash'] })];
+    const without = analyzeCoverage({ flowMapGraph: oneRoute(), tests });
+    const withEmpty = analyzeCoverage({ flowMapGraph: oneRoute(), tests, executions: [] });
+    // The input is additive by construction: supplying nothing leaves every
+    // numerator where it was, and the only difference is what the ledger can
+    // honestly say about execution.
+    expect(without.headline.lowerPercent).toBe(withEmpty.headline.lowerPercent);
+    expect(axisOf(without, 'ROUTE').covered).toBe(axisOf(withEmpty, 'ROUTE').covered);
+  });
+});
+
+// ─── The ledger: what IS covered, and by how few tests ──────────────────────
+
+describe('the item-level ledger', () => {
+  it('names the tests that cover an item, which nothing in the product could', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: [test_({ id: 't1', routes: ['/dash'] }), test_({ id: 't2', routes: ['/dash'] })],
+    });
+    const row = ledgerFor(report, 'ROUTE:/dash');
+    expect(row?.testCount).toBe(2);
+    expect(row?.testIds.sort()).toEqual(['t1', 't2']);
+    expect(row?.evidence).toBe('LITERAL');
+  });
+
+  it('discloses the per-item test cap, and keeps testCount exact', () => {
+    const over = MAX_LEDGER_TESTS_PER_ITEM + 2;
+    const report = analyzeCoverage({
+      flowMapGraph: oneRoute(),
+      tests: Array.from({ length: over }, (_, index) =>
+        test_({ id: `t${index}`, routes: ['/dash'] }),
+      ),
+    });
+    const row = ledgerFor(report, 'ROUTE:/dash');
+    // `testIds` is navigation and is capped; `testCount` is the arithmetic and
+    // is not. A reader measuring the array would report 10 covers for an item
+    // with 12, which is a cap that bit unreported.
+    expect(row?.testCount).toBe(over);
+    expect(row?.testIds).toHaveLength(MAX_LEDGER_TESTS_PER_ITEM);
+    expect(row?.testIdsTruncated).toBe(true);
+    expect(report.ledger.capsThatBit.join(' ')).toContain('MAX_LEDGER_TESTS_PER_ITEM');
+    expect(report.ledger.capsThatBit.join(' ')).toContain('is exact');
+  });
+
+  it('counts an item held up by exactly one test, which is one skip from a gap', () => {
+    const report = run([
+      test_({ id: 't1', routes: ['/'] }),
+      test_({ id: 't2', routes: ['/'] }),
+      test_({ id: 't3', routes: ['/products'] }),
+    ]);
+    const single = report.ledger.items.filter((item) => item.testCount === 1);
+    expect(report.ledger.singleTested).toBe(single.length);
+    expect(report.ledger.singleTested).toBeGreaterThan(0);
+  });
+
+  it('keeps `total` exact and says so, so nobody measures the capped array', () => {
+    const report = run([test_({ id: 't1', routes: ['/'] })]);
+    expect(report.ledger.total).toBe(report.ledger.items.length);
+    expect(report.ledger.returned).toBe(report.ledger.items.length);
+    expect(report.ledger.rule).toContain('never capped');
+  });
+
+  /**
+   * THE CAP, ACTUALLY BITING.
+   *
+   * A mutant that measured `total` from the capped array SURVIVED every test
+   * above, because no fixture had more than a handful of items — which is the
+   * precise shape of a cap nobody has ever seen bite. A reader measuring
+   * `items.length` on a project with 19,000 covered controls would report
+   * 2,000 and no indication it had been truncated.
+   */
+  it('keeps `total` exact when MAX_LEDGER_ITEMS bites, and names the cap', () => {
+    const controls = MAX_LEDGER_ITEMS + 100;
+    const labels = Array.from({ length: controls }, (_, index) => `'Widget ${index}'`).join(' ');
+    const report = analyzeCoverage({
+      flowMapGraph: lopsidedGraph(controls),
+      tests: [test_({ id: 't1', routes: ['/dash'], code: `click ${labels}` })],
+    });
+
+    // One route plus every control, all covered.
+    expect(report.ledger.total).toBe(controls + 1);
+    expect(report.ledger.items).toHaveLength(MAX_LEDGER_ITEMS);
+    expect(report.ledger.returned).toBe(MAX_LEDGER_ITEMS);
+    expect(report.ledger.truncated).toBe(true);
+    expect(report.ledger.capsThatBit.join(' ')).toContain('MAX_LEDGER_ITEMS');
+    expect(report.ledger.capsThatBit.join(' ')).toContain('`total` is exact');
+    // The axis denominator is unaffected: the cap is on the LIST, never on the
+    // arithmetic. A cap that moved a percentage would be the defect.
+    expect(axisOf(report, 'CONTROL').denominator).toBe(controls);
+    expect(axisOf(report, 'CONTROL').covered).toBe(controls);
+  });
+
+  it('orders fewest-covering-tests first, so a cap keeps the rows that matter', () => {
+    const report = run([
+      test_({ id: 't1', routes: ['/'] }),
+      test_({ id: 't2', routes: ['/'] }),
+      test_({ id: 't3', routes: ['/'] }),
+      test_({ id: 't4', routes: ['/products'] }),
+    ]);
+    const counts = report.ledger.items.map((item) => item.testCount);
+    expect([...counts].sort((a, b) => a - b)).toEqual(counts);
+  });
+});
+
+// ─── The bound: proven below, plausible above ───────────────────────────────
+
+describe('the strict/generous interval', () => {
+  /**
+   * The FORM axis is matched by a bare substring on purpose — a false "nobody
+   * tests your signup form" is the claim that makes a team close the tab — so
+   * the two edges of the bound have to be able to disagree about one form.
+   */
+  function formGraph(): Record<string, unknown> {
+    return {
+      projectId: 'p1',
+      environmentId: 'e1',
+      version: 1,
+      baseUrl: 'https://shop.test',
+      exploredAt: '2026-07-01T00:00:00.000Z',
+      truncatedReason: null,
+      nodes: [
+        node({
+          id: 'n1',
+          route: '/signup',
+          forms: [form('signup', 'Create account', [['Email address', true, 'EMAIL']])],
+        }),
+      ],
+      edges: [],
+      journeys: [],
+      features: [],
+    };
+  }
+
+  it('counts a bare mention in the upper edge and not in the lower one', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: formGraph(),
+      // Mentions the submit label as prose, and never declares the route.
+      tests: [test_({ id: 't1', routes: [], code: 'we should create account here' })],
+    });
+    const forms = axisOf(report, 'FORM');
+    expect(forms.covered).toBe(1);
+    expect(forms.provenCovered).toBe(0);
+    expect(forms.mentionOnly).toBe(1);
+    expect(forms.percent).toBe(100);
+    expect(forms.provenPercent).toBe(0);
+  });
+
+  /**
+   * THE CASE THAT ISOLATES THE QUOTE CHECK.
+   *
+   * The first test above leaves `routes` empty, so route co-location alone
+   * holds the lower edge down and the quoted-literal check is never exercised
+   * — a mutant that degraded `quotesLiteral` to a bare substring SURVIVED it.
+   * Here the test declares the form's route, so co-location is satisfied and
+   * the ONLY thing between the upper and lower edges is whether the label is
+   * written as a quoted string.
+   */
+  it('still withholds the lower edge when the label is mentioned unquoted on the right route', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: formGraph(),
+      tests: [
+        test_({
+          id: 't1',
+          routes: ['/signup'],
+          // `fill` plus the field label, which the generous matcher accepts —
+          // and the label appears bare, not as `'Email address'`.
+          code: 'await thing.fill(email address value)',
+        }),
+      ],
+    });
+    const forms = axisOf(report, 'FORM');
+    expect(forms.covered).toBe(1);
+    expect(forms.provenCovered).toBe(0);
+  });
+
+  it('counts a quoted label on the form’s own route in the lower edge', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: formGraph(),
+      tests: [
+        test_({ id: 't1', routes: ['/signup'], code: `click('Create account')` }),
+      ],
+    });
+    const forms = axisOf(report, 'FORM');
+    expect(forms.covered).toBe(1);
+    expect(forms.provenCovered).toBe(1);
+    expect(forms.mentionOnly).toBe(0);
+  });
+
+  /**
+   * The other half of the FORM lower edge. A mutant that dropped the route
+   * co-location requirement and kept only the quote check SURVIVED the two
+   * tests above, because neither of them quotes a label off-route.
+   */
+  it('withholds the lower edge for a quoted label in a test that never goes there', () => {
+    const report = analyzeCoverage({
+      flowMapGraph: formGraph(),
+      tests: [
+        test_({ id: 't1', routes: ['/somewhere-else'], code: `click('Create account')` }),
+      ],
+    });
+    const forms = axisOf(report, 'FORM');
+    // Generously covered — a test naming this form's submit control is real
+    // information and a false "nobody tests your signup form" is the claim
+    // that makes a team close the tab. Not PROVEN, because nothing says that
+    // test was ever on the page the form is on.
+    expect(forms.covered).toBe(1);
+    expect(forms.provenCovered).toBe(0);
+  });
+
+  /** The CONTROL axis's own lower edge. Route co-location is already required
+   * by its covered matcher, so the only thing the lower edge adds is the quote. */
+  it('withholds the lower edge for a control whose label is only mentioned in prose', () => {
+    const graph = lopsidedGraph(1);
+    const report = analyzeCoverage({
+      flowMapGraph: graph,
+      // On the right route, and the label appears as prose rather than as a
+      // locator argument.
+      tests: [test_({ id: 't1', routes: ['/dash'], code: 'the widget 0 panel renders' })],
+    });
+    const controls = axisOf(report, 'CONTROL');
+    expect(controls.covered).toBe(1);
+    expect(controls.provenCovered).toBe(0);
+
+    const quoted = analyzeCoverage({
+      flowMapGraph: graph,
+      tests: [test_({ id: 't1', routes: ['/dash'], code: `click('Widget 0')` })],
+    });
+    expect(axisOf(quoted, 'CONTROL').provenCovered).toBe(1);
+  });
+
+  it('renders a range only when the two edges differ', () => {
+    const wide = coverageHeadline(
+      coverageAxisReadings({
+        ...ZERO_COUNTS,
+        FORM: { denominator: 4, covered: 3, provenCovered: 1 },
+      }),
+    );
+    expect(wide.lowerPercent).toBe(25);
+    expect(wide.upperPercent).toBe(75);
+    expect(wide.range).toBe('25–75%');
+
+    const tight = coverageHeadline(
+      coverageAxisReadings({
+        ...ZERO_COUNTS,
+        ROUTE: { denominator: 4, covered: 2, provenCovered: 2 },
+      }),
+    );
+    expect(tight.range).toBe('50%');
   });
 });

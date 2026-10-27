@@ -768,6 +768,27 @@ model Project {
   /// project. Null means the documented default. This is the money cap: every
   /// item is a model call and, eventually, a browser.
   closureItemBudget        Int?
+  /// `CoverageConfig` — route weights, declared criticality and out-of-scope
+  /// globs, as validated configuration THE CUSTOMER OWNS.
+  ///
+  /// THE DEFECT: risk ranking is an English money-word regex and it is
+  /// `\b`-bounded, so `/pay_now` and `/checkoutConfirm` — two of the
+  /// highest-risk route spellings there are — both miss. No regex fixes that,
+  /// because the question is not how a route is spelled but what it does, and
+  /// the only party who knows is the team that wrote it. A code comment already
+  /// invited them to "tell us so" with nowhere in the product to do it.
+  ///
+  /// NULLABLE WITH NO DEFAULT. `{}` would claim a customer had reviewed their
+  /// scope and declared nothing out of it, which is a positive assertion; null
+  /// is "nobody has configured this", and the UI can say which. Same judgement
+  /// as `quarantineBudgetPercent` and `coverageTargetPercent` above.
+  ///
+  /// `outOfScope` removes items from the DENOMINATOR, which makes it the one
+  /// knob here a customer could use to make their own number say anything — so
+  /// `maxOutOfScopePercent` inside it is the brake, it is stored beside the
+  /// rules it bounds, and a reader that hits it must report the cap AS A COUNT
+  /// AND AS A REASON rather than applying half the configuration silently.
+  coverageConfig           Json?
   archivedAt               DateTime?
   createdAt                DateTime    @default(now())
   updatedAt                DateTime    @updatedAt
@@ -791,6 +812,9 @@ model Project {
   coverageItems     CoverageItem[]
   surfaceDimensions SurfaceDimension[]
   coverageSnapshots CoverageSnapshot[]
+  /// Suite health over time. `Test.flakeRate` is overwritten on every run and
+  /// the score was recomputed per request, so rot had no direction at all.
+  healthSnapshots   SuiteHealthSnapshot[]
   failureSignatures FailureSignature[]
   closureCampaigns  ClosureCampaign[]
   gapClosures       GapClosure[]
@@ -1260,6 +1284,29 @@ model Test {
   /// read as "closes nothing" — the closure ledger (`GapClosure`) is the
   /// authority on what is closed, and this column is what lets it name a test.
   gapId       String?
+  /// WHAT THIS TEST IS FOR, SAID OUT LOUD — surface item keys the test claims
+  /// to cover.
+  ///
+  /// THE DEFECT: the numerator was derived entirely by regex over test source.
+  /// Many tests are unreadable to that extractor — a page object, a
+  /// fixture-driven table test, a helper that builds its URL from a factory —
+  /// and there was NO WAY, for a human or for our own generator, to state what
+  /// a test is for. The product asked customers to believe a coverage number
+  /// and gave them no way to correct it.
+  ///
+  /// A DECLARATION IS A CLAIM, NOT PROOF. It is authoritative against a regex's
+  /// guess about INTENT and it is the weakest evidence there is about the
+  /// NUMBER: it feeds a `SPEC` edge, whose ceiling is DECLARED
+  /// (`COVERAGE_EDGE_SOURCE_CEILING`), so it can never reach PASSING without a
+  /// run observing the test. If it could, `covers: ['ROUTE:/billing']` would be
+  /// a one-line way to manufacture a green coverage report and this column
+  /// would be the largest hole in the product rather than the fix for one.
+  ///
+  /// `String[]` with an EMPTY DEFAULT, which is honest here where it would not
+  /// be on a count: `[]` means this test declares nothing, and that is the
+  /// ordinary case for every hand-written and imported test — there is no
+  /// fourth state between "declares nothing" and "declares an empty list".
+  covers      String[]  @default([])
   disabledAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -1314,6 +1361,10 @@ model Test {
   /// test detail page makes.
   requirementLinks RequirementLink[]
   manualTestCases  ManualTestCase[]
+  /// The surface this test is believed to cover, per source of evidence. The
+  /// read the deletion path makes before coverage is allowed to fall, and the
+  /// reason coverage CAN fall at all.
+  coverageEdges    TestCoverageEdge[]
 
   @@index([orgId])
   @@index([projectId, type])
@@ -1680,12 +1731,18 @@ model TestResult {
   /// read six months later cannot recover what the gate was at the time.
   mutationMinScore   Float?
 
-  run               Run                @relation(fields: [runId], references: [id], onDelete: Cascade)
-  test              Test               @relation(fields: [testId], references: [id], onDelete: Cascade)
+  run               Run                 @relation(fields: [runId], references: [id], onDelete: Cascade)
+  test              Test                @relation(fields: [testId], references: [id], onDelete: Cascade)
   steps             Step[]
   findings          Finding[]
   verdict           TriageVerdict?
   mutationSurvivors MutationSurvivor[]
+  /// Per-cell evidence underneath the worst-wins roll-up above. Relation fields
+  /// produce NO SQL on this table — see the migration's TestResult section: the
+  /// only thing this round does to the largest table in the product is let two
+  /// new child tables point at it, and it adds NO COLUMN here.
+  variants          TestResultVariant[]
+  metricSamples     TestMetricSample[]
 
   @@unique([runId, testId])
   @@index([orgId])
@@ -3628,7 +3685,7 @@ model CoverageItem {
   /// disappearing denominator needs an audit trail as much as a growing one.
   retiredAt   DateTime?
 
-  project          Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project          Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
   waiver           CoverageWaiver?
   /// Requirements claimed to be covered by this surface. The join that lets the
   /// spec side and the crawl side be reconciled at all: a requirement naming a
@@ -3639,6 +3696,13 @@ model CoverageItem {
   /// authorization axis be reported against the ONE reconciled inventory rather
   /// than against a second list of route strings nobody reconciled.
   accessCells      RouteAccessCell[]
+  /// The provenance edges that make up this item's NUMERATOR — one per (test,
+  /// source), so a regex and a run can disagree about the same test and the
+  /// disagreement is a finding rather than a silent overwrite. `matches` above
+  /// stays and is what the cockpit renders; these rows are the durable,
+  /// diffable truth beneath it, and they are what lets a tier be computed and
+  /// coverage be observed to DROP.
+  coverageEdges    TestCoverageEdge[]
 
   @@unique([projectId, key])
   @@index([orgId])
@@ -5287,4 +5351,441 @@ model SurfaceDriftRecord {
   @@index([currentFlowMapId])
   @@index([baselineFlowMapId])
   @@index([triggerId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Measurement: the ladder, the provenance edges, the per-variant evidence,
+// the metric channel, suite-health history, and the scope its owner declares
+//
+// ── WHAT WAS WRONG, AND WHY ALL OF IT IS ONE ROUND ──────────────────────────
+//
+// The ENUMERATE slices built the denominator. Nothing built the measurement.
+// Concretely, and every one of these is a lie inside the only sentence this
+// company has:
+//
+//   1. "COVERED" WAS A BOOLEAN MEANING "SOME TEST MENTIONS IT". There was no
+//      requirement that the test ASSERTS anything, that it PASSED, that it RAN,
+//      or that it is not quarantined — so a test that always fails closed a gap
+//      while every gate in the product excluded it from every rule.
+//      "CoverageTier" is the ladder that separates those five situations.
+//   2. THE NUMERATOR LINK WAS A REGEX RECOMPUTED PER REQUEST, with no identity
+//      and no history, so coverage could not FALL when a test was deleted or
+//      quarantined. The number was structurally incapable of going down for the
+//      most common reason it should. "TestCoverageEdge" is that identity.
+//   3. "TestResult" IS UNIQUE ON (runId, testId) AND REDUCES WORST-WINS, so
+//      "passes in Chromium, fails in WebKit" stored as "failed", and the
+//      DEVICE_LOCALE and ROLE_CELL axes of the denominator had no per-variant
+//      evidence to rest on at all. "TestResultVariant" is that evidence, and
+//      the roll-up is UNCHANGED — this is additional, not a replacement.
+//   4. EVERY NUMBER A PLUGIN PRODUCES SURVIVED ONLY AS PROSE INSIDE A STEP
+//      TITLE. The mutation score got five columns last round because it is the
+//      metric no competitor ships; LCP, CLS, INP, k6's p95 and the visual diff
+//      ratio did not, so `MAX_VITAL_BREACHES` and `MAX_P95_LATENCY_MS` are
+//      saveable gate rules with no stored number to read. "TestMetricSample" is
+//      the open channel.
+//   5. "Test"."flakeRate" IS OVERWRITTEN ON EVERY RUN and the health score is
+//      recomputed per request, so rot has no DIRECTION — the premise of the
+//      whole suite-health lens was unmeasurable. "TestFlakeHistory" fixed the
+//      per-test half and cannot fix this one: weak assertions, duplicates and
+//      obsolete tests are properties of the SUITE, not aggregates of per-test
+//      flake. "SuiteHealthSnapshot" is the trend.
+//   6. RISK RANKING IS AN ENGLISH MONEY-WORD REGEX, `\b`-bounded, so `/pay_now`
+//      and `/checkoutConfirm` both miss — and a code comment invited the
+//      customer to "tell us so" with nowhere in the product to do it.
+//      "Project"."coverageConfig" is that somewhere.
+//
+// ── THE HONESTY RULES THIS DDL ENCODES ──────────────────────────────────────
+//
+//   · "TestCoverageEdge"."tier" AND ."source" HAVE NO DEFAULT. A default tier
+//     of DECLARED would mint a claim nothing produced; a default source would
+//     let a writer's bug read as a regex match. With no default the INSERT
+//     fails and somebody finds out.
+//   · EVERY MEASUREMENT ON "SuiteHealthSnapshot" IS NULLABLE AND NONE DEFAULTS
+//     TO 0. `weakAssertions: 0` means we scanned every test and found none —
+//     the best possible result — and writing it for a scan that never ran is
+//     the most flattering lie this product could tell about itself. Same rule
+//     as "SurfaceDriftRecord"'s six counts and "TestResult"."mutationScore".
+//   · "TestMetricSample"."value" IS NULLABLE AND CARRIES A REQUIRED REASON WHEN
+//     NULL. An LCP of 0 ms is a page that painted instantly; a p95 of 0 is a
+//     load test that never ran.
+//   · EVERY DIMENSION OF A VARIANT KEY IS NOT NULL, with '<unvaried>' and
+//     '<anonymous>' as the sentinels. A nullable dimension would break the
+//     unique index in the quietest possible way — PostgreSQL treats every NULL
+//     as distinct, so the default cell, which is the one almost every test runs
+//     in, would re-insert on every run and be counted once per run. This is
+//     the same defect "RouteAccessCell"."role" records, and it is repeated here
+//     because it is repeatable.
+//   · "Project"."coverageConfig" IS NULLABLE WITH NO DEFAULT. `{}` would claim
+//     a customer had reviewed their scope and declared nothing out of it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The coverage ladder. See packages/shared/src/coverage-tiers.ts, which owns
+/// the rank, the per-source ceiling and the promotion rule.
+///
+/// MONOTONIC: every rung implies the ones below it, which is what lets a report
+/// say "34% passing, 61% navigated" as two readings of one measurement. It also
+/// forces the thing that matters commercially — ASSERTED sits above NAVIGATED,
+/// so asserting implies having been reached, so STATIC extraction can never
+/// exceed DECLARED no matter how confidently a regex spots an `expect()`.
+enum CoverageTier {
+  DECLARED
+  NAVIGATED
+  ASSERTED
+  PASSING
+  FRESH
+}
+
+/// How a test came to be linked to a surface item.
+///
+/// RUNTIME OUTRANKS SPEC OUTRANKS STATIC when two disagree: one is a record of
+/// what a browser did, one is a person or a generator stating an intention, one
+/// is a regular expression's opinion about a string in a file.
+enum CoverageEdgeSource {
+  STATIC
+  SPEC
+  RUNTIME
+}
+
+/// What a metric's number is measured in.
+///
+/// A closed list of UNITS and a free-form metric NAME, which is the split that
+/// lets a plugin that does not exist yet record a reading without a migration
+/// while keeping the value comparable and renderable. A unitless reading is
+/// RATIO or SCORE, never an absent unit — a bare number beside numbers that
+/// have units is the thing a reader misreads.
+enum MetricUnit {
+  MILLISECONDS
+  SECONDS
+  BYTES
+  COUNT
+  PERCENT
+  RATIO
+  SCORE
+  REQUESTS_PER_SECOND
+  PIXELS
+}
+
+/// Which way is better. Stored per sample and never looked up from a table of
+/// known metric names: the channel is open, and a lookup would default an
+/// unknown metric to one direction and gate the wrong way.
+enum MetricDirection {
+  HIGHER_IS_BETTER
+  LOWER_IS_BETTER
+}
+
+/// One test → surface-item provenance edge: the NUMERATOR, with an identity.
+///
+/// ── WHY A ROW AND NOT A RECOMPUTED MATCH ────────────────────────────────────
+///
+/// `CoverageItem.matches` is a Json blob of `SurfaceMatch[]` rewritten wholesale
+/// on every analysis, and before that the link was a regex run per request. Both
+/// have the same fatal property: the link has no identity, so it cannot be
+/// observed to DISAPPEAR. A test deleted, renamed, disabled or quarantined does
+/// not lower coverage — the match simply stops being derived, and an item that
+/// was covered yesterday becomes indistinguishable from one never covered at
+/// all. A coverage number that cannot fall for the most common reason it should
+/// is not a measurement.
+///
+/// `matches` stays. It is what the cockpit renders today and every reader of it
+/// keeps working; this table is the durable, diffable, per-source truth beneath
+/// it, exactly as `TestFlakeHistory` sits beneath `Test.flakeRate`.
+///
+/// ── WHY THE UNIQUE KEY INCLUDES `source` ────────────────────────────────────
+///
+/// So that a STATIC edge and a RUNTIME edge for the same (test, item) can
+/// COEXIST AND DISAGREE. That disagreement is a finding, not a conflict to be
+/// resolved on write: a regex that claims a test covers /checkout beside a run
+/// that never reached /checkout is how you discover a test that mentions a route
+/// it never visits. `resolveCoverageEdges` ranks them at read time and reports
+/// `conflicting`.
+model TestCoverageEdge {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  testId    String
+  itemId    String
+
+  /// NO DEFAULT on either. See the section header: a defaulted tier mints a
+  /// claim nothing produced, and a defaulted source lets a writer's bug read as
+  /// a regex match.
+  source CoverageEdgeSource
+  tier   CoverageTier
+
+  /// Why `tier` is not higher. TEXT and not an enum, the same judgement as
+  /// `MutationSurvivor.reason` and `CoverageItem.unexercisableReason`: the
+  /// domain is `TIER_CAP_REASONS`, enforced at the producer by
+  /// `tierCapReasonSchema`, and nothing filters rows on it — so an enum here
+  /// would be this round's FIFTH new Postgres type, added purely so that it
+  /// could need a drift guard of its own.
+  ///
+  /// NULL means nothing capped it, which is the honest reading for a FRESH edge:
+  /// there is no rung above it to be held back from.
+  cappedBy String?
+
+  /// 0-1, with a CEILING PER SOURCE enforced by `testCoverageEdgeSchema`:
+  /// STATIC 0.8, SPEC 0.95, RUNTIME 1. Same pattern and same reason as
+  /// `LINK_METHOD_CONFIDENCE_CEILING` — a regex able to write 1 is a regex whose
+  /// guess reads on screen as certainty.
+  confidence Float
+  /// The sentence that justifies the edge, in the customer's terms. Same
+  /// contract as `CoverageItem.evidence`: this is what makes the NUMERATOR
+  /// auditable rather than asserted, which until now only the denominator was.
+  evidence   String
+
+  /// The run that last confirmed it. NULL is only legitimate for a DECLARED
+  /// edge — `testCoverageEdgeSchema` refuses a higher tier without one, because
+  /// a tier claiming an observation with no run to point at is the one thing a
+  /// provenance edge may not be.
+  lastConfirmedRunId String?
+  lastConfirmedAt    DateTime?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  /// Set when the producer stops finding it, rather than deleting the row —
+  /// same argument as `CoverageItem.retiredAt`, and here it is the entire
+  /// point: a retired edge is how coverage GOES DOWN with an audit trail,
+  /// instead of a number quietly shrinking with nothing to explain it.
+  retiredAt   DateTime?
+
+  test Test         @relation(fields: [testId], references: [id], onDelete: Cascade)
+  item CoverageItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  /// One edge per (item, test, source). The constraint IS the coexistence rule
+  /// above, and it is what makes a producer's upsert idempotent.
+  ///
+  /// Prisma's derived name is used, deliberately. It is 41 bytes, comfortably
+  /// inside PostgreSQL's 63-byte identifier limit, so a `map:` here would be
+  /// decoration — and a hand-named constraint that did not NEED naming makes
+  /// the one below look like a style choice rather than the requirement it is.
+  @@unique([itemId, testId, source])
+  @@index([orgId])
+  /// "Every edge on this item, strongest first" — the read behind every tier.
+  @@index([itemId, tier])
+  /// "What does this test cover?" — the read behind a test detail page, and the
+  /// one the deletion path makes before coverage is allowed to fall.
+  @@index([testId])
+  /// The live denominator's own query: "every un-retired edge in this project".
+  @@index([projectId, retiredAt])
+}
+
+/// One cell of the matrix a test actually ran in: browser x viewport x locale x
+/// role x environment.
+///
+/// ── WHAT THIS DOES NOT CHANGE ───────────────────────────────────────────────
+///
+/// "TestResult" KEEPS ITS (runId, testId) UNIQUE CONSTRAINT AND ITS WORST-WINS
+/// ROLL-UP, untouched, and this migration adds NO COLUMN to it. Every existing
+/// reader of `TestResult.status` keeps the contract it was written against.
+/// This table is evidence underneath that contract: a reader asking "did it
+/// pass?" wants the roll-up, a reader asking "where did it pass?" wants these
+/// rows, and reconciling the two by overwriting either one is how a matrix
+/// becomes a single wrong answer.
+///
+/// A run with no variation writes NO ROWS HERE. Absent means "this execution
+/// was not varied"; one synthetic row duplicating the roll-up would make an
+/// unvaried run indistinguishable from a deliberate one-browser matrix.
+model TestResultVariant {
+  id           String @id @default(cuid())
+  orgId        String
+  testResultId String
+  /// Denormalised from the parent so the two reads this table exists for —
+  /// "this run's WebKit failures" and "this test's de-DE history" — do not have
+  /// to join through "TestResult" to filter. Copied on insert and never
+  /// updated; the parent is immutable once written.
+  runId        String
+  testId       String
+
+  /// THE FIVE DIMENSIONS. ALL NOT NULL. See the section header for why a
+  /// nullable dimension would silently count the default cell once per run.
+  /// '<unvaried>' means nobody varied this dimension; on `role`, '<anonymous>'
+  /// additionally means "ran as a logged-out visitor", which is a real answer
+  /// and not a missing one.
+  browser     String
+  viewport    String
+  locale      String
+  role        String
+  /// The environment id this cell ran against, or '<unvaried>'. TEXT rather
+  /// than a foreign key: an environment is deletable and the evidence of what
+  /// was measured where must outlive it, which is the same argument
+  /// `CoverageItem.environmentId` records.
+  environment String
+
+  status           TestResultStatus
+  durationMs       Int              @default(0)
+  errorMessage     String?
+  /// §5 — a retry that passes is not a pass, per cell as well as per test.
+  retriedAndPassed Boolean          @default(false)
+  /// Why this cell measured nothing. NULL IS A FIFTH STATE AND IT IS NOT
+  /// NOT_RUN — identical contract to `TestResult.notRunKind`, including that
+  /// defaulting it would put a claim in the database that nothing produced.
+  notRunKind       NotRunKind?
+
+  createdAt DateTime @default(now())
+
+  testResult TestResult         @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+  metrics    TestMetricSample[]
+
+  /// The cell's identity. THE ONE CONSTRAINT IN THIS ROUND THAT MUST BE NAMED
+  /// EXPLICITLY: Prisma's derived name for a six-column unique is
+  /// "TestResultVariant_testResultId_browser_viewport_locale_role_environment_key",
+  /// which is 75 bytes, and PostgreSQL TRUNCATES at 63 SILENTLY. A truncated
+  /// name is one Prisma's introspection disagrees with for ever — an earlier
+  /// round paid for exactly that with permanent phantom drift on every
+  /// `migrate dev`. The two other uniques in this round are left to Prisma
+  /// because they fit.
+  @@unique([testResultId, browser, viewport, locale, role, environment], map: "TestResultVariant_cell_key")
+  @@index([orgId])
+  /// "This run's failures, by cell" — the matrix view's own query.
+  @@index([runId, status])
+  /// "Where has this test passed over time?" — the per-cell trend.
+  @@index([testId, createdAt])
+  @@index([testResultId])
+}
+
+/// One numeric reading, from one plugin, about one test — or one cell of it.
+///
+/// ── WHY A ROW PER READING AND NOT MORE COLUMNS ON "TestResult" ──────────────
+///
+/// The mutation score got five scalar columns last round, correctly: it is ONE
+/// known metric with a known denominator and the `(testId, createdAt)` index
+/// already answers its trend from the index alone. This is the opposite problem.
+/// The channel is OPEN — LCP, CLS, INP, k6's p95 and error rate, a visual diff
+/// ratio, and whatever a plugin nobody has written yet measures — so a column
+/// per metric is a migration per metric, and a Json blob would make every trend
+/// query a sequential scan plus a per-row parse and would let a writer put a
+/// string where the number goes.
+///
+/// Adding this table adds NO COLUMN to "TestResult", which is the largest table
+/// in the product.
+model TestMetricSample {
+  id           String  @id @default(cuid())
+  orgId        String
+  projectId    String
+  runId        String
+  testId       String
+  testResultId String
+  /// The cell this reading belongs to, when it belongs to one. NULL for a
+  /// reading about the whole test; `variantKey` below carries the sentinel so
+  /// the unique index still holds — see the note there.
+  variantId    String?
+
+  /// The metric's identity in the plugin's own spelling: `lcp`,
+  /// `http_req_duration_p95`, `visual_diff_ratio`. Validated as an identifier
+  /// by `testMetricSchema` because it is the key a trend query GROUPs on, and a
+  /// sentence cannot be grouped on. Never derived from a step title.
+  name String
+
+  /// THE NUMBER, OR NULL FOR "WE TRIED AND COULD NOT MEASURE IT".
+  ///
+  /// Not zero. An LCP of 0 ms is a page that painted instantly, a p95 of 0 is a
+  /// load test that never ran, a visual diff ratio of 0 is a pixel-perfect
+  /// match — a product that writes 0 for "not measured" reports its own blind
+  /// spots as its best results. Same three-state contract as
+  /// `TestResult.mutationScore`.
+  value             Float?
+  /// Required exactly when `value` is NULL, enforced by `testMetricSchema`. A
+  /// null with no reason is indistinguishable from a writer's bug and will be
+  /// read as zero by the first consumer that forgets to check.
+  unavailableReason String?
+  unit              MetricUnit
+  direction         MetricDirection
+
+  /// The cell this reading came from, as TEXT, with '<unvaried>' for a
+  /// whole-test reading.
+  ///
+  /// IT IS DELIBERATELY BOTH THIS AND `variantId`. The id is the join; this is
+  /// the identity, and it is NOT NULL so that the unique index below actually
+  /// constrains the common case. A unique over a nullable `variantId` would
+  /// treat every whole-test reading as distinct — PostgreSQL's NULLs again —
+  /// and the same metric would be inserted once per run for ever.
+  variantKey String
+
+  createdAt DateTime @default(now())
+
+  testResult TestResult         @relation(fields: [testResultId], references: [id], onDelete: Cascade)
+  variant    TestResultVariant? @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  /// One reading per metric per cell per result. The producer's upsert key.
+  /// Prisma's derived name is 49 bytes — inside the limit, so no `map:`.
+  @@unique([testResultId, variantKey, name])
+  @@index([orgId])
+  /// THE TREND QUERY, and the reason this table exists: "this project's `lcp`
+  /// over time". Without it every trend is a sequential scan of every reading
+  /// the install has ever taken.
+  @@index([projectId, name, createdAt])
+  /// "This test's readings for one metric" — the per-test trend.
+  @@index([testId, name, createdAt])
+  /// "Everything this run measured" — the run report's own read.
+  @@index([runId])
+  @@index([variantId])
+}
+
+/// A stored suite-health reading, so rot has a direction.
+///
+/// ── WHY "TestFlakeHistory" DOES NOT COVER THIS ──────────────────────────────
+///
+/// That table is one row per TEST per UTC day and it correctly fixed the
+/// per-test half. The suite-level numbers are not aggregates of it, and not for
+/// want of a GROUP BY: weak assertions, near-duplicates, obsolete tests and the
+/// quarantine budget are properties of the SUITE, computed by
+/// packages/agent/src/suite-health.ts from test SOURCE. Nothing has ever stored
+/// one of them, so "is this suite getting worse?" — the premise of the entire
+/// suite-health lens — had no answer.
+///
+/// ── ONE ROW PER MEASUREMENT, NOT PER DAY ───────────────────────────────────
+///
+/// Unlike "TestFlakeHistory", which aggregates per day because its write volume
+/// is tests x runs. This is one row per SUITE per measurement: an hourly schedule
+/// writes 24 rows a day for a project regardless of suite size, which is three
+/// orders of magnitude less than the per-test table it sits beside. Aggregating
+/// it per day would throw away exactly the intra-day resolution that table had
+/// to give up, for no saving worth having.
+model SuiteHealthSnapshot {
+  id        String  @id @default(cuid())
+  orgId     String
+  projectId String
+  commitSha String?
+  /// The run the pass-rate and duration halves were taken from. NULL for a
+  /// source-only scan, which measures the other six and honestly reports NULL
+  /// for these two rather than 0.
+  runId     String?
+
+  /// EVERY ONE OF THESE IS NULLABLE AND NONE HAS A DEFAULT. 0 is a measurement
+  /// — "we scanned every test and found none" — and it is the BEST possible
+  /// result for five of them. A snapshot whose scan never ran, or was truncated
+  /// by a budget, or could not parse the dialect, has no number. See the
+  /// section header; this is the rule the whole table turns on.
+  testCount          Int?
+  quarantinedCount   Int?
+  flakyCount         Int?
+  weakAssertionCount Int?
+  duplicateCount     Int?
+  obsoleteCount      Int?
+  passRatePercent    Float?
+  medianDurationMs   Int?
+  p95DurationMs      Int?
+  /// The composite, 0-100. NULL WHEN NOT COMPUTED: a 0 would read as a suite
+  /// with no value whatsoever, which is the opposite of "we did not score it".
+  /// Stored beside its inputs because a composite nobody can decompose is a
+  /// number nobody can argue with, which is the same as one nobody believes.
+  score              Float?
+
+  /// Every cap that BIT, as a sentence — a scan budget, a file take, a dialect
+  /// the parser could not read. Defaulted to `[]` here and nowhere among the
+  /// counts above, and the difference is exact: an empty caveat list is a
+  /// positive claim that nothing was truncated, which is the ordinary and
+  /// verifiable case, whereas an empty count would be a claim about the
+  /// customer's suite.
+  caveats     Json     @default("[]")
+  /// Changes whenever the answer could change, so an unchanged score and an
+  /// unchanged measurement are distinguishable.
+  fingerprint String
+  createdAt   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  /// The trend, which is the only reason the table exists.
+  @@index([projectId, createdAt])
+  @@index([projectId, commitSha])
 }

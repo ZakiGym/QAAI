@@ -132,12 +132,24 @@ type ModelName =
   | 'coverageWaiver'
   | 'coverageSnapshot'
   | 'componentItem'
-  | 'componentState';
+  | 'componentState'
+  /**
+   * The provenance edges. A real model in this fake and not an omission: the
+   * writer's whole point is that a link can be RETIRED rather than silently
+   * vanish, and "retired" is unobservable against a fake that does not hold
+   * the rows.
+   */
+  | 'testCoverageEdge';
 
 const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   codebaseSnapshot: new Set(['id', 'orgId', 'projectId']),
   flowMap: new Set(['id', 'orgId', 'projectId', 'version']),
-  test: new Set(['id', 'orgId', 'projectId', 'disabledAt', 'filePath']),
+  /*
+   * `quarantined` is read because a suppressed result gates nothing, so a
+   * quarantined test must not close a gap. Without this entry the fake refuses
+   * the query, which is the behaviour that caught it being added.
+   */
+  test: new Set(['id', 'orgId', 'projectId', 'disabledAt', 'filePath', 'quarantined']),
   testResult: new Set(['id', 'orgId', 'testId', 'runId', 'status', 'test']),
   coverageItem: new Set([
     'id',
@@ -156,6 +168,13 @@ const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   coverageSnapshot: new Set(['id', 'orgId', 'projectId']),
   componentItem: new Set(['id', 'orgId', 'projectId', 'modulePath', 'exportName', 'retiredAt']),
   componentState: new Set(['id', 'orgId', 'componentId', 'kind', 'retiredAt', 'component']),
+  /*
+   * `source` is in here deliberately. The retirement sweep is scoped to
+   * `source: 'STATIC'` so that a RUNTIME or SPEC producer's rows are never
+   * removed by a recompute of the static ones, and a fake that shrugged at the
+   * filter would make deleting that scope from the query undetectable.
+   */
+  testCoverageEdge: new Set(['id', 'orgId', 'projectId', 'itemId', 'testId', 'source', 'retiredAt']),
 };
 
 interface Store {
@@ -168,6 +187,8 @@ interface Store {
   coverageSnapshot: Row[];
   componentItem: Row[];
   componentState: Row[];
+  /** The provenance edges. See the delegate's comment in `makeDb`. */
+  testCoverageEdge: Row[];
 }
 
 function matchesCondition(value: unknown, cond: unknown): boolean {
@@ -319,6 +340,14 @@ function makeDb(store: Store): Row {
         const unique = (where.projectId_key ??
           where.projectId_modulePath_exportName ??
           where.componentId_kind ??
+          /*
+           * `TestCoverageEdge`'s compound unique. Named here rather than left
+           * to the `where` fallback below, which would compare the nested
+           * object against a column that does not exist, never match, and turn
+           * every upsert into an insert — making "re-seeing a retired edge
+           * un-retires it" and "one edge per source" both unobservable.
+           */
+          where.itemId_testId_source ??
           where) as Row;
         const found = store[name].find((row) =>
           Object.entries(unique).every(([key, value]) => row[key] === value),
@@ -371,6 +400,12 @@ function makeDb(store: Store): Row {
     coverageSnapshot: model('coverageSnapshot'),
     componentItem: model('componentItem'),
     componentState: model('componentState'),
+    /*
+     * The provenance edges. A real delegate because the write path's two
+     * properties — one edge per source, and retired rather than deleted — are
+     * only observable against a fake that holds the rows.
+     */
+    testCoverageEdge: model('testCoverageEdge'),
     /*
      * The store calls `$transaction` with an ARRAY of operations. Prisma's are
      * lazy and only run when the transaction opens; the fake's have already
@@ -556,6 +591,7 @@ function seed(overrides: Partial<Store> = {}): Store {
     coverageSnapshot: [],
     componentItem: [],
     componentState: [],
+    testCoverageEdge: [],
     ...overrides,
   };
   return store;
@@ -1858,5 +1894,230 @@ describe('computeCoverage — the environment gate on the reconciliation', () =>
     const routes = result.reconciliation!.find((report) => report.axis === 'ROUTE')!;
 
     expect(routes.rows.some((row) => row.identity === '/checkout')).toBe(true);
+  });
+});
+
+// ─── The provenance edges: the door for TestCoverageEdge ────────────────────
+
+/**
+ * `CoverageItem.matches` is a JSON blob replaced wholesale on every recompute,
+ * so it can say WHICH tests cover an item and nothing else: no identity, no
+ * history, no record of HOW the link was established, and no way for a link to
+ * be retired with an audit trail instead of simply vanishing.
+ *
+ * These are the tests for the write path that fixes that, and for the two
+ * properties that make it safe to run on a live install.
+ */
+describe('computeCoverage — the provenance edges', () => {
+  const edges = (): Row[] => store.testCoverageEdge;
+  const live = (): Row[] => edges().filter((row) => row.retiredAt === null);
+
+  it('writes one edge per match, and caps every one of them at DECLARED', async () => {
+    await compute({ persist: true });
+
+    expect(live().length).toBeGreaterThan(0);
+    for (const edge of live()) {
+      // STATIC is a regex over test source. It can prove a string appears in a
+      // spec; it cannot prove the spec is reachable, enabled, wired into a
+      // suite or ever executed. A writer that promoted its own edges past
+      // DECLARED is the one lie this table exists to prevent.
+      expect(edge.source).toBe('STATIC');
+      expect(edge.tier).toBe('DECLARED');
+      expect(edge.cappedBy).toBe('STATIC_EVIDENCE_ONLY');
+      expect(edge.lastConfirmedRunId).toBeNull();
+      expect(edge.lastConfirmedAt).toBeNull();
+    }
+  });
+
+  it('grades confidence by how the match was made, under STATIC’s ceiling', async () => {
+    await compute({ persist: true });
+    for (const edge of live()) {
+      // The per-source ceiling `testCoverageEdgeSchema` enforces. A route
+      // literal read verbatim out of a spec and a four-character field name
+      // found somewhere in a file are not the same evidence.
+      expect(edge.confidence as number).toBeLessThanOrEqual(0.8);
+      expect(edge.confidence as number).toBeGreaterThan(0);
+    }
+    expect(new Set(live().map((edge) => edge.confidence)).size).toBeGreaterThanOrEqual(1);
+  });
+
+  it('carries the evidence sentence, so a human can argue with the link', async () => {
+    await compute({ persist: true });
+    for (const edge of live()) expect(String(edge.evidence).length).toBeGreaterThan(0);
+  });
+
+  it('upserts rather than inserting, so a recompute does not duplicate a link', async () => {
+    await compute({ persist: true });
+    const first = live().length;
+    await compute({ persist: true });
+    expect(live().length).toBe(first);
+  });
+
+  it('RETIRES a link the matcher stopped finding, rather than deleting it', async () => {
+    await compute({ persist: true });
+    const before = live().length;
+    expect(before).toBeGreaterThan(0);
+
+    // Every test disappears, so no match survives. Coverage falling is a thing
+    // that must leave a trail: a row that vanishes is indistinguishable from a
+    // row that was never there.
+    store.test.length = 0;
+    await compute({ persist: true });
+
+    expect(live()).toHaveLength(0);
+    expect(edges().length).toBe(before);
+    expect(edges().every((edge) => edge.retiredAt !== null)).toBe(true);
+  });
+
+  it('un-retires the SAME row when the match comes back', async () => {
+    await compute({ persist: true });
+    const id = live()[0]?.id;
+    const tests = [...store.test];
+    store.test.length = 0;
+    await compute({ persist: true });
+    store.test.push(...tests);
+    await compute({ persist: true });
+
+    const back = edges().find((edge) => edge.id === id);
+    expect(back?.retiredAt).toBeNull();
+  });
+
+  it('never retires another source’s edge, which no producer here writes', async () => {
+    // A RUNTIME edge, as an instrumentation producer would write it. This
+    // function recomputes the STATIC ones and must not touch it — one edge per
+    // source is the whole point of the unique index.
+    store.testCoverageEdge.push({
+      id: 'edge_runtime',
+      orgId: ORG,
+      projectId: PROJECT,
+      itemId: 'whatever',
+      testId: 'whatever',
+      source: 'RUNTIME',
+      tier: 'PASSING',
+      cappedBy: null,
+      confidence: 1,
+      evidence: 'a run was observed to reach it',
+      lastConfirmedRunId: 'run_x',
+      lastConfirmedAt: new Date(),
+      retiredAt: null,
+    });
+
+    store.test.length = 0;
+    await compute({ persist: true });
+
+    const runtime = edges().find((edge) => edge.id === 'edge_runtime');
+    expect(runtime?.retiredAt).toBeNull();
+    expect(runtime?.tier).toBe('PASSING');
+  });
+
+  it('writes nothing on a dry run, like every other write in this file', async () => {
+    await compute({ persist: false });
+    expect(edges()).toHaveLength(0);
+  });
+
+  it('discloses on the SNAPSHOT when the provenance table could not be written', async () => {
+    // The migration that mints this table is written and UNAPPLIED, so the
+    // delegate exists on the generated client and the table does not. The
+    // measurement must survive that; what it must not do is fail quietly.
+    const broken = { ...store.testCoverageEdge };
+    delete (store as unknown as Row).testCoverageEdge;
+    try {
+      const result = await compute({ persist: true });
+      expect(result.snapshot.caveats.join(' ')).toContain('provenance was NOT fully recorded');
+      // The count AND the reason, which is what tells "the table does not
+      // exist" apart from "one row failed its foreign key".
+      expect(result.snapshot.caveats.join(' ')).toMatch(/\d+ of \d+ test-to-surface link/);
+      // The number itself is unaffected: what is missing is the audit trail.
+      expect(store.coverageSnapshot).toHaveLength(1);
+    } finally {
+      (store as unknown as Row).testCoverageEdge = Object.values(broken);
+    }
+  });
+});
+
+// ─── Quarantine, read through the store ─────────────────────────────────────
+
+describe('loadExecutions — a suppressed result gates nothing', () => {
+  const ordersStatus = (): unknown => itemByKey('ROUTE:/orders')?.status;
+
+  it('refuses to call an item COVERED on a quarantined test’s pass', async () => {
+    store.testResult.push({
+      id: 'res_q',
+      orgId: ORG,
+      testId: 't1',
+      runId: 'run_1',
+      status: 'PASSED',
+      retriedAndPassed: false,
+      createdAt: new Date('2026-10-20T00:00:00.000Z'),
+    });
+
+    await compute({ persist: true });
+    expect(ordersStatus()).toBe('COVERED');
+
+    const test = store.test.find((row) => row.id === 't1')!;
+    test.quarantined = true;
+    test.quarantineExpiresAt = null;
+    await compute({ persist: true });
+    expect(ordersStatus()).toBe('ASSERTED_NOT_RUN');
+  });
+
+  it('lets an EXPIRED quarantine gate again, rather than suppressing for ever', async () => {
+    store.testResult.push({
+      id: 'res_q',
+      orgId: ORG,
+      testId: 't1',
+      runId: 'run_1',
+      status: 'PASSED',
+      retriedAndPassed: false,
+      createdAt: new Date('2026-10-20T00:00:00.000Z'),
+    });
+    const test = store.test.find((row) => row.id === 't1')!;
+    test.quarantined = true;
+    // Withholding coverage from a test whose suppression ran out is wrong in
+    // the pessimistic direction, which is still wrong.
+    test.quarantineExpiresAt = new Date('2020-01-01T00:00:00.000Z');
+
+    await compute({ persist: true });
+    expect(ordersStatus()).toBe('COVERED');
+  });
+
+  it('reports a quarantined test with no result at all, rather than omitting it', async () => {
+    const test = store.test.find((row) => row.id === 't1')!;
+    test.quarantined = true;
+    test.quarantineExpiresAt = null;
+
+    const result = await compute({ persist: true });
+    // "Its only test is suppressed" and "its only test has never run" are
+    // different findings, and the matcher can only tell them apart if the fact
+    // reaches it.
+    expect(result.snapshot.caveats.join(' ')).toContain('matched by a quarantined test');
+  });
+});
+
+describe('loadExecutions — an unreadable quarantine is not an empty one', () => {
+  it('says the percentage is a CEILING when quarantine could not be read', async () => {
+    /*
+     * The quarantine read is a NEW query on an old path: `computeCoverage` is
+     * called by the surface route, the gate, the worker and this file's own
+     * recompute, and one of those environments being unable to answer it must
+     * not take the measurement down. What it must also not do is look like
+     * "nothing is quarantined", because that is the flattering answer.
+     */
+    KNOWN_FILTERS.test.delete('quarantined');
+    try {
+      const result = await compute({ persist: true });
+      const caveats = result.snapshot.caveats.join(' ');
+      expect(caveats).toContain('Quarantine could not be read');
+      expect(caveats).toContain('CEILING rather than a measurement');
+      // The measurement itself survives — the snapshot is still written.
+      expect(store.coverageSnapshot).toHaveLength(1);
+    } finally {
+      KNOWN_FILTERS.test.add('quarantined');
+    }
+  });
+
+  it('says nothing of the kind when the read worked', async () => {
+    const result = await compute({ persist: true });
+    expect(result.snapshot.caveats.join(' ')).not.toContain('Quarantine could not be read');
   });
 });

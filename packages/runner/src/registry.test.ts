@@ -29,6 +29,8 @@ import { TEST_TYPES } from '@qaai/shared';
 import type { RunnerPlugin } from '@qaai/shared';
 import { desktopPlugin } from './plugins/desktop.js';
 import { jobsPlugin } from './plugins/jobs.js';
+import { linksPlugin } from './plugins/links.js';
+import { seoPlugin } from './plugins/seo.js';
 
 /** A healthy image: every tool present, every browser installed. */
 const everything: RunnabilityProbes = {
@@ -136,21 +138,22 @@ describe('the deployment-wide runnability report', () => {
 /*
  * ── Plugins waiting on a TestType ───────────────────────────────────────────
  *
- * The usual gap in this registry is a type with no plugin. DESKTOP and JOBS
- * are the mirror image — a complete plugin for a type `TEST_TYPES` does not
- * contain yet — and the risk is the one this repo keeps producing: a module
- * that only its own test calls, which `check:wiring` cannot see here because
- * an unminted type is not in the list that gate iterates.
+ * The usual gap in this registry is a type with no plugin. DESKTOP, JOBS,
+ * LINKS and SEO are the mirror image — a complete plugin for a type
+ * `TEST_TYPES` does not contain yet — and the risk is the one this repo keeps
+ * producing: a module that only its own test calls, which `check:wiring`
+ * cannot see here because an unminted type is not in the list that gate
+ * iterates.
  *
  * So these assertions are about the SEAM: the plugins are reachable from the
  * registry today, the gap is sayable, and the promotion is what makes the
  * shared edit sufficient on its own.
  */
 describe('a plugin whose TestType is not minted yet', () => {
-  it('names both pending types, so the gap is sayable rather than silent', () => {
+  it('names every pending type, so the gap is sayable rather than silent', () => {
     // "QAAI cannot test your Electron app" and "QAAI can, but you cannot create
     // the test yet" are different sentences with different remedies.
-    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS']);
+    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS', 'LINKS', 'SEO']);
   });
 
   it('keeps every pending type genuinely absent from TEST_TYPES', () => {
@@ -179,15 +182,38 @@ describe('a plugin whose TestType is not minted yet', () => {
      * hands it a widened one and watches the plugins arrive in a real table.
      */
     const table: Record<string, RunnerPlugin> = {};
-    const moved = promotePendingPlugins(table, [...TEST_TYPES, 'DESKTOP', 'JOBS']);
+    const moved = promotePendingPlugins(table, [...TEST_TYPES, 'DESKTOP', 'JOBS', 'LINKS', 'SEO']);
 
-    expect(moved.sort()).toEqual(['DESKTOP', 'JOBS']);
+    expect(moved.sort()).toEqual(['DESKTOP', 'JOBS', 'LINKS', 'SEO']);
     expect(table.DESKTOP).toBe(desktopPlugin);
     expect(table.JOBS).toBe(jobsPlugin);
-    expect(typeof table.DESKTOP?.validate).toBe('function');
-    expect(typeof table.DESKTOP?.execute).toBe('function');
-    expect(typeof table.JOBS?.validate).toBe('function');
-    expect(typeof table.JOBS?.execute).toBe('function');
+    expect(table.LINKS).toBe(linksPlugin);
+    expect(table.SEO).toBe(seoPlugin);
+    for (const name of moved) {
+      expect(typeof table[name]?.validate, name).toBe('function');
+      expect(typeof table[name]?.execute, name).toBe('function');
+    }
+  });
+
+  it('promotes each plugin under the name the plugin itself claims', () => {
+    /*
+     * The key in `PENDING_PLUGINS` is what `pluginFor` will answer to, and the
+     * plugin's own `type` is what every result it produces is labelled with.
+     * Nothing in the type system ties them together — `PendingPlugin.type` is a
+     * bare `string` precisely because the union does not contain these names —
+     * so a copy-paste that registered the SEO plugin under LINKS would compile,
+     * promote, and then file every SEO defect as a links result.
+     *
+     * Asserted by promoting into a real table and reading each plugin's own
+     * `type` back off it, because that is the pair that has to agree.
+     */
+    const table: Record<string, RunnerPlugin> = {};
+    const moved = promotePendingPlugins(table, [...TEST_TYPES, 'DESKTOP', 'JOBS', 'LINKS', 'SEO']);
+
+    expect(moved.length).toBeGreaterThan(0);
+    for (const name of moved) {
+      expect(table[name]?.type, name).toBe(name);
+    }
   });
 
   it('promotes nothing while the vocabulary does not name them', () => {
@@ -206,7 +232,7 @@ describe('a plugin whose TestType is not minted yet', () => {
      * it — and it would send the reader to write one. The remedy is minting
      * the type, so that is what the sentence says.
      */
-    for (const type of ['DESKTOP', 'JOBS'] as const) {
+    for (const type of ['DESKTOP', 'JOBS', 'LINKS', 'SEO'] as const) {
       const reason = reasonUnsupported(type as never);
       expect(reason, type).toMatch(/has a runner plugin in this build/);
       expect(reason, type).toMatch(/not a member of TEST_TYPES yet/);

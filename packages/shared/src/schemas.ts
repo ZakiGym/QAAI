@@ -12,9 +12,11 @@ import {
   GIT_INTEGRATION_KINDS,
   GRID_INTEGRATION_KINDS,
   LANGUAGES,
+  NOT_RUN_KINDS,
   ORG_ROLES,
   PRIORITIES,
   RUN_FINISHED_PREFS,
+  TEST_RESULT_STATUSES,
   TEST_TYPES,
   UI_FRAMEWORKS,
   VERDICTS,
@@ -49,6 +51,23 @@ import {
   UNEXERCISABLE_REASONS,
 } from './surface';
 /*
+ * The coverage ladder, imported rather than restated — the same argument as the
+ * surface vocabularies above, and sharper here because this is the ONLY write
+ * path to `TestCoverageEdge.tier`. A `z.enum(['DECLARED', …])` written out here
+ * would be a second copy of the ladder, and the first thing a second copy does
+ * is stop matching: a rung added to COVERAGE_TIERS and not to the schema is a
+ * rung no writer can ever store, which is exactly the shape of the eight
+ * unsaveable gate kinds. coverage-tiers.test.ts compares these enums' own
+ * options back against these lists for that reason; this file's own test
+ * asserts the refusals instead.
+ */
+import {
+  COVERAGE_EDGE_SOURCES,
+  COVERAGE_TIERS,
+  DEFAULT_COVERAGE_FRESHNESS_DAYS,
+  TIER_CAP_REASONS,
+} from './coverage-tiers';
+/*
  * The findings vocabulary, imported rather than restated. `MAX_FINDINGS` selects
  * on a severity and a kind, and a `z.enum` here that spelled its own four
  * severities would be a THIRD copy of a list the plugins already emit and
@@ -61,7 +80,14 @@ import {
  * that way: a value import there would close the loop, and in ESM the loser of
  * that race reads an uninitialised binding.
  */
-import { FINDING_KINDS, FINDING_SEVERITIES } from './types';
+import {
+  COVERAGE_CRITICALITIES,
+  FINDING_KINDS,
+  FINDING_SEVERITIES,
+  METRIC_DIRECTIONS,
+  METRIC_UNITS,
+  UNVARIED,
+} from './types';
 
 const slug = z
   .string()
@@ -436,6 +462,38 @@ const relativeFilePath = z
  */
 const authProfileId = z.string().min(1).max(64);
 
+/**
+ * WHAT THIS TEST IS FOR, SAID OUT LOUD — surface keys the test claims to cover.
+ *
+ * ── The defect ──────────────────────────────────────────────────────────────
+ *
+ * The numerator was derived entirely by regex over test source. Many tests are
+ * simply unreadable to that extractor — a page object, a fixture-driven table
+ * test, a helper that builds its URL from a factory — and there was NO WAY, for
+ * a human or for our own generator, to state what a test is for. The product
+ * asked customers to believe a coverage number and gave them no way to correct
+ * it.
+ *
+ * ── A DECLARATION IS A CLAIM, NOT PROOF ─────────────────────────────────────
+ *
+ * This is the AUTHORITATIVE numerator in the sense that it beats a regex's
+ * guess about intent. It is the WEAKEST evidence in the sense that matters for
+ * the number: it feeds a `SPEC` edge, whose ceiling is `DECLARED`
+ * (`COVERAGE_EDGE_SOURCE_CEILING`), so it can never reach PASSING without a
+ * run observing the test. If it could, `covers: ['ROUTE:/billing']` would be a
+ * one-line way to manufacture a green coverage report, and this field would be
+ * the largest hole in the product rather than the fix for one.
+ *
+ * ── THE BOUNDS, AND WHY THERE ARE ANY ───────────────────────────────────────
+ *
+ * 100 keys and 500 characters each. A declaration is stored in a `TEXT[]`
+ * column and expanded into one edge row per key on every run finalisation, so
+ * an unbounded array is both a row explosion and a `where key in (…)` with a
+ * megabyte of strings in it. 100 is far more than any honest test covers; a
+ * test that claims more is describing a suite.
+ */
+const coversDeclaration = z.array(z.string().min(1).max(500)).max(100);
+
 export const updateTestSchema = z.object({
   code: z.string().max(500_000),
   name: z.string().min(1).max(160).optional(),
@@ -456,6 +514,17 @@ export const updateTestSchema = z.object({
    * rather than quietly running anonymously and passing.
    */
   authProfileRequired: z.boolean().optional(),
+  /**
+   * Re-declare what this test covers. OPTIONAL and NOT nullable, which is a
+   * different choice from `authProfileId` above and the difference is the
+   * point: omitting it leaves the declaration alone, and sending `[]`
+   * deliberately clears it. There is no third state to express — "no
+   * declaration" and "an empty declaration" are the same fact about a test —
+   * so a nullable would add a value with no meaning, and every client that
+   * predates this field keeps saving without silently erasing a declaration
+   * somebody made.
+   */
+  covers: coversDeclaration.optional(),
 });
 
 export const createTestSchema = z.object({
@@ -471,6 +540,12 @@ export const createTestSchema = z.object({
   authProfileId: authProfileId.nullable().default(null),
   /** See `updateTestSchema.authProfileRequired`. */
   authProfileRequired: z.boolean().default(false),
+  /**
+   * What this test covers, as the author or the generator declares it. Defaults
+   * to empty — a test that declares nothing is the ordinary case and always
+   * will be, and the STATIC extractor still has its say about it.
+   */
+  covers: coversDeclaration.default([]),
 });
 
 /**
@@ -2793,3 +2868,351 @@ export const surfaceDimensionSchema = z
       path: ['detail', 'defaultVariant'],
     },
   );
+
+// ─── Measurement: the ladder, the edges, the variants and the metric channel ─
+
+/**
+ * The three vocabularies of the coverage ladder, as validators.
+ *
+ * `z.enum` over the imported lists rather than hand-written literals, so the
+ * run-time parity tests in schemas.test.ts and coverage-tiers.test.ts are
+ * comparing the schema against the ladder and not against a copy of it. See the
+ * import note at the head of this file.
+ */
+export const coverageTierSchema = z.enum(COVERAGE_TIERS);
+export const coverageEdgeSourceSchema = z.enum(COVERAGE_EDGE_SOURCES);
+export const tierCapReasonSchema = z.enum(TIER_CAP_REASONS);
+
+/**
+ * One test → surface-item provenance edge.
+ *
+ * ── The defect this shape ends ──────────────────────────────────────────────
+ *
+ * The numerator link was recomputed by regex on every request, with no identity
+ * and no history. So coverage could not FALL when a test was deleted or
+ * quarantined: the link simply stopped being derived, and an item that had been
+ * covered yesterday was indistinguishable from one that had never been covered
+ * at all. The number was structurally incapable of going down for the most
+ * common reason it should.
+ *
+ * ── `confidence` HAS A CEILING PER SOURCE, ENFORCED HERE ────────────────────
+ *
+ * The same pattern as `LINK_METHOD_CONFIDENCE_CEILING` in requirements.ts, and
+ * for the identical reason: a regex able to write `confidence: 1` is a regex
+ * whose guess reads on screen as certainty. A STATIC edge is capped at 0.8, a
+ * SPEC edge at 0.95 — a human can be wrong about what a test does — and only a
+ * RUNTIME edge, which is a record of something a browser was observed to do,
+ * may claim 1.
+ *
+ * ── `tier` IS ACCEPTED AND STILL CAPPED SERVER-SIDE ─────────────────────────
+ *
+ * This schema deliberately does NOT re-derive the tier; `promoteCoverageTier`
+ * does that, from evidence, in one place. What it DOES refuse is a tier the
+ * source could never have earned, because that check is cheap and the failure
+ * it catches — a STATIC writer storing PASSING — is the whole product.
+ */
+export const testCoverageEdgeSchema = z
+  .object({
+    testId: z.string().min(1).max(64),
+    /** `CoverageItem.key`, the stable `KIND:identity`. Same bound as `surfaceItemSchema.key`. */
+    itemKey: z.string().min(1).max(500),
+    source: coverageEdgeSourceSchema,
+    tier: coverageTierSchema,
+    /**
+     * Why `tier` is not higher. Null is legitimate and means nothing capped it:
+     * a FRESH edge has nothing above it to be held back from.
+     */
+    cappedBy: tierCapReasonSchema.nullable().default(null),
+    /** 0-1. See the ceiling note above. */
+    confidence: z.number().min(0).max(1),
+    /** The sentence that justifies the edge, in the customer's terms. */
+    evidence: z.string().min(1).max(1_000),
+    /**
+     * The run that last confirmed this edge. REQUIRED for any tier above
+     * DECLARED and refused below — see the refinements. A tier that claims an
+     * observation with no run to point at is an unauditable claim, which is the
+     * one thing a provenance edge may not be.
+     */
+    lastConfirmedRunId: z.string().min(1).max(64).nullable().default(null),
+    lastConfirmedAtIso: z.string().datetime().nullable().default(null),
+  })
+  .refine(
+    (edge) =>
+      edge.confidence <=
+      ({ STATIC: 0.8, SPEC: 0.95, RUNTIME: 1 } as const satisfies Record<
+        (typeof COVERAGE_EDGE_SOURCES)[number],
+        number
+      >)[edge.source],
+    {
+      message:
+        'confidence is above what this source can earn — a regex cannot be certain, and only an ' +
+        'observed run may claim 1',
+      path: ['confidence'],
+    },
+  )
+  .refine((edge) => edge.source === 'RUNTIME' || edge.tier === 'DECLARED', {
+    message:
+      'only a RUNTIME edge may exceed DECLARED — a static match and a declaration are claims, ' +
+      'not observations (COVERAGE_EDGE_SOURCE_CEILING)',
+    path: ['tier'],
+  })
+  .refine((edge) => edge.tier === 'DECLARED' || edge.lastConfirmedRunId !== null, {
+    message: 'a tier above DECLARED must name the run that observed it',
+    path: ['lastConfirmedRunId'],
+  });
+
+/**
+ * One cell of the matrix, as a validator.
+ *
+ * Every dimension DEFAULTS to its sentinel rather than being optional, so the
+ * row written from this schema always has five non-null columns and the unique
+ * index that is the row's identity actually holds. See `TestVariantKey` for why
+ * a nullable dimension would silently duplicate the default cell once per run.
+ */
+/**
+ * `'<anonymous>'`, restated rather than imported, and the reason is a real
+ * import cycle rather than an oversight.
+ *
+ * The constant is `ANONYMOUS_ROLE` in auth-profiles.ts, which is its owner —
+ * `roleKey` returns it and every `RouteAccessCell` row spells a logged-out
+ * visitor with it. This file CANNOT import it: auth-profiles.ts imports
+ * `authProfileConfigSchema` back out of this file, so a value import here
+ * closes the cycle (schemas → auth-profiles → schemas), which is the same
+ * hazard the `import type` notes at the head of this file document for
+ * flow-map.ts and types.ts.
+ *
+ * So the literal is duplicated and PINNED: schemas.test.ts asserts it equals
+ * `ANONYMOUS_ROLE`, which a test file can import because it imports both. A
+ * duplicate nobody checks is how two halves of one key come to disagree; a
+ * duplicate a test holds to its source is a duplicate that cannot drift.
+ */
+const ANONYMOUS_ROLE_SENTINEL = '<anonymous>';
+
+const variantDimension = (max: number, extraSentinels: readonly string[] = []) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    /*
+     * The sentinels are the only values allowed to contain an angle bracket. A
+     * real browser name, locale tag or environment id cannot contain one, so
+     * this refinement costs nothing — and it closes the only way a caller could
+     * forge "this dimension was not varied" for a cell that was.
+     */
+    .refine(
+      (value) => !value.includes('<') || value === UNVARIED || extraSentinels.includes(value),
+      {
+        message: `angle brackets are reserved for the sentinels ${[UNVARIED, ...extraSentinels].join(', ')}`,
+      },
+    );
+
+export const testVariantKeySchema = z.object({
+  browser: variantDimension(60).default(UNVARIED),
+  viewport: variantDimension(60).default(UNVARIED),
+  locale: variantDimension(40).default(UNVARIED),
+  /**
+   * `'<anonymous>'` is a real answer — it ran logged out — and {@link UNVARIED}
+   * means nobody varied the role at all. Two sentinels because those are two
+   * facts, and only one of them is a claim about the application.
+   */
+  role: variantDimension(120, [ANONYMOUS_ROLE_SENTINEL]).default(UNVARIED),
+  environment: variantDimension(64).default(UNVARIED),
+});
+
+/**
+ * One numeric reading.
+ *
+ * ── THE TWO REFINEMENTS ARE THE SCHEMA ──────────────────────────────────────
+ *
+ * A null value demands a reason, and a present value forbids one. Both
+ * directions, because each prevents a different lie: a null with no reason is
+ * indistinguishable from a writer's bug and will be read as zero by the first
+ * consumer that forgets to check, and a value WITH an unavailability reason is
+ * a row that says both "we measured 4.2" and "we could not measure this".
+ *
+ * There is no `0` for an unmeasured metric. An LCP of 0 ms is a page that
+ * painted instantly; a p95 of 0 is a load test that never ran.
+ */
+export const testMetricSchema = z
+  .object({
+    /** The plugin's own spelling: `lcp`, `http_req_duration_p95`. Stable, or there is no trend. */
+    name: z
+      .string()
+      .min(1)
+      .max(120)
+      .regex(
+        /^[a-z0-9][a-z0-9_.:-]*$/,
+        'a metric name is an identifier, not a sentence — it is the key a trend query groups on',
+      ),
+    /** NULL MEANS NOT MEASURED. Finite: NaN and Infinity are not measurements. */
+    value: z
+      .number()
+      .refine((n) => Number.isFinite(n), 'must be a finite number')
+      .nullable(),
+    unavailableReason: z.string().min(1).max(300).nullable().default(null),
+    unit: z.enum(METRIC_UNITS),
+    direction: z.enum(METRIC_DIRECTIONS),
+    variant: testVariantKeySchema.nullable().default(null),
+  })
+  .refine((metric) => metric.value !== null || metric.unavailableReason !== null, {
+    message:
+      'a metric with no value must say why — an unexplained null is read as zero by the first ' +
+      'consumer that forgets to check',
+    path: ['unavailableReason'],
+  })
+  .refine((metric) => metric.value === null || metric.unavailableReason === null, {
+    message: 'a metric cannot both have a value and be unavailable',
+    path: ['unavailableReason'],
+  });
+
+/**
+ * One variant result, with its own status and its own numbers.
+ *
+ * Bounded at 40 metrics per cell: the performance plugin emits six vitals, k6
+ * emits a handful of thresholds, and a cell claiming more than 40 readings is a
+ * writer in a loop. The cap is a REFUSAL rather than a silent truncation —
+ * dropping readings over a limit would be a cap that bit without being
+ * reported, and this is a write path where the caller can be told.
+ */
+export const testResultVariantSchema = z.object({
+  key: testVariantKeySchema,
+  /**
+   * `TEST_RESULT_STATUSES`, imported and not spelled out. A cell's status has to
+   * be the same five words the roll-up uses or the worst-wins reduction has
+   * nothing to compare — and a sixth word written here would be a value the
+   * Postgres enum rejects, discovered on an insert at run time.
+   */
+  status: z.enum(TEST_RESULT_STATUSES),
+  durationMs: z.number().int().min(0),
+  errorMessage: z.string().max(5_000).nullable().default(null),
+  retriedAndPassed: z.boolean().default(false),
+  /**
+   * Why this cell measured nothing. NULL IS A FIFTH STATE and it is NOT
+   * `NOT_RUN` — the same contract as `TestResult.notRunKind`. `why` travels
+   * with the kind because the kind alone ("UNSUPPORTED") is not a sentence a
+   * customer can act on.
+   */
+  notRun: z
+    .object({ kind: z.enum(NOT_RUN_KINDS), why: z.string().min(1).max(500) })
+    .nullable()
+    .default(null),
+  metrics: z.array(testMetricSchema).max(40).default([]),
+});
+
+/**
+ * A suite-health reading on its way to being stored.
+ *
+ * EVERY NUMBER IS `.nullable()` WITH A `null` DEFAULT, and that is not laziness
+ * about validation — it is the contract. `0` is a measurement ("we scanned every
+ * test and found no weak assertions"); `null` is the absence of one ("the scan
+ * never ran, or was truncated"). A `.default(0)` anywhere in this object would
+ * turn every unmeasured dimension into the best possible result, which is the
+ * most flattering lie this product could tell about itself.
+ */
+const healthCount = z.number().int().min(0).nullable().default(null);
+const healthPercent = z.number().min(0).max(100).nullable().default(null);
+
+export const suiteHealthSnapshotSchema = z.object({
+  commitSha: z.string().min(7).max(64).nullable().default(null),
+  runId: z.string().min(1).max(64).nullable().default(null),
+  testCount: healthCount,
+  quarantinedCount: healthCount,
+  flakyCount: healthCount,
+  weakAssertionCount: healthCount,
+  duplicateCount: healthCount,
+  obsoleteCount: healthCount,
+  passRatePercent: healthPercent,
+  medianDurationMs: healthCount,
+  p95DurationMs: healthCount,
+  /** The composite. NULL WHEN NOT COMPUTED — a 0 would read as a worthless suite. */
+  score: healthPercent,
+  /**
+   * Every cap that BIT, as a sentence. `.default([])` is safe here and nowhere
+   * else in this object: an empty caveat list is a positive claim that nothing
+   * was truncated, which is the ordinary and verifiable case, whereas an empty
+   * COUNT would be a claim about the customer's suite.
+   */
+  caveats: z.array(z.string().min(1).max(500)).max(40).default([]),
+  fingerprint: z.string().min(1).max(200),
+});
+
+/**
+ * What the customer owns about their own measurement.
+ *
+ * ── Why this is configuration and not a better regex ────────────────────────
+ *
+ * Risk ranking is an English money-word regex, `\b`-bounded, so `/pay_now` and
+ * `/checkoutConfirm` — the two highest-risk spellings in the sample — both
+ * miss. No regex fixes that, because the question is not how a route is spelled
+ * but what it does, and the only party who knows is the team that wrote it. A
+ * code comment already invited them to "tell us so" with nowhere to do it.
+ *
+ * ── `maxOutOfScopePercent` IS THE BRAKE ON THE ONE SETTING THAT COULD LIE ────
+ *
+ * `outOfScope` removes items from the DENOMINATOR, which is the only knob in
+ * this product a customer could use to make their own coverage number say
+ * anything. So it is bounded, the bound is stored beside the rules, and the
+ * reader is required to report the cap as a count AND as a reason when it bites
+ * rather than applying half the configuration silently. 25 is the default
+ * because a quarter of an application being declared not-our-problem is already
+ * a lot; 100 is permitted, and a customer who sets it has said so on the record
+ * in configuration anyone can read.
+ */
+const scopePattern = z
+  .string()
+  .min(1)
+  .max(300)
+  .refine((pattern) => !pattern.includes('\u0000'), 'a glob cannot contain a null byte');
+
+const scopeRule = z.object({
+  pattern: scopePattern,
+  /** A scope rule with no reason is a silent exclusion — the thing waivers exist to prevent. */
+  reason: z.string().min(1).max(500),
+});
+
+export const coverageConfigSchema = z.object({
+  /** Most specific LAST: a later rule wins, as every ignore-file already works. */
+  criticality: z
+    .array(scopeRule.extend({ level: z.enum(COVERAGE_CRITICALITIES) }))
+    .max(200)
+    .default([]),
+  outOfScope: z.array(scopeRule).max(200).default([]),
+  weights: z
+    .array(
+      scopeRule.extend({
+        /**
+         * Bounded at 10. An unbounded multiplier is a ranking in which one glob
+         * is the entire report, which is indistinguishable from no ranking.
+         */
+        multiplier: z.number().min(0.1).max(10),
+      }),
+    )
+    .max(200)
+    .default([]),
+  maxOutOfScopePercent: z.number().int().min(0).max(100).default(25),
+});
+
+/**
+ * The write path for `Project.coverageConfig`.
+ *
+ * A PUT of the whole object, not a patch, and deliberately: a scope
+ * configuration is read as a whole by every reader, and a partial update that
+ * left `outOfScope` from one revision beside `maxOutOfScopePercent` from
+ * another would be a brake set against rules nobody reviewed together.
+ */
+export const updateCoverageConfigSchema = coverageConfigSchema;
+
+/**
+ * The freshness window a caller may ask a report to use.
+ *
+ * Exported as a schema rather than left to each route, because the window is
+ * what the difference between PASSING and FRESH MEANS, and three routes with
+ * three different unvalidated windows would be three different numbers on three
+ * screens. Bounded at 365: a window longer than a year is not freshness.
+ */
+export const freshnessDaysSchema = z
+  .number()
+  .int()
+  .min(1)
+  .max(365)
+  .default(DEFAULT_COVERAGE_FRESHNESS_DAYS);

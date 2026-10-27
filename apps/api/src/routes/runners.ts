@@ -25,7 +25,19 @@ import { Router } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import express from 'express';
 import { z } from 'zod';
-import { STEP_STATUSES, TEST_RESULT_STATUSES, runnerPoolName } from '@qaai/shared';
+import {
+  MAX_READINGS_PER_EXECUTION,
+  MAX_VARIANTS_PER_EXECUTION,
+  STEP_STATUSES,
+  TEST_RESULT_STATUSES,
+  UNVARIED,
+  planMeasurements,
+  runnerPoolName,
+  testMetricSchema,
+  testResultVariantSchema,
+  variantKeyOf,
+} from '@qaai/shared';
+import type { MeasurementParent, ReadingRow, VariantRow } from '@qaai/shared';
 import { artifactKey } from '@qaai/storage';
 import { prisma, unscoped, withTenant } from '../lib/prisma.js';
 import { hashToken } from '../lib/crypto.js';
@@ -291,7 +303,10 @@ agentRouter.post('/claim', async (req, res) => {
     : runner.capabilities;
   if (input.capabilities) {
     await prisma.runner
-      .update({ where: { id: runner.id }, data: { capabilities: capabilities as unknown as object } })
+      .update({
+        where: { id: runner.id },
+        data: { capabilities: capabilities as unknown as object },
+      })
       .catch(() => {});
   }
 
@@ -361,7 +376,11 @@ agentRouter.post('/claim', async (req, res) => {
     publish(runner.orgId, {
       runId: assignment.runId,
       type: 'run.started',
-      data: { total: assignment.tests.length, baseUrl: assignment.environment.baseUrl, onPrem: true },
+      data: {
+        total: assignment.tests.length,
+        baseUrl: assignment.environment.baseUrl,
+        onPrem: true,
+      },
       at: new Date().toISOString(),
     });
   }
@@ -469,6 +488,26 @@ const findingSchema = z.object({
   helpUrl: z.string().max(500).nullish(),
 });
 
+/**
+ * The inserted cell's id, or an exception.
+ *
+ * Reached only if a reading survived `planMeasurements` naming a cell that was
+ * not inserted — which this file's own code cannot produce, because the orphan
+ * refusal in there is exactly that check. So it is deliberately a 500: the only
+ * alternative is `variantId: null`, which would file one cell's measurement
+ * under the whole test and report it as a measured fact about the test. A loud
+ * failure beats a quiet lie.
+ *
+ * The key is safe to name — `variantKeyOf` produced it, so it is JSON-escaped.
+ */
+function cellIdFor(ids: ReadonlyMap<string, string>, variantKey: string): string {
+  const id = ids.get(variantKey);
+  if (id === undefined) {
+    throw new Error(`no inserted cell for ${variantKey}; refusing to file it under the whole test`);
+  }
+  return id;
+}
+
 const executionSchema = z.object({
   testId: z.string().min(1).max(64),
   status: z.enum(TEST_RESULT_STATUSES),
@@ -481,6 +520,41 @@ const executionSchema = z.object({
   videoKey: z.string().max(500).nullish(),
   traceKey: z.string().max(500).nullish(),
   findings: z.array(findingSchema).max(500).default([]),
+  /*
+   * THE MATRIX AND THE NUMBERS, built from the shared validators rather than
+   * re-declared beside them. `testResultVariantSchema` and `testMetricSchema`
+   * are what the worker's own ingest admits and what `TestResultVariant` /
+   * `TestMetricSample` were designed against — including the five sentinels,
+   * the forty-readings-per-cell cap and the null-demands-a-reason refinement —
+   * and a second spelling of any of that here would be a second contract for
+   * one table.
+   *
+   * Both default to `[]`, so every agent that has never heard of a matrix keeps
+   * reporting exactly as it does today, and an absent list stays what the model
+   * says it is: "this execution was not varied", rather than a cell nobody ran.
+   *
+   * Both bounds are REFUSALS that name the bound, never truncations. A variant
+   * list cut off at a limit is a matrix with holes and a hole reads as "not
+   * varied"; a reading dropped over a limit is a number the trend will never
+   * know was taken. The constants are the builder's own so the two cannot
+   * drift.
+   */
+  variants: z
+    .array(testResultVariantSchema)
+    .max(
+      MAX_VARIANTS_PER_EXECUTION,
+      `at most ${MAX_VARIANTS_PER_EXECUTION} matrix cells per test — nothing is truncated, ` +
+        'because a cell list cut off at a limit is a matrix with holes',
+    )
+    .default([]),
+  metrics: z
+    .array(testMetricSchema)
+    .max(
+      MAX_READINGS_PER_EXECUTION,
+      `at most ${MAX_READINGS_PER_EXECUTION} readings per test — nothing is truncated, because a ` +
+        'dropped reading is a number the trend query will never know was taken',
+    )
+    .default([]),
 });
 
 const resultsSchema = z.object({
@@ -507,17 +581,57 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
   const job = await requireLease(String(req.params.jobId), leaseOf(req));
   const input = resultsSchema.parse(req.body);
 
-  let accepted = 0;
+  /*
+   * `TestMetricSample.projectId` carries the trend index
+   * `(projectId, name, createdAt)` — the read this table exists for — so every
+   * reading needs one, and it is resolved HERE from the run this lease is for
+   * rather than taken from the payload. A reading filed under a project the
+   * reporter named would be a number in a stranger's trend.
+   *
+   * One lookup per batch, and a 404 rather than a guess if the run has been
+   * deleted underneath the lease.
+   */
+  const run = await prisma.run.findUnique({
+    where: { id: job.runId },
+    select: { projectId: true },
+  });
+  if (!run) throw notFound('Run');
+
+  /*
+   * ── TWO PASSES, AND THE SPLIT IS THE REFUSAL CONTRACT ─────────────────────
+   *
+   * Everything that can be refused is decided BEFORE anything is written, so a
+   * 400 leaves the database exactly as it found it. Deciding inside the write
+   * loop would mean the eleventh result's malformed matrix answered 400 after
+   * ten results had already been persisted — a refusal that half-applies,
+   * which this file already has a test calling worse than none.
+   *
+   * The matching stays in the first pass with the planning, because a cell's
+   * `runId` and `testId` are copied from the parent row and there is no plan
+   * without it.
+   */
+  const planned: Array<{
+    execution: (typeof input.results)[number];
+    parent: MeasurementParent;
+    measurements: { variants: VariantRow[]; readings: ReadingRow[] };
+  }> = [];
   const unknownTests: string[] = [];
 
-  for (const execution of input.results) {
+  for (const [index, execution] of input.results.entries()) {
     const result = await prisma.testResult.findFirst({
       where: {
         runId: job.runId,
         testId: execution.testId,
         ...(job.shardIndex === null ? {} : { shardIndex: job.shardIndex }),
       },
-      select: { id: true, testId: true },
+      /*
+       * `runId` is selected because the cell and the reading rows COPY it from
+       * this row. It is denormalised on both tables and never updated, so the
+       * value written here is the only one those two reads will ever see — and
+       * taking it from the body instead would be a cross-run write waiting for
+       * the first agent to send a stale id.
+       */
+      select: { id: true, testId: true, runId: true },
     });
 
     /*
@@ -532,9 +646,38 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
       continue;
     }
 
+    const parent: MeasurementParent = {
+      orgId: runner.orgId,
+      projectId: run.projectId,
+      // FROM THE PARENT ROW. Not from the body, and not from the URL.
+      runId: result.runId,
+      testId: result.testId,
+      testResultId: result.id,
+    };
+
+    const plan = planMeasurements(parent, execution.variants, execution.metrics);
+    /*
+     * The index and not the test id: a batch holds fifty of these and the
+     * reporter needs to know which one, but `testId` is free text off the wire
+     * and this message is logged by the error handler. The index says the same
+     * thing and cannot carry a newline.
+     */
+    if (!plan.ok) throw badRequest(`results[${index}]: ${plan.why}`);
+
+    planned.push({
+      execution,
+      parent,
+      measurements: { variants: plan.variants, readings: plan.readings },
+    });
+  }
+
+  let cells = 0;
+  let readings = 0;
+
+  for (const { execution, parent, measurements } of planned) {
     await prisma.$transaction(async (tx) => {
       await tx.testResult.update({
-        where: { id: result.id },
+        where: { id: parent.testResultId },
         data: {
           status: execution.status,
           durationMs: execution.durationMs,
@@ -548,12 +691,12 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
       });
 
       // Replace rather than append: a re-reported test must not double its steps.
-      await tx.step.deleteMany({ where: { testResultId: result.id } });
+      await tx.step.deleteMany({ where: { testResultId: parent.testResultId } });
       if (execution.steps.length > 0) {
         await tx.step.createMany({
           data: execution.steps.map((step) => ({
             orgId: runner.orgId,
-            testResultId: result.id,
+            testResultId: parent.testResultId,
             index: step.index,
             title: step.title,
             status: step.status,
@@ -569,12 +712,12 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
         });
       }
 
-      await tx.finding.deleteMany({ where: { testResultId: result.id } });
+      await tx.finding.deleteMany({ where: { testResultId: parent.testResultId } });
       if (execution.findings.length > 0) {
         await tx.finding.createMany({
           data: execution.findings.map((finding) => ({
             orgId: runner.orgId,
-            testResultId: result.id,
+            testResultId: parent.testResultId,
             kind: finding.kind,
             severity: finding.severity,
             code: finding.code,
@@ -584,9 +727,76 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
           })),
         });
       }
+
+      /*
+       * ── THE MATRIX AND THE READINGS ───────────────────────────────────────
+       *
+       * REPLACE, NOT APPEND, in the SAME transaction as the steps and the
+       * findings and for the same reason: a redelivered batch must overwrite.
+       * Without these deletes a retried POST would double every reading, and
+       * every cell would be refused by `TestResultVariant_cell_key` and take
+       * the whole result's write down with it.
+       *
+       * The readings are deleted FIRST and explicitly. They cascade from their
+       * CELL, so a whole-test reading — `variantId: null` by design — has
+       * nothing to cascade from and would outlive a variant-only delete,
+       * leaving last attempt's number beside this attempt's cells. Deleting
+       * them outright means the order does not depend on which rows happen to
+       * belong to a cell.
+       *
+       * The deletes run even when there is nothing to write, which is the half
+       * that matters: a test that stopped reporting a matrix must stop having
+       * one, not keep serving the previous attempt's cells for ever.
+       */
+      await tx.testMetricSample.deleteMany({ where: { testResultId: parent.testResultId } });
+      await tx.testResultVariant.deleteMany({ where: { testResultId: parent.testResultId } });
+
+      /*
+       * `createManyAndReturn`, because the readings need each cell's id and
+       * nothing else can supply it. The id is mapped back by the five
+       * dimensions the insert RETURNED, never by position: relying on the
+       * insert preserving input order would mis-attribute every reading in the
+       * batch the first time it did not, silently.
+       */
+      const inserted =
+        measurements.variants.length > 0
+          ? await tx.testResultVariant.createManyAndReturn({
+              data: measurements.variants,
+              select: {
+                id: true,
+                browser: true,
+                viewport: true,
+                locale: true,
+                role: true,
+                environment: true,
+              },
+            })
+          : [];
+      const idByCell = new Map(inserted.map((cell) => [variantKeyOf(cell), cell.id]));
+
+      if (measurements.readings.length > 0) {
+        await tx.testMetricSample.createMany({
+          data: measurements.readings.map((reading) => ({
+            ...reading,
+            /*
+             * NULL for a whole-test reading, the cell's id for a cell's — and
+             * `variantKey` is written in BOTH cases, carrying '<unvaried>' for
+             * the first. That pairing is deliberate: the id is the join, the
+             * key is the identity, and the unique index is over the key because
+             * a unique over the nullable id would treat every whole-test
+             * reading as distinct and insert the same metric once per run for
+             * ever.
+             */
+            variantId:
+              reading.variantKey === UNVARIED ? null : cellIdFor(idByCell, reading.variantKey),
+          })),
+        });
+      }
     });
 
-    accepted += 1;
+    cells += measurements.variants.length;
+    readings += measurements.readings.length;
+
     publish(runner.orgId, {
       runId: job.runId,
       type: 'test.finished',
@@ -611,7 +821,14 @@ agentRouter.post('/jobs/:jobId/results', async (req, res) => {
   // reports steadily should never be reaped for silence.
   await renewLease({ jobId: job.id, leaseId: leaseOf(req), running: true });
 
-  res.json({ accepted, dropped: unknownTests.length });
+  /*
+   * `cells` and `readings` are what was actually STORED, and they are reported
+   * because nothing else tells the agent apart from a batch whose matrix landed
+   * and a batch whose matrix it forgot to send. `accepted: 50` said nothing
+   * about either, and a measurement channel whose silence looks like success is
+   * the shape of every lie in this product's list.
+   */
+  res.json({ accepted: planned.length, dropped: unknownTests.length, cells, readings });
 });
 
 // ─── Agent: logs ─────────────────────────────────────────────────────────────
@@ -931,9 +1148,9 @@ runnersRouter.get('/pools', async (req, res) => {
      * that has to match exactly. Typing it by hand is the failure this whole
      * screen exists to explain.
      */
-    knownPools: [
-      ...new Set(runners.filter((r) => !r.revokedAt).flatMap((r) => r.pools)),
-    ].sort((a, b) => a.localeCompare(b)),
+    knownPools: [...new Set(runners.filter((r) => !r.revokedAt).flatMap((r) => r.pools))].sort(
+      (a, b) => a.localeCompare(b),
+    ),
     environments,
   });
 });
@@ -1107,7 +1324,10 @@ runnersRouter.post('/:runnerId/rotate', requireRole('ADMIN'), async (req, res) =
     },
   });
 
-  res.json({ runner: { id: runner.id, name: runner.name, tokenPrefix: token.prefix }, token: token.raw });
+  res.json({
+    runner: { id: runner.id, name: runner.name, tokenPrefix: token.prefix },
+    token: token.raw,
+  });
 });
 
 /**
@@ -1176,7 +1396,10 @@ runnersRouter.post('/queue', requireRole('ADMIN'), async (req, res) => {
   });
   if (results.length === 0) throw badRequest('That run has no tests to dispatch.');
 
-  const bySlice = new Map<number | null, Array<{ type: (typeof results)[number]['test']['type'] }>>();
+  const bySlice = new Map<
+    number | null,
+    Array<{ type: (typeof results)[number]['test']['type'] }>
+  >();
   for (const result of results) {
     const slice = bySlice.get(result.shardIndex) ?? [];
     slice.push({ type: result.test.type });
