@@ -27,6 +27,18 @@ import type { RunJob } from './jobs';
  */
 import type { AppliedCrawlPolicy } from './flow-map';
 /*
+ * The principal vocabulary. No cycle is possible: principals.ts imports nothing
+ * from here.
+ *
+ * `DEFAULT_PRINCIPAL_NAME` is imported as a VALUE rather than copied, which is
+ * safe because this module is not declaration-only — it already exports
+ * `GATE_RULE_KINDS`, `METRIC_UNITS` and others at run time. An earlier draft
+ * duplicated the literal to keep the import type-only and that was a second
+ * source of truth about the one name every session lookup keys on.
+ */
+import { DEFAULT_PRINCIPAL_NAME } from './principals';
+import type { Principal, PrincipalSession, RunPrincipalSessions } from './principals';
+/*
  * The vitals vocabulary, imported rather than restated: `MAX_VITAL_BREACHES`
  * names a metric, and a gate that spelled its own six metric names would drift
  * from the plugin that measures them the first time a seventh is added.
@@ -617,8 +629,41 @@ export interface RunContext {
     imageKey: string;
     ignoreRegions: Array<{ x: number; y: number; width: number; height: number }>;
   } | null;
-  /** Playwright storageState JSON from the auth profile, when one applies (§2). */
+  /**
+   * Playwright storageState JSON from the auth profile, when one applies (§2).
+   *
+   * UNCHANGED, AND IT STAYS UNCHANGED. This is the DEFAULT PRINCIPAL's session,
+   * and it keeps meaning exactly what it has always meant: the one identity the
+   * run resolved. Every existing plugin, harness and test that reads it keeps
+   * working and keeps being right. `sessions` below generalises it; it does not
+   * replace it, and nothing should be migrated off this field.
+   */
   storageState: unknown | null;
+  /**
+   * EVERY principal's session, keyed by the scenario's own name for the actor.
+   *
+   * ── What this makes expressible that `storageState` could not ────────────
+   *
+   * One session per run made an entire class of test inexpressible, and it is
+   * the class where the bugs are: "user A can read user B's invoice" had to be
+   * approximated by asking ANONYMOUSLY and checking for a denial, which every
+   * application gets right; invite-and-accept and submit-and-approve had no
+   * second actor to be; and nothing could sweep the enumerated endpoints with
+   * tenant A's token against tenant B's ids.
+   *
+   * ── Why it is OPTIONAL ──────────────────────────────────────────
+   *
+   * Same argument as `workspace` and `authProfileId` on this interface: every
+   * existing construction site of `RunContext` keeps compiling and keeps
+   * meaning what it meant. Absent means "this run resolved at most one
+   * session", and {@link runSessions} is the one place that normalises the two
+   * representations — so a reader never has to decide which field to trust.
+   *
+   * SECRET-BEARING, like `storageState` and `secrets`. The artifact writer and
+   * log serialiser mask it; use `describePrincipal` from principals.ts for
+   * anything a human or a report will read.
+   */
+  sessions?: RunPrincipalSessions;
   /** Where the plugin writes screenshots/videos/traces. */
   artifacts: ArtifactSink;
   logger: RunLogger;
@@ -632,6 +677,59 @@ export interface RunContext {
     retryOnce: boolean;
   };
 }
+
+/**
+ * The one place that normalises `storageState` and `sessions` into a single
+ * answer to "which sessions does this run have?".
+ *
+ * ── Why this exists at all ────────────────────────────────────────
+ *
+ * Because two fields that can both describe the default identity is two fields
+ * that can DISAGREE about it, and the way that defect shows up is the worst
+ * available: a test runs as the wrong identity, sees less than it should, and
+ * PASSES. So no consumer should read either field directly to find a
+ * principal's session — they call this, and the precedence is decided once,
+ * here, rather than six times in six scenario builders.
+ *
+ * `sessions` wins where both describe the same name, because a value set per
+ * principal is a more specific statement than a run-wide default — the same
+ * precedence `ExecutableTest.authProfileId` already has over
+ * `RunContext.storageState`, and chosen to match it rather than to be
+ * independently reasonable.
+ *
+ * Returns a plain object, never a `Map`: it has to survive `structuredClone`
+ * across the worker boundary.
+ */
+export function runSessions(ctx: {
+  storageState: unknown | null;
+  sessions?: RunPrincipalSessions;
+  authProfileId?: string | null;
+}): RunPrincipalSessions {
+  const named = ctx.sessions ?? {};
+  if (DEFAULT_PRINCIPAL_NAME in named) return named;
+  /*
+   * No default entry, so synthesise one from the legacy field. A null
+   * storageState is still a session — the ANONYMOUS one — and recording it is
+   * what stops a caller reading "no entry" as "we could not sign in". Those are
+   * different facts and only one of them is a problem.
+   */
+  const fallback: PrincipalSession = {
+    principal: {
+      name: DEFAULT_PRINCIPAL_NAME,
+      kind: ctx.storageState === null ? 'ANONYMOUS' : 'PERSISTENT',
+      lifecycle: 'ACTIVE',
+      role: null,
+      authProfileId: ctx.authProfileId ?? null,
+      authProfileKind: null,
+      tenant: null,
+      createdByScenario: null,
+    },
+    storageState: ctx.storageState,
+    expiresAtIso: null,
+  };
+  return { ...named, [DEFAULT_PRINCIPAL_NAME]: fallback };
+}
+
 
 export interface ArtifactSink {
   /** Returns the storage key. */
@@ -696,6 +794,28 @@ export interface ExecutableTest {
    * test (the foreign key nulls the binding and leaves this true).
    */
   authProfileRequired?: boolean;
+  /**
+   * THE ACTORS THIS TEST NEEDS, when one identity is not enough.
+   *
+   * `authProfileId` above binds the test to ONE session and is the right answer
+   * for most tests. It cannot express a test that needs two — and the tests
+   * that need two are the authorization tests: a holder and a subject, an
+   * inviter and an invitee, a submitter and an approver, a tenant and another
+   * tenant.
+   *
+   * ── How the two fields relate ────────────────────────────────────
+   *
+   * They are not alternatives and the test does not choose. `authProfileId` is
+   * the DEFAULT principal's binding; this list names the others. A test with
+   * `authProfileId` set and this list empty is exactly what it has always been.
+   * A test that names principals here gets one session per name in
+   * `RunContext.sessions`, and the default one is still `storageState`.
+   *
+   * Carries no credential: a `Principal` names an `AuthProfile` by id and the
+   * worker resolves it. See the note on `Principal` in principals.ts for why
+   * that type has no field a secret could sit in.
+   */
+  principals?: readonly Principal[];
 }
 
 /**

@@ -210,6 +210,90 @@ describe('the analysis this parser reads is the analysis @qaai/shared writes', (
     expect(parsed!.authSurfaces).toHaveLength(produced.authSurfaces.length);
   });
 
+  /**
+   * THE SAME DEFECT AS THE AUTH SURFACES ABOVE, AND IT SHIPPED THE SAME WAY.
+   *
+   * `detectForms` in packages/shared/src/codebase.ts reads six declared
+   * constraints off the markup — `maxlength`, `minlength`, `min`, `max`, `step`,
+   * `pattern` — and `FormFieldSummary` in packages/agent/src/coverage.ts has a
+   * slot for every one. For a whole round the link between them threw them
+   * away: `parseField` never read the six keys and `negativeExpansionFor`
+   * hard-coded them absent. So the producer read them, the consumer could have
+   * used them, and the ten constraint-governed equivalence classes stayed
+   * unreachable on this path — not because the value was missing, but because
+   * this file dropped it.
+   *
+   * 104 tests passed with the carry removed, which is why this one exists.
+   */
+  it('carries the six declared CONSTRAINTS through the parser instead of dropping them', () => {
+    const produced = analyseCodebase([
+      {
+        path: 'signup.html',
+        content: `<form name="signup">
+             <input type="text" name="zip" maxlength="5" minlength="5" pattern="[0-9]{5}" required>
+             <input type="number" name="qty" min="1" max="99" step="1" required>
+           </form>`,
+      },
+    ]);
+    const parsed = parseCodebaseAnalysis(JSON.parse(JSON.stringify(produced)));
+    expect(parsed).not.toBeNull();
+
+    const fields = new Map(
+      (parsed!.forms[0]?.fields ?? []).map((field) => [field.name, field] as const),
+    );
+    const zip = fields.get('zip');
+    const qty = fields.get('qty');
+    expect(zip, 'the producer found a zip field').toBeDefined();
+    expect(qty, 'the producer found a qty field').toBeDefined();
+
+    // READ: the number and the regex the markup declares, not a re-derivation.
+    expect(zip!.maxLength).toBe(5);
+    expect(zip!.minLength).toBe(5);
+    expect(zip!.pattern).toBe('[0-9]{5}');
+    expect(qty!.min).toBe('1');
+    expect(qty!.max).toBe('99');
+    expect(qty!.step).toBe('1');
+
+    /*
+     * DECLARED_ABSENT stays NULL and does not collapse to "nobody looked".
+     * Only this state licenses the unbounded classes, so a `?? undefined`
+     * anywhere on the path would cost a real test on every literal form.
+     */
+    expect(zip!.min).toBeNull();
+    expect(zip!.step).toBeNull();
+    expect(qty!.pattern).toBeNull();
+  });
+
+  /**
+   * And the end of the chain: a carried constraint has to become a CASE.
+   *
+   * Asserted on the plan item's steps rather than on the field shape, because
+   * the step is the artefact a human approves — and because the projection in
+   * `negativeExpansionFor` is a second place the six can be dropped, which the
+   * test above would not notice.
+   */
+  it('turns a declared constraint into a boundary case a human can read', () => {
+    const produced = analyseCodebase([
+      {
+        path: 'signup.html',
+        content: `<form name="signup">
+             <input type="number" name="qty" min="1" max="99" step="1" required>
+           </form>`,
+      },
+    ]);
+    const parsed = parseCodebaseAnalysis(JSON.parse(JSON.stringify(produced)))!;
+    const steps = scenariosFromSource(parsed, allTypes(['E2E']))
+      .items.flatMap((item) => item.steps)
+      .join('\n');
+
+    // The classes that are arithmetic over a declared bound. Unreachable by
+    // construction until the bound arrived here.
+    expect(steps).toContain('[at-min]');
+    expect(steps).toContain('[under-min]');
+    expect(steps).toContain('[at-max]');
+    expect(steps).toContain('[over-max]');
+  });
+
   it('agrees with the producer on every kind it can emit', () => {
     // Not a copy of the list: the shared constant IS the list. A kind added
     // there without a title here fails this rather than reaching a user as

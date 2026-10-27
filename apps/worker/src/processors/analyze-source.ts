@@ -113,7 +113,9 @@ import { enqueueGenerate, type AnalyzeSourceJob } from '../queues.js';
  * static read. The producer is `analyseCodebase` in packages/shared/src/codebase.ts
  * (`detectForms`), and it reads a `<form>` block with regexes: for each control
  * it takes `name`/`id`, the associated label, `type`, the bare `required`
- * attribute, and — for a `<select>` — the literal `<option>` text.
+ * attribute, the six declared constraints (`maxlength`, `minlength`, `min`,
+ * `max`, `step`, `pattern`) and — for a `<select>` — the literal `<option>`
+ * text.
  *
  * PRESENT, so these classes are reachable: happy-path, empty, whitespace-only
  * (from `required`), unbounded-length, injection-like, wrong-type,
@@ -121,21 +123,26 @@ import { enqueueGenerate, type AnalyzeSourceJob } from '../queues.js';
  * (where the semantic admits it), and not-in-options (from `options`, which
  * `parseField` used to drop and now keeps — the producer has always written it).
  *
- * ABSENT, so these ten classes cannot be built here AT ALL: at-max-length,
+ * ALSO PRESENT NOW, and this paragraph used to say the opposite: at-max-length,
  * over-max-length, at-min-length, under-min-length, at-min, under-min, at-max,
- * over-max, step-misaligned, pattern-violating. Every one of them needs a
- * number or a regex off the markup — `maxlength`, `minlength`, `min`, `max`,
- * `step`, `pattern` — and `detectForms` reads none of those attributes. It is
- * not a shape problem that could be fixed here by adding fields: the value is
- * not in the analysis, and inventing a limit would be the product making up a
- * fact about the customer's page. packages/shared is read-only to this change,
- * so the fix is a request on that file, recorded here rather than faked.
+ * over-max, step-misaligned and pattern-violating. Every one needs a number or
+ * a regex off the markup — `maxlength`, `minlength`, `min`, `max`, `step`,
+ * `pattern` — and the inventory recorded that `detectForms` read none of them
+ * and that the fix was a request on packages/shared rather than something that
+ * could be faked here. That request was granted:
+ * `SOURCE_FORM_CONSTRAINTS` in packages/shared/src/codebase.ts reads all six.
  *
- * The consequence is stated out loud wherever it shows, because absence has two
- * meanings and only one of them is true here: these constraints are UNCAPTURED,
- * not declared-as-none. `nothingDeclared` in packages/agent/src/boundaries.ts
- * is what keeps the two apart, and it is why every constraint below is left
- * genuinely absent instead of being written as `null`.
+ * The request being granted is not the same as the value arriving, and for one
+ * round it did not: `parseField` never read the six keys and
+ * `negativeExpansionFor` hard-coded them absent, so the producer read them, the
+ * consumer had a slot for each, and the ten classes stayed unreachable because
+ * the link between them dropped the values. Both ends are wired now.
+ *
+ * Absence still has two meanings and they are still kept apart, which is the
+ * part of the old paragraph that was right: a constraint is UNCAPTURED when the
+ * producer could not read the tag completely (a JSX expression, a spread) and
+ * DECLARED_ABSENT when it read the tag and the attribute is not there. Only the
+ * second licenses the unbounded classes, and only the first asks for a crawl.
  */
 export interface SourceFormField {
   /** The `name` attribute, or the schema key the handler reads. */
@@ -157,6 +164,74 @@ export interface SourceFormField {
    * from data rather than writing them out.
    */
   options?: string[];
+
+  /*
+   * ─── The six declared constraints ──────────────────────────────────────────
+   *
+   * THE SAME DEFECT AS `options`, ONE ROUND LATER AND TEN CLASSES WIDE. The
+   * inventory above used to say these were absent because `detectForms` read
+   * none of them, and that the fix was "a request on packages/shared". The
+   * request was GRANTED — `SOURCE_FORM_CONSTRAINTS` in
+   * packages/shared/src/codebase.ts now reads `maxlength`, `minlength`, `min`,
+   * `max`, `step` and `pattern` off the markup — and this file was never
+   * updated, so `parseField` dropped all six on the way in and
+   * `negativeExpansionFor` left them absent on the way out. The producer read
+   * them, the consumer (`FormFieldSummary` in packages/agent/src/coverage.ts)
+   * already had a slot for every one, and the ten classes stayed unreachable
+   * anyway because the one link between them threw the values away.
+   *
+   * ── THE THREE STATES ARE THE WHOLE VALUE AND MUST SURVIVE THE JSON ────────
+   *
+   * Same convention as `FormField` and as the producer:
+   *   • key ABSENT    → NOT_CAPTURED   (nothing looked; the remedy is a crawl)
+   *   • key null      → DECLARED_ABSENT (we read the tag; it declares none)
+   *   • key a value   → READ
+   *
+   * So these are carried with a CONDITIONAL SPREAD and never with an explicit
+   * `undefined`, which would create the key and turn "nobody looked" into "the
+   * page declares nothing" — the false-UNBOUNDED claim the producer's opacity
+   * rule exists to prevent, re-introduced one file downstream.
+   */
+  maxLength?: number | null;
+  minLength?: number | null;
+  min?: string | null;
+  max?: string | null;
+  step?: string | null;
+  pattern?: string | null;
+}
+
+/**
+ * Carry one three-stated NUMERIC constraint across the JSON boundary.
+ *
+ * `raw` is parsed JSON, so every arm has to be decided rather than trusted: a
+ * number is READ, an explicit null is DECLARED_ABSENT, and anything else —
+ * missing, a string, a NaN the producer could not parse — is NOT_CAPTURED and
+ * returns `{}` so the key stays absent. Returning `{ [key]: undefined }` would
+ * create the key and lose exactly the distinction this function exists for.
+ */
+function carryNumeric<K extends 'maxLength' | 'minLength'>(
+  raw: Record<string, unknown>,
+  key: K,
+): { [P in K]?: number | null } {
+  const value = raw[key];
+  if (value === null) return { [key]: null } as { [P in K]?: number | null };
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return { [key]: value } as { [P in K]?: number | null };
+  }
+  return {};
+}
+
+/** The string-valued half: `min`, `max`, `step`, `pattern`. See {@link carryNumeric}. */
+function carryString<K extends 'min' | 'max' | 'step' | 'pattern'>(
+  raw: Record<string, unknown>,
+  key: K,
+): { [P in K]?: string | null } {
+  const value = raw[key];
+  if (value === null) return { [key]: null } as { [P in K]?: string | null };
+  if (typeof value === 'string' && value !== '') {
+    return { [key]: value } as { [P in K]?: string | null };
+  }
+  return {};
 }
 
 export interface SourceForm {
@@ -421,6 +496,15 @@ function parseField(raw: unknown): SourceFormField | null {
     // ABSENT rather than becoming an empty array. An empty array is a claim
     // that the select offers nothing, which no real select does.
     ...(options.length > 0 ? { options } : {}),
+    // The six declared constraints, each independently three-stated. Order
+    // matches SOURCE_FORM_CONSTRAINTS in packages/shared/src/codebase.ts so a
+    // seventh is one line in both places rather than a silent omission here.
+    ...carryNumeric(raw, 'maxLength'),
+    ...carryNumeric(raw, 'minLength'),
+    ...carryString(raw, 'min'),
+    ...carryString(raw, 'max'),
+    ...carryString(raw, 'step'),
+    ...carryString(raw, 'pattern'),
   };
 }
 
@@ -929,11 +1013,22 @@ function negativeExpansionFor(
 ): ReturnType<typeof expandNegativeCases> {
   /*
    * A `SourceForm` is projected onto the `FormSummary` the shared expansion
-   * reads. Every constraint is left ABSENT, not null, and that is the whole
-   * point: `boundaries.ts` words its "no case for this class" reason from the
-   * difference, so the plan says "no maxlength was captured" (true — a static
-   * read never looked) instead of "the page declares no maxlength" (a claim
-   * about markup nobody opened).
+   * reads, and each of the six declared constraints is carried THROUGH in
+   * whichever of its three states the producer answered.
+   *
+   * It used to hard-code every constraint as absent, with a comment arguing
+   * that this was the honest answer because a static read never looked. That
+   * argument was true and is now FALSE: `detectForms` reads all six off literal
+   * markup and answers `undefined` only for a tag it could not parse
+   * completely. Hard-coding absence here would report "no maxlength was
+   * captured" about a field whose `maxlength="5"` the producer read and handed
+   * over — our own gap invented on top of a fact we already had, which is the
+   * same lie as the one the old comment was avoiding, pointing the other way.
+   *
+   * A conditional spread, not `?? null`: the difference between NOT_CAPTURED
+   * and DECLARED_ABSENT is what `boundaries.ts` words its reason from, and
+   * `?? null` would collapse the first into the second and license the
+   * UNBOUNDED classes on a field nobody could read.
    */
   const summary: FormSummary = {
     name: form.name,
@@ -945,6 +1040,12 @@ function negativeExpansionFor(
       name: field.name,
       inputType: field.inputType,
       ...(field.options && field.options.length > 0 ? { options: field.options } : {}),
+      ...('maxLength' in field ? { maxLength: field.maxLength } : {}),
+      ...('minLength' in field ? { minLength: field.minLength } : {}),
+      ...('min' in field ? { min: field.min } : {}),
+      ...('max' in field ? { max: field.max } : {}),
+      ...('step' in field ? { step: field.step } : {}),
+      ...('pattern' in field ? { pattern: field.pattern } : {}),
     })),
   };
   return expandNegativeCases(itemHandle, [summary]);

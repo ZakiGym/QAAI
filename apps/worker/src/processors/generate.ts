@@ -31,6 +31,8 @@
 
 import { GenerationRefused, generateTest } from '@qaai/agent';
 import type { AdmissionInput } from '@qaai/agent';
+import { z } from 'zod';
+import { principalSchema } from '@qaai/shared';
 import type { FlowMap, GenerateJob, Priority, TestType } from '@qaai/shared';
 import { llm, logger, prisma } from '../context.js';
 import { secretsFor } from '../vault.js';
@@ -59,6 +61,71 @@ export const GENERATE_AUDIT_ACTIONS = { refused: 'generate.refused' } as const;
  * produces — and never a generation that times out or exhausts the worker.
  */
 export const DUPLICATE_CANDIDATE_CAP = 200;
+
+/** One validated actor, as `principalSchema` defines it. */
+export type PlanItemPrincipal = z.infer<typeof principalSchema>;
+
+/**
+ * THE ACTORS, CARRIED FROM THE PLAN ITEM ONTO THE TEST.
+ *
+ * `PlanItem.principals` and `Test.principals` both exist, and the schema comment
+ * on the first says in so many words that "the Generator copies this across when
+ * it turns the item into a test". THIS IS THAT COPY, and without it the column
+ * is written by a producer and read by nothing: a multi-actor scenario's two
+ * actors are lost between the plan and the test, the runner resolves one
+ * session, and an invite-and-accept test runs as one identity pretending to be
+ * two — which passes, because one actor can always see its own invite.
+ *
+ * ── THE THREE STATES, PRESERVED ────────────────────────────────────────────
+ *
+ *   null  "this item predates principals". The single-identity case, which is
+ *         every test in the product today.
+ *   []    "it declares none". ALSO the single-identity case, and deliberately
+ *         not merged with null — one says nobody asked and the other says
+ *         somebody asked and the answer was none.
+ *   rows  the actors, each validated.
+ *
+ * ── WHY A PARSE FAILURE IS A REVIEW FLAG AND NOT A THROW ───────────────────
+ *
+ * The column is Json, so it can hold anything a previous writer put there.
+ * Refusing the whole generation over an unreadable actor list would lose a test
+ * that is otherwise fine; copying the list through unvalidated would put
+ * whatever is in that column in front of the runner, and `principalSchema` is
+ * `.strict()` precisely because it must have no field a credential could sit
+ * in. So an unreadable list becomes NO list plus a flag that SAYS the actors
+ * were dropped — the test runs single-identity and the human is told, rather
+ * than the test running single-identity while claiming two.
+ */
+export function readPlanItemPrincipals(raw: unknown): {
+  /*
+   * The PARSED rows, not `unknown[]`. Typed deliberately: `unknown[]` is not
+   * assignable to Prisma's Json input (no index signature), and the compiler
+   * refusing it is the right outcome — it means nothing can reach that column
+   * without having been through `principalSchema`, which is the whole point of
+   * this function.
+   */
+  principals: PlanItemPrincipal[] | null;
+  flag: string | null;
+} {
+  if (raw === null || raw === undefined) return { principals: null, flag: null };
+  if (!Array.isArray(raw)) {
+    return {
+      principals: null,
+      flag:
+        'This plan item\u2019s `principals` column is not a list, so the actors it named could not be read and this test will run as a single identity. A two-actor scenario executed as one actor passes trivially \u2014 one actor can always see its own invite \u2014 so do not trust a pass here until the column is fixed.',
+    };
+  }
+  if (raw.length === 0) return { principals: [], flag: null };
+
+  const parsed = principalSchema.array().max(16).safeParse(raw);
+  if (!parsed.success) {
+    return {
+      principals: null,
+      flag: `This plan item named ${raw.length} actor(s) and the list did not validate (${parsed.error.issues[0]?.message ?? 'unknown reason'}), so none of them was copied onto the test and it will run as a single identity. Nothing from that column was passed through unchecked.`,
+    };
+  }
+  return { principals: parsed.data, flag: null };
+}
 
 type ExistingTests = NonNullable<AdmissionInput['existing']>;
 
@@ -396,6 +463,14 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
       );
 
       const reviewFlags = [...generated.reviewFlags];
+
+      /*
+       * The actors travel from the item onto the test. See
+       * {@link readPlanItemPrincipals} for why an unreadable list becomes a
+       * flag rather than a throw or a silent pass-through.
+       */
+      const actors = readPlanItemPrincipals(item.principals);
+      if (actors.flag !== null) reviewFlags.push(actors.flag);
       /*
        * The role travels from the plan item onto the test, and this is the link
        * that makes the whole chain mean anything: the gap names a profile, the
@@ -461,6 +536,21 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
           // item's role is dropped on the floor here.
           authProfileId: item.authProfileId,
           authProfileRequired: item.authProfileId !== null,
+          /*
+           * THE SECOND IDENTITY, WHICH `authProfileId` HAS NOWHERE TO PUT.
+           *
+           * `authProfileId` above names at most ONE identity, and one identity
+           * is what made "user A reads user B's invoice" inexpressible: the
+           * only available approximation was to ask anonymously, which every
+           * application denies, so the check passed everywhere. This column is
+           * what the runner reads to resolve a session PER ACTOR.
+           *
+           * Null is not written over an existing value: a null `principals`
+           * means "this item predates principals" and the column's default is
+           * already null, so the key is omitted entirely rather than set — the
+           * same shape `spec` uses two fields up, and for the same reason.
+           */
+          ...(actors.principals !== null ? { principals: actors.principals } : {}),
           planItemId: item.id,
           /*
            * THE PROVENANCE, copied onto the test AT BIRTH.
@@ -512,6 +602,13 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
             .filter((gate) => gate.status === 'UNAVAILABLE')
             .map((gate) => gate.gate),
           comparedAgainst: candidates.existing.length,
+          /*
+           * COUNT ONLY, never the actors themselves. A principal carries a
+           * name and an auth-profile id and `principalSchema` is `.strict()`
+           * with no field a credential could sit in — but a log line that
+           * spreads a row is how that stops being true, so this one counts.
+           */
+          actors: actors.principals?.length ?? 0,
         },
         'test generated',
       );

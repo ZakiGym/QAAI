@@ -87,6 +87,64 @@ enum AuthProfileKind {
   MOCK_IDP
 }
 
+/// MAY THIS IDENTITY BE DAMAGED? Mirrors PRINCIPAL_KINDS in
+/// packages/shared/src/principals.ts.
+///
+/// ── Why this column exists ──────────────────────────────────────────────────
+///
+/// Logout, session expiry, password reset, email verification and lockout — the
+/// highest-risk flows any application has — were skip-listed, and `/logout` was
+/// on a literal skip list. The reason was sound: there is ONE shared account,
+/// and driving any of those against it destroys the only way in. So the most
+/// dangerous flows in the product were the only ones never tested.
+///
+/// This column is what makes them testable. A scenario may destroy a
+/// DISPOSABLE principal and may never touch a PERSISTENT one, and
+/// `proveDisposable` in principals.ts is the only way to obtain a value the
+/// type system will let a destructive step accept.
+///
+/// ── Why three members and not a boolean ────────────────────────────────────
+///
+/// ANONYMOUS has no account to destroy, so both booleans are lies about it:
+/// false reads as "the customer's precious account" and true as "go ahead".
+/// Logging out an anonymous principal is not a refused destructive step, it is
+/// not a destructive step, and collapsing that distinction puts an
+/// unexercisable surface in the same bucket as an exercisable one.
+enum PrincipalKind {
+  PERSISTENT
+  DISPOSABLE
+  ANONYMOUS
+}
+
+/// WHERE A PRINCIPAL IS IN ITS LIFE. Mirrors PRINCIPAL_LIFECYCLES in
+/// packages/shared/src/principals.ts.
+///
+/// Ten members, and three of them exist purely to stop a lie:
+///
+///   · PROVISION_FAILED is not DECLARED. A signup that could not complete is a
+///     check that did not happen; a principal still waiting to be created is a
+///     check that has not happened yet. Recording the first as the second makes
+///     a broken signup flow look like a queue.
+///   · DESTRUCTION_REFUSED is not ACTIVE. When disposability cannot be proved
+///     the principal is intact — but the scenario did NOT RUN, and an intact
+///     principal recorded as ACTIVE is a surface silently absent from the
+///     report.
+///   · UNAVAILABLE is not PROVISION_FAILED. Bot protection in front of the
+///     signup form is neither the application's fault nor ours; it is a
+///     configuration the customer can fix, and it carries a different remedy.
+enum PrincipalLifecycle {
+  DECLARED
+  PROVISIONING
+  PROVISION_FAILED
+  ACTIVE
+  SIGNED_OUT
+  SESSION_EXPIRED
+  LOCKED_OUT
+  DESTROYED
+  DESTRUCTION_REFUSED
+  UNAVAILABLE
+}
+
 /// What one role got when it asked for one route. Mirrors
 /// ROUTE_ACCESS_OUTCOMES in packages/shared/src/auth-profiles.ts.
 ///
@@ -967,7 +1025,7 @@ model Secret {
 }
 
 model AuthProfile {
-  id                    String          @id @default(cuid())
+  id                    String             @id @default(cuid())
   orgId                 String
   environmentId         String
   name                  String
@@ -997,11 +1055,65 @@ model AuthProfile {
   /// the opposite of an unlabelled logged-in one. A reader that needs the
   /// difference asks whether the column is null.
   role                  String?
+  /// MAY A SCENARIO DESTROY THIS IDENTITY?
+  ///
+  /// DEFAULT PERSISTENT, AND THAT ASYMMETRY IS THE POINT. Every row that
+  /// exists today is the customer's own account, so the default is the only
+  /// correct back-fill — and the costs of the two mistakes are not comparable.
+  /// Wrongly calling the customer's account disposable costs them their
+  /// production login; wrongly calling a throwaway persistent costs one
+  /// scenario reported as UNEXERCISABLE with a remedy printed beside it. The
+  /// default is the one whose failure is cheap.
+  ///
+  /// Filtered on: "find me a disposable principal in this environment" is the
+  /// read every destructive scenario makes before it will run at all, and
+  /// `@@index([environmentId, principalKind])` below is that query's index.
+  principalKind         PrincipalKind      @default(PERSISTENT)
+  /// Where this identity is in its life. See the enum for why ten.
+  ///
+  /// DEFAULT ACTIVE, because a profile that exists and has a storageState is
+  /// by definition one we have signed in as. A disposable profile moves through
+  /// PROVISIONING → ACTIVE → DESTROYED under the scenario that owns it.
+  principalLifecycle    PrincipalLifecycle @default(ACTIVE)
+  /// THE SCENARIO THAT CREATED THIS IDENTITY, for a disposable one.
+  ///
+  /// Required for disposability in `proveDisposable`, and the reason is not
+  /// bookkeeping: "disposable" with no creator is a claim nobody made. The only
+  /// principal a scenario may destroy is one it brought into existence, and
+  /// this column is what makes that CHECKABLE rather than asserted. The fastest
+  /// way to delete the customer's account is to copy the shared session into a
+  /// new profile and label it DISPOSABLE; an empty column here refuses that.
+  ///
+  /// Null on every PERSISTENT row, for ever. Nothing created them.
+  createdByScenario     String?
+  /// When a disposable identity was actually destroyed, or null.
+  ///
+  /// Kept beside `principalLifecycle` rather than derived from it because the
+  /// pair (lifecycle DESTROYED, disposedAt null) is a state that can only arise
+  /// from a bug in the teardown path, and a column that cannot express the
+  /// inconsistency cannot reveal it.
+  disposedAt            DateTime?
+  /// THE TENANT THIS IDENTITY BELONGS TO, as the APPLICATION UNDER TEST spells
+  /// it — never as QAAI spells it.
+  ///
+  /// The cross-tenant sweep needs tenant A's TOKEN and tenant B's IDS to be two
+  /// separately addressable facts: hold a principal in tenant A, take the ids
+  /// harvested while acting in tenant B, and ask A for each one. That is the bug
+  /// class that ends a company, and with one session per run it was
+  /// inexpressible — the IDOR check asked ANONYMOUSLY and tested whether an
+  /// anonymous visitor is denied, which every application gets right.
+  ///
+  /// Null means the application has no tenancy, or nobody said. Null is NOT a
+  /// tenant: `admitCrossTenantProbe` refuses the sweep with NO_TENANCY rather
+  /// than comparing null against null and reporting no leakage found.
+  tenantId              String?
+  /// What a human calls the tenant. Shown in reports; never compared.
+  tenantLabel           String?
   /// Cached Playwright storageState, refreshed on expiry (§2).
   storageState          Json?
   storageStateExpiresAt DateTime?
-  createdAt             DateTime        @default(now())
-  updatedAt             DateTime        @updatedAt
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
 
   environment   Environment        @relation(fields: [environmentId], references: [id], onDelete: Cascade)
   /// Tests that execute AS this profile. See Test.authProfileId for why that
@@ -1014,6 +1126,14 @@ model AuthProfile {
 
   @@unique([environmentId, name])
   @@index([orgId])
+  /// "Is there a disposable identity in this environment?" — asked before every
+  /// destructive scenario, and the answer decides whether the scenario runs or
+  /// is recorded as UNEXERCISABLE. Without this index that is a scan of every
+  /// profile in the install on a read that happens once per scenario.
+  @@index([environmentId, principalKind])
+  /// "Which identities belong to the other tenant?" — the cross-tenant sweep's
+  /// own query, run once per sweep per tenant pair.
+  @@index([tenantId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1177,6 +1297,34 @@ model PlanItem {
   assertions      Json // string[]
   journeyId       String?
   authProfileId   String?
+  /// WHICH ACTORS THIS ITEM NEEDS, so a producer can say so.
+  ///
+  /// `authProfileId` above names at most one identity, which is why a producer
+  /// that wanted two had nowhere to put the second. Same shape and same Json
+  /// rationale as `Test.principals`; the Generator copies this across when it
+  /// turns the item into a test, and a scenario that needs a disposable
+  /// principal declares it HERE, where the approval step can see it before
+  /// anything is created.
+  principals      Json?
+  /// THE BOUNDARY CLASS THIS ITEM ATTACKS, or null for a positive-path item.
+  ///
+  /// `BoundaryClass` in packages/shared/src/boundaries.ts — EMPTY,
+  /// WHITESPACE_ONLY, TOO_LONG, CHECKSUM_INVALID, LEAP_DAY and the rest.
+  ///
+  /// Why it is on the item at all: one whole feature became ONE negative item
+  /// derived from the FIRST required field, so there was no way to tell two
+  /// negative items apart, no way to ask "which classes has this field been
+  /// attacked at?", and therefore no way for the closure loop to notice that
+  /// twenty-six of the twenty-seven classes had never been tried.
+  ///
+  /// TEXT AND NOT AN ENUM, on the same judgement as `gapKind` above and
+  /// `MutationSurvivor.reason`: nothing FILTERS rows on it — the reads are
+  /// "show me this item" and "group this project's items by class" — so an
+  /// enum would be one more Postgres type whose only job is to need a drift
+  /// guard. Its domain is enforced at the producer by `boundaryClassSchema`,
+  /// and the run-time parity for it lives in
+  /// packages/shared/src/boundaries.test.ts.
+  boundaryClass   String?
   /// The coverage gap this item was minted to close — `CoverageGap.id` from
   /// packages/agent/src/coverage.ts, which is a stable hash of (kind, subject)
   /// and therefore the same id the next analysis will produce for the same gap.
@@ -1371,6 +1519,29 @@ model Test {
   /// Set by whoever asked for the role: a plan item that named a profile, or a
   /// person in the editor. Never set by the runner.
   authProfileRequired Boolean @default(false)
+  /// THE ACTORS THIS TEST NEEDS, when one identity is not enough.
+  ///
+  /// `authProfileId` above binds the test to ONE session and is the right
+  /// answer for most tests. It cannot express a test that needs TWO — and the
+  /// tests that need two are the authorization tests: a holder and a subject,
+  /// an inviter and an invitee, a submitter and an approver, a tenant and
+  /// another tenant. With one storageState per run, "user A can read user B's
+  /// invoice" was inexpressible, so the IDOR check fetched ids anonymously and
+  /// asked whether an anonymous visitor is denied.
+  ///
+  /// Json and not a join table, deliberately. A principal is SCENARIO-LOCAL: it
+  /// is a NAME the test uses for an actor ("victim", "invitee", "memberA"),
+  /// bound to an AuthProfile id, and it has no identity or lifetime outside the
+  /// test that names it. A join table would invite rows to be shared between
+  /// tests, and two tests sharing a disposable principal is a destructive
+  /// scenario destroying another test's actor mid-run. Validated by
+  /// `principalSchema` in packages/shared/src/schemas.ts, which is `.strict()`
+  /// and has no field a credential could sit in.
+  ///
+  /// Null means "this test predates principals" and `[]` means "it declares
+  /// none". Both behave as the single-identity case, which is what every
+  /// existing test is.
+  principals          Json?
 
   project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
   suite       Suite?           @relation(fields: [suiteId], references: [id], onDelete: SetNull)

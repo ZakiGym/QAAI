@@ -12,7 +12,30 @@ import { SECRET_MASK } from './constants';
 /** Values shorter than this are too likely to be substrings of ordinary text. */
 const MIN_MASKABLE_LENGTH = 6;
 
-/** Header and field names whose values are redacted regardless of vault contents. */
+/**
+ * Header and field names whose values are redacted regardless of vault contents.
+ *
+ * ── THE TRAP IN THIS LIST, AND THE LEAK IT ALREADY CAUSED ──────────────────
+ *
+ * The match is EXACT on the lower-cased key (see {@link maskDeep}), not a
+ * substring. So `totp` redacts and `totpSecret` DID NOT; `token` redacts and
+ * `bypassToken` DID NOT; `session` redacts and `sessions` DID NOT. The list
+ * reads as though it covers a family of names and it covers precisely the
+ * spellings written here, which is the worst shape a safety list can have:
+ * comprehensive-looking and narrow.
+ *
+ * `storageState` IS the session — a JSON blob of cookies minted by the browser.
+ * It is not a `Secret` row, so value-masking cannot reach it either, and it was
+ * travelling verbatim through the pino formatter
+ * (apps/worker/src/context.ts: `log: (o) => maskDeep(o)`) and every artifact
+ * writer. `RunContext.sessions` then made one storageState into one per
+ * principal, multiplying the same leak.
+ *
+ * Every spelling a credential-bearing field actually uses in this repo is
+ * therefore listed explicitly, snake_case included. When you add a field that
+ * holds a credential, add its exact key here — and prefer naming it after
+ * something already on this list.
+ */
 const ALWAYS_REDACT_KEYS = new Set(
   [
     'authorization',
@@ -31,8 +54,30 @@ const ALWAYS_REDACT_KEYS = new Set(
     'private_key',
     'session',
     'sessionid',
+    'sessions',
+    'session_id',
+    'sessionstate',
+    'session_state',
+    // THE SESSION ITSELF. A Playwright storageState is a cookie jar: handing it
+    // to anyone is handing them the logged-in account.
+    'storagestate',
+    'storage_state',
     'totp',
     'otp',
+    'totpsecret',
+    'totp_secret',
+    'otpcode',
+    'otp_code',
+    'recoverycode',
+    'recovery_code',
+    // A reset token is a one-shot account takeover, and a bypass token is the
+    // customer's own signed permission to skip their bot defence. Both are
+    // named in the round's security rules and neither was matched.
+    'resettoken',
+    'reset_token',
+    'bypasstoken',
+    'bypass_token',
+    'api_key',
     'card',
     'cardnumber',
     'cvc',

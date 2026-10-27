@@ -94,6 +94,14 @@ import type {
   TestType,
   UnexercisableReason,
 } from '@qaai/shared';
+/*
+ * ONE SPELLING OF "SIGNED OUT" IN THE PRODUCT. `ANONYMOUS_ROLE` is
+ * `<anonymous>` and `roleKey` is the normaliser; a local `?? 'anon'` here would
+ * make this file's (route, role) cells fail to join `access-matrix.ts`'s and
+ * `gap-closure.ts`'s, which is how two screens come to disagree about one
+ * percentage. See the closure-join section at the bottom of this file.
+ */
+import { ANONYMOUS_ROLE, roleKey } from '@qaai/shared';
 import { expandBoundaries, type BoundaryCase, type BoundaryExpansion, type BoundaryField } from './boundaries.js';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
@@ -5240,4 +5248,419 @@ export function dimensionUnmeasuredDisclosures(
     });
   }
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE CLOSURE JOIN: (route, role) ATTRIBUTION AND gap → plan item → test
+//
+// ── THE LOOP THAT COULD NOT CONVERGE ────────────────────────────────────────
+//
+// An UNREACHED_AUTH_ROUTE gap says "no AUTHENTICATED test reaches this route".
+// The closure loop answered it by generating a test, and nothing in the ledger
+// could say WHICH test was meant to close WHICH gap — so the next analysis
+// re-derived the same gap from the same crawl and the campaign proposed the
+// same work again, for ever. Two separate facts were missing and each one alone
+// is enough to break it:
+//
+//   1. ROLE WAS NOT PART OF THE ATTRIBUTION. Coverage was attributed per ROUTE.
+//      A route reached by an anonymous test and a route reached by an admin test
+//      were the same covered route, so a gap that specifically wanted an
+//      authenticated visit could be "closed" by a signed-out one — and
+//      re-reported immediately, because the derivation that produced it had not
+//      changed.
+//   2. PROVENANCE WAS NOT JOINED. `CoverageGap.id`, `PlanItem.gapId` and
+//      `Test.gapId` all existed as columns and nothing read all three together,
+//      so "this gap has a test" was unanswerable and the only available
+//      behaviour was to propose again.
+//
+// Both are closed below, and neither function imports `gap-closure.ts`. That is
+// not a style choice: `gap-closure.ts` imports `routeVisits` from THIS file as a
+// value, so an import the other way is a genuine runtime cycle. The division is
+// that this file owns the ATTRIBUTION and the JOIN over its own vocabulary, and
+// `gap-closure.ts` owns the role BINDING and the convergence verdict over those
+// results.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The role a test executed as, as a single comparable key.
+ *
+ * `roleKey`/`ANONYMOUS_ROLE` from @qaai/shared, NOT a local `?? 'anon'`. There
+ * is one spelling of "signed out" in this product and it is `<anonymous>`; a
+ * second one here would make this file's cells fail to join
+ * `access-matrix.ts`'s and `gap-closure.ts`'s, which is how two screens come to
+ * disagree about the same percentage.
+ *
+ * ── THE THIRD STATE, WHICH IS THE WHOLE POINT ──────────────────────────────
+ *
+ * A test with `authProfileRequired: true` and `authProfileId: null` has a
+ * BROKEN binding: it declared that it is meaningless signed out, and the
+ * profile it named was deleted (the foreign key is SetNull). It is NOT
+ * anonymous — calling it that would attribute its coverage to the signed-out
+ * role and report the anonymous surface as better covered than it is — and it
+ * is not authenticated either, because there is no session to inject. So it
+ * attributes to NO role and is counted separately, and the gap it was written
+ * to close correctly re-opens with the broken binding named.
+ */
+export type TestRoleAttribution =
+  | { readonly kind: 'ROLE'; readonly role: string }
+  | { readonly kind: 'BROKEN_BINDING' };
+
+export function roleOfTest(
+  test: Pick<CoverageTestInput, 'authProfileId' | 'authProfileRequired'>,
+): TestRoleAttribution {
+  if (test.authProfileRequired === true && !test.authProfileId) {
+    return { kind: 'BROKEN_BINDING' };
+  }
+  return { kind: 'ROLE', role: roleKey(test.authProfileId ?? null) };
+}
+
+/** `${route}\u0000${role}` — a cell key that cannot be confused by a route containing a colon. */
+export function routeRoleCellKey(route: string, role: string): string {
+  return `${route}\u0000${role}`;
+}
+
+export interface RouteRoleCell {
+  readonly route: string;
+  /** An auth profile id, or `ANONYMOUS_ROLE`. */
+  readonly role: string;
+  /** Tests attributed here. Empty means UNCOVERED, never UNMEASURED. */
+  readonly testIds: readonly string[];
+}
+
+export interface RouteRoleAttribution {
+  readonly cells: readonly RouteRoleCell[];
+  /** Keyed by {@link routeRoleCellKey}, for an O(1) join. */
+  readonly byKey: ReadonlyMap<string, RouteRoleCell>;
+  /**
+   * Tests whose role binding is broken, so their coverage is attributed to NO
+   * role.
+   *
+   * COUNTED AND NAMED rather than folded into the anonymous row. "Your admin
+   * test is running anonymously" is the finding; silently crediting the
+   * anonymous role with it is the flattering answer and it is not true.
+   */
+  readonly brokenBindingTestIds: readonly string[];
+  /**
+   * Tests whose route list was read PARTIALLY, so their absence from a cell
+   * proves nothing.
+   *
+   * This is the field that keeps an UNCOVERED verdict honest. A test whose
+   * extractor hit a cap may well visit a route it is not credited with, so a
+   * cell that is empty only because of such a test is UNMEASURED and not
+   * UNCOVERED — and the two have different remedies.
+   */
+  readonly truncatedTestIds: readonly string[];
+}
+
+/**
+ * Attribute every test to the (route, role) cells it covers.
+ *
+ * `routeVisits` is this file's own route matcher, so `/orders/:id` and
+ * `/orders/42` land in one cell here exactly as they do everywhere else.
+ *
+ * DETERMINISTIC: cells come out in (route as given) × (sorted role) order and
+ * test ids within a cell are sorted, so two runs over the same input produce a
+ * byte-identical attribution.
+ */
+export function attributeRouteRoles(input: {
+  /** The routes to attribute against — the crawl's, so this is a denominator. */
+  readonly routes: readonly string[];
+  readonly tests: readonly CoverageTestInput[];
+  /** Every role a cell should exist for, beyond the ones tests happen to use. */
+  readonly roles?: readonly string[];
+}): RouteRoleAttribution {
+  const brokenBindingTestIds: string[] = [];
+  const truncatedTestIds: string[] = [];
+
+  const attributable: Array<{ test: CoverageTestInput; role: string }> = [];
+  for (const test of input.tests) {
+    if (test.coverageTruncated === true) truncatedTestIds.push(test.id);
+    const attribution = roleOfTest(test);
+    if (attribution.kind === 'BROKEN_BINDING') {
+      brokenBindingTestIds.push(test.id);
+      continue;
+    }
+    attributable.push({ test, role: attribution.role });
+  }
+
+  /*
+   * THE ROLE AXIS IS A DENOMINATOR AND MUST NOT BE DERIVED FROM THE TESTS
+   * ALONE. If the only roles that get a cell are the roles some test already
+   * used, then a project with an admin profile and no admin test has NO admin
+   * cells — and a missing cell reads as nothing to cover rather than as
+   * something uncovered. That is precisely the shape that made the auth loop
+   * unable to converge, in the denominator instead of the numerator.
+   */
+  const roles = [
+    ...new Set([
+      ANONYMOUS_ROLE,
+      ...(input.roles ?? []).map((role) => roleKey(role)),
+      ...attributable.map((entry) => entry.role),
+    ]),
+  ].sort();
+
+  const cells: RouteRoleCell[] = [];
+  const byKey = new Map<string, RouteRoleCell>();
+  for (const route of input.routes) {
+    for (const role of roles) {
+      const testIds = attributable
+        .filter(
+          (entry) =>
+            entry.role === role && entry.test.routes.some((r) => routeVisits(r, route)),
+        )
+        .map((entry) => entry.test.id)
+        .sort();
+      const cell: RouteRoleCell = { route, role, testIds };
+      cells.push(cell);
+      byKey.set(routeRoleCellKey(route, role), cell);
+    }
+  }
+
+  return { cells, byKey, brokenBindingTestIds, truncatedTestIds };
+}
+
+/**
+ * How far a gap got towards being closed, ACCORDING TO THE ROWS THAT EXIST.
+ *
+ * ── HOW THIS RELATES TO `CLOSURE_STATES` ABOVE, WHICH IT DOES NOT REPLACE ──
+ *
+ * `ClosureState` and the ledger around it answer a question that needs TWO
+ * measurements: "we wrote a test for this gap — did re-measuring show the gap
+ * gone?" Hence NOT_CLOSED, REOPENED and UNVERIFIABLE, none of which mean
+ * anything without a previous report to compare against. That vocabulary is a
+ * text column in the database and this file does not widen it.
+ *
+ * This one answers a question that needs ONE: "what rows exist for this gap
+ * right now, and does the role they run as match the role the gap asked for?"
+ * The ledger has no notion of a role at all, which is exactly the half the
+ * closure loop was missing — a SECURITY_SMOKE that can only assert anonymous
+ * denial satisfied every check the ledger could make and still left the gap
+ * derivable, so closing it RE-CREATED it.
+ *
+ * The spellings are deliberately shared where the meaning is shared:
+ * `TEST_WRITTEN`, `PROPOSED`, `OPEN` and `CLOSED` mean here what they mean
+ * there, so a reader does not have to hold two vocabularies, and a caller
+ * feeding this verdict into `closureVerdict` has no translation to get wrong.
+ * `TEST_WRONG_ROLE` is the one genuinely new member.
+ */
+export const ROLE_CLOSURE_STATES = [
+  /** A test exists and is bound to the role the gap asked for. */
+  'CLOSED',
+  /**
+   * A test exists but is NOT bound to the role the gap asked for.
+   *
+   * THE STATE THAT NAMES THE OLD BUG. A SECURITY_SMOKE that can only assert
+   * anonymous denial lands here: the gap has a test, the test passes, and the
+   * gap is still open because the test never reached the page. Reporting this as
+   * CLOSED is what made closing an UNREACHED_AUTH_ROUTE gap RE-CREATE it.
+   */
+  'TEST_WRONG_ROLE',
+  /** A test exists for it. Whether it PASSES is a run's question, not this one's. */
+  'TEST_WRITTEN',
+  /** A plan item exists and no test came of it — approval pending, or a refusal. */
+  'PROPOSED',
+  /** Nothing has been proposed for this gap yet. */
+  'OPEN',
+] as const;
+export type RoleClosureState = (typeof ROLE_CLOSURE_STATES)[number];
+
+const ROLE_CLOSURE_STATE_PRESENT: Record<RoleClosureState, true> = {
+  CLOSED: true,
+  TEST_WRONG_ROLE: true,
+  TEST_WRITTEN: true,
+  PROPOSED: true,
+  OPEN: true,
+};
+export const ROLE_CLOSURE_STATE_LIST = Object.keys(
+  ROLE_CLOSURE_STATE_PRESENT,
+) as ReadonlyArray<RoleClosureState>;
+
+/** A `PlanItem` row as the join needs it. Narrow, so no database is required. */
+export interface ClosurePlanItemRow {
+  readonly id: string;
+  /** `PlanItem.gapId` — null for a cold plan proposed from a crawl. */
+  readonly gapId: string | null;
+  readonly authProfileId: string | null;
+  readonly generatedTestId: string | null;
+}
+
+/** A `Test` row as the join needs it. */
+export interface ClosureTestRow {
+  readonly id: string;
+  /** `Test.gapId`, copied onto the test at birth by the generate processor. */
+  readonly gapId: string | null;
+  readonly planItemId: string | null;
+  readonly authProfileId: string | null;
+  readonly authProfileRequired?: boolean;
+}
+
+export interface ClosureLink {
+  readonly gapId: string;
+  readonly state: RoleClosureState;
+  readonly planItemIds: readonly string[];
+  readonly testIds: readonly string[];
+  /** The role the gap asked for, or `ANONYMOUS_ROLE` when it asked for none. */
+  readonly wantedRole: string;
+  /** The roles the tests actually run as. Disagreement with the above IS the bug. */
+  readonly actualRoles: readonly string[];
+  /** One sentence a human reads. Never empty. */
+  readonly why: string;
+}
+
+export interface ClosureJoin {
+  readonly links: readonly ClosureLink[];
+  readonly byGapId: ReadonlyMap<string, ClosureLink>;
+  readonly counts: Readonly<Record<RoleClosureState, number>>;
+  /**
+   * Plan items and tests carrying a `gapId` no gap in this report has.
+   *
+   * A DANGLING PROVENANCE, reported rather than dropped. It means the gap
+   * stopped being derived — the crawl changed, the route went away, or the
+   * analysis was run against a different flow map — and a test still claims to
+   * close it. Silently ignoring those is how a suite accumulates tests nobody
+   * can explain.
+   */
+  readonly orphanedPlanItemIds: readonly string[];
+  readonly orphanedTestIds: readonly string[];
+}
+
+/**
+ * Join gaps to the plan items minted for them and the tests generated from
+ * those items, and decide how far each gap actually got.
+ *
+ * ── WHY THE ROLE COMPARISON IS THE LOAD-BEARING PART ───────────────────────
+ *
+ * A gap that wants an admin visit and has a test bound to no profile is NOT
+ * closed. The test runs as a signed-out visitor, asserts whatever that visitor
+ * can see, passes, and is counted as coverage of a page it never reached — and
+ * the next analysis re-derives the gap, because nothing about the application
+ * changed. That is the non-convergence the register describes, and
+ * `TEST_WRONG_ROLE` is this function refusing to call it closed.
+ *
+ * `authProfileRequired: true` with a null `authProfileId` is a BROKEN binding
+ * and is treated as wrong-role for the same reason {@link roleOfTest} does not
+ * call it anonymous: there is no session to inject, so the test does not reach
+ * the page whatever its own declaration says.
+ *
+ * DETERMINISTIC and pure: no clock, no randomness, input order preserved for
+ * the gaps and sorted within every list.
+ */
+export function joinGapClosure(input: {
+  readonly gaps: readonly Pick<CoverageGap, 'id' | 'requiresAuth' | 'authProfile'>[];
+  readonly planItems: readonly ClosurePlanItemRow[];
+  readonly tests: readonly ClosureTestRow[];
+}): ClosureJoin {
+  const gapIds = new Set(input.gaps.map((gap) => gap.id));
+
+  const itemsByGap = new Map<string, ClosurePlanItemRow[]>();
+  const orphanedPlanItemIds: string[] = [];
+  for (const item of input.planItems) {
+    if (item.gapId === null) continue; // a cold plan item; no provenance to join.
+    if (!gapIds.has(item.gapId)) {
+      orphanedPlanItemIds.push(item.id);
+      continue;
+    }
+    const list = itemsByGap.get(item.gapId) ?? [];
+    list.push(item);
+    itemsByGap.set(item.gapId, list);
+  }
+
+  /*
+   * A TEST REACHES A GAP TWO WAYS, and both are needed.
+   *
+   * `Test.gapId` is copied on at birth and is the durable one — it survives the
+   * TestPlan being deleted, which `Test → PlanItem → gap` does not. But a test
+   * generated before that column was written has only `planItemId`, so the
+   * item's own `gapId` is the fallback. Reading one alone under-reports closure
+   * and re-proposes work that exists.
+   */
+  const itemGapById = new Map(
+    input.planItems.filter((item) => item.gapId !== null).map((item) => [item.id, item.gapId!]),
+  );
+  const testsByGap = new Map<string, ClosureTestRow[]>();
+  const orphanedTestIds: string[] = [];
+  for (const test of input.tests) {
+    const viaItem = test.planItemId !== null ? itemGapById.get(test.planItemId) : undefined;
+    const gapId = test.gapId ?? viaItem ?? null;
+    if (gapId === null) continue;
+    if (!gapIds.has(gapId)) {
+      orphanedTestIds.push(test.id);
+      continue;
+    }
+    const list = testsByGap.get(gapId) ?? [];
+    list.push(test);
+    testsByGap.set(gapId, list);
+  }
+
+  const links: ClosureLink[] = [];
+  const byGapId = new Map<string, ClosureLink>();
+  const counts = ROLE_CLOSURE_STATE_LIST.reduce(
+    (acc, state) => ({ ...acc, [state]: 0 }),
+    {} as Record<RoleClosureState, number>,
+  );
+
+  for (const gap of input.gaps) {
+    const items = itemsByGap.get(gap.id) ?? [];
+    const tests = testsByGap.get(gap.id) ?? [];
+    const wantedRole = roleKey(gap.authProfile?.id ?? null);
+    const actualRoles = [
+      ...new Set(
+        tests.map((test) => {
+          const attribution = roleOfTest(test);
+          return attribution.kind === 'BROKEN_BINDING' ? 'BROKEN_BINDING' : attribution.role;
+        }),
+      ),
+    ].sort();
+
+    let state: RoleClosureState;
+    let why: string;
+    if (tests.length === 0) {
+      if (items.length === 0) {
+        state = 'OPEN';
+        why = 'Nothing has been proposed for this gap yet.';
+      } else {
+        state = 'PROPOSED';
+        why = `${items.length} plan item(s) exist for this gap and no test came of them — either the approval is still pending or generation refused them. Check the audit trail before proposing again; re-proposing would mint a duplicate.`;
+      }
+    } else if (actualRoles.includes(wantedRole)) {
+      state = 'CLOSED';
+      why =
+        wantedRole === ANONYMOUS_ROLE
+          ? `A test exists for this gap and the gap needed no role.`
+          : `A test exists for this gap and is bound to the role it asked for.`;
+    } else if (gap.requiresAuth) {
+      /*
+       * THE OLD BUG, NAMED. The gap asked for a session; the test has a
+       * different role or a broken binding, so it never reached the page. It
+       * passes anyway — an anonymous visitor gets a redirect and the test
+       * asserts the redirect — and the gap is still open.
+       */
+      state = 'TEST_WRONG_ROLE';
+      why = `This gap needs a test signed in as "${wantedRole}", and the ${tests.length} test(s) written for it run as ${actualRoles.join(', ')}. Those tests can only prove the wall holds; the page behind it is still uncovered, so this gap will be reported again until one of them is bound to the right profile.`;
+    } else {
+      state = 'TEST_WRITTEN';
+      why = `${tests.length} test(s) exist for this gap. It needs no particular role, so the role difference (${actualRoles.join(', ')}) does not matter here.`;
+    }
+
+    const link: ClosureLink = {
+      gapId: gap.id,
+      state,
+      planItemIds: items.map((item) => item.id).sort(),
+      testIds: tests.map((test) => test.id).sort(),
+      wantedRole,
+      actualRoles,
+      why,
+    };
+    links.push(link);
+    byGapId.set(gap.id, link);
+    counts[state] += 1;
+  }
+
+  return {
+    links,
+    byGapId,
+    counts,
+    orphanedPlanItemIds: orphanedPlanItemIds.sort(),
+    orphanedTestIds: orphanedTestIds.sort(),
+  };
 }

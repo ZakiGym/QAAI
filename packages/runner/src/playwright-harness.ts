@@ -37,6 +37,19 @@ import {
 } from './determinism.js';
 import { childEnv } from './child-env.js';
 import { authProfileRequired, declaredAuthProfileId, suppliedAuthProfileId } from './run-workspace.js';
+/*
+ * THE PRINCIPAL VOCABULARY, reached through its own module rather than
+ * re-derived here.
+ *
+ * `principals.ts` landed in this package tested and imported by nothing but its
+ * own test file — this codebase's signature defect — and this import is what
+ * makes it REACHED. `runSessions` is @qaai/shared's ONE normaliser over
+ * (`storageState`, `sessions`): two fields that can disagree about the default
+ * identity is how a test comes to run as the wrong principal and pass, so no
+ * consumer, including this one, gets to decide which field to trust.
+ */
+import { principalStorageStateFileName } from './principals.js';
+import { runSessions } from '@qaai/shared';
 import {
   botProtectionRemedy,
   environmentExtraHeaderSchema,
@@ -182,6 +195,24 @@ interface Workspace {
    */
   storageStatePath: string | null;
   /**
+   * EVERY NAMED PRINCIPAL'S SESSION FILE, keyed by principal name.
+   *
+   * ── What this makes possible, and what one file made impossible ──────────
+   *
+   * One `storageState` per run meant one cookie jar per run, and that made a
+   * whole class of test INEXPRESSIBLE rather than merely hard: "user A cannot
+   * read user B's invoice" had to be approximated by asking ANONYMOUSLY, which
+   * every application gets right, so the check passed everywhere and found
+   * nothing. Invite-and-accept and submit-and-approve had no second actor to
+   * be. And nothing could sweep the enumerated endpoints with tenant A's
+   * session against tenant B's ids.
+   *
+   * EMPTY IS THE NORMAL CASE and costs nothing: a single-principal run writes
+   * {@link storageStatePath} exactly as it always did and this map holds only
+   * the default entry. Nothing is migrated off `storageState`.
+   */
+  principalStatePaths: ReadonlyMap<string, PrincipalStateFiles>;
+  /**
    * Where the injected runtime observer writes its NDJSON, or null when no
    * observer was injected because the spec drives no browser. Inside the run
    * directory, so `cleanup` removes it with everything else — the observation
@@ -236,6 +267,129 @@ function safeFixturePath(dir: string, filePath: string): string {
 export function storageStateFileName(profileId: string | null): string {
   if (!profileId) return 'storage-state.json';
   return `storage-state-${profileId.replace(/[^A-Za-z0-9._-]/g, '_')}.json`;
+}
+
+/**
+ * ONE PRINCIPAL'S SESSION, WRITTEN UNDER TWO NAMES — AND WHY THAT IS NOT
+ * SLOPPINESS.
+ *
+ * Two conventions for this file already existed in the repository when the
+ * per-principal path landed, and they disagree:
+ *
+ *   · `principalStorageStateFileName` in packages/runner/src/principals.ts
+ *     answers `storage-state-principal-<name>.json`. It is what
+ *     `PrincipalContextPlan.storageStateFileName` reports, so it is the name the
+ *     RUNNER's own contract promises and the name a human debugging a workspace
+ *     will look for.
+ *   · `actorStateFile` in packages/agent/src/multi-actor.ts answers
+ *     `playwright/.auth/<name>.json`, which is the path PLAYWRIGHT'S OWN
+ *     multi-role documentation uses — and therefore the path the GENERATED SPEC
+ *     reads, because that spec is the customer's code and admission's NO_LOCK_IN
+ *     gate fails any file that needs QAAI installed to run. An env var would
+ *     have put the string "QAAI" into the customer's repository.
+ *
+ * Writing only the runner's name makes every generated multi-actor spec read a
+ * file that is not there, get no session, run anonymously — and PASS, because an
+ * anonymous request is denied by every correct application. That is the exact
+ * false green this whole round exists to remove, so the session is written
+ * under BOTH names and `canonical` says which one is authoritative for a human.
+ * A session is a few kilobytes in an ephemeral workspace that is deleted in
+ * `cleanup`, so the duplication costs nothing; a symlink would be the cheaper
+ * answer and is not portable. Consolidating the two conventions onto one is in
+ * this round's handover — it is a change to two files this one does not own.
+ */
+export interface PrincipalStateFiles {
+  /** The runner's own name. Authoritative for `PrincipalContextPlan` and for humans. */
+  readonly canonical: string;
+  /** Playwright's documented convention, which the customer's own spec reads. */
+  readonly playwrightConvention: string;
+}
+
+/**
+ * The two relative paths one principal's session is written to.
+ *
+ * `playwright/.auth/` is a FIXED prefix and the name is sanitised by
+ * `principalStorageStateFileName`, so neither half can escape the workspace
+ * however the scenario named its actor — a principal name is scenario-authored
+ * text that becomes a real path, and `safeSpecPath` exists in this file because
+ * that distinction has already cost something once.
+ */
+export function principalStateFiles(principalName: string): PrincipalStateFiles {
+  const safe = principalName.replace(/[^A-Za-z0-9._-]/g, '_') || 'unnamed';
+  return {
+    canonical: principalStorageStateFileName(principalName),
+    playwrightConvention: `playwright/.auth/${safe}.json`,
+  };
+}
+
+/**
+ * The two filesystem calls {@link writePrincipalSessions} needs, as a narrow
+ * injected interface.
+ *
+ * Narrow ON PURPOSE and not `typeof import('node:fs/promises')`: this is the
+ * one function in the per-principal path with any logic in it — which
+ * principals get a file, under which names, with which bytes — and a function
+ * that reaches for the real filesystem can only be tested by writing to a real
+ * disk. The adapter at the call site is three lines and has no branches, so
+ * there is nothing in it left to get wrong.
+ */
+export interface SessionFileWriter {
+  mkdir(path: string): Promise<void>;
+  writeFile(path: string, contents: string): Promise<void>;
+}
+
+/**
+ * Write every named principal's session into the workspace, and return where
+ * each one landed.
+ *
+ * ── THE FOUR RULES, ALL OF WHICH ARE TESTED ───────────────────────────────
+ *
+ *  1. TWO PRINCIPALS GET TWO FILES. Different names, different bytes. Two files
+ *     is what two cookie jars is what two live identities is — the whole point
+ *     of the round. If this ever collapsed to one file the two actors would
+ *     share a session and every authorization scenario would pass.
+ *  2. A NULL `storageState` GETS NO FILE. Null is the ANONYMOUS principal and
+ *     the not-yet-created one. Falling back to the default session there would
+ *     hand an anonymous baseline an authenticated cookie jar, which is the
+ *     single most dangerous thing this function could do.
+ *  3. EACH SESSION IS WRITTEN UNDER BOTH NAMES. See {@link PrincipalStateFiles}
+ *     for why there are two and which is authoritative for whom.
+ *  4. NOTHING IS LOGGED, RETURNED OR THROWN THAT CARRIES THE SESSION. The
+ *     return value is paths. A `storageState` is secret-bearing and the only
+ *     place it goes is a file in a workspace `cleanup` deletes.
+ *
+ * `runSessions` is the normaliser, so a `ctx` carrying only the legacy
+ * `storageState` yields exactly one default entry and a `ctx` carrying both
+ * cannot produce two different answers about who the default is.
+ */
+export async function writePrincipalSessions(
+  ctx: Pick<RunContext, 'storageState' | 'sessions' | 'authProfileId'>,
+  dir: string,
+  fs: SessionFileWriter,
+): Promise<ReadonlyMap<string, PrincipalStateFiles>> {
+  const written = new Map<string, PrincipalStateFiles>();
+  // Sorted, so the write ORDER is a property of the input and not of key
+  // insertion — a run that writes the same files in a different order is a run
+  // whose artifacts cannot be diffed against another.
+  // Normalised ONCE. Calling `runSessions` per iteration would re-synthesise the
+  // default entry each time, and two calls that could disagree about the default
+  // identity is the exact hazard the single normaliser exists to remove.
+  const sessions = runSessions(ctx);
+  for (const name of Object.keys(sessions).sort()) {
+    const session = sessions[name];
+    if (!session || !session.storageState) continue;
+    const files = principalStateFiles(name);
+    const serialised = JSON.stringify(session.storageState);
+    for (const relativePath of [files.canonical, files.playwrightConvention]) {
+      // The same escape guard every other path in this file goes through: a
+      // principal name is scenario-authored text that becomes a real path.
+      const target = safeFixturePath(dir, relativePath);
+      await fs.mkdir(dirname(target));
+      await fs.writeFile(target, serialised);
+    }
+    written.set(name, files);
+  }
+  return written;
 }
 
 /** Playwright's device preset for a browser engine. */
@@ -919,12 +1073,46 @@ async function createWorkspace(
     await writeFile(storageStatePath, JSON.stringify(ctx.storageState), 'utf8');
   }
 
+  /*
+   * ── ONE CONTEXT PER PRINCIPAL ─────────────────────────────────────────────
+   *
+   * The block above is UNCHANGED and stays unchanged: it writes the DEFAULT
+   * principal's session to the name every existing spec, plugin and test
+   * already reads, so a single-principal run behaves exactly as it did before
+   * this loop existed. That is the compatibility guarantee, and it is why this
+   * is an addition rather than a replacement.
+   *
+   * `runSessions(ctx)` is @qaai/shared's one normaliser over the two fields —
+   * the legacy `storageState` and the new `sessions` map — so this loop never
+   * has to decide which of them to trust. A run with no `sessions` at all
+   * yields exactly one synthesised default entry, which is why the common case
+   * costs one extra file and no behaviour change.
+   *
+   * A principal whose `storageState` is NULL gets NO FILE, deliberately. Null
+   * is the ANONYMOUS principal and the not-yet-created one, and in both cases
+   * writing the default session there instead would hand an anonymous baseline
+   * an authenticated cookie jar and make every authorization probe in the
+   * scenario pass. `PrincipalContextPlan.injectStorageState` carries the same
+   * rule, in the same words, for the same reason.
+   *
+   * NOTHING HERE IS LOGGED. A storageState is secret-bearing: it is written to
+   * a file inside a workspace `cleanup` deletes, and the only thing that leaves
+   * this function is a PATH. `describeRunSessions` in principals.ts is the one
+   * safe rendering, and it exists precisely so a diagnostic added at 3am has
+   * something to call that is not the context itself.
+   */
+  const principalStatePaths = await writePrincipalSessions(ctx, dir, {
+    mkdir: (path) => mkdir(path, { recursive: true }).then(() => undefined),
+    writeFile: (path, contents) => writeFile(path, contents, 'utf8'),
+  });
+
   return {
     dir,
     specPath,
     outputDir,
     reportPath: join(dir, 'report.json'),
     storageStatePath,
+    principalStatePaths,
     observeDir,
     cleanup: () => rm(dir, { recursive: true, force: true }),
   };
@@ -962,6 +1150,19 @@ function runPlaywright(
           // depending on the answer, and it is otherwise unrecoverable from the
           // artifacts.
           QAAI_AUTH_PROFILE: suppliedAuthProfileId(ctx) ?? '',
+          /*
+           * WHICH PRINCIPALS HAVE A SESSION ON DISK — names only, comma
+           * separated, never a value and never a path.
+           *
+           * A multi-actor spec does not read this: it opens
+           * `playwright/.auth/<actor>.json` by Playwright's own convention, so
+           * it stays QAAI-free and NO_LOCK_IN-clean. This is for the failure
+           * that is otherwise unrecoverable from the artifacts — a two-actor
+           * scenario that failed because the SECOND actor never had a session
+           * looks identical to one that failed on an assertion, and the
+           * difference is the whole diagnosis.
+           */
+          QAAI_PRINCIPALS: [...ws.principalStatePaths.keys()].sort().join(','),
           // The seed the run actually used, so a spec that generates its own data
           // reads the same number that decided the test order.
           QAAI_SEED: String(d.seed),

@@ -163,16 +163,220 @@ could not express faithfully.
 
 ${UNIVERSAL_RULES}`;
 
-/** Only the states this plan item touches — the whole map would blow the budget. */
-function relevantContext(flowMap: FlowMap, item: PlanItem): string {
+/**
+ * THE NODES AND EDGES A PLAN ITEM IS ABOUT, NAMED RATHER THAN GUESSED AT.
+ *
+ * A producer that knows which states its item walks says so here. Everything
+ * named is PINNED into the prompt: it cannot be evicted by the context budget
+ * and it does not have to win a word-overlap contest to be included.
+ *
+ * ── WHY THIS EXISTS ────────────────────────────────────────────────────────
+ *
+ * Retrieval used to be substring overlap and nothing else, over `title`,
+ * `steps` and `assertions`, keeping the top six nodes by how many >3-character
+ * words they shared. It ignored `journeyId` — which the Explorer has always
+ * populated — and it ignored edges entirely. The consequence was not a slightly
+ * worse prompt: THE PAGE THE ITEM IS ABOUT COULD BE ABSENT FROM IT. An item
+ * titled "Check out with two items in the cart" shares no word longer than three
+ * characters with a node routed `/order/confirm` titled "Thanks!", so the
+ * confirmation page — the only page the assertion is about — scored zero and was
+ * dropped, and the model invented a locator for it and flagged the invention.
+ * Every such flag read as the model being careful when it was the retrieval
+ * being blind.
+ *
+ * ── THE THREE-TIER RESOLUTION, in order ────────────────────────────────────
+ *
+ *   1. EXPLICIT. `targets.nodeIds` / `targets.edgeIds`, set by a producer that
+ *      derived the item from a specific walk, race, boundary form or access
+ *      matrix cell. Authoritative, order-preserving.
+ *   2. JOURNEY-GROUNDED. `item.journeyId` resolves to a `Journey`, whose
+ *      `edgeIds` are an ORDERED path; the edges' `from`/`to` are the states the
+ *      journey actually traverses, in traversal order. This needs no schema
+ *      change at all — `journeyId` was on `PlanItem` the whole time and was
+ *      simply never read here, which is why this was the cheapest large quality
+ *      win available.
+ *   3. WORD OVERLAP. Unchanged, and still useful: it fills whatever budget the
+ *      first two leave, so an item with no targets and no journey behaves
+ *      exactly as it did before.
+ *
+ * ── OPTIONAL, AND DELIBERATELY STRUCTURAL ──────────────────────────────────
+ *
+ * `targets` is not on `planItemSchema` in packages/shared/src/schemas.ts and
+ * this file does not own that schema, so it is declared as a structural
+ * widening: a producer in this package can set it, this function reads it when
+ * present, and a `PlanItem` that lacks it is assignable unchanged. The
+ * consequence is stated plainly rather than hidden — the field does NOT survive
+ * a round trip through `planItemSchema.parse` or through the `PlanItem` table,
+ * so an item that travels through the database arrives with tier 1 empty and
+ * falls back to tier 2. That is why tier 2 carries the weight, and the exact
+ * schema and migration edit that would make tier 1 durable is in this round's
+ * handover.
+ */
+export interface PlanItemTargets {
+  /** `FlowNode.id`s this item is about. Pinned, in this order. */
+  nodeIds?: readonly string[];
+  /** `FlowEdge.id`s this item traverses. Pinned, with both endpoints. */
+  edgeIds?: readonly string[];
+}
+
+/** A `PlanItem` a producer in this package has annotated with its targets. */
+export type TargetedPlanItem = PlanItem & { targets?: PlanItemTargets | null };
+
+/**
+ * How many states reach the prompt when nothing is pinned.
+ *
+ * Six, unchanged from the substring-only version, because the budget was never
+ * the defect — the SELECTION was. Pinned states are not subject to it (see
+ * {@link ContextSelection.pinnedOverflow}): a cap that silently evicts the page
+ * the item names would re-create the exact bug this function exists to remove.
+ */
+const CONTEXT_NODE_BUDGET = 6;
+
+/** How many transitions are rendered. A journey longer than this is disclosed. */
+const CONTEXT_EDGE_BUDGET = 12;
+
+/**
+ * What retrieval chose, and everything it could not — so a caller can flag it.
+ *
+ * `text` alone would make every shortfall invisible, and a budget that bit
+ * without being reported reads as "that is all there is". Every count here is
+ * paired with the reason it is non-zero.
+ */
+export interface ContextSelection {
+  /** The rendered STATES and TRANSITIONS block for the prompt. */
+  text: string;
+  /** Node ids actually rendered, in render order. */
+  nodeIds: readonly string[];
+  /** Edge ids actually rendered, in render order. */
+  edgeIds: readonly string[];
+  /** How the pinned set was arrived at. `NONE` means pure word overlap. */
+  grounding: 'EXPLICIT' | 'JOURNEY' | 'NONE';
+  /** Target node ids the flow map does not contain — producer/crawl drift. */
+  missingNodeIds: readonly string[];
+  /** Target edge ids the flow map does not contain. */
+  missingEdgeIds: readonly string[];
+  /**
+   * Set when `item.journeyId` names a journey this flow map has no record of.
+   *
+   * A real state, not a tidy-up: a plan outlives the crawl it was proposed
+   * against, and an item pointing at a journey from a superseded version has
+   * lost its grounding. Reported so the test that is generated anyway says so.
+   */
+  unknownJourneyId: string | null;
+  /** States that matched and did not fit the budget. Never silently dropped. */
+  omittedNodes: number;
+  /** Transitions of a pinned journey that did not fit {@link CONTEXT_EDGE_BUDGET}. */
+  omittedEdges: number;
+  /** True when the pinned set alone exceeded the budget, which it is allowed to. */
+  pinnedOverflow: boolean;
+}
+
+function selectorsFor(node: FlowMap['nodes'][number]): string {
+  const locators = [
+    ...node.affordances.map((a) => ({ label: a.label, sel: a.selector })),
+    ...node.forms.flatMap((f) =>
+      f.fields.map((x) => ({ label: x.label ?? x.name, sel: x.selector })),
+    ),
+  ]
+    .map(
+      (entry) =>
+        `      ${describeSelector(entry.sel)}  [confidence ${entry.sel.confidence.toFixed(2)}]`,
+    )
+    .join('\n');
+  return locators || '      (no locators captured)';
+}
+
+/**
+ * Only the states and transitions this plan item touches — the whole map would
+ * blow the budget.
+ *
+ * EXPORTED for the tests that pin the three-tier resolution. Retrieval is the
+ * one part of generation whose correctness is checkable WITHOUT a model: the
+ * question "is the page this item is about in the prompt" has an exact answer,
+ * and it had no test at all while the answer was frequently no.
+ */
+export function relevantContext(flowMap: FlowMap, item: TargetedPlanItem): ContextSelection {
+  const nodeById = new Map(flowMap.nodes.map((node) => [node.id, node]));
+  const edgeById = new Map(flowMap.edges.map((edge) => [edge.id, edge]));
+
+  const missingNodeIds: string[] = [];
+  const missingEdgeIds: string[] = [];
+  let unknownJourneyId: string | null = null;
+
+  /*
+   * TIER 1 and TIER 2 both feed this ordered, de-duplicated pin list. Order is
+   * preserved because it is MEANINGFUL: a journey's edges are a path, and
+   * rendering its states in traversal order is most of what tells the model
+   * which page comes after which.
+   */
+  const pinnedNodeIds: string[] = [];
+  const pinnedEdgeIds: string[] = [];
+  const pinNode = (id: string): void => {
+    if (!pinnedNodeIds.includes(id)) pinnedNodeIds.push(id);
+  };
+
+  const explicitNodes = item.targets?.nodeIds ?? [];
+  const explicitEdges = item.targets?.edgeIds ?? [];
+  for (const id of explicitNodes) {
+    if (nodeById.has(id)) pinNode(id);
+    else missingNodeIds.push(id);
+  }
+  for (const id of explicitEdges) {
+    const edge = edgeById.get(id);
+    if (!edge) {
+      missingEdgeIds.push(id);
+      continue;
+    }
+    if (!pinnedEdgeIds.includes(id)) pinnedEdgeIds.push(id);
+    // Both endpoints, because a transition the model cannot see both sides of
+    // is not a transition it can write a step for.
+    if (nodeById.has(edge.from)) pinNode(edge.from);
+    if (nodeById.has(edge.to)) pinNode(edge.to);
+  }
+
+  const hadExplicit = pinnedNodeIds.length > 0 || pinnedEdgeIds.length > 0;
+
+  if (item.journeyId !== null) {
+    const journey = flowMap.journeys.find((j) => j.id === item.journeyId);
+    if (!journey) {
+      unknownJourneyId = item.journeyId;
+    } else {
+      for (const edgeId of journey.edgeIds) {
+        const edge = edgeById.get(edgeId);
+        if (!edge) {
+          // The journey names an edge the graph does not hold. Recorded rather
+          // than skipped: it means the journey and the node list came out of
+          // different crawls, which is worth a human knowing.
+          missingEdgeIds.push(edgeId);
+          continue;
+        }
+        if (!pinnedEdgeIds.includes(edgeId)) pinnedEdgeIds.push(edgeId);
+        if (nodeById.has(edge.from)) pinNode(edge.from);
+        if (nodeById.has(edge.to)) pinNode(edge.to);
+      }
+    }
+  }
+
+  const grounding: ContextSelection['grounding'] = hadExplicit
+    ? 'EXPLICIT'
+    : pinnedNodeIds.length > 0 || pinnedEdgeIds.length > 0
+      ? 'JOURNEY'
+      : 'NONE';
+
+  /*
+   * TIER 3. Word overlap over everything not already pinned, exactly as before.
+   * `score > 0` is still required unless the whole map is small enough to show,
+   * so an unrelated node does not crowd out a pinned one.
+   */
   const words = new Set(
     `${item.title} ${item.steps.join(' ')} ${item.assertions.join(' ')}`
       .toLowerCase()
       .split(/[^a-z0-9]+/)
       .filter((w) => w.length > 3),
   );
-
+  const pinnedSet = new Set(pinnedNodeIds);
   const scored = flowMap.nodes
+    .filter((node) => !pinnedSet.has(node.id))
     .map((node) => {
       const hay = `${node.route} ${node.title} ${node.forms
         .map((f) => f.fields.map((x) => `${x.name} ${x.label ?? ''}`).join(' '))
@@ -180,28 +384,125 @@ function relevantContext(flowMap: FlowMap, item: PlanItem): string {
       const score = [...words].filter((w) => hay.includes(w)).length;
       return { node, score };
     })
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 6)
-    .filter((entry) => entry.score > 0 || flowMap.nodes.length <= 6);
+    .filter((entry) => entry.score > 0 || flowMap.nodes.length <= CONTEXT_NODE_BUDGET)
+    .sort((a, b) => b.score - a.score);
 
-  return scored
-    .map(({ node }) => {
-      const locators = [
-        ...node.affordances.map((a) => ({ label: a.label, sel: a.selector })),
-        ...node.forms.flatMap((f) =>
-          f.fields.map((x) => ({ label: x.label ?? x.name, sel: x.selector })),
-        ),
-      ]
-        .map(
-          (entry) =>
-            `      ${describeSelector(entry.sel)}  [confidence ${entry.sel.confidence.toFixed(2)}]`,
-        )
-        .join('\n');
+  const fillBudget = Math.max(0, CONTEXT_NODE_BUDGET - pinnedNodeIds.length);
+  const filled = scored.slice(0, fillBudget);
+  const omittedNodes = scored.length - filled.length;
 
-      return `  ${node.route} — "${node.title}"${node.behindAuth ? ' (behind auth)' : ''}
-${locators || '      (no locators captured)'}`;
+  const renderedNodeIds = [...pinnedNodeIds, ...filled.map((entry) => entry.node.id)];
+  const renderedEdgeIds = pinnedEdgeIds.slice(0, CONTEXT_EDGE_BUDGET);
+  const omittedEdges = pinnedEdgeIds.length - renderedEdgeIds.length;
+
+  const stateBlock = renderedNodeIds
+    .map((id) => {
+      const node = nodeById.get(id);
+      if (!node) return null;
+      const pin = pinnedSet.has(id) ? ' *THIS ITEM IS ABOUT THIS STATE*' : '';
+      return `  ${node.route} — "${node.title}"${
+        node.behindAuth ? ' (behind auth)' : ''
+      }${pin}\n${selectorsFor(node)}`;
     })
+    .filter((entry): entry is string => entry !== null)
     .join('\n\n');
+
+  /*
+   * THE TRANSITIONS, which were absent from this prompt entirely.
+   *
+   * A multi-step journey test is mostly transitions: what you click on page A
+   * to reach page B. The model was given both pages and no statement of what
+   * connects them, so it inferred the link from the affordance labels and
+   * flagged the inference. The edge's own `action` and `selector` are exactly
+   * that statement, and the crawler proved each one by traversing it.
+   */
+  const edgeBlock = renderedEdgeIds
+    .map((id) => {
+      const edge = edgeById.get(id);
+      if (!edge) return null;
+      const from = nodeById.get(edge.from);
+      const to = nodeById.get(edge.to);
+      const how = edge.selector
+        ? `${describeSelector(edge.selector)}  [confidence ${edge.selector.confidence.toFixed(2)}]`
+        : '(no locator captured — infer it and flag the inference)';
+      return `  ${from?.route ?? edge.from} → ${to?.route ?? edge.to}: ${edge.action}
+      ${how}${edge.formId ? `\n      fill form "${edge.formId}" first` : ''}`;
+    })
+    .filter((entry): entry is string => entry !== null)
+    .join('\n');
+
+  const text = [
+    stateBlock,
+    edgeBlock
+      ? `\nTRANSITIONS, in the order this item's journey traverses them:\n${edgeBlock}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  return {
+    text,
+    nodeIds: renderedNodeIds,
+    edgeIds: renderedEdgeIds,
+    grounding,
+    missingNodeIds,
+    missingEdgeIds,
+    unknownJourneyId,
+    omittedNodes,
+    omittedEdges,
+    pinnedOverflow: pinnedNodeIds.length > CONTEXT_NODE_BUDGET,
+  };
+}
+
+/**
+ * The review flags retrieval itself owes the human, if any.
+ *
+ * Separate from `relevantContext` so the selection can be tested on its counts
+ * without asserting on prose. Every one of these is a cap or a drift that BIT —
+ * the rule being honoured is that a shortfall is reported as a count AND a
+ * reason, so the report can say "at least N more existed".
+ */
+export function contextReviewFlags(selection: ContextSelection): string[] {
+  const flags: string[] = [];
+  if (selection.unknownJourneyId !== null) {
+    flags.push(
+      `This item names journey "${selection.unknownJourneyId}", which this flow map does not contain — the plan is older than the crawl it was generated against. The states below were chosen by word overlap instead, so the page the item is about may not be among them.`,
+    );
+  }
+  if (selection.missingNodeIds.length > 0) {
+    flags.push(
+      `${selection.missingNodeIds.length} state(s) this item targets are not in this flow map (${selection.missingNodeIds
+        .slice(0, 3)
+        .join(', ')}), so their locators were not available to the generator.`,
+    );
+  }
+  if (selection.missingEdgeIds.length > 0) {
+    flags.push(
+      `${selection.missingEdgeIds.length} transition(s) this item traverses are not in this flow map (${selection.missingEdgeIds
+        .slice(0, 3)
+        .join(', ')}), so how to get between those pages was inferred rather than given.`,
+    );
+  }
+  if (selection.omittedNodes > 0) {
+    flags.push(
+      `Only ${selection.nodeIds.length} of ${
+        selection.nodeIds.length + selection.omittedNodes
+      } matching states fitted the generator's context budget, so at least ${
+        selection.omittedNodes
+      } more existed and their locators were not offered.`,
+    );
+  }
+  if (selection.omittedEdges > 0) {
+    flags.push(
+      `This item's journey is longer than the ${CONTEXT_EDGE_BUDGET} transitions that fitted the context budget; at least ${selection.omittedEdges} more steps exist and were not described.`,
+    );
+  }
+  if (selection.grounding === 'NONE' && selection.nodeIds.length === 0) {
+    flags.push(
+      'No state in this flow map matched this item by target, journey or wording, so every locator in this test was inferred.',
+    );
+  }
+  return flags;
 }
 
 function describeSelector(sel: { strategy: string; value: string; name?: string }): string {
@@ -222,7 +523,14 @@ function describeSelector(sel: { strategy: string; value: string; name?: string 
 }
 
 export interface GenerateTestArgs {
-  item: PlanItem;
+  /*
+   * `TargetedPlanItem`, not `PlanItem`: a producer that knows which states and
+   * transitions its item is about names them, and {@link relevantContext} pins
+   * them into the prompt. A plain `PlanItem` is assignable unchanged, so every
+   * existing caller keeps compiling and keeps getting the journey-grounded
+   * fallback.
+   */
+  item: TargetedPlanItem;
   flowMap: FlowMap;
   language: Language;
   framework: UiFramework;
@@ -332,6 +640,13 @@ async function generateCodeTest(
   const ecosystem = strategy.forcePlaywright ? ECOSYSTEMS.PLAYWRIGHT_TS : projectEcosystem;
   const suggestedPath = testFilePath(ecosystem, { feature: item.feature, title: item.title });
 
+  /*
+   * Retrieval runs ONCE and its accounting travels with the test. Calling
+   * `relevantContext` twice — once for the prompt and once for the flags —
+   * would be two selections that can disagree about what the model was shown.
+   */
+  const context = relevantContext(flowMap, item);
+
   const hybridReturnLines =
     strategy.mode === 'hybrid'
       ? `\n  spec         the runner configuration described under THE SPEC below`
@@ -366,7 +681,7 @@ crawler records them. Translate each one into ${ecosystem.label}'s own locator
 API, keeping the same target. Where that ecosystem has no equivalent — no role
 engine, CSS only — pick the most stable selector it does have and add a
 reviewFlag saying what was lost.
-${relevantContext(flowMap, item) || '  (no matching states — infer carefully and flag it)'}
+${context.text || '  (no matching states — infer carefully and flag it)'}
 
 BASE URL: ${flowMap.baseUrl} (configured for the suite; navigate with relative paths)
 ${
@@ -520,7 +835,19 @@ ${report.revisePrompt}`);
    *             where the old `@qaai/`, fixed-sleep and path-convention flags
    *             now come from, each from the gate named after it.
    */
-  const flags = [...generated.reviewFlags, ...report.reviewFlags];
+  /*
+   * RETRIEVAL'S OWN FLAGS JOIN THE GATE'S.
+   *
+   * A retrieval that could not find the page the item is about used to be
+   * invisible: the model inferred a locator, flagged the inference, and the flag
+   * read as the model being careful rather than as the prompt being blind. These
+   * say which it was.
+   */
+  const flags = [
+    ...generated.reviewFlags,
+    ...report.reviewFlags,
+    ...contextReviewFlags(context),
+  ];
   const code = report.code;
   const filePath = report.correctedFilePath ?? generated.filePath;
 
@@ -663,6 +990,9 @@ async function generateSpecDriven(
   const { item, flowMap } = args;
   const filePath = specFilePathFor(item.testType, item.title);
   const code = specPointerCode(item.testType);
+  // One selection, reused for the prompt and for the flags. Same reason as the
+  // code path: two selections could disagree about what the model was shown.
+  const context = relevantContext(flowMap, item);
 
   /**
    * The spec path's gate.
@@ -719,7 +1049,7 @@ async function generateSpecDriven(
         filePath,
         code,
         spec,
-        reviewFlags: [...reviewFlags, ...report.reviewFlags],
+        reviewFlags: [...reviewFlags, ...report.reviewFlags, ...contextReviewFlags(context)],
         admission: report,
         attempts: 0,
       };
@@ -752,7 +1082,7 @@ PAGES AND REAL LOCATORS FROM THE CRAWL
 Selectors are written in Playwright's role/label vocabulary because that is how
 the crawler records them; where the spec takes CSS selectors, translate to the
 most stable equivalent and flag anything you had to infer.
-${relevantContext(flowMap, item) || '  (no matching states — infer carefully and flag it)'}
+${context.text || '  (no matching states — infer carefully and flag it)'}
 
 BASE URL: ${flowMap.baseUrl} (paths in the spec resolve against it)
 ${
@@ -827,7 +1157,7 @@ ${report.revisePrompt}`);
     filePath,
     code,
     spec: generated.spec,
-    reviewFlags: [...generated.reviewFlags, ...report.reviewFlags],
+    reviewFlags: [...generated.reviewFlags, ...report.reviewFlags, ...contextReviewFlags(context)],
     admission: report,
     attempts,
   };

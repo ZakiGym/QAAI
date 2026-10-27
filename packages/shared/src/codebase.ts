@@ -264,7 +264,85 @@ export interface SourceFormField {
   semantic: FieldSemantic;
   /** Present for select elements whose options are literal in the markup. */
   options?: string[];
+
+  /*
+   * ─── Declared constraints, read off the SOURCE ─────────────────────────────
+   *
+   * THE DEFECT THESE CLOSE: without them a boundary test is unreachable *by
+   * construction* on this path. "Submit one character over the limit" is not a
+   * judgement anything can invent — the limit is a number the markup already
+   * carries — and until these fields existed `detectForms` read none of them, so
+   * ten of the twenty attribute-governed equivalence classes produced nothing
+   * from a source analysis and `fieldFromSource` in apps/api/src/lib/
+   * coverage-store.ts had to hard-code `constraintsRead: false`.
+   *
+   * ── THE THREE STATES, AND WHY THEY ARE NOT THE CRAWL'S THREE ──────────────
+   *
+   * Same convention as `FormField` in flow-map.ts, which the keystone's
+   * `ConstraintReading` in boundaries.ts reads:
+   *   • absent / undefined → NOT_CAPTURED. Nothing could read it.
+   *   • null               → DECLARED_ABSENT. We read the tag and it declares
+   *                          no such attribute.
+   *   • a value            → READ.
+   *
+   * The distinction is load-bearing and it is the whole reason this is not a
+   * plain `number`. DECLARED_ABSENT licenses the UNBOUNDED classes — "no
+   * maxlength is declared here, so send 10,000 characters and assert the app
+   * copes" — and NOT_CAPTURED licenses nothing at all. Collapse the two and the
+   * product asserts, ten times per field, that an application declares no
+   * limits on the strength of a regex that never looked.
+   *
+   * ── WHY THIS PATH IS STINGIER WITH `null` THAN THE CRAWL IS ───────────────
+   *
+   * The crawler reads a live DOM element, so an absent `maxlength` really is
+   * DECLARED_ABSENT: the DOM is authoritative. A regex over JSX, ERB or Vue
+   * source is NOT. `maxLength={MAX}`, a `{...props}` spread or a wrapper
+   * component all mean "the attribute may well be there and we cannot see it",
+   * which is NOT_CAPTURED. So {@link detectForms} answers `null` only for a tag
+   * it can prove it read completely — literal markup with no interpolation —
+   * and `undefined` for every tag that contains an expression. A field summary
+   * from a `.tsx` file will therefore carry mostly `undefined`, and that is the
+   * honest reading: the remedy is a crawl, not a more confident regex.
+   *
+   * `min`/`max`/`step` are strings, not numbers, for the same reason flow-map.ts
+   * gives: `min` is "2024-01-01" on a date input, "08:00" on a time input and
+   * "1" on a number input, and parsing at capture time throws the date cases
+   * away.
+   */
+
+  /** `maxlength` / React's `maxLength`. The most useful number on the page. */
+  maxLength?: number | null;
+  /** `minlength` / `minLength`. */
+  minLength?: number | null;
+  /** `min` verbatim — numeric, date, time or week, whatever the input type says. */
+  min?: string | null;
+  /** `max` verbatim. */
+  max?: string | null;
+  /** `step` verbatim, including the literal "any". */
+  step?: string | null;
+  /** `pattern` source, verbatim and NOT compiled — an invalid one must not throw. */
+  pattern?: string | null;
 }
+
+/**
+ * The six constraint attributes {@link detectForms} attempts, as the slugs the
+ * field keys are named for.
+ *
+ * Exported so a consumer can iterate the set rather than hard-coding six string
+ * literals that then drift: `fieldFromSource` in apps/api/src/lib/
+ * coverage-store.ts has to decide one cell per constraint per field, and a
+ * seventh constraint added here must show up there as an unmeasured cell rather
+ * than vanish.
+ */
+export const SOURCE_FORM_CONSTRAINTS = [
+  'maxLength',
+  'minLength',
+  'min',
+  'max',
+  'step',
+  'pattern',
+] as const;
+export type SourceFormConstraint = (typeof SOURCE_FORM_CONSTRAINTS)[number];
 
 export interface SourceForm {
   /** Deterministic: file path plus the form's index within it. Stable across runs. */
@@ -2901,6 +2979,115 @@ const hasBareAttr = (tag: string, name: string): boolean =>
   new RegExp(`\\b${name}\\b(?!\\s*=\\s*\\{?\\s*(?:"|'|false))`, 'i').test(tag);
 
 /**
+ * Whether this tag was read COMPLETELY, which decides what an absent attribute
+ * means.
+ *
+ * THE DEFECT: `attr()` returning null is two different facts. On literal markup
+ * — `<input type="text" name="zip">` in an .html or .erb file — it means the
+ * attribute is genuinely not declared, which is a real and useful claim: it
+ * licenses the UNBOUNDED boundary classes. On a tag carrying an expression —
+ * `maxLength={MAX}`, `{...register('zip')}`, `<%= f.text_field :zip, opts %>` —
+ * it means nothing at all, because the attribute may be in the part we cannot
+ * read. Treating the second as the first is how this product comes to assert
+ * "the application declares no limit on this field" on the strength of a regex
+ * that never looked, ten classes deep, on every React form in the repository.
+ *
+ * So: a tag containing any interpolation or spread is OPAQUE, and every
+ * constraint it does not literally state is NOT_CAPTURED (`undefined`) rather
+ * than DECLARED_ABSENT (`null`). The test is deliberately crude and deliberately
+ * errs towards opaque — a false "we could not read it" costs a boundary class
+ * on one field and is fixed by a crawl; a false "nothing is declared" ships a
+ * test that fails against a correct application.
+ *
+ * `{` alone catches JSX attribute expressions and Vue/Angular bindings;
+ * `<%`/`{{`/`{%` catch ERB, Handlebars/Mustache/Vue-interpolation and Twig/
+ * Liquid. `attr()` itself can read `maxLength={"10"}`, so a quoted JSX literal
+ * is still READ — opacity only governs what SILENCE means.
+ *
+ * ── QUOTED VALUES ARE STRIPPED FIRST, AND THAT IS NOT A DETAIL ─────────────
+ *
+ * The question is whether the tag's STRUCTURE is readable — whether an
+ * attribute could be hiding in a part we cannot parse — not whether a brace
+ * appears anywhere in it. Without the strip, `pattern="[0-9]{5}"` reads as
+ * opaque because of the regex quantifier, and every other constraint on that
+ * field silently drops from DECLARED_ABSENT to NOT_CAPTURED. Patterns with
+ * quantifiers are one of the commonest things on a real form, so the naive test
+ * cost precision on exactly the fields that declare the most. It erred in the
+ * SAFE direction — a lost class, never a false claim — which is why it was only
+ * visible by probing the output rather than as a failure.
+ */
+const tagIsOpaque = (tag: string): boolean => {
+  const structure = tag.replace(/"[^"]*"/g, '""').replace(/'[^']*'/g, "''");
+  return (
+    structure.includes('{') ||
+    structure.includes('<%') ||
+    structure.includes('{{') ||
+    structure.includes('{%')
+  );
+};
+
+/*
+ * SOURCE_FORM_CONSTRAINTS, partitioned by the TYPE each one holds.
+ *
+ * Two helpers rather than one because the value types genuinely differ, and the
+ * split is enforced rather than remembered: `STRING_CONSTRAINTS_COVER_THE_REST`
+ * below fails to compile if the two halves stop partitioning the whole, so a
+ * seventh constraint cannot be added to `SOURCE_FORM_CONSTRAINTS` without being
+ * routed to one of them. The first draft used one loosely-typed helper for both
+ * and `tsc` rejected a `string` landing on `maxLength` — the mix-up this split
+ * makes unrepresentable.
+ */
+type NumericSourceConstraint = 'maxLength' | 'minLength';
+type StringSourceConstraint = Exclude<SourceFormConstraint, NumericSourceConstraint>;
+const STRING_CONSTRAINTS_COVER_THE_REST: Record<StringSourceConstraint, true> = {
+  min: true,
+  max: true,
+  step: true,
+  pattern: true,
+};
+void STRING_CONSTRAINTS_COVER_THE_REST;
+
+/**
+ * One string-valued constraint attribute, in the three states
+ * {@link SourceFormField} documents. Returns `{}` for NOT_CAPTURED so the key
+ * stays ABSENT — writing an explicit `undefined` would still create the key, and
+ * the boundary expansion reads key PRESENCE to decide whether "the page declares
+ * none" is a sentence it is entitled to write.
+ */
+function stringConstraint<K extends StringSourceConstraint>(
+  tag: string,
+  html: string,
+  key: K,
+): { [P in K]?: string | null } {
+  const raw = attr(tag, html);
+  if (raw !== null) return { [key]: raw } as { [P in K]?: string | null };
+  return (tagIsOpaque(tag) ? {} : { [key]: null }) as { [P in K]?: string | null };
+}
+
+/**
+ * The numeric pair (`maxlength`, `minlength`), with one extra arm the string
+ * version does not need.
+ *
+ * PRESENT-BUT-UNPARSEABLE IS `undefined`, NOT `null`. `maxlength="{{limit}}"`
+ * or `maxlength="ten"` is the page declaring a limit we cannot turn into a
+ * number — NOT_CAPTURED. An earlier draft of this helper answered `null` there,
+ * which says "the page declares no limit" about a page that visibly declares
+ * one, and that is precisely the false-UNBOUNDED assertion the opacity rule
+ * above exists to prevent. Same lie, one arm further in.
+ */
+function numericConstraint<K extends NumericSourceConstraint>(
+  tag: string,
+  html: string,
+  key: K,
+): { [P in K]?: number | null } {
+  type Out = { [P in K]?: number | null };
+  const raw = attr(tag, html);
+  if (raw === null) return (tagIsOpaque(tag) ? {} : { [key]: null }) as Out;
+  const parsed = Number(raw.trim());
+  return (Number.isFinite(parsed) ? { [key]: parsed } : {}) as Out;
+}
+
+/**
  * name/label/type → a data-generation hint, in the Explorer's vocabulary.
  *
  * Ordered most specific first, and the card fields come before the generic ones
@@ -2992,6 +3179,21 @@ function detectForms(files: AnalysedFile[], out: Collector, ledger: Ledger): voi
           required,
           semantic: inferSemantic(name, inputType, label),
           ...(options && options.length > 0 ? { options } : {}),
+          /*
+           * The six declared constraints. Spread last and each one independently
+           * three-stated, so a key that is ABSENT here stays absent — which is
+           * what the boundary expansion reads to decide whether "the page
+           * declares none" is a sentence it is entitled to write.
+           *
+           * Order matches SOURCE_FORM_CONSTRAINTS so a seventh constraint is one
+           * line in both places rather than a silent omission in this one.
+           */
+          ...numericConstraint(tag, 'maxlength', 'maxLength'),
+          ...numericConstraint(tag, 'minlength', 'minLength'),
+          ...stringConstraint(tag, 'min', 'min'),
+          ...stringConstraint(tag, 'max', 'max'),
+          ...stringConstraint(tag, 'step', 'step'),
+          ...stringConstraint(tag, 'pattern', 'pattern'),
         });
       };
 

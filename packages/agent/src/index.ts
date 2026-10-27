@@ -221,3 +221,72 @@ export * from './coverage-states.js';
 export * from './coverage-fields.js';
 export * from './coverage-matrix.js';
 export * from './coverage-async.js';
+
+/*
+ * ── THE SCENARIO-DEPTH MODULES ──────────────────────────────────────────────
+ *
+ * Seven modules, and `check:wiring` flagged every single one of them under
+ * `package-exports` the moment it landed: built, typechecked, documented as
+ * serving a producer, and reachable from nothing but its own test file. That is
+ * this codebase's signature defect and these lines are half the cure; the other
+ * half is that each module is also REACHED by a real call path, which is what
+ * `explorer.ts`, `coverage.ts` and `generator.ts` do in this same change. A
+ * barrel line alone would make them public and still uncalled, which is a
+ * prettier shape of the same defect.
+ *
+ * What each one buys, in the order the plan consumes them:
+ *
+ *   `synthetic-factory`  the seeded, locale-aware value factory plus the
+ *                        uniqueness audit and the cleanup ledger. Three comments
+ *                        in this repo promised a faker-based generator; this and
+ *                        `@qaai/shared`'s `synthetic.ts` are it, so a generated
+ *                        test stops inventing literals that collide.
+ *   `walks`              routes walked in two states, re-entered, looped, and
+ *                        driven through browser BACK — the shapes a
+ *                        first-discovery spanning path cannot express.
+ *   `fault-scenarios`    fault injection AND the race/replay/double-submit
+ *                        scenarios. A submit button was one click; two in flight
+ *                        is where money bugs live.
+ *   `auth-lifecycle`     the fourteen flows nothing had ever driven — signup,
+ *                        logout, session expiry, password reset, lockout — each
+ *                        against a principal it proved disposable FIRST.
+ *   `multi-actor`        invite-and-accept and submit-and-approve: two sessions
+ *                        in one scenario, which one storageState made
+ *                        inexpressible.
+ *   `authz-probe`        the IDOR sweep that asks AS A REAL TENANT instead of
+ *                        anonymously, which is the only version of the question
+ *                        that can fail on a real application.
+ *   `gap-closure`        the (route, role) closure join, so closing an
+ *                        UNREACHED_AUTH_ROUTE gap stops RE-CREATING it.
+ *
+ * ── ORDER AND CYCLES, CHECKED ───────────────────────────────────────────────
+ *
+ * Last in the file on purpose. `fault-scenarios` and `walks` import
+ * `coverage-states.js`, `gap-closure` imports `coverage.js` and
+ * `access-matrix.js`, `multi-actor` imports `access-matrix.js` — every one of
+ * those is above, so no line here introduces a cycle this barrel did not
+ * already have.
+ *
+ * ── NAME COLLISIONS ────────────────────────────────────────────────────────
+ *
+ * None: the seven modules' exported names were diffed against the 1,319 names
+ * this barrel already published, against each other pairwise, and against the
+ * three modules the shared barrel gained in this same change. `tsc -p
+ * packages/agent/tsconfig.json` reports no TS2308 on this file, which is how the
+ * absence was established rather than asserted.
+ *
+ * One near-miss recorded so nobody re-introduces it: `authz-probe.ts` and
+ * `packages/runner/src/plugins/tenancy.ts` both export `CONTROL_STATES`,
+ * `ControlState` and `CONTROL_STATE_DETAIL`. They are in DIFFERENT packages, so
+ * neither barrel is TS2308 today — and a consumer that imports both @qaai/agent
+ * and @qaai/runner must alias one. They are also genuinely two questions: the
+ * agent's is "did the control request prove the endpoint is live", the runner's
+ * is "was the control attempted at all".
+ */
+export * from './synthetic-factory.js';
+export * from './walks.js';
+export * from './fault-scenarios.js';
+export * from './auth-lifecycle.js';
+export * from './multi-actor.js';
+export * from './authz-probe.js';
+export * from './gap-closure.js';

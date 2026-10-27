@@ -129,3 +129,51 @@ export * from './measurement-rows';
 export * from './coverage-tiers';
 export * from './coverage-dimensions';
 export * from './attestation';
+
+/*
+ * ── PRINCIPALS, BOUNDARIES AND THE PUBLISHED-VALUE CATALOGUE ────────────────
+ *
+ * THE DEFECT THESE THREE LINES CLOSE, AND WHY IT WAS INVISIBLE.
+ *
+ * All three modules landed as public vocabulary — `principals.ts` is the
+ * identity/disposability/cross-tenant-probe contract six scenario modules in
+ * packages/agent and two in packages/runner are written against, `boundaries.ts`
+ * is the 27-class negative-test partition and the unread-constraint rule, and
+ * `provider-catalogue.ts` is the published third-party test values a generated
+ * spec is allowed to quote. Every one of them was reachable from outside this
+ * package only by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which compiles,
+ * bypasses the package entry point, and leaves the compiler-enforced presence
+ * records enforced on files nobody imports as a package. Nine files did exactly
+ * that in one round, and `coverage-tiers` above carries the same note.
+ *
+ * `check:wiring` did NOT flag `principals.ts` or `boundaries.ts`, and that is
+ * the part worth recording: `schemas.ts` and `types.ts` reach them by relative
+ * path INSIDE this package, so the `package-exports` ratchet sees them as
+ * reached while the package's front door is shut. The gap was only visible as
+ * seven TS2305 errors in @qaai/agent — `has no exported member 'Principal'`,
+ * `'proveDisposable'`, `'isSafeProbeMethod'`, `'DEFAULT_PRINCIPAL_NAME'` — from
+ * sibling files that had already landed. A ratchet that cannot see a shut front
+ * door is why this comment is this long.
+ *
+ * ── THE STANDING TEST THIS BARREL APPLIES, CHECKED RATHER THAN CLAIMED ──────
+ *
+ * Pure types, closed vocabularies, zod and arithmetic; no `node:` builtin
+ * anywhere, so none of these can 500 a web page that reads a value from
+ * @qaai/shared. Each one's ONLY import is type-only and already above:
+ * `principals.ts` → `./constants`, `boundaries.ts` → `./flow-map`,
+ * `provider-catalogue.ts` → `./test-values`. So no line here adds a cycle and
+ * the order below is the import order.
+ *
+ * ── NAME COLLISIONS ────────────────────────────────────────────────────────
+ *
+ * None, against the 971 names this barrel already published and against each
+ * other. One trap for whoever imports next, recorded because it is NOT an
+ * error here: `BoundaryField` and `BoundaryExpectation` are exported from BOTH
+ * `@qaai/shared` (this file's `./boundaries`, the 27-class keystone) and
+ * `@qaai/agent` (its own `boundaries.ts`, the form-expansion vocabulary). Two
+ * different shapes under two different barrels is not TS2308 — a consumer that
+ * imports both packages must alias one of them.
+ */
+export * from './principals';
+export * from './boundaries';
+export * from './provider-catalogue';

@@ -112,6 +112,30 @@ const COVERAGE_TIERS_FILE = fileURLToPath(
 const COVERAGE_DIMENSIONS_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/coverage-dimensions.ts', import.meta.url),
 );
+/*
+ * The scenario vocabulary: WHO a test acts as, and which of those actors may be
+ * damaged. In @qaai/shared and NOT in constants.ts for the same reason as the
+ * eight above — `principals.ts` holds the disposability proof, the destructive
+ * step binding and the cross-tenant probe admission beside the vocabulary, and
+ * those three are the only code that interprets it.
+ *
+ * `BoundaryClass` is deliberately NOT paired below, and that is not an
+ * omission: it is not a Prisma enum. `PlanItem.boundaryClass` is a TEXT column
+ * with its domain enforced at the producer, exactly as `PlanItem.gapKind`,
+ * `MutationSurvivor.reason` and `CoverageSnapshot.comparability` are. Nothing
+ * filters rows on it — the reads are "show me this item" and "group this
+ * project's items by class" — so an enum would have been one more Postgres type
+ * whose only job is to need a drift guard. Its run-time parity lives in
+ * packages/shared/src/boundaries.test.ts, against the zod schema.
+ *
+ * `UniquenessScope` and `CleanupObligation` are absent on the same argument and
+ * one step further: both live INSIDE the `Test.principals` / synthetic-value
+ * JSON rather than in a column at all, so there is no database type for them to
+ * drift from. Their parity is in packages/shared/src/synthetic.contract.test.ts.
+ */
+const PRINCIPALS_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/principals.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -137,7 +161,8 @@ const PAIRS: Array<{
     | 'apiSurface'
     | 'authProfiles'
     | 'coverageTiers'
-    | 'coverageDimensions';
+    | 'coverageDimensions'
+    | 'principals';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -530,6 +555,38 @@ const PAIRS: Array<{
     tsConst: 'FAULT_DETECTION_OUTCOMES',
     source: 'coverageDimensions',
   },
+  /*
+   * ── The actors (§ scenario depth) ─────────────────────────────────────────
+   *
+   * Two, and both are filtered on, which is what earned each a database type
+   * rather than a TEXT column — and is therefore exactly what makes each one a
+   * value a row may hold and TypeScript may not know about.
+   *
+   * The reason to be strict about these two specifically is different from
+   * every pair above it. The others decide whether a NUMBER is right. These
+   * two decide whether the customer still has an account tomorrow.
+   */
+  // MAY THIS IDENTITY BE DAMAGED? `proveDisposable` switches on it and refuses
+  // every member except DISPOSABLE, so a kind the database accepts and
+  // TypeScript cannot name falls through to the refusal arm — safe, and that
+  // asymmetry is the whole design. The dangerous direction is the mirror: a
+  // kind MISSING from the Prisma enum cannot be stored, so a disposable
+  // identity a scenario created would be written as the DEFAULT, PERSISTENT —
+  // which is safe too, by the same deliberate asymmetry, and presents as a
+  // destructive scenario that is refused for ever with no way to clear it.
+  // Both failures are loud. Neither can damage the customer's login, and that
+  // is the property this pair is here to keep true.
+  { prismaEnum: 'PrincipalKind', tsConst: 'PRINCIPAL_KINDS', source: 'principals' },
+  // WHERE A PRINCIPAL IS IN ITS LIFE. `UNMEASURED_LIFECYCLES` is what stops a
+  // scenario whose actor never existed being reported as a pass, and
+  // `SESSIONED_LIFECYCLES` is what the cross-tenant sweep tests membership of
+  // before it will accept a denial as evidence. A lifecycle the database
+  // accepts and TypeScript cannot name is outside BOTH lists: it would be
+  // treated as measured and as holding a session, so a scenario that never ran
+  // would be counted as a passing one and a denial from a signed-out principal
+  // would be read as an authorization control working. Those are the two
+  // specific lies this enum exists to prevent.
+  { prismaEnum: 'PrincipalLifecycle', tsConst: 'PRINCIPAL_LIFECYCLES', source: 'principals' },
 ];
 
 /*
@@ -635,6 +692,7 @@ const apiSurface = readFileSync(API_SURFACE, 'utf8');
 const authProfiles = readFileSync(AUTH_PROFILES, 'utf8');
 const coverageTiers = readFileSync(COVERAGE_TIERS_FILE, 'utf8');
 const coverageDimensions = readFileSync(COVERAGE_DIMENSIONS_FILE, 'utf8');
+const principals = readFileSync(PRINCIPALS_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -646,7 +704,8 @@ const SOURCES: Record<
   | 'apiSurface'
   | 'authProfiles'
   | 'coverageTiers'
-  | 'coverageDimensions',
+  | 'coverageDimensions'
+  | 'principals',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -660,6 +719,7 @@ const SOURCES: Record<
   authProfiles: { text: authProfiles, label: 'shared/auth-profiles.ts' },
   coverageTiers: { text: coverageTiers, label: 'shared/coverage-tiers.ts' },
   coverageDimensions: { text: coverageDimensions, label: 'shared/coverage-dimensions.ts' },
+  principals: { text: principals, label: 'shared/principals.ts' },
 };
 const problems: string[] = [];
 

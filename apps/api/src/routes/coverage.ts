@@ -73,8 +73,11 @@ import type {
 import { quarantineSuppresses } from '@qaai/runner';
 import {
   GAP_KINDS,
+  ROLE_CLOSURE_STATE_LIST,
   analyzeCoverage,
+  attributeRouteRoles,
   gapProvenance,
+  joinGapClosure,
   planItemForGap,
   type CoverageExecutionFact,
   type CoverageGap,
@@ -2294,3 +2297,125 @@ coverageRouter.get(
     });
   },
 );
+
+/*
+ * ── GET /coverage/:projectId/closure ────────────────────────────────────────
+ *
+ * MOUNTED UNDER `/coverage` (see apps/api/src/index.ts: `app.use('/coverage',
+ * coverageRouter)`), so the full URL is `/coverage/:projectId/closure`. Said
+ * here because a router that declares a relative path and is mounted at the
+ * wrong prefix is a 404 with a comment swearing it works — one in this
+ * repository declared `/:runId/report`, was mounted at `/`, and squatted at a
+ * root path nothing asks for while the only URL anybody used 404'd.
+ *
+ * It needs no router-level ordering decision: `coverageRouter` carries no
+ * router-level `requireAuth`, every route in it declares its own
+ * `requireScope`, and this one does the same.
+ *
+ * ── WHY THIS ENDPOINT EXISTS ────────────────────────────────────────────────
+ *
+ * `GET /coverage/:projectId` answers "what is missing". It cannot answer "what
+ * did we already do about it", and that question was unanswerable anywhere in
+ * the product: `CoverageGap.id`, `PlanItem.gapId` and `Test.gapId` all existed
+ * as columns and nothing read all three together. So the closure campaign could
+ * not tell a gap nobody had touched from one with a plan item sitting on an
+ * approval screen, and it proposed the same work again — and, worse, it counted
+ * an UNREACHED_AUTH_ROUTE gap as closed by a test that runs signed OUT, which
+ * made closing that gap RE-CREATE it.
+ *
+ * The two numbers a reader should look at first are `counts.TEST_WRONG_ROLE`
+ * and `roleCoverage.brokenBindings`. Both are non-zero exactly when the suite
+ * contains tests that pass while proving nothing about the page they claim.
+ */
+coverageRouter.get('/:projectId/closure', requireScope('tests:read'), async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const { report, flowMapId, flowMapVersion } = await cachedCoverageFor(projectId, false);
+
+  const [planItems, tests] = await Promise.all([
+    prisma.planItem.findMany({
+      where: { testPlan: { projectId } },
+      select: { id: true, gapId: true, authProfileId: true, generatedTestId: true },
+    }),
+    prisma.test.findMany({
+      where: { projectId },
+      select: {
+        id: true,
+        gapId: true,
+        planItemId: true,
+        authProfileId: true,
+        authProfileRequired: true,
+        /*
+         * `routes` is NOT selected and the role attribution below therefore
+         * credits no test with any route. That is deliberate and it is
+         * disclosed in `roleCoverage.why`: the route list is extracted from
+         * `code`, loading every test's source for this endpoint would be tens
+         * of megabytes on a large project, and `GET /coverage/:projectId`
+         * already does that work behind a cache. So this endpoint reports the
+         * ROLE axis — which needs only these columns — and says plainly that
+         * its cells are not a coverage measurement.
+         */
+      },
+    }),
+  ]);
+
+  const join = joinGapClosure({ gaps: report.gaps, planItems, tests });
+
+  /*
+   * The (route, role) grid, over the ROLES this project has configured. Its
+   * `testIds` are empty by construction here (see the select comment above), so
+   * what it is actually reporting is the DENOMINATOR: which (route, role) cells
+   * exist at all, and which tests have a binding too broken to sit in any of
+   * them.
+   */
+  const roleAttribution = attributeRouteRoles({
+    routes: [...new Set(report.gaps.map((gap) => gap.route).filter((r): r is string => r !== null))],
+    tests: [],
+    roles: [
+      ...new Set(
+        tests.map((test) => test.authProfileId).filter((id): id is string => id !== null),
+      ),
+    ],
+  });
+
+  res.json({
+    projectId,
+    flowMapId,
+    flowMapVersion,
+    fingerprint: report.fingerprint,
+    /** One row per gap IN THIS REPORT, in the report's own ranked order. */
+    links: join.links,
+    counts: join.counts,
+    /** Every state the join can produce, so a zero is readable as a real zero. */
+    states: ROLE_CLOSURE_STATE_LIST,
+    roleCoverage: {
+      cells: roleAttribution.cells.length,
+      roles: [...new Set(roleAttribution.cells.map((cell) => cell.role))].sort(),
+      brokenBindings: tests.filter(
+        (test) => test.authProfileRequired === true && test.authProfileId === null,
+      ).length,
+      why:
+        'These cells are the DENOMINATOR, not a measurement: this endpoint does not load test ' +
+        'source, so no test is credited with a route here and every `testIds` is empty. Read ' +
+        'GET /coverage/:projectId for the measured numbers. `brokenBindings` IS measured, from ' +
+        'two columns: a test that declares it is meaningless signed out and has no profile to ' +
+        'sign in as runs anonymously, so it proves nothing about the page it claims and the gap ' +
+        'it was written to close stays open.',
+    },
+    orphaned: {
+      planItemIds: join.orphanedPlanItemIds,
+      testIds: join.orphanedTestIds,
+      why:
+        'Plan items and tests carrying a gapId no gap in this report has. It means the gap ' +
+        'stopped being derived — the crawl changed, the route went away, or this analysis ran ' +
+        'against a different flow map — and the test still claims to close it. Reported rather ' +
+        'than dropped, because a suite that accumulates tests nobody can explain is how the ' +
+        'numerator drifts away from the application.',
+    },
+    why:
+      'TEST_WRONG_ROLE is the number to read first. A gap that needs an authenticated visit and ' +
+      'has a test bound to no profile is NOT closed: the test runs as a signed-out visitor, ' +
+      'asserts what that visitor can see, PASSES, and the next analysis derives the identical ' +
+      'gap. Reporting it as closed is what made this loop unable to converge. PROPOSED is the ' +
+      'second: work already sitting on an approval screen, which must not be proposed again.',
+  });
+});

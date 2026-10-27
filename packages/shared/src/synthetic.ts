@@ -201,6 +201,233 @@ const WORDS = [
   'lantern',
 ] as const;
 
+// ─── Uniqueness and cleanup: the contract half of this module ────────────────
+
+/*
+ * WHAT WAS MISSING, AND WHY IT IS A CONTRACT RATHER THAN MORE GENERATION.
+ *
+ * Everything above this line generates values well: seeded, pure, bounded by
+ * what the page declared. What it could not do is tell a caller WHAT KIND OF
+ * UNIQUENESS a value has, or WHETHER USING IT LEAVES A ROW BEHIND. Both are
+ * facts the generator already knows — they fall straight out of the semantic —
+ * and neither reached the caller, so every consumer had to guess.
+ *
+ * The cost of guessing, in the two directions:
+ *
+ *   · A value treated as more unique than it is collides. The run's third
+ *     signup test reuses a reusable city name as though it were a fresh
+ *     identifier, hits a unique constraint, and the failure reads as an
+ *     application bug.
+ *   · A value treated as less unique than it is is thrown away and regenerated,
+ *     which costs the determinism the whole file is built on.
+ *
+ * And the cost of not stating cleanup is a staging database that fills with
+ * rows nobody can attribute, until a customer turns the suite off. The `token`
+ * on the factory was built for exactly that attribution and nothing declared
+ * which values carry it.
+ */
+
+/**
+ * How widely a generated value must not repeat.
+ *
+ * Four members, ordered from strictest to loosest, and the ordering is
+ * load-bearing: {@link uniquenessAtLeast} compares them, so a caller that needs
+ * at least UNIQUE_PER_RUN can accept a GLOBALLY_UNIQUE value without a special
+ * case.
+ *
+ * GLOBALLY_UNIQUE is NOT "unique across the universe" — nothing here can
+ * promise that, and a contract that overclaims is worse than one that is
+ * narrow. It means "must not repeat across runs, so it is derived from the run
+ * seed AND carries the run token". A caller that needs a guarantee stronger
+ * than a 32-bit hash can give must say so and supply its own value; see the
+ * note on {@link SyntheticValue.uniqueness}.
+ */
+export const UNIQUENESS_SCOPES = [
+  /** Must not repeat across runs. Derived from the run seed and token-bearing. */
+  'GLOBALLY_UNIQUE',
+  /** Must not repeat within one run. Two tests in a run get different values. */
+  'UNIQUE_PER_RUN',
+  /** Must not repeat within one test. Two fields in one form get different values. */
+  'UNIQUE_PER_TEST',
+  /** May repeat freely. A city, a country, a search term — nothing keys on it. */
+  'REUSABLE',
+] as const;
+export type UniquenessScope = (typeof UNIQUENESS_SCOPES)[number];
+
+/**
+ * Compile-time half of the parity guard. A `Record` keyed on the union cannot
+ * be written without naming every member; the run-time half compares
+ * `uniquenessScopeSchema.options` against the derived list, in
+ * `synthetic.contract.test.ts`.
+ */
+const UNIQUENESS_SCOPE_PRESENT: Record<UniquenessScope, true> = {
+  GLOBALLY_UNIQUE: true,
+  UNIQUE_PER_RUN: true,
+  UNIQUE_PER_TEST: true,
+  REUSABLE: true,
+};
+
+/** Derived, never hand-listed. */
+export const UNIQUENESS_SCOPE_LIST = Object.keys(
+  UNIQUENESS_SCOPE_PRESENT,
+) as ReadonlyArray<UniquenessScope>;
+
+/** Strictness rank, for comparison. Keyed on the union so a fifth scope has no rank by default. */
+const UNIQUENESS_RANK: Record<UniquenessScope, number> = {
+  GLOBALLY_UNIQUE: 4,
+  UNIQUE_PER_RUN: 3,
+  UNIQUE_PER_TEST: 2,
+  REUSABLE: 1,
+};
+
+/** Is `actual` at least as strict as `required`? */
+export function uniquenessAtLeast(actual: UniquenessScope, required: UniquenessScope): boolean {
+  return UNIQUENESS_RANK[actual] >= UNIQUENESS_RANK[required];
+}
+
+/**
+ * What using this value obliges the suite to clean up afterwards.
+ *
+ * UNKNOWN is a real member and the most important one. A value typed into a
+ * form the crawl never submitted leaves behind whatever that form does, and
+ * this module cannot know what that is. Reporting UNKNOWN makes the obligation
+ * visible and unresolved; reporting NONE would be a claim that nothing was
+ * created, which is the kind of quiet false statement that fills a customer's
+ * database.
+ */
+export const CLEANUP_OBLIGATIONS = [
+  /** Nothing persists. A search term, a value typed into a form that was never submitted. */
+  'NONE',
+  /** A row was created and must be deleted. A signup, an invite, an order. */
+  'DELETE_ENTITY',
+  /** A unique identifier was consumed and must be released before it can be reused. */
+  'RELEASE_IDENTIFIER',
+  /** A session or token was minted and must be revoked. */
+  'REVOKE_CREDENTIAL',
+  /** This module cannot tell. Visible and unresolved, never silently NONE. */
+  'UNKNOWN',
+] as const;
+export type CleanupObligation = (typeof CLEANUP_OBLIGATIONS)[number];
+
+/** Compile-time half of the parity guard. */
+const CLEANUP_OBLIGATION_PRESENT: Record<CleanupObligation, true> = {
+  NONE: true,
+  DELETE_ENTITY: true,
+  RELEASE_IDENTIFIER: true,
+  REVOKE_CREDENTIAL: true,
+  UNKNOWN: true,
+};
+
+/** Derived, never hand-listed. */
+export const CLEANUP_OBLIGATION_LIST = Object.keys(
+  CLEANUP_OBLIGATION_PRESENT,
+) as ReadonlyArray<CleanupObligation>;
+
+/**
+ * The uniqueness each semantic needs, as a total function.
+ *
+ * A `Record` keyed on `FormFieldSemantic`, so a twentieth semantic cannot be
+ * added to flow-map.ts without deciding this — which is the point. The failure
+ * mode a partial lookup produces is a new semantic defaulting to REUSABLE, and
+ * REUSABLE is the answer that collides.
+ *
+ * The judgements worth arguing with, stated rather than buried:
+ *
+ *   · `email` and `username` are GLOBALLY_UNIQUE because an application holds a
+ *     unique index on them and a collision ACROSS runs is the commonest
+ *     cross-run flake there is — run 2 cannot sign up as run 1's user.
+ *   · `phone` is UNIQUE_PER_RUN and not global, because the supply of valid
+ *     reserved test numbers is small and genuinely exhaustible; promising
+ *     global uniqueness over a finite pool would be a promise this module
+ *     breaks on the two-hundredth run.
+ *   · `credit_card` is REUSABLE, which looks wrong and is the only correct
+ *     answer: the value is a PROVIDER'S PUBLISHED TEST NUMBER from
+ *     test-values.ts, every caller must use the same one, and generating a
+ *     "unique" card number means generating one the provider will not honour.
+ *   · `person_name`, `street_address` and `city` are REUSABLE because nothing
+ *     keys on them; making them unique would churn values for no benefit and
+ *     make every diff unreadable.
+ *   · `password` is UNIQUE_PER_TEST, not global: it is never a key, but two
+ *     accounts in one test sharing a password makes a lockout scenario
+ *     ambiguous about which account it locked.
+ */
+const SEMANTIC_UNIQUENESS: Record<FormFieldSemantic, UniquenessScope> = {
+  email: 'GLOBALLY_UNIQUE',
+  username: 'GLOBALLY_UNIQUE',
+  password: 'UNIQUE_PER_TEST',
+  person_name: 'REUSABLE',
+  phone: 'UNIQUE_PER_RUN',
+  street_address: 'REUSABLE',
+  city: 'REUSABLE',
+  postal_code: 'REUSABLE',
+  country: 'REUSABLE',
+  credit_card: 'REUSABLE',
+  card_expiry: 'REUSABLE',
+  card_cvc: 'REUSABLE',
+  date: 'REUSABLE',
+  number: 'REUSABLE',
+  currency: 'REUSABLE',
+  url: 'UNIQUE_PER_RUN',
+  search: 'REUSABLE',
+  freeform: 'UNIQUE_PER_TEST',
+  unknown: 'UNIQUE_PER_TEST',
+};
+
+/**
+ * The cleanup each semantic implies, as a total function for the same reason.
+ *
+ * Every identity-shaped semantic is UNKNOWN rather than DELETE_ENTITY, and that
+ * is deliberate. Whether typing an email into a form creates a row depends on
+ * whether the form was submitted and what it does, and this module sees a FIELD
+ * — it never sees the submission. UNKNOWN is the honest answer and it is
+ * actionable: the scenario that submits the form knows, and
+ * {@link withCleanup} is how it says so.
+ */
+const SEMANTIC_CLEANUP: Record<FormFieldSemantic, CleanupObligation> = {
+  email: 'UNKNOWN',
+  username: 'UNKNOWN',
+  password: 'NONE',
+  person_name: 'NONE',
+  phone: 'UNKNOWN',
+  street_address: 'NONE',
+  city: 'NONE',
+  postal_code: 'NONE',
+  country: 'NONE',
+  credit_card: 'NONE',
+  card_expiry: 'NONE',
+  card_cvc: 'NONE',
+  date: 'NONE',
+  number: 'NONE',
+  currency: 'NONE',
+  url: 'NONE',
+  search: 'NONE',
+  freeform: 'NONE',
+  unknown: 'UNKNOWN',
+};
+
+/** The uniqueness scope a value of this semantic carries. Total, by construction. */
+export function uniquenessFor(semantic: FormFieldSemantic): UniquenessScope {
+  return SEMANTIC_UNIQUENESS[semantic];
+}
+
+/** The cleanup obligation a value of this semantic carries. Total, by construction. */
+export function cleanupFor(semantic: FormFieldSemantic): CleanupObligation {
+  return SEMANTIC_CLEANUP[semantic];
+}
+
+/**
+ * Restate a value's cleanup obligation, for a caller that knows what the
+ * submission does.
+ *
+ * The narrow, deliberate way to resolve an UNKNOWN: the scenario that submits
+ * the form knows whether a row was created, and this is how it records that
+ * without the generator pretending to know. Returns a new value; nothing here
+ * mutates.
+ */
+export function withCleanup(value: SyntheticValue, cleanup: CleanupObligation): SyntheticValue {
+  return { ...value, cleanup };
+}
+
 // ─── Public shape ────────────────────────────────────────────────────────────
 
 /**
@@ -278,6 +505,25 @@ export interface SyntheticValue {
   unsatisfiable: string[];
   /** One sentence for a human, when there is something to say. */
   note: string | null;
+  /**
+   * How widely this value must not repeat, so a caller never has to guess.
+   *
+   * Derived from the semantic by {@link uniquenessFor}. It describes what the
+   * value NEEDS, not a proof that the generation achieved it: uniqueness here
+   * rests on a 32-bit hash of (seed, scope, field), which is ample for the
+   * dozens-of-values-per-run case this module serves and is not a cryptographic
+   * guarantee. Saying which it is beats letting a reader assume the stronger
+   * one.
+   */
+  uniqueness: UniquenessScope;
+  /**
+   * What using this value obliges the suite to clean up.
+   *
+   * UNKNOWN wherever submitting the form MIGHT have created a row, because this
+   * module sees a field and never a submission. A scenario that knows resolves
+   * it with {@link withCleanup}.
+   */
+  cleanup: CleanupObligation;
 }
 
 export interface SyntheticFormFill {
@@ -375,6 +621,8 @@ export function syntheticValue(
         value: '',
         honoured: ['options'],
         unsatisfiable: ['options'],
+        uniqueness: uniquenessFor(field.semantic),
+        cleanup: cleanupFor(field.semantic),
         note: 'Every option on this control looks like a placeholder ("Select…"), so there is no valid value to choose. That is worth looking at.',
       };
     }
@@ -384,6 +632,8 @@ export function syntheticValue(
       value: chosen,
       honoured: ['options'],
       unsatisfiable: [],
+      uniqueness: uniquenessFor(field.semantic),
+      cleanup: cleanupFor(field.semantic),
       note: `Chosen from the ${field.options.length} option(s) the control offers rather than generated.`,
     };
   }
@@ -467,6 +717,8 @@ export function syntheticValue(
     value: fitted.value,
     honoured: [...new Set(honoured)],
     unsatisfiable: [...new Set(unsatisfiable)],
+    uniqueness: uniquenessFor(field.semantic),
+    cleanup: cleanupFor(field.semantic),
     note: notes.length > 0 ? notes.join(' ') : null,
   };
 }

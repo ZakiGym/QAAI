@@ -5,6 +5,31 @@
  */
 
 import { z } from 'zod';
+/*
+ * The scenario-depth vocabularies, imported rather than restated — same
+ * argument as every other vocabulary in this file. A `z.enum(['PERSISTENT',
+ * …])` written out here is a second list that drifts from the first, and the
+ * drift is invisible until a customer cannot save a row.
+ */
+import {
+  BOUNDARY_CLASSES,
+  BOUNDARY_CONSTRAINTS,
+  BOUNDARY_EXPECTATIONS,
+  BOUNDARY_DESCRIPTORS,
+  BOUNDARY_RISKS,
+} from './boundaries';
+import {
+  DESTRUCTIVE_STEP_KINDS,
+  PRINCIPAL_KINDS,
+  PRINCIPAL_LIFECYCLES,
+} from './principals';
+import { CLEANUP_OBLIGATIONS, UNIQUENESS_SCOPES } from './synthetic';
+import {
+  PAYMENT_OUTCOMES,
+  TEST_VALUE_EVIDENCE,
+  TEST_VALUE_KINDS,
+  TEST_VALUE_PROVIDERS,
+} from './test-values';
 import {
   AUTH_PROFILE_KINDS,
   CHAT_INTEGRATION_KINDS,
@@ -4006,4 +4031,357 @@ export const benchmarkFaultResultSchema = z
   .refine((row) => row.outcome === 'DETECTED' || row.detectedByTestId === null, {
     message: 'a test is named as having caught a fault that was not recorded as detected',
     path: ['outcome'],
+  });
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCENARIO DEPTH: principals, boundaries, synthetic values
+//
+// Five write paths and five refusals. Each refusal is a defect this round was
+// commissioned to prevent, written as a `.refine` rather than as a comment
+// asking the next person to remember:
+//
+//   1. a destructive step bound to a PERSISTENT principal
+//   2. a boundary case whose defining constraint was never read
+//   3. a synthetic value with no uniqueness scope
+//   4. a test bound to an auth profile from a different project
+//   5. a catalogue entry with no provenance
+//
+// The parity tests for every enum below live in `principals.test.ts`,
+// `boundaries.test.ts` and `synthetic.contract.test.ts`, which compare each
+// schema's `.options` against the list derived from its compile-time presence
+// record. Both halves are needed: eight `GateRule` kinds shipped UNSAVEABLE for
+// two slices because only one of the two existed, and `check:wiring` cannot see
+// that class of defect — a union member with no write path is live code in a
+// file that is reached.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const principalKindSchema = z.enum(PRINCIPAL_KINDS);
+export const principalLifecycleSchema = z.enum(PRINCIPAL_LIFECYCLES);
+export const destructiveStepKindSchema = z.enum(DESTRUCTIVE_STEP_KINDS);
+
+/**
+ * A tenant as the application under test names it.
+ *
+ * `id` is required and `label` is nullable, never the reverse: the id is what a
+ * cross-tenant comparison is made on, and a comparison on a human label is a
+ * comparison on a value the customer may legitimately duplicate.
+ */
+export const tenantRefSchema = z.object({
+  id: z.string().min(1).max(200),
+  label: z.string().min(1).max(200).nullable().default(null),
+});
+
+/**
+ * A principal, on the way into a plan item or a test.
+ *
+ * NOTE WHAT CANNOT BE SENT HERE. There is no field for a password, a TOTP
+ * secret, an OTP, a session cookie, a storageState, a bypass token or an API
+ * key, and `.strict()` means a client that sends one is REFUSED rather than
+ * having it silently dropped. That is the stronger behaviour on purpose: a
+ * dropped secret is a secret the sender still believes was stored, and it
+ * reaches our logs on the way to being dropped.
+ *
+ * A credential is named by pointing `authProfileId` at a row whose
+ * secret-bearing fields reference `Secret.name` — the pattern already in the
+ * schema.
+ */
+export const principalSchema = z
+  .object({
+    name: z.string().min(1).max(120),
+    kind: principalKindSchema,
+    lifecycle: principalLifecycleSchema,
+    role: z.string().min(1).max(120).nullable().default(null),
+    authProfileId: z.string().min(1).max(64).nullable().default(null),
+    authProfileKind: z.enum(AUTH_PROFILE_KINDS).nullable().default(null),
+    tenant: tenantRefSchema.nullable().default(null),
+    createdByScenario: z.string().min(1).max(200).nullable().default(null),
+  })
+  .strict()
+  .refine((p) => p.kind !== 'ANONYMOUS' || p.authProfileId === null, {
+    message:
+      'an ANONYMOUS principal names an auth profile — anonymous means no credential, so this row ' +
+      'claims two contradictory things and one of them will be silently ignored at run time',
+    path: ['authProfileId'],
+  })
+  .refine((p) => p.kind !== 'DISPOSABLE' || p.createdByScenario !== null, {
+    message:
+      'a DISPOSABLE principal must name the scenario that created it — only a principal the ' +
+      'scenario itself brought into existence may be destroyed, and an unverified disposability ' +
+      'claim is how the customer’s own account gets deleted',
+    path: ['createdByScenario'],
+  });
+
+/**
+ * REFUSAL 1 — a destructive step bound to a PERSISTENT principal.
+ *
+ * The compiler already refuses this in TypeScript: a destructive step takes
+ * `DestructiblePrincipal`, which only `proveDisposable` can mint. This schema
+ * is the SECOND half, and it is not redundant — it guards the path the compiler
+ * cannot see, which is a row arriving over HTTP or out of a model's tool call.
+ * The agent validates generated plan items with these schemas, so a model that
+ * proposes "log out the admin" against the customer's shared account is
+ * refused on the way in rather than at the point it runs.
+ *
+ * ANONYMOUS is refused too, and for a different reason that matters: it is not
+ * dangerous, it is MEANINGLESS. A logout scenario against a principal with no
+ * session asserts nothing and would be recorded as a passing destructive test —
+ * a pass that means "we did not check".
+ */
+export const destructiveStepSchema = z
+  .object({
+    kind: destructiveStepKindSchema,
+    /** The principal this step acts on. Must be provably disposable. */
+    target: principalSchema,
+    /** What the step is for, in the words the test name will use. */
+    intent: z.string().min(1).max(300),
+  })
+  .strict()
+  .refine((step) => step.target.kind !== 'PERSISTENT', {
+    message:
+      'a destructive step is bound to a PERSISTENT principal — that is the customer’s own ' +
+      'account and may never be damaged. Create a disposable principal in the scenario (a signup ' +
+      'it performs, or an AuthProfile marked DISPOSABLE) and bind the step to that instead',
+    path: ['target', 'kind'],
+  })
+  .refine((step) => step.target.kind !== 'ANONYMOUS', {
+    message:
+      'a destructive step is bound to an ANONYMOUS principal, which has no session to destroy — ' +
+      'the step would assert nothing and be recorded as a passing destructive test',
+    path: ['target', 'kind'],
+  })
+  .refine((step) => step.target.lifecycle !== 'DESTROYED', {
+    message: 'the target principal is already destroyed, so this step would report a second success for one act',
+    path: ['target', 'lifecycle'],
+  });
+
+export const boundaryClassSchema = z.enum(BOUNDARY_CLASSES);
+export const boundaryExpectationSchema = z.enum(BOUNDARY_EXPECTATIONS);
+export const boundaryRiskSchema = z.enum(BOUNDARY_RISKS);
+export const boundaryConstraintSchema = z.enum(BOUNDARY_CONSTRAINTS);
+
+/** The four terms on which a class may or may not be generated. See boundaries.ts. */
+export const boundaryApplicabilityStateSchema = z.enum([
+  'APPLICABLE',
+  'UNBOUNDED',
+  'CONSTRAINT_UNREAD',
+  'INAPPLICABLE',
+]);
+
+/**
+ * REFUSAL 2 — a boundary case whose defining constraint was never read.
+ *
+ * THE DEFECT: "type 300 characters and expect an error" against a field whose
+ * `maxlength` nobody captured is a FAILING TEST THAT IS QAAI'S FAULT. The
+ * customer investigates, finds their field never claimed a limit, and stops
+ * trusting the suite — which costs more than the bug the test might have found.
+ *
+ * Three refinements, because there are three distinct ways to get this wrong:
+ *
+ *   · CONSTRAINT_UNREAD must not be stored as a case AT ALL. It is not a case;
+ *     it is a gap in our own crawl, and it belongs in the enumeration's
+ *     `unreadConstraints` count with the re-crawl remedy beside it. Letting it
+ *     through here is how OUR gap gets filed as a fact about the customer.
+ *   · INAPPLICABLE likewise — the class could never have applied.
+ *   · `assertsRejection` is the dangerous one, and it is refused unless the
+ *     state is APPLICABLE *and* the expectation is REJECTED. UNBOUNDED is the
+ *     case this catches: the probe is worth running (an unbounded field is
+ *     where the interesting failures are) and its outcome may NOT be asserted
+ *     as a rejection, because no limit was ever claimed to be enforced.
+ */
+export const boundaryCaseSchema = z
+  .object({
+    field: z.string().min(1).max(200),
+    klass: boundaryClassSchema,
+    applicability: boundaryApplicabilityStateSchema,
+    expected: boundaryExpectationSchema,
+    risk: boundaryRiskSchema,
+    /**
+     * The constraint value the case was derived from, as read off the page.
+     * Required when APPLICABLE — a case with no basis is a case derived from
+     * nothing.
+     */
+    basis: z.string().min(1).max(500).nullable().default(null),
+    /** Does the generated test assert that the application REJECTS this input? */
+    assertsRejection: z.boolean(),
+  })
+  .strict()
+  .refine((c) => c.applicability !== 'CONSTRAINT_UNREAD', {
+    message:
+      'this boundary case rests on a constraint the crawl never read, so the field has no such ' +
+      'boundary — it has an unknown one. Generating here asserts a limit the page may never have ' +
+      'claimed. Record it in the enumeration’s unreadConstraints count and re-crawl with ' +
+      'constraint capture instead',
+    path: ['applicability'],
+  })
+  .refine((c) => c.applicability !== 'INAPPLICABLE', {
+    message: 'this boundary class cannot apply to this kind of field, so there is no case to store',
+    path: ['applicability'],
+  })
+  .refine((c) => !c.assertsRejection || (c.applicability === 'APPLICABLE' && c.expected === 'REJECTED'), {
+    message:
+      'the test asserts a rejection that is not warranted: a rejection may only be asserted when ' +
+      'the defining constraint was READ and the class expects REJECTED. On an UNBOUNDED field, or ' +
+      'for a class whose correct behaviour is genuinely ambiguous, assert a handled outcome — no ' +
+      '500, no silently discarded value — and nothing stronger',
+    path: ['assertsRejection'],
+  })
+  .refine((c) => c.applicability !== 'APPLICABLE' || c.basis !== null, {
+    message:
+      'an APPLICABLE case must carry the constraint value it was derived from, so a reviewer can ' +
+      'see that the 11-character string is 11 characters because the page said 10',
+    path: ['basis'],
+  })
+  .refine((c) => BOUNDARY_DESCRIPTORS[c.klass].constraint !== 'EXISTING_VALUE' || c.basis !== null, {
+    message:
+      'this class needs a value already in the system before it means anything — "sign up with an ' +
+      'existing email" run against an email nobody registered tests the happy path and reports a ' +
+      'negative-case pass. Name the established value in `basis`',
+    path: ['basis'],
+  });
+
+export const uniquenessScopeSchema = z.enum(UNIQUENESS_SCOPES);
+export const cleanupObligationSchema = z.enum(CLEANUP_OBLIGATIONS);
+
+/**
+ * REFUSAL 3 — a synthetic value with no uniqueness scope.
+ *
+ * `uniqueness` and `cleanup` are REQUIRED with no default, and the absence of a
+ * default is the whole point. A default of REUSABLE would make every value that
+ * forgot to declare a scope collide on the unique index it needed, and the
+ * failure would read as an application bug; a default of GLOBALLY_UNIQUE would
+ * claim a guarantee the generation did not make. There is no safe default, so
+ * there is no default.
+ *
+ * `value` is capped rather than unbounded because a synthetic value that is
+ * megabytes long is a generator bug, and storing it would carry that bug into
+ * the customer's repository.
+ */
+export const syntheticValueSchema = z
+  .object({
+    field: z.string().min(1).max(200),
+    semantic: z.string().min(1).max(60),
+    value: z.string().max(20_000),
+    honoured: z.array(z.string().min(1).max(60)).max(32).default([]),
+    unsatisfiable: z.array(z.string().min(1).max(60)).max(32).default([]),
+    note: z.string().min(1).max(2_000).nullable().default(null),
+    uniqueness: uniquenessScopeSchema,
+    cleanup: cleanupObligationSchema,
+  })
+  .strict()
+  .refine((v) => v.cleanup !== 'NONE' || v.uniqueness !== 'GLOBALLY_UNIQUE', {
+    message:
+      'a globally unique value that obliges no cleanup will exhaust its own namespace: every run ' +
+      'consumes an identifier nothing ever releases. Declare the obligation (DELETE_ENTITY or ' +
+      'RELEASE_IDENTIFIER), or UNKNOWN if the submission’s effect is genuinely unknown',
+    path: ['cleanup'],
+  });
+
+/**
+ * REFUSAL 4 — a test bound to an auth profile from a different project.
+ *
+ * THE DEFECT THIS PREVENTS is the quietest one in this file. `AuthProfile`
+ * hangs off an `Environment`, which hangs off a `Project`, and nothing in the
+ * `Test.authProfileId` foreign key constrains the two to agree. A test bound
+ * across that line resolves a storageState for somebody else's application,
+ * navigates the customer's base URL with it, gets whatever an unauthenticated
+ * visitor gets, and PASSES — while being counted as authenticated coverage of a
+ * page it never reached. No error is raised at any layer.
+ *
+ * The check needs a fact the test row does not carry, so the schema takes it:
+ * `authProfileProjectId` is resolved by the caller and compared here. That is
+ * deliberate rather than convenient — a refinement that cannot see both sides
+ * of the comparison cannot make it, and a comment asking the route to check is
+ * what the last three slices proved does not hold.
+ */
+export const testAuthBindingSchema = z
+  .object({
+    testId: z.string().min(1).max(64).nullable().default(null),
+    projectId: z.string().min(1).max(64),
+    authProfileId: z.string().min(1).max(64).nullable().default(null),
+    /** The project the named profile actually belongs to. Resolved by the caller. */
+    authProfileProjectId: z.string().min(1).max(64).nullable().default(null),
+    /** "This test is meaningless signed out." The INTENT, not the binding. */
+    authProfileRequired: z.boolean().default(false),
+    /** The other actors, when one identity is not enough. */
+    principals: z.array(principalSchema).max(16).default([]),
+  })
+  .strict()
+  .refine((b) => b.authProfileId === null || b.authProfileProjectId !== null, {
+    message:
+      'the named auth profile could not be resolved to a project, so the binding cannot be ' +
+      'checked — and an unchecked binding is how a test silently runs as the wrong identity, sees ' +
+      'what an anonymous visitor sees, and passes',
+    path: ['authProfileProjectId'],
+  })
+  .refine((b) => b.authProfileProjectId === null || b.authProfileProjectId === b.projectId, {
+    message:
+      'the test is bound to an auth profile belonging to a DIFFERENT project. Nothing would raise ' +
+      'an error: the run would resolve a session for another application, browse this one ' +
+      'anonymously, pass, and be counted as authenticated coverage of a page it never reached',
+    path: ['authProfileId'],
+  })
+  .refine(
+    (b) =>
+      new Set(b.principals.map((p) => p.name)).size === b.principals.length,
+    {
+      message:
+        'two principals share a name, so one would overwrite the other in RunContext.sessions and ' +
+        'the test would silently act as a single identity',
+      path: ['principals'],
+    },
+  );
+
+/**
+ * REFUSAL 5 — a catalogue entry with no provenance.
+ *
+ * A WRONG TEST CARD NUMBER IS A SILENT PAYMENT-TEST FAILURE: the charge is
+ * declined for the wrong reason, the test asserts a decline, and it passes while
+ * proving nothing. So every entry must say which provider published the value
+ * and how this repo knows — `evidence` is the KIND of knowledge and
+ * `sourceNote` is the sentence a reader acts on, and neither is optional.
+ *
+ * `.strict()` AND NO SECRET FIELD, which is the structural half of the
+ * guarantee. The catalogue is incapable of holding a credential: there is no
+ * property for one, and an entry that sends an extra property is refused rather
+ * than having it dropped. A published test card number is not a secret — that
+ * is precisely what makes it publishable — and anything that IS a secret
+ * belongs on an `AuthProfile` row referencing `Secret.name`.
+ */
+export const testValueEntrySchema = z
+  .object({
+    id: z.string().min(1).max(120),
+    provider: z.enum(TEST_VALUE_PROVIDERS),
+    kind: z.enum(TEST_VALUE_KINDS),
+    value: z.string().min(1).max(500).nullable(),
+    purpose: z.string().min(1).max(300),
+    /*
+     * The outcome a payment value forces. OPTIONAL, because it is meaningless
+     * for the non-payment kinds — a mail sink forces no payment outcome — and
+     * `.strict()` means an omission here is a REFUSAL rather than a dropped
+     * field. Leaving it out refused every card in the shipped catalogue, which
+     * is what the "accepts every entry already in the catalogue" test exists to
+     * catch: a write path that rejects the product's own data is a feature
+     * nobody can save.
+     */
+    outcome: z.enum(PAYMENT_OUTCOMES).optional(),
+    expected: z.string().min(1).max(500),
+    testModeOnly: z.boolean(),
+    verified: z.boolean(),
+    evidence: z.enum(TEST_VALUE_EVIDENCE),
+    sourceNote: z.string().min(1).max(1_000),
+  })
+  .strict()
+  .refine((e) => e.sourceNote.trim().length > 0, {
+    message:
+      'a catalogue entry with no provenance cannot be acted on: a wrong test card number is a ' +
+      'silent payment-test failure, so every value must say where it came from and how to confirm it',
+    path: ['sourceNote'],
+  })
+  .refine((e) => !e.verified || e.evidence !== 'published-recalled', {
+    message:
+      'an entry recalled from documentation rather than fetched may not be marked verified — ' +
+      'recall is the weakest evidence here and claiming otherwise is the one dishonesty this ' +
+      'catalogue exists to prevent',
+    path: ['verified'],
   });

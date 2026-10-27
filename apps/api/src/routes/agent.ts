@@ -74,6 +74,9 @@ import {
   postCheckCode,
   verificationRunTag,
   HEAL_VERIFY_STATES,
+  SCENARIO_KIND_LIST,
+  SCENARIO_KIND_RISK,
+  type ScenarioKind,
 } from '@qaai/agent';
 import type { OpenHeal, PostCheck } from '@qaai/agent';
 /*
@@ -2681,5 +2684,191 @@ agentRouter.get('/projects/:projectId/validity', async (req, res) => {
       'Both rates are NULL rather than numbers unless the verdict is SUFFICIENT. This is a ' +
       'CORRELATION and is reported as one: nothing here claims the coverage caused the quality, ' +
       'and there is no field that says it did.',
+  });
+});
+
+/*
+ * ── GET /projects/:projectId/scenario-capability ────────────────────────────
+ *
+ * MOUNTED AT THE ROOT — apps/api/src/index.ts does `app.use('/', agentRouter)`
+ * — so the full URL is exactly the path declared above, with no prefix. Stated
+ * because a router that declares a relative path and is mounted at the wrong
+ * prefix is a 404 with a comment swearing it works.
+ *
+ * DECLARED BELOW `agentRouter.use(requireAuth)` (line 438), deliberately: it
+ * reads a project's configuration and must not answer an anonymous caller. The
+ * only routes above that line are the ones that carry their own authentication,
+ * and this is not one of them.
+ *
+ * ── WHY THIS ENDPOINT EXISTS ────────────────────────────────────────────────
+ *
+ * "My plan has no race tests" and "nothing looked for race conditions in my
+ * application" are different sentences with different remedies, and the product
+ * rendered them identically — as an absence. An absence reads as a clean bill
+ * of health, which is the single most flattering wrong answer this product can
+ * give, so every kind this project CANNOT produce is reported as UNAVAILABLE
+ * with the fact that is missing and what to do about it. Never as a zero.
+ */
+agentRouter.get('/projects/:projectId/scenario-capability', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  // Same guard the sibling `/projects/:projectId/dimensions` route uses: the
+  // project has to exist before anything is reported about it.
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const [authProfiles, flowMap, apiOperations, emailOtpTests] = await Promise.all([
+    /*
+     * COUNTS AND KINDS ONLY — never a config blob. An AuthProfile's config
+     * holds the credential, and an endpoint that reports capability has no need
+     * of it. `select` is narrowed rather than the row being fetched and picked
+     * apart, so a field added to that model cannot start arriving here.
+     */
+    prisma.authProfile.findMany({
+      // AuthProfile hangs off the ENVIRONMENT, not the project: a credential is
+      // environment-specific, which is the whole reason the model is shaped
+      // that way. Scoping it by `projectId` directly does not compile.
+      where: { environment: { projectId } },
+      select: { id: true, name: true, kind: true },
+    }),
+    prisma.flowMap.findFirst({
+      where: { projectId },
+      orderBy: { version: 'desc' },
+      select: { id: true, version: true },
+    }),
+    prisma.apiOperation.count({ where: { projectId } }),
+    /*
+     * THE ONLY MAIL-SINK EVIDENCE THIS SCHEMA HOLDS, and it is weak.
+     *
+     * There is NO per-environment place to configure a mail catcher anywhere in
+     * this product — `grep -i mailSink` over schema.prisma returns nothing, and
+     * `mailboxUrl` exists only inside an individual EMAIL_OTP test's `spec`
+     * Json. So the best available signal is "this project has at least one
+     * EMAIL_OTP test, therefore somebody somewhere knows a mailbox URL", and
+     * the verdict below says exactly that rather than implying a configured
+     * sink. An `EnvironmentMailSink` model is the real fix and it is in this
+     * round's handover.
+     *
+     * An earlier draft of this query counted `environmentAccess` rows with a
+     * non-null `provider`, which is BOT PROTECTION and has nothing to do with
+     * mail — and it did not even compile, because `provider` is a non-nullable
+     * enum defaulting to UNKNOWN. A count that cannot be null would have
+     * reported every project as mail-capable.
+     */
+    prisma.test.count({ where: { projectId, type: 'EMAIL_OTP' } }),
+  ]);
+
+  const profiles = authProfiles.length;
+  const crawled = flowMap !== null;
+
+  /**
+   * One kind's verdict. `available: false` ALWAYS carries a `missing` and a
+   * `remedy`; there is no arm of this function that returns an unavailable
+   * verdict with nothing beside it, because an unexplained absence is the thing
+   * this endpoint exists to stop.
+   */
+  const verdict = (
+    kind: ScenarioKind,
+  ): {
+    kind: ScenarioKind;
+    rank: number;
+    why: string;
+    available: boolean;
+    missing: string | null;
+    remedy: string | null;
+  } => {
+    const risk = SCENARIO_KIND_RISK[kind];
+    const base = { kind, rank: risk.points, why: risk.why };
+    const no = (missing: string, remedy: string) => ({
+      ...base,
+      available: false,
+      missing,
+      remedy,
+    });
+    const yes = () => ({ ...base, available: true, missing: null, remedy: null });
+
+    switch (kind) {
+      case 'TENANCY':
+      case 'MULTI_ACTOR':
+        /*
+         * TWO identities, not one. One auth profile cannot be both sides of a
+         * handoff or both tenants of an isolation sweep, and a sweep run with
+         * one identity on both sides asks a principal for its own records —
+         * which `tenancyPlugin.validate` refuses outright rather than letting
+         * it pass vacuously.
+         */
+        return profiles >= 2
+          ? yes()
+          : no(
+              `${kind} needs two distinct identities and this project has ${profiles} auth profile(s).`,
+              'Configure a second auth profile on this project. One identity cannot be both sides of a handoff, and a sweep that asks a principal for its own records proves nothing.',
+            );
+      case 'AUTHZ_PROBE':
+        return profiles >= 2
+          ? yes()
+          : no(
+              `An IDOR probe asks AS A REAL SIGNED-IN PRINCIPAL for another principal's object, and this project has ${profiles} auth profile(s).`,
+              'Configure a second auth profile. The anonymous version of this check passes against every correct application, so it has never found anything.',
+            );
+      case 'AUTH_LIFECYCLE':
+        /*
+         * A mail sink, because signup, email verification and password reset
+         * all stop at a message nothing can read. The journey is still PLANNED
+         * without one — `auth-lifecycle.ts` records UNREACHABLE_NO_MAIL_SINK
+         * rather than silently skipping — and it cannot be driven.
+         */
+        return emailOtpTests > 0
+          ? yes()
+          : no(
+              'Signup, email verification and password reset all stop at a delivered message, and nothing on this project shows where one can be read. NOTE: this product has no per-environment mail-sink setting at all \u2014 the only evidence available is whether an EMAIL_OTP test exists \u2014 so read an `available: true` here as "somebody knows a mailbox URL", not as "a sink is configured".',
+              'Until an EnvironmentMailSink setting exists, add an EMAIL_OTP test carrying a mailboxUrl. Without a readable mailbox these flows are reported UNREACHABLE_NO_MAIL_SINK, which is honest but is not coverage.',
+            );
+      case 'WALK':
+      case 'FAULT_INJECTION':
+      case 'RACE':
+      case 'BOUNDARY':
+      case 'FUZZ':
+        return crawled
+          ? yes()
+          : no(
+              'Nothing has been crawled for this project, so there is no graph to walk, no request to intercept and no form to perturb.',
+              'Run the Explorer. Every kind here is derived from the crawl and none of them can be guessed at.',
+            );
+      default: {
+        /*
+         * Exhaustive. A tenth scenario kind is a COMPILE ERROR here rather than
+         * a silent `available: true` — which is how a kind nobody wired would
+         * come to be reported as working.
+         */
+        const unreachable: never = kind;
+        return unreachable;
+      }
+    }
+  };
+
+  const kinds = SCENARIO_KIND_LIST.map(verdict).sort((a, b) => b.rank - a.rank);
+
+  res.json({
+    projectId,
+    flowMapId: flowMap?.id ?? null,
+    flowMapVersion: flowMap?.version ?? null,
+    /** Names and kinds only. A profile's config holds the credential; this does not. */
+    authProfiles: authProfiles.map((p) => ({ id: p.id, name: p.name, kind: p.kind })),
+    apiOperations,
+    emailOtpTests,
+    /** Ranked by bug-finding power, highest first. Same order the plan uses. */
+    kinds,
+    counts: {
+      available: kinds.filter((k) => k.available).length,
+      unavailable: kinds.filter((k) => !k.available).length,
+    },
+    why:
+      'Every unavailable kind names the FACT that is missing and the remedy. That is the whole ' +
+      'point of this endpoint: "no race tests were proposed" and "nothing looked for race ' +
+      'conditions" are different sentences, and an absence reported as a zero reads as a clean ' +
+      'bill of health. A kind listed as available can still produce nothing — that means the ' +
+      'enumerator looked and found none, which is a real and different answer.',
   });
 });

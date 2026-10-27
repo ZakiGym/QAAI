@@ -153,7 +153,7 @@ describe('a plugin whose TestType is not minted yet', () => {
   it('names every pending type, so the gap is sayable rather than silent', () => {
     // "QAAI cannot test your Electron app" and "QAAI can, but you cannot create
     // the test yet" are different sentences with different remedies.
-    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS', 'LINKS', 'SEO']);
+    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS', 'LINKS', 'SEO', 'TENANCY']);
   });
 
   it('keeps every pending type genuinely absent from TEST_TYPES', () => {

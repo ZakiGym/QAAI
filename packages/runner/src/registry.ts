@@ -32,6 +32,13 @@ import { desktopPlugin } from './plugins/desktop.js';
 import { jobsPlugin } from './plugins/jobs.js';
 import { linksPlugin } from './plugins/links.js';
 import { seoPlugin } from './plugins/seo.js';
+/*
+ * The cross-tenant isolation sweep. Registered here because that is the only
+ * thing that makes it reachable: it landed tested and imported by nothing but
+ * its own test file, which `check:wiring` flags as `package-exports` and this
+ * codebase produces more often than any other defect.
+ */
+import { tenancyPlugin } from './plugins/tenancy.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -107,6 +114,31 @@ const PENDING_PLUGINS: Readonly<Record<string, PendingPlugin>> = {
   JOBS: jobsPlugin,
   LINKS: linksPlugin,
   SEO: seoPlugin,
+  /*
+   * TENANCY — one tenant's session against another tenant's ids, swept across
+   * every enumerated endpoint. The register calls this the bug class that ends
+   * a company, and until the per-principal session path landed it was not
+   * merely untested but INEXPRESSIBLE: one `storageState` per run meant one
+   * cookie jar, so the only version of the question the product could ask was
+   * the anonymous one, which every correct application answers with a denial.
+   * A check that passes everywhere has never found anything.
+   *
+   * PENDING RATHER THAN IN `PLUGINS`, and the distinction is the honest one.
+   * `tenancyPlugin.type` is the literal `'TENANCY'`, which `TEST_TYPES` does
+   * not contain, so no `Test` row can carry that type and no run can resolve to
+   * this plugin yet. The two things that change that are a member in
+   * `packages/shared/src/constants.ts` and a migrated Prisma `TestType` enum —
+   * both in files this change does not own, both named in the handover.
+   *
+   * It is NOT forced into `SECURITY_SMOKE` to make it reachable sooner. That
+   * type's plugin already exists and does something else, and a tenancy spec
+   * executed by it would be validated against the wrong schema and reported
+   * under a name that does not describe what failed. `pendingTypes()` is the
+   * read path that reports this as a known, named gap in the meantime, which is
+   * the difference between a surface that is UNEXERCISABLE and one that does
+   * not exist.
+   */
+  TENANCY: tenancyPlugin,
 };
 
 /**
