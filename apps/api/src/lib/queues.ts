@@ -48,12 +48,31 @@ export async function enqueue<K extends keyof JobPayloads>(
   // `attempts` overrides the queue default (3). A job whose processor is not
   // idempotent — like import, which inserts rows — must pass attempts:1 so a
   // transient failure does not silently re-run and double its writes.
-  opts: { jobId?: string; delayMs?: number; attempts?: number } = {},
+  //
+  // `removeOnComplete`/`removeOnFail` exist for one case and must be passed
+  // TOGETHER with a `jobId` that is keyed on something long-lived — a project
+  // rather than a run. The queue default retains a completed job for 24 hours,
+  // and a retained job keeps its id as a Redis key, so every later `add()`
+  // under that id is dropped and this function still returns an id and still
+  // logs "job enqueued". Setting both turns the id from a permanent lock into
+  // an in-flight-only one. See `analyzeSourceJobOptions` in
+  // packages/shared/src/jobs.ts for the whole argument.
+  opts: {
+    jobId?: string;
+    delayMs?: number;
+    attempts?: number;
+    removeOnComplete?: boolean;
+    removeOnFail?: boolean;
+  } = {},
 ): Promise<string> {
   const job = await queueFor(name).add(name, payload, {
     ...(opts.jobId ? { jobId: opts.jobId } : {}),
     ...(opts.delayMs ? { delay: opts.delayMs } : {}),
     ...(opts.attempts ? { attempts: opts.attempts } : {}),
+    ...(opts.removeOnComplete === undefined
+      ? {}
+      : { removeOnComplete: opts.removeOnComplete }),
+    ...(opts.removeOnFail === undefined ? {} : { removeOnFail: opts.removeOnFail }),
   });
   logger.info({ queue: name, jobId: job.id }, 'job enqueued');
   return String(job.id);

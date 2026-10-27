@@ -4,7 +4,7 @@
  */
 
 import { Queue } from 'bullmq';
-import { QUEUE_NAMES } from '@qaai/shared';
+import { analyzeSourceJobOptions, QUEUE_NAMES } from '@qaai/shared';
 import type {
   CopilotJob,
   ExploreJob,
@@ -151,18 +151,33 @@ export async function enqueueExplore(job: ExploreJob): Promise<void> {
 /**
  * Queue a source analysis.
  *
- * `attempts: 1`, and the job id pins one analysis per project in flight. Both
- * for the same reason the Explorer runs at one attempt: the job WRITES — a
- * FlowMap version and a TestPlan — so a retry does not re-do the work, it
- * duplicates it, and the user ends up approving one of two identical plans.
- * Everything the processor needs is read fresh from the database, so the next
- * deliberate run is always a better answer than a retry of this one.
+ * `attempts: 1` because the job WRITES — a FlowMap version and a TestPlan — so
+ * a retry does not re-do the work, it duplicates it, and the user ends up
+ * approving one of two identical plans. Everything the processor needs is read
+ * fresh from the database, so the next deliberate run is always a better answer
+ * than a retry of this one.
+ *
+ * The job id pins one analysis per project IN FLIGHT, and it only means that
+ * because of the two removal flags `analyzeSourceJobOptions` carries with it.
+ * Without them this function read as a lock and behaved as a permanent one: the
+ * id is a Redis key, the queue above sets no `defaultJobOptions`, so BullMQ
+ * retained the first completed job for ever and silently dropped every later
+ * analysis of that project. Exactly the defect `enqueueExplore` above was fixed
+ * for — and this producer was not on the list of ids that comment says were
+ * deliberately left permanent, because it was simply missed.
+ *
+ * The options come from packages/shared rather than from here: the API's
+ * endpoint is the other producer of this queue, it is the one real traffic goes
+ * through, and it had inherited `attempts: 3` onto this non-idempotent
+ * processor. Two producers whose retry and de-duplication semantics disagree is
+ * how one install duplicates plans while another proposes none.
  */
 export async function enqueueAnalyzeSource(job: AnalyzeSourceJob): Promise<void> {
-  await analyzeSourceQueue.add(ANALYZE_SOURCE_QUEUE, job, {
-    jobId: `analyze-source-${job.projectId}`,
-    attempts: 1,
-  });
+  await analyzeSourceQueue.add(
+    ANALYZE_SOURCE_QUEUE,
+    job,
+    analyzeSourceJobOptions(job.projectId),
+  );
 }
 
 /**

@@ -38,7 +38,12 @@
  */
 
 import { Router } from 'express';
-import { analyseCodebase, detectProject, summariseAnalysis } from '@qaai/shared';
+import {
+  analyseCodebase,
+  analyzeSourceJobOptions,
+  detectProject,
+  summariseAnalysis,
+} from '@qaai/shared';
 import type { RepoFile } from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, notFound } from '../lib/errors.js';
@@ -420,12 +425,26 @@ sourceRouter.post(
       );
     }
 
-    await enqueue('qaai.analyze-source', {
-      orgId: actor.orgId,
-      projectId,
-      requestedBy: actor.userId,
-      autoApprove: req.body?.autoApprove === true,
-    });
+    /*
+     * The options are NOT spelled out here. This endpoint and the worker's
+     * `enqueueAnalyzeSource` are two producers of one queue, and they had the
+     * opposite half of the same bug: this one inherited `attempts: 3` onto a
+     * processor that creates a FlowMap version and a TestPlan, so a transient
+     * failure proposed the plan twice; that one pinned a per-project job id and
+     * retained the job, so every analysis after a project's first was dropped
+     * with a 202 and an audit row and nothing to show for it.
+     * `analyzeSourceJobOptions` is the single answer both now call.
+     */
+    await enqueue(
+      'qaai.analyze-source',
+      {
+        orgId: actor.orgId,
+        projectId,
+        requestedBy: actor.userId,
+        autoApprove: req.body?.autoApprove === true,
+      },
+      analyzeSourceJobOptions(projectId),
+    );
 
     await audit({
       actor,
