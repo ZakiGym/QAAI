@@ -67,14 +67,22 @@ const {
   AUTH_TITLES,
   DEFAULT_TEST_TYPES,
   MAX_PLAN_ITEMS,
+  MAX_UNIT_ITEMS,
   PROJECT_ANALYSIS_FIELDS,
   SOURCE_FLOW_MAP_REASON,
   STATIC_ONLY_SENTENCE,
+  UNIT_RISK_FACETS,
+  UNIT_RISK_FACET_LIST,
   analysisFromProject,
   flowMapFromSource,
+  identifierWords,
+  likelyTestPaths,
+  parameterNames,
   parseCodebaseAnalysis,
   processAnalyzeSource,
+  rankUnitSubjects,
   resolveTestTypeChoice,
+  riskFacetsFor,
   scenariosFromSource,
   summaryFromSource,
   testTypeChoiceFromProject,
@@ -158,6 +166,40 @@ const rawAnalysis = {
       form: loginForm,
     },
   ],
+  /*
+   * The component inventory, in the shape `analyseCodebase` writes it — so the
+   * honesty walk below covers UNIT_GEN items too. It was the absence of this
+   * key from the fixture AND from the parser that let a whole test type be
+   * unreachable while 106 tests passed.
+   *
+   * Two entries, chosen to exercise both halves: a money utility, which ranks,
+   * and a page, which must be kept off this axis because its route is already
+   * proposed as its own test.
+   */
+  components: [
+    {
+      modulePath: 'src/billing/pricing.ts',
+      exportName: 'priceCart',
+      kind: 'UTILITY',
+      propsSummary: 'props: items, taxRate',
+      hasCatalogueEntry: null,
+      catalogueRef: null,
+      evidence: 'src/billing/pricing.ts exports priceCart — classified UTILITY',
+      line: 12,
+      states: [],
+    },
+    {
+      modulePath: 'app/account/page.tsx',
+      exportName: 'default',
+      kind: 'PAGE',
+      propsSummary: null,
+      hasCatalogueEntry: null,
+      catalogueRef: null,
+      evidence: 'app/account/page.tsx exports default (the default export) — classified PAGE',
+      line: 1,
+      states: [],
+    },
+  ],
   warnings: ['3 file(s) exceeded the size cap and were not parsed'],
 };
 
@@ -165,11 +207,19 @@ const analysis = (): CodebaseAnalysis => parseCodebaseAnalysis(rawAnalysis)!;
 
 const allTypes = (types: TestType[]) => resolveTestTypeChoice(types);
 
-/** Everything the four derivation rules can produce, so honesty is checked over all of it. */
+/**
+ * Everything the derivation rules can produce, so honesty is checked over all
+ * of it — UNIT_GEN included.
+ *
+ * It is the walk over THIS that matters, not the per-producer tests: a new
+ * producer added without being listed here gets none of the five honesty
+ * assertions applied to it, and that is exactly how a unit item could have
+ * shipped claiming to have read a function body.
+ */
 const everything = () =>
   scenariosFromSource(
     analysis(),
-    allTypes(['SMOKE', 'API', 'E2E', 'ACCESSIBILITY', 'SECURITY_SMOKE']),
+    allTypes(['SMOKE', 'API', 'E2E', 'ACCESSIBILITY', 'SECURITY_SMOKE', 'UNIT_GEN']),
   );
 
 // ─── 1. Reading what another process wrote ───────────────────────────────────
@@ -681,6 +731,19 @@ describe('the boundary of a static pass', () => {
     'as seen',
     'the screenshot',
   ];
+
+  /*
+   * The walk is only worth anything if it HAS an item of each producer's type.
+   * `everything()` is capped at MAX_PLAN_ITEMS, so a producer whose items all
+   * fall below the cap would be walked zero times and every assertion below
+   * would pass vacuously about it. Asserted rather than assumed.
+   */
+  it('actually walks an item from every producer, so the assertions are not vacuous', () => {
+    const types = new Set(everything().items.map((item) => item.testType));
+    for (const type of ['SMOKE', 'API', 'E2E', 'ACCESSIBILITY', 'SECURITY_SMOKE', 'UNIT_GEN']) {
+      expect(types, `nothing of type ${type} reached the honesty walk`).toContain(type);
+    }
+  });
 
   it('never claims observation, in any item, in any field', () => {
     for (const item of everything().items) {
@@ -1297,7 +1360,13 @@ function stubPrisma(
    * The ingest's snapshot — the processor's REAL input. Defaults to none so
    * every existing case still exercises the project-column fallback.
    */
-  snapshot: { analysis: unknown } | null = null,
+  /*
+   * `paths` is the sibling column `defaultLoadAnalysedPaths` reads. Optional,
+   * so every existing case still stubs a snapshot with no path list — which is
+   * the production state for a project ingested before it was populated, and
+   * the state the "nobody looked" disclosure depends on.
+   */
+  snapshot: { analysis: unknown; paths?: unknown } | null = null,
   /**
    * Auth profiles on that environment. Defaults to NONE, which is the honest
    * default for a project that arrived as a repository and has configured no
@@ -1867,5 +1936,715 @@ describe('no two auth items on the approval screen carry the same title', () => 
     expect(items).toHaveLength(1);
     expect(items[0]!.steps.join(' ')).toContain('"Email"');
     expect(items[0]!.steps.join(' ')).toContain('"Password"');
+  });
+});
+
+// ─── UNIT_GEN: the logic half of the application ─────────────────────────────
+
+/**
+ * THE DEFECT THESE EXIST TO HOLD SHUT, and it was four breaks deep.
+ *
+ * `TEST_TYPE_DECLARATIONS.UNIT_GEN` recorded `producers: ['NONE']` — nothing
+ * anywhere could put a unit test into a plan — and the reason turned out to be
+ * one line upstream of every theory about it: `CodebaseAnalysis` in this file
+ * declared no `components` field, so `parseCodebaseAnalysis` dropped
+ * `analysis.components` on the floor. `analyseCodebase` ALWAYS sets it. A
+ * repository with four hundred exported functions arrived at the only pass that
+ * could have ranked them as a list of routes and forms.
+ *
+ * So the first test here is the contract-parity one, in the shape the auth
+ * surfaces and the six form constraints already taught this file to write: run
+ * the REAL producer, round-trip through JSON the way the snapshot column does,
+ * and assert the value SURVIVES. A fixture is a copy of the contract, and a
+ * copy is what drifts.
+ *
+ * The rest hold the line this producer must not cross. It knows a module path,
+ * an export name and PARAMETER NAMES; it does not know a body, a type or a
+ * return. An item that claimed otherwise would be the agent's imagination
+ * wearing a rationale's clothes, on the one subject where a plausible wrong
+ * assertion is hardest to spot.
+ */
+
+const moneyComponent = {
+  modulePath: 'src/billing/pricing.ts',
+  exportName: 'priceCart',
+  // `as const` so the fixture is assignable to `SourceComponentExport` where
+  // `riskFacetsFor` is called directly; a widened `string` would make every
+  // classifier test take `unknown` and stop checking the shape at all.
+  kind: 'UTILITY' as const,
+  propsSummary: 'props: items, discountCode, taxRate',
+  hasCatalogueEntry: null,
+  catalogueRef: null,
+  evidence: 'src/billing/pricing.ts exports priceCart — classified UTILITY',
+  line: 12,
+  states: [],
+};
+
+const withComponents = (components: unknown[]): CodebaseAnalysis =>
+  parseCodebaseAnalysis({ ...rawAnalysis, components })!;
+
+describe('the component inventory reaches this parser instead of being dropped', () => {
+  it('carries components through the parser, from the real producer', () => {
+    const produced = analyseCodebase([
+      {
+        path: 'src/pricing.ts',
+        content: [
+          'export function priceCart({ items, taxRate }) {',
+          '  return items.length * taxRate;',
+          '}',
+        ].join('\n'),
+      },
+      { path: 'package.json', content: '{}' },
+    ]);
+    expect(produced.components?.length, 'the producer found an export').toBeGreaterThan(0);
+
+    // Round-trip through JSON, because that is what the snapshot column does.
+    const parsed = parseCodebaseAnalysis(JSON.parse(JSON.stringify(produced)));
+    expect(parsed).not.toBeNull();
+    // The whole defect: this was 0 while the line above was > 0.
+    expect(parsed!.components).toHaveLength(produced.components!.length);
+    expect(parsed!.components.map((c) => c.exportName)).toContain('priceCart');
+  });
+
+  it('turns a carried component into a UNIT_GEN item a plugin would accept', () => {
+    // And the end of the chain: a carried component has to become an ITEM.
+    const produced = analyseCodebase([
+      {
+        path: 'src/pricing.ts',
+        content: 'export function priceCart({ items, taxRate }) { return 0; }',
+      },
+      { path: 'package.json', content: '{}' },
+    ]);
+    const parsed = parseCodebaseAnalysis(JSON.parse(JSON.stringify(produced)))!;
+    const items = scenariosFromSource(parsed, allTypes(['UNIT_GEN'])).items;
+
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.every((item) => item.testType === 'UNIT_GEN')).toBe(true);
+    // The plan's own schema, so an item that cannot be stored fails here rather
+    // than at the approval screen.
+    for (const item of items) expect(planItemSchema.safeParse(item).success).toBe(true);
+  });
+
+  it('drops an entry with no evidence rather than defaulting it', () => {
+    const parsed = withComponents([
+      { ...moneyComponent, modulePath: '' },
+      { ...moneyComponent, exportName: '' },
+      // A kind from a newer producer. Guessing UTILITY would put an unknown
+      // thing into the ranking under a label nobody wrote.
+      { ...moneyComponent, kind: 'SAGA' },
+      moneyComponent,
+    ]);
+    expect(parsed.components).toHaveLength(1);
+  });
+
+  it('treats (module, exportName) as the identity, so two readers are one subject', () => {
+    const parsed = withComponents([
+      moneyComponent,
+      { ...moneyComponent, evidence: 'found again by a second detector' },
+      { ...moneyComponent, exportName: 'priceOrder' },
+    ]);
+    expect(parsed.components).toHaveLength(2);
+  });
+});
+
+describe('identifier classification', () => {
+  it('splits camelCase and snake_case before matching', () => {
+    expect(identifierWords('getTaxAmount_v2')).toEqual(['get', 'tax', 'amount', 'v2']);
+    expect(identifierWords('HTTPRetryPolicy')).toEqual(['http', 'retry', 'policy']);
+  });
+
+  it('matches words, not substrings — which is the difference between a classifier and a coincidence', () => {
+    // Every one of these hits on a substring search and means nothing: `tax` in
+    // `taxonomy`, `can` in `cancel`, `age` in `message`, `lock` in `blockquote`.
+    for (const name of ['getTaxonomy', 'cancelOrder', 'renderMessage', 'parseBlockquote']) {
+      const hits = riskFacetsFor({ ...moneyComponent, modulePath: 'src/ui.ts', exportName: name, propsSummary: null }).hits;
+      const coincidental = hits.filter((hit) => hit.where === 'EXPORT_NAME');
+      // `parseBlockquote` legitimately matches VALIDATION on `parse`; what must
+      // not appear is a match on the substring.
+      expect(coincidental.map((hit) => hit.word)).not.toContain('tax');
+      expect(coincidental.map((hit) => hit.word)).not.toContain('can');
+      expect(coincidental.map((hit) => hit.word)).not.toContain('age');
+      expect(coincidental.map((hit) => hit.word)).not.toContain('lock');
+    }
+  });
+
+  it('counts each facet ONCE however many of its words hit', () => {
+    // Otherwise a wordy name outranks an important one for being wordy.
+    const wordy = riskFacetsFor({
+      ...moneyComponent,
+      exportName: 'applyDiscountToInvoiceTotalPriceAmount',
+      modulePath: 'src/x.ts',
+      propsSummary: null,
+    });
+    const terse = riskFacetsFor({
+      ...moneyComponent,
+      exportName: 'chargeCard',
+      modulePath: 'src/x.ts',
+      propsSummary: null,
+    });
+    expect(wordy.score).toBe(terse.score);
+    expect(wordy.hits.length).toBeGreaterThan(terse.hits.length);
+  });
+
+  it('reads the MODULE PATH, which is how an unnamed function is caught at all', () => {
+    // `apply` in `src/billing/discounts.ts` is money code and its name says
+    // nothing. This is the function a name-only classifier misses.
+    const hit = riskFacetsFor({
+      ...moneyComponent,
+      exportName: 'apply',
+      modulePath: 'src/billing/discounts.ts',
+      propsSummary: null,
+    });
+    expect(hit.leadFacet).toBe('MONEY');
+    expect(hit.hits.some((h) => h.where === 'MODULE_PATH')).toBe(true);
+  });
+
+  it('reads PARAMETER names, so a neutral name with a money argument still ranks', () => {
+    const hit = riskFacetsFor({
+      ...moneyComponent,
+      exportName: 'apply',
+      modulePath: 'src/util.ts',
+      propsSummary: 'props: subtotal, rate',
+    });
+    expect(hit.hits.some((h) => h.where === 'PARAMETER' && h.word === 'subtotal')).toBe(true);
+  });
+
+  it('ranks money and permission above the other three', () => {
+    const score = (exportName: string): number =>
+      riskFacetsFor({ ...moneyComponent, exportName, modulePath: 'src/x.ts', propsSummary: null })
+        .score;
+    // Silent defects outrank loud ones: a wrong total is charged and a wrong
+    // permission is granted, and neither raises anything.
+    expect(score('priceCart')).toBeGreaterThan(score('validateInput'));
+    expect(score('canEditOrder')).toBeGreaterThan(score('validateInput'));
+    expect(score('validateInput')).toBeGreaterThan(score('nextRenewalDate'));
+  });
+
+  it('breaks a tie by the declared facet order, not by iteration order', () => {
+    // A function on both MONEY and DATE_MATH is titled after MONEY, every time,
+    // because the lead facet is a function of the vocabulary.
+    const hit = riskFacetsFor({
+      ...moneyComponent,
+      exportName: 'invoiceDueDate',
+      modulePath: 'src/x.ts',
+      propsSummary: null,
+    });
+    expect(hit.leadFacet).toBe('MONEY');
+  });
+
+  it('derives its facet list from the declaration rather than restating it', () => {
+    expect([...UNIT_RISK_FACET_LIST].sort()).toEqual([...UNIT_RISK_FACETS].sort());
+  });
+
+  it('reads parameter names off the one-line summary, and nothing else', () => {
+    expect(parameterNames('props: items, discountCode, taxRate')).toEqual([
+      'items',
+      'discountCode',
+      'taxRate',
+    ]);
+    // Null is a real answer and must not become a fabricated parameter.
+    expect(parameterNames(null)).toEqual([]);
+    expect(parameterNames('props: ')).toEqual([]);
+  });
+});
+
+describe('ranking the inventory', () => {
+  const ranked = (components: unknown[], paths: string[] = []) =>
+    rankUnitSubjects(withComponents(components), paths);
+
+  it('is byte-identical for the same analysis, twice', () => {
+    // Distinct parameter lists on purpose: the shared `taxRate` on
+    // `moneyComponent` would put MONEY on all three and make this test about
+    // the fixture rather than about the ranking.
+    const components = [
+      { ...moneyComponent, exportName: 'priceCart', modulePath: 'src/b.ts', propsSummary: 'props: items' },
+      { ...moneyComponent, exportName: 'canEdit', modulePath: 'src/a.ts', propsSummary: 'props: actor' },
+      { ...moneyComponent, exportName: 'validateZip', modulePath: 'src/c.ts', propsSummary: 'props: zip' },
+    ];
+    // No clock, no Math.random: re-analysing an unchanged repository has to
+    // propose the same functions in the same order or the approval screen
+    // reshuffles between runs.
+    const a = JSON.stringify(ranked(components).subjects.map((s) => s.component.exportName));
+    const b = JSON.stringify(ranked(components).subjects.map((s) => s.component.exportName));
+    expect(a).toBe(b);
+    expect(JSON.parse(a)).toEqual(['priceCart', 'canEdit', 'validateZip']);
+  });
+
+  it('does not depend on the order the producer emitted them in', () => {
+    const forwards = [
+      { ...moneyComponent, exportName: 'validateZip', modulePath: 'src/c.ts' },
+      { ...moneyComponent, exportName: 'priceCart', modulePath: 'src/b.ts' },
+    ];
+    const names = (components: unknown[]) =>
+      ranked(components).subjects.map((s) => s.component.exportName);
+    expect(names(forwards)).toEqual(names([...forwards].reverse()));
+  });
+
+  it('keeps a PAGE off this axis, because its route is already proposed', () => {
+    // One surface in two denominators is the defect `componentHasOwnAxis` was
+    // written to prevent — arriving here from two producers that AGREE.
+    const result = ranked([
+      { ...moneyComponent, kind: 'PAGE', exportName: 'CheckoutPage' },
+      { ...moneyComponent, kind: 'LAYOUT', exportName: 'BillingLayout' },
+      moneyComponent,
+    ]);
+    expect(result.onOtherAxis).toBe(2);
+    expect(result.subjects).toHaveLength(1);
+  });
+
+  it('counts the exports it did not rank rather than letting them vanish', () => {
+    const result = ranked([
+      moneyComponent,
+      { ...moneyComponent, exportName: 'formatLabel', modulePath: 'src/ui/label.ts', propsSummary: null },
+      { ...moneyComponent, exportName: 'Spinner', modulePath: 'src/ui/spinner.ts', propsSummary: null, kind: 'COMPONENT' },
+    ]);
+    // Not proposed AND not silently gone: an unranked export is an uncovered
+    // surface, and the number is what makes that readable.
+    expect(result.subjects).toHaveLength(1);
+    expect(result.unranked).toBe(2);
+  });
+
+  it('finds an existing test beside a module, in the recorded paths', () => {
+    expect(likelyTestPaths('src/billing/pricing.ts', ['src/billing/pricing.test.ts'])).toEqual([
+      'src/billing/pricing.test.ts',
+    ]);
+    expect(likelyTestPaths('src/pricing.ts', ['src/__tests__/pricing.spec.ts'])).toEqual([
+      'src/__tests__/pricing.spec.ts',
+    ]);
+    expect(likelyTestPaths('app/pricing.py', ['app/test_pricing.py'])).toEqual([
+      'app/test_pricing.py',
+    ]);
+  });
+
+  it('does not call an unrelated file a test for this module', () => {
+    // `src/testUtils.ts` is not a test for itself, and a sibling module's test
+    // is not this module's test. A regex over anything containing "test" says
+    // both are.
+    expect(likelyTestPaths('src/testUtils.ts', ['src/testUtils.ts'])).toEqual([]);
+    expect(likelyTestPaths('src/pricing.ts', ['src/checkout.test.ts'])).toEqual([]);
+  });
+
+  it('answers nothing when no path list was read, which is not "it has no tests"', () => {
+    // The distinction the plan carries: an empty result here means nobody
+    // looked, and the item says so in those words.
+    expect(likelyTestPaths('src/pricing.ts', [])).toEqual([]);
+  });
+});
+
+describe('a UNIT_GEN plan item', () => {
+  const itemFor = (components: unknown[] = [moneyComponent], paths: string[] = []) =>
+    scenariosFromSource(
+      withComponents(components),
+      allTypes(['UNIT_GEN']),
+      [],
+      paths,
+    );
+
+  it('names the file, the export and the WORD that classified it', () => {
+    const item = itemFor().items[0]!;
+    // Evidence-shaped, like every other producer here — and naming the word is
+    // what lets a reviewer say "no, `charge` there is an electric charge".
+    expect(item.rationale).toContain('src/billing/pricing.ts');
+    expect(item.rationale).toContain('priceCart');
+    expect(item.rationale).toMatch(/the word "(price|billing|pricing|taxRate|tax)"/);
+    expect(item.rationale).toContain(STATIC_ONLY_SENTENCE);
+  });
+
+  it('says outright that the BODY, the TYPES and the RETURN were not read', () => {
+    const item = itemFor().items[0]!;
+    // The one sentence that stops a green unit test being read as proof the
+    // signature is honoured. Without it the item reads as though someone looked
+    // at the function.
+    expect(item.rationale).toMatch(/BODY/);
+    expect(item.rationale).toMatch(/parameter NAMES only/);
+    expect(item.assertions.join(' ')).toMatch(/Do not read a pass here as proof/);
+  });
+
+  it('asserts a defect CLASS, never what the function computes', () => {
+    const item = itemFor().items[0]!;
+    const text = `${item.title} ${item.rationale} ${item.assertions.join(' ')}`;
+    // The line this producer will not cross. A rationale that said what the
+    // arithmetic should be would be inventing the only fact nobody read.
+    expect(item.assertions[0]).toMatch(/never returns a negative/);
+    expect(text).not.toMatch(/returns \d/);
+    expect(text).not.toMatch(/should equal/);
+  });
+
+  it('carries no auth profile, because there is nobody to be in a unit test', () => {
+    const item = itemFor().items[0]!;
+    expect(item.authProfileId).toBeNull();
+  });
+
+  it('ranks money as a critical path and a date helper as merely important', () => {
+    expect(itemFor([moneyComponent]).items[0]!.priority).toBe('CRITICAL_PATH');
+    expect(
+      itemFor([
+        {
+          ...moneyComponent,
+          exportName: 'nextRenewalDate',
+          modulePath: 'src/schedule/renewal.ts',
+          propsSummary: 'props: startedAt, timezone',
+        },
+      ]).items[0]!.priority,
+    ).toBe('IMPORTANT');
+  });
+
+  it('tells the generator the parameter NAMES are facts and the types are not', () => {
+    const steps = itemFor().items[0]!.steps.join('\n');
+    expect(steps).toContain('items, discountCode, taxRate');
+    expect(steps).toMatch(/the names are from the source, the TYPES are not/);
+  });
+
+  it('proposes boundary cases over the parameters rather than ten happy paths', () => {
+    const item = itemFor().items[0]!;
+    const cases = item.steps.filter((step) => /^\[/.test(step));
+    expect(cases.length).toBeGreaterThan(1);
+  });
+
+  it('asserts no rejection that rests on a parameter being required', () => {
+    /*
+     * `propsSummaryFor` strips everything after `[:=]`, so `{ qty = 1 }` and
+     * `{ qty }` are the same string here and optionality is unread.
+     *
+     * Declaring the parameters `required` adds exactly two cases to the
+     * expansion — `empty -> rejected` and `whitespace-only -> rejected` — and
+     * both assert a refusal a DEFAULTED parameter is right not to perform. So
+     * the test is on those two classes by name and on the EXPECTATION, not on
+     * a class name the vocabulary does not contain: an assertion against
+     * /MISSING_REQUIRED/ passes no matter what this code does, because
+     * `EQUIVALENCE_CLASSES` has no such member. (It did, and this mutation
+     * survived until the assertion was written against the real output.)
+     */
+    const item = itemFor().items[0]!;
+    const cases = item.steps.filter((step) => /^\[/.test(step));
+    expect(cases.length, 'there are cases to inspect').toBeGreaterThan(0);
+
+    for (const step of cases) {
+      expect(step, 'a rejection that rests on absence').not.toMatch(
+        /^\[(empty|whitespace-only)\].*expect it to be rejected/,
+      );
+    }
+    expect(cases.join('\n')).not.toMatch(/^\[empty\]/m);
+    expect(cases.join('\n')).not.toMatch(/^\[whitespace-only\]/m);
+    expect(item.assertions.join(' ')).toMatch(/whether it is optional/);
+  });
+
+  it('says there is nothing to vary when no parameter name was recorded', () => {
+    const item = itemFor([{ ...moneyComponent, propsSummary: null }]).items[0]!;
+    expect(item.steps.join('\n')).toMatch(/recorded no parameter names for it/);
+    expect(item.assertions.join(' ')).toMatch(/any input variation at all/);
+  });
+
+  it('points at an existing test instead of restating it, when one was found', () => {
+    const item = itemFor([moneyComponent], ['src/billing/pricing.test.ts']).items[0]!;
+    expect(item.rationale).toContain('src/billing/pricing.test.ts');
+    expect(item.rationale).toMatch(/extend them rather than restate them/);
+    expect(item.assertions.join(' ')).toMatch(/Nothing here duplicates an assertion already made/);
+  });
+
+  it('does not claim a module has no tests when no paths were read', () => {
+    const item = itemFor([moneyComponent], []).items[0]!;
+    expect(item.rationale).toMatch(/in the recorded paths/);
+    expect(item.rationale).not.toMatch(/has no tests/);
+  });
+
+  it('groups by the feature its directory names, not by `src`', () => {
+    expect(itemFor().items[0]!.feature).toBe('Billing');
+    expect(
+      itemFor([{ ...moneyComponent, modulePath: 'src/pricing.ts' }]).items[0]!.feature,
+    ).toBe('Pricing');
+  });
+
+  it('is stable: the same analysis produces the same item id', () => {
+    expect(itemFor().items[0]!.id).toBe(itemFor().items[0]!.id);
+    expect(itemFor().items[0]!.id).toMatch(/^source:unit:/);
+  });
+});
+
+describe('what the UNIT_GEN producer discloses', () => {
+  const derive = (components: unknown[], paths: string[] = []) =>
+    scenariosFromSource(withComponents(components), allTypes(['UNIT_GEN']), [], paths);
+
+  const why = (derived: ReturnType<typeof derive>, needle: RegExp): string | undefined =>
+    derived.skipped.find((entry) => needle.test(entry.what))?.why;
+
+  it('counts the cap that bit, with the number and the reason', () => {
+    const many = Array.from({ length: MAX_UNIT_ITEMS + 4 }, (_unused, index) => ({
+      ...moneyComponent,
+      modulePath: `src/billing/m${index}.ts`,
+      exportName: `priceThing${index}`,
+    }));
+    const derived = derive(many);
+
+    expect(derived.items).toHaveLength(MAX_UNIT_ITEMS);
+    // A cap applied without being disclosed is the undisclosed cap that makes a
+    // percentage go up.
+    expect(why(derived, /further ranked function/)).toMatch(
+      new RegExp(`only the top ${MAX_UNIT_ITEMS} by risk`),
+    );
+  });
+
+  it('tells "the repository exports none" apart from "nobody looked"', () => {
+    const derived = derive([]);
+    expect(derived.items).toHaveLength(0);
+    // Two states that arrive here identically, and the next action differs.
+    expect(why(derived, /Unit/i)).toMatch(/re-import the source to tell those two apart/);
+  });
+
+  it('counts the pages it kept off the axis, rather than going quiet', () => {
+    const derived = derive([
+      { ...moneyComponent, kind: 'PAGE', exportName: 'CheckoutPage' },
+      moneyComponent,
+    ]);
+    expect(why(derived, /page and layout export/)).toMatch(/one surface in two denominators/);
+  });
+
+  it('counts the unranked exports, because they are uncovered and not absent', () => {
+    const derived = derive([
+      moneyComponent,
+      { ...moneyComponent, exportName: 'formatLabel', modulePath: 'src/ui/label.ts', propsSummary: null },
+    ]);
+    const reason = why(derived, /other exported function/);
+    expect(reason).toMatch(/They are not covered and they are not proposed/);
+    expect(reason).toMatch(/Ask for one by hand if a name is misleading/);
+  });
+
+  it('counts the inventory in the totals, so the denominator is readable', () => {
+    // A distinct export, because (module, exportName) is the identity and the
+    // same pair twice is correctly ONE subject — which this assertion would
+    // otherwise be quietly measuring instead.
+    const derived = derive([
+      moneyComponent,
+      { ...moneyComponent, kind: 'PAGE', exportName: 'CheckoutPage' },
+    ]);
+    expect(derived.totals.components).toBe(2);
+  });
+
+  it('pairs each surviving item with its subject', () => {
+    const many = Array.from({ length: MAX_UNIT_ITEMS + 2 }, (_unused, index) => ({
+      ...moneyComponent,
+      modulePath: `src/billing/m${index}.ts`,
+      exportName: `priceThing${index}`,
+    }));
+    const derived = derive(many);
+
+    expect(derived.unitSubjects).toHaveLength(derived.items.length);
+    const ids = new Set(derived.items.map((item) => item.id));
+    expect(derived.unitSubjects.every((pair) => ids.has(pair.itemId))).toBe(true);
+  });
+
+  it('drops the subject of an item the PLAN-WIDE cap deferred', () => {
+    /*
+     * The case the test above cannot reach. MAX_UNIT_ITEMS (8) bites first, so
+     * eight unit items always survive MAX_PLAN_ITEMS (40) and the filter never
+     * fires — the assertion passed with the filter replaced by `() => true`.
+     *
+     * To make the plan cap bite on a unit item it has to be OUTRANKED: forty
+     * guarded routes are CRITICAL_PATH, a date-arithmetic helper is IMPORTANT,
+     * and the unit items land below the cut. A subject left behind here would
+     * have the generator fetch a module's source, fence it and fingerprint it
+     * for a row that is not on the approval screen.
+     */
+    const crowded = parseCodebaseAnalysis({
+      routes: Array.from({ length: MAX_PLAN_ITEMS }, (_unused, index) => ({
+        path: `/page-${index}`,
+        file: `app/page-${index}/page.tsx`,
+        behindAuth: true,
+        authEvidence: 'middleware matcher',
+      })),
+      components: [
+        {
+          ...moneyComponent,
+          exportName: 'nextRenewalDate',
+          modulePath: 'src/schedule/renewal.ts',
+          propsSummary: 'props: startedAt',
+        },
+      ],
+    })!;
+    const derived = scenariosFromSource(crowded, allTypes(['SMOKE', 'UNIT_GEN']));
+
+    expect(derived.items).toHaveLength(MAX_PLAN_ITEMS);
+    expect(
+      derived.items.some((item) => item.testType === 'UNIT_GEN'),
+      'the unit item was deferred by the plan cap',
+    ).toBe(false);
+    expect(derived.unitSubjects).toEqual([]);
+  });
+
+  it('proposes nothing at all when UNIT_GEN was not asked for', () => {
+    const derived = scenariosFromSource(withComponents([moneyComponent]), allTypes(['SMOKE']));
+    expect(derived.items.every((item) => item.testType !== 'UNIT_GEN')).toBe(true);
+    expect(derived.unitSubjects).toEqual([]);
+  });
+
+  it('is requestable, and is not in the no-preference default', () => {
+    // Derivable, so a stored request for it is honoured rather than refused...
+    expect(resolveTestTypeChoice(['UNIT_GEN']).types).toEqual(['UNIT_GEN']);
+    // ...and absent from the default, because it needs a materialised checkout
+    // to execute and a model to write. Both are honest outcomes for a type
+    // somebody asked for and neither is an acceptable surprise.
+    expect(DEFAULT_TEST_TYPES).not.toContain('UNIT_GEN');
+  });
+});
+
+describe('the processor on a plan that carries unit items', () => {
+  beforeEach(() => {
+    h.events = [];
+    h.generated = [];
+    h.apiKey = '';
+  });
+
+  /** A project that asked for unit tests, with the inventory on the row. */
+  const unitProject = () => ({
+    id: 'p1',
+    codebaseAnalysis: rawAnalysis,
+    testTypePreference: ['UNIT_GEN'],
+  });
+
+  const skipsOf = (recorded: ReturnType<typeof stubPrisma>): Array<{ what: string; why: string }> =>
+    (recorded.plans[0] as { skipped: Array<{ what: string; why: string }> }).skipped;
+
+  it('says the existing-test check was not made when no path list was recorded', async () => {
+    const recorded = stubPrisma(unitProject(), { id: 'e1', baseUrl: 'https://shop.example' });
+    // `stubPrisma`'s snapshot carries no `paths`, which is exactly the
+    // production state for a project ingested before the column was populated.
+    await processAnalyzeSource(job(), { loadAnalysedPaths: async () => null });
+
+    const skips = skipsOf(recorded);
+    // The lie this prevents: a unit item that silently reads as "this function
+    // has no tests" when nobody looked for one.
+    const entry = skips.find((s) => /already have tests/.test(s.what));
+    expect(entry, JSON.stringify(skips.map((s) => s.what))).toBeDefined();
+    expect(entry!.why).toMatch(/recorded no file list/);
+    expect(entry!.why).toMatch(/may duplicate a test you already have/);
+  });
+
+  it('does not say it when the path list WAS read', async () => {
+    const recorded = stubPrisma(unitProject(), { id: 'e1', baseUrl: 'https://shop.example' });
+    await processAnalyzeSource(job(), {
+      loadAnalysedPaths: async () => ['src/billing/pricing.ts', 'src/billing/pricing.test.ts'],
+    });
+
+    // Never a standing nag: the sentence reaches the plan only when it bites.
+    expect(skipsOf(recorded).some((s) => /already have tests/.test(s.what))).toBe(false);
+  });
+
+  it('says the function\'s source was not read, rather than leaving it implied', async () => {
+    const recorded = stubPrisma(unitProject(), { id: 'e1', baseUrl: 'https://shop.example' });
+    // No `openWorkspace`, which is every production caller today: this
+    // processor runs on an UPLOAD, before any run has materialised anything.
+    await processAnalyzeSource(job(), { loadAnalysedPaths: async () => [] });
+
+    const entry = skipsOf(recorded).find((s) => /Reading the source of/.test(s.what));
+    expect(entry).toBeDefined();
+    expect(entry!.why).toMatch(/no checkout of your repository was available/);
+    expect(entry!.why).toMatch(/parameter NAMES/);
+    // And it must not be read as a fact about the customer's code.
+    expect(entry!.why).toMatch(/never about what the function computes/);
+  });
+
+  it('stops saying it once a checkout IS available', async () => {
+    const recorded = stubPrisma(unitProject(), { id: 'e1', baseUrl: 'https://shop.example' });
+    await processAnalyzeSource(job(), {
+      loadAnalysedPaths: async () => [],
+      // The injected reader — no disk, no network, no checkout. The seam is
+      // what makes this provable at all.
+      openWorkspace: async () => ({
+        read: async (relPath: string) =>
+          relPath === 'src/billing/pricing.ts'
+            ? { kind: 'FILE' as const, text: 'export const priceCart = (items) => items.length;' }
+            : { kind: 'ABSENT' as const },
+      }),
+    });
+
+    expect(skipsOf(recorded).some((s) => /Reading the source of/.test(s.what))).toBe(false);
+  });
+});
+
+describe('the default path-list loader', () => {
+  beforeEach(() => {
+    h.events = [];
+    h.generated = [];
+    h.apiKey = '';
+  });
+
+  const unitProject = () => ({ id: 'p1', testTypePreference: ['UNIT_GEN'] });
+
+  const skipsOf = (recorded: ReturnType<typeof stubPrisma>): Array<{ what: string; why: string }> =>
+    (recorded.plans[0] as { skipped: Array<{ what: string; why: string }> }).skipped;
+
+  /*
+   * These run the DEFAULT loader — no `loadAnalysedPaths` dep — because that is
+   * where the null-versus-`[]` decision actually lives. Injecting the dep in
+   * every test left the default free to return `[]` for an unreadable column,
+   * and a mutation doing exactly that survived: the plan then stops saying the
+   * existing-test check was not made, and every unit item quietly reads as
+   * "this function has no tests".
+   */
+  it('reads a recorded path list off the snapshot and matches a test file to a module', async () => {
+    const recorded = stubPrisma(
+      unitProject(),
+      { id: 'e1', baseUrl: 'https://shop.example' },
+      { analysis: rawAnalysis, paths: ['src/billing/pricing.ts', 'src/billing/pricing.test.ts'] },
+    );
+    await processAnalyzeSource(job());
+
+    const items = (recorded.plans[0] as { items: { create: PlanItem[] } }).items.create;
+    const unit = items.find((item) => item.testType === 'UNIT_GEN');
+    expect(unit, 'a unit item was proposed').toBeDefined();
+    expect(unit!.rationale).toContain('src/billing/pricing.test.ts');
+    expect(skipsOf(recorded).some((s) => /already have tests/.test(s.what))).toBe(false);
+  });
+
+  it('answers NULL for an unreadable column, so the plan says nobody looked', async () => {
+    const recorded = stubPrisma(
+      unitProject(),
+      { id: 'e1', baseUrl: 'https://shop.example' },
+      // Not an array: a snapshot written by an older ingest. `[]` here would
+      // read as "the ingest looked and the repository has no files".
+      { analysis: rawAnalysis, paths: { nope: true } },
+    );
+    await processAnalyzeSource(job());
+
+    expect(skipsOf(recorded).some((s) => /already have tests/.test(s.what))).toBe(true);
+  });
+
+  it('asks Postgres for the paths column by name', async () => {
+    /*
+     * `stubPrisma`'s `findFirst` ignores `select` and returns the whole stub
+     * object, so a loader that selected the wrong column still read the right
+     * value from the double — a mutation changing `select: { paths: true }` to
+     * `{ id: true }` survived every test above. In production that select is
+     * the query, and a column left out of it comes back undefined.
+     */
+    const selects: unknown[] = [];
+    stubPrisma(
+      unitProject(),
+      { id: 'e1', baseUrl: 'https://shop.example' },
+      { analysis: rawAnalysis, paths: ['src/billing/pricing.ts'] },
+    );
+    const snapshots = (h.prisma as { codebaseSnapshot: { findFirst: (a: unknown) => unknown } })
+      .codebaseSnapshot;
+    const passthrough = snapshots.findFirst;
+    snapshots.findFirst = (args: unknown) => {
+      selects.push((args as { select?: unknown }).select);
+      return passthrough(args);
+    };
+
+    await processAnalyzeSource(job());
+    expect(selects).toContainEqual({ paths: true });
+  });
+
+  it('answers NULL for an empty column too, for the same reason', async () => {
+    const recorded = stubPrisma(
+      unitProject(),
+      { id: 'e1', baseUrl: 'https://shop.example' },
+      { analysis: rawAnalysis, paths: [] },
+    );
+    await processAnalyzeSource(job());
+
+    // A repository with no files is not a thing that happens, so an empty
+    // column is a column nobody populated.
+    expect(skipsOf(recorded).some((s) => /already have tests/.test(s.what))).toBe(true);
   });
 });

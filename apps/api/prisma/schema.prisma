@@ -1348,6 +1348,43 @@ model PlanItem {
   /// because the id is a hash and tells a reader nothing. Text, not an enum —
   /// see `Project.closureApprovalPolicy` for why.
   gapKind         String?
+  /// THE MATRIX CELLS THIS ITEM ASKS FOR, and the cap that was applied.
+  ///
+  /// `TestMatrix` in packages/shared/src/schemas.ts — a cell list, the full
+  /// product size it was taken from, and a nullable `capBite`. Json for the same
+  /// reason `steps` and `assertions` are: it is a list of structured values with
+  /// no read that filters on their contents, and a column per axis would be a
+  /// migration per axis.
+  ///
+  /// NULL MEANS NOBODY DECLARED A MATRIX, which is NOT the same as an empty cell
+  /// list. An empty list is the unvaried single run every test in this product
+  /// has always been — a decision. Null is the absence of one, and it is what
+  /// every row written before this column existed is. The distinction matters
+  /// because the approval screen shows "runs in 12 cells" for one and nothing at
+  /// all for the other, and defaulting null to `{ cells: [] }` would claim a
+  /// decision the proposer never made.
+  ///
+  /// The cap travels INSIDE it on purpose. A cell list expanded under a limit
+  /// that bit is a SAMPLE, and a reader handed the list alone cannot tell it
+  /// from a matrix somebody chose — so any percentage over it would read as a
+  /// percentage over the matrix.
+  matrixCells     Json?
+  /// THE BROWSER ENVIRONMENT BLOCK this item needs — geolocation, permissions,
+  /// fake media, clipboard, throttling, offline, forced-colors, device scale and
+  /// HTTP credential NAMES.
+  ///
+  /// `BrowserEnvironment` in packages/shared/src/browser-matrix.ts. Every field
+  /// is optional and ABSENT MEANS THE BROWSER'S OWN DEFAULT, which is why the
+  /// column is nullable with no default: a defaulted block would be a set of
+  /// fabricated values, and a defaulted geolocation in particular would make
+  /// every location-dependent test pass at 0,0 — Null Island, a real coordinate
+  /// the browser accepts, somewhere nobody chose.
+  ///
+  /// NEVER A CREDENTIAL. `httpCredentials` carries secret NAMES only; the schema
+  /// is `.strict()` and has no password property, so an extra one is refused
+  /// rather than stored. Same guarantee, and same argument, as the provider
+  /// catalogue's entry shape.
+  browserEnv      Json?
   state           PlanItemState @default(PROPOSED)
   decidedBy       String?
   decidedAt       DateTime?
@@ -1482,6 +1519,19 @@ model Test {
   /// ordinary case for every hand-written and imported test — there is no
   /// fourth state between "declares nothing" and "declares an empty list".
   covers      String[]  @default([])
+  /// THE MATRIX CELLS AND THE ENVIRONMENT BLOCK, copied across when the
+  /// Generator turns a `PlanItem` into a test. Identical contract, identical
+  /// null semantics and identical no-credential guarantee — see the long notes
+  /// on `PlanItem.matrixCells` and `PlanItem.browserEnv`.
+  ///
+  /// Beside `spec` rather than inside it, and the reason is the only thing worth
+  /// adding here: `spec` is TYPE-SPECIFIC and is parsed by exactly one plugin,
+  /// while a matrix cell set and an environment block are read by the harness
+  /// BEFORE any plugin is chosen — the browser is launched from them. Burying
+  /// them in `spec` would mean the harness parsing nineteen different shapes to
+  /// find out what browser to start.
+  matrixCells Json?
+  browserEnv  Json?
   disabledAt  DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
@@ -2718,6 +2768,32 @@ model VisualBaseline {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   test    Test    @relation(fields: [testId], references: [id], onDelete: Cascade)
 
+  /// FOUR MEMBERS AND NOT SIX, DELIBERATELY, NOW THAT A VISUAL TEST HAS A MATRIX.
+  ///
+  /// This round lets one VISUAL test declare viewports, colour schemes, reduced
+  /// motion and the interaction STATES to reach first, and the obvious reading is
+  /// that this key needs two more columns — otherwise a light and a dark capture
+  /// of one test upsert onto ONE row, whichever ran last becomes the other's
+  /// reference, and every later diff is measured against the wrong rendering.
+  /// That is the shared-baseline defect `environmentId` was added to kill,
+  /// multiplied by the number of cells.
+  ///
+  /// It does not, because `viewport` and `browser` ARE the cell. Every writer
+  /// goes through `baselineViewportKey(cell, state)` and `variantBrowserKey(cell)`
+  /// in packages/shared/src/browser-matrix.ts, which pack the device, the colour
+  /// scheme, the motion preference, the forced-colors mode and the state into the
+  /// first and the engine, channel and version pin into the second — so
+  /// `1280x800+dark` and `1280x800+light` are already different rows under this
+  /// key, with no column and no index change.
+  ///
+  /// Two properties make that the better trade rather than a dodge. An unvaried
+  /// DEFAULT-state cell produces `1280x800` byte for byte, which is exactly what
+  /// the pre-matrix writer wrote — so no existing baseline stops matching and
+  /// nobody is forced into a re-approval sweep by a migration. And a six-column
+  /// unique here would have derived the name
+  /// "VisualBaseline_testId_viewport_browser_environmentId_cellKey_state_key" at
+  /// 69 bytes, which PostgreSQL TRUNCATES AT 63 SILENTLY — permanent phantom
+  /// drift on every `migrate dev`, which an earlier round already paid for once.
   @@unique([testId, viewport, browser, environmentId])
   @@index([orgId])
   /// "every baseline for this environment" — the read a per-environment
@@ -4283,6 +4359,77 @@ enum DeploymentCapabilityStatus {
   MISSING
   WRONG_VERSION
   NOT_CHECKED
+}
+
+/// Whether this deployment could run ONE CELL of a matrix. Mirrors
+/// MATRIX_CELL_STATUSES in packages/shared/src/browser-matrix.ts.
+///
+/// ── WHY SIX WHERE DeploymentCapabilityStatus HAS FOUR ───────────────────────
+///
+/// That enum answers "can this deployment execute this TEST TYPE", where every
+/// negative answer is an install or an upgrade. A CELL has two more ways to
+/// fail, and neither has a remedy anybody can act on by installing something:
+///
+///   UNSUPPORTED_COMBINATION -- no deployment anywhere can run it, because the
+///       combination does not exist. There is no Firefox beta channel and no
+///       WebKit canary. Reporting it as MISSING sends a reader to install a
+///       build that was never published; reporting it as SKIPPED hides an
+///       authoring mistake inside a percentage.
+///   NEEDS_BROWSER_GRID -- the request is coherent and this image can never
+///       serve it. A pinned Safari or Firefox VERSION means a released consumer
+///       browser, and Playwright ships one patched build of each with no
+///       channels; its webkit is NOT Safari. The remedy is a hosted grid or a
+///       device farm, which is a purchase.
+///
+/// NOT_CHECKED carries the same warning as its twin above and for the same
+/// reason: an unprobed cell stays in the denominator, because dropping it would
+/// let a deployment that never ran a preflight silently shed every cell it could
+/// not prove it could run, and the percentage would rise for a probe nobody
+/// executed.
+///
+/// An enum and not a TEXT column because it is GROUPED ON: "how many of this
+/// run's cells did we refuse, and for which of the six reasons" is the question
+/// that stops a matrix percentage from including cells that cannot run.
+enum MatrixCellStatus {
+  AVAILABLE
+  MISSING
+  WRONG_VERSION
+  NOT_CHECKED
+  UNSUPPORTED_COMBINATION
+  NEEDS_BROWSER_GRID
+}
+
+/// WHY A RESULT DOES NOT CARRY THE ASSERTION IT IS SUPPOSED TO. Mirrors
+/// UNASSERTED_REASONS in packages/shared/src/test-type-decl.ts.
+///
+/// ── The defect, which is the headline one of this round ─────────────────────
+///
+/// CHECKOUT COULD BE CLICKED THROUGH AND THE MONEY PATH COULD NOT BE ASSERTED:
+/// no 3DS, no decline, no insufficient funds, no webhook transition, no refund,
+/// no partial capture -- and the result of clicking through it was a PASS. The
+/// same shape runs through every type this round adds. A plugin that cannot make
+/// an assertion now records WHICH ONE and WHY, so a pass with a non-empty
+/// `notAsserted` is a pass with a stated hole in it that the gate can refuse to
+/// count. A pass with nothing recorded is the lie.
+///
+/// NOT_IMPLEMENTED is the weakest member and is deliberately distinct from
+/// CAPABILITY_ABSENT: one is a roadmap item and the other is a Dockerfile line,
+/// and a report that merged them would send a customer to install something that
+/// does not exist.
+///
+/// An enum because the one question that makes the column useful -- "how often,
+/// across this project, did we fail to assert the webhook transition" -- is a
+/// GROUP BY and not a regex over a sentence. Same argument as the migration that
+/// moved the mutation score out of a Step TITLE.
+enum UnassertedReason {
+  CAPABILITY_ABSENT
+  PROVIDER_TEST_MODE_LIMIT
+  UNREACHABLE_BEHIND_BOT_PROTECTION
+  REQUIRES_PROVISIONED_SANDBOX
+  WOULD_MUTATE_PROTECTED_DATA
+  CAP_BIT
+  SURFACE_UNREACHED
+  NOT_IMPLEMENTED
 }
 
 /// Whether a seeded defect was found. Mirrors FAULT_DETECTION_OUTCOMES.
@@ -6798,11 +6945,115 @@ model TestResultVariant {
   /// defaulting it would put a claim in the database that nothing produced.
   notRunKind       NotRunKind?
 
+  /// THE RESOLVED CELL, in full.
+  ///
+  /// The five TEXT dimensions above cannot express a browser CHANNEL, a device
+  /// scale factor, a colour scheme, a reduced-motion preference or a
+  /// forced-colors mode — and those are precisely the axes a widened matrix
+  /// varies. `variantBrowserKey` and `variantViewportKey` in
+  /// packages/shared/src/browser-matrix.ts pack what fits into `browser` and
+  /// `viewport`, which stay the IDENTITY and keep the six-column unique index
+  /// doing its job; this column is the detail behind that identity.
+  ///
+  /// Json and not twelve columns, on the same judgement `TestMetricSample`
+  /// records: the axis set is open — a cell kind nobody has thought of yet is a
+  /// migration per axis — and nothing filters rows on a cell's interior. The
+  /// reads are "this run's failures by cell" and "this test's history in this
+  /// cell", and both go through the indexed TEXT keys.
+  ///
+  /// NULL means the run was not varied, matching the table's own rule that an
+  /// unvaried execution writes no rows here at all.
+  matrixCell        Json?
+  /// WHETHER THIS DEPLOYMENT COULD RUN THIS CELL — the cell-level twin of
+  /// `DeploymentCapability.status`, and a different question from it.
+  ///
+  /// ── The defect ─────────────────────────────────────────────────────────────
+  ///
+  /// `notRunKind.UNSUPPORTED` answers "this deployment cannot execute this TEST
+  /// TYPE". It cannot answer "chromium ran and chrome-beta is not installed", so
+  /// a four-cell matrix with one unavailable channel recorded three real results
+  /// and one SKIPPED — indistinguishable from a placeholder nobody reached. A
+  /// matrix percentage then included a cell that can never fail.
+  ///
+  /// Six values where the type-level enum has four, because a CELL has two more
+  /// ways to fail and neither is an install: UNSUPPORTED_COMBINATION (no build
+  /// of that engine has that channel — there is no Firefox beta) and
+  /// NEEDS_BROWSER_GRID (a released consumer version, which only a hosted grid
+  /// can serve; Playwright's webkit is not Safari). Collapsing either into
+  /// MISSING sends a reader to install something that was never published.
+  ///
+  /// NULLABLE WITH NO DEFAULT, exactly like `notRunKind`: null means nobody
+  /// recorded a cell status, which is the honest reading of every row written
+  /// before this column existed and of any writer that made no claim. Defaulting
+  /// it to AVAILABLE would assert that every historical cell ran.
+  cellStatus        MatrixCellStatus?
+  /// What a human needs in order to fix it. Required beside MISSING,
+  /// WRONG_VERSION, UNSUPPORTED_COMBINATION and NEEDS_BROWSER_GRID — four
+  /// different next actions — and refused beside NOT_CHECKED, because there is
+  /// no remedy for a question nobody asked. Enforced by
+  /// `testResultVariantCellSchema`.
+  ///
+  /// NEVER A CREDENTIAL. This string is rendered in the run report and the
+  /// matrix view, so a remedy that embedded a token, a cookie or a storageState
+  /// value would be publishing it. Truncated and hashed both count as leaks.
+  cellRemedy        String?
+  /// WHAT THIS CELL DID NOT ASSERT.
+  ///
+  /// ── The headline defect of the round ───────────────────────────────────────
+  ///
+  /// CHECKOUT COULD BE CLICKED THROUGH AND THE MONEY PATH COULD NOT BE ASSERTED:
+  /// no 3DS, no decline, no insufficient funds, no webhook transition, no
+  /// refund, no partial capture — and the result of clicking through it was a
+  /// PASS. The same shape runs through every new type: a PWA result with no
+  /// service worker reached, a PUSH result with no transport, a DOCUMENT result
+  /// that downloaded a file and asserted nothing about its bytes. Every one of
+  /// them was a green row.
+  ///
+  /// So a pass with a non-empty `notAsserted` is a pass WITH A STATED HOLE IN
+  /// IT, and the gate can refuse to count it. A pass with nothing recorded is
+  /// the lie.
+  ///
+  /// `String[] @default([])`, and the empty default is honest here where it
+  /// would not be on a count: `[]` is the claim that this cell made every
+  /// assertion it was supposed to, which is exactly what a passing E2E cell is
+  /// claiming. There is no fourth state between "asserted everything" and "named
+  /// what it did not".
+  notAsserted       String[]          @default([])
+  /// WHY, as a groupable value.
+  ///
+  /// The one question that makes the column above useful is "how often, across
+  /// this project, did we fail to assert the webhook transition" — and that is a
+  /// GROUP BY, not a regex over a sentence. The same argument the migration that
+  /// moved the mutation score out of a Step TITLE makes at length.
+  ///
+  /// Required exactly when `notAsserted` is non-empty, enforced by
+  /// `testResultVariantCellSchema`: a hole with no reason cannot tell a missing
+  /// binary (a Dockerfile line) from a feature nobody has built (a roadmap item),
+  /// and a report that merged them would send a customer to install something
+  /// that does not exist.
+  notAssertedReason UnassertedReason?
+
   createdAt DateTime @default(now())
 
   testResult TestResult         @relation(fields: [testResultId], references: [id], onDelete: Cascade)
   metrics    TestMetricSample[]
 
+  /// "How many of this run's cells did we refuse, and for which of the six
+  /// reasons" -- the one read that makes `cellStatus` a GROUP BY instead of a
+  /// regex over a sentence, and therefore the one thing standing between a
+  /// matrix percentage and a percentage with cells in it that cannot run.
+  ///
+  /// Added alongside `[runId, status]` rather than widened into it: that index
+  /// serves "this run's failures by cell" and is the matrix view's own query, and
+  /// a three-column index is not the same read.
+  ///
+  /// NO INDEX FOR `notAssertedReason` yet, and the omission is deliberate rather
+  /// than forgotten. The rollup it wants is project-wide, this table has no
+  /// `projectId`, and a speculative index on a column whose reader does not
+  /// exist is dead weight on the largest evidence table in the product. The
+  /// per-run question is answered through this same index plus a filter. Add the
+  /// project-wide one with the surface that asks it.
+  @@index([runId, cellStatus])
   /// The cell's identity. THE ONE CONSTRAINT IN THIS ROUND THAT MUST BE NAMED
   /// EXPLICITLY: Prisma's derived name for a six-column unique is
   /// "TestResultVariant_testResultId_browser_viewport_locale_role_environment_key",

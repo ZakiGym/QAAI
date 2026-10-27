@@ -56,6 +56,142 @@ export const TEST_TYPE_LABELS: Record<TestType, string> = {
   PERFORMANCE: 'Performance budgets (Core Web Vitals)',
 };
 
+// ─── Test types that have a declaration and no minted member yet ─────────────
+//
+// ── THE DEFECT, AND WHY IT IS TWO LISTS AND NOT ONE ─────────────────────────
+//
+// `TEST_TYPES` above is not a list. It is a Postgres enum, `createTestSchema`,
+// the cockpit's filter chips, a compiler-exhaustive `Record` in @qaai/runner and
+// another in @qaai/agent, and — the part that decides this — `check:wiring`
+// FAILS a member with no runner plugin, saying "every test of this type is
+// recorded SKIPPED at run time". It is right to. A percentage containing tests
+// that cannot fail is the one lie this product cannot afford, and a minted type
+// with no plugin is exactly that.
+//
+// The runner already solved the mirror image. `PENDING_PLUGINS` in
+// packages/runner/src/registry.ts holds FIVE COMPLETE PLUGINS whose type is not
+// minted — DESKTOP, JOBS, LINKS, SEO and TENANCY — and `promotePendingPlugins`
+// moves each into the live table the moment the vocabulary names it, so that
+// "the shared edit alone is sufficient". What was missing was the other end: a
+// name a plugin, a spec schema, a preflight declaration and a plan item could
+// all be written against while the member does not exist yet.
+//
+// That is this list. A pending type is:
+//   · DECLARABLE — `PENDING_TEST_TYPE_DECLARATIONS` in ./test-type-decl.ts says
+//     what it needs, which producer may emit it and what it will NOT assert;
+//   · SPEC-VALIDATABLE — its spec schema lives in ./schemas.ts like any other;
+//   · NOT STORABLE — no `Test` row can carry it, because the Prisma `TestType`
+//     enum does not have it and `check:enums` would fail a Prisma value with no
+//     TypeScript twin.
+//
+// Not storable is the honest state of a type whose plugin is being written, and
+// it is strictly better than the alternative: six plugins landing in parallel,
+// each adding its own member to the array above, is six conflicting edits to one
+// file and a window in which `check:wiring` reports six failures that no agent
+// can tell apart from its own.
+//
+// ── THE MINT, WHICH IS ONE EDIT PER TYPE AND MUST BE ALL OF IT ──────────────
+//
+// See {@link mintTestTypeSteps}. All four steps go in ONE change: a member here
+// without a plugin fails `check:wiring`, a Prisma value without a member fails
+// `check:enums`, and a member without a Prisma value fails `check:wiring` too.
+// The three guards are deliberately mutually blocking, which is what makes a
+// half-finished mint impossible to ship.
+
+export const PENDING_TEST_TYPES = [
+  /** Electron, Tauri and WebView shells. Plugin: plugins/desktop.ts. */
+  'DESKTOP',
+  /** Queue consumers, cron entries, webhook receivers. Plugin: plugins/jobs.ts. */
+  'JOBS',
+  /** Link and asset edges a crawl discovered. Plugin: plugins/links.ts. */
+  'LINKS',
+  /** Title, canonical, hreflang, OG, JSON-LD, robots. Plugin: plugins/seo.ts. */
+  'SEO',
+  /** One tenant's session against another tenant's ids. Plugin: plugins/tenancy.ts. */
+  'TENANCY',
+  /** A dependency misbehaving, through the route interception har.ts already has. */
+  'CHAOS',
+  /** The money path: 3DS, declines, webhook transitions, refunds, partial capture. */
+  'PAYMENTS',
+  /** A produced file: invoice, statement, label, signed contract, export. */
+  'DOCUMENT',
+  /** Service worker, offline navigation, cache-first, background sync, install. */
+  'PWA',
+  /** A notification actually delivered: Web Push, APNs, FCM. */
+  'PUSH',
+  /** RTL mirroring, pseudo-localization, truncation, missing keys. */
+  'I18N_DEEP',
+] as const;
+export type PendingTestType = (typeof PENDING_TEST_TYPES)[number];
+
+/**
+ * Human labels, beside the list rather than in the web app, for the same reason
+ * `TEST_TYPE_LABELS` is: the surface that offers a type and the code that
+ * refuses it must not end up describing different things.
+ */
+export const PENDING_TEST_TYPE_LABELS: Record<PendingTestType, string> = {
+  DESKTOP: 'Desktop shell (Electron / Tauri)',
+  JOBS: 'Background jobs & webhooks',
+  LINKS: 'Links & assets',
+  SEO: 'SEO & metadata',
+  TENANCY: 'Cross-tenant isolation',
+  CHAOS: 'Dependency chaos',
+  PAYMENTS: 'Payments (test mode)',
+  DOCUMENT: 'Documents & downloads',
+  PWA: 'PWA & offline',
+  PUSH: 'Push notifications',
+  I18N_DEEP: 'Deep i18n (RTL, pseudo-loc, truncation)',
+};
+
+/**
+ * Every type name the product has a declaration for, minted or not.
+ *
+ * DERIVED, never hand-listed. A third array would be a third thing to forget,
+ * and this one is the denominator of "what can QAAI test" on every surface that
+ * answers that question.
+ */
+export const ANY_TEST_TYPES: readonly (TestType | PendingTestType)[] = [
+  ...TEST_TYPES,
+  ...PENDING_TEST_TYPES,
+];
+export type AnyTestType = TestType | PendingTestType;
+
+/** Narrows an untrusted string to a MINTED type — the only kind a row may hold. */
+export function isTestType(value: unknown): value is TestType {
+  return typeof value === 'string' && (TEST_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * Narrows to a PENDING type.
+ *
+ * Its one job is to let a caller say the right sentence. "QAAI cannot test your
+ * Electron app" and "QAAI can test your Electron app and you cannot create the
+ * test yet" are different facts with different remedies, and without this the
+ * second reads as the first — understating what the product does while
+ * overstating what a customer can reach.
+ */
+export function isPendingTestType(value: unknown): value is PendingTestType {
+  return typeof value === 'string' && (PENDING_TEST_TYPES as readonly string[]).includes(value);
+}
+
+/**
+ * The four edits that mint a pending type, in the order they must be made.
+ *
+ * A function returning sentences rather than a doc comment, because this is the
+ * text a refusal prints: `reasonUnsupported` in packages/runner/src/registry.ts
+ * already tells a reader "add it to TEST_TYPES in constants.ts", and it could
+ * only say two of the four steps. A remedy that is three-quarters complete sends
+ * somebody to ship a mint that fails a different guard.
+ */
+export function mintTestTypeSteps(type: PendingTestType): string[] {
+  return [
+    `Add '${type}' to TEST_TYPES in packages/shared/src/constants.ts and a label to TEST_TYPE_LABELS.`,
+    `Move its entry from PENDING_TEST_TYPE_DECLARATIONS to TEST_TYPE_DECLARATIONS in packages/shared/src/test-type-decl.ts.`,
+    `Add ${type} to enum TestType in apps/api/prisma/schema.prisma and write the migration (ALTER TYPE "TestType" ADD VALUE '${type}').`,
+    `Add an entry to TYPE_REQUIREMENTS in packages/runner/src/preflight.ts and to STRATEGIES in packages/agent/src/spec-strategies.ts — both are compiler-exhaustive Records over TestType, so neither package compiles until you do.`,
+  ];
+}
+
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────
 
 export const VERDICTS = ['REAL_BUG', 'INTENDED_CHANGE', 'FLAKE', 'ENV_ISSUE'] as const;

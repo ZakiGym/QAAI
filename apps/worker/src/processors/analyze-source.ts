@@ -66,16 +66,20 @@ import {
 } from '@qaai/agent';
 import {
   AUTH_SURFACE_KINDS,
+  COMPONENT_ITEM_KINDS,
   CREATABLE_TEST_TYPES,
   FORM_FIELD_SEMANTICS,
   TEST_TYPES,
   TEST_TYPE_LABELS,
+  componentHasOwnAxis,
 } from '@qaai/shared';
 import type {
   AuthSurfaceKind,
+  ComponentItemKind,
   FlowMap,
   FlowNode,
   FormField,
+  FormFieldSemantic,
   FormModel,
   PlanItem,
   Priority,
@@ -85,6 +89,11 @@ import type {
 } from '@qaai/shared';
 import { config, logger, prisma, publishEvent } from '../context.js';
 import { enqueueGenerate, type AnalyzeSourceJob } from '../queues.js';
+import {
+  readSourceUnderTest,
+  type SourceUnderTestContext,
+  type WorkspaceFileReader,
+} from '../lib/workspace.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The analysis this processor consumes
@@ -319,6 +328,44 @@ export interface SourceAuthSurface {
   form: SourceForm | null;
 }
 
+/**
+ * One exported function, hook or component — the UNIT_GEN denominator.
+ *
+ * Projected from `SourceComponent` in packages/shared/src/codebase.ts, which is
+ * what WRITES these, and deliberately narrower: the catalogue fields
+ * (`hasCatalogueEntry`, `catalogueRef`) and the render `states` belong to the
+ * component-inventory axis and say nothing about whether a FUNCTION is worth a
+ * unit test, so they are not read here rather than read and ignored.
+ *
+ * ── The ceiling on what this can know, which every sentence below respects ──
+ *
+ * `propsSummary` is produced by `propsSummaryFor`, which splits a destructured
+ * parameter list on `[:=]` and keeps the identifiers. So it carries PARAMETER
+ * NAMES and nothing else — no types, no arity for a positional signature, no
+ * return shape, no throw. And `model CodebaseSnapshot` says it outright: "the
+ * repo-relative paths that were analysed. No file contents."
+ *
+ * So this inventory can say WHICH function deserves a test and cannot say WHAT
+ * it does. A proposal that asserted "priceCart applies the discount before tax"
+ * would be inventing the one fact nobody read. The function's own text comes
+ * from the materialised checkout, through
+ * `apps/worker/src/lib/workspace.ts` — and when there is no checkout, the item
+ * is still correct and says which half it is missing.
+ */
+export interface SourceComponentExport {
+  /** Repo-relative module path. Identity, with `exportName`. The evidence. */
+  modulePath: string;
+  /** The exported name. `default` is legal and common. */
+  exportName: string;
+  kind: ComponentItemKind;
+  /** `props: a, b, c` — parameter NAMES. Null when none were read. */
+  propsSummary: string | null;
+  /** Navigation, not identity. */
+  line: number | null;
+  /** The producer's own sentence about why this is an export. */
+  evidence: string;
+}
+
 export interface CodebaseAnalysis {
   /** Bumped when the shape changes; an unknown version is still parsed leniently. */
   schema: number;
@@ -337,6 +384,22 @@ export interface CodebaseAnalysis {
   forms: SourceForm[];
   endpoints: SourceEndpoint[];
   authSurfaces: SourceAuthSurface[];
+  /**
+   * Exported functions, hooks and components. The UNIT_GEN denominator.
+   *
+   * It was parsed away. `CodebaseAnalysis` here declared no such field, so
+   * `parseCodebaseAnalysis` dropped `analysis.components` on the floor —
+   * `analyseCodebase` ALWAYS sets it, and a repository with four hundred
+   * exported functions in it arrived at this processor as a list of routes and
+   * forms. That is why no producer anywhere emitted a UNIT_GEN item: the input
+   * never reached the only pass that could have derived one.
+   *
+   * Empty is a real answer (a repository of templates exports nothing), and so
+   * is "the stored snapshot predates the component reader" — both arrive here
+   * as `[]`, and the difference is reported by the skipped entry the producer
+   * writes rather than being guessed at.
+   */
+  components: SourceComponentExport[];
   /**
    * What the ingest could not read — unparseable files, skipped directories, a
    * truncated upload. Carried onto the plan verbatim, because a plan that is
@@ -393,6 +456,8 @@ const MAX_FORMS_PER_ROUTE = 20;
 const MAX_FIELDS_PER_FORM = 60;
 const MAX_AUTH_SURFACES = 40;
 const MAX_WARNINGS = 50;
+/** The producer's own cap on the component inventory (MAX_COMPONENTS in codebase.ts). */
+const MAX_COMPONENTS = 5000;
 
 /**
  * The types proposed when the funnel stored no preference.
@@ -400,6 +465,14 @@ const MAX_WARNINGS = 50;
  * Exactly the three the four derivation rules produce, and no more. A default
  * that quietly included, say, LOAD would put a k6 scenario in front of someone
  * who never asked for one and cannot run it.
+ *
+ * UNIT_GEN is DERIVABLE and deliberately NOT here, which is that argument one
+ * step further in: a unit item needs the repository materialised into the run
+ * workspace to execute (`TEST_TYPE_DECLARATIONS.UNIT_GEN.repository` is
+ * `MATERIALISED`) and its spec strategy is `hybrid`, so on a deployment with no
+ * model it is refused with a reason. Both are honest outcomes for a type
+ * somebody ASKED for, and neither is an acceptable surprise for somebody who
+ * did not.
  */
 export const DEFAULT_TEST_TYPES: readonly TestType[] = ['SMOKE', 'API', 'E2E'];
 
@@ -415,6 +488,8 @@ const DERIVABLE: Partial<Record<TestType, string>> = {
   E2E: 'one per form, and one per sign-in surface',
   ACCESSIBILITY: 'one axe scan over the routes the source declares',
   SECURITY_SMOKE: 'one probe that the routes the source guards actually refuse anonymous requests',
+  UNIT_GEN:
+    'one per exported function whose name, module path or parameters put it on a risk facet — money, a permission decision, input validation, date arithmetic or concurrent execution',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -570,6 +645,52 @@ function parseEndpoint(raw: unknown): SourceEndpoint | null {
   };
 }
 
+const COMPONENT_KINDS: ReadonlySet<string> = new Set<ComponentItemKind>(COMPONENT_ITEM_KINDS);
+
+/**
+ * One exported function, or null.
+ *
+ * Dropped rather than defaulted on three fields, for the reason the file header
+ * gives: an entry with no module path has no evidence, an entry with no export
+ * name cannot be imported by a test, and an entry whose `kind` this build does
+ * not know is from a newer producer — guessing UTILITY for it would put an
+ * unknown thing into the risk ranking under a label nobody wrote.
+ */
+function parseComponent(raw: unknown): SourceComponentExport | null {
+  if (!isRecord(raw)) return null;
+  const modulePath = str(raw.modulePath).trim();
+  const exportName = str(raw.exportName).trim();
+  const kind = str(raw.kind).trim();
+  if (modulePath === '' || exportName === '' || !COMPONENT_KINDS.has(kind)) return null;
+
+  const propsSummary = str(raw.propsSummary).trim();
+  const line = typeof raw.line === 'number' && Number.isFinite(raw.line) ? raw.line : null;
+  return {
+    modulePath,
+    exportName,
+    kind: kind as ComponentItemKind,
+    propsSummary: propsSummary === '' ? null : propsSummary,
+    line,
+    evidence: str(raw.evidence).trim() || `${modulePath} exports ${exportName}`,
+  };
+}
+
+/**
+ * `(module, exportName)` is the identity, the same pair `SourceBackgroundSurface`
+ * joins on, so the same export read twice by two detectors is one subject.
+ */
+function dedupeComponents(components: SourceComponentExport[]): SourceComponentExport[] {
+  const seen = new Set<string>();
+  const out: SourceComponentExport[] = [];
+  for (const component of components) {
+    const key = `${component.modulePath}\u0000${component.exportName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(component);
+  }
+  return out;
+}
+
 function parseAuthSurface(raw: unknown): SourceAuthSurface | null {
   if (!isRecord(raw)) return null;
   const kind = str(raw.kind).trim().toUpperCase();
@@ -650,6 +771,11 @@ export function parseCodebaseAnalysis(raw: unknown): CodebaseAnalysis | null {
     forms,
     endpoints: dedupeEndpoints(endpoints),
     authSurfaces,
+    components: dedupeComponents(
+      arr(raw.components, MAX_COMPONENTS)
+        .map(parseComponent)
+        .filter((c): c is SourceComponentExport => c !== null),
+    ),
     warnings: arr(raw.warnings, MAX_WARNINGS)
       .map((w) => str(w).trim())
       .filter((w) => w !== ''),
@@ -1640,6 +1766,630 @@ function securityItem(guarded: Array<{ path: string; evidence: string | null }>)
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// UNIT_GEN: the logic half of the application
+// ─────────────────────────────────────────────────────────────────────────────
+
+/*
+ * ── WHY THIS SECTION EXISTS ────────────────────────────────────────────────
+ *
+ * Every producer in this file proposes a test that drives the application from
+ * OUTSIDE — a page, a request, a form. None of them can reach the arithmetic.
+ * A pricing function that applies the discount after tax, a permission check
+ * that reads the role off the wrong object, a renewal date that lands a day
+ * early in one timezone: none of those is visible from a route's status code,
+ * and all three are the defects that cost money.
+ *
+ * `TEST_TYPE_DECLARATIONS.UNIT_GEN` in packages/shared/src/test-type-decl.ts
+ * records the state this replaces, in its own words: `producers: ['NONE']` —
+ * "the type whose emptiness costs the most. Pricing, validation and permission
+ * logic — the LOGIC HALF of every application — is unreachable."
+ *
+ * ── THE LINE THIS SECTION WILL NOT CROSS ───────────────────────────────────
+ *
+ * The inventory carries a module path, an export name, a kind and a list of
+ * PARAMETER NAMES. It does not carry a body, a type, a return shape or a
+ * default. So a proposal here may say "this function's name and its module
+ * both name money, and money arithmetic is worth a test at its edges"; it may
+ * NOT say what the function computes, what it returns, or what it should
+ * return. The first is a fact about the repository. The second would be the
+ * agent's imagination wearing a rationale's clothes, and on the one subject
+ * where a plausible-looking wrong assertion is hardest to spot.
+ *
+ * The function's own text arrives separately, from the materialised checkout,
+ * through apps/worker/src/lib/workspace.ts — fenced as untrusted data, bounded,
+ * and with every absence counted. When there is no checkout the item is still
+ * correct and SAYS which half it is missing.
+ */
+
+/**
+ * The five risk facets, which are the five places a unit defect costs
+ * something a route test cannot see.
+ *
+ * Not "complexity", not "lines of code", not "cyclomatic anything". Those rank
+ * the functions that are HARD, and the question is which ones are EXPENSIVE
+ * WHEN WRONG. A six-line function that rounds a tax figure outranks a
+ * two-hundred-line formatter, and no complexity metric says so.
+ */
+export const UNIT_RISK_FACETS = [
+  'MONEY',
+  'PERMISSION',
+  'VALIDATION',
+  'DATE_MATH',
+  'CONCURRENCY',
+] as const;
+export type UnitRiskFacet = (typeof UNIT_RISK_FACETS)[number];
+
+const UNIT_RISK_FACET_PRESENT: Record<UnitRiskFacet, true> = {
+  MONEY: true,
+  PERMISSION: true,
+  VALIDATION: true,
+  DATE_MATH: true,
+  CONCURRENCY: true,
+};
+
+/** Derived, never hand-listed. */
+export const UNIT_RISK_FACET_LIST = Object.keys(
+  UNIT_RISK_FACET_PRESENT,
+) as ReadonlyArray<UnitRiskFacet>;
+
+interface RiskFacetDeclaration {
+  readonly label: string;
+  /**
+   * Weight. MONEY and PERMISSION outrank the rest because their defects are
+   * silent: a wrong total is charged and a wrong permission is granted, and
+   * neither raises anything. A validation defect usually surfaces as a visible
+   * error, which is why it ranks below them and above the other two.
+   */
+  readonly weight: number;
+  /** What a human reads as the reason this function was picked out. */
+  readonly why: string;
+  /** The assertion a human can approve, which must not claim to know the body. */
+  readonly expectation: string;
+  /** Four words for a title. */
+  readonly titleVerb: string;
+  /** Matched against the identifier's WORDS, never as a substring. */
+  readonly words: readonly string[];
+}
+
+/**
+ * The vocabulary, matched word-wise.
+ *
+ * Word-wise and not by substring, which is the difference between a classifier
+ * and a coincidence generator: `'tax'` as a substring hits `syntax`,
+ * `taxonomy` and `getTaxonomyLabel`; `'can'` hits `cancel`, `canonical` and
+ * `scanDirectory`. `identifierWords` splits camelCase and snake_case first, so
+ * `getTaxonomy` yields ['get','taxonomy'] and matches nothing here.
+ */
+const RISK_FACETS: Record<UnitRiskFacet, RiskFacetDeclaration> = {
+  MONEY: {
+    label: 'money arithmetic',
+    weight: 5,
+    why: 'a wrong total is charged, and nothing raises — the customer finds it on the statement',
+    expectation:
+      'it never returns a negative, a fractional-cent or a NaN amount, and it rounds the same way twice for the same input',
+    titleVerb: 'holds its money arithmetic at the edges',
+    words: [
+      'price', 'pricing', 'amount', 'amounts', 'total', 'totals', 'subtotal', 'tax', 'taxes',
+      'vat', 'discount', 'discounts', 'coupon', 'refund', 'refunds', 'fee', 'fees', 'charge',
+      'charges', 'invoice', 'invoices', 'currency', 'cents', 'money', 'cost', 'payment',
+      'payments', 'billing', 'proration', 'prorate', 'balance', 'payout', 'payouts',
+    ],
+  },
+  PERMISSION: {
+    label: 'a permission decision',
+    weight: 4,
+    why: 'a wrong answer here grants access, and a granted access raises nothing at all',
+    expectation:
+      'it DENIES by default — an unknown role, a missing subject, a null actor and a mismatched tenant each come back refused, not allowed',
+    titleVerb: 'denies rather than defaults open',
+    words: [
+      'can', 'may', 'allow', 'allowed', 'allows', 'authorize', 'authorise', 'authorized',
+      'permission', 'permissions', 'permit', 'role', 'roles', 'scope', 'scopes', 'grant',
+      'grants', 'guard', 'access', 'acl', 'policy', 'policies', 'owns', 'owner', 'tenant',
+      'admin', 'forbid', 'forbidden', 'authz',
+    ],
+  },
+  VALIDATION: {
+    label: 'input validation',
+    weight: 3,
+    why: 'it is the boundary between data somebody typed and data the rest of the application trusts',
+    expectation:
+      'it REJECTS what it cannot accept rather than passing it through — and the rejection names the field, so a caller can act on it',
+    titleVerb: 'rejects what it cannot accept',
+    words: [
+      'validate', 'validated', 'validates', 'validation', 'valid', 'invalid', 'sanitize',
+      'sanitise', 'sanitizer', 'parse', 'parsed', 'parser', 'assert', 'schema', 'check',
+      'checks', 'verify', 'verified', 'normalize', 'normalise', 'coerce', 'guardrail',
+    ],
+  },
+  DATE_MATH: {
+    label: 'date arithmetic',
+    weight: 2,
+    why: 'month ends, leap days and timezone offsets are where date code is wrong, and a route test never sees them',
+    expectation:
+      'it lands on the same instant across a DST boundary, a leap day and a month end, and is explicit about the timezone it computes in',
+    titleVerb: 'survives month ends and DST',
+    words: [
+      'date', 'dates', 'datetime', 'time', 'times', 'timestamp', 'timezone', 'tz', 'expire',
+      'expires', 'expiry', 'expiration', 'duration', 'period', 'periods', 'due', 'overdue',
+      'schedule', 'scheduled', 'interval', 'age', 'renew', 'renewal', 'anniversary', 'elapsed',
+      'cutoff', 'deadline',
+    ],
+  },
+  CONCURRENCY: {
+    label: 'concurrent or repeated execution',
+    weight: 2,
+    why: 'the second caller, the retry and the duplicate delivery are what break it, and a single-threaded test never produces any of them',
+    expectation:
+      'running it twice with the same input has the same effect as running it once, and a second concurrent caller does not observe a half-finished state',
+    titleVerb: 'is safe to run twice',
+    words: [
+      'lock', 'locks', 'locking', 'mutex', 'semaphore', 'queue', 'queued', 'retry', 'retries',
+      'debounce', 'throttle', 'concurrent', 'concurrency', 'atomic', 'atomically', 'race',
+      'idempotent', 'idempotency', 'transaction', 'transactional', 'reentrant', 'dedupe',
+      'deduplicate',
+    ],
+  },
+};
+
+/** Built once, so the per-export loop is a set lookup rather than a scan. */
+const FACET_BY_WORD: ReadonlyMap<string, UnitRiskFacet> = (() => {
+  const map = new Map<string, UnitRiskFacet>();
+  for (const facet of UNIT_RISK_FACET_LIST) {
+    for (const word of RISK_FACETS[facet].words) {
+      // First declaration wins, so a word in two lists is a decision somebody
+      // made in the order above rather than whichever loop ran last.
+      if (!map.has(word)) map.set(word, facet);
+    }
+  }
+  return map;
+})();
+
+/**
+ * `getTaxAmount_v2` → ['get','tax','amount','v2'].
+ *
+ * The whole classifier rests on this. Substring matching on these vocabularies
+ * produces nonsense at a rate that would discredit the ranking — see the note
+ * on {@link RISK_FACETS}.
+ */
+export function identifierWords(identifier: string): string[] {
+  return identifier
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .map((word) => word.toLowerCase())
+    .filter((word) => word !== '');
+}
+
+/** `props: a, b, c` → ['a','b','c']. Empty for null, which is a real answer. */
+export function parameterNames(propsSummary: string | null): string[] {
+  if (propsSummary === null) return [];
+  const body = propsSummary.replace(/^props\s*:\s*/i, '');
+  return body
+    .split(',')
+    .map((part) => part.trim())
+    .filter((part) => /^[A-Za-z_$][\w$]*$/.test(part));
+}
+
+/** One facet found on one export, with the evidence that found it. */
+export interface UnitRiskHit {
+  readonly facet: UnitRiskFacet;
+  /** Where the word was: the export name, the module path, or a parameter. */
+  readonly where: 'EXPORT_NAME' | 'MODULE_PATH' | 'PARAMETER';
+  /** The word that matched, so a human can disagree with the classification. */
+  readonly word: string;
+}
+
+/** An export ranked for a unit test, with everything the item needs. */
+export interface UnitSubject {
+  readonly component: SourceComponentExport;
+  readonly hits: readonly UnitRiskHit[];
+  /** Sum of the matched facets' weights. Each facet counts ONCE. */
+  readonly score: number;
+  /** Highest-weighted facet found. The one the item is titled after. */
+  readonly leadFacet: UnitRiskFacet;
+  readonly parameters: readonly string[];
+  /** Repo-relative test files that look like they cover this module. */
+  readonly testPaths: readonly string[];
+}
+
+/**
+ * Classify one export. Null when no facet matched.
+ *
+ * A facet counts ONCE however many of its words hit, so a function called
+ * `applyDiscountToInvoiceTotal` does not outrank `chargeCard` four times over
+ * for being wordier. The hits list keeps every match, because it is the
+ * evidence a human reads to disagree.
+ */
+export function riskFacetsFor(component: SourceComponentExport): {
+  hits: UnitRiskHit[];
+  score: number;
+  leadFacet: UnitRiskFacet | null;
+} {
+  const hits: UnitRiskHit[] = [];
+  const add = (where: UnitRiskHit['where'], words: readonly string[]): void => {
+    for (const word of words) {
+      const facet = FACET_BY_WORD.get(word);
+      if (facet) hits.push({ facet, where, word });
+    }
+  };
+
+  add('EXPORT_NAME', identifierWords(component.exportName));
+  /*
+   * The path counts, and it is the weaker signal of the three on purpose: a
+   * function called `apply` in `src/billing/discounts.ts` is money code and its
+   * name says nothing, which is exactly the function a name-only classifier
+   * misses. `identifierWords` is applied per SEGMENT so `src/billing` yields
+   * ['src','billing'] and a repository that happens to live under
+   * `~/tax-return-app` does not label its whole tree.
+   */
+  for (const segment of component.modulePath.split('/')) {
+    add('MODULE_PATH', identifierWords(segment.replace(/\.[^.]+$/, '')));
+  }
+  const parameters = parameterNames(component.propsSummary);
+  for (const parameter of parameters) add('PARAMETER', identifierWords(parameter));
+
+  const found = new Set(hits.map((hit) => hit.facet));
+  let score = 0;
+  for (const facet of found) score += RISK_FACETS[facet].weight;
+
+  // Ties broken by the declaration order of UNIT_RISK_FACETS, so the lead facet
+  // is a function of the vocabulary rather than of iteration order.
+  let leadFacet: UnitRiskFacet | null = null;
+  for (const facet of UNIT_RISK_FACET_LIST) {
+    if (!found.has(facet)) continue;
+    if (leadFacet === null || RISK_FACETS[facet].weight > RISK_FACETS[leadFacet].weight) {
+      leadFacet = facet;
+    }
+  }
+  return { hits, score, leadFacet };
+}
+
+/**
+ * How many unit items one analysis proposes.
+ *
+ * Below MAX_PLAN_ITEMS on purpose: a repository with four hundred exported
+ * functions would otherwise fill the whole approval screen with unit tests and
+ * push every route and endpoint off it. The ones left out are counted and said.
+ */
+export const MAX_UNIT_ITEMS = 8;
+
+/**
+ * Filename conventions that mean "this file tests that module".
+ *
+ * A closed, documented list rather than a regex over anything containing
+ * `test`: `src/testUtils.ts` is not a test for `src/testUtils.ts`, and
+ * `e2e/checkout.spec.ts` is not a unit test for `src/checkout.ts`. Each entry
+ * is a suffix swap or a directory the ecosystem actually uses.
+ *
+ * This is a HEURISTIC over filenames and is reported as one — the inventory has
+ * no import graph, so there is no way to know from here whether
+ * `pricing.test.ts` imports `pricing.ts` or merely sits beside it.
+ */
+const TEST_PATH_SHAPES: readonly string[] = [
+  '.test', '.spec', '_test', '-test', '.tests',
+];
+
+/** `src/a/b.ts` → ['src','a','b','.ts'] split into the parts a swap needs. */
+function splitModulePath(modulePath: string): { dir: string; base: string; ext: string } {
+  const slash = modulePath.lastIndexOf('/');
+  const dir = slash === -1 ? '' : modulePath.slice(0, slash);
+  const rest = modulePath.slice(slash + 1);
+  const dot = rest.lastIndexOf('.');
+  return dot <= 0
+    ? { dir, base: rest, ext: '' }
+    : { dir, base: rest.slice(0, dot), ext: rest.slice(dot) };
+}
+
+/**
+ * Test files that look like they cover this module, out of the paths the
+ * ANALYSIS recorded.
+ *
+ * Reads the recorded path list, never the disk: this runs at analysis time,
+ * where there is no checkout. An empty result means "none of the conventions
+ * below matched a recorded path", which is said rather than reported as "this
+ * module has no tests".
+ */
+export function likelyTestPaths(
+  modulePath: string,
+  knownPaths: readonly string[],
+): string[] {
+  if (knownPaths.length === 0) return [];
+  const { dir, base, ext } = splitModulePath(modulePath);
+  const candidates = new Set<string>();
+  const prefix = dir === '' ? '' : `${dir}/`;
+  for (const shape of TEST_PATH_SHAPES) {
+    // Beside it, and in the two directories the ecosystems put tests in.
+    candidates.add(`${prefix}${base}${shape}${ext}`);
+    candidates.add(`${prefix}__tests__/${base}${shape}${ext}`);
+    candidates.add(`${prefix}tests/${base}${shape}${ext}`);
+  }
+  // Python's convention is a prefix, not a suffix.
+  candidates.add(`${prefix}test_${base}${ext}`);
+
+  const known = new Set(knownPaths);
+  return [...candidates].filter((candidate) => known.has(candidate)).sort();
+}
+
+/**
+ * Rank the inventory. Deterministic, and a pure function of the analysis.
+ *
+ * Sorted by score DESC, then by module path and export name ASC — never by the
+ * order the producer happened to emit them in, so re-analysing an unchanged
+ * repository proposes the same eight functions in the same order. No clock, no
+ * `Math.random`, nothing ambient.
+ *
+ * An export with no facet is NOT proposed. That is a judgement and it is the
+ * right one at a cap of eight: with four hundred exports to choose from,
+ * proposing `formatLabel` ahead of `applyTax` would be worse than proposing
+ * nothing. The ones skipped are counted by the caller.
+ */
+export function rankUnitSubjects(
+  analysis: CodebaseAnalysis,
+  knownPaths: readonly string[],
+): { subjects: UnitSubject[]; unranked: number; onOtherAxis: number } {
+  const subjects: UnitSubject[] = [];
+  let unranked = 0;
+  let onOtherAxis = 0;
+
+  for (const component of analysis.components) {
+    /*
+     * A PAGE or a LAYOUT is already counted on the ROUTE axis — `smokeItem`
+     * proposes a test for the route it serves. Proposing a unit test for it as
+     * well puts one surface in two denominators, which is the defect
+     * `componentHasOwnAxis` was written to prevent, arriving from two producers
+     * that agree rather than from one that is wrong.
+     */
+    if (componentHasOwnAxis(component.kind) !== null) {
+      onOtherAxis += 1;
+      continue;
+    }
+
+    const { hits, score, leadFacet } = riskFacetsFor(component);
+    if (leadFacet === null) {
+      unranked += 1;
+      continue;
+    }
+    subjects.push({
+      component,
+      hits,
+      score,
+      leadFacet,
+      parameters: parameterNames(component.propsSummary),
+      testPaths: likelyTestPaths(component.modulePath, knownPaths),
+    });
+  }
+
+  subjects.sort(
+    (a, b) =>
+      b.score - a.score ||
+      a.component.modulePath.localeCompare(b.component.modulePath) ||
+      a.component.exportName.localeCompare(b.component.exportName),
+  );
+  return { subjects, unranked, onOtherAxis };
+}
+
+/**
+ * A parameter's semantic, from its NAME, for the boundary expansion.
+ *
+ * Name-only, because that is all there is — and the item says so. `unknown` is
+ * the honest answer for most parameters and it still yields the classes that do
+ * not need a type: empty, whitespace-only, over-long, and the injection shapes.
+ */
+function semanticForParameter(parameter: string): FormFieldSemantic {
+  const words = new Set(identifierWords(parameter));
+  const has = (...candidates: string[]): boolean => candidates.some((c) => words.has(c));
+
+  if (has('email', 'emails')) return 'email';
+  if (has('password', 'passwd', 'secret', 'token')) return 'password';
+  if (has('url', 'uri', 'href', 'link', 'endpoint')) return 'url';
+  if (has('phone', 'mobile', 'msisdn')) return 'phone';
+  if (has('amount', 'price', 'total', 'subtotal', 'cents', 'cost', 'fee', 'balance')) {
+    return 'currency';
+  }
+  if (has('date', 'datetime', 'timestamp', 'expiry', 'due', 'deadline', 'cutoff')) return 'date';
+  if (has('count', 'qty', 'quantity', 'limit', 'offset', 'index', 'size', 'age', 'days')) {
+    return 'number';
+  }
+  if (has('name', 'firstname', 'lastname', 'fullname')) return 'person_name';
+  return 'unknown';
+}
+
+/**
+ * A unit test's parameters, projected onto the boundary expansion's form shape.
+ *
+ * ── `required: false` ON EVERY PARAMETER, AND WHY THAT IS THE HONEST CHOICE ─
+ *
+ * `propsSummaryFor` splits a destructured parameter list on `[:=]` and keeps
+ * the identifier, so `{ qty = 1 }` and `{ qty }` produce the same string. The
+ * inventory therefore cannot tell a defaulted parameter from a required one.
+ *
+ * `required: true` would license the expansion's missing-required-field case,
+ * whose expectation is "rejected" — and on a parameter that actually has a
+ * default, that case asserts a rejection the function is right not to perform,
+ * so the test fails against correct code. `required: false` loses that one case
+ * and keeps every case that does not depend on the distinction. The loss is
+ * disclosed on the item rather than taken quietly.
+ *
+ * No constraint is carried AT ALL, for the reason the form path spells out: the
+ * difference between NOT_CAPTURED and DECLARED_ABSENT is what `boundaries.ts`
+ * words its reason from, and a signature nobody read declares neither.
+ */
+function unitExpansionFor(subject: UnitSubject, handle: string): ReturnType<typeof expandNegativeCases> {
+  const summary: FormSummary = {
+    name: `${subject.component.exportName}()`,
+    submitLabel: null,
+    fields: subject.parameters.slice(0, MAX_FIELDS_PER_FORM).map((parameter) => ({
+      label: parameter,
+      name: parameter,
+      required: false,
+      semantic: semanticForParameter(parameter),
+      // There is no DOM here. 'text' is the expansion's own neutral value and
+      // it is what makes the string classes apply; it is not a claim that the
+      // parameter is a string.
+      inputType: 'text',
+    })),
+  };
+  return expandNegativeCases(handle, [summary]);
+}
+
+/** One ranked function as a proposal a human can approve. */
+function unitItem(subject: UnitSubject): PlanItem {
+  const { component, leadFacet } = subject;
+  const declaration = RISK_FACETS[leadFacet];
+  const handle = itemId('unit', `${component.modulePath}:${component.exportName}`);
+  const expansion = unitExpansionFor(subject, handle);
+
+  /*
+   * The evidence, in the shape every other producer in this file writes it: the
+   * file, the fact read out of it, and the WORD that caused the classification.
+   * Naming the word is what lets a reviewer say "no, `charge` there means an
+   * electric charge" and be right, instead of arguing with a score.
+   */
+  const facetsFound = [...new Set(subject.hits.map((hit) => hit.facet))];
+  const evidenceWords = facetsFound
+    .map((facet) => {
+      const hit = subject.hits.find((h) => h.facet === facet)!;
+      return `${RISK_FACETS[facet].label} (the word "${hit.word}" in its ${
+        hit.where === 'EXPORT_NAME'
+          ? 'name'
+          : hit.where === 'MODULE_PATH'
+            ? 'module path'
+            : 'parameter list'
+      })`;
+    })
+    .join('; ');
+
+  const cases = expansion.cases.slice(0, MAX_BOUNDARY_CASES_PER_GAP);
+
+  return {
+    id: handle,
+    title: clamp(`${component.exportName} ${declaration.titleVerb}`, TITLE_MAX),
+    rationale: clamp(
+      `\`${component.modulePath}\` exports \`${component.exportName}\`${
+        component.line === null ? '' : ` (line ${component.line})`
+      }, classified ${component.kind}. It names ${evidenceWords} — and ${declaration.why}. ` +
+        `No route test can reach this: a wrong answer inside the function is invisible from the ` +
+        `outside, which is what makes it worth its own test. ` +
+        (subject.testPaths.length > 0
+          ? `${subject.testPaths.length} file(s) in the repository look like tests for this module (${subject.testPaths.join(', ')}) — this proposal should extend them rather than restate them. `
+          : 'No file matching a test-naming convention was found beside this module in the recorded paths. ') +
+        `${STATIC_ONLY} In particular the function's BODY, its parameter TYPES and its RETURN ` +
+        `shape were not read: ${UNIT_SIGNATURE_UNREAD}`,
+      1000,
+    ),
+    feature: clamp(unitFeatureFor(component.modulePath), 80),
+    // MONEY and PERMISSION only. A validation or date helper is worth a test and
+    // is not a critical path, and marking all five critical would make the word
+    // mean nothing on this plan.
+    priority: declaration.weight >= 4 ? 'CRITICAL_PATH' : 'IMPORTANT',
+    testType: 'UNIT_GEN',
+    steps: [
+      `Import \`${component.exportName}\` from \`${component.modulePath}\` — ${
+        component.exportName === 'default'
+          ? 'it is the default export'
+          : 'it is a named export'
+      }`,
+      ...(subject.parameters.length > 0
+        ? [
+            `Call it with its declared parameters (${subject.parameters.join(', ')}) — the names are from the source, the TYPES are not, so read the signature before writing the call`,
+          ]
+        : [
+            'Read the signature in the source to find out what it takes — the inventory recorded no parameter names for it',
+          ]),
+      ...cases.map(caseStep),
+    ],
+    assertions: [
+      `\`${component.exportName}\` ${declaration.expectation}`,
+      ...(subject.testPaths.length > 0
+        ? [
+            `Nothing here duplicates an assertion already made in ${subject.testPaths.join(' or ')}`,
+          ]
+        : []),
+      unitDisclosure(expansion, subject),
+    ],
+    journeyId: null,
+    /*
+     * NULL ON PURPOSE, and for a different reason from the other four. A unit
+     * test calls a function in a process; there is no browser, no session and
+     * nobody to be. Binding a profile would have the runner resolve a
+     * storageState and sign somebody in before invoking a pure function — work
+     * with no subject, and a sign-in failure reported as a defect in the
+     * arithmetic.
+     */
+    authProfileId: null,
+  };
+}
+
+/**
+ * The one sentence that stops a green unit test being read as proof the
+ * signature is honoured.
+ */
+const UNIT_SIGNATURE_UNREAD =
+  'the inventory records parameter NAMES only, so whether a parameter is optional, what type ' +
+  'it takes and what the function returns are all unread here. Every case below is a shape ' +
+  'question, not a type claim.';
+
+/** `src/billing/invoice.ts` → 'Billing'. Groups the suite tree the way routes do. */
+function unitFeatureFor(modulePath: string): string {
+  const parts = modulePath.split('/').filter((part) => part !== '');
+  // The directory above the file, skipping the conventional roots that group
+  // nothing: `src/pricing.ts` is Pricing, not Src.
+  const skip = new Set(['src', 'lib', 'app', 'packages', 'apps', 'source', 'internal']);
+  const named = [...parts.slice(0, -1)].reverse().find((part) => !skip.has(part.toLowerCase()));
+  const base = named ?? splitModulePath(modulePath).base;
+  return base.charAt(0).toUpperCase() + base.slice(1);
+}
+
+/**
+ * What this item does NOT cover, said on the item.
+ *
+ * Three separate omissions, told apart because they have three different next
+ * actions — collapsing them into "some cases were not generated" is what lets
+ * the worst one hide inside the mildest:
+ *
+ *   • the SIGNATURE was never read, so no case can depend on a type or on a
+ *     parameter being optional. Next action: read the source.
+ *   • the function has no recorded parameters at all, so there is nothing to
+ *     vary. Next action: read the source.
+ *   • the cap bit inside what COULD be built. Next action: approve this and
+ *     propose the rest.
+ */
+function unitDisclosure(
+  expansion: ReturnType<typeof expandNegativeCases>,
+  subject: UnitSubject,
+): string {
+  /*
+   * THE ORDER IS LOAD-BEARING, AND THE FIRST DRAFT GOT IT WRONG.
+   *
+   * This string is clamped to 400 characters, and the clamp BIT: the sentence
+   * ended with "Do not read a pass here as proof the function's contract is
+   * enforced", the `dropped` list from the expansion ran to several hundred
+   * characters ahead of it, and the one sentence the whole disclosure exists
+   * for was the part that got cut. A cap that silently removes the warning and
+   * leaves the detail is worse than no disclosure, because what survives reads
+   * complete. This module's own test caught it ("says outright that the BODY,
+   * the TYPES and the RETURN were not read").
+   *
+   * So the non-negotiable sentence goes FIRST and the per-case detail LAST, and
+   * the clamp can only ever eat the detail. Anything added here goes after the
+   * first sentence, never before it.
+   */
+  const cap = expansion.dropped.map((d) => d.what);
+  return clamp(
+    `Do not read a pass here as proof the function's contract is enforced. ` +
+      `NOT COVERED: ${
+        subject.parameters.length === 0
+          ? 'any input variation at all — the inventory recorded no parameter names for this export, so there is nothing to vary and the cases above are limited to calling it'
+          : "anything that depends on a parameter's TYPE or on whether it is optional"
+      }. ${UNIT_SIGNATURE_UNREAD}${
+        cap.length > 0 ? ` Also, inside what could be built: ${cap.join('; ')}.` : ''
+      }`,
+    400,
+  );
+}
+
 const PRIORITY_RANK: Record<Priority, number> = {
   CRITICAL_PATH: 0,
   IMPORTANT: 1,
@@ -1650,7 +2400,27 @@ export interface DerivedPlan {
   items: PlanItem[];
   skipped: Array<{ what: string; why: string }>;
   /** Counts for the summary line and the log. */
-  totals: { routes: number; endpoints: number; forms: number; authSurfaces: number };
+  totals: {
+    routes: number;
+    endpoints: number;
+    forms: number;
+    authSurfaces: number;
+    /** Exported functions in the inventory, before the risk ranking trimmed them. */
+    components: number;
+  };
+  /**
+   * THE SEAM BETWEEN THIS PASS AND THE FUNCTION'S OWN SOURCE.
+   *
+   * A UNIT_GEN item is a proposal about a function, and the generator needs the
+   * function — not a page's locators, which is what `relevantContext(flowMap,
+   * item)` hands it today. `PlanItem` has no field for a module path and an
+   * export name, and inventing one would mean a schema change this file does
+   * not own, so the pairing travels beside the items instead.
+   *
+   * ONLY the items that survived the cap appear here. A subject for a deferred
+   * item would have the generator fetch source for a proposal nobody approved.
+   */
+  unitSubjects: Array<{ itemId: string; subject: UnitSubject }>;
 }
 
 /**
@@ -1672,6 +2442,21 @@ export function scenariosFromSource(
    * the `authProfileId` of each producer.
    */
   authProfiles: readonly AuthProfileChoice[] = [],
+  /**
+   * Every repo-relative path the ingest recorded, or none.
+   *
+   * LAST, and with a default, so the three-argument call every existing caller
+   * makes keeps its meaning — `authProfiles` is positional and inserting this
+   * before it would silently pass a path list where the roles go.
+   *
+   * `CodebaseSnapshot.paths` is a SIBLING column to `analysis`, so it is not in
+   * the blob the first argument parses. It is here for one job: deciding whether
+   * a module already has a test beside it. An empty list means NOBODY LOOKED —
+   * `likelyTestPaths` finds nothing and the item says "no file matching a
+   * convention was found in the recorded paths", which is a different sentence
+   * from "this module has no tests" and has to stay different.
+   */
+  knownPaths: readonly string[] = [],
 ): DerivedPlan {
   const wants = (type: TestType): boolean => choice.types.includes(type);
   const items: PlanItem[] = [];
@@ -1690,6 +2475,7 @@ export function scenariosFromSource(
     endpoints: analysis.endpoints.length,
     forms: forms.length,
     authSurfaces: analysis.authSurfaces.length,
+    components: analysis.components.length,
   };
 
   /*
@@ -1724,6 +2510,49 @@ export function scenariosFromSource(
   }
   if (wants('ACCESSIBILITY') && analysis.routes.length > 0) {
     items.push(accessibilityItem(analysis.routes));
+  }
+
+  /*
+   * ── UNIT_GEN ──────────────────────────────────────────────────────────────
+   *
+   * The one producer here whose subject is not a URL. Every cap and every
+   * exclusion it applies is reported as a count AND a reason, because the whole
+   * point of a denominator is that trimming it quietly makes the number go up.
+   */
+  const unitSubjects: Array<{ itemId: string; subject: UnitSubject }> = [];
+  if (wants('UNIT_GEN')) {
+    const ranked = rankUnitSubjects(analysis, knownPaths);
+    const taken = ranked.subjects.slice(0, MAX_UNIT_ITEMS);
+    for (const subject of taken) {
+      const item = unitItem(subject);
+      items.push(item);
+      unitSubjects.push({ itemId: item.id, subject });
+    }
+
+    if (analysis.components.length === 0) {
+      skipped.push({
+        what: TEST_TYPE_LABELS.UNIT_GEN,
+        why: 'the stored analysis carries no component inventory, so there is no exported function to rank. Either the repository exports none, or the snapshot was written before the component reader existed — re-import the source to tell those two apart.',
+      });
+    }
+    if (ranked.onOtherAxis > 0) {
+      skipped.push({
+        what: `${ranked.onOtherAxis} page and layout export(s)`,
+        why: 'they are route entry points, and the route they serve is already proposed as its own test. Counting them here as well would put one surface in two denominators.',
+      });
+    }
+    if (ranked.unranked > 0) {
+      skipped.push({
+        what: `${ranked.unranked} other exported function(s)`,
+        why: `none of them names money, a permission decision, input validation, date arithmetic or concurrent execution, so none was ranked. They are not covered and they are not proposed — at a cap of ${MAX_UNIT_ITEMS} a formatter ahead of a tax calculation would be worse than nothing. Ask for one by hand if a name is misleading.`,
+      });
+    }
+    if (ranked.subjects.length > taken.length) {
+      skipped.push({
+        what: `${ranked.subjects.length - taken.length} further ranked function(s)`,
+        why: `only the top ${MAX_UNIT_ITEMS} by risk are proposed per analysis, so unit items cannot crowd every route and endpoint off the approval screen. Approve these and re-analyse for the next ones.`,
+      });
+    }
   }
 
   const guarded = [
@@ -1807,7 +2636,19 @@ export function scenariosFromSource(
     });
   }
 
-  return { items: chosen, skipped, totals };
+  /*
+   * Only the subjects whose item SURVIVED the plan-wide cap. A subject whose
+   * item was deferred would have the generator fetch a module's source for a
+   * proposal nobody can approve — a download, a fence and a fingerprint for a
+   * row that is not on the screen.
+   */
+  const kept = new Set(chosen.map((item) => item.id));
+  return {
+    items: chosen,
+    skipped,
+    totals,
+    unitSubjects: unitSubjects.filter((pair) => kept.has(pair.itemId)),
+  };
 }
 
 /** The prose above the approval list. Says what was read, and what was not. */
@@ -1817,8 +2658,9 @@ export function summaryFromSource(derived: DerivedPlan, analysis: CodebaseAnalys
   const count = derived.items.length;
   return (
     `${count} test${count === 1 ? '' : 's'} proposed from your codebase${frameworks} — ` +
-    `${totals.routes} route(s), ${totals.endpoints} endpoint(s), ${totals.forms} form(s) and ` +
-    `${totals.authSurfaces} auth surface(s) read out of the source. ` +
+    `${totals.routes} route(s), ${totals.endpoints} endpoint(s), ${totals.forms} form(s), ` +
+    `${totals.authSurfaces} auth surface(s) and ${totals.components} exported function(s) ` +
+    `read out of the source. ` +
     `Nothing was rendered and no request was sent: these are the claims the code makes, ` +
     `and each item is a way to find out whether the claim holds. ` +
     `No journeys are proposed — a path through the app is a runtime fact, and there is no ` +
@@ -1946,6 +2788,39 @@ export interface AnalyzeSourceDeps {
    * what let the two halves of this wave disagree in the first place.
    */
   loadAnalysis?: (orgId: string, projectId: string) => Promise<CodebaseAnalysis | null>;
+  /**
+   * Every repo-relative path the ingest recorded, or null when none was read.
+   *
+   * A SEPARATE loader rather than a wider `loadAnalysis`, because `paths` is a
+   * sibling COLUMN to `analysis` on `CodebaseSnapshot` and the two answer
+   * different questions: `analysis` is what the detectors concluded, `paths` is
+   * the raw file list they concluded it from. The only thing read here needs
+   * the second for is deciding whether a module already has a test beside it.
+   *
+   * NULL and `[]` are different and the difference is on the plan: null means
+   * the path list was not read, `[]` means it was read and is empty.
+   */
+  loadAnalysedPaths?: (orgId: string, projectId: string) => Promise<string[] | null>;
+  /**
+   * THE FUNCTION'S OWN SOURCE, when a checkout of the repository is available.
+   *
+   * Undefined by every production caller today, and that is the honest state
+   * rather than an oversight: this processor runs on an UPLOAD, before any run
+   * has materialised anything, and `CodebaseSnapshot` stores paths with no
+   * contents by design. So the deterministic path produces its UNIT_GEN items
+   * from the inventory alone, and {@link readSourceUnderTest} reports
+   * NO_WORKSPACE for each of them — which is what the plan then SAYS, instead
+   * of leaving a reader to assume the function was read.
+   *
+   * WHAT IT WOULD TAKE to fill it is one call: `materialiseRepoWorkspace`
+   * (apps/worker/src/repo-materialise.ts) already does the hard part — GitHub
+   * App token, tarball at a ref, capped extraction into a per-run temp dir,
+   * `cleanup()` for the `finally` — so a caller passes
+   * `nodeWorkspaceFileReader(workspace.root)` here and holds the workspace for
+   * the whole analysis rather than per item. It costs one download, which is
+   * why it is a decision and not an accident.
+   */
+  openWorkspace?: () => Promise<WorkspaceFileReader | null>;
 }
 
 export async function processAnalyzeSource(
@@ -2044,7 +2919,17 @@ export async function processAnalyzeSource(
       ).map((profile) => ({ id: profile.id, name: profile.name, kind: profile.kind }))
     : [];
 
-  const derived = scenariosFromSource(analysis, choice, authProfiles);
+  /*
+   * The recorded path list, for the one question it answers: does this module
+   * already have a test beside it. NULL is kept apart from `[]` all the way
+   * onto the plan — see the skipped entry below.
+   */
+  const analysedPaths = await (deps.loadAnalysedPaths ?? defaultLoadAnalysedPaths)(
+    orgId,
+    projectId,
+  );
+
+  const derived = scenariosFromSource(analysis, choice, authProfiles, analysedPaths ?? []);
   if (derived.items.length === 0) {
     throw new Error(
       `Nothing could be proposed for project ${projectId}: ${
@@ -2056,6 +2941,92 @@ export async function processAnalyzeSource(
   // `scenariosFromSource` already records which guarded items ended up unbound,
   // because that is a judgement about the plan and belongs in the pure function.
   const skipped = [...derived.skipped];
+
+  /*
+   * ── THE UNIT ITEMS' SOURCE CONTEXT ────────────────────────────────────────
+   *
+   * A UNIT_GEN proposal names a function; the generator needs the function. The
+   * read happens HERE rather than inside `scenariosFromSource` because that
+   * function is pure — no database, no clock, no I/O — and its judgement is
+   * testable over a fixture precisely because of that.
+   *
+   * Said once, when it BITES, and never as a standing nag: the sentence below
+   * only reaches the plan when there ARE unit items, and it names the count.
+   * A reader of a unit proposal has to know whether the function was read,
+   * because "this function's name says money" and "I have read this function"
+   * licence completely different assertions, and only one of them is what a
+   * static pass has.
+   */
+  if (derived.unitSubjects.length > 0) {
+    const reader = deps.openWorkspace ? await deps.openWorkspace() : null;
+    const contexts: SourceUnderTestContext[] = [];
+    for (const { subject } of derived.unitSubjects) {
+      contexts.push(
+        await readSourceUnderTest({
+          reader,
+          subject: {
+            modulePath: subject.component.modulePath,
+            exportName: subject.component.exportName,
+            testPaths: subject.testPaths,
+            /*
+             * EMPTY, ALWAYS, AND NOT BECAUSE NOTHING CALLS THESE FUNCTIONS.
+             * There is no import graph here — the file header says so about
+             * journeys for the same reason — so which modules call this one is
+             * a fact nobody has recorded. An inferred caller list would be the
+             * plausible-looking invention this file exists not to make.
+             */
+            callerPaths: [],
+          },
+        }),
+      );
+    }
+
+    const unread = contexts.filter((context) => context.module === null).length;
+    if (unread > 0) {
+      skipped.push({
+        what: `Reading the source of ${unread} proposed function(s)`,
+        why:
+          contexts.every((context) =>
+            context.omissions.some((omission) => omission.reason === 'NO_WORKSPACE'),
+          )
+            ? 'no checkout of your repository was available while this plan was written, so these proposals are derived from the inventory — the module, the export and its parameter NAMES — and not from the function body. Their assertions are about shape, never about what the function computes. A run materialises the repository and the generator reads the function then.'
+            : `their module could not be read out of the checkout: ${contexts
+                .flatMap((context) => context.omissions)
+                .filter((omission) => omission.reason !== 'NO_WORKSPACE')
+                .slice(0, 4)
+                .map((omission) => `${omission.what} — ${omission.why}`)
+                .join(' ')}`,
+      });
+    }
+
+    /*
+     * The fingerprint is logged and not stored, because there is no column for
+     * it: `TestPlan` carries items, a summary and skips. Logged rather than
+     * dropped so a support question about "which version of pricing.ts did this
+     * proposal come from" has an answer in the run log, and NEVER substituted
+     * with a hash of nothing when no source was read — see `fingerprint: null`.
+     */
+    logger.info(
+      {
+        projectId,
+        unitItems: derived.unitSubjects.length,
+        unreadModules: unread,
+        fingerprints: contexts.map((context, index) => ({
+          itemId: derived.unitSubjects[index]?.itemId ?? null,
+          fingerprint: context.fingerprint,
+        })),
+      },
+      'analyze-source: unit subjects prepared',
+    );
+  }
+
+  if (analysedPaths === null && derived.unitSubjects.length > 0) {
+    skipped.push({
+      what: 'Checking whether these functions already have tests',
+      why: 'the ingest recorded no file list for this project, so no existing test file could be matched to a module. Every unit proposal above may duplicate a test you already have — read it before approving.',
+    });
+  }
+
   let flowMapId: string | null = null;
   let flowMapVersion = 0;
 
@@ -2273,6 +3244,34 @@ async function defaultLoadAnalysis(
     select: { analysis: true },
   });
   return parseCodebaseAnalysis(snapshot?.analysis);
+}
+
+/**
+ * The newest ingest's recorded file list, or null.
+ *
+ * Same row as `defaultLoadAnalysis` and a second query on purpose: the two are
+ * separate deps (see {@link AnalyzeSourceDeps}), so a test can seed an analysis
+ * with no path list and prove that the plan SAYS the existing-test check was
+ * not made. Merging them would make that state unreachable.
+ *
+ * Returns null — never `[]` — for a snapshot whose `paths` is not a readable
+ * array of strings. `[]` would read as "the ingest looked and the repository
+ * has no files", which is not a thing that happens.
+ */
+async function defaultLoadAnalysedPaths(
+  orgId: string,
+  projectId: string,
+): Promise<string[] | null> {
+  const snapshot = await prisma.codebaseSnapshot.findFirst({
+    where: { projectId, orgId },
+    orderBy: { createdAt: 'desc' },
+    select: { paths: true },
+  });
+  if (!Array.isArray(snapshot?.paths)) return null;
+  const paths = snapshot.paths
+    .map((entry) => (typeof entry === 'string' ? entry.trim() : ''))
+    .filter((entry) => entry !== '');
+  return paths.length > 0 ? paths : null;
 }
 
 async function defaultLoadProjectRow(

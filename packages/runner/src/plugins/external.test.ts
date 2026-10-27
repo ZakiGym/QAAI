@@ -1,13 +1,23 @@
 /**
- * A missing dependency on the WORKER must never be recorded as a failing test.
+ * A dependency that was not where the command looked must never be recorded as
+ * a failing test — and the remedy must name the right tree.
  *
- * This repo has now made that mistake four times — a missing Firefox binary, a
- * missing mutation tool, a missing CLI, and finally a suite that could not
- * import its own dependencies. The first three were caught because the tool was
- * absent and produced no report. The fourth slipped through precisely because
- * the runner DID produce a well-formed report: every "failure" in it was one
- * collection error, and the suite was reported as the customer's application
- * being broken.
+ * This repo has now made the first mistake four times — a missing Firefox
+ * binary, a missing mutation tool, a missing CLI, and finally a suite that
+ * could not import its own dependencies. The first three were caught because
+ * the tool was absent and produced no report. The fourth slipped through
+ * precisely because the runner DID produce a well-formed report: every
+ * "failure" in it was one collection error, and the suite was reported as the
+ * customer's application being broken.
+ *
+ * The SECOND mistake outlived the fix for the first. The downgrade was right
+ * and the sentence attached to it was not: it said "a dependency missing from
+ * the worker — install it in the worker image", for every caller. INTEGRATION
+ * and UNIT_GEN run inside the customer's MATERIALISED CHECKOUT, which QAAI
+ * installs nothing in on purpose, so for the two types this plugin exists to
+ * serve the remedy named a change that cannot fix it. A SKIPPED with a correct
+ * status and an unactionable sentence is a support ticket, so
+ * `loadGapRemedy` is tested on its prose and not only on its status.
  *
  * The counter-test matters as much as the test: a real assertion failure must
  * still be a failure, or this classifier becomes a way to hide bugs.
@@ -15,7 +25,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { parseReport } from '../reports/index.js';
-import { onlyLoadErrors } from './external.js';
+import {
+  EXTERNAL_WORKSPACE_KINDS,
+  EXTERNAL_WORKSPACE_KIND_LIST,
+  loadGapRemedy,
+  onlyLoadErrors,
+} from './external.js';
 
 function junit(cases: Array<[name: string, failure: string]>): string {
   return (
@@ -313,5 +328,82 @@ describe('a run with no materialised repository', () => {
 
     expect(execution.status).toBe('FAILED');
     expect(execution.errorMessage).toMatch(/not inside the repository/);
+  });
+});
+
+describe('the remedy for a suite that could not load', () => {
+  const GAP = "Cannot find module '@acme/pricing'";
+
+  it('derives its list from the declaration rather than restating it', () => {
+    expect([...EXTERNAL_WORKSPACE_KIND_LIST].sort()).toEqual([...EXTERNAL_WORKSPACE_KINDS].sort());
+  });
+
+  it('blames QAAI\'s own no-install default inside the customer\'s checkout', () => {
+    const remedy = loadGapRemedy(GAP, 'MATERIALISED_REPOSITORY');
+
+    // The sentence this replaces. It is the wrong diagnosis AND an unactionable
+    // remedy: nothing added to QAAI's image puts @acme/pricing in the
+    // customer's tree.
+    expect(remedy).not.toMatch(/install it in the worker image/);
+    expect(remedy).toMatch(/installs NOTHING/);
+    expect(remedy).toMatch(/will not fix this/);
+    // And it names what WOULD work, in the customer's own command.
+    expect(remedy).toMatch(/npm ci/);
+    expect(remedy).toContain(GAP);
+  });
+
+  it('still points at the worker image for QAAI\'s own scratch tree', () => {
+    // The original sentence was right for this case, and it must survive: the
+    // E2E plugin's in-ecosystem route builds a scratch tree next to QAAI's own
+    // dependencies, and there a missing module IS the image's problem.
+    const remedy = loadGapRemedy(GAP, 'SCRATCH_TREE');
+    expect(remedy).toMatch(/install it in the image and re-run/);
+    expect(remedy).not.toMatch(/installs NOTHING/);
+  });
+
+  it('names both causes when the caller did not say which tree it was', () => {
+    // ABSENT is a third answer. Picking the likelier one is how the single
+    // wrong sentence got written in the first place.
+    const remedy = loadGapRemedy(GAP, undefined);
+    expect(remedy).toMatch(/did not record which tree/);
+    expect(remedy).toMatch(/worker image/);
+    expect(remedy).toMatch(/does not install/);
+  });
+
+  it('never calls a load gap a verdict on the application, in any branch', () => {
+    for (const kind of [...EXTERNAL_WORKSPACE_KINDS, undefined]) {
+      expect(loadGapRemedy(GAP, kind)).toMatch(
+        /not a failure of the application under test/,
+      );
+    }
+  });
+});
+
+describe('a UNIT_GEN suite whose imports do not resolve', () => {
+  it('is SKIPPED with the checkout\'s remedy, not the worker image\'s', async () => {
+    // End to end through the plugin, because the whole defect was that the
+    // plugin knew which tree it was in and the sentence did not. A unit test on
+    // `loadGapRemedy` alone would pass with the plugin still passing undefined.
+    const report = junit([['collect', "Cannot find module '@acme/pricing'"]]);
+    const test = unitGenTest({
+      spec: {
+        command: process.execPath,
+        args: [
+          '-e',
+          `require("fs").writeFileSync("report.xml", ${JSON.stringify(report)}); process.exit(1);`,
+        ],
+        reportPath: 'report.xml',
+        reportFormat: 'junit-xml',
+        timeoutSeconds: 60,
+      },
+    });
+
+    const execution = await externalPlugin.execute(makeContext(workspace), test);
+
+    // SKIPPED, because a suite that could not load evaluated no test — this is
+    // the half that already worked and must keep working.
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toMatch(/installs NOTHING/);
+    expect(execution.errorMessage).not.toMatch(/install it in the worker image/);
   });
 });

@@ -31,6 +31,7 @@ import {
   TEST_VALUE_PROVIDERS,
 } from './test-values';
 import {
+  ANY_TEST_TYPES,
   AUTH_PROFILE_KINDS,
   CHAT_INTEGRATION_KINDS,
   ENVIRONMENT_KINDS,
@@ -48,6 +49,48 @@ import {
   isSupportedPair,
   pairMessage,
 } from './constants';
+/*
+ * The matrix and declaration vocabularies, imported and not restated — the same
+ * argument as the surface and ladder imports below, and sharpest here because
+ * `z.enum(['chromium', 'firefox', 'webkit'])` written out in this file WAS the
+ * product's entire cross-browser vocabulary, and a second copy of it already
+ * exists as a hand-written union in packages/runner/src/preflight.ts.
+ *
+ * `channelExistsFor`, `fabricatedEnvironmentFields` and `declarationProblems`
+ * are imported as VALUES rather than just the lists, for the reason the
+ * dimension import below records: a refinement that reimplemented "does a
+ * Firefox beta exist" or "is this geolocation a fallback" would be a second
+ * opinion about the same fact, and the first thing a second opinion does is
+ * diverge. Neither module imports this one, so there is no cycle.
+ */
+import {
+  BROWSER_CHANNELS,
+  BROWSER_ENGINES,
+  BROWSER_PERMISSIONS,
+  COLOUR_SCHEMES,
+  DEVICE_PRESETS,
+  FORCED_COLORS_MODES,
+  INTERACTION_STATES,
+  MATRIX_CELL_STATUSES,
+  NETWORK_PROFILES,
+  NETWORK_PROFILE_SHAPES,
+  NEVER_CAPTURABLE_UNREACHED_REASONS,
+  REDUCED_MOTION_PREFERENCES,
+  STATE_UNREACHED_REASONS,
+  channelExistsFor,
+  fabricatedEnvironmentFields,
+} from './browser-matrix';
+import type { BrowserEnvironment } from './browser-matrix';
+import {
+  DATA_EFFECTS,
+  DEVICE_NEEDS,
+  EGRESS_NEEDS,
+  REPOSITORY_NEEDS,
+  TEST_TYPE_PRODUCERS,
+  UNASSERTED_REASONS,
+  declarationProblems,
+} from './test-type-decl';
+import type { TestTypeDeclaration } from './test-type-decl';
 import {
   ACCESS_OUTCOMES,
   CRAWL_ACCEPTANCE_STATES,
@@ -430,6 +473,399 @@ export const selectorSchema = z.object({
   confidence: z.number().min(0).max(1),
 });
 
+/*
+ * ── WHY THIS SECTION SITS HERE, ABOVE THE PLAN AND TEST WRITE PATHS ────────
+ *
+ * Declaration order, and it is load-bearing rather than tidiness.
+ * `planItemSchema`, `createTestSchema` and `updateTestSchema` all reference
+ * `testMatrixSchema` and `browserEnvironmentSchema`, and these are `const`
+ * bindings evaluated at module load — a `z.object({ … testMatrixSchema … })`
+ * below its declaration is a TDZ error (TS2448/TS2454), not a hoisted
+ * reference. Putting the vocabulary first is what lets the three doors be open
+ * at all, and a column no request can reach is exactly the defect the note on
+ * `createTestSchema.matrixCells` records.
+ */
+// ─── The browser / device matrix — the write paths (§4) ──────────────────────
+//
+// `BROWSER_ENGINES` used to be declared HERE, three members wide, and was the
+// whole of the product's cross-browser vocabulary. It now lives in
+// ./browser-matrix.ts beside the channels, versions, devices and rendering
+// preferences that are properties of it, and this file imports it — see the
+// import block's note. Every schema below is a `z.enum` over an imported list
+// for the reason stated there and three more times in this file: a second copy
+// of a list is a copy that stops matching, and a member no writer can store is
+// exactly the shape of the eight unsaveable gate kinds.
+//
+// The RUN-TIME half of each parity guard — comparing these schemas' `.options`
+// back against the lists, which only an assertion can do — lives in
+// browser-matrix.test.ts and test-type-decl.test.ts.
+
+export const browserEngineSchema = z.enum(BROWSER_ENGINES);
+export const browserChannelSchema = z.enum(BROWSER_CHANNELS);
+export const devicePresetSchema = z.enum(DEVICE_PRESETS);
+export const colourSchemeSchema = z.enum(COLOUR_SCHEMES);
+export const reducedMotionSchema = z.enum(REDUCED_MOTION_PREFERENCES);
+export const forcedColorsSchema = z.enum(FORCED_COLORS_MODES);
+export const networkProfileSchema = z.enum(NETWORK_PROFILES);
+export const browserPermissionSchema = z.enum(BROWSER_PERMISSIONS);
+export const interactionStateSchema = z.enum(INTERACTION_STATES);
+export const matrixCellStatusSchema = z.enum(MATRIX_CELL_STATUSES);
+/**
+ * TEXT columns whose domain is enforced HERE, at the producer, rather than by a
+ * Postgres type — the same arrangement `tierCapReasonSchema` has for
+ * `TestCoverageEdge.cappedBy`, and for the same reason: nothing filters rows on
+ * either of them. These two schemas are therefore the ONLY guard those
+ * vocabularies have, which is why their own test compares `.options` back
+ * against the lists.
+ */
+export const stateUnreachedReasonSchema = z.enum(STATE_UNREACHED_REASONS);
+export const testTypeProducerSchema = z.enum(TEST_TYPE_PRODUCERS);
+export const repositoryNeedSchema = z.enum(REPOSITORY_NEEDS);
+export const deviceNeedSchema = z.enum(DEVICE_NEEDS);
+export const egressNeedSchema = z.enum(EGRESS_NEEDS);
+export const dataEffectSchema = z.enum(DATA_EFFECTS);
+export const unassertedReasonSchema = z.enum(UNASSERTED_REASONS);
+
+/** A dotted-numeric version, as a browser prints it. Never a range in one string. */
+const versionLiteral = z
+  .string()
+  .min(1)
+  .max(40)
+  .regex(/^\d+(\.\d+)*$/, 'a version is dotted numerals — put the bounds in atLeast/below');
+
+/**
+ * A version window, and WHY the cell needs it.
+ *
+ * `why` is `.min(1)` and not optional, which is the one field doing real work.
+ * "Chrome >= 120" tells a reader nothing and cannot be reviewed; "the dialog
+ * element's closedby attribute landed in 120" tells them what breaks if they
+ * widen it. A WRONG_VERSION row built from a pin with no reason is a refusal
+ * nobody can judge, and the first thing anyone does with one is delete the pin.
+ */
+export const browserVersionRangeSchema = z
+  .object({
+    atLeast: versionLiteral,
+    /** Null = no ceiling has been ESTABLISHED. Not "every future version works". */
+    below: versionLiteral.nullable().default(null),
+    why: z.string().min(1).max(300),
+  })
+  .strict()
+  .refine((r) => r.below === null || r.atLeast !== r.below, {
+    message:
+      'atLeast and below are the same version, so the window is empty and every build on earth is ' +
+      'outside it — a pin that refuses everything reads as a WRONG_VERSION defect in the browser',
+    path: ['below'],
+  });
+
+/**
+ * Pinned, or not.
+ *
+ * A discriminated union and not a nullable range, because `null` would be read
+ * by the first careless consumer as "no answer yet" — which is NOT_CHECKED, a
+ * completely different sentence. UNPINNED is a decision: this cell does not care
+ * which version it gets, so no version is read and a report may not print one.
+ */
+export const browserVersionPinSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('UNPINNED') }).strict(),
+  z.object({ kind: z.literal('RANGE'), range: browserVersionRangeSchema }).strict(),
+]);
+
+/**
+ * An explicit screen.
+ *
+ * Everything but width and height is optional, and omitted means the browser's
+ * own — stated here because `userAgent` is the one that cannot be defaulted
+ * safely: an absent user agent is the engine's own, and a synthesised one is a
+ * lie the application under test will believe and branch on.
+ */
+export const explicitViewportSchema = z
+  .object({
+    width: z.number().int().min(200).max(4000),
+    height: z.number().int().min(200).max(4000),
+    deviceScaleFactor: z.number().positive().max(5).optional(),
+    hasTouch: z.boolean().optional(),
+    isMobile: z.boolean().optional(),
+    userAgent: z.string().min(1).max(500).optional(),
+  })
+  .strict();
+
+export const matrixDeviceSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('PRESET'), preset: devicePresetSchema }).strict(),
+  z.object({ kind: z.literal('VIEWPORT'), viewport: explicitViewportSchema }).strict(),
+]);
+
+/**
+ * ONE CELL — and the three refusals are the whole reason this is a schema rather
+ * than an interface.
+ *
+ * REFUSAL 1 — A PINNED VERSION WITH NO ENGINE. A version range is a claim about
+ * ONE engine's release train: Chrome 120 and Firefox 120 are unrelated builds
+ * months apart, and WebKit does not number that way at all. An unanchored range
+ * would be compared against whatever the deployment happened to launch, which
+ * is a number compared to nothing — and it would come back AVAILABLE or
+ * WRONG_VERSION with equal confidence either way.
+ *
+ * REFUSAL 2 — A CHANNEL WITH NO ENGINE, for the same reason in a different
+ * costume: every channel except BUNDLED is a chromium build, so a channel on an
+ * unanchored cell is either redundant or a contradiction, and nothing can tell
+ * which.
+ *
+ * REFUSAL 3 — A CHANNEL THAT DOES NOT EXIST FOR THE ENGINE. There is no Firefox
+ * beta channel and no WebKit canary. Accepting one would produce a cell that
+ * resolves UNSUPPORTED_COMBINATION at run time for ever, so the suite carries a
+ * test that can never execute and the matrix percentage includes it. Decided by
+ * asking `channelExistsFor` rather than re-listing the rule here: a second
+ * opinion about the same fact diverges, and the first divergence is a cell the
+ * API accepts and the runner refuses.
+ */
+export const matrixCellSchema = z
+  .object({
+    /** Absent = the deployment's default engine, reported as `<default>`. */
+    engine: browserEngineSchema.optional(),
+    /** Absent = BUNDLED, which is Playwright's own build and is NOT Chrome. */
+    channel: browserChannelSchema.optional(),
+    version: browserVersionPinSchema.optional(),
+    device: matrixDeviceSchema.optional(),
+    colourScheme: colourSchemeSchema.optional(),
+    reducedMotion: reducedMotionSchema.optional(),
+    forcedColors: forcedColorsSchema.optional(),
+    /** BCP-47. Absent = the engine's own, which is the image's locale. */
+    locale: z.string().min(2).max(35).optional(),
+    /** IANA zone. Absent = the host's, which is why a date test must name one. */
+    timezone: z.string().min(1).max(64).optional(),
+  })
+  .strict()
+  .refine((c) => c.version === undefined || c.version.kind === 'UNPINNED' || c.engine !== undefined, {
+    message:
+      'this cell pins a browser version and names no engine. A version range is a claim about one ' +
+      "engine's release train — Chrome 120 and Firefox 120 are unrelated builds — so an unanchored " +
+      'range would be compared against whatever the deployment happened to launch',
+    path: ['engine'],
+  })
+  .refine((c) => c.channel === undefined || c.channel === 'BUNDLED' || c.engine !== undefined, {
+    message:
+      'this cell names a channel and no engine. Every channel except BUNDLED is a chromium build, ' +
+      'so a channel on an unanchored cell is either redundant or a contradiction and nothing can ' +
+      'tell which',
+    path: ['engine'],
+  })
+  .refine(
+    (c) => c.engine === undefined || c.channel === undefined || channelExistsFor(c.engine, c.channel),
+    {
+      message:
+        'no build of that engine has that channel — there is no Firefox beta and no WebKit canary. ' +
+        'Accepting it would store a cell that resolves UNSUPPORTED_COMBINATION for ever, so the ' +
+        'suite would carry a test that can never execute and the matrix percentage would include it',
+      path: ['channel'],
+    },
+  );
+
+/**
+ * The axes a test declares, which the runner expands into cells.
+ *
+ * Every axis OPTIONAL, and an omitted axis contributes exactly ONE UNVARIED
+ * value rather than a default. That is the difference between "these two devices,
+ * everything else the browser's own" and a cross product with three fabricated
+ * defaults in it, and it is enforced in `enumerateMatrix`, not here.
+ *
+ * `maxCells` has a DEFAULT and the default is disclosed when it bites. A cap
+ * that silently truncated a 2,400-cell matrix to 50 produces a percentage over
+ * 50 cells that reads as a percentage over the matrix — so the enumeration
+ * returns a `capBite` with the count and the reason, and the gate refuses to
+ * score a capped matrix as a whole one.
+ */
+export const matrixAxesSchema = z
+  .object({
+    engines: z.array(browserEngineSchema).max(3).optional(),
+    channels: z.array(browserChannelSchema).max(9).optional(),
+    versions: z.array(browserVersionPinSchema).max(8).optional(),
+    devices: z.array(matrixDeviceSchema).max(24).optional(),
+    colourSchemes: z.array(colourSchemeSchema).max(3).optional(),
+    reducedMotion: z.array(reducedMotionSchema).max(2).optional(),
+    forcedColors: z.array(forcedColorsSchema).max(2).optional(),
+    locales: z.array(z.string().min(2).max(35)).max(20).optional(),
+    timezones: z.array(z.string().min(1).max(64)).max(20).optional(),
+  })
+  .strict()
+  .refine(
+    (a) => Object.values(a).every((axis) => axis === undefined || axis.length > 0),
+    {
+      message:
+        'an axis is present and empty, which has exactly the effect of omitting it — so it cannot ' +
+        'be a decision. Omit the axis, or name its values',
+    },
+  );
+
+/**
+ * THE BROWSER ENVIRONMENT BLOCK — everything `CONFIG_TEMPLATE`'s `use` could not
+ * say, and the refusals that keep an absent field meaning the browser's default.
+ *
+ * `use` carried baseURL, timezone and locale. So geolocation, permissions, fake
+ * media, clipboard, throttling, offline, colour scheme, reduced motion,
+ * forced-colors, device scale and HTTP credentials were all ungated, and every
+ * feature behind one of them was untestable with nothing anywhere saying so.
+ *
+ * ── `.strict()` IS A SECURITY PROPERTY HERE, NOT TIDINESS ───────────────────
+ *
+ * There is no `password` field on `httpCredentials` and there never will be:
+ * only secret NAMES, resolved in the runner against the project's `Secret` rows,
+ * with the values never returning to a spec, a log or a report. `.strict()` is
+ * what makes an extra `password` property a REFUSAL rather than a silently
+ * dropped field — the same arrangement, and the same argument, as
+ * `testValueEntrySchema`'s "no secret field" guarantee.
+ *
+ * ── EVERY REFUSAL IS A FABRICATED DEFAULT ──────────────────────────────────
+ *
+ * Asked of `fabricatedEnvironmentFields` rather than re-listed here, so the
+ * producer's pre-flight check and this write path cannot disagree. The
+ * archetype is `{ latitude: 0, longitude: 0 }`: Null Island is a real
+ * coordinate, so the browser accepts it, the application geolocates, and every
+ * location assertion built on it passes somewhere nobody chose — for ever, and
+ * green.
+ */
+export const fakeMediaDeviceSchema = z
+  .object({
+    /** A fixture key the run already loaded. Never a path off this machine. */
+    fixture: z.string().min(1).max(200),
+    describes: z.string().min(1).max(300),
+  })
+  .strict();
+
+export const httpCredentialRefSchema = z
+  .object({
+    usernameSecretName: z.string().min(1).max(80),
+    passwordSecretName: z.string().min(1).max(80),
+    /** Scope it to one origin, so a redirect cannot carry it somewhere else. */
+    origin: z.string().min(1).max(200).optional(),
+  })
+  .strict();
+
+export const browserEnvironmentSchema = z
+  .object({
+    geolocation: z
+      .object({
+        latitude: z.number().min(-90).max(90),
+        longitude: z.number().min(-180).max(180),
+        accuracyMetres: z.number().min(0).max(100_000).optional(),
+      })
+      .strict()
+      .optional(),
+    /** `.min(1)`: an empty grant list is refused — see the refinement below. */
+    permissions: z.array(browserPermissionSchema).min(1).max(13).optional(),
+    camera: fakeMediaDeviceSchema.optional(),
+    microphone: fakeMediaDeviceSchema.optional(),
+    clipboard: z.boolean().optional(),
+    network: networkProfileSchema.optional(),
+    offline: z.boolean().optional(),
+    colourScheme: colourSchemeSchema.optional(),
+    reducedMotion: reducedMotionSchema.optional(),
+    forcedColors: forcedColorsSchema.optional(),
+    deviceScaleFactor: z.number().positive().max(5).optional(),
+    httpCredentials: httpCredentialRefSchema.optional(),
+  })
+  .strict()
+  .refine((env) => fabricatedEnvironmentFields(env as BrowserEnvironment).length === 0, {
+    message:
+      'a field here holds the shape of a fallback rather than a choice, and a test built on one ' +
+      'PASSES: 0,0 is Null Island, an accuracy of 0 metres is a fix no device produces, and an ' +
+      'empty permission list has exactly the effect of omitting the field. Omit it instead and the ' +
+      "browser supplies its own — that is what an absent field means here, every time",
+  })
+  .refine((env) => !(env.network === 'OFFLINE' && env.offline === false), {
+    message:
+      "network is OFFLINE and offline is false, which is a contradiction. Playwright's offline " +
+      'switch and a zero-bandwidth profile are different mechanisms, and a spec that set one and ' +
+      'not the other was silently half-throttled — so this refuses rather than picking a winner',
+    path: ['offline'],
+  })
+  .refine(
+    (env) =>
+      !(
+        env.offline === true &&
+        env.network !== undefined &&
+        NETWORK_PROFILE_SHAPES[env.network].downloadKbps > 0
+      ),
+    {
+      /*
+       * Asked of `NETWORK_PROFILE_SHAPES` rather than of a second list of
+       * "profiles that are compatible with offline", and the colocated test is
+       * why: the first version of this refinement asked
+       * `UNTHROTTLED_PROFILES.includes(env.network)` and therefore refused
+       * `{ offline: true, network: 'OFFLINE' }` — the one pairing that is not
+       * merely legal but is the CORRECT way to say it. A refinement that refuses
+       * the right answer is worse than no refinement, because the only way past
+       * it is to delete the field.
+       */
+      message:
+        'offline is true beside a throttling profile with bandwidth in it, so the two instructions ' +
+        'disagree about whether there is a link at all. Use `network: "OFFLINE"`, or drop one',
+      path: ['network'],
+    },
+  );
+
+/**
+ * What a `Test` or a `PlanItem` STORES: the cells and the environment.
+ *
+ * ── WHY THIS IS ONE SHAPE AND NOT TWO COLUMNS' WORTH OF LOOSE JSON ─────────
+ *
+ * Because the cap has to travel with the cells. A stored cell list that was
+ * expanded under a `maxCells` that bit is a SAMPLE, and a reader handed the list
+ * alone cannot tell it from a matrix somebody chose. So `capBite` is part of the
+ * stored shape, it is nullable, and null means the cap did not bite — never
+ * "unknown".
+ *
+ * `cells` may be empty, and empty is meaningful: it is the unvaried run every
+ * test in this product has always been, and it is NOT the same as the column
+ * being null (nobody declared a matrix). Both are legitimate; neither is the
+ * other.
+ */
+export const matrixCapBiteSchema = z
+  .object({
+    cap: z.string().min(1).max(120),
+    limit: z.number().int().min(0),
+    taken: z.number().int().min(0),
+    /**
+     * Nullable and NOT `.default(0)`, the same choice `dimensionCapBiteSchema`
+     * records: zero is the claim that nothing was hidden, which is the opposite
+     * of what a bitten cap means, and it is the value a reader sums into a total
+     * without noticing.
+     */
+    atLeastMore: z.number().int().min(0).nullable(),
+    detail: z.string().min(1).max(500),
+  })
+  .strict();
+
+export const testMatrixSchema = z
+  .object({
+    cells: z.array(matrixCellSchema).max(200).default([]),
+    /** Null = the cap did not bite. Never "unknown". */
+    capBite: matrixCapBiteSchema.nullable().default(null),
+    /** The full product size, so a reader sees what a take was out of. */
+    declared: z.number().int().min(0).default(0),
+  })
+  .strict()
+  .refine((m) => m.declared >= m.cells.length, {
+    message:
+      'declared is smaller than the number of stored cells, so the full product is smaller than ' +
+      'the sample taken from it — one of the two numbers is wrong and a percentage over either ' +
+      'would be wrong with it',
+    path: ['declared'],
+  })
+  .refine((m) => m.capBite === null || m.capBite.taken === m.cells.length, {
+    message:
+      'the cap says it took a different number of cells than are stored here. The cap disclosure is ' +
+      'the only thing that stops a sample being read as a matrix, so it may not disagree with the ' +
+      'sample it describes',
+    path: ['capBite'],
+  })
+  .refine((m) => m.capBite !== null || m.declared === m.cells.length, {
+    message:
+      'no cap is recorded and fewer cells are stored than were declared, so cells went missing with ' +
+      'nothing to explain it. A cap that BIT must be reported as a count AND a reason',
+    path: ['capBite'],
+  });
+
+
 export const planItemSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1).max(160),
@@ -459,6 +895,23 @@ export const planItemSchema = z.object({
    * means "not minted for a gap" — it is not a missing value to be guessed at.
    */
   gapId: z.string().nullable().default(null),
+  /**
+   * THE MATRIX AND THE ENVIRONMENT THE PROPOSER ASKS FOR.
+   *
+   * Here as well as on `createTestSchema` because this is the APPROVAL shape: a
+   * human reads a plan item and decides, and "runs in 12 cells across Chrome
+   * stable and Chrome beta, with geolocation set to Berlin" is exactly the part
+   * of a proposal that needs a decision before anything is created. The
+   * Generator copies both across when it turns the item into a test, which is
+   * the same path `principals` and `authProfileId` already take.
+   *
+   * Optional, never nullable, for the reason spelled out on
+   * `createTestSchema.matrixCells`: the Explorer proposes cold plans that
+   * declare no matrix at all, and that is the ordinary case rather than a
+   * missing value to be guessed at.
+   */
+  matrixCells: testMatrixSchema.optional(),
+  browserEnv: browserEnvironmentSchema.optional(),
 });
 
 export const testPlanSchema = z.object({
@@ -583,6 +1036,35 @@ export const updateTestSchema = z.object({
    * somebody made.
    */
   covers: coversDeclaration.optional(),
+  /**
+   * THE MATRIX CELLS AND THE ENVIRONMENT BLOCK.
+   *
+   * ── WHY THESE TWO LINES EXIST, AND WHAT GOES WRONG WITHOUT THEM ───────────
+   *
+   * The columns landed on `Test` and `PlanItem` in the same change as this
+   * field, and without a line here they would have been columns no request can
+   * reach. That is this codebase's signature defect in its most literal form:
+   * `check:wiring` would report the models as connected (the tables are read and
+   * written for other reasons), the migration would apply cleanly, the schemas
+   * would validate, and a customer declaring a 12-cell matrix would watch it be
+   * silently dropped by the validator before the route ever saw it. `PlanItem.
+   * gapId` shipped exactly that way — "a column written around its own
+   * validator is a column that will eventually be written wrong" — and the note
+   * on `gapId` above records it.
+   *
+   * ── OPTIONAL, NEVER NULLABLE, AND THE DIFFERENCE IS NOT COSMETIC ──────────
+   *
+   * Omitting either leaves what is stored alone, which is what every client that
+   * predates these fields does on every save. A `.nullable()` here would add a
+   * third value — "deliberately clear it" — and that is the same judgement
+   * `covers` above makes and `authProfileId` deliberately makes the other way.
+   * The reason it goes this way here: a nullable matrix lets a client that has
+   * never heard of matrices send `null` and erase a declaration somebody made,
+   * and a dropped matrix is invisible — the test still runs, in one cell, and
+   * passes.
+   */
+  matrixCells: testMatrixSchema.optional(),
+  browserEnv: browserEnvironmentSchema.optional(),
 });
 
 export const createTestSchema = z.object({
@@ -604,6 +1086,35 @@ export const createTestSchema = z.object({
    * will be, and the STATIC extractor still has its say about it.
    */
   covers: coversDeclaration.default([]),
+  /**
+   * THE MATRIX CELLS AND THE ENVIRONMENT BLOCK.
+   *
+   * ── WHY THESE TWO LINES EXIST, AND WHAT GOES WRONG WITHOUT THEM ───────────
+   *
+   * The columns landed on `Test` and `PlanItem` in the same change as this
+   * field, and without a line here they would have been columns no request can
+   * reach. That is this codebase's signature defect in its most literal form:
+   * `check:wiring` would report the models as connected (the tables are read and
+   * written for other reasons), the migration would apply cleanly, the schemas
+   * would validate, and a customer declaring a 12-cell matrix would watch it be
+   * silently dropped by the validator before the route ever saw it. `PlanItem.
+   * gapId` shipped exactly that way — "a column written around its own
+   * validator is a column that will eventually be written wrong" — and the note
+   * on `gapId` above records it.
+   *
+   * ── OPTIONAL, NEVER NULLABLE, AND THE DIFFERENCE IS NOT COSMETIC ──────────
+   *
+   * Omitting either leaves what is stored alone, which is what every client that
+   * predates these fields does on every save. A `.nullable()` here would add a
+   * third value — "deliberately clear it" — and that is the same judgement
+   * `covers` above makes and `authProfileId` deliberately makes the other way.
+   * The reason it goes this way here: a nullable matrix lets a client that has
+   * never heard of matrices send `null` and erase a declaration somebody made,
+   * and a dropped matrix is invisible — the test still runs, in one cell, and
+   * passes.
+   */
+  matrixCells: testMatrixSchema.optional(),
+  browserEnv: browserEnvironmentSchema.optional(),
 });
 
 /**
@@ -809,13 +1320,26 @@ export const emailOtpSpecSchema = z.object({
 
 export type EmailOtpSpec = z.infer<typeof emailOtpSpecSchema>;
 
-// ─── Cross-browser & localisation (§4) ───────────────────────────────────────
-
-export const BROWSER_ENGINES = ['chromium', 'firefox', 'webkit'] as const;
 
 /** Chromium is always run; listing it again is harmless. */
 export const crossBrowserSpecSchema = z.object({
   browsers: z.array(z.enum(BROWSER_ENGINES)).min(1).default(['chromium', 'firefox', 'webkit']),
+  /**
+   * THE WIDENED AXIS SET, added beside `browsers` rather than replacing it.
+   *
+   * `browsers` stays, with its default, because `plugins/matrix.ts`,
+   * `spec-strategies.ts` and `new-test-templates.ts` all read it and every
+   * CROSS_BROWSER test ever stored carries it. Removing it would invalidate the
+   * stored specs of a feature whose whole point is that it keeps working.
+   *
+   * When `matrix` is present it is the richer statement and `browsers` is its
+   * floor: a plugin that honours `matrix` must still include chromium, for the
+   * reason `browserProjects` records — a matrix without the default browser
+   * hides regressions.
+   */
+  matrix: matrixAxesSchema.optional(),
+  /** The `use` block, when this test needs one. Absent = browser defaults. */
+  environment: browserEnvironmentSchema.optional(),
 });
 
 export const localizationSpecSchema = z.object({
@@ -1074,9 +1598,122 @@ export const visualTestSpecSchema = z.object({
   settleMs: z.number().int().min(0).max(30_000).default(250),
   /** Rectangles excluded from the diff — clocks, avatars, ad slots. */
   ignoreRegions: z.array(ignoreRegionSchema).max(50).default([]),
+  /**
+   * THE MATRIX THIS TEST DECLARES — the field that turns N hand-written tests
+   * into one.
+   *
+   * `path` and `viewport` above stay exactly as they are, with their defaults,
+   * because `plugins/visual.ts` and `spec-strategies.ts` read them and every
+   * stored visual spec carries them. When `matrix` is absent the test behaves
+   * precisely as it always has: one path, one viewport, one capture.
+   *
+   * When it is present, `viewport` is the FIRST cell rather than the only one.
+   * That is additive on purpose — a plugin honouring the matrix captures every
+   * cell, and a plugin that does not still captures the one it always did.
+   */
+  matrix: matrixAxesSchema.optional(),
+  /**
+   * THE STATES TO REACH BEFORE CAPTURING.
+   *
+   * A visual test could name a path and a viewport, so what it captured was
+   * always the page as it ARRIVES — and a dropdown standing open, a focus ring,
+   * an error summary, a loading skeleton and an empty state are exactly where
+   * visual regressions live. One hand-written test each meant nobody covered
+   * them.
+   *
+   * DEFAULT is the implicit member: a spec that names no state captures the
+   * page as it arrives, which is what every existing spec does. Naming DEFAULT
+   * explicitly alongside others is how a test says "and also the plain one".
+   */
+  states: z.array(interactionStateSchema).max(INTERACTION_STATES.length).optional(),
+  /** The `use` block, when this test needs one. Absent = browser defaults. */
+  environment: browserEnvironmentSchema.optional(),
 });
 
 export type VisualTestSpec = z.infer<typeof visualTestSpecSchema>;
+
+/**
+ * ONE CAPTURE'S WORTH OF EVIDENCE: the cell, the state, and whether the state
+ * was actually REACHED.
+ *
+ * ── THE DEFECT THIS SHAPE REFUSES ──────────────────────────────────────────
+ *
+ * The worst available outcome for a visual matrix is not a missing capture. It
+ * is a capture of the WRONG THING filed under the right name: the test asked for
+ * the ERROR state, nothing triggered validation, the screenshot was taken
+ * anyway, it looks fine, somebody approves it — and the baseline now permanently
+ * asserts the DEFAULT state under the name of a state nobody ever saw. Every
+ * future run of that cell passes, and the error rendering is untested for ever
+ * with a green row above it.
+ *
+ * So `reached` is required, `unreachedReason` is required exactly when it is
+ * false, and the refinement refuses an image key beside a reason that means the
+ * state was never on screen. Membership of
+ * `NEVER_CAPTURABLE_UNREACHED_REASONS` is asked rather than re-listed, so the
+ * gate and this write path cannot disagree about which reasons those are.
+ *
+ * ── THE BASELINE SCOPE TRAVELS WITH IT ─────────────────────────────────────
+ *
+ * `environmentId` is required and has NO DEFAULT, carrying forward exactly what
+ * `VisualBaseline.environmentId` was added for: the unique key used to be
+ * (test, viewport, browser), so STAGING AND PRODUCTION SHARED A BASELINE and
+ * whichever ran first became the other's reference. A matrix multiplies that
+ * risk by the number of cells, so the scope is part of the evidence rather than
+ * something a writer remembers.
+ */
+export const visualCaptureSchema = z
+  .object({
+    cell: matrixCellSchema,
+    state: interactionStateSchema,
+    /** Was the state actually on screen when the shutter fired? */
+    reached: z.boolean(),
+    /** Required exactly when `reached` is false. */
+    unreachedReason: stateUnreachedReasonSchema.optional(),
+    /** One sentence a human can act on. Required beside any unreached reason. */
+    unreachedDetail: z.string().min(1).max(500).optional(),
+    /** The stored image, or null when nothing was captured. Never a placeholder key. */
+    imageKey: z.string().min(1).max(500).nullable().default(null),
+    /**
+     * The environment this capture was taken against. NO DEFAULT and no
+     * sentinel — see the note above. A defaulted scope is how the
+     * shared-reference defect comes back one writer at a time.
+     */
+    environmentId: z.string().min(1).max(64),
+  })
+  .strict()
+  .refine((c) => c.reached || c.unreachedReason !== undefined, {
+    message:
+      'the state was not reached and no reason is given. A capture with no reason is ' +
+      "indistinguishable from a writer's bug, and the first consumer that forgets to check will " +
+      'read it as a successful capture of that state',
+    path: ['unreachedReason'],
+  })
+  .refine((c) => !c.reached || c.unreachedReason === undefined, {
+    message:
+      'the state was reached and an unreached reason is given, so the row says both. There is no ' +
+      'reason to give for a state that was on screen',
+    path: ['unreachedReason'],
+  })
+  .refine((c) => c.unreachedReason === undefined || c.unreachedDetail !== undefined, {
+    message:
+      'an unreached reason with no detail is a classification nobody can act on — NO_TRIGGER_FOUND ' +
+      'is useful only when it says which trigger was looked for',
+    path: ['unreachedDetail'],
+  })
+  .refine(
+    (c) =>
+      c.imageKey === null ||
+      c.unreachedReason === undefined ||
+      !NEVER_CAPTURABLE_UNREACHED_REASONS.includes(c.unreachedReason),
+    {
+      message:
+        'an image is recorded for a state that was never on screen. That is the worst outcome a ' +
+        'visual matrix has: the capture is of the DEFAULT rendering, it looks fine, somebody ' +
+        'approves it, and the baseline then asserts this state for ever while the real one stays ' +
+        'untested behind a green row',
+      path: ['imageKey'],
+    },
+  );
 
 // ─── Load testing — k6 (§4) ──────────────────────────────────────────────────
 
@@ -4384,4 +5021,846 @@ export const testValueEntrySchema = z
       'recall is the weakest evidence here and claiming otherwise is the one dishonesty this ' +
       'catalogue exists to prevent',
     path: ['verified'],
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SEVEN NEW TEST TYPES — their specs, and the honesty columns of each
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Every schema in this section belongs to a type in `PENDING_TEST_TYPES`: it can
+// be authored and validated today and no `Test` row can carry it yet, which is
+// the honest state of a type whose plugin is being written. See the long note on
+// `PENDING_TEST_TYPES` in ./constants.ts for why that is two lists rather than
+// one, and `mintTestTypeSteps` for the four edits that promote a type.
+//
+// They are HERE rather than in a new file for the reason this file's existing
+// sections are: the write path to a column belongs beside the write paths to its
+// neighbours, and a spec schema in a second file is a spec schema the create-test
+// route forgets to parse.
+
+// ─── PAYMENTS: the money path (§4) ───────────────────────────────────────────
+
+/**
+ * THE DEFECT: checkout could be clicked through and the money path could not be
+ * asserted. No 3DS, no decline, no insufficient funds, no webhook transition, no
+ * refund, no partial capture — and clicking through was a PASS. It is the first
+ * flow every buyer names.
+ *
+ * ── THE TWO STRUCTURAL REFUSALS, WHICH ARE THE POINT OF THIS SHAPE ─────────
+ *
+ * 1. `testMode` is `z.literal(true)`, NOT `z.boolean()`. There is no way to
+ *    express a live-mode payment scenario in this type system: the only value
+ *    the field accepts is `true`, so a live-mode scenario cannot be constructed,
+ *    cannot be parsed, cannot be stored and cannot be handed to a plugin. That
+ *    is a TYPE-LEVEL refusal rather than a convention, which is what the rule
+ *    asks for — a boolean defaulting to true would be a convention, and a
+ *    convention is one careless writer away from a real charge on a customer's
+ *    account.
+ *
+ * 2. `.strict()` AND NO CREDENTIAL FIELD. There is no `apiKey`, no `secretKey`
+ *    and no `token` property, and an extra one is REFUSED rather than dropped.
+ *    The card is named by its `catalogueId` — a published test value from
+ *    ./provider-catalogue.ts, which is admitted through `admitPublishedValue`
+ *    and therefore cannot itself be credential-shaped — and the sandbox key
+ *    lives on a customer-owned `Integration` row. The same arrangement, and the
+ *    same argument, as `testValueEntrySchema`.
+ */
+export const PAYMENT_SCENARIO_KINDS = [
+  /** A successful authorisation and capture. The only one that was reachable. */
+  'AUTHORISE_AND_CAPTURE',
+  /** Authorised, captured later. The window where an order can be lost. */
+  'AUTHORISE_THEN_DELAYED_CAPTURE',
+  /** Captured for less than authorised — the shipping-partial case. */
+  'PARTIAL_CAPTURE',
+  /** The 3-D Secure challenge, completed. */
+  'THREE_DS_CHALLENGE_PASS',
+  /** The 3-D Secure challenge, abandoned or failed. */
+  'THREE_DS_CHALLENGE_FAIL',
+  'DECLINE_GENERIC',
+  'DECLINE_INSUFFICIENT_FUNDS',
+  'DECLINE_EXPIRED_CARD',
+  'DECLINE_INCORRECT_CVC',
+  /** Rejected before any network call. The client-side validation path. */
+  'INVALID_CARD_NUMBER',
+  /** The provider's asynchronous state change, received and asserted. */
+  'WEBHOOK_TRANSITION',
+  'REFUND_FULL',
+  'REFUND_PARTIAL',
+  /** Two identical submissions; exactly one charge must exist afterwards. */
+  'DUPLICATE_SUBMISSION',
+] as const;
+export type PaymentScenarioKind = (typeof PAYMENT_SCENARIO_KINDS)[number];
+
+const PAYMENT_SCENARIO_KIND_PRESENT: Record<PaymentScenarioKind, true> = {
+  AUTHORISE_AND_CAPTURE: true,
+  AUTHORISE_THEN_DELAYED_CAPTURE: true,
+  PARTIAL_CAPTURE: true,
+  THREE_DS_CHALLENGE_PASS: true,
+  THREE_DS_CHALLENGE_FAIL: true,
+  DECLINE_GENERIC: true,
+  DECLINE_INSUFFICIENT_FUNDS: true,
+  DECLINE_EXPIRED_CARD: true,
+  DECLINE_INCORRECT_CVC: true,
+  INVALID_CARD_NUMBER: true,
+  WEBHOOK_TRANSITION: true,
+  REFUND_FULL: true,
+  REFUND_PARTIAL: true,
+  DUPLICATE_SUBMISSION: true,
+};
+
+/** Derived, never hand-listed. */
+export const PAYMENT_SCENARIO_KIND_LIST = Object.keys(
+  PAYMENT_SCENARIO_KIND_PRESENT,
+) as ReadonlyArray<PaymentScenarioKind>;
+
+export const paymentScenarioKindSchema = z.enum(PAYMENT_SCENARIO_KINDS);
+
+/**
+ * Scenarios that only a published test value can drive.
+ *
+ * Exported so `assessGate` in ./provider-catalogue.ts and a plan can ask ONE
+ * list whether a scenario needs a catalogue entry. A scenario in here with no
+ * `catalogueId` is refused below: without a value that forces the outcome, the
+ * test drives a normal card, the charge succeeds, and a decline assertion fails
+ * — reported as an application defect that does not exist.
+ */
+export const OUTCOME_FORCING_SCENARIOS: readonly PaymentScenarioKind[] = [
+  'THREE_DS_CHALLENGE_PASS',
+  'THREE_DS_CHALLENGE_FAIL',
+  'DECLINE_GENERIC',
+  'DECLINE_INSUFFICIENT_FUNDS',
+  'DECLINE_EXPIRED_CARD',
+  'DECLINE_INCORRECT_CVC',
+  'INVALID_CARD_NUMBER',
+];
+
+export const paymentScenarioSchema = z
+  .object({
+    kind: paymentScenarioKindSchema,
+    /**
+     * THE ONLY ACCEPTED VALUE IS `true`. See the note above: this is the
+     * type-level half of "structurally incapable of driving a live-mode charge".
+     */
+    testMode: z.literal(true),
+    /** `CataloguePublisher` — validated against the catalogue by the producer. */
+    publisher: z.string().min(1).max(60),
+    /**
+     * The published test value that forces the outcome, by id. Null only for
+     * scenarios that need no forcing value — see the refinement.
+     */
+    catalogueId: z.string().min(1).max(120).nullable().default(null),
+    /** The route the checkout starts at. */
+    path: z.string().min(1).max(500),
+    /** Minor units. Integer, because a float amount is a rounding defect waiting. */
+    amountMinor: z.number().int().min(1).max(100_000_000),
+    currency: z.string().length(3).regex(/^[A-Z]{3}$/, 'ISO 4217, uppercase'),
+    /**
+     * For PARTIAL_CAPTURE and REFUND_PARTIAL. Refused above `amountMinor`: a
+     * capture larger than the authorisation is a provider error, not a test.
+     */
+    partialAmountMinor: z.number().int().min(1).max(100_000_000).nullable().default(null),
+    /**
+     * The provider event the scenario waits for, for WEBHOOK_TRANSITION.
+     *
+     * The webhook is the half of a payment integration that breaks silently: the
+     * charge succeeds, the application never hears about it, and the order sits
+     * unpaid while the customer has been billed. A UI-only checkout test passes
+     * through that defect every time.
+     */
+    webhookEvent: z.string().min(1).max(120).nullable().default(null),
+    /**
+     * WHAT THIS SCENARIO DOES NOT PROVE, declared with the scenario.
+     *
+     * Not a report field — a SPEC field, written before the run. A test-mode
+     * payment never settles and no provider simulates a real issuer's 3DS UI, so
+     * a scenario that said nothing about it would let a green row read as
+     * coverage of settlement. Each entry carries an `UnassertedReason` so the
+     * two halves — our gap and the provider's limit — stay apart.
+     */
+    notAsserted: z
+      .array(
+        z
+          .object({
+            assertion: z.string().min(1).max(300),
+            reason: unassertedReasonSchema,
+          })
+          .strict(),
+      )
+      .max(20)
+      .default([]),
+  })
+  .strict()
+  .refine((s) => !OUTCOME_FORCING_SCENARIOS.includes(s.kind) || s.catalogueId !== null, {
+    message:
+      'this scenario needs a published test value to force its outcome and names none. Without one ' +
+      'the test drives an ordinary card, the charge succeeds, and the decline assertion fails — ' +
+      'reported as an application defect that does not exist',
+    path: ['catalogueId'],
+  })
+  .refine(
+    (s) =>
+      (s.kind !== 'PARTIAL_CAPTURE' && s.kind !== 'REFUND_PARTIAL') || s.partialAmountMinor !== null,
+    {
+      message:
+        'a partial capture or partial refund with no partial amount is a full one, so the scenario ' +
+        'asserts the opposite of what it is named for',
+      path: ['partialAmountMinor'],
+    },
+  )
+  .refine((s) => s.partialAmountMinor === null || s.partialAmountMinor <= s.amountMinor, {
+    message:
+      'the partial amount exceeds the authorised amount. That is a provider error rather than an ' +
+      'application behaviour, so the test would be asserting against the provider',
+    path: ['partialAmountMinor'],
+  })
+  .refine((s) => s.kind !== 'WEBHOOK_TRANSITION' || s.webhookEvent !== null, {
+    message:
+      'a webhook-transition scenario names no event to wait for, so it would pass the moment the ' +
+      'page did — which is the exact defect it exists to catch: the charge succeeds, the ' +
+      'application never hears about it, and the order sits unpaid while the customer has been billed',
+    path: ['webhookEvent'],
+  });
+
+/** A PAYMENTS test's whole spec: one or more scenarios over one checkout. */
+export const paymentsTestSpecSchema = z
+  .object({
+    scenarios: z.array(paymentScenarioSchema).min(1).max(20),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict();
+
+// ─── DOCUMENT: a produced file (§4) ──────────────────────────────────────────
+
+/**
+ * THE DEFECT: `setInputFiles` appears NOWHERE in the runner, nothing asserts a
+ * downloaded file's name, type or bytes, and no plugin calls `page.pdf()` or
+ * asserts a produced document. So invoices, statements, shipping labels, signed
+ * contracts and CSV exports — the artefacts a business is judged on — were
+ * untested, and a click that produced a corrupt zero-byte PDF passed.
+ *
+ * ── WHY `minBytes` IS REQUIRED AND HAS NO DEFAULT ──────────────────────────
+ *
+ * Because zero is the failure. A download handler that errors server-side
+ * frequently produces a 0-byte or a few-hundred-byte HTML error page with a
+ * `.pdf` name, and every assertion short of a byte floor passes on it: the file
+ * exists, the name matches, the download event fired. A floor somebody chose is
+ * the cheapest assertion that catches it, and a DEFAULT floor would be a number
+ * this schema invented about a document it has never seen.
+ *
+ * `expectText` is OPTIONAL and its absence is reported, not assumed: extracting
+ * the text layer of a PDF needs a parser this image does not carry, so the
+ * DOCUMENT declaration marks `pdftotext` SPEC-scoped and a run without it
+ * reports the text assertion UNAVAILABLE rather than passing.
+ */
+export const DOCUMENT_SOURCES = [
+  /** A browser download event, triggered by a click. */
+  'DOWNLOAD',
+  /** `page.pdf()` — print-to-PDF of the rendered page. */
+  'PRINT_TO_PDF',
+  /** A direct GET of a document URL, with the session's own cookies. */
+  'DIRECT_FETCH',
+  /** An attachment on an outbound email, read from a mail sink. */
+  'EMAIL_ATTACHMENT',
+] as const;
+export type DocumentSource = (typeof DOCUMENT_SOURCES)[number];
+
+const DOCUMENT_SOURCE_PRESENT: Record<DocumentSource, true> = {
+  DOWNLOAD: true,
+  PRINT_TO_PDF: true,
+  DIRECT_FETCH: true,
+  EMAIL_ATTACHMENT: true,
+};
+
+export const DOCUMENT_SOURCE_LIST = Object.keys(
+  DOCUMENT_SOURCE_PRESENT,
+) as ReadonlyArray<DocumentSource>;
+
+export const documentSourceSchema = z.enum(DOCUMENT_SOURCES);
+
+export const documentArtifactSchema = z
+  .object({
+    source: documentSourceSchema,
+    /** The route or click path that produces it. */
+    path: z.string().min(1).max(500),
+    /** A glob or exact name. `invoice-*.pdf` is the common shape. */
+    expectFilename: z.string().min(1).max(300).optional(),
+    /** The media type the response must declare. */
+    expectMediaType: z.string().min(1).max(120).optional(),
+    /**
+     * The byte floor. REQUIRED, no default — see the note above. Zero is
+     * explicitly outside the range: a floor of 0 asserts nothing.
+     */
+    minBytes: z.number().int().min(1).max(1_000_000_000),
+    /** A ceiling, for the runaway-export case. Optional: most documents have none. */
+    maxBytes: z.number().int().min(1).max(1_000_000_000).optional(),
+    /**
+     * The file's leading bytes, as a hex string — `25504446` for `%PDF`.
+     *
+     * The one assertion that distinguishes a real PDF from an HTML error page
+     * wearing a `.pdf` name, which is the single commonest way this path fails.
+     */
+    expectMagicHex: z
+      .string()
+      .min(2)
+      .max(32)
+      .regex(/^[0-9a-f]+$/i, 'hex bytes, no 0x prefix')
+      .optional(),
+    /** Strings the extracted text must contain. Needs a parser; reported if absent. */
+    expectText: z.array(z.string().min(1).max(300)).max(20).optional(),
+    /** For a multi-page document. Null = no expectation about page count. */
+    expectPages: z.number().int().min(1).max(10_000).nullable().default(null),
+    /** A file this test UPLOADS first, by fixture key. Never a path off this machine. */
+    uploadFixture: z.string().min(1).max(200).optional(),
+    notAsserted: z
+      .array(
+        z
+          .object({ assertion: z.string().min(1).max(300), reason: unassertedReasonSchema })
+          .strict(),
+      )
+      .max(20)
+      .default([]),
+  })
+  .strict()
+  .refine((d) => d.maxBytes === undefined || d.maxBytes >= d.minBytes, {
+    message: 'maxBytes is below minBytes, so no file can satisfy both',
+    path: ['maxBytes'],
+  })
+  .refine(
+    (d) =>
+      d.expectFilename !== undefined ||
+      d.expectMediaType !== undefined ||
+      d.expectMagicHex !== undefined ||
+      (d.expectText !== undefined && d.expectText.length > 0),
+    {
+      message:
+        'this artefact asserts only a byte floor, so a different document of the right size would ' +
+        'pass. Name the filename, the media type, the magic bytes or some text — the point of the ' +
+        'type is that a click producing an HTML error page with a .pdf name must not be a pass',
+    },
+  )
+  .refine((d) => d.source !== 'PRINT_TO_PDF' || d.uploadFixture === undefined, {
+    message:
+      'a print-to-PDF capture has nothing to upload, so an upload fixture here would be silently ' +
+      'ignored — and a silently ignored instruction is how a test comes to assert less than it says',
+    path: ['uploadFixture'],
+  });
+
+export const documentTestSpecSchema = z
+  .object({
+    artifacts: z.array(documentArtifactSchema).min(1).max(20),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict();
+
+// ─── PWA: service worker, offline, cache, sync, install (§4) ─────────────────
+
+/**
+ * THE DEFECT: service workers, offline navigation, cache-first behaviour,
+ * background sync and the install prompt were all untestable. An application
+ * that claims to work offline had no way to be asked, and the claim is in the
+ * marketing copy of every PWA.
+ *
+ * Each check is a MEMBER rather than a boolean field, so that a run can report
+ * per check: `REGISTERS` passing and `OFFLINE_NAVIGATION` unavailable is a real
+ * and common state, and one boolean per spec could not express it.
+ */
+export const PWA_CHECKS = [
+  /** A service worker reaches `activated` for the scope the page declares. */
+  'SERVICE_WORKER_ACTIVATES',
+  /** The manifest parses and names the fields an install needs. */
+  'MANIFEST_VALID',
+  /** A navigation succeeds with the network down. */
+  'OFFLINE_NAVIGATION',
+  /** A cached response is served without the network being touched. */
+  'CACHE_FIRST',
+  /** A write made offline replays once connectivity returns. */
+  'BACKGROUND_SYNC_REPLAY',
+  /** The in-page install affordance appears when the criteria are met. */
+  'INSTALL_PROMPT_AVAILABLE',
+  /** A new worker takes over without a stale shell being served. */
+  'UPDATE_TAKES_OVER',
+] as const;
+export type PwaCheck = (typeof PWA_CHECKS)[number];
+
+const PWA_CHECK_PRESENT: Record<PwaCheck, true> = {
+  SERVICE_WORKER_ACTIVATES: true,
+  MANIFEST_VALID: true,
+  OFFLINE_NAVIGATION: true,
+  CACHE_FIRST: true,
+  BACKGROUND_SYNC_REPLAY: true,
+  INSTALL_PROMPT_AVAILABLE: true,
+  UPDATE_TAKES_OVER: true,
+};
+
+export const PWA_CHECK_LIST = Object.keys(PWA_CHECK_PRESENT) as ReadonlyArray<PwaCheck>;
+
+export const pwaCheckSchema = z.enum(PWA_CHECKS);
+
+export const pwaTestSpecSchema = z
+  .object({
+    path: z.string().min(1).default('/'),
+    checks: z.array(pwaCheckSchema).min(1).max(PWA_CHECKS.length),
+    /** The scope a worker must claim. Absent = whatever the page registers. */
+    expectScope: z.string().min(1).max(300).optional(),
+    /** Paths that must still render with the network down. */
+    offlinePaths: z.array(z.string().min(1)).max(50).default([]),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict()
+  .refine(
+    (s) => !s.checks.includes('OFFLINE_NAVIGATION') || s.offlinePaths.length > 0,
+    {
+      message:
+        'OFFLINE_NAVIGATION is requested and no path is named, so the check would assert that the ' +
+        'page it is already on still renders — which a warm in-memory document does whether a ' +
+        'worker exists or not. That is a pass meaning "we did not check"',
+      path: ['offlinePaths'],
+    },
+  );
+
+// ─── PUSH: a notification actually delivered (§4) ────────────────────────────
+
+/**
+ * THE DEFECT: mobile tests stop at the app's own UI and nothing triggers or
+ * asserts an APNs, FCM or Web Push delivery. So the notification path — the one
+ * a product manager measures retention by — was never driven.
+ *
+ * ── TWO OF THE THREE TRANSPORTS CANNOT BE DRIVEN FROM THIS IMAGE ───────────
+ *
+ * There is no install that produces an iOS device token. So a PUSH test naming
+ * APNs or FCM must report UNAVAILABLE with `CAPABILITY_ABSENT` and a remedy,
+ * never SKIPPED: a skipped push test inside a percentage is a notification path
+ * that can never fail. WEB_PUSH is the one arm an emulated browser context can
+ * serve, and the declaration says so.
+ *
+ * NO CREDENTIAL FIELD, and `.strict()`. An APNs key or an FCM service account
+ * belongs on a customer-owned `Integration` row referencing `Secret.name`, and
+ * `senderIntegrationId` is how this spec points at one.
+ */
+export const PUSH_TRANSPORTS = ['WEB_PUSH', 'APNS', 'FCM'] as const;
+export type PushTransport = (typeof PUSH_TRANSPORTS)[number];
+
+const PUSH_TRANSPORT_PRESENT: Record<PushTransport, true> = {
+  WEB_PUSH: true,
+  APNS: true,
+  FCM: true,
+};
+
+export const PUSH_TRANSPORT_LIST = Object.keys(
+  PUSH_TRANSPORT_PRESENT,
+) as ReadonlyArray<PushTransport>;
+
+/** Transports that need a real device, so no install can make them available here. */
+export const DEVICE_BOUND_PUSH_TRANSPORTS: readonly PushTransport[] = ['APNS', 'FCM'];
+
+export const pushTransportSchema = z.enum(PUSH_TRANSPORTS);
+
+export const pushDeliverySchema = z
+  .object({
+    transport: pushTransportSchema,
+    /** What in the application causes the notification. A route, or an API call. */
+    triggerPath: z.string().min(1).max(500),
+    /** Substrings the delivered payload must contain. */
+    expectTitle: z.string().min(1).max(300).optional(),
+    expectBody: z.string().min(1).max(500).optional(),
+    /** The deep link a tap must honour. The half that silently rots. */
+    expectDeepLink: z.string().min(1).max(500).optional(),
+    /**
+     * The customer's own sender credential, by `Integration` id. NEVER a key.
+     * Null for WEB_PUSH against the app's own VAPID setup.
+     */
+    senderIntegrationId: z.string().min(1).max(64).nullable().default(null),
+    /** How long to wait. A delivery is asynchronous and a zero wait is no test. */
+    timeoutSeconds: z.number().int().min(1).max(300).default(30),
+    notAsserted: z
+      .array(
+        z
+          .object({ assertion: z.string().min(1).max(300), reason: unassertedReasonSchema })
+          .strict(),
+      )
+      .max(20)
+      .default([]),
+  })
+  .strict()
+  .refine(
+    (d) =>
+      d.expectTitle !== undefined || d.expectBody !== undefined || d.expectDeepLink !== undefined,
+    {
+      message:
+        'this delivery asserts nothing about the notification, so it would pass on any push at all ' +
+        '— including the wrong one, sent to the wrong person, in the wrong language',
+    },
+  )
+  .refine(
+    (d) => !DEVICE_BOUND_PUSH_TRANSPORTS.includes(d.transport) || d.senderIntegrationId !== null,
+    {
+      message:
+        'APNs and FCM need the customer’s own sender credential, named here as an Integration id. ' +
+        'A device-bound transport with none cannot be attempted, and must be reported UNAVAILABLE ' +
+        'with that remedy rather than skipped',
+      path: ['senderIntegrationId'],
+    },
+  );
+
+export const pushTestSpecSchema = z
+  .object({
+    deliveries: z.array(pushDeliverySchema).min(1).max(20),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict();
+
+// ─── CHAOS: a dependency misbehaving (§4) ────────────────────────────────────
+
+/**
+ * THE DEFECT: `har.ts` already has route interception — 1,528 lines of it,
+ * written and tested — and NO TEST TYPE USED IT. So dependency-misbehaviour
+ * paths could not be exercised at all: the 500 from the payment provider, the
+ * eight-second timeout from the search service, the malformed JSON from the
+ * analytics vendor. Every one of those renders something, and nobody had ever
+ * seen what.
+ *
+ * The capability is already on the image, which is why the CHAOS declaration
+ * lists no binary. What was missing was a type that asks for it.
+ *
+ * `urlPattern` is a glob over the request URL and the fault is SYNTHESISED: the
+ * request must never reach the third party it impersonates, which is also why
+ * this type needs no credential of any kind and declares APP_UNDER_TEST egress.
+ */
+export const CHAOS_FAULTS = [
+  'HTTP_500',
+  'HTTP_503',
+  'HTTP_429',
+  /** The connection is refused outright, which is not the same as a 5xx. */
+  'CONNECTION_REFUSED',
+  /** Held open past the application's own timeout. */
+  'SLOW_RESPONSE',
+  /** A 200 whose body is not the shape the client parses. */
+  'MALFORMED_BODY',
+  /** A 200 with no body at all — the case a `try/catch` around JSON misses. */
+  'EMPTY_BODY',
+  /** The response arrives truncated mid-stream. */
+  'TRUNCATED_BODY',
+] as const;
+export type ChaosFault = (typeof CHAOS_FAULTS)[number];
+
+const CHAOS_FAULT_PRESENT: Record<ChaosFault, true> = {
+  HTTP_500: true,
+  HTTP_503: true,
+  HTTP_429: true,
+  CONNECTION_REFUSED: true,
+  SLOW_RESPONSE: true,
+  MALFORMED_BODY: true,
+  EMPTY_BODY: true,
+  TRUNCATED_BODY: true,
+};
+
+export const CHAOS_FAULT_LIST = Object.keys(CHAOS_FAULT_PRESENT) as ReadonlyArray<ChaosFault>;
+
+export const chaosFaultSchema = z.enum(CHAOS_FAULTS);
+
+export const chaosTestSpecSchema = z
+  .object({
+    path: z.string().min(1).default('/'),
+    /** Glob over the request URL. The dependency this test misbehaves. */
+    urlPattern: z.string().min(1).max(500),
+    fault: chaosFaultSchema,
+    /** For SLOW_RESPONSE. Must exceed what the application waits for, or nothing happens. */
+    delayMs: z.number().int().min(1).max(120_000).nullable().default(null),
+    /**
+     * WHAT THE APPLICATION MUST DO ABOUT IT. Required, with no default.
+     *
+     * A chaos test that injects a fault and asserts nothing is a test that
+     * passes when the application crashes, because a crash is also a thing that
+     * happened. The whole value of the type is the assertion that the user is
+     * shown a recoverable state rather than a white screen or a silent success.
+     */
+    expectVisible: z.string().min(1).max(300),
+    /** The fault must NOT be reported to the user as a success. */
+    expectNotVisible: z.string().min(1).max(300).optional(),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict()
+  .refine((s) => s.fault !== 'SLOW_RESPONSE' || s.delayMs !== null, {
+    message:
+      'SLOW_RESPONSE with no delay is not slow, so the request completes normally and the test ' +
+      'asserts the happy path under the name of a timeout test',
+    path: ['delayMs'],
+  })
+  .refine((s) => s.fault === 'SLOW_RESPONSE' || s.delayMs === null, {
+    message:
+      'a delay is set on a fault that does not use one, so the instruction would be silently ' +
+      'ignored — and a silently ignored instruction is how a test asserts less than it says',
+    path: ['delayMs'],
+  });
+
+// ─── I18N_DEEP: the l10n defects LOCALIZATION cannot find (§4) ───────────────
+
+/**
+ * THE DEFECT: the LOCALIZATION plugin only re-runs the same code under another
+ * locale and emits ZERO findings, so no l10n defect class is detectable — not
+ * RTL mirroring, not pseudo-localization, not truncation, not a missing key. Its
+ * `Finding` kind is dead code.
+ *
+ * Every check here is DETERMINISTIC AND MODEL-FREE, which is what makes the type
+ * viable with no API key: a pseudo-localized string is generated from the run
+ * seed, truncation is a measured overflow of a rendered box, mirroring is a
+ * computed-style comparison, and an untranslated key is a rendered string that
+ * equals its own lookup key.
+ *
+ * It does NOT assert that a translation is CORRECT. That needs a human or a
+ * model, it is declared as `knownUnasserted` on the type, and claiming it would
+ * be the exact dishonesty this type exists to replace.
+ */
+export const I18N_CHECKS = [
+  /** The document direction and the layout actually mirror under an RTL locale. */
+  'RTL_MIRRORING',
+  /** A pseudo-localized build renders without clipping or overflow. */
+  'PSEUDO_LOCALIZATION',
+  /** No rendered string overflows its box under a longer language. */
+  'TRUNCATION',
+  /** No rendered string is identical to its own translation key. */
+  'MISSING_KEY',
+  /** Dates, numbers and currency are formatted for the locale, not the host. */
+  'FORMATTING',
+  /** The locale the application chose matches the one requested. */
+  'LOCALE_NEGOTIATION',
+] as const;
+export type I18nCheck = (typeof I18N_CHECKS)[number];
+
+const I18N_CHECK_PRESENT: Record<I18nCheck, true> = {
+  RTL_MIRRORING: true,
+  PSEUDO_LOCALIZATION: true,
+  TRUNCATION: true,
+  MISSING_KEY: true,
+  FORMATTING: true,
+  LOCALE_NEGOTIATION: true,
+};
+
+export const I18N_CHECK_LIST = Object.keys(I18N_CHECK_PRESENT) as ReadonlyArray<I18nCheck>;
+
+export const i18nCheckSchema = z.enum(I18N_CHECKS);
+
+/** Locales whose script is right-to-left, so RTL_MIRRORING has something to assert. */
+export const RTL_LOCALE_PREFIXES: readonly string[] = ['ar', 'he', 'fa', 'ur', 'yi', 'dv', 'ps'];
+
+/** Is this BCP-47 tag a right-to-left locale? Prefix match on the language subtag. */
+export function isRtlLocale(tag: string): boolean {
+  const language = tag.split('-')[0]?.toLowerCase() ?? '';
+  return RTL_LOCALE_PREFIXES.includes(language);
+}
+
+export const i18nDeepSpecSchema = z
+  .object({
+    path: z.string().min(1).default('/'),
+    checks: z.array(i18nCheckSchema).min(1).max(I18N_CHECKS.length),
+    locales: z
+      .array(
+        z
+          .object({
+            tag: z.string().min(2).max(35),
+            timezone: z.string().max(64).optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+    /**
+     * The seed the pseudo-localized strings are generated from. REQUIRED, so the
+     * same spec produces byte-identical expansion every run — an ambient clock
+     * or a `Math.random` here would make a truncation finding unreproducible,
+     * and an unreproducible finding is one nobody fixes.
+     */
+    seed: z.string().min(1).max(120),
+    /** How much longer a pseudo-localized string is. 1.3 is the usual German factor. */
+    expansionFactor: z.number().min(1).max(3).default(1.3),
+    environment: browserEnvironmentSchema.optional(),
+  })
+  .strict()
+  .refine((s) => !s.checks.includes('RTL_MIRRORING') || s.locales.some((l) => isRtlLocale(l.tag)), {
+    message:
+      'RTL_MIRRORING is requested and no right-to-left locale is listed, so the check would compare ' +
+      'a left-to-right layout against itself and pass. That is a pass meaning "we did not check"',
+    path: ['locales'],
+  });
+
+// ─── What a test type declares (§4) ──────────────────────────────────────────
+
+/**
+ * The write path for a {@link TestTypeDeclaration}.
+ *
+ * ── WHY THERE IS A WRITE PATH FOR A TABLE THAT SHIPS IN SOURCE ─────────────
+ *
+ * Because an INSTALLED third-party plugin brings its own type, and the install
+ * screen has to validate what it declares before the runner is asked to honour
+ * it. `TEST_TYPE_DECLARATIONS` is the first-party half and ships as data; this
+ * schema is how a plugin's declaration gets the same scrutiny — including the
+ * refusals, which are the part that matters.
+ *
+ * The coherence rules are asked of `declarationProblems` rather than being
+ * restated here, so a producer that checks before writing and this write path
+ * cannot disagree. The two with teeth:
+ *
+ *   · A TYPE THAT MUTATES DATA WITH NO PRINCIPAL. `dataEffect` above READS_ONLY
+ *     with an empty `principalKinds` is a type that changes the customer's data
+ *     with no identity named — so nothing can refuse to point it at their
+ *     production login, and `proveDisposable` never gets asked.
+ *   · A PROVIDER-TEST-MODE TYPE THAT DOES NOT REFUSE LIVE CREDENTIALS. The
+ *     refusal has to be structural; a declaration is how the gate knows to check
+ *     that it is.
+ */
+export const typeRequirementSchema = z.discriminatedUnion('kind', [
+  z
+    .object({
+      kind: z.literal('BINARY'),
+      scope: z.enum(['TYPE', 'SPEC']),
+      name: z.string().min(1).max(80),
+      install: z.string().min(1).max(300),
+      why: z.string().min(1).max(300).optional(),
+      version: browserVersionRangeSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('BROWSER'),
+      scope: z.enum(['TYPE', 'SPEC']),
+      name: browserEngineSchema,
+      install: z.string().min(1).max(300),
+      why: z.string().min(1).max(300).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('CHANNEL'),
+      scope: z.enum(['TYPE', 'SPEC']),
+      channel: browserChannelSchema,
+      install: z.string().min(1).max(300),
+      why: z.string().min(1).max(300).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('PLATFORM'),
+      scope: z.enum(['TYPE', 'SPEC']),
+      platform: z.string().min(1).max(40),
+      why: z.string().min(1).max(300),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('UNPROBED'),
+      scope: z.literal('SPEC'),
+      what: z.string().min(1).max(300),
+      why: z.string().min(1).max(400),
+    })
+    .strict(),
+]);
+
+export const testTypeDeclarationSchema = z
+  .object({
+    /** Minted or pending — both are declarable, only one is storable. */
+    type: z.enum(ANY_TEST_TYPES as readonly [string, ...string[]]),
+    summary: z.string().min(1).max(300),
+    requirements: z.array(typeRequirementSchema).max(20).default([]),
+    engines: z.array(browserEngineSchema).max(3).default([]),
+    repository: repositoryNeedSchema,
+    device: deviceNeedSchema,
+    egress: egressNeedSchema,
+    dataEffect: dataEffectSchema,
+    principalKinds: z.array(principalKindSchema).max(3).default([]),
+    coversSurfaceKinds: z.array(z.enum(SURFACE_KINDS)).max(SURFACE_KINDS.length).default([]),
+    /** `['NONE']` is the honest answer for a type nothing emits. Never `[]`. */
+    producers: z.array(testTypeProducerSchema).min(1).max(TEST_TYPE_PRODUCERS.length),
+    knownUnasserted: z
+      .array(
+        z
+          .object({ assertion: z.string().min(1).max(300), reason: unassertedReasonSchema })
+          .strict(),
+      )
+      .max(20)
+      .default([]),
+    refusesLiveCredentials: z.boolean(),
+  })
+  .strict()
+  .superRefine((decl, ctx) => {
+    for (const problem of declarationProblems(decl as TestTypeDeclaration)) {
+      ctx.addIssue({ code: 'custom', message: problem });
+    }
+  });
+
+// ─── Per-cell evidence: the write path to TestResultVariant ──────────────────
+
+/**
+ * ONE CELL'S RESULT, with the two honesty columns this round adds.
+ *
+ * ── WRITTEN TO `TestResultVariant`, NOT TO A PARALLEL SHAPE ────────────────
+ *
+ * That table already exists and already holds per-cell evidence under a
+ * six-column unique key, and the MEASURE round's own note says a reader asking
+ * "did it pass" wants the roll-up while a reader asking "WHERE did it pass"
+ * wants these rows. The widened matrix needs two things that table could not
+ * say, and both are columns on it rather than a second table:
+ *
+ *   `cellStatus` / `cellRemedy` — a cell this deployment could not run. Without
+ *       it, MISSING and WRONG_VERSION were indistinguishable from SKIPPED, so a
+ *       percentage included cells that can never fail. `notRunKind` is the
+ *       type-level twin and stays exactly as it is; this is the CELL-level one,
+ *       and the two are not the same question.
+ *   `notAsserted` / `notAssertedReason` — WHAT WAS NOT ASSERTED, AND WHY. The
+ *       headline defect of the round: checkout could be clicked through and the
+ *       money path could not be asserted, and the result was a PASS. A pass with
+ *       a non-empty `notAsserted` is a pass with a stated hole in it, which the
+ *       gate can refuse to count. A pass with nothing recorded is the lie.
+ *
+ * `matrixCell` carries the resolved cell, because the five TEXT dimensions
+ * cannot express a channel, a device scale, a colour scheme or a motion
+ * preference and `variantBrowserKey` / `variantViewportKey` pack only some of
+ * them. The KEY stays the identity; the JSON is the detail behind it.
+ */
+export const testResultVariantCellSchema = z
+  .object({
+    /** The resolved cell. Its key must equal the stored browser/viewport pair. */
+    matrixCell: matrixCellSchema,
+    /** AVAILABLE for a cell that ran. The other five mean no evidence exists. */
+    cellStatus: matrixCellStatusSchema,
+    /** Null for AVAILABLE and NOT_CHECKED; required for the other four. */
+    cellRemedy: z.string().min(1).max(500).nullable().default(null),
+    /**
+     * Assertions this cell did NOT make. Empty means it made all of them, which
+     * is a strong claim and is why this is a list rather than a boolean.
+     */
+    notAsserted: z.array(z.string().min(1).max(300)).max(20).default([]),
+    /** Required exactly when `notAsserted` is non-empty. */
+    notAssertedReason: unassertedReasonSchema.nullable().default(null),
+  })
+  .strict()
+  .refine(
+    (v) =>
+      v.cellStatus === 'AVAILABLE' || v.cellStatus === 'NOT_CHECKED' || v.cellRemedy !== null,
+    {
+      message:
+        'a cell was refused and no remedy is given. MISSING means install something, WRONG_VERSION ' +
+        'means upgrade or pin, UNSUPPORTED_COMBINATION means the combination does not exist and ' +
+        'NEEDS_BROWSER_GRID means a purchase — four different next actions, and a status with none ' +
+        'of them is a wall',
+      path: ['cellRemedy'],
+    },
+  )
+  .refine((v) => v.cellStatus !== 'NOT_CHECKED' || v.cellRemedy === null, {
+    message:
+      'a remedy is given for a cell nobody probed, so the advice is derived from a fact we do not ' +
+      'have. There is no remedy for a question nobody asked',
+    path: ['cellRemedy'],
+  })
+  .refine((v) => v.notAsserted.length === 0 || v.notAssertedReason !== null, {
+    message:
+      'this cell records assertions it did not make and gives no reason, so a reader cannot tell a ' +
+      'missing binary from a feature nobody has built. A failure suppressed without being counted ' +
+      'is the defect; a reason is what makes it a count',
+    path: ['notAssertedReason'],
+  })
+  .refine((v) => v.notAsserted.length > 0 || v.notAssertedReason === null, {
+    message:
+      'a reason is given and nothing is listed as unasserted, so the row claims a hole it does not ' +
+      'describe',
+    path: ['notAsserted'],
   });

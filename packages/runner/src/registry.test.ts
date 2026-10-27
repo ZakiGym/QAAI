@@ -153,7 +153,30 @@ describe('a plugin whose TestType is not minted yet', () => {
   it('names every pending type, so the gap is sayable rather than silent', () => {
     // "QAAI cannot test your Electron app" and "QAAI can, but you cannot create
     // the test yet" are different sentences with different remedies.
-    expect(pendingTypes().sort()).toEqual(['DESKTOP', 'JOBS', 'LINKS', 'SEO', 'TENANCY']);
+    //
+    // WIDENED FROM FIVE TO TEN when this round's six test types were
+    // registered, and the list is pinned EXACTLY on purpose: it is the gap
+    // ledger, so a plugin joining or a type being minted must change this line
+    // deliberately rather than drift. This assertion is what caught the
+    // registration, which is the point of pinning it.
+    //
+    // 'EMAIL' is the one entry that is NOT merely awaiting a mint: unlike its
+    // nine siblings it is in neither TEST_TYPES nor PENDING_TEST_TYPES, so it
+    // has no declaration either. `undeclaredPluginTypes()` in registry.ts is
+    // the function that reports that narrower gap, and
+    // registry.declarations.test.ts pins it.
+    expect(pendingTypes().sort()).toEqual([
+      'CHAOS',
+      'DESKTOP',
+      'DOCUMENT',
+      'EMAIL',
+      'JOBS',
+      'LINKS',
+      'PUSH',
+      'PWA',
+      'SEO',
+      'TENANCY',
+    ]);
   });
 
   it('keeps every pending type genuinely absent from TEST_TYPES', () => {

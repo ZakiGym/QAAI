@@ -1,0 +1,242 @@
+-- The browser/device matrix cells, the environment block, and the two columns
+-- that stop a pass meaning "we did not check".
+--
+-- WHY THIS EXISTS
+--
+-- The product's entire cross-browser vocabulary was
+-- `z.enum(['chromium','firefox','webkit'])` -- three members, each collapsing to
+-- one desktop preset. Four consequences, every one of them shipped:
+--
+--   1. CHROME STABLE VS CHROME BETA WAS INEXPRESSIBLE, and that is what a buyer
+--      means by cross-browser, because it is where their customers' regressions
+--      come from. So were Edge, a named Safari version, and a real iPhone
+--      viewport.
+--
+--   2. A VISUAL TEST GOT ONE PATH AND ONE VIEWPORT. Covering a route's hover,
+--      open, error, loading and empty renderings cost one hand-written test
+--      each, so in practice nobody covered them -- and nothing anywhere said
+--      which states had never been reached.
+--
+--   3. `CONFIG_TEMPLATE`'s `use` BLOCK CARRIED baseURL, timezone AND locale AND
+--      NOTHING ELSE. Geolocation, permissions, fake media, clipboard, network
+--      throttling, offline, forced-colors, device scale and HTTP credentials
+--      were all ungated, so every feature behind one of them was untestable with
+--      nothing anywhere saying so.
+--
+--   4. CHECKOUT COULD BE CLICKED THROUGH AND THE MONEY PATH COULD NOT BE
+--      ASSERTED: no 3DS, no decline, no insufficient funds, no webhook
+--      transition, no refund, no partial capture -- and the result of clicking
+--      through it was a PASS. The same shape runs through every type this round
+--      declares. A plugin with no way to record which assertion it could not
+--      make has no way to report a hole except by passing.
+--
+-- WHAT THIS MIGRATION ADDS, AND WHAT IT DELIBERATELY DOES NOT
+--
+-- TWO ENUMS AND SEVEN COLUMNS. NO TABLE. Every column lands on a model that
+-- already has a read path, because a correct Prisma model connected to nothing
+-- is this codebase's signature defect and three keystones in a row shipped one.
+-- `check:wiring` reports 0 disconnected before this migration and must still
+-- report 0 after it.
+--
+-- In particular there is no PaymentScenario table, no DocumentArtifact table and
+-- no PushDelivery table, and that is a decision rather than an omission. All
+-- three are PER-CELL EVIDENCE of a test type, and `TestResultVariant` is where
+-- per-cell evidence lands -- its own note says a reader asking "did it pass"
+-- wants the roll-up while a reader asking "WHERE did it pass" wants these rows.
+-- A parallel shape beside it would have been a second answer to one question,
+-- and three tables no route reads would have been three disconnected models. The
+-- SPEC side of those three types is `Test.spec` + `Test.matrixCells`, validated
+-- by `paymentScenarioSchema`, `documentArtifactSchema` and `pushDeliverySchema`
+-- in packages/shared/src/schemas.ts; the EVIDENCE side is the five columns added
+-- to `TestResultVariant` below.
+--
+-- NO `TestType` ENUM VALUE IS ADDED, and this is the point most worth recording.
+-- The seven new types of this round -- CHAOS, PAYMENTS, DOCUMENT, PWA, PUSH,
+-- LINKS/SEO and the deep-i18n type -- are declared in
+-- `PENDING_TEST_TYPES` (packages/shared/src/constants.ts) and
+-- `PENDING_TEST_TYPE_DECLARATIONS` (packages/shared/src/test-type-decl.ts), and
+-- NOT minted. Three guards make that the only honest order:
+--
+--   * `check:wiring` FAILS a `TEST_TYPES` member with no runner plugin, saying
+--     "every test of this type is recorded SKIPPED at run time". It is right to:
+--     a percentage containing tests that cannot fail is the one lie this product
+--     cannot afford.
+--   * `check:enums` FAILS a Prisma value with no TypeScript twin, and vice
+--     versa. So the enum and the array move together or not at all.
+--   * `TYPE_REQUIREMENTS` (packages/runner/src/preflight.ts) and `STRATEGIES`
+--     (packages/agent/src/spec-strategies.ts) are compiler-exhaustive `Record`s
+--     over `TestType`, so neither package compiles until both have an entry.
+--
+-- The three are deliberately mutually blocking, which is what makes a
+-- half-finished mint impossible to ship. `mintTestTypeSteps` in constants.ts
+-- returns the four edits, in order, and the registry's own
+-- `promotePendingPlugins` picks the plugin up with no further change.
+--
+-- WRITTEN BY HAND. `prisma migrate dev` was not run (no database is reachable
+-- here and the round's rules forbid it), so this file is hand-authored against a
+-- `prisma validate`-clean schema and a regenerated client. It has NOT been
+-- applied -- `check-enums.ts` reports the two new types as declared and absent
+-- from the live database until `prisma migrate deploy` runs, which is the
+-- correct and honest reading of an undeployed migration.
+
+-- CreateEnum
+--
+-- Whether this deployment could run ONE CELL. Six members where
+-- `DeploymentCapabilityStatus` has four, because a cell has two more ways to
+-- fail and neither of them is an install:
+--
+--   UNSUPPORTED_COMBINATION -- no deployment anywhere can run it. There is no
+--       Firefox beta channel and no WebKit canary. Reporting it as MISSING sends
+--       a reader to install a build that was never published.
+--   NEEDS_BROWSER_GRID -- coherent, and this image can never serve it. A pinned
+--       Safari or Firefox VERSION means a released consumer browser, and
+--       Playwright ships one patched build of each with no channels; its webkit
+--       is NOT Safari. The remedy is a purchase, not an install.
+CREATE TYPE "MatrixCellStatus" AS ENUM ('AVAILABLE', 'MISSING', 'WRONG_VERSION', 'NOT_CHECKED', 'UNSUPPORTED_COMBINATION', 'NEEDS_BROWSER_GRID');
+
+-- CreateEnum
+--
+-- Why a result does not carry the assertion it is supposed to. NOT_IMPLEMENTED
+-- is the weakest member and is deliberately distinct from CAPABILITY_ABSENT: one
+-- is a roadmap item and the other is a Dockerfile line, and a report that merged
+-- them would send a customer to install something that does not exist.
+CREATE TYPE "UnassertedReason" AS ENUM ('CAPABILITY_ABSENT', 'PROVIDER_TEST_MODE_LIMIT', 'UNREACHABLE_BEHIND_BOT_PROTECTION', 'REQUIRES_PROVISIONED_SANDBOX', 'WOULD_MUTATE_PROTECTED_DATA', 'CAP_BIT', 'SURFACE_UNREACHED', 'NOT_IMPLEMENTED');
+
+-- AlterTable
+--
+-- THE MATRIX AND THE ENVIRONMENT, on the plan item and on the test it becomes.
+--
+-- JSONB NULLABLE WITH NO DEFAULT, all four, and the null is load-bearing twice
+-- over:
+--
+--   * NULL MEANS NOBODY DECLARED A MATRIX, which is NOT the same as an empty
+--     cell list. An empty list is the unvaried single run every test in this
+--     product has always been -- a decision somebody made. Null is the absence
+--     of one, and it is what every row that exists today is. The approval screen
+--     shows "runs in 12 cells" for one and nothing at all for the other, so
+--     defaulting null to `{"cells":[]}` would claim a decision the proposer
+--     never made.
+--   * A DEFAULTED ENVIRONMENT BLOCK WOULD BE A SET OF FABRICATED VALUES, and the
+--     geolocation case is the sharpest: `{"latitude":0,"longitude":0}` is Null
+--     Island, a real coordinate the browser accepts, so every location-dependent
+--     test built on it PASSES somewhere nobody chose. Absent means the browser's
+--     own default, every field, every time.
+--
+-- The matrix JSON carries its own cap disclosure. A cell list expanded under a
+-- limit that bit is a SAMPLE, and a reader handed the list alone cannot tell it
+-- from a matrix somebody chose -- so `capBite` travels inside the column and
+-- `testMatrixSchema` refuses a short list with no cap recorded.
+--
+-- NEVER A CREDENTIAL in `browserEnv`. `httpCredentials` carries secret NAMES
+-- only; the zod schema is `.strict()` and has no password property, so an extra
+-- one is refused rather than silently stored. Same structural guarantee, and
+-- same argument, as the provider catalogue's entry shape.
+ALTER TABLE "PlanItem" ADD COLUMN "matrixCells" JSONB;
+ALTER TABLE "PlanItem" ADD COLUMN "browserEnv" JSONB;
+ALTER TABLE "Test" ADD COLUMN "matrixCells" JSONB;
+ALTER TABLE "Test" ADD COLUMN "browserEnv" JSONB;
+
+-- AlterTable
+--
+-- FIVE COLUMNS ON "TestResultVariant", AND NONE ON "TestResult".
+--
+-- "TestResult" is the largest table in the product and keeps its (runId, testId)
+-- unique constraint, its worst-wins roll-up and every contract its readers were
+-- written against. This migration adds no column to it. Same discipline as the
+-- migration that added "TestResultVariant" in the first place.
+--
+--   "matrixCell" JSONB -- the resolved cell in full. The five NOT NULL TEXT
+--       dimensions above it cannot express a browser CHANNEL, a device scale
+--       factor, a colour scheme, a reduced-motion preference or a forced-colors
+--       mode, and those are exactly the axes a widened matrix varies.
+--       `variantBrowserKey` and `variantViewportKey` pack what fits into
+--       "browser" and "viewport", which stay the IDENTITY and keep the
+--       six-column unique index doing its job; this is the detail behind it.
+--       NULL means the run was not varied, matching the table's own rule that an
+--       unvaried execution writes no rows here at all.
+--
+--   "cellStatus" / "cellRemedy" -- A CELL THIS DEPLOYMENT COULD NOT RUN.
+--       `notRunKind.UNSUPPORTED` answers "this deployment cannot execute this
+--       TEST TYPE" and cannot answer "chromium ran and chrome-beta is not
+--       installed", so a four-cell matrix with one unavailable channel recorded
+--       three real results and one SKIPPED -- indistinguishable from a
+--       placeholder nobody reached. NULLABLE WITH NO DEFAULT, exactly like
+--       "notRunKind": null means nobody recorded a cell status, which is the
+--       honest reading of every row written before this column and of any writer
+--       that made no claim. Defaulting it to AVAILABLE would assert that every
+--       historical cell ran. The remedy is required beside the four refusing
+--       statuses -- four different next actions -- and refused beside
+--       NOT_CHECKED, because there is no remedy for a question nobody asked.
+--
+--   "notAsserted" / "notAssertedReason" -- WHAT WAS NOT ASSERTED, AND WHY.
+--       Defect 4 in this file's header, in two columns. A pass with a non-empty
+--       "notAsserted" is a pass WITH A STATED HOLE IN IT, which the gate can
+--       refuse to count; a pass with nothing recorded is the lie.
+--
+--       `TEXT[] DEFAULT ARRAY[]::TEXT[]`, and the empty default is honest here
+--       where it would not be on a count: `[]` is the claim that this cell made
+--       every assertion it was supposed to, which is exactly what a passing E2E
+--       cell is claiming. There is no fourth state between "asserted everything"
+--       and "named what it did not" -- the same argument "Test"."covers" records
+--       for its own empty default, and the opposite of the one
+--       "CoverageAttestation"."unmeasured" records for refusing one.
+--
+--       The reason is required exactly when the list is non-empty, enforced by
+--       `testResultVariantCellSchema`. A hole with no reason cannot tell a
+--       missing binary from a feature nobody has built.
+ALTER TABLE "TestResultVariant" ADD COLUMN "matrixCell" JSONB;
+ALTER TABLE "TestResultVariant" ADD COLUMN "cellStatus" "MatrixCellStatus";
+ALTER TABLE "TestResultVariant" ADD COLUMN "cellRemedy" TEXT;
+ALTER TABLE "TestResultVariant" ADD COLUMN "notAsserted" TEXT[] DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE "TestResultVariant" ADD COLUMN "notAssertedReason" "UnassertedReason";
+
+-- CreateIndex
+--
+-- "How many of this run's cells did we refuse, and for which of the six
+-- reasons" -- the read that makes "cellStatus" a GROUP BY instead of a regex
+-- over a sentence, and therefore the one thing standing between a matrix
+-- percentage and a percentage with cells in it that cannot run.
+--
+-- Added alongside "TestResultVariant_runId_status_idx" rather than widening it:
+-- that index serves "this run's failures by cell", which is the matrix view's
+-- own query, and a three-column index is not the same read.
+--
+-- NO INDEX FOR "notAssertedReason", and the omission is deliberate rather than
+-- forgotten. The rollup it wants is project-wide, this table has no "projectId",
+-- and a speculative index on a column whose reader does not exist is dead weight
+-- on the largest evidence table in the product. The per-run question is answered
+-- through this same index plus a filter. Add the project-wide one with the
+-- surface that asks it.
+CREATE INDEX "TestResultVariant_runId_cellStatus_idx" ON "TestResultVariant"("runId", "cellStatus");
+
+-- NO CHANGE TO "VisualBaseline", AND IT IS NOT AN OVERSIGHT.
+--
+-- This round lets ONE visual test declare viewports, colour schemes, reduced
+-- motion and the interaction STATES to reach first, and the obvious reading is
+-- that the baseline's unique key -- (testId, viewport, browser, environmentId)
+-- -- needs two more members. Otherwise a light and a dark capture of one test
+-- upsert onto ONE row, whichever cell ran last becomes the other's reference,
+-- every later diff is measured against the wrong rendering, and the red it
+-- produces is permanently false: nobody can fix it by changing the application,
+-- because the application is not what differs. That is the shared-baseline
+-- defect "environmentId" was added to kill, multiplied by the number of cells.
+--
+-- It needs no change because "viewport" and "browser" ARE the cell, as long as
+-- one function produces each. `baselineViewportKey(cell, state)` packs the
+-- device, colour scheme, motion preference, forced-colors mode and state;
+-- `variantBrowserKey(cell)` packs the engine, channel and version pin. So
+-- `1280x800+dark` and `1280x800+light` are already different rows under the
+-- existing key.
+--
+-- Two properties make that the better trade rather than a dodge:
+--
+--   * AN UNVARIED, DEFAULT-STATE CELL PRODUCES `1280x800` BYTE FOR BYTE, which
+--     is exactly what the pre-matrix writer wrote. So no existing baseline stops
+--     matching and no customer is forced into a re-approval sweep by a
+--     migration. A sixth column with a back-filled sentinel would have been
+--     correct and would have cost exactly that.
+--   * A six-column unique there derives the name
+--     "VisualBaseline_testId_viewport_browser_environmentId_cellKey_state_key"
+--     at 69 bytes, and PostgreSQL TRUNCATES AT 63 SILENTLY -- permanent phantom
+--     drift on every `migrate dev`, which an earlier round already paid for
+--     once and which "TestResultVariant_cell_key" carries the note about.

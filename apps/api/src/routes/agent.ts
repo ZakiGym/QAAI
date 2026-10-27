@@ -2836,6 +2836,45 @@ agentRouter.get('/projects/:projectId/scenario-capability', async (req, res) => 
               'Nothing has been crawled for this project, so there is no graph to walk, no request to intercept and no form to perturb.',
               'Run the Explorer. Every kind here is derived from the crawl and none of them can be guessed at.',
             );
+      case 'TYPE_COVERAGE':
+        /*
+         * WHICH TEST TYPE A SURFACE EARNS — the funnel that widened the
+         * deterministic producer from TWO types to all nineteen minted ones.
+         *
+         * A crawl is enough to RUN it and is NOT enough to answer it fully, and
+         * saying only the first would be the shape of dishonesty this endpoint
+         * exists to stop. `signalsFromFlowMap` reports what a browser can see —
+         * a card field, a file input, a download affordance, an id in a route —
+         * and returns NO KEY AT ALL for a database, a CLI entry point, a unit
+         * runner, a native build or a declared budget, because a crawl cannot
+         * see any of them. Those come back NOT_PROBED, which is a hole in OUR
+         * enumeration rather than a fact about the application.
+         *
+         * So this arm is deliberately NOT `yes()`: `yes()` sets `remedy: null`,
+         * and a reader would take an unqualified `available: true` to mean the
+         * funnel had considered every type — at which point a plan with no
+         * MOBILE item reads as "this application has no native build" when the
+         * truth is that nobody looked. `available` is honest (the kind runs and
+         * produces real verdicts) and the remedy names what the crawl alone
+         * leaves unanswered.
+         */
+        return crawled
+          ? {
+              ...base,
+              available: true,
+              missing: null,
+              remedy:
+                'A crawl answers only the signals a browser can observe. Whether this ' +
+                'application earns MOBILE, CLI, DATABASE, UNIT_GEN, INTEGRATION, MUTATION, LOAD ' +
+                'or PERFORMANCE tests needs source analysis and the environment settings, and ' +
+                'until those run the funnel reports each of them NOT_PROBED — which means ' +
+                '"nobody looked", NOT "no such surface". Connect the repository and run source ' +
+                'analysis to widen it.',
+            }
+          : no(
+              'Nothing has been crawled for this project, so no signal has been observed and no test type can be shown to be earned.',
+              'Run the Explorer. Every type the funnel proposes is justified by an observed signal, and with nothing observed it proposes nothing rather than guessing.',
+            );
       default: {
         /*
          * Exhaustive. A tenth scenario kind is a COMPILE ERROR here rather than

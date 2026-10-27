@@ -16,12 +16,14 @@ import {
   looksLikeAuthPath,
   planItemForGap,
   proposePlan,
+  proposeTypeCoverage,
   resumeAdvice,
   resumePointFrom,
   withObservation,
   withResumePoint,
 } from '@qaai/agent';
-import type { AuthProfileChoice, CrawlOutcome } from '@qaai/agent';
+import { signalsFromFlowMap } from '@qaai/agent';
+import type { AuthProfileChoice, CrawlOutcome, TypeSignals, TypeVerdict } from '@qaai/agent';
 import { signInWithProfile } from '@qaai/runner';
 import type { LoginFailure, LoginResult } from '@qaai/runner';
 import { adjudicateCrawl } from '@qaai/shared';
@@ -79,11 +81,72 @@ const MAX_PLAN_ITEMS = 12;
  * on a spinner for five minutes before claiming "the crawl did not finish" —
  * about a crawl that had in fact finished and was sitting in the database.
  */
-function planFromCrawl(
+/**
+ * The funnel's verdicts for this map, for the MODEL prompt's type offer.
+ *
+ * A function rather than a value threaded through, because the two callers sit
+ * in different branches of the same `if` and only one of them runs: computing
+ * it twice is two passes over a declared thirty-row table with no I/O in it,
+ * which is cheaper than restructuring the branch and much easier to read.
+ *
+ * Deterministic for one map — the seed is derived from the map, never a clock —
+ * so the two callers cannot disagree about what this application earns.
+ */
+function typeVerdictsFor(
+  flowMap: FlowMap,
+  observed: TypeSignals = {},
+): readonly TypeVerdict[] {
+  return proposeTypeCoverage({
+    seed: `${flowMap.projectId}:${flowMap.version}`,
+    signals: { ...signalsFromFlowMap(flowMap), ...observed },
+  }).verdicts;
+}
+
+/**
+ * EXPORTED SO THE WIRING IS PROVABLE, which is this file's own established
+ * pattern — see the note on {@link adjudicateExplore}: "pure and exported so
+ * the composition is testable… an inline version of it would be untestable in
+ * exactly the way the old crawl was."
+ *
+ * It applies with more force here. This is the NO-MODEL branch, the one that
+ * runs on a deployment with no ANTHROPIC_API_KEY, and it is now the only place
+ * the type funnel is reached in production. An unexported version of it would
+ * mean the widening from two proposable types to nineteen was asserted only in
+ * packages/agent and connected to nothing provable — the defect this whole
+ * round exists to remove, reproduced by the change that removes it.
+ */
+export function planFromCrawl(
   flowMap: FlowMap,
   reason: string,
   authProfiles: AuthProfileChoice[],
   caveats: readonly string[] = [],
+  /**
+   * SIGNALS THE CRAWL COULD NOT OBSERVE, from a caller that has them.
+   *
+   * ── WHY THIS PARAMETER EXISTS, AND THE MEASUREMENT THAT FORCED IT ──────────
+   *
+   * A crawl can see a card field, a file input, a download affordance and an id
+   * in a route. It CANNOT see a database, a CLI entry point, a unit runner, a
+   * native build, a declared locale set or a throughput budget — and every
+   * MINTED type the funnel can propose needs one of those. The consequence,
+   * measured rather than assumed: from crawl signals ALONE the funnel earns
+   * ZERO storable types. It produces the honest disclosures (PAYMENTS and
+   * DOCUMENT are EARNED and unstorable; DATABASE and CLI are NOT_PROBED) and no
+   * items.
+   *
+   * That is a correct and useful output and it is not the whole feature. This
+   * parameter is the seam the rest arrives through: a caller that has run source
+   * analysis or read the environment's declared locales and browsers merges its
+   * readings over the crawl's, and the funnel then proposes LOCALIZATION,
+   * UNIT_GEN, DATABASE and the rest. NOTHING IN THIS PROCESSOR GATHERS THEM
+   * YET — that is named in this round's handover rather than faked here, and an
+   * absent override leaves every such signal NOT_PROBED, which is the true
+   * reading and never ABSENT.
+   *
+   * The caller's readings WIN over the crawl's, because a caller that probed the
+   * environment knows more about it than a browser did. The crawl is the floor.
+   */
+  observed: TypeSignals = {},
 ): TestPlan {
   /*
    * The roles are passed even here — ESPECIALLY here. This is the no-key path,
@@ -95,11 +158,49 @@ function planFromCrawl(
   const report = analyzeCoverage({ flowMapGraph: flowMap, tests: [], authProfiles });
   const chosen = report.gaps.slice(0, MAX_PLAN_ITEMS);
 
+  /*
+   * ── THE TYPE FUNNEL, ON THE PATH EVERY NEW CUSTOMER TAKES ─────────────────
+   *
+   * THE DEFECT THIS CLOSES. `analyzeCoverage` produces GAPS, and
+   * `planItemForGap` turns each one into an item whose `testType` comes from the
+   * gap's kind — which is why this path proposed E2E, SMOKE, API, ACCESSIBILITY
+   * and SECURITY_SMOKE and NOTHING ELSE, against nineteen minted types with
+   * working plugins. Nine of those nineteen had no producer anywhere in the
+   * product: a customer could store a LOCALIZATION test, the plugin would run
+   * it, and nothing in QAAI had ever proposed one.
+   *
+   * `proposeTypeCoverage` is the other question — not "which gap is worth a
+   * test" but "which TYPE does this application earn" — and it is deliberately
+   * wired HERE, in the no-model branch, rather than only beside `proposePlan`:
+   * this deployment has no ANTHROPIC_API_KEY and this is the branch that runs,
+   * so a widening reachable only from the model path would be a widening
+   * reachable from nothing.
+   *
+   * THE SEED IS DERIVED FROM THE MAP, NEVER FROM A CLOCK. The funnel's ids are
+   * a function of the TYPE and not of the seed (so re-running re-proposes the
+   * same id instead of minting a duplicate), and the seed is carried only
+   * because the input type demands one. `Date.now()` here would make the plan
+   * unreproducible for no gain.
+   */
+  const typeCoverage = proposeTypeCoverage({
+    seed: `${flowMap.projectId}:${flowMap.version}`,
+    signals: { ...signalsFromFlowMap(flowMap), ...observed },
+  });
+  const typeItems = typeCoverage.proposals.map((proposal) => proposal.item);
+
+  const proposedCount = chosen.length + typeItems.length;
+
   return {
     summary:
-      `${chosen.length} test${chosen.length === 1 ? '' : 's'} proposed directly from the crawl of ` +
+      `${proposedCount} test${proposedCount === 1 ? '' : 's'} proposed directly from the crawl of ` +
       `${flowMap.baseUrl} — ${report.totals.routes} route(s), ${report.totals.forms} form(s) and ` +
-      `${report.totals.journeys} journey(s) seen. Written by the crawler, not by a model: ${reason} ` +
+      `${report.totals.journeys} journey(s) seen` +
+      (typeItems.length > 0
+        ? `, of which ${typeItems.length} cover${typeItems.length === 1 ? 's' : ''} a test TYPE ` +
+          `this application earns (${typeItems.map((item) => item.testType).join(', ')})`
+        : '') +
+      `${typeCoverage.unminted.length > 0 ? `; ${typeCoverage.unminted.length} further type(s) are earned and cannot be stored yet — see below` : ''}` +
+      `. Written by the crawler, not by a model: ${reason} ` +
       `Every item below is real and approvable; turning an approved item into code is the step that ` +
       `needs the model.`,
     // The reason rides in `skipped` too, because that is the field the approval
@@ -120,8 +221,62 @@ function planFromCrawl(
         what: gap.title,
         why: `ranked below the top ${MAX_PLAN_ITEMS} gaps from this crawl`,
       })),
+      /*
+       * EVERY TYPE THE FUNNEL WITHHELD, WITH ITS REASON, IN THE FIELD THE
+       * APPROVAL SCREEN RENDERS AS "DELIBERATELY NOT PROPOSED".
+       *
+       * This is the honesty half of widening the funnel, and it is the half
+       * that is easy to leave out. A plan that proposes a LOCALIZATION test
+       * against one application and not another, with no sentence beside the
+       * omission, reads as the agent's judgement — and the two reasons are not
+       * interchangeable: NOT_WARRANTED means the crawl looked and the surface
+       * is not there (a finished answer), NOT_PROBED means nobody enumerated it
+       * (a hole in OUR work, which a crawl-only run has a great many of).
+       * UNMINTED is the third: the application EARNS the type and no `Test` row
+       * can carry it, which is a gap in the product rather than in the
+       * application, and it comes with the mint steps.
+       */
+      /*
+       * THE SUFFIX IS A MACHINE-READABLE TAG, AND IT IS A COMPROMISE WITH A
+       * REASON. `testPlanSchema.skipped` is `{ what, why }` and nothing else,
+       * so there is no typed field for "which KIND of not-proposed this is" —
+       * widening that wire shape is a schema change this round does not own.
+       *
+       * Without a tag the plan screen renders all three kinds as one grey list,
+       * and they are not one thing: an EARNED type nobody can store is OUR
+       * backlog and somebody should act on it, an unenumerated type is a hole
+       * in OUR crawl, and an inapplicable type is a finished answer that needs
+       * nobody. Thirty such lines, undifferentiated, bury the two entries a
+       * human actually has to read. `SKIPPED_TAGS` in apps/web/lib/plan-skipped
+       * .ts holds the other half of this contract and a test pins both.
+       */
+      ...typeCoverage.verdicts
+        .filter((verdict) => verdict.decision === 'NOT_WARRANTED')
+        .map((verdict) => ({
+          what: `${verdict.type} tests — not applicable`,
+          why: verdict.decision === 'NOT_WARRANTED' ? verdict.why : '',
+        })),
+      ...typeCoverage.verdicts
+        .filter((verdict) => verdict.decision === 'NOT_PROBED')
+        .map((verdict) => ({
+          what: `${verdict.type} tests — not enumerated`,
+          why: verdict.decision === 'NOT_PROBED' ? verdict.why : '',
+        })),
+      ...typeCoverage.unminted.map((entry) => ({
+        what: `${entry.type} tests — earned, not yet storable`,
+        why:
+          `This application EARNS ${entry.type} tests — the enumeration found the surface it ` +
+          `tests — and no test of that type can be stored yet, so none was proposed. ` +
+          `${entry.remedy}`,
+      })),
     ],
-    items: chosen.map(planItemForGap),
+    /*
+     * GAP ITEMS FIRST, THEN THE TYPE ITEMS. A measured gap is a stronger signal
+     * than an earned type — the first is an absence this product PROVED, the
+     * second is an inference from a declared rule — so the gaps keep the top of
+     * the list and the cap bites the type items first.
+     */
+    items: [...chosen.map(planItemForGap), ...typeItems].slice(0, MAX_PLAN_ITEMS + typeItems.length),
     flowMapVersion: flowMap.version,
   };
 }
@@ -1997,7 +2152,22 @@ export async function processExplore(job: ExploreJob): Promise<void> {
           llm,
           { orgId, projectId, agent: 'EXPLORER', subjectId: stored.id },
           flowMap,
-          { authProfiles: authProfileChoices },
+          {
+            authProfiles: authProfileChoices,
+            /*
+             * THE DETERMINISTIC HALF RUNS FIRST AND THE MODEL ONLY WIDENS WHAT
+             * IT PROVED — the shape every model path in this round takes.
+             *
+             * Without this the prompt's `testType` line falls back to the five
+             * types the crawl owns, which is the honest floor and also the
+             * defect: the model could not name a sixth type against an
+             * application that plainly earned one. Passing the verdicts offers
+             * it exactly the types the funnel established from observed signals
+             * and no others, so it cannot propose a MOBILE test against a
+             * website.
+             */
+            typeVerdicts: typeVerdictsFor(flowMap),
+          },
         )
       ).plan;
       writtenByModel = true;

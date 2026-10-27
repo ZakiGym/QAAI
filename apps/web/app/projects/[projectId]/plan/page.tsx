@@ -3,6 +3,7 @@
 import { use, useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api, ApiError } from '../../../../lib/api';
+import { groupSkipped } from '../../../../lib/plan-skipped';
 import { Button } from '../../../../components/ui/Button';
 import Link from 'next/link';
 import { EmptyState } from '../../../../components/ui/EmptyState';
@@ -562,13 +563,40 @@ export default function PlanPage({ params }: { params: Promise<{ projectId: stri
       {plan.skipped.length > 0 && (
         <section className="mt-8">
           <SectionLabel>Deliberately skipped</SectionLabel>
-          <ul className="text-ink-faint space-y-1 text-xs">
-            {plan.skipped.map((s, i) => (
-              <li key={i}>
-                <span className="text-ink-dim">{s.what}</span> — {s.why}
-              </li>
-            ))}
-          </ul>
+          {/*
+            GROUPED, because three different facts were rendering as one grey
+            list. The type funnel adds one entry per test type it did not
+            propose — up to thirty — and they are not one kind of thing: a type
+            this application EARNS and QAAI cannot store is our backlog and
+            somebody should act on it; a type nobody enumerated is a hole in our
+            crawl with a remedy; a type that does not apply is a finished
+            answer. Undifferentiated, the thirty bury the two entries that
+            explain the screen ("Model-written test proposals") and the one
+            group that is actionable looks exactly like the ones that are not.
+
+            Correctness only: no new colour, class or icon. `groupSkipped` is a
+            pure function in apps/web/lib/plan-skipped.ts and the markup below
+            is the same <ul> this section already used, three times with a
+            heading, in the order a reader should read them. The untagged
+            entries keep the original un-headed shape and come FIRST.
+          */}
+          {groupSkipped(plan.skipped).map((section) => (
+            <div key={section.group} className="mt-3 first:mt-0">
+              {section.label !== '' && (
+                <p className="text-ink-dim text-xs font-medium">{section.label}</p>
+              )}
+              {section.note !== '' && (
+                <p className="text-ink-faint mt-0.5 text-xs">{section.note}</p>
+              )}
+              <ul className="text-ink-faint mt-1 space-y-1 text-xs">
+                {section.entries.map((s, i) => (
+                  <li key={i}>
+                    <span className="text-ink-dim">{s.what}</span> — {s.why}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
         </section>
       )}
 

@@ -102,6 +102,24 @@ import type {
  * percentage. See the closure-join section at the bottom of this file.
  */
 import { ANONYMOUS_ROLE, roleKey } from '@qaai/shared';
+/*
+ * THE TYPE DECLARATIONS, for the obligation matrix at the bottom of this file.
+ * `coversSurfaceKinds` was declared by the keystone and read by nothing outside
+ * its own zod schema; `auditObligationPolicy` is the consumer.
+ */
+import {
+  ANY_TEST_TYPES,
+  DEPLOYMENT_CAPABILITY_STATUS_LABELS,
+  SURFACE_KINDS,
+  capabilityCounts,
+  declarationFor,
+  obligationsFor,
+} from '@qaai/shared';
+import type {
+  DeploymentCapabilityStatus,
+  SurfaceKind,
+  TypeObligationPolicy,
+} from '@qaai/shared';
 import { expandBoundaries, type BoundaryCase, type BoundaryExpansion, type BoundaryField } from './boundaries.js';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
@@ -5663,4 +5681,237 @@ export function joinGapClosure(input: {
     orphanedPlanItemIds: orphanedPlanItemIds.sort(),
     orphanedTestIds: orphanedTestIds.sort(),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE OBLIGATION MATRIX READS THE TYPE DECLARATIONS
+//
+// ── THE DEFECT: AN OBLIGATION NOTHING CAN EVER CLOSE ────────────────────────
+//
+// `TypeObligationPolicy` lets a project say which test types each surface axis
+// OWES, and `obligationsFor` answers it. Nothing validated the answer against
+// what a test type can actually DO. The keystone's declarations carry
+// `coversSurfaceKinds` — the surface kinds a type can produce coverage for —
+// and until this section it was read by NOTHING outside its own zod schema:
+// declared, tested, and connected to no consumer, which is this codebase's
+// signature defect.
+//
+// The two together are what catch the nasty case. A project that declares
+// `ROUTE: ['DATABASE']` mints one obligation per route that NO DATABASE test
+// can ever satisfy, because DATABASE covers the persistence axis and not the
+// route axis. Every one of those obligations is reported uncovered for ever:
+// the coverage number is permanently capped below 100, the gap list is full of
+// items nobody can close, and nothing anywhere says why. For a project with 412
+// routes that is 412 pieces of eternal debt, and the remedy — fix the policy —
+// is the one thing the report never suggests, because the report does not know
+// the obligation is impossible.
+//
+// ── THREE REASONS AN OBLIGATION IS NOT OWED, AND THEY ARE NOT THE SAME ──────
+//
+// IMPOSSIBLE is a defect in the POLICY: no type covers that axis, so fix the
+// policy. UNRUNNABLE is a fact about the DEPLOYMENT: the type is right for the
+// axis and this image cannot execute it, so install the tool — and the
+// obligation leaves the denominator with that reason, which is the rule
+// `NON_EXECUTABLE_CAPABILITY_STATUSES` already states. UNPRODUCEABLE is a gap
+// in QAAI: the type is right and runnable and no producer emits it, so the
+// obligation stays IN the denominator and is honestly uncovered, because the
+// work is ours and shedding it would raise the customer's number for our own
+// shortfall.
+//
+// Each one has a different remedy and a different owner, which is the whole
+// reason this is four outcomes rather than a boolean.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Why an obligation is not an ordinary, closeable one. */
+export const OBLIGATION_REFUSALS = [
+  /** No declared test type covers this surface kind. The POLICY is wrong. */
+  'IMPOSSIBLE_FOR_AXIS',
+  /** The policy names something that is not a declared test type at all. */
+  'NOT_A_DECLARED_TYPE',
+  /** The right type for the axis, and this deployment cannot execute it. */
+  'UNRUNNABLE_HERE',
+  /** The right type, runnable, and no producer can propose one. OUR gap. */
+  'NO_PRODUCER',
+] as const;
+export type ObligationRefusal = (typeof OBLIGATION_REFUSALS)[number];
+
+const OBLIGATION_REFUSAL_PRESENT: Record<ObligationRefusal, true> = {
+  IMPOSSIBLE_FOR_AXIS: true,
+  NOT_A_DECLARED_TYPE: true,
+  UNRUNNABLE_HERE: true,
+  NO_PRODUCER: true,
+};
+/** Derived from the presence record rather than hand-listed, so the two cannot drift. */
+export const OBLIGATION_REFUSAL_LIST = Object.keys(
+  OBLIGATION_REFUSAL_PRESENT,
+) as ReadonlyArray<ObligationRefusal>;
+
+/**
+ * The refusals that take an obligation OUT of the coverage denominator.
+ *
+ * `NO_PRODUCER` is deliberately NOT here. The type is right for the axis and
+ * this deployment can run it; what is missing is a producer in QAAI, and
+ * shedding the obligation would raise the customer's coverage percentage
+ * because of a gap in OUR product. That is the "cap applied without being
+ * disclosed" rule pointed at ourselves, and it is the one of the four that is
+ * tempting to get wrong.
+ *
+ * `IMPOSSIBLE_FOR_AXIS` and `NOT_A_DECLARED_TYPE` leave the denominator because
+ * neither is a statement about the application: the first is a mis-typed
+ * policy and the second is a typo, and counting either as debt invents a defect
+ * in the customer's test suite out of a defect in their configuration.
+ */
+export const OBLIGATION_REFUSALS_OUT_OF_DENOMINATOR: readonly ObligationRefusal[] = [
+  'IMPOSSIBLE_FOR_AXIS',
+  'NOT_A_DECLARED_TYPE',
+  'UNRUNNABLE_HERE',
+];
+
+/** One (axis, type) obligation, adjudicated. */
+export interface ObligationVerdict {
+  readonly kind: SurfaceKind;
+  /** A string, not a `TestType`: a stored policy can name something that is not one. */
+  readonly type: string;
+  /** Whether this obligation belongs in the coverage denominator. */
+  readonly counts: boolean;
+  /** Null for an ordinary, closeable obligation. */
+  readonly refusal: ObligationRefusal | null;
+  /** The sentence to print beside the number. Never empty. */
+  readonly why: string;
+}
+
+export interface ObligationAudit {
+  readonly verdicts: readonly ObligationVerdict[];
+  /** Obligations that count. The denominator. */
+  readonly counted: number;
+  /** Out of the denominator, each with its reason — never a silent drop. */
+  readonly excluded: readonly ObligationVerdict[];
+  /**
+   * Axes the policy declares an obligation for that NO type covers.
+   *
+   * Surfaced on its own because it is the only one of the four whose remedy is
+   * an edit to the POLICY, and because it is otherwise invisible: those
+   * obligations simply never close, and a number that never reaches 100 reads
+   * as an untested application rather than a mis-typed configuration.
+   */
+  readonly impossible: readonly ObligationVerdict[];
+}
+
+/**
+ * Adjudicate a project's obligation policy against what the types declare.
+ *
+ * DETERMINISTIC AND MODEL-FREE: a total function of the policy, the
+ * declarations and the capability map, iterated over `SURFACE_KINDS` — a
+ * constant — so the output is byte-identical for one input.
+ *
+ * `capability` is the deployment's probe result per type, and an ABSENT KEY
+ * MEANS NOT_CHECKED rather than MISSING. That asymmetry is the same one
+ * `NON_EXECUTABLE_CAPABILITY_STATUSES` records: an unprobed type stays IN the
+ * denominator, because dropping it would let a deployment that never ran a
+ * preflight shed every obligation it could not prove it could run, and the
+ * percentage would rise for a probe nobody executed.
+ */
+export function auditObligationPolicy(args: {
+  policy: TypeObligationPolicy | null;
+  /** Probe results per test type. An absent key is NOT_CHECKED, never MISSING. */
+  capability?: Readonly<Partial<Record<string, DeploymentCapabilityStatus>>>;
+}): ObligationAudit {
+  const verdicts: ObligationVerdict[] = [];
+
+  for (const kind of SURFACE_KINDS) {
+    for (const type of obligationsFor(kind, args.policy)) {
+      const declaration = declarationFor(type);
+
+      if (declaration === null) {
+        verdicts.push({
+          kind,
+          type,
+          counts: false,
+          refusal: 'NOT_A_DECLARED_TYPE',
+          why:
+            `This project's obligation policy says a ${kind} owes a "${type}" test, and "${type}" ` +
+            'is not a declared test type. Nothing can ever satisfy it, so it is OUT of the ' +
+            'denominator rather than counted as debt — correct the policy.',
+        });
+        continue;
+      }
+
+      if (!declaration.coversSurfaceKinds.includes(kind)) {
+        verdicts.push({
+          kind,
+          type,
+          counts: false,
+          refusal: 'IMPOSSIBLE_FOR_AXIS',
+          why:
+            `A ${kind} cannot be covered by a ${type} test: that type declares it covers ` +
+            `${declaration.coversSurfaceKinds.join(', ') || '(no surface kind)'}. This ` +
+            'obligation could never be closed, so it is OUT of the denominator rather than ' +
+            'reported as permanent debt — correct the policy.',
+        });
+        continue;
+      }
+
+      const status = args.capability?.[type] ?? 'NOT_CHECKED';
+      if (!capabilityCounts(status)) {
+        verdicts.push({
+          kind,
+          type,
+          counts: false,
+          refusal: 'UNRUNNABLE_HERE',
+          why:
+            `${type} is the right type for a ${kind} and this deployment cannot execute it ` +
+            `(${DEPLOYMENT_CAPABILITY_STATUS_LABELS[status]}). The obligation is OUT of the ` +
+            'denominator with that reason, so the percentage is over what this deployment can ' +
+            'actually run — install the tool and it returns.',
+        });
+        continue;
+      }
+
+      const hasProducer = declaration.producers.some((producer) => producer !== 'NONE');
+      if (!hasProducer) {
+        verdicts.push({
+          kind,
+          type,
+          counts: true,
+          refusal: 'NO_PRODUCER',
+          why:
+            `${type} covers a ${kind} and this deployment can run it, and NO PRODUCER IN QAAI ` +
+            'can propose one — so this obligation is genuinely uncovered and STAYS in the ' +
+            'denominator. The gap is ours, not yours: shedding it would raise your coverage ' +
+            'number because of a shortfall in this product.',
+        });
+        continue;
+      }
+
+      verdicts.push({
+        kind,
+        type,
+        counts: true,
+        refusal: null,
+        why: `A ${kind} owes a ${type} test, and one can be proposed, run and scored.`,
+      });
+    }
+  }
+
+  return {
+    verdicts,
+    counted: verdicts.filter((verdict) => verdict.counts).length,
+    excluded: verdicts.filter((verdict) => !verdict.counts),
+    impossible: verdicts.filter((verdict) => verdict.refusal === 'IMPOSSIBLE_FOR_AXIS'),
+  };
+}
+
+/**
+ * Which test types could satisfy an obligation on this axis at all.
+ *
+ * The read path that makes a policy EDITOR able to offer only the types that
+ * make sense for an axis, rather than all nineteen — which is how
+ * `ROUTE: ['DATABASE']` gets typed in the first place. Derived from the
+ * declarations, so it cannot disagree with `auditObligationPolicy`.
+ */
+export function typesCovering(kind: SurfaceKind): string[] {
+  return ANY_TEST_TYPES.filter((type) => {
+    const declaration = declarationFor(type);
+    return declaration !== null && declaration.coversSurfaceKinds.includes(kind);
+  }).sort();
 }

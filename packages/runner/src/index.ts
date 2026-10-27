@@ -49,3 +49,48 @@ export * from './visual-services.js';
 export * from './plugins/external-loader.js';
 export * from './plugins/sandbox.js';
 export * from './reporters/index.js';
+
+/*
+ * ── THE SIX TEST TYPES AND THE THREE MODULES BEHIND THEM ────────────────────
+ *
+ * `check:wiring` reported SEVEN `package-exports` failures at once when this
+ * round's agents landed — chaos, document, email, push, pwa, l10n-deep and
+ * matrix — every one of them complete, tested and imported by nothing but its
+ * own test file. That is this codebase's signature defect reproduced six times
+ * in parallel, and for one reason: the registry entry and the barrel line both
+ * live in files none of their authors owned.
+ *
+ * `registry.ts` is what makes the five plugins REACHED, and these lines are
+ * what make them PUBLIC. Both halves are needed and they are not the same
+ * thing: a module on a barrel and called by nobody is the same dead code with a
+ * nicer address, which is why the registry edit came first.
+ *
+ * Why each of the three non-plugin modules is public API on purpose:
+ *
+ *   · `matrix.ts` turns a declared cell set into executions and routes each
+ *     per-cell verdict onto a `TestResultVariant` row. The worker is the caller
+ *     — it owns the execution loop — and it is in a package that cannot reach
+ *     this one except through this file.
+ *   · `files.ts` is the upload/download step surface: `setInputFiles` appeared
+ *     NOWHERE in this runner and nothing asserted a downloaded file's name,
+ *     media type or bytes. The harness stages the fixture and the DOCUMENT
+ *     plugin asserts the artefact, so both sides import it.
+ *   · `l10n-deep.ts` holds the detectors that make a LOCALIZATION finding
+ *     possible at all — `FindingKind` has had a `LOCALIZATION` member that
+ *     nothing in the repository ever emitted. `plugins/matrix.ts` is the
+ *     caller; it is public so the agent can render the detector list beside a
+ *     plan item and the web app can label an unmeasured detector.
+ *
+ * NAME COLLISIONS, checked rather than assumed: `files.ts` and `l10n-deep.ts`
+ * both export a `decodeUtf8`-adjacent helper set and neither collides with the
+ * other or with the twenty-odd modules already here — verified by typechecking
+ * this package with the lines in place, which is what TS2308 would have caught.
+ */
+export * from './matrix.js';
+export * from './files.js';
+export * from './l10n-deep.js';
+export { chaosPlugin } from './plugins/chaos.js';
+export { documentPlugin } from './plugins/document.js';
+export { pwaPlugin } from './plugins/pwa.js';
+export { pushPlugin } from './plugins/push.js';
+export { emailPlugin } from './plugins/email.js';

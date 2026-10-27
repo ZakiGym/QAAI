@@ -177,3 +177,42 @@ export * from './attestation';
 export * from './principals';
 export * from './boundaries';
 export * from './provider-catalogue';
+
+/*
+ * ── THE BROWSER/DEVICE MATRIX AND THE TEST-TYPE DECLARATIONS ────────────────
+ *
+ * THE DEFECT THESE TWO LINES CLOSE, AND IT IS LESSON B BITING IN REAL TIME.
+ *
+ * Both modules landed as public vocabulary and neither reached this barrel.
+ * `browser-matrix.ts` is the engine × channel × version × device × environment
+ * vocabulary that replaced `z.enum(['chromium','firefox','webkit'])`, and
+ * `test-type-decl.ts` is what a test type DECLARES — its requirements, its
+ * repository need, its egress, its data effect, and which producers can emit
+ * it. The runner's matrix resolver, the agent's obligation matrix, the worker's
+ * preflight and the web app's type panel are all in packages that cannot see
+ * this one's source, so every one of them reaches these two by the package
+ * entry point or not at all.
+ *
+ * `check:wiring`'s `package-exports` ratchet did NOT flag either one, and that
+ * is the part worth recording for the third time in this file: `schemas.ts` and
+ * the sibling modules reach them by relative path INSIDE this package, so the
+ * ratchet reads them as REACHED while the front door is shut. It surfaced
+ * instead as seventeen TS2305 errors in @qaai/runner — `has no exported member
+ * 'NETWORK_PROFILES'`, `'MatrixCell'`, `'resolveMatrixCell'`,
+ * `'TEST_TYPE_DECLARATIONS'` — from packages/runner/src/matrix.ts, a file that
+ * had already landed green against a relative path it could not keep.
+ *
+ * ── THE STANDING TEST THIS BARREL APPLIES, CHECKED RATHER THAN CLAIMED ──────
+ *
+ * Closed unions, zod and arithmetic; no `node:` builtin in either file, so
+ * neither can 500 a web page that reads a value from @qaai/shared. Verified by
+ * grep rather than asserted.
+ *
+ * ORDER IS LOAD-BEARING: `test-type-decl.ts` imports `BROWSER_ENGINES` and
+ * three types from `browser-matrix.ts`, so the matrix line goes first.
+ * `browser-matrix.ts`'s only import is `UNVARIED` from `./types`, which is
+ * published far above, so neither line adds a cycle. No name collides with the
+ * 971 names already here or with each other — checked both ways.
+ */
+export * from './browser-matrix';
+export * from './test-type-decl';

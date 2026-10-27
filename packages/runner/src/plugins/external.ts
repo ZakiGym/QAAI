@@ -155,11 +155,18 @@ export const externalPlugin: RunnerPlugin = {
       if (!written.ok) return unrunnableAsWritten(test, startedAt, written.why);
       return runExternal(ctx, test, spec, {
         workspace: workspace.root,
+        // Both types this plugin serves run in the CUSTOMER'S checkout, which is
+        // the one tree QAAI installs nothing in. Stated here, where it is known,
+        // rather than defaulted in `runExternal`, where it is not.
+        workspaceKind: 'MATERIALISED_REPOSITORY',
         extraConsole: written.console,
       });
     }
 
-    return runExternal(ctx, test, spec, { workspace: workspace.root });
+    return runExternal(ctx, test, spec, {
+      workspace: workspace.root,
+      workspaceKind: 'MATERIALISED_REPOSITORY',
+    });
   },
 };
 
@@ -269,6 +276,87 @@ export function onlyLoadErrors(parsed: ParsedReport): string | null {
   return (messages[0] ?? 'the suite failed to load').split('\n')[0]!.slice(0, 300);
 }
 
+/**
+ * WHICH tree the command ran in, because it decides the remedy for a suite that
+ * could not load.
+ *
+ * ── The wrong sentence this exists to stop ─────────────────────────────────
+ *
+ * The load-gap path below used to say, for every caller: "This is a dependency
+ * missing from the worker — install it in the worker image and re-run." That is
+ * right for QAAI's own scratch trees and WRONG for the two types this plugin
+ * exists to serve. INTEGRATION and UNIT_GEN execute inside the run's
+ * MATERIALISED REPOSITORY, and `materialiseRepoWorkspace` extracts the tarball
+ * and runs no package manager — no `npm ci`, no `pip install`, nothing —
+ * deliberately, because running a third-party repository's install hooks on the
+ * worker is arbitrary code execution. So the usual cause of
+ * `Cannot find module` there is QAAI's own documented default, the worker image
+ * is fine, and the remedy named a change nobody can make to fix it. A remedy
+ * that cannot work is worse than no remedy: it sends the reader to the wrong
+ * place and spends their afternoon there.
+ *
+ * ABSENT is a third answer and not a default for one of the two. A caller that
+ * does not say which tree it built gets a sentence naming both causes, because
+ * "we do not know which tree this was" is the truth in that case and picking
+ * the likelier one is how the wrong sentence got written the first time.
+ */
+export const EXTERNAL_WORKSPACE_KINDS = [
+  /** The customer's repository, checked out for this run. Nothing is installed in it. */
+  'MATERIALISED_REPOSITORY',
+  /** A throwaway tree QAAI built for one test, beside QAAI's own dependencies. */
+  'SCRATCH_TREE',
+] as const;
+export type ExternalWorkspaceKind = (typeof EXTERNAL_WORKSPACE_KINDS)[number];
+
+const EXTERNAL_WORKSPACE_KIND_PRESENT: Record<ExternalWorkspaceKind, true> = {
+  MATERIALISED_REPOSITORY: true,
+  SCRATCH_TREE: true,
+};
+
+/** Derived, never hand-listed. */
+export const EXTERNAL_WORKSPACE_KIND_LIST = Object.keys(
+  EXTERNAL_WORKSPACE_KIND_PRESENT,
+) as ReadonlyArray<ExternalWorkspaceKind>;
+
+/**
+ * The sentence a suite that could not load carries.
+ *
+ * Exported so it is tested directly: the three branches differ only in prose,
+ * which is exactly the kind of difference that rots silently behind a status
+ * assertion. The status is SKIPPED in all three cases and always was — a
+ * configuration gap is not a verdict on the application — so a test that only
+ * checks the status cannot tell the right sentence from the wrong one.
+ */
+export function loadGapRemedy(
+  loadGap: string,
+  kind: ExternalWorkspaceKind | undefined,
+): string {
+  const head = `The suite could not be loaded, so no test was evaluated: ${loadGap}.`;
+  const notTheApp = 'This is a configuration gap, not a failure of the application under test.';
+
+  if (kind === 'MATERIALISED_REPOSITORY') {
+    return (
+      `${head} ${notTheApp} QAAI checks your repository out for the run and installs NOTHING ` +
+      'in it — running a repository\'s own install hooks on the worker is arbitrary code ' +
+      'execution, so it is not done by default. Either have this test\'s command install its ' +
+      'dependencies first (for example `npm ci && npx vitest run …`), or commit a vendored ' +
+      'dependency tree. Installing anything in QAAI\'s worker image will not fix this.'
+    );
+  }
+  if (kind === 'SCRATCH_TREE') {
+    return (
+      `${head} ${notTheApp} This ran in a scratch tree QAAI built, so the missing dependency ` +
+      'is one the worker image is expected to provide — install it in the image and re-run.'
+    );
+  }
+  return (
+    `${head} ${notTheApp} The caller did not record which tree this ran in, so the cause is ` +
+    'one of two: a dependency missing from QAAI\'s worker image, or — if this ran inside a ' +
+    'checkout of your repository — the dependencies QAAI deliberately does not install there. ' +
+    'Check which directory the command ran in before acting on either.'
+  );
+}
+
 export interface RunExternalOptions {
   /**
    * The directory `spec.cwd` is resolved against — this run's materialised
@@ -283,6 +371,12 @@ export interface RunExternalOptions {
    * caller that forgets is a compile error rather than a wrong answer.
    */
   workspace: string;
+  /**
+   * Which tree that is. OPTIONAL, and absence is reported as absence — see
+   * {@link EXTERNAL_WORKSPACE_KINDS}. It is read on exactly one path: the
+   * remedy for a suite that could not load.
+   */
+  workspaceKind?: ExternalWorkspaceKind;
   /** Notes to surface on the result — see {@link writeGeneratedTest}. */
   extraConsole?: ConsoleEntry[];
 }
@@ -471,11 +565,18 @@ export async function runExternal(
    * The report is well-formed, so nothing above catches it — but every "failure"
    * in it is a collection error reading `ModuleNotFoundError: No module named
    * 'playwright'`, or `Cannot find module`, or `NoClassDefFoundError`. That is a
-   * dependency missing from the WORKER, and recording it as FAILED blames the
-   * customer's application for our environment. This repo has now fixed that
-   * same mistake three times — a missing Firefox binary, a missing mutation
-   * tool, a missing CLI — and it came back through the one path that does
-   * produce a readable report.
+   * dependency that was not where the command looked, and recording it as FAILED
+   * blames the customer's application for a configuration gap. This repo has now
+   * fixed that same mistake three times — a missing Firefox binary, a missing
+   * mutation tool, a missing CLI — and it came back through the one path that
+   * does produce a readable report.
+   *
+   * WHOSE gap it is depends on WHICH TREE the command ran in, which is why the
+   * remedy comes from {@link loadGapRemedy} rather than being written here: in
+   * QAAI's own scratch tree it is the worker image, and in the customer's
+   * materialised checkout it is the install QAAI deliberately does not perform.
+   * One sentence for both was wrong for the second, and the second is the case
+   * INTEGRATION and UNIT_GEN are always in.
    *
    * Deliberately narrow: it only downgrades when EVERY failure looks like a load
    * error. A suite where one test fails on a bad import and forty pass is still
@@ -494,9 +595,7 @@ export async function runExternal(
     durationMs: Date.now() - startedAt,
     steps,
     errorMessage: loadGap
-      ? `The suite could not be loaded, so no test was evaluated: ${loadGap}. ` +
-        'This is a dependency missing from the worker, not a failure of the application under test — ' +
-        'install it in the worker image and re-run.'
+      ? loadGapRemedy(loadGap, options.workspaceKind)
       : summary.errorMessage
         ? `${summary.errorMessage}${hint}`.slice(0, 2000)
         : null,

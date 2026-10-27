@@ -915,9 +915,17 @@ export function specAssertions(spec: unknown): {
  * reasoning `routesFromSpec` already follows. Values are folded in as well as
  * keys, because `status: 200` and `status: 404` are different behaviour and
  * collapsing them to "asserts status" would call them duplicates.
+ *
+ * `assertInvariants` is CHAOS's field, added when that plugin landed. This
+ * alternation is anchored `^…$`, so without the exact name two CHAOS tests
+ * differing ONLY in which invariants they check produce identical behaviour
+ * tokens and can be judged duplicates of each other — one dependency-failure
+ * test would suppress another that checks something else entirely. The looser
+ * regex in `specAssertions` already matches the name, so the ASSERTIONS gate
+ * was never the problem; this is the duplicate-detection half.
  */
 const ASSERTION_KEY =
-  /^(expect|expected|assert|status|statusCode|expectStatus|body|bodyMatches|bodyContains|contains|matches|equals|maxLatencyMs|threshold|thresholds|budget|budgets|maxDiffRatio|minScore|rules|severity)$/i;
+  /^(expect|expected|assert|assertInvariants|status|statusCode|expectStatus|body|bodyMatches|bodyContains|contains|matches|equals|maxLatencyMs|threshold|thresholds|budget|budgets|maxDiffRatio|minScore|rules|severity)$/i;
 
 export function specBehaviorTokens(spec: unknown): string[] {
   const out = new Set<string>();

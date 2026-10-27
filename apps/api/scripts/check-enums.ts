@@ -136,6 +136,54 @@ const COVERAGE_DIMENSIONS_FILE = fileURLToPath(
 const PRINCIPALS_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/principals.ts', import.meta.url),
 );
+/*
+ * The matrix vocabulary: engines, channels, version pins, device presets,
+ * rendering preferences, interaction states and -- the one that is a Prisma enum
+ * -- what became of ONE CELL when it met a real image. In @qaai/shared and NOT
+ * in constants.ts for the same reason as the nine above: `browser-matrix.ts`
+ * holds `resolveMatrixCell`, the cell-key producers and the fabricated-default
+ * check beside the vocabulary, and those are the only code that interprets it.
+ *
+ * ONE of its lists is paired below. The other eight are deliberately NOT, and
+ * that is not an omission:
+ *
+ *   * `BROWSER_ENGINES`, `BROWSER_CHANNELS`, `DEVICE_PRESETS`, `COLOUR_SCHEMES`,
+ *     `REDUCED_MOTION_PREFERENCES`, `FORCED_COLORS_MODES`, `NETWORK_PROFILES`
+ *     and `BROWSER_PERMISSIONS` live INSIDE `Test.matrixCells` and
+ *     `Test.browserEnv` JSON rather than in a column, so there is no database
+ *     type for them to drift from -- the same argument `UniquenessScope` and
+ *     `CleanupObligation` carry above. Their parity is in
+ *     packages/shared/src/browser-matrix.test.ts, against the zod schemas.
+ *   * `INTERACTION_STATES` and `STATE_UNREACHED_REASONS` are TEXT with their
+ *     domain enforced at the producer, exactly as `MutationSurvivor.reason` and
+ *     `TestCoverageEdge.cappedBy` are. Nothing filters rows on either.
+ *
+ * `MATRIX_CELL_STATUSES` is the exception and earns its Postgres type the same
+ * way `DeploymentCapabilityStatus` did: it is GROUPED ON. "How many of this
+ * run's cells did we refuse, and for which of the six reasons" is the question
+ * that stops a matrix percentage from including cells that cannot run.
+ */
+const BROWSER_MATRIX_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/browser-matrix.ts', import.meta.url),
+);
+/*
+ * The declaration vocabulary: what each test type NEEDS, which producer may
+ * emit it, what it covers, and -- the Prisma enum -- WHY A RESULT DOES NOT CARRY
+ * THE ASSERTION IT IS SUPPOSED TO. In @qaai/shared and NOT in constants.ts for
+ * the same reason as the ten above: `test-type-decl.ts` holds the nineteen
+ * minted and eight pending declarations, `declarationProblems` and
+ * `typesWithNoProducer` beside the vocabulary.
+ *
+ * `TEST_TYPE_PRODUCERS`, `REPOSITORY_NEEDS`, `DEVICE_NEEDS`, `EGRESS_NEEDS` and
+ * `DATA_EFFECTS` are NOT paired below: all five are fields of a DECLARATION,
+ * which ships as data in that file and is validated by
+ * `testTypeDeclarationSchema` when a third-party plugin brings its own. None of
+ * them is a column, so there is no database type to drift from, and their parity
+ * is in packages/shared/src/test-type-decl.test.ts.
+ */
+const TEST_TYPE_DECL_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/test-type-decl.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -162,7 +210,9 @@ const PAIRS: Array<{
     | 'authProfiles'
     | 'coverageTiers'
     | 'coverageDimensions'
-    | 'principals';
+    | 'principals'
+    | 'browserMatrix'
+    | 'testTypeDecl';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -587,6 +637,43 @@ const PAIRS: Array<{
   // would be read as an authorization control working. Those are the two
   // specific lies this enum exists to prevent.
   { prismaEnum: 'PrincipalLifecycle', tsConst: 'PRINCIPAL_LIFECYCLES', source: 'principals' },
+  /*
+   * ── The matrix and the honesty column (this round) ────────────────────────
+   *
+   * Two, and both are here for the same reason the five dimension pairs above
+   * are: each decides whether a NUMBER is right, and each is GROUPED ON, which
+   * is what earned it a Postgres type instead of a TEXT column with a producer
+   * guard.
+   */
+  // WHAT BECAME OF ONE CELL. `cellCounts` tests membership of
+  // `UNEXERCISABLE_CELL_STATUSES` before a cell may be scored, so a status the
+  // database accepts and TypeScript cannot name lands in the "counts" arm --
+  // which means a cell that could not run would be scored as one that did, and
+  // the matrix percentage would include a cell that can never fail. The mirror
+  // direction is worse than its DeploymentCapabilityStatus twin's: a value
+  // MISSING from the Prisma enum cannot be stored, so an UNSUPPORTED_COMBINATION
+  // or NEEDS_BROWSER_GRID cell would be written as NULL -- which this schema
+  // reads as "nobody recorded a cell status", i.e. indistinguishable from a
+  // SKIPPED row, which is the exact defect the column was added to kill.
+  {
+    prismaEnum: 'MatrixCellStatus',
+    tsConst: 'MATRIX_CELL_STATUSES',
+    source: 'browserMatrix',
+  },
+  // WHY A RESULT DOES NOT CARRY ITS ASSERTION. The highest-stakes pair of the
+  // round, because this column is the only thing standing between "checkout was
+  // clicked through" and "the money path was asserted". `OUR_UNASSERTED_REASONS`
+  // splits the list into our gap and the environment's, and a reason the
+  // database accepts and TypeScript cannot name falls into NEITHER half: the
+  // hole is recorded, nobody is sent to fix it, and the row reads as diligence.
+  // A reason MISSING from the Prisma enum is the other half of the same defect
+  // -- the insert fails, and a plugin that cannot record its hole has no way to
+  // report one except by passing.
+  {
+    prismaEnum: 'UnassertedReason',
+    tsConst: 'UNASSERTED_REASONS',
+    source: 'testTypeDecl',
+  },
 ];
 
 /*
@@ -693,6 +780,8 @@ const authProfiles = readFileSync(AUTH_PROFILES, 'utf8');
 const coverageTiers = readFileSync(COVERAGE_TIERS_FILE, 'utf8');
 const coverageDimensions = readFileSync(COVERAGE_DIMENSIONS_FILE, 'utf8');
 const principals = readFileSync(PRINCIPALS_FILE, 'utf8');
+const browserMatrix = readFileSync(BROWSER_MATRIX_FILE, 'utf8');
+const testTypeDecl = readFileSync(TEST_TYPE_DECL_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -705,7 +794,9 @@ const SOURCES: Record<
   | 'authProfiles'
   | 'coverageTiers'
   | 'coverageDimensions'
-  | 'principals',
+  | 'principals'
+  | 'browserMatrix'
+  | 'testTypeDecl',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -720,6 +811,8 @@ const SOURCES: Record<
   coverageTiers: { text: coverageTiers, label: 'shared/coverage-tiers.ts' },
   coverageDimensions: { text: coverageDimensions, label: 'shared/coverage-dimensions.ts' },
   principals: { text: principals, label: 'shared/principals.ts' },
+  browserMatrix: { text: browserMatrix, label: 'shared/browser-matrix.ts' },
+  testTypeDecl: { text: testTypeDecl, label: 'shared/test-type-decl.ts' },
 };
 const problems: string[] = [];
 

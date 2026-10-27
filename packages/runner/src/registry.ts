@@ -39,6 +39,42 @@ import { seoPlugin } from './plugins/seo.js';
  * codebase produces more often than any other defect.
  */
 import { tenancyPlugin } from './plugins/tenancy.js';
+/*
+ * ── THE SIX TEST TYPES THIS ROUND LANDED ───────────────────────────────────
+ *
+ * Every one of them arrived in the state `check:wiring` names `package-exports`
+ * — complete, tested, and imported by nothing but its own test file. Seven
+ * files were in that state at once, which is this codebase's signature defect
+ * reproduced six times in parallel because the registry entry lives in a file
+ * none of their authors owned. These imports and the table below are what make
+ * them REACHED; the barrel line in index.ts only makes them public, which is
+ * the same dead code with a nicer address.
+ *
+ * All six go in `PENDING_PLUGINS` rather than `PLUGINS`, and that is not
+ * caution: each one's `type` is a string literal `TEST_TYPES` does not contain,
+ * so no `Test` row can carry it and no run can resolve to it. Forcing one into
+ * an existing type to make it reachable sooner would validate its spec against
+ * the wrong schema and report what failed under a name that does not describe
+ * it. `promotePendingPlugins` moves each the day its member is minted.
+ */
+import { chaosPlugin } from './plugins/chaos.js';
+import { documentPlugin } from './plugins/document.js';
+import { pushPlugin } from './plugins/push.js';
+import { pwaPlugin } from './plugins/pwa.js';
+/*
+ * EMAIL is the one whose NAME is a problem, recorded here rather than fixed
+ * silently. `emailPlugin.type` is the literal `'EMAIL'`, and `'EMAIL'` is in
+ * NEITHER `TEST_TYPES` nor `PENDING_TEST_TYPES` — so unlike its five siblings
+ * it has no declaration, `mintTestTypeSteps` cannot be called for it, and
+ * `declaredRequirements` below returns an empty list with a reason rather than
+ * a requirement set. The plugin's own header argues for the spelling (it
+ * matches `SurfaceDimensionKind`'s `EMAIL`, the surface it covers) and that
+ * argument is sound; what is missing is the member in
+ * packages/shared/src/constants.ts, which is in this round's handover. It is
+ * registered anyway, because `pendingTypes()` naming it is strictly better
+ * than a plugin no gate can see.
+ */
+import { emailPlugin } from './plugins/email.js';
 
 const PLUGINS: Partial<Record<TestType, RunnerPlugin>> = {
   E2E: e2ePlugin,
@@ -139,6 +175,41 @@ const PENDING_PLUGINS: Readonly<Record<string, PendingPlugin>> = {
    * not exist.
    */
   TENANCY: tenancyPlugin,
+  /*
+   * CHAOS — a dependency misbehaving, driven through the route interception
+   * `har.ts` has always had and no test type ever used. Reads BOTH its own
+   * wider fault vocabulary and the shared `chaosTestSpecSchema`, so a stored
+   * row runs today and the gap between the two is a number it exports rather
+   * than a surprise.
+   */
+  CHAOS: chaosPlugin,
+  /*
+   * DOCUMENT — a produced file: an invoice, a statement, a label, a signed
+   * contract, an export. `setInputFiles` appeared nowhere in this runner and
+   * nothing anywhere asserted a downloaded file's name, media type or bytes, so
+   * "the button worked" was the strongest claim available about a download.
+   */
+  DOCUMENT: documentPlugin,
+  /*
+   * PWA — the service worker, offline navigation, cache-first behaviour and the
+   * install prompt: a second, cached copy of the application that no online
+   * test has ever executed.
+   */
+  PWA: pwaPlugin,
+  /*
+   * PUSH — a notification actually DELIVERED, over Web Push, APNs or FCM.
+   * Mobile tests stopped at the app's own UI; nothing triggered or asserted a
+   * delivery. A device-bound transport with no customer-owned sender reports
+   * UNAVAILABLE rather than SKIPPED, which is the distinction that keeps a
+   * percentage from counting a test that can never run.
+   */
+  PUSH: pushPlugin,
+  /*
+   * EMAIL — a transactional message's own delivery and content, as opposed to
+   * EMAIL_OTP, which drives a sign-in. See the import note: this key is the one
+   * of the six with no declared member behind it.
+   */
+  EMAIL: emailPlugin,
 };
 
 /**
@@ -309,4 +380,278 @@ export function runnabilityFor(
     probes: options.probes,
     pluginless: (type) => pluginlessReason(type, options.hasPlugin),
   });
+}
+
+/*
+ * ── THE DECLARATION BRIDGE: ONE ANSWER TO "WHAT DOES THIS TYPE NEED" ────────
+ *
+ * THE DEFECT. There were TWO tables of requirements and they covered different
+ * types. `TYPE_REQUIREMENTS` in ./preflight.ts is a `Record<TestType, …>` — the
+ * nineteen MINTED types, and the only one the prober can read. The keystone's
+ * `TEST_TYPE_DECLARATIONS` / `PENDING_TEST_TYPE_DECLARATIONS` in
+ * packages/shared/src/test-type-decl.ts cover all THIRTY, including the eleven
+ * pending ones whose plugins this file now registers.
+ *
+ * So `runnabilityReport()` could not answer for CHAOS, DOCUMENT, PWA or PUSH at
+ * all — not "unknown", not "pending": the call did not typecheck, and a caller
+ * asking "can this deployment run the six types you just shipped" got nothing
+ * back. A plugin registered and un-probeable is the preflight failing at
+ * exactly the moment it exists for.
+ *
+ * This bridge reads the DECLARATION and hands it to the prober, so the two
+ * tables stop being two answers. `requirementParity` below is the guard that
+ * keeps them one answer for the minted overlap: if somebody edits one table
+ * only, that function names the type rather than leaving a deployment with two
+ * different beliefs about what MOBILE needs.
+ */
+
+import type { TypeRequirement } from '@qaai/shared';
+import { ANY_TEST_TYPES, declarationFor, requirementsForType } from '@qaai/shared';
+import type { Requirement } from './preflight.js';
+import { TYPE_REQUIREMENTS } from './preflight.js';
+
+/**
+ * A declared requirement, in the shape the prober understands.
+ *
+ * ── THE ONE LOSSY CASE, AND WHY IT IS A DEMOTION RATHER THAN A DROP ─────────
+ *
+ * `TypeRequirement` has a `CHANNEL` member that `Requirement` does not, because
+ * nothing in ./preflight.ts can probe for Chrome Beta: the prober asks
+ * Playwright which ENGINES are installed, and a channel is a separate browser
+ * on the host that Playwright reports nothing about. The three available
+ * treatments are not equal:
+ *
+ *   · DROP IT — a cap applied without being disclosed, and the worst of the
+ *     three: the report would say MOBILE is runnable having silently stopped
+ *     asking about the thing that would stop it.
+ *   · KEEP IT AS TYPE-SCOPED — the prober would report it ABSENT (it cannot
+ *     see it) and REFUSE a type whose channel is installed. "QAAI refused my
+ *     Chrome stable" is worse than "QAAI did not check it and said so".
+ *   · DEMOTE IT TO `UNPROBED` AT SPEC SCOPE — reported in `degraded`, never a
+ *     refusal, with the channel named and the real answerer pointed at. That
+ *     is what this does, and {@link CHANNEL_REQUIREMENTS_DEMOTED} makes the
+ *     count sayable so the demotion is disclosed rather than discovered.
+ *
+ * `resolveMatrixCell` in packages/shared/src/browser-matrix.ts is the function
+ * that DOES answer for a channel, against a `DeploymentBrowsers` capability the
+ * worker collects. It reports NEEDS_BROWSER_GRID and UNSUPPORTED_COMBINATION,
+ * which no amount of installing changes — two outcomes this prober's four
+ * statuses cannot express, which is the deeper reason the two live apart.
+ */
+export function asProbeRequirement(requirement: TypeRequirement): Requirement {
+  if (requirement.kind !== 'CHANNEL') return requirement;
+  return {
+    kind: 'UNPROBED',
+    scope: 'SPEC',
+    what: `the \`${requirement.channel}\` browser channel (${requirement.install})`,
+    why:
+      'this prober asks Playwright which ENGINES are installed and a channel is a separate ' +
+      'browser on the host it reports nothing about. `resolveMatrixCell` in ' +
+      '@qaai/shared/browser-matrix answers for a channel against a collected ' +
+      'DeploymentBrowsers capability — including NEEDS_BROWSER_GRID and ' +
+      'UNSUPPORTED_COMBINATION, which no install fixes and which this prober cannot express.',
+  };
+}
+
+/** How many declared CHANNEL requirements were demoted, per type. Disclosed, never silent. */
+export function CHANNEL_REQUIREMENTS_DEMOTED(): Array<{ type: string; channels: string[] }> {
+  const out: Array<{ type: string; channels: string[] }> = [];
+  for (const type of ANY_TEST_TYPES) {
+    const channels = requirementsForType(type)
+      .filter((requirement): requirement is Extract<TypeRequirement, { kind: 'CHANNEL' }> =>
+        requirement.kind === 'CHANNEL',
+      )
+      .map((requirement) => requirement.channel);
+    if (channels.length > 0) out.push({ type, channels });
+  }
+  return out;
+}
+
+/**
+ * What a type declares it needs, minted or not, in the prober's shape.
+ *
+ * Returns an EMPTY list with a reason — never a fabricated requirement set —
+ * for a name with no declaration. `'EMAIL'` is exactly that case today: a
+ * registered plugin whose type string is in neither `TEST_TYPES` nor
+ * `PENDING_TEST_TYPES`, so there is nothing to read. Answering with `[]` and no
+ * distinction would say "this type needs nothing", which is what API and
+ * SECURITY_SMOKE genuinely report, so the two are kept apart by `declared`.
+ */
+export function declaredRequirements(type: string): {
+  readonly declared: boolean;
+  readonly requirements: readonly Requirement[];
+  readonly why: string;
+} {
+  const declaration = declarationFor(type);
+  if (declaration === null) {
+    return {
+      declared: false,
+      requirements: [],
+      why:
+        `"${type}" has no entry in TEST_TYPE_DECLARATIONS or ` +
+        'PENDING_TEST_TYPE_DECLARATIONS, so what it needs is UNKNOWN rather than nothing. A ' +
+        'plugin is registered under this name and no declaration describes it — add the member ' +
+        'to TEST_TYPES or PENDING_TEST_TYPES in packages/shared/src/constants.ts and the ' +
+        'declaration beside it.',
+    };
+  }
+  return {
+    declared: true,
+    requirements: declaration.requirements.map(asProbeRequirement),
+    why: declaration.summary,
+  };
+}
+
+/**
+ * Runnability for ANY declared type, pending ones included.
+ *
+ * The same answer `runnabilityReport` gives for the nineteen, extended to the
+ * thirty by reading the declaration instead of `TYPE_REQUIREMENTS`. A name with
+ * no declaration is REFUSED rather than answered — see `declaredRequirements` —
+ * because the one thing worse than "unknown" here is a confident "runnable"
+ * about a type nobody described.
+ *
+ * The cast on `types` is narrow and load-bearing, and it is the same shape as
+ * the one `PENDING_PLUGINS` uses above: `checkRunnability` reads a type only as
+ * a `Record` key and as a string in its sentence, and every key is checked
+ * against the declarations immediately below, so nothing is answered under a
+ * name the declarations do not hold.
+ */
+export function declaredRunnability(
+  types: readonly string[],
+  options: {
+    probes?: RunnabilityProbes;
+    hasPlugin?: (type: string) => boolean;
+  } = {},
+): Promise<TypeRunnability[]> {
+  const requirements: Partial<Record<TestType, readonly Requirement[]>> = {};
+  const undeclared: string[] = [];
+  for (const type of types) {
+    const declared = declaredRequirements(type);
+    if (!declared.declared) {
+      undeclared.push(type);
+      continue;
+    }
+    requirements[type as TestType] = declared.requirements;
+  }
+
+  const hasPlugin =
+    options.hasPlugin ??
+    ((type: string) =>
+      PLUGINS[type as TestType] !== undefined || Object.keys(PENDING_PLUGINS).includes(type));
+
+  return checkRunnability(types.filter((type) => !undeclared.includes(type)) as TestType[], {
+    probes: options.probes,
+    requirements,
+    pluginless: (type) =>
+      hasPlugin(type)
+        ? null
+        : `${reasonUnsupported(type)} — no amount of installing tools on this worker changes that.`,
+  });
+}
+
+/**
+ * Where the two requirement tables DISAGREE about a minted type.
+ *
+ * Exported and empty-on-purpose: two hand-maintained answers to "what does
+ * MOBILE need" is how one of them starts being wrong, and the one that would be
+ * wrong is whichever a reader is not looking at. A test asserts this is empty,
+ * so editing one table alone fails rather than shipping a deployment with two
+ * beliefs.
+ *
+ * Compares the SET of (kind, name) pairs rather than the objects: the
+ * declaration carries a `why` the prober's table does not always repeat, and a
+ * difference in prose is not a difference in what must be installed.
+ */
+export function requirementParity(): Array<{ type: TestType; only: string[] }> {
+  const key = (requirement: Requirement): string =>
+    requirement.kind === 'BINARY'
+      ? `BINARY:${requirement.name}`
+      : requirement.kind === 'BROWSER'
+        ? `BROWSER:${requirement.name}`
+        : requirement.kind === 'PLATFORM'
+          ? `PLATFORM:${requirement.platform}`
+          : `UNPROBED:${requirement.what}`;
+
+  const out: Array<{ type: TestType; only: string[] }> = [];
+  for (const type of Object.keys(TYPE_REQUIREMENTS) as TestType[]) {
+    const fromTable = new Set(TYPE_REQUIREMENTS[type].map(key));
+    const fromDecl = new Set(declaredRequirements(type).requirements.map(key));
+    const only = [
+      ...[...fromTable].filter((entry) => !fromDecl.has(entry)).map((entry) => `preflight:${entry}`),
+      ...[...fromDecl].filter((entry) => !fromTable.has(entry)).map((entry) => `declaration:${entry}`),
+    ].sort();
+    if (only.length > 0) out.push({ type, only });
+  }
+  return out;
+}
+
+/**
+ * Registered plugins whose type string no declaration describes.
+ *
+ * The gap `'EMAIL'` is in today, as a countable value rather than a comment. A
+ * plugin here is reachable (`pendingTypes()` names it) and un-probeable
+ * (`declaredRequirements` refuses it), which is a different and smaller gap
+ * than a plugin nothing imports — and it is the one state this round could not
+ * close without editing packages/shared/src/constants.ts.
+ */
+export function undeclaredPluginTypes(): string[] {
+  const names = [...Object.keys(PLUGINS), ...Object.keys(PENDING_PLUGINS)];
+  return [...new Set(names)].filter((name) => declarationFor(name) === null).sort();
+}
+
+/**
+ * Types that must be EXCLUDED from a coverage denominator, each with a reason.
+ *
+ * ── THE LIE THIS EXISTS TO STOP ─────────────────────────────────────────────
+ *
+ * A percentage whose denominator contains a type this image cannot execute is a
+ * percentage containing tests that can never fail. Before the preflight existed
+ * the product discovered a missing k6 one run at a time and recorded the result
+ * SKIPPED — and a SKIPPED row inside a denominator is indistinguishable from a
+ * surface nobody has got to yet.
+ *
+ * So the exclusion is a LIST OF REASONS, not a filter. Every caller that drops
+ * a type from a denominator has the sentence to print beside the number, and a
+ * type dropped with no sentence is not expressible here.
+ *
+ * `runnable === null` is NOT excluded, and that is the subtle half: nothing was
+ * probed, which is not evidence that the type cannot run. Excluding it would
+ * let a deployment that never ran a preflight shed every type it could not
+ * prove it could run, and the percentage would RISE for a probe nobody
+ * executed — the same rule `UNEXERCISABLE_CELL_STATUSES` records for a matrix
+ * cell in packages/runner/src/matrix.ts.
+ */
+export function denominatorExclusions(
+  runnability: readonly TypeRunnability[],
+): Array<{ type: TestType; reason: string }> {
+  const out: Array<{ type: TestType; reason: string }> = [];
+  for (const entry of runnability) {
+    if (entry.runnable !== false) continue;
+    const missing = entry.missing.map((requirement) =>
+      requirement.kind === 'BINARY'
+        ? `\`${requirement.name}\` is not installed — ${requirement.install}`
+        : requirement.kind === 'BROWSER'
+          ? `Playwright's ${requirement.name} is not installed — ${requirement.install}`
+          : requirement.kind === 'PLATFORM'
+            ? `this worker is not ${requirement.platform}`
+            : requirement.what,
+    );
+    const wrong = entry.wrongVersion.map((requirement) =>
+      requirement.kind === 'BINARY'
+        ? `\`${requirement.name}\` is installed and outside its declared window — upgrade it`
+        : 'a declared version window is unmet',
+    );
+    out.push({
+      type: entry.type,
+      reason:
+        missing.length + wrong.length > 0
+          ? `${entry.type} cannot run on this deployment: ${[...missing, ...wrong].join('; ')}. ` +
+            'It is OUT of the coverage denominator, so the percentage is over what this ' +
+            'deployment can actually execute — it is not reported as passing and not reported ' +
+            'as skipped.'
+          : entry.reason,
+    });
+  }
+  return out;
 }
