@@ -89,6 +89,29 @@ const AUTH_PROFILES = fileURLToPath(
 const COVERAGE_TIERS_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/coverage-tiers.ts', import.meta.url),
 );
+/*
+ * The dimension vocabulary: the axes a number may be broken down on, the kinds
+ * of cell that live below a surface item, why a cell carries no measurement,
+ * which test types a deployment can execute, and whether a seeded defect was
+ * found. In @qaai/shared and NOT in constants.ts for the same reason as the
+ * seven above — `coverage-dimensions.ts` holds the cell-kind-to-dimension
+ * record, the two measurement constructors and the comparability rule beside
+ * the vocabulary, and dragging five lists into constants.ts would separate them
+ * from the only code that interprets them.
+ *
+ * `SNAPSHOT_COMPARABILITIES` and `VALIDITY_VERDICTS` are deliberately NOT
+ * paired below, and that is not an omission: neither is a Prisma enum.
+ * `CoverageSnapshot.comparability`, `CoverageHistory.comparability` and
+ * `ValidityBacktest.verdict` are TEXT columns with their domain enforced at the
+ * producer, exactly as `MutationSurvivor.reason`, `CoverageItem`.
+ * `unexercisableReason` and `TestCoverageEdge.cappedBy` are. Nothing filters
+ * rows on them, so an enum would have been two more Postgres types whose only
+ * job is to need a drift guard. The run-time parity for those two lives in
+ * packages/shared/src/coverage-dimensions.test.ts against the zod schemas.
+ */
+const COVERAGE_DIMENSIONS_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/coverage-dimensions.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -113,7 +136,8 @@ const PAIRS: Array<{
     | 'requirements'
     | 'apiSurface'
     | 'authProfiles'
-    | 'coverageTiers';
+    | 'coverageTiers'
+    | 'coverageDimensions';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -436,6 +460,76 @@ const PAIRS: Array<{
   // number going UP is a regression: a direction the database accepts and
   // TypeScript cannot name is a gate that fires backwards.
   { prismaEnum: 'MetricDirection', tsConst: 'METRIC_DIRECTIONS', source: 'types' },
+  /*
+   * ── The dimensions (§ coverage) ───────────────────────────────────────────
+   *
+   * Five, and every one is filtered on or keyed on a `Record`, which is what
+   * earned it a database type rather than a TEXT column — and is therefore
+   * exactly what makes it a value a row may hold and TypeScript may not know
+   * about.
+   *
+   * The reason to be strict about these five specifically: the previous slice's
+   * four decided how STRONG the numerator is, and these five decide WHAT IS
+   * BEING DIVIDED and WHETHER IT WAS MEASURED AT ALL. A value that falls
+   * through a switch here does not produce an obviously-broken screen — it
+   * produces an axis rendered as 0% that was never measured, which is a lie
+   * about the customer's application assembled out of our own silence.
+   */
+  // The axes a report may be broken down on. `COVERAGE_DIMENSION_DESCRIPTORS`
+  // is a `Record` keyed on this union, so a fourteenth dimension in the
+  // database that TypeScript cannot name would be rows of cells with no axis to
+  // be counted on — and a cell counted on no axis is counted nowhere, which
+  // raises the percentage.
+  {
+    prismaEnum: 'CoverageDimensionKind',
+    tsConst: 'COVERAGE_DIMENSIONS',
+    source: 'coverageDimensions',
+  },
+  // Every kind of cell below a surface item. `CELL_KIND_DIMENSION` is also a
+  // `Record` keyed on this union, so a kind the database accepts and TypeScript
+  // cannot name has NO DIMENSION: the row exists, no denominator contains it,
+  // and the state it represents is invisible rather than uncovered. One enum
+  // and not six precisely so that six parallel dimension modules cannot each
+  // invent their own spelling of a page state.
+  {
+    prismaEnum: 'CoverageCellKind',
+    tsConst: 'COVERAGE_CELL_KINDS',
+    source: 'coverageDimensions',
+  },
+  // THE highest-stakes member of the five. It is the only reason an unmeasured
+  // axis renders as "not measured" rather than as 0%, and it is grouped by —
+  // "we have no extractor" is work for us and "a cap bit" is a budget to raise.
+  // A reason in the database that TypeScript cannot name falls through the
+  // grouping into neither bucket, and the shortfall it explains becomes an
+  // unexplained one.
+  {
+    prismaEnum: 'DimensionUnmeasuredReason',
+    tsConst: 'DIMENSION_UNMEASURED_REASONS',
+    source: 'coverageDimensions',
+  },
+  // Which of the nineteen test types this deployment can execute.
+  // `capabilityCounts` tests membership of `NON_EXECUTABLE_CAPABILITY_STATUSES`
+  // before it will take an obligation out of the denominator, so a status
+  // TypeScript cannot name lands in the "counts" arm — safe — while one MISSING
+  // from the Prisma enum is a probe that cannot be recorded, and an unrecorded
+  // probe is indistinguishable from NOT_CHECKED. NOT_CHECKED rendering as
+  // UNSUPPORTED is the single rendering mistake this enum exists to prevent.
+  {
+    prismaEnum: 'DeploymentCapabilityStatus',
+    tsConst: 'DEPLOYMENT_CAPABILITY_STATUSES',
+    source: 'coverageDimensions',
+  },
+  // Whether a seeded defect was found. `RATED_FAULT_OUTCOMES` is what the
+  // detection rate divides by, and NOT_EXERCISED is deliberately outside it —
+  // an outcome the database accepts and TypeScript cannot name would land in
+  // neither half of the fraction and the parts would stop summing to the whole.
+  // This is the number the entire product's credibility rests on, so it is the
+  // last place an unnameable value may appear.
+  {
+    prismaEnum: 'FaultDetectionOutcome',
+    tsConst: 'FAULT_DETECTION_OUTCOMES',
+    source: 'coverageDimensions',
+  },
 ];
 
 /*
@@ -540,6 +634,7 @@ const requirements = readFileSync(REQUIREMENTS, 'utf8');
 const apiSurface = readFileSync(API_SURFACE, 'utf8');
 const authProfiles = readFileSync(AUTH_PROFILES, 'utf8');
 const coverageTiers = readFileSync(COVERAGE_TIERS_FILE, 'utf8');
+const coverageDimensions = readFileSync(COVERAGE_DIMENSIONS_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -550,7 +645,8 @@ const SOURCES: Record<
   | 'requirements'
   | 'apiSurface'
   | 'authProfiles'
-  | 'coverageTiers',
+  | 'coverageTiers'
+  | 'coverageDimensions',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -563,6 +659,7 @@ const SOURCES: Record<
   apiSurface: { text: apiSurface, label: 'shared/api-surface.ts' },
   authProfiles: { text: authProfiles, label: 'shared/auth-profiles.ts' },
   coverageTiers: { text: coverageTiers, label: 'shared/coverage-tiers.ts' },
+  coverageDimensions: { text: coverageDimensions, label: 'shared/coverage-dimensions.ts' },
 };
 const problems: string[] = [];
 

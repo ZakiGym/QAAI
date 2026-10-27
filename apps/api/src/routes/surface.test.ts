@@ -203,7 +203,26 @@ type ModelName =
   | 'testResult'
   | 'coverageItem'
   | 'coverageWaiver'
-  | 'coverageSnapshot';
+  | 'coverageSnapshot'
+  /*
+   * ── THE TABLES THE DIMENSION PASS TOUCHES ────────────────────────────────
+   *
+   * `componentItem` / `componentState` are READ for the COMPONENT and
+   * COMPONENT_STATE cells; the five `coverage*` tables below are the write
+   * paths this round added. Real delegates rather than stubs, because the
+   * properties that matter — a cell retired rather than deleted, a sweep
+   * scoped by cell kind so another producer's rows survive, a rollup upsert
+   * idempotent on its scope key — are only observable against a fake that
+   * holds the rows.
+   */
+  | 'componentItem'
+  | 'componentState'
+  | 'testCoverageEdge'
+  | 'coverageFormField'
+  | 'coverageItemState'
+  | 'coverageTypeObligation'
+  | 'coverageRollup'
+  | 'coverageHistory';
 
 const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   project: new Set(['id', 'orgId', 'archivedAt']),
@@ -230,6 +249,21 @@ const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   ]),
   coverageWaiver: new Set(['id', 'orgId', 'projectId', 'itemId', 'expiresAt']),
   coverageSnapshot: new Set(['id', 'orgId', 'projectId']),
+  componentItem: new Set(['id', 'orgId', 'projectId', 'modulePath', 'exportName', 'retiredAt']),
+  componentState: new Set(['id', 'orgId', 'componentId', 'kind', 'retiredAt', 'component']),
+  testCoverageEdge: new Set(['id', 'orgId', 'projectId', 'itemId', 'testId', 'source', 'retiredAt']),
+  coverageFormField: new Set(['id', 'orgId', 'projectId', 'itemId', 'fieldKey', 'kind', 'retiredAt']),
+  /*
+   * `kind` is the load-bearing entry. `CoverageItemState` has more than one
+   * producer — the field pass writes COMPONENT_* cells and the page-state
+   * adapter writes PAGE_*, ERROR_* and DATA_* into the same table — so the
+   * retirement sweep is scoped to the kinds it produced, and a fake that
+   * shrugged at the filter would make deleting that scope undetectable.
+   */
+  coverageItemState: new Set(['id', 'orgId', 'projectId', 'itemId', 'stateKey', 'kind', 'retiredAt']),
+  coverageTypeObligation: new Set(['id', 'orgId', 'projectId', 'itemId', 'testType', 'retiredAt']),
+  coverageRollup: new Set(['id', 'orgId', 'projectId', 'snapshotId', 'scopeKey', 'dimension']),
+  coverageHistory: new Set(['id', 'orgId', 'projectId', 'snapshotId', 'scopeKey']),
 };
 
 /** Models with no orgId column, mirroring GLOBAL_MODELS in lib/prisma.ts. */
@@ -426,6 +460,38 @@ function makeDb(store: Store): Row {
       count: async ({ where }: Row = {}) => {
         h.ops.push(`${name}.count`);
         return select(where).length;
+      },
+      /**
+       * `groupBy`, in the one shape the store uses: `by: ['kind']` with
+       * `_count: { _all: true }`.
+       *
+       * A real grouping and not a stub, because the per-dimension stored-cell
+       * counts are derived from the CELL KIND through `CELL_KIND_DIMENSION` —
+       * one vocabulary, one mapping — and a fake returning a flat total would
+       * make a kind filed on the wrong axis invisible. Filtered like every
+       * other read, so `retiredAt: null` is applied and a retired cell is not
+       * counted as live.
+       */
+      groupBy: async ({ by, where }: Row = {}) => {
+        h.ops.push(`${name}.groupBy`);
+        const keys = (by ?? []) as string[];
+        const buckets = new Map<string, { row: Row; count: number }>();
+        for (const row of select(where)) {
+          const identity = keys.map((key) => String(row[key])).join('\u0000');
+          const existing = buckets.get(identity);
+          if (existing) {
+            existing.count += 1;
+            continue;
+          }
+          buckets.set(identity, {
+            row: Object.fromEntries(keys.map((key) => [key, row[key]])),
+            count: 1,
+          });
+        }
+        return [...buckets.values()].map((bucket) => ({
+          ...bucket.row,
+          _count: { _all: bucket.count },
+        }));
       },
       delete: async ({ where }: Row) => {
         h.ops.push(`${name}.delete`);
@@ -647,6 +713,24 @@ function seed(): Store {
     coverageItem: [],
     coverageWaiver: [],
     coverageSnapshot: [],
+    /*
+     * The component inventory and the five dimension tables, all EMPTY.
+     *
+     * Empty is the honest starting state and it is an assertion in its own
+     * right: with no component rows the COMPONENT and COMPONENT_STATE axes
+     * measure nothing and report NULL rather than 0%, and with no
+     * `typeObligationPolicy` on the project row the TEST_TYPE axis owes
+     * nothing. A fixture that pre-filled either would make this suite pass
+     * against a denominator the customer never configured.
+     */
+    componentItem: [],
+    componentState: [],
+    testCoverageEdge: [],
+    coverageFormField: [],
+    coverageItemState: [],
+    coverageTypeObligation: [],
+    coverageRollup: [],
+    coverageHistory: [],
   };
 }
 

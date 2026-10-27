@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "application": "@qaai/demo",
+  "$why": [
+    "THE SEEDED-FAULT CATALOGUE — how QAAI finds out whether it finds anything.",
+    "",
+    "QAAI has never been able to say \"we detect N% of seeded defects\", which is the",
+    "ground truth every coverage claim rests on: a 90% coverage number over a suite",
+    "that catches nothing is worth less than a 40% number over a suite that catches",
+    "everything, and until this file existed the product could not tell those two",
+    "apart about ITSELF.",
+    "",
+    "Each entry is one defect, individually switchable, with a machine-readable",
+    "record of what it breaks and which declared surface item it lives on. The",
+    "harness (packages/cli/src/bench.ts) switches one on, runs the suite, records",
+    "DETECTED / MISSED / NOT_EXERCISED, switches it off, and repeats.",
+    "",
+    "── WHY SOURCE PATCHES AND NOT A RUNTIME FLAG ───────────────────────────────",
+    "",
+    "A fault is a set of `find`/`replace` edits against real lines of the demo app,",
+    "applied on disk and reverted byte-for-byte. Three reasons, in order of how much",
+    "they matter:",
+    "",
+    "  1. IT IS THE REAL THING. A flag-guarded branch is a branch the app always",
+    "     carries; a patched line is the defect a developer would actually have",
+    "     written. DEMO_PLANTED_BUG is the flag version and it has one defect in it,",
+    "     for ever, because adding a second would mean another env var and another",
+    "     permanent branch.",
+    "  2. IMPOSSIBLE TO LEAVE ON. The clean baseline is asserted STRUCTURALLY and not",
+    "     against a digest committed in this file: every edit's `find` text must be",
+    "     present exactly once and its `replace` text must be absent, which is",
+    "     precisely the statement \"no fault from this catalogue is applied right",
+    "     now\". It is checked BEFORE the first fault and AFTER the last, together",
+    "     with a per-file digest taken at the start of the run and compared at the",
+    "     end. A digest committed here would have been stronger and wrong: it goes",
+    "     stale on any unrelated edit to the demo app, and a benchmark that is red",
+    "     for a reason unconnected to the benchmark is a benchmark somebody",
+    "     switches off.",
+    "  3. NO NEW ENVIRONMENT VARIABLE. A connector's switches belong on a row the",
+    "     customer owns, and a benchmark's switches belong in the benchmark.",
+    "",
+    "The cost is that an edit to the demo app can invalidate an anchor. That is a",
+    "FEATURE here: the patch stops applying, the bench reports the fault as",
+    "NOT_APPLICABLE with the file and the anchor named, and the count of faults it",
+    "could not attempt is printed beside the detection rate rather than quietly",
+    "shrinking it.",
+    "",
+    "── THE RATE IS PER CLASS, NEVER BLENDED ────────────────────────────────────",
+    "",
+    "\"We catch 90% of broken validations and 20% of silent failures\" is a finding a",
+    "team acts on. One blended percentage is a marketing number, and it is also",
+    "unstable: it moves when somebody adds three more faults of the class we happen",
+    "to be good at. `class` is what the rate is grouped by, and a class with one",
+    "member reports n=1 rather than hiding behind the average.",
+    "",
+    "── NOT_EXERCISED IS NOT A MISS ─────────────────────────────────────────────",
+    "",
+    "A fault whose surface no test ever touched proves nothing about the assertions.",
+    "It is a COVERAGE gap, and reporting it as MISSED would blame the assertions for",
+    "it while reporting it as DETECTED would be fiction. It is excluded from both",
+    "halves of the fraction and counted beside it. A benchmark that cannot tell \"we",
+    "had no test\" from \"our test passed anyway\" is useless in both directions."
+  ],
+  "$classes": {
+    "WRONG_TOTAL": "A number the user reads is arithmetically wrong while every other number on the page stays right. Only an assertion about MEANING catches it; a pixel diff and a 200-check both sail past.",
+    "BROKEN_VALIDATION": "A constraint the form declares is no longer enforced on the server. Caught only by a test that submits the invalid case, which is the half of testing most suites do not have.",
+    "SERVER_ERROR": "A path that answered 404 or 200 now throws. The easiest class to catch and therefore the floor: a suite that misses these is not reaching the path at all.",
+    "A11Y": "An accessible name or a label association disappears. Caught only by a test type most suites do not run, which is why this class and the per-TYPE coverage breakdown are read together.",
+    "OFF_BY_ONE": "A boundary moves by one. The demo has no pagination, so these are the free-shipping threshold and the stock clamp — the same defect shape as an off-by-one page size, on the boundaries this application actually has.",
+    "SILENT_FAILURE": "The user-visible flow succeeds and a side effect does not happen. Nothing errors, nothing is red, and the only witness is an assertion about the side effect itself.",
+    "SECURITY": "A guard against an attacker-controlled input is removed. The response is a 303 either way, so a status-code assertion cannot see it.",
+    "FLAKY_RACE": "Intermittent. The point of the class is that a single run cannot settle it, so the bench reports the repetition count and the share of repetitions that went red — never one boolean."
+  },
+  "faults": [
+    {
+      "id": "FAULT-TOTAL-TAX-FLOOR",
+      "class": "WRONG_TOTAL",
+      "title": "Tax truncates instead of rounding",
+      "breaks": "Every order total is up to one cent low. Subtotal, shipping and the per-line prices stay correct and the tax line itself is off by at most a cent — small enough that a human reviewing the page will not see it, and large enough that a test comparing total against subtotal + shipping + tax will.",
+      "surfaceItemKey": "ROUTE:/checkout",
+      "alsoAffects": ["ROUTE:/cart", "ENDPOINT:POST /checkout", "NOTIFICATION:order-receipt"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/store.ts",
+          "find": "  return Math.round(subtotal * TAX_RATE);",
+          "replace": "  return Math.floor(subtotal * TAX_RATE);"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-TOTAL-DROPS-SHIPPING",
+      "class": "WRONG_TOTAL",
+      "title": "The order total omits shipping",
+      "breaks": "The totals block still prints a shipping line with the right figure and the grand total no longer includes it. Two numbers on one page that disagree — the same shape as the planted bug, on a different addend, so this class has two members and its rate is not an n of one.",
+      "surfaceItemKey": "ROUTE:/cart",
+      "alsoAffects": ["ROUTE:/checkout", "ENDPOINT:POST /checkout", "NOTIFICATION:order-receipt"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/store.ts",
+          "find": "  const correctTotal = subtotal + shipping + tax;",
+          "replace": "  const correctTotal = subtotal + tax;"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-VALIDATION-CARD-OPTIONAL",
+      "class": "BROKEN_VALIDATION",
+      "title": "Checkout no longer requires a card number",
+      "breaks": "POST /checkout accepts an order with no card number and redirects to the confirmation page. The markup still says `required`, so a browser blocks it and curl does not — which is why a server-side negative test is the only thing that can see this.",
+      "surfaceItemKey": "FORM:POST /checkout#place-order",
+      "alsoAffects": ["ENDPOINT:POST /checkout"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  const required = ['email', 'fullName', 'address', 'city', 'postalCode', 'cardNumber'];",
+          "replace": "  const required = ['email', 'fullName', 'address', 'city', 'postalCode'];"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-500-PRODUCT-NOT-FOUND",
+      "class": "SERVER_ERROR",
+      "title": "An unknown product id throws instead of 404ing",
+      "breaks": "GET /products/does-not-exist reads a property off undefined and answers 500 with Express's default error page. The 404 branch is gone.",
+      "surfaceItemKey": "ROUTE:/products/:param",
+      "alsoAffects": ["ENDPOINT:GET /products/:param"],
+      "declaredState": "unknown-id",
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  const product = findProduct(req.params.id);\n  if (!product) {",
+          "replace": "  const product = findProduct(req.params.id);\n  if (false as boolean) {"
+        }
+      ],
+      "editNote": "`if (false as boolean)` rather than deleting the block, because a fault must change BEHAVIOUR and not shape: deleting it would also delete the lines, and a diff that moves everything below it is a diff nobody can review. The cast is what stops TypeScript narrowing the branch away and reporting the body as unreachable."
+    },
+    {
+      "id": "FAULT-A11Y-CHECKOUT-EMAIL-LABEL",
+      "class": "A11Y",
+      "title": "The checkout email field loses its label association",
+      "breaks": "The input keeps its id, its type and its `required`, and has no accessible name. axe reports a label violation; every functional test still passes, because `fill('#email')` does not care whether the field is labelled.",
+      "surfaceItemKey": "FORM:POST /checkout#place-order",
+      "alsoAffects": ["ROUTE:/checkout"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/views.ts",
+          "find": "  <label for=\"email\">Email address</label>\n  <input id=\"email\" name=\"email\" type=\"email\" value=\"${esc(email)}\" required autocomplete=\"email\">",
+          "replace": "  <span>Email address</span>\n  <input id=\"email\" name=\"email\" type=\"email\" value=\"${esc(email)}\" required autocomplete=\"email\">"
+        }
+      ],
+      "editNote": "A `<span>` and not a deletion. Deleting the text would also remove the visible prompt, and a screenshot diff would then catch this for the wrong reason — the fault would be reported DETECTED by a test that noticed the layout, not the accessibility. As written the field still reads as labelled to a human and is unlabelled to an API, which is the defect accessibility testing exists to find."
+    },
+    {
+      "id": "FAULT-OFFBYONE-FREE-SHIPPING",
+      "class": "OFF_BY_ONE",
+      "title": "Free shipping needs one cent more than the threshold",
+      "breaks": "A subtotal of exactly $150.00 is charged $7.00 shipping and $150.01 is not. The home page advertises \"over $150\" and the code said at-or-above, so only a test sitting exactly ON the boundary can tell the difference.",
+      "surfaceItemKey": "ROUTE:/cart",
+      "alsoAffects": ["ROUTE:/checkout", "ENDPOINT:POST /checkout"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/store.ts",
+          "find": "  return subtotal >= FREE_SHIPPING_THRESHOLD_CENTS || subtotal === 0 ? 0 : SHIPPING_CENTS;",
+          "replace": "  return subtotal > FREE_SHIPPING_THRESHOLD_CENTS || subtotal === 0 ? 0 : SHIPPING_CENTS;"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-OFFBYONE-QUANTITY-CLAMP",
+      "class": "OFF_BY_ONE",
+      "title": "The cart accepts one more than the stock",
+      "breaks": "Adding 99 of the grinder (stock 5) lands 6 in the cart instead of 5. The order goes through and the inventory table on /admin still says 5.",
+      "surfaceItemKey": "FORM:POST /cart/add#product-detail",
+      "alsoAffects": ["ENDPOINT:POST /cart/add", "ROUTE:/cart"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  else lines.push({ productId, quantity: Math.min(product.stock, quantity) });",
+          "replace": "  else lines.push({ productId, quantity: Math.min(product.stock + 1, quantity) });"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-SILENT-NO-RECEIPT",
+      "class": "SILENT_FAILURE",
+      "title": "The order receipt is never sent",
+      "breaks": "The order is created, the confirmation page says a receipt is on its way to the customer, and no mail is sent. No error, no log line, no red test — unless something asserts on the mailbox. This is the class of defect that reaches production and is found by a customer.",
+      "surfaceItemKey": "NOTIFICATION:order-receipt",
+      "alsoAffects": ["ENDPOINT:POST /checkout", "ENDPOINT:GET /__mail"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  mailbox.add({\n    to: email,\n    from: 'orders@groundcoffee.example',",
+          "replace": "  if (false as boolean) mailbox.add({\n    to: email,\n    from: 'orders@groundcoffee.example',"
+        }
+      ],
+      "editNote": "The same `if (false as boolean)` guard as FAULT-500, and for an additional reason here: every identifier inside the call — `email`, `order`, `formatMoney` — stays referenced, so the patched file has no unused-variable error and the fault is a behaviour change and nothing else. Commenting the block out instead would have removed four live references and turned one seeded defect into a compile error."
+    },
+    {
+      "id": "FAULT-SECURITY-OPEN-REDIRECT",
+      "class": "SECURITY",
+      "title": "The sign-in redirect honours an absolute URL",
+      "breaks": "POST /login with next=https://evil.example sends the freshly authenticated user there. The response is a 303 with or without the fault and the only difference is the Location header, so a test asserting \"signing in lands me somewhere\" passes and one asserting WHERE does not.",
+      "surfaceItemKey": "FORM:POST /login#password",
+      "alsoAffects": ["ENDPOINT:POST /login", "AUTH_SURFACE:LOGIN@/login"],
+      "deterministic": true,
+      "repetitions": 1,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  res.redirect(303, next.startsWith('/') && !next.startsWith('//') ? next : '/account');",
+          "replace": "  res.redirect(303, next.length > 0 ? next : '/account');"
+        }
+      ]
+    },
+    {
+      "id": "FAULT-FLAKY-SESSION-REMINT",
+      "class": "FLAKY_RACE",
+      "title": "Roughly a quarter of sessions are re-minted on every request",
+      "breaks": "A session whose uuid starts with 0-3 gets a brand new id on every request, so its cart empties between pages. Consistent for an unlucky session and intermittent across runs, which is what a session flake actually looks like from a test's point of view.",
+      "surfaceItemKey": "ENDPOINT:POST /cart/add",
+      "alsoAffects": ["ROUTE:/cart", "ROUTE:/checkout", "ROUTE:/account"],
+      "deterministic": false,
+      "nondeterminismNote": "NOT REPRODUCIBLE FROM THE BENCH SEED, said out loud rather than implied. The draw is `randomUUID()` inside the demo app, which the bench does not control and will not reach into: a fault that needed the application rewired to be measurable would stop being the defect it is modelling. So the bench runs it `repetitions` times, reports the share of repetitions that went red, and carries a caveat naming this fault as the reason the run is not bit-reproducible from its seed.",
+      "repetitions": 5,
+      "edits": [
+        {
+          "file": "src/index.ts",
+          "find": "  let sid = cookies[SESSION_COOKIE];\n  if (!sid) {",
+          "replace": "  let sid = cookies[SESSION_COOKIE];\n  if (!sid || /^[0-3]/.test(sid)) {"
+        }
+      ]
+    }
+  ]
+}

@@ -177,3 +177,47 @@ export * from './access-matrix.js';
  * only, both already in this barrel's graph, so it adds no cycle.
  */
 export * from './mobile-crawler.js';
+
+/*
+ * ── THE DIMENSION MODULES ───────────────────────────────────────────────────
+ *
+ * Five modules, measuring nine of the keystone's thirteen axes between them.
+ * Every one was flagged `package-exports` by `check:wiring` the moment it
+ * landed — built, tested, and reachable from nothing but its own test file,
+ * which is this codebase's signature defect. These lines are what make them
+ * reachable, and `coverage.ts`'s dimension registry is what makes them REACHED:
+ * the registry imports all five, so the modules are on a real call path as well
+ * as on this barrel.
+ *
+ * `coverage-rollup.ts` was never flagged, because `coverage-async.ts` already
+ * imports `dominantRollupReason` from it. It is listed anyway: the rollup ROWS
+ * are what apps/api writes to `CoverageRollup` and what the digest and the PR
+ * comment read, and a shape half of whose consumers cannot import it is how one
+ * screen comes to disagree with another about the same percentage.
+ *
+ * ── THE NAME COLLISIONS, CHECKED RATHER THAN CLAIMED ────────────────────────
+ *
+ * Two were resolved by their authors before landing and are recorded here so
+ * the next person does not re-introduce them:
+ *
+ *   · `UnmeasuredBreakdown` — coverage-fields.ts owns the name
+ *     (`Record<DimensionUnmeasuredReason, number>`); coverage-states.ts renamed
+ *     its own differently-shaped one to `StateUnmeasuredBreakdown`. Two of
+ *     those under one name in a star export is TS2308 on this file and breaks
+ *     the barrel for every consumer.
+ *   · `dominantUnmeasuredReason` (coverage-matrix.ts) and
+ *     `dominantRollupReason` (coverage-rollup.ts) are the same plurality rule
+ *     and the same tie-break implemented twice. They do not collide, so the
+ *     barrel compiles; ONE of them should survive, and the consolidation is in
+ *     this round's handover rather than done by reaching into two files at once.
+ *
+ * Order follows the import graph so no line adds a cycle this barrel did not
+ * already have: `coverage-rollup.ts` first (imported by coverage-async.ts),
+ * then the four that import `coverage.js`, `surface-inventory.js` and
+ * `access-matrix.js`, all of which are above.
+ */
+export * from './coverage-rollup.js';
+export * from './coverage-states.js';
+export * from './coverage-fields.js';
+export * from './coverage-matrix.js';
+export * from './coverage-async.js';

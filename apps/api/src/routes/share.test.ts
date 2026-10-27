@@ -477,7 +477,7 @@ function seed(): void {
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
-const { shareRouter } = await import('./share.js');
+const { shareRouter, publicCoverageReport } = await import('./share.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 const { hashToken } = await import('../lib/crypto.js');
 
@@ -911,5 +911,188 @@ describe('the public screenshot endpoint', () => {
     const { token } = await mint();
     expect((await call(`/share/${token}/screenshot/step_nope`)).status).toBe(404);
     expect(h.fetched).toEqual([]);
+  });
+});
+
+// ─── The public coverage report ──────────────────────────────────────────────
+
+/**
+ * The redaction, which is the risky half of publishing a coverage number.
+ *
+ * `publicCoverageReport` is pure, so every case below is a literal and there is
+ * no database, no clock and no HTTP in any of them. What is being tested is not
+ * the arithmetic — that is `coverage-dimensions`' job — but the five things a
+ * public document may not contain, and each of them has a test that fails if
+ * the field comes back.
+ */
+describe('the public coverage report', () => {
+  const attestation = {
+    projectId: 'proj_1',
+    snapshotId: 'snap_1',
+    issuedAtIso: '2026-10-26T09:00:00.000Z',
+    issuedByUserId: 'user_1',
+    crawlVersion: 'enumerate.4',
+    crawlFingerprint: 'crawl_abc123',
+    denominatorDefinition: '412 CoverageItem(s) across 4 axis/axes (ROUTE, ENDPOINT, FORM, AUTH_SURFACE)',
+    percent: 61.4,
+    denominator: 412,
+    covered: 253,
+    scopeStatement: 'This document states what QAAI measured about one application at one moment.',
+    unmeasured: [],
+    caps: [],
+    fingerprint: 'fp_deadbeef',
+  };
+
+  const measured = {
+    dimension: 'FORM_FIELD',
+    cells: 12,
+    measured: 10,
+    unmeasured: 2,
+    unmeasuredReason: 'NOT_ENUMERATED',
+    unmeasuredDetail: 'two forms were never enumerated',
+    tiers: { denominator: 10, tiers: [{ tier: 'ASSERTED', percent: 40 }] },
+  };
+  const unmeasured = {
+    dimension: 'ROLE_CELL',
+    cells: 198,
+    measured: 0,
+    unmeasured: 198,
+    unmeasuredReason: 'NO_EXTRACTOR',
+    unmeasuredDetail: 'the cells are enumerated and nothing matches a test to one of them',
+    tiers: { denominator: 0, tiers: [{ tier: 'ASSERTED', percent: null }] },
+  };
+
+  const build = (over: Partial<Parameters<typeof publicCoverageReport>[0]> = {}) =>
+    publicCoverageReport({
+      attestation,
+      scopeLines: [attestation.scopeStatement],
+      dimensions: [measured, unmeasured],
+      rule: 'Each dimension divides by ITS OWN cells.',
+      tier: 'ASSERTED',
+      caveatCount: 3,
+      ...over,
+    });
+
+  it('publishes the figure, the scope statement and the claim fingerprint', () => {
+    const report = build();
+    expect(report.percent).toBe(61.4);
+    expect(report.covered).toBe(253);
+    expect(report.denominator).toBe(412);
+    // The rung, so the number has units. A percentage with no rung is a
+    // percentage two readers will interpret two ways.
+    expect(report.tier).toBe('ASSERTED');
+    expect(report.fingerprint).toBe('fp_deadbeef');
+    expect(report.scopeLines).toContain(attestation.scopeStatement);
+  });
+
+  it('never publishes the crawl fingerprint, only whether one was recorded', () => {
+    /*
+     * The fingerprint's only public job is comparability, and `comparable`
+     * already answers that. The VALUE is an identifier of the customer's
+     * internal inventory, and a public document that carries it lets anybody
+     * holding the URL tell whether two applications are the same one.
+     */
+    const report = build();
+    expect(report.crawlFingerprintRecorded).toBe(true);
+    expect(JSON.stringify(report)).not.toContain('crawl_abc123');
+  });
+
+  it('never publishes the denominator definition, which names the declarers and axes', () => {
+    // The authenticated version of that sentence names which declarers ran and
+    // which axes are in scope. It is rebuilt from counts for a public reader
+    // rather than copied.
+    expect(JSON.stringify(build())).not.toContain('CoverageItem(s) across');
+  });
+
+  it('never publishes the project id, the snapshot id or the issuer', () => {
+    /*
+     * A project id addresses the project through the authenticated API, and the
+     * issuer is a named employee of the customer. Neither is needed to read the
+     * document and both are credentials in a trench coat.
+     */
+    const body = JSON.stringify(build());
+    expect(body).not.toContain('proj_1');
+    expect(body).not.toContain('snap_1');
+    expect(body).not.toContain('user_1');
+  });
+
+  it('reports an unmeasured axis as NULL, not as 0%', () => {
+    const report = build();
+    const roleCell = report.dimensions.find((entry) => entry.dimension === 'ROLE_CELL');
+    // The single most expensive wrong answer available in this payload: a
+    // buyer forwards this document, and 0% there is our silence published as
+    // the customer's failure.
+    expect(roleCell?.percent).toBeNull();
+    expect(roleCell?.measured).toBe(0);
+    // And the denominator is still stated, because "0 of 198 measured" is far
+    // more useful than "not measured" and is still not a percentage.
+    expect(roleCell?.cells).toBe(198);
+    expect(roleCell?.unmeasuredReason).toBe('NO_EXTRACTOR');
+  });
+
+  it('reads each figure off its own ladder and never sums two denominators', () => {
+    const report = build();
+    const formField = report.dimensions.find((entry) => entry.dimension === 'FORM_FIELD');
+    // 4 of 10, from FORM_FIELD's own ladder. Not 4 of 208, which is what
+    // adding ROLE_CELL's cells to the denominator would produce.
+    expect(formField?.percent).toBe(40);
+    expect(formField?.measured).toBe(10);
+    expect(report.rule).toContain('ITS OWN cells');
+    // There is deliberately no combined figure anywhere on the payload.
+    for (const forbidden of ['total', 'overall', 'score', 'combined']) {
+      expect(Object.keys(report), forbidden).not.toContain(forbidden);
+    }
+  });
+
+  it('counts the internal notes it held back rather than publishing them', () => {
+    /*
+     * Our caveat sentences quote cap names and row counts, and one of them
+     * quotes a database error message. Free text written by our own code about
+     * our own failures is not something a rule can reliably redact, so the
+     * COUNT is published and the text is not — and withholding it silently
+     * would be its own bug.
+     */
+    const report = build({ caveatCount: 3 });
+    const note = report.withheld.find((entry) => entry.what.includes('internal note'));
+    expect(note?.what).toContain('3 internal note(s)');
+  });
+
+  it('says nothing about internal notes when there were none', () => {
+    const report = build({ caveatCount: 0 });
+    expect(report.withheld.some((entry) => entry.what.includes('internal note'))).toBe(false);
+    // The other three disclosures are unconditional: they are about what this
+    // document structurally never contains, not about this particular one.
+    expect(report.withheld).toHaveLength(3);
+  });
+
+  it('always discloses that the item list is withheld, and why', () => {
+    // The disclosure is unconditional because the withholding is. A reader who
+    // wonders what the 412 are must be told we are not saying, rather than left
+    // to assume the document is complete.
+    const report = build();
+    const items = report.withheld[0];
+    expect(items?.what).toContain('route, endpoint, form and component');
+    expect(items?.detail).toContain('sitemap');
+  });
+
+  it('reports UNPROVABLE comparability when no crawl fingerprint was recorded', () => {
+    /*
+     * "We cannot establish comparability" is weaker than "they differ" and is
+     * reported as its own state. A document that claimed a clean comparison
+     * across an unknown boundary would produce a confident delta over two
+     * measurements of possibly different applications.
+     */
+    const report = build({ attestation: { ...attestation, crawlFingerprint: null } });
+    expect(report.crawlFingerprintRecorded).toBe(false);
+    expect(report.comparable.ok).toBe(false);
+    expect(report.comparable.detail).toContain('cannot be established');
+  });
+
+  it('keeps a NULL headline null, because an empty denominator has no percentage', () => {
+    const report = build({
+      attestation: { ...attestation, percent: null, denominator: 0, covered: 0 },
+    });
+    expect(report.percent).toBeNull();
+    expect(report.denominator).toBe(0);
   });
 });

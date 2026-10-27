@@ -47,7 +47,7 @@ vi.mock('../context.js', () => ({
 
 vi.mock('../vault.js', () => ({ open: (enc: string): string => enc }));
 
-const { collectDigest, renderDigest } = await import('./digest.js');
+const { collectDigest, hasSomethingToSay, renderDigest } = await import('./digest.js');
 import type { Digest, DigestItem } from './digest.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +76,14 @@ const digestOf = (newFailures: DigestItem[]): Digest => ({
   since: SINCE,
   until: UNTIL,
   runs: { total: 1, red: 1 },
+  /*
+   * NULL, which is NOT MEASURED, and that is the honest default for a fixture:
+   * a project with no stored snapshot has no coverage figure. The renderer
+   * prints the words rather than a number for it, which the test below asserts
+   * — a `0` here would have let the one lie this field exists to prevent pass
+   * unnoticed in every other case in this file.
+   */
+  coverage: null,
   newFailures,
   flakes: [],
   fixed: [],
@@ -360,5 +368,166 @@ describe('collectDigest resolves ownership through the shared helpers', () => {
       owner: 'a deleted user',
       ownerState: 'OWNED',
     });
+  });
+});
+
+// ─── The coverage line ───────────────────────────────────────────────────────
+
+/**
+ * The one sentence this company has, in the only message most of a team ever
+ * reads about their test suite.
+ *
+ * Found by MUTATION: replacing the "not measured" branch with `0.0%` left this
+ * whole suite green, which means the lie this field exists to prevent was
+ * enforced by nothing but a comment — in a message that arrives in a chat
+ * channel every morning, where nobody re-reads it after the first time they
+ * have believed it.
+ */
+describe('the coverage line in a digest', () => {
+  const WEB = 'https://app.qaai.dev';
+
+  it('says NOT MEASURED in words, never 0%, when there is no snapshot', () => {
+    const text = renderDigest(digestOf([digestItem()]), WEB);
+
+    expect(text).toContain('Coverage: not measured');
+    expect(text).toContain('this is not 0%');
+    // The assertion that kills the mutant: no figure anywhere on the line.
+    expect(text).not.toMatch(/Coverage: \d/);
+  });
+
+  it('reports the figure and a comparable delta', () => {
+    const text = renderDigest(
+      {
+        ...digestOf([digestItem()]),
+        coverage: {
+          percent: 61.4,
+          denominator: 412,
+          tier: 'ASSERTED',
+          deltaPercent: 6.4,
+          comparability: 'COMPARABLE',
+          comparabilityDetail: null,
+          rollup: null,
+        },
+      },
+      WEB,
+    );
+
+    expect(text).toContain('61.4% of 412 surface item(s) at ASSERTED');
+    expect(text).toContain('(+6.4 points)');
+  });
+
+  it('REFUSES a delta across two crawl fingerprints and says why instead', () => {
+    /*
+     * The number is right there in the field. Subtracting two percentages
+     * always succeeds, which is exactly why this has to be a refusal: the two
+     * snapshots measured different applications, and "coverage fell 9 points"
+     * in a morning digest is a regression a whole team will spend the morning
+     * looking for.
+     */
+    const text = renderDigest(
+      {
+        ...digestOf([digestItem()]),
+        coverage: {
+          percent: 48,
+          denominator: 100,
+          tier: 'ASSERTED',
+          deltaPercent: -9,
+          comparability: 'UNCOMPARABLE_CRAWL_CHANGED',
+          comparabilityDetail: 'the crawl fingerprint changed between the two',
+          rollup: null,
+        },
+      },
+      WEB,
+    );
+
+    expect(text).toContain('no comparable baseline');
+    expect(text).toContain('crawl fingerprint changed');
+    expect(text).not.toContain('-9.0 points');
+  });
+
+  it('says NOT MEASURED when the denominator was zero, rather than 0%', () => {
+    const text = renderDigest(
+      {
+        ...digestOf([digestItem()]),
+        coverage: {
+          percent: null,
+          denominator: 0,
+          tier: 'ASSERTED',
+          deltaPercent: null,
+          comparability: 'UNCOMPARABLE_NO_BASELINE',
+          comparabilityDetail: null,
+          rollup: null,
+        },
+      },
+      WEB,
+    );
+
+    expect(text).toContain('not measured (the denominator was zero');
+    expect(text).not.toMatch(/Coverage: 0/);
+  });
+
+  it('names the unowned bucket as a FINDING rather than printing a sentinel', () => {
+    // "UNOWNED" in a chat message is jargon. "surface nobody owns" is the
+    // sentence a reader acts on — and an unowned bucket being the LARGEST one
+    // is the single most useful thing this line can say.
+    const text = renderDigest(
+      {
+        ...digestOf([digestItem()]),
+        coverage: {
+          percent: 61.4,
+          denominator: 412,
+          tier: 'ASSERTED',
+          deltaPercent: null,
+          comparability: 'UNCOMPARABLE_NO_BASELINE',
+          comparabilityDetail: null,
+          rollup: { label: 'surface nobody owns', percent: 12.5, denominator: 128 },
+        },
+      },
+      WEB,
+    );
+
+    expect(text).toContain('surface nobody owns: 12.5% of 128');
+  });
+
+  it('renders an unmeasured rollup bucket as words too', () => {
+    const text = renderDigest(
+      {
+        ...digestOf([digestItem()]),
+        coverage: {
+          percent: 61.4,
+          denominator: 412,
+          tier: 'ASSERTED',
+          deltaPercent: null,
+          comparability: 'UNCOMPARABLE_NO_BASELINE',
+          comparabilityDetail: null,
+          rollup: { label: 'the payments feature', percent: null, denominator: 40 },
+        },
+      },
+      WEB,
+    );
+
+    expect(text).toContain('the payments feature: not measured of 40');
+  });
+
+  it('does NOT make a quiet digest speak', () => {
+    /*
+     * Coverage is deliberately absent from `hasSomethingToSay`. A window full
+     * of passing runs must stay quiet, and "your coverage is still 61%" is not
+     * news — it is the same number as yesterday, and a daily message that
+     * always has something in it is a daily message nobody opens.
+     */
+    const quiet = {
+      ...digestOf([]),
+      coverage: {
+        percent: 61.4,
+        denominator: 412,
+        tier: 'ASSERTED',
+        deltaPercent: 6.4,
+        comparability: 'COMPARABLE',
+        comparabilityDetail: null,
+        rollup: null,
+      },
+    };
+    expect(hasSomethingToSay(quiet)).toBe(false);
   });
 });

@@ -1777,3 +1777,147 @@ export interface AuthProfileKindReport {
   }>;
   note: string;
 }
+
+// ─── The coverage dimensions ─────────────────────────────────────────────────
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE PER-DIMENSION BREAKDOWN
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * Every shape here carries a NULL that must never be rendered as a zero, and
+ * the field names say which. Read the comment on `wasMeasured` before rendering
+ * any of this: it is the one field that tells "we measured this axis and 0% of
+ * it is covered" apart from "we do not measure this axis", and those are
+ * opposite claims that differ by a single `??` in a renderer.
+ *
+ * There is deliberately NO combined figure on `CoverageDimensionReport` and
+ * there must not be one: thirteen axes are thirteen denominators, and this
+ * product has already shipped a headline that added four incommensurable
+ * populations into one fraction and made the most numerous of them 80% of the
+ * answer.
+ */
+
+/** One rung of one dimension's ladder. `percent` is NULL on an empty denominator. */
+export interface CoverageTierRung {
+  tier: string;
+  /** Cells at this rung or above. */
+  atOrAbove: number;
+  /** NULL when the denominator is zero. Never 0 and never 100. */
+  percent: number | null;
+}
+
+export interface CoverageLadderView {
+  /** The MEASURED cell count. Not `cells` — see `StoredDimensionView`. */
+  denominator: number;
+  tiers: CoverageTierRung[];
+}
+
+/** A cap that BIT, as a count AND a reason. Rule 10, as a shape. */
+export interface DimensionCapView {
+  cap: string;
+  limit: number;
+  /**
+   * How many more cells existed beyond the cap, when the reader could tell.
+   *
+   * NULL is "more existed and we cannot say how many", which is a weaker and
+   * still useful sentence. `0` would be the claim that nothing was hidden,
+   * which is the opposite of what a bitten cap means — so a renderer must
+   * branch on null rather than printing the number.
+   */
+  atLeastMore: number | null;
+  detail: string;
+}
+
+/** Which module answers for an axis, or why nothing does. */
+export type DimensionProducerView =
+  | { measured: true; module: string; entryPoint: string; measures: string }
+  | { measured: false; reason: string; detail: string; enumeratedBy: string | null };
+
+export interface StoredDimensionView {
+  dimension: string;
+  /** Cells this axis has, as far as anything knows: `measured + unmeasured`. */
+  cells: number;
+  /** Cells an extractor produced a tier for. The ladder's denominator. */
+  measured: number;
+  /** Cells with no measurement. Counted, never dropped, never a gap. */
+  unmeasured: number;
+  unmeasuredReason: string | null;
+  unmeasuredDetail: string | null;
+  tiers: CoverageLadderView;
+  caps: DimensionCapView[];
+  /**
+   * THE FIELD A RENDERER MUST BRANCH ON.
+   *
+   * True when an extractor produced tiers for at least one cell. False means
+   * NOT MEASURED, and a screen that printed `0%` for it would be stating a fact
+   * about the customer's application assembled out of our own silence — which
+   * is worse than printing nothing, because it is actionable and wrong.
+   *
+   * Computed by `dimensionWasMeasured` in packages/shared and served, rather
+   * than derived here from `percent !== null`: a measured axis whose denominator
+   * is zero is ALSO null, and those two are different findings.
+   */
+  wasMeasured: boolean;
+  producer: DimensionProducerView;
+}
+
+export interface CoverageDimensionReport {
+  /** The single honest figure, over ITEMS. NULL when there was nothing to divide. */
+  headline: {
+    percent: number | null;
+    denominator: number;
+    covered: number;
+    tier: string;
+  };
+  /**
+   * The delta WITH its comparability, or null when there is no history.
+   *
+   * `meaningful` is the field to branch on and `deltaPercent` is NULL whenever
+   * it is false. Two snapshots taken against different crawls measured
+   * different applications, so "coverage fell 9 points" across them is an
+   * artefact of our own enumeration — and a screen that printed the number
+   * anyway would show a team a regression nobody caused.
+   */
+  delta: {
+    percent: number | null;
+    previousPercent: number | null;
+    deltaPercent: number | null;
+    comparability: string;
+    comparabilityDetail: string | null;
+    meaningful: boolean;
+  } | null;
+  /** All thirteen axes, each with its own denominator. */
+  dimensions: StoredDimensionView[];
+  /**
+   * Stored cells per axis, or NULL for "this deployment cannot answer".
+   *
+   * An empty record would read as a project whose breakdown is genuinely
+   * empty, which is the opposite of the truth and the worse of the two wrong
+   * answers.
+   */
+  storedCells: Record<string, number> | null;
+  /** The per-feature and per-team buckets, or NULL for "cannot answer". */
+  rollups: {
+    scopes: Array<{
+      scopeKey: string;
+      dimension: string | null;
+      feature: string | null;
+      teamId: string | null;
+      numerator: number;
+      denominator: number;
+      percent: number | null;
+      tier: string;
+      unmeasured: number;
+      unmeasuredReason: string | null;
+      unmeasuredDetail: string | null;
+    }>;
+    truncated: boolean;
+    why: string;
+  } | null;
+  caps: DimensionCapView[];
+  /** The sentence printed where a combined figure would go. Render it. */
+  rule: string;
+  why: string;
+  caveats: string[];
+}

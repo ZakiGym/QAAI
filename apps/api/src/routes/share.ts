@@ -64,6 +64,7 @@ import { storage } from '../lib/storage.js';
 import { logger } from '../lib/logger.js';
 import { env } from '../env.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
+import type { AttestationPayload } from '@qaai/shared';
 
 export const shareRouter: Router = Router();
 
@@ -429,6 +430,212 @@ function buildReport(run: SharedRun, share: { expiresAt: Date | null }) {
     truncatedResults: Math.max(0, run.totalCount - results.length),
     withheld,
     expiresAt: share.expiresAt,
+  };
+}
+
+// ─── The public coverage report ──────────────────────────────────────────────
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * A COVERAGE REPORT AS A PUBLIC DOCUMENT
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * A run share answers "look at this broken test"; this answers "here is what
+ * has been tested", which is the document a buyer, an auditor or a board asks
+ * for and which has never left one authenticated screen.
+ *
+ * ── A SHARE LINK IS A PUBLIC SURFACE, AND THE RISK HERE IS NOT THE FIGURE ──
+ *
+ * The percentage is harmless. What is not harmless is everything a coverage
+ * measurement is MADE of, and this function's whole job is to not publish it:
+ *
+ *   · ITEM KEYS. `CoverageItem.key` is `ROUTE:/admin/users/:id` — the internal
+ *     route table of the application under test, in a list, sorted. Publishing
+ *     it would make this link an ENUMERATION ORACLE for an application whose
+ *     own sitemap may be the only thing standing between an attacker and an
+ *     unauthenticated admin page. They are hashed into the attestation
+ *     fingerprint and discarded, which is exactly why `attest` takes them as a
+ *     separate argument and does not keep them.
+ *   · THE CRAWL FINGERPRINT. Stated as a BOOLEAN here and not as a value: the
+ *     fingerprint's only public job is to say whether two documents are
+ *     comparable, and the comparability verdict already says that. The value
+ *     itself is an identifier of a customer's internal inventory.
+ *   · FILE PATHS, SOURCE LOCATIONS, HOSTS. None of the three is on this
+ *     payload. `denominatorDefinition` is the one field that could carry them
+ *     and it is REBUILT from counts here rather than copied, because the
+ *     authenticated version of that sentence names the declarers and the axes.
+ *   · STACK TRACES AND ERROR TEXT. There is none in a coverage measurement, and
+ *     `caveats` is the field that would smuggle it: our caveat sentences quote
+ *     cap names and counts, and one of them quotes a Prisma error message when
+ *     the provenance write fails. So caveats are NOT published whole — the
+ *     count is, and the scope lines, which are ours and are written for a
+ *     reader.
+ *
+ * ── AND IT MUST NOT BECOME AN ORACLE BEYOND WHAT IT ALREADY STATES ─────────
+ *
+ * The rule, stated so the next person can apply it: a public coverage report
+ * may publish AGGREGATES of the customer's application and NAMES of our own
+ * limits. It may never publish an identifier of a thing inside their
+ * application. A feature name is the one borderline case, and it is published
+ * only in the rollup — because a feature is a thing the customer named for a
+ * human audience, not a thing our crawler discovered.
+ */
+export interface PublicCoverageReport {
+  /** The headline. NULL when there was nothing to divide. Never 0, never 100. */
+  percent: number | null;
+  denominator: number;
+  covered: number;
+  /** The rung the figure is taken at, so the number has units. */
+  tier: string;
+  issuedAtIso: string;
+  /** The enumerator's version. Ours, not theirs — safe, and needed for comparison. */
+  crawlVersion: string;
+  /**
+   * Whether a crawl fingerprint was recorded, NOT the fingerprint.
+   *
+   * Its only public job is comparability, and `comparable` below already
+   * answers that. The value is an identifier of the customer's inventory.
+   */
+  crawlFingerprintRecorded: boolean;
+  /** The identity of this CLAIM. Ours, a hash, and the point of the document. */
+  fingerprint: string;
+  /** The mandatory scope statement plus one line per limitation. Rendered verbatim. */
+  scopeLines: string[];
+  /**
+   * Per-axis readings, with no cell lists and no item keys.
+   *
+   * `percent` is NULL for an unmeasured axis and `measured` is the count it was
+   * taken over. A renderer must branch on `measured === 0`, never print a zero.
+   */
+  dimensions: Array<{
+    dimension: string;
+    percent: number | null;
+    cells: number;
+    measured: number;
+    unmeasured: number;
+    unmeasuredReason: string | null;
+    unmeasuredDetail: string | null;
+  }>;
+  /** The sentence printed where a combined figure would go. */
+  rule: string;
+  /** Whether this document may be compared to another, and why not when it may not. */
+  comparable: { ok: boolean; detail: string };
+  /**
+   * What was withheld, and WHY, as sentences a viewer can act on by asking a
+   * colleague with a login.
+   *
+   * Withholding silently would be its own bug: a report that hides half of
+   * what it is made of and does not say so sends the reader looking for a
+   * cause that is sitting in the part they cannot see.
+   */
+  withheld: WithheldNote[];
+}
+
+/**
+ * Build the public document from an attestation and its breakdown.
+ *
+ * PURE, and that is deliberate: the redaction is the risky half of this
+ * feature, so it is a function over two records with no database and no clock
+ * in it, testable against a literal. The route below is the thin adapter.
+ */
+export function publicCoverageReport(input: {
+  attestation: AttestationPayload;
+  scopeLines: readonly string[];
+  dimensions: ReadonlyArray<{
+    dimension: string;
+    cells: number;
+    measured: number;
+    unmeasured: number;
+    unmeasuredReason: string | null;
+    unmeasuredDetail: string | null;
+    tiers: { denominator: number; tiers: ReadonlyArray<{ tier: string; percent: number | null }> };
+  }>;
+  rule: string;
+  tier: string;
+  /** How many internal caveat sentences were held back. A count, never the text. */
+  caveatCount: number;
+}): PublicCoverageReport {
+  const withheld: WithheldNote[] = [
+    {
+      what: 'Every route, endpoint, form and component this measurement counted',
+      detail:
+        'The percentage is over a named list of surface items, and the list is not published here: ' +
+        'it is the internal route table of the application, and a public document containing it ' +
+        'would be a sitemap for anybody holding this URL. The items are hashed into the ' +
+        'fingerprint above, so the set is checkable without being readable.',
+    },
+    {
+      what: 'Source file paths, hostnames and the environment this was measured against',
+      detail:
+        'A coverage item carries the file and line a detector read it from, and the measurement ' +
+        'is taken against one environment with its own base URL. None of that is in this ' +
+        'document. On a preview deployment the hostname IS the access control.',
+    },
+  ];
+  if (input.caveatCount > 0) {
+    withheld.push({
+      what: `${input.caveatCount} internal note(s) about how this figure was computed`,
+      detail:
+        'The scope section above carries every limitation that affects what this number MEANS. ' +
+        'The remaining notes are operational — cap names, row counts, and in one case a database ' +
+        'error message — and free text written by our own code about our own failures is not ' +
+        'something a rule can reliably redact, so none of it is published.',
+    });
+  }
+  withheld.push({
+    what: 'The workspace around this measurement',
+    detail:
+      'This link resolves one coverage report. The project, its runs, its tests, its environments ' +
+      'and everything else in the workspace are not reachable from it.',
+  });
+
+  return {
+    percent: input.attestation.percent,
+    denominator: input.attestation.denominator,
+    covered: input.attestation.covered,
+    tier: input.tier,
+    issuedAtIso: input.attestation.issuedAtIso,
+    crawlVersion: input.attestation.crawlVersion,
+    crawlFingerprintRecorded: input.attestation.crawlFingerprint !== null,
+    fingerprint: input.attestation.fingerprint,
+    scopeLines: [...input.scopeLines],
+    dimensions: input.dimensions.map((dimension) => ({
+      dimension: dimension.dimension,
+      /*
+       * Read off THIS dimension's own ladder at the one named rung, and NULL
+       * when nothing was measured — the same arithmetic the authenticated
+       * screen uses, so the public document and the screen cannot disagree
+       * about an axis. A `?? 0` anywhere on this line would publish our silence
+       * as the customer's zero, in a document they forward to a buyer.
+       */
+      percent:
+        dimension.measured === 0
+          ? null
+          : (dimension.tiers.tiers.find((rung) => rung.tier === input.tier)?.percent ?? null),
+      cells: dimension.cells,
+      measured: dimension.measured,
+      unmeasured: dimension.unmeasured,
+      unmeasuredReason: dimension.unmeasuredReason,
+      unmeasuredDetail: dimension.unmeasuredDetail,
+    })),
+    rule: input.rule,
+    comparable:
+      input.attestation.crawlFingerprint === null
+        ? {
+            ok: false,
+            detail:
+              'No crawl fingerprint was recorded for this measurement, so whether it can be ' +
+              'compared with another report cannot be established. That is weaker than "they ' +
+              'differ" and is reported as its own state rather than as a clean comparison.',
+          }
+        : {
+            ok: true,
+            detail:
+              'A crawl fingerprint was recorded. Two reports from the same enumerator version ' +
+              'whose fingerprints match measured the same application and may be compared; two ' +
+              'whose fingerprints differ may not, however close their percentages are.',
+          },
+    withheld,
   };
 }
 

@@ -1287,10 +1287,29 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
 
       // Visual tests compare against an approved baseline. Resolved here so the
       // runner never needs database access.
+      /*
+       * SCOPED TO THIS RUN'S ENVIRONMENT, and that clause is the whole reason
+       * `VisualBaseline.environmentId` exists.
+       *
+       * This read was `{ orgId, testId }` with `orderBy: updatedAt desc`, which
+       * is "whichever baseline for this test was approved most recently,
+       * wherever it was captured". With one image per (test, viewport,
+       * browser) that was merely imprecise; with the environment in the key it
+       * is the defect the column was added to remove, running in the opposite
+       * direction — a staging capture approved this morning would be diffed
+       * against production this afternoon, and every red it produced would be
+       * permanently false.
+       *
+       * A test with no baseline for THIS environment resolves to null, which
+       * the visual plugin already treats as "first run: capture and approve".
+       * That is the safe failure and it is the one the migration discloses: one
+       * re-approval per test per environment, rather than a diff against a
+       * reference whose environment nobody recorded.
+       */
       const baselineRow =
         test.type === 'VISUAL'
           ? await prisma.visualBaseline.findFirst({
-              where: { orgId, testId: test.id },
+              where: { orgId, testId: test.id, environmentId: run.environment.id },
               orderBy: { updatedAt: 'desc' },
               select: { imageKey: true, ignoreRegions: true },
             })
@@ -1482,10 +1501,30 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       if (execution.newBaseline) {
         await prisma.visualBaseline.upsert({
           where: {
-            testId_viewport_browser: {
+            /*
+             * FOUR MEMBERS, AND THE FOURTH IS THE WHOLE POINT.
+             *
+             * This key was `(testId, viewport, browser)`, so staging and
+             * production SHARED a reference image for one test: a staging
+             * capture silently became the production baseline, and every red it
+             * produced afterwards was permanently false. `VisualBaseline` grew
+             * `environmentId` for exactly that, with NO DEFAULT — a defaulted
+             * sentinel is how the shared-reference defect comes back one writer
+             * at a time — so this writer has to name the environment it
+             * captured in, and `run.environment.id` is the only environment it
+             * has an observation FROM.
+             *
+             * The safe failure on deploy is one re-approval per test per
+             * environment: existing rows carry `<unattributed>`, which this key
+             * never matches, so the first run after the migration captures a
+             * fresh baseline rather than diffing against a reference whose
+             * environment nobody recorded.
+             */
+            testId_viewport_browser_environmentId: {
               testId: test.id,
               viewport: execution.newBaseline.viewport,
               browser: execution.newBaseline.browser,
+              environmentId: run.environment.id,
             },
           },
           create: {
@@ -1494,6 +1533,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
             testId: test.id,
             viewport: execution.newBaseline.viewport,
             browser: execution.newBaseline.browser,
+            environmentId: run.environment.id,
             imageKey: execution.newBaseline.imageKey,
           },
           update: { imageKey: execution.newBaseline.imageKey },

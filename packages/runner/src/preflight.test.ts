@@ -26,7 +26,14 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import {
+  checkRequirement,
   checkRunnability,
+  compareVersions,
+  guardProbeHost,
+  parseVersion,
+  satisfiesRange,
+  storageStateVerdict,
+  STORAGE_STATE_MARGIN_MS,
   environmentBlock,
   environmentPreflight,
   fetchProbe,
@@ -39,7 +46,7 @@ import {
   PREFLIGHT_PROBE_ATTEMPTS,
   TYPE_REQUIREMENTS,
 } from './preflight.js';
-import type { RunnabilityProbes, UrlProbeResult } from './preflight.js';
+import type { HostGuardIo, RunnabilityProbes, UrlProbeResult } from './preflight.js';
 import { TEST_TYPES } from '@qaai/shared';
 import type { TestType } from '@qaai/shared';
 
@@ -77,6 +84,24 @@ const everything: RunnabilityProbes = {
 
 const noSleep = async (): Promise<void> => {};
 
+/**
+ * A host guard that allows everything, injected into every probe below.
+ *
+ * It is not optional politeness. `probeBaseUrl` defaults to HOSTED mode, and
+ * HOSTED mode resolves the hostname through `node:dns` before it will connect —
+ * so a test that left this out would do a real DNS lookup for
+ * `staging.example.com`, pass on a machine with a resolver and fail on a train.
+ * Eight tests in this file did exactly that the moment the guard landed, which
+ * is the guard proving it runs before the connection rather than after it.
+ *
+ * The guard's OWN behaviour is tested separately, against a fake classifier and
+ * a fake resolver, under 'refusing a host this worker must not open'.
+ */
+const publicHost: HostGuardIo = {
+  classify: () => ({ kind: 'name' }),
+  resolves: async () => ({ ok: true, reason: '' }),
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The base URL
 // ─────────────────────────────────────────────────────────────────────────────
@@ -92,7 +117,7 @@ describe('probing the base URL', () => {
      */
     for (const status of [200, 302, 401, 404, 500, 503]) {
       const { probe, calls } = recordingProbe([answered(status)]);
-      const check = await probeBaseUrl({ baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
+      const check = await probeBaseUrl({ hostGuard: publicHost, baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
       expect(check.outcome, `HTTP ${status}`).toBe('OK');
       expect(check.blocksTypes).toEqual([]);
       expect(calls).toHaveLength(1);
@@ -101,7 +126,7 @@ describe('probing the base URL', () => {
 
   it('says so in the detail, so nobody re-litigates the 5xx rule from the code', async () => {
     const { probe } = recordingProbe([answered(500)]);
-    const check = await probeBaseUrl({ baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
+    const check = await probeBaseUrl({ hostGuard: publicHost, baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
     expect(check.detail).toMatch(/any status counts/i);
     expect(check.detail).toMatch(/may be the bug under test/i);
   });
@@ -115,6 +140,7 @@ describe('probing the base URL', () => {
      */
     const { probe } = recordingProbe([refused]);
     const check = await probeBaseUrl({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E', 'CLI', 'DATABASE', 'API', 'MUTATION', 'PROTOCOL'],
       probe,
@@ -130,6 +156,7 @@ describe('probing the base URL', () => {
     const sleeps: number[] = [];
 
     const check = await probeBaseUrl({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probe,
@@ -145,7 +172,7 @@ describe('probing the base URL', () => {
 
   it('gives up only after the documented number of attempts', async () => {
     const { probe, calls } = recordingProbe([refused]);
-    const check = await probeBaseUrl({ baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
+    const check = await probeBaseUrl({ hostGuard: publicHost, baseUrl: BASE, types: ['E2E'], probe, sleep: noSleep });
 
     expect(calls).toHaveLength(PREFLIGHT_PROBE_ATTEMPTS);
     expect(check.outcome).toBe('UNAVAILABLE');
@@ -158,6 +185,7 @@ describe('probing the base URL', () => {
     // request somebody else's server has to answer.
     const { probe, calls } = recordingProbe([answered(200)]);
     const check = await probeBaseUrl({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['CLI', 'DATABASE'],
       probe,
@@ -178,7 +206,7 @@ describe('probing the base URL', () => {
      */
     for (const bad of ['not a url', 'staging.example.com', 'ftp://files.example.com']) {
       const { probe, calls } = recordingProbe([refused]);
-      const check = await probeBaseUrl({ baseUrl: bad, types: ['E2E'], probe, sleep: noSleep });
+      const check = await probeBaseUrl({ hostGuard: publicHost, baseUrl: bad, types: ['E2E'], probe, sleep: noSleep });
       expect(check.outcome, bad).toBe('UNKNOWN');
       expect(check.blocksTypes).toEqual([]);
       expect(calls).toEqual([]);
@@ -190,6 +218,7 @@ describe('probing the base URL', () => {
     // environment — and this function must never be the reason a run fails to
     // start with an exception instead of a verdict.
     const check = await probeBaseUrl({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probe: async () => {
@@ -516,6 +545,7 @@ describe('the environment preflight', () => {
      */
     const signIn = vi.fn(async () => ({ ok: true as const }));
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probes: everything,
@@ -533,6 +563,7 @@ describe('the environment preflight', () => {
 
   it('reports the first thing that is wrong as the run-level reason', async () => {
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probes: everything,
@@ -546,6 +577,7 @@ describe('the environment preflight', () => {
 
   it('says so plainly when there is nothing wrong', async () => {
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probes: everything,
@@ -564,6 +596,7 @@ describe('the environment preflight', () => {
      * tooling answer is the one a reader can act on first.
      */
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['LOAD'],
       probes: { ...everything, onPath: () => false },
@@ -579,6 +612,7 @@ describe('the environment preflight', () => {
 
   it('carries a repository gap the caller already established', async () => {
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['UNIT_GEN'],
       probes: everything,
@@ -601,6 +635,7 @@ describe('the environment preflight', () => {
 describe('deciding whether a run could be attempted at all', () => {
   const blockedPreflight = async (types: readonly TestType[]) =>
     environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types,
       probes: everything,
@@ -635,6 +670,7 @@ describe('deciding whether a run could be attempted at all', () => {
 
   it('blocks nothing when every check passed', async () => {
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: BASE,
       types: ['E2E'],
       probes: everything,
@@ -650,6 +686,7 @@ describe('deciding whether a run could be attempted at all', () => {
     // Honesty rule: UNKNOWN is never rounded to UNAVAILABLE. A browser whose
     // install state is undeterminable must not refuse the test.
     const pre = await environmentPreflight({
+      hostGuard: publicHost,
       baseUrl: 'not a url',
       types: ['E2E'],
       probes: { ...everything, browserInstalled: () => null },
@@ -723,5 +760,464 @@ describe('the rule that an unanswered check blocks nothing', () => {
       kind: 'BLOCKED_BY_ENV',
     });
     expect(unattemptable(pre, [{ id: 't1', type: 'E2E' }])).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Versions: the difference between "not installed" and "installed and too old".
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('reading a tool version', () => {
+  it('reads the version out of whatever the tool decided to print', () => {
+    // Four real shapes. No tool agrees with any other tool about this.
+    expect(parseVersion('k6 v0.49.0')).toEqual([0, 49, 0]);
+    expect(parseVersion('grpcurl 1.9.1')).toEqual([1, 9, 1]);
+    expect(parseVersion('11.7.1\n')).toEqual([11, 7, 1]);
+    expect(parseVersion('Chromium 121.0.6167.85')).toEqual([121, 0, 6167, 85]);
+  });
+
+  it('answers null — never a zero version — for output it cannot parse', () => {
+    /*
+     * The whole point. `[0]` would compare as older than everything and turn a
+     * tool whose `--version` we failed to read into a confident WRONG_VERSION
+     * against a binary that may be perfectly current.
+     */
+    expect(parseVersion('command not found')).toBeNull();
+    expect(parseVersion('')).toBeNull();
+  });
+
+  it('treats a short version as the same version, not a smaller one', () => {
+    expect(compareVersions([1, 2], [1, 2, 0])).toBe(0);
+    expect(compareVersions([1, 2], [1, 2, 1])).toBe(-1);
+    // Component-wise, not string-wise: 10 is above 9 and "10" sorts below "9".
+    expect(compareVersions([0, 10, 0], [0, 9, 9])).toBe(1);
+  });
+
+  it('refuses a version below the floor and accepts one on it', () => {
+    const range = { atLeast: '0.40.0', below: null, why: 'needs --summary-export' };
+    expect(satisfiesRange('k6 v0.39.9', range)).toBe(false);
+    expect(satisfiesRange('k6 v0.40.0', range)).toBe(true);
+    // No ceiling established means no ceiling applied.
+    expect(satisfiesRange('k6 v9.0.0', range)).toBe(true);
+  });
+
+  it('applies a ceiling only when one has been established', () => {
+    const range = { atLeast: '1.0.0', below: '2.0.0', why: 'the flag went away in 2.x' };
+    expect(satisfiesRange('1.9.9', range)).toBe(true);
+    expect(satisfiesRange('2.0.0', range)).toBe(false);
+  });
+
+  it('answers null for a version it could not parse, rather than refusing it', () => {
+    const range = { atLeast: '1.0.0', below: null, why: 'whatever' };
+    expect(satisfiesRange('not a version', range)).toBeNull();
+  });
+});
+
+describe('a requirement with a declared version window', () => {
+  const ranged: RunnabilityProbes = { ...everything, onPath: () => true };
+
+  /*
+   * TYPE_REQUIREMENTS declares no version ranges on purpose (see its header), so
+   * these tests build their own requirement. That is deliberate: the mechanism
+   * is proven here, and nothing in the shipped table can fire it until somebody
+   * establishes a real floor.
+   */
+  const withRange = (over: Partial<RunnabilityProbes> = {}) =>
+    checkRequirement(
+      {
+        kind: 'BINARY' as const,
+        scope: 'TYPE' as const,
+        name: 'k6',
+        install: 'brew install k6',
+        version: { atLeast: '0.40.0', below: null, why: 'plugins/load.ts passes --summary-export' },
+      },
+      { ...ranged, ...over },
+    );
+
+  it('separates "too old" from "not installed", because the remedies differ', async () => {
+    const status = await withRange({ binaryVersion: () => 'k6 v0.30.0' });
+    expect(status.satisfied).toBe(false);
+    expect(status.unmet).toBe('VERSION');
+    expect(status.observedVersion).toBe('k6 v0.30.0');
+    // The sentence has to send the reader to upgrade, not to install.
+    expect(status.detail).toContain('is installed');
+    expect(status.detail).toContain('Upgrade it rather than installing it');
+  });
+
+  it('calls an absent binary ABSENT and reads no version off it', async () => {
+    const status = await withRange({ onPath: () => false, binaryVersion: () => 'k6 v9.9.9' });
+    expect(status.unmet).toBe('ABSENT');
+    // It is not there, so there is no version to report. Reporting the probe's
+    // answer here would be a reading taken from a binary that is not present.
+    expect(status.observedVersion).toBeNull();
+  });
+
+  it('claims nothing when a window is declared and no version probe exists', async () => {
+    // The default: no `binaryVersion` probe, because reading a version means
+    // executing the binary and this module does not do that.
+    const status = await withRange();
+    expect(status.satisfied).toBeNull();
+    expect(status.unmet).toBeNull();
+    expect(status.observedVersion).toBeNull();
+    expect(status.detail).toContain('could not be read');
+  });
+
+  it('claims nothing when the tool answers with something unparseable', async () => {
+    const status = await withRange({ binaryVersion: () => 'k6: permission denied' });
+    expect(status.satisfied).toBeNull();
+    expect(status.observedVersion).toBeNull();
+  });
+
+  it('says the version was NOT READ when no window is declared', async () => {
+    const status = await checkRequirement(
+      { kind: 'BINARY', scope: 'TYPE', name: 'k6', install: 'brew install k6' },
+      ranged,
+    );
+    expect(status.satisfied).toBe(true);
+    /*
+     * "We did not check" must never read as "any version works". This is the
+     * sentence that keeps those apart.
+     */
+    expect(status.detail).toContain('its version was not read');
+  });
+
+  it('refuses the type on a wrong version, and keeps it out of `missing`', async () => {
+    const [load] = await checkRunnability(['LOAD'], {
+      probes: { ...ranged, binaryVersion: () => 'k6 v0.1.0' },
+      requirements: {
+        LOAD: [
+          {
+            kind: 'BINARY',
+            scope: 'TYPE',
+            name: 'k6',
+            install: 'brew install k6',
+            version: { atLeast: '0.40.0', below: null, why: 'needs --summary-export' },
+          },
+        ],
+      },
+    });
+    expect(load!.runnable).toBe(false);
+    expect(load!.wrongVersion).toHaveLength(1);
+    // Kept apart: a row that said "missing" about an installed binary would
+    // send somebody to install something they already have.
+    expect(load!.missing).toHaveLength(0);
+    expect(load!.reason).toContain('upgrade, not an install');
+  });
+
+  it('reports an absent requirement before an out-of-range one', async () => {
+    const [type] = await checkRunnability(['LOAD'], {
+      probes: {
+        ...ranged,
+        onPath: (binary) => binary !== 'absent-tool',
+        binaryVersion: () => 'v0.1.0',
+      },
+      requirements: {
+        LOAD: [
+          { kind: 'BINARY', scope: 'TYPE', name: 'absent-tool', install: 'install absent-tool' },
+          {
+            kind: 'BINARY',
+            scope: 'TYPE',
+            name: 'old-tool',
+            install: 'upgrade old-tool',
+            version: { atLeast: '5.0.0', below: null, why: 'needs a 5.x flag' },
+          },
+        ],
+      },
+    });
+    // Both are unmet. The install has to be named first — a reader told to
+    // upgrade a tool they have not installed goes looking for a version of it.
+    expect(type!.missing).toHaveLength(1);
+    expect(type!.wrongVersion).toHaveLength(1);
+    expect(type!.reason).toContain('it is missing');
+    expect(type!.reason).not.toContain('upgrade, not an install');
+  });
+
+  it('declares no version window for any shipped type, until somebody establishes one', () => {
+    /*
+     * A TRIPWIRE, not a tautology. No minimum version for k6, Lighthouse or
+     * grpcurl has ever been established in this repository — there is no such
+     * figure in the Dockerfile, in docs/ or in the plugins. A plausible floor
+     * typed into TYPE_REQUIREMENTS would fire on a customer's working binary
+     * and report a number this product invented about a tool it never tested.
+     *
+     * So adding one has to be a deliberate edit that deletes this assertion and
+     * says how the figure was verified, rather than a line in a diff.
+     */
+    const ranged = Object.entries(TYPE_REQUIREMENTS).flatMap(([type, reqs]) =>
+      reqs.filter((r) => r.kind === 'BINARY' && r.version !== undefined).map(() => type),
+    );
+    expect(ranged).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The host guard: this probe opens a host a customer named.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('refusing a host this worker must not open', () => {
+  const refusing = (reason: string): HostGuardIo => ({
+    classify: () => ({ kind: 'name' }),
+    resolves: async () => ({ ok: false, reason }),
+  });
+
+  it('refuses a target that does not resolve publicly, in hosted mode', async () => {
+    const verdict = await guardProbeHost({
+      hostname: 'metadata.internal',
+      mode: 'HOSTED',
+      io: refusing('Refusing metadata.internal: it resolves to 169.254.169.254, which is a link-local address.'),
+    });
+    expect(verdict.allowed).toBe(false);
+    expect(verdict).toMatchObject({ reason: expect.stringContaining('link-local') });
+  });
+
+  it('refuses an ambiguous host without ever handing it to a resolver', async () => {
+    /*
+     * `0177.0.0.1` is 127.0.0.1 to something downstream and a hostname to
+     * something else. Resolving it would give the octal form a second chance at
+     * being interpreted, so the refusal must happen before the lookup.
+     */
+    const resolves = vi.fn(async () => ({ ok: true, reason: '' }));
+    const verdict = await guardProbeHost({
+      hostname: '0177.0.0.1',
+      mode: 'HOSTED',
+      io: { classify: () => ({ kind: 'ambiguous', why: 'that is an IP address in a form QAAI will not guess at' }), resolves },
+    });
+    expect(verdict.allowed).toBe(false);
+    expect(resolves).not.toHaveBeenCalled();
+  });
+
+  it('allows a public host and says the check actually ran', async () => {
+    const verdict = await guardProbeHost({
+      hostname: 'staging.example.com',
+      mode: 'HOSTED',
+      io: publicHost,
+    });
+    expect(verdict).toMatchObject({ allowed: true, skipped: false });
+  });
+
+  it('skips the check for a self-hosted deployment, and SAYS it skipped it', async () => {
+    /*
+     * A self-hosted QAAI exists to test http://localhost:3000. Refusing that
+     * would break the install for everyone behind their own firewall — but a
+     * guard that passes silently in the one mode where it does nothing is
+     * indistinguishable from a guard that ran.
+     */
+    const resolves = vi.fn(async () => ({ ok: true, reason: '' }));
+    const verdict = await guardProbeHost({
+      hostname: 'localhost',
+      mode: 'SELF_HOSTED',
+      io: { classify: () => ({ kind: 'address' }), resolves },
+    });
+    expect(verdict).toMatchObject({ allowed: true, skipped: true });
+    expect(resolves).not.toHaveBeenCalled();
+    expect(verdict).toMatchObject({ detail: expect.stringContaining('was not checked') });
+  });
+
+  it('never connects to a host it refused', async () => {
+    // The assertion that makes this a guard rather than a label: the prober is
+    // never called at all.
+    const { calls, probe } = recordingProbe([answered(200)]);
+    const check = await probeBaseUrl({
+      baseUrl: 'http://169.254.169.254/latest/meta-data/',
+      types: ['E2E'],
+      probe,
+      sleep: noSleep,
+      hostGuard: refusing('Refusing 169.254.169.254: that is a link-local address.'),
+    });
+    expect(calls).toEqual([]);
+    expect(check.outcome).toBe('UNAVAILABLE');
+    expect(check.blocksTypes).toContain('E2E');
+  });
+
+  it('blames QAAI rather than the customer when it is QAAI that refused', async () => {
+    const check = await probeBaseUrl({
+      baseUrl: 'http://10.0.0.5/',
+      types: ['E2E'],
+      probe: async () => answered(200),
+      sleep: noSleep,
+      hostGuard: refusing('Refusing 10.0.0.5: that is a private address.'),
+    });
+    /*
+     * A reader sent to check their VPN over a refusal QAAI made would never
+     * find anything wrong with it. The sentence has to say which side said no.
+     */
+    expect(check.detail).toContain('refusal by QAAI');
+    expect(check.detail).not.toContain('did not answer');
+  });
+
+  it('defaults to refusing rather than probing when no mode is given', async () => {
+    /*
+     * The direction a security default has to fail. A caller that forgets the
+     * mode gets HOSTED, not an open probe at whatever host it was handed.
+     */
+    const resolves = vi.fn(async () => ({ ok: false, reason: 'Refusing it: private.' }));
+    const check = await probeBaseUrl({
+      baseUrl: 'http://192.168.1.1/',
+      types: ['E2E'],
+      probe: async () => answered(200),
+      sleep: noSleep,
+      hostGuard: { classify: () => ({ kind: 'address' }), resolves },
+    });
+    expect(resolves).toHaveBeenCalled();
+    expect(check.outcome).toBe('UNAVAILABLE');
+  });
+
+  it('names the skipped check in the detail of a run that passed', async () => {
+    const check = await probeBaseUrl({
+      baseUrl: 'http://localhost:3000',
+      types: ['E2E'],
+      probe: async () => answered(200),
+      sleep: noSleep,
+      mode: 'SELF_HOSTED',
+      hostGuard: publicHost,
+    });
+    expect(check.outcome).toBe('OK');
+    // A degradation that is APPLIED must also be REPORTED.
+    expect(check.detail).toContain('was not checked against the private-address rules');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The stored session, checked without spending a login on it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('checking a stored session for staleness', () => {
+  const NOW = Date.parse('2026-10-26T12:00:00.000Z');
+  const at = (iso: string): number => Date.parse(iso) / 1000;
+
+  it('proves a session unusable when a cookie has already expired', () => {
+    const verdict = storageStateVerdict({
+      cookies: [{ name: 'session', expires: at('2026-10-22T12:00:00.000Z') }],
+      now: NOW,
+    });
+    expect(verdict.usable).toBe(false);
+    expect(verdict.detail).toContain('session');
+    expect(verdict.detail).toContain('Re-record the session');
+  });
+
+  it('refuses to claim a fresh session WORKS, only that nothing says it is stale', () => {
+    /*
+     * A server can revoke a session whose cookie has months left. The login
+     * probe establishes that it works; this only establishes that it has not
+     * timed out, and the wording may not overstate it.
+     */
+    const verdict = storageStateVerdict({
+      cookies: [{ name: 'session', expires: at('2027-01-01T00:00:00.000Z') }],
+      now: NOW,
+    });
+    expect(verdict.usable).toBe(true);
+    expect(verdict.detail).toContain('Nothing in the stored session says it is stale');
+    expect(verdict.detail).toContain('separate question');
+  });
+
+  it('answers null — not usable, not broken — with no session to inspect', () => {
+    expect(storageStateVerdict({ cookies: null, now: NOW }).usable).toBeNull();
+    expect(storageStateVerdict({ cookies: [], now: NOW }).usable).toBeNull();
+  });
+
+  it('answers null for session cookies, which carry no expiry to read', () => {
+    /*
+     * Playwright writes `-1` for a session cookie. Treating that as an expiry
+     * would make every such state look like it expired in 1969 — the most
+     * destructive available reading, since it would block the run.
+     */
+    const verdict = storageStateVerdict({
+      cookies: [{ name: 'sid', expires: -1 }],
+      now: NOW,
+    });
+    expect(verdict.usable).toBeNull();
+    expect(verdict.detail).toContain('no expiry');
+  });
+
+  it('ignores session cookies when dating the ones that do have expiries', () => {
+    const verdict = storageStateVerdict({
+      cookies: [
+        { name: 'sid', expires: -1 },
+        { name: 'auth', expires: at('2027-01-01T00:00:00.000Z') },
+      ],
+      now: NOW,
+    });
+    expect(verdict.usable).toBe(true);
+    expect(verdict.detail).toContain('2027-01-01');
+  });
+
+  it('calls a session that dies inside the margin stale now, not mid-suite', () => {
+    const verdict = storageStateVerdict({
+      cookies: [{ name: 'auth', expires: (NOW + 10_000) / 1000 }],
+      now: NOW,
+      marginMs: STORAGE_STATE_MARGIN_MS,
+    });
+    // Ten seconds left will not survive a suite. Reporting it as usable means
+    // the run spends its budget discovering that halfway through.
+    expect(verdict.usable).toBe(false);
+  });
+
+  it('names the cookie and the date and cannot name the value', () => {
+    const verdict = storageStateVerdict({
+      cookies: [{ name: 'qaai_session', expires: at('2020-01-01T00:00:00.000Z') }],
+      now: NOW,
+    });
+    /*
+     * `StoredCookie` has no `value` field, so there is nothing for a detail
+     * string to leak — this asserts the consequence of that design. The cookie
+     * NAME is the actionable half and is not a secret.
+     */
+    expect(verdict.detail).toContain('qaai_session');
+    expect(verdict.detail).toContain('2020-01-01');
+    expect(Object.keys({ name: '', expires: 0 })).toEqual(['name', 'expires']);
+  });
+});
+
+describe('spending a login only when it could tell us something', () => {
+  it('does not drive a browser login for a session it can prove is expired', async () => {
+    const signIn = vi.fn(async () => ({ ok: true }) as const);
+    const checks = await probeIdentities({
+      identities: [
+        {
+          profileId: 'p1',
+          label: 'admin',
+          testIds: ['t1', 't2'],
+          cookies: [{ name: 'auth', expires: Date.parse('2020-01-01T00:00:00.000Z') / 1000 }],
+        },
+      ],
+      signIn,
+      now: () => Date.parse('2026-10-26T12:00:00.000Z'),
+    });
+    // Thirty seconds of browser saved, and — the bigger win — the right
+    // diagnosis instead of "could not sign in".
+    expect(signIn).not.toHaveBeenCalled();
+    expect(checks[0]).toMatchObject({ outcome: 'UNAVAILABLE', blocksTestIds: ['t1', 't2'] });
+    expect(checks[0]!.detail).toContain('stale');
+  });
+
+  it('still asks the resolver when freshness establishes nothing', async () => {
+    /*
+     * The control. `usable: null` and `usable: true` must BOTH fall through:
+     * neither establishes that the application still accepts the session, and
+     * short-circuiting on either would turn this cheap check into a pass that
+     * means "we did not look".
+     */
+    const signIn = vi.fn(async () => ({ ok: true }) as const);
+    await probeIdentities({
+      identities: [{ profileId: 'p1', label: 'admin', testIds: ['t1'], cookies: null }],
+      signIn,
+      now: () => Date.parse('2026-10-26T12:00:00.000Z'),
+    });
+    expect(signIn).toHaveBeenCalledTimes(1);
+
+    const fresh = vi.fn(async () => ({ ok: true }) as const);
+    await probeIdentities({
+      identities: [
+        {
+          profileId: 'p1',
+          label: 'admin',
+          testIds: ['t1'],
+          cookies: [{ name: 'auth', expires: Date.parse('2027-01-01T00:00:00.000Z') / 1000 }],
+        },
+      ],
+      signIn: fresh,
+      now: () => Date.parse('2026-10-26T12:00:00.000Z'),
+    });
+    expect(fresh).toHaveBeenCalledTimes(1);
   });
 });

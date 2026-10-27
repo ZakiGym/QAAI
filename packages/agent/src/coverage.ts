@@ -50,10 +50,22 @@
 
 import { createHash } from 'node:crypto';
 import {
+  /*
+   * The dimension vocabulary and the two honest constructors, for the registry
+   * at the foot of this file. `unmeasuredDimension` in particular is imported
+   * rather than hand-rolled because it is the constructor that CANNOT produce a
+   * zero percent: `measured: 0` gives an empty ladder, and `coveragePercent`
+   * returns null for an empty denominator at every rung. A local
+   * `{ ...measurement, percent: 0 }` here would be this product's cardinal lie
+   * in one line.
+   */
+  COVERAGE_DIMENSIONS,
   EXCLUSION_KINDS,
   EXCLUSION_KIND_LABELS,
   FORM_FIELD_SEMANTICS,
   UNEXERCISABLE_REASON_LABELS,
+  dimensionWasMeasured,
+  unmeasuredDimension,
   controlsFromFlowMap,
   /*
    * The ONE division in this repo. Imported rather than reimplemented so the
@@ -66,6 +78,11 @@ import {
   exclusionsByRule,
 } from '@qaai/shared';
 import type {
+  AttestationUnmeasured,
+  CoverageDimensionKind,
+  DimensionCapBite,
+  DimensionMeasurement,
+  DimensionUnmeasuredReason,
   ExclusionKind,
   FormFieldSemantic,
   PlanItem,
@@ -4407,7 +4424,20 @@ function priorityForGap(gap: CoverageGap): Priority {
   return 'NICE_TO_HAVE';
 }
 
-function routeFeatureName(route: string | null): string | null {
+/**
+ * The feature a route belongs to: its first path segment, title-cased.
+ *
+ * EXPORTED, because the coverage ROLLUP has to bucket by the same feature a GAP
+ * is filed under. Two spellings of "payments" is two different 31%, and the
+ * rollup's whole headline finding — "31% of your surface is attributed to no
+ * feature" — is only true if "attributed" means the same thing on both sides.
+ *
+ * Returns null for a route whose first segment is a parameter or a wildcard, so
+ * a catch-all is UNATTRIBUTED rather than a feature called ":param". A
+ * catch-all route literal once produced 100% coverage and survived a whole
+ * round; a catch-all FEATURE would be the same mistake one level down.
+ */
+export function routeFeatureName(route: string | null): string | null {
   if (!route) return null;
   const first = route.split('/').filter(Boolean)[0];
   if (!first || first === ':param' || first === '*') return null;
@@ -4738,4 +4768,476 @@ export function rankGapsForClosure(
   }
 
   return { gaps: chosen, skipped, considered: ordered.length };
+}
+
+// ─── The dimension registry: one report, many denominators ───────────────────
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE DIMENSION REGISTRY
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * `coverageHeadline` above is one figure over four axes, and the section that
+ * introduces it spends forty lines on why those four percentages are a
+ * WEIGHTED MEAN and not a sum — because the sum made CONTROL roughly 80% of the
+ * quoted number, and a code comment naming four labels could move the published
+ * figure from 2% to 11%.
+ *
+ * This round adds nine more axes. Nine more chances to commit that same defect,
+ * and this registry is the structure that makes it impossible rather than
+ * merely discouraged:
+ *
+ *   · {@link CoverageDimensionReport} carries a LIST of `DimensionMeasurement`s
+ *     and has NO total field. There is nowhere to put one.
+ *   · A figure is only ever read by `dimensionPercentAt`, which takes exactly
+ *     ONE measurement. It is structurally incapable of adding two denominators.
+ *   · {@link DIMENSIONS_NEVER_SUMMED} is the sentence printed where a combined
+ *     figure would go, so a reader who looks for one finds the reason instead
+ *     of a number.
+ *
+ * ── THE HEADLINE DOES NOT MOVE ──────────────────────────────────────────────
+ *
+ * The figure the previous round established stays what it was: the surface
+ * snapshot's `percent`, over `CoverageItem`s. The dimensions are a
+ * BREAKDOWN BENEATH it, never contributors to it.
+ *
+ * It is NOT called "the single honest figure" here, which an earlier draft of
+ * this comment did. That snapshot `percent` is `sum(covered) / sum(denominator)`
+ * over the four MEASURED_SURFACE_KINDS — see `summedKindPercent` in
+ * surface-coverage.ts, which documents the same field as the summed-denominator
+ * defect and says in terms "do not put it on a screen, in a badge, or in front
+ * of a customer". That defect is OPEN; fixing it needs a published per-kind
+ * weight table in packages/shared/src/surface.ts. What this round can claim is
+ * narrower and still worth claiming: the nine new axes do not make it worse,
+ * because none of them reaches it. Folding a dimension's cells
+ * into the headline's denominator would let a project with 40 form fields and
+ * 14 routes have its headline decided by its forms — the original defect with
+ * new nouns.
+ *
+ * ── WHAT "MEASURED" MEANS HERE, AND THE TWO THINGS IT IS NOT ────────────────
+ *
+ * An axis is `measured: true` when a module in THIS package can produce a
+ * `DimensionMeasurement` for it — a tier per cell — from facts a crawl, a
+ * source read or a run report supplies. Two neighbouring states are explicitly
+ * NOT that, and keeping them apart is most of this file's value:
+ *
+ *   · AN AXIS SOMEBODY INTENDS TO BUILD. It ships UNMEASURED AND NAMED, through
+ *     `unmeasuredDimension`, which is a constructor that cannot produce a zero
+ *     percent. "0% of your component states are covered" is a lie about the
+ *     customer's application assembled out of our own silence; "we do not
+ *     measure component states" is a true and useful fact about our product.
+ *   · AN AXIS WHOSE CELLS ARE ENUMERABLE AND WHOSE COVERAGE IS NOT. ROLE_CELL
+ *     is exactly this and it is the reason `enumeratedBy` exists: the access
+ *     matrix produces route x role cells, so the DENOMINATOR is known and real,
+ *     and nothing in this build matches a TEST to one of those cells. A crawl
+ *     probe proves the application refuses a role; it does not prove anybody
+ *     asserts that it does. Scoring a probe as coverage would be the forbidden
+ *     lie in its most tempting form — coverage attributed to a test that never
+ *     ran — so the cells are counted, the reason is `NO_EXTRACTOR`, and the
+ *     percentage is null.
+ *
+ * {@link DIMENSION_REGISTRY} is the one place those three states are recorded,
+ * and `measuredDimensionKinds()` is asserted against the keystone's
+ * `EXTRACTED_COVERAGE_DIMENSIONS` by this module's test — so the two cannot
+ * disagree about which axes this build measures, and adding a member to either
+ * one alone is a red test rather than a silent claim.
+ */
+
+/** The sentence printed where a combined dimension figure would otherwise go. */
+export const DIMENSIONS_NEVER_SUMMED =
+  'Each dimension divides by ITS OWN cells and there is deliberately no combined figure. A page ' +
+  'state, a form field, a validation rule, a type obligation and a flag combination are five ' +
+  'different things to test; adding their counts makes the most numerous axis the answer, which ' +
+  'is how this product once shipped a headline where one axis was 80% of the figure. Read each ' +
+  'dimension against its own denominator, or read the surface headline, which is a weighted mean ' +
+  'over ITEMS and is the one figure to quote.';
+
+/** An axis a module in this package produces a `DimensionMeasurement` for. */
+export interface MeasuredDimensionProducer {
+  measured: true;
+  /** The module that answers for this axis, as a path a reader can open. */
+  module: string;
+  /** The exported entry point, so a reader finds the call rather than greps. */
+  entryPoint: string;
+  /** Why this axis is worth its own denominator, in the customer's terms. */
+  measures: string;
+}
+
+/**
+ * An axis nothing in this build measures, with the reason it does not.
+ *
+ * `reason` is the keystone's closed vocabulary rather than a sentence, because
+ * the report GROUPS by it and the grouping is the actionable half: NO_EXTRACTOR
+ * is work for us, NOT_ENUMERATED is a crawl to re-run. `enumeratedBy` is what
+ * separates "we cannot even count these" from "we count them and cannot score
+ * them", and those two have the same shape on a screen and different remedies.
+ */
+export interface UnmeasuredDimensionEntry {
+  measured: false;
+  reason: DimensionUnmeasuredReason;
+  detail: string;
+  /** The module that produces the CELLS, when one does. Null when none does. */
+  enumeratedBy: string | null;
+}
+
+export type DimensionRegistryEntry = MeasuredDimensionProducer | UnmeasuredDimensionEntry;
+
+/**
+ * WHICH MODULE ANSWERS FOR EACH AXIS.
+ *
+ * A `Record` over the whole union rather than a map of the measured ones, which
+ * is the compile-time half of this codebase's two-mechanism guard: a fourteenth
+ * `CoverageDimensionKind` breaks this line until somebody decides who measures
+ * it, and the run-time half — `measuredDimensionKinds()` against
+ * `EXTRACTED_COVERAGE_DIMENSIONS`, plus the parity assertions in this module's
+ * test — catches a member added here and nowhere else. Eight `GateRule` kinds
+ * shipped unsaveable for two slices because only one of the two existed, and
+ * `check:wiring` cannot see that class of defect.
+ */
+export const DIMENSION_REGISTRY: Record<CoverageDimensionKind, DimensionRegistryEntry> = {
+  PAGE_STATE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-states.ts',
+    entryPoint: 'measureStateDimensions',
+    measures:
+      'the states one route can be in — default, loading, empty, slow, interstitial — each as its own cell, instead of folding every state of a route into one entry',
+  },
+  ERROR_STATE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-states.ts',
+    entryPoint: 'measureStateDimensions',
+    measures:
+      'the 4xx/5xx and validation-failure states of a route, split by whether each was declared, observed, asserted or merely mentioned',
+  },
+  DATA_VARIANT: {
+    measured: true,
+    module: 'packages/agent/src/coverage-states.ts',
+    entryPoint: 'measureStateDimensions',
+    measures:
+      'the same surface under a different fixture shape — none, one, many, boundary — so an untested empty state is uncovered rather than invisible',
+  },
+  FORM_FIELD: {
+    measured: true,
+    module: 'packages/agent/src/coverage-fields.ts',
+    entryPoint: 'analyseFieldCoverage',
+    measures:
+      'one input of one form, so a three-field form with one test that fills the email box is three cells and not one tick',
+  },
+  VALIDATION_RULE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-fields.ts',
+    entryPoint: 'analyseFieldCoverage',
+    measures:
+      '`required`, `semantic`, the length and range bounds and every other rule derived from one field — the boundary cases the old boolean counted by nobody',
+  },
+  COMPONENT: {
+    measured: true,
+    module: 'packages/agent/src/coverage-fields.ts',
+    entryPoint: 'analyseFieldCoverage',
+    measures: "one exported component of the customer's own design system",
+  },
+  COMPONENT_STATE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-fields.ts',
+    entryPoint: 'analyseFieldCoverage',
+    measures:
+      "one component in one named state — loading, empty, error, disabled — which is where a component library's untested surface actually lives",
+  },
+  TEST_TYPE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-matrix.ts',
+    entryPoint: 'buildTypeObligationMatrix',
+    measures:
+      'one surface and one test type it owes a test of, so "routes with an ACCESSIBILITY test: 3 of 14" is sayable at last — a PERFORMANCE test no longer marks /checkout fully visited exactly as an E2E does',
+  },
+  DEVICE_LOCALE: {
+    measured: true,
+    module: 'packages/agent/src/coverage-matrix.ts',
+    entryPoint: 'buildDeviceLocaleMatrix',
+    measures:
+      'one surface at one device, viewport or locale — the denominator the CROSS_BROWSER, LOCALIZATION and MOBILE plugins have been executing against nothing',
+  },
+  FLAG_COMBINATION: {
+    measured: true,
+    module: 'packages/agent/src/coverage-matrix.ts',
+    entryPoint: 'buildFlagCombinationMatrix',
+    measures:
+      'one surface under one OBSERVED feature-flag combination, never the cross product — an enumerated combination space is a count, not a denominator',
+  },
+  BACKGROUND_JOB: {
+    measured: true,
+    module: 'packages/agent/src/coverage-async.ts',
+    entryPoint: 'measureAsyncCoverage',
+    measures:
+      'one scheduled job, queue consumer or webhook receiver — surface no crawl can ever reach, and therefore surface a crawl-only denominator silently reported as absent',
+  },
+  NOTIFICATION: {
+    measured: true,
+    module: 'packages/agent/src/coverage-async.ts',
+    entryPoint: 'measureAsyncCoverage',
+    measures:
+      'one outbound email or notification template, with the asserted-effect rung kept separate from the trigger-fired one',
+  },
+  /*
+   * THE ONE AXIS WHOSE CELLS EXIST AND WHOSE COVERAGE DOES NOT.
+   *
+   * `access-matrix.ts` builds the route x role matrix and ships in this same
+   * round: it produces an `AccessMatrix` with real cells, including the
+   * NOT_PROBED ones, so the DENOMINATOR for this axis is known and defensible.
+   * What it does not produce is a `DimensionMeasurement`, because nothing in
+   * this build matches a TEST to a (route, role) cell — and the outcome it
+   * records is the APPLICATION's behaviour, not a test's assertion about it.
+   *
+   * Mapping a probe to a coverage tier here would be the single most tempting
+   * version of this product's cardinal lie: a crawl that observed a 403 would
+   * mark the forbidden state COVERED, the figure would rise with no test
+   * written, and the rise would be invisible because the probe really did
+   * happen. So the cells are COUNTED, the reason is NO_EXTRACTOR, and
+   * `dimensionPercentAt` returns null at every rung by arithmetic.
+   */
+  ROLE_CELL: {
+    measured: false,
+    reason: 'NO_EXTRACTOR',
+    enumeratedBy: 'packages/agent/src/access-matrix.ts',
+    detail:
+      'The route x role cells ARE enumerated — the access matrix produces them, NOT_PROBED cells ' +
+      'included — so this denominator is known. What is missing is the other half: nothing in ' +
+      'this build matches a TEST to one of those cells. A crawl probe proves the application ' +
+      'refuses a role; it does not prove anybody asserts that it does, and scoring the probe as ' +
+      'coverage would attribute coverage to a test that never ran. Counted, named, and not scored.',
+  },
+};
+
+/** The axes this build measures. Asserted against the keystone's list by the test. */
+export function measuredDimensionKinds(): CoverageDimensionKind[] {
+  return COVERAGE_DIMENSIONS.filter((dimension) => DIMENSION_REGISTRY[dimension].measured);
+}
+
+/** The axes nothing in this build measures. NAMED, never scored as 0%. */
+export function unmeasuredDimensionKinds(): CoverageDimensionKind[] {
+  return COVERAGE_DIMENSIONS.filter((dimension) => !DIMENSION_REGISTRY[dimension].measured);
+}
+
+/**
+ * The reading for an axis this build does not measure, built from the registry's
+ * own reason and sentence.
+ *
+ * Zero cells measured, therefore a NULL percentage at every rung by arithmetic
+ * — `measured: 0` means `coverageLadder([])` means `coveragePercent` divides by
+ * zero and returns null. A renderer cannot accidentally print 0 for this,
+ * because there is no 0 anywhere in it.
+ *
+ * `knownCells` is how an enumerated-but-unscored axis keeps its denominator
+ * visible: pass the access matrix's cell count for ROLE_CELL and the report
+ * says "0 of 198 measured", which is a far more useful sentence than "not
+ * measured" and is still not a percentage.
+ *
+ * Exported because the API, the digest and the attestation all have to produce
+ * the same sentence for the same absent axis. Three spellings of "we do not
+ * measure this" is three different disclosures about one measurement.
+ */
+export function unmeasuredDimensionReading(
+  dimension: CoverageDimensionKind,
+  knownCells = 0,
+): DimensionMeasurement {
+  const entry = DIMENSION_REGISTRY[dimension];
+  if (entry.measured) {
+    throw new Error(
+      `${dimension} HAS a producer in DIMENSION_REGISTRY — calling it unmeasured would report a ` +
+        'measurement we took as one we did not',
+    );
+  }
+  return unmeasuredDimension({
+    dimension,
+    reason: entry.reason,
+    detail: entry.detail,
+    cells: knownCells,
+  });
+}
+
+/**
+ * ONE REPORT, MANY MEASUREMENTS.
+ *
+ * Deliberately has no `percent`, no `total`, no `overall` and no `score`. The
+ * figures live on the measurements, one rung at a time, through
+ * `dimensionPercentAt`.
+ */
+export interface CoverageDimensionReport {
+  /**
+   * Every one of the thirteen axes, in `COVERAGE_DIMENSIONS` order, each with
+   * its own denominator.
+   *
+   * ALL THIRTEEN, not just the measured ones. An axis omitted from this list is
+   * an axis a reader cannot see we do not measure, and invisible raises the
+   * perceived completeness of a report exactly as an unenumerated state raises
+   * a percentage.
+   */
+  measurements: DimensionMeasurement[];
+  /** The axes a module in this package answered for. */
+  measured: CoverageDimensionKind[];
+  /** The axes nothing answered for, each present in `measurements` as unmeasured. */
+  unmeasured: CoverageDimensionKind[];
+  /** Which module answers for each axis, so a finding is traceable to a file. */
+  producers: Record<CoverageDimensionKind, DimensionRegistryEntry>;
+  /**
+   * Every cap that bit, across every dimension, as a count AND a reason.
+   *
+   * Collected here as well as on each measurement because rule 10 is a property
+   * of the REPORT: a caller that renders only the headline must still be able
+   * to say "at least 240 more form fields existed" without walking thirteen
+   * measurements to find out.
+   */
+  caps: DimensionCapBite[];
+  /** Printed where a combined figure would go. */
+  rule: string;
+}
+
+/**
+ * Assemble the report from whatever the dimension modules produced.
+ *
+ * Takes the measurements as an INJECTED partial map rather than calling the six
+ * modules itself, for the reason rule 8 of this codebase gives: every one of
+ * them needs a crawl, a source read, a run report or an access matrix, and a
+ * function that fetched those could not be tested without them. The ADAPTERS
+ * live in apps/api's coverage store, which is the one place holding all four
+ * inputs; this is the assembly, and it is pure.
+ *
+ * ── THE TWO REFUSALS ────────────────────────────────────────────────────────
+ *
+ * A measurement whose `dimension` does not match its key is REFUSED, not
+ * re-labelled. A COMPONENT_STATE reading filed under COMPONENT would be counted
+ * on the wrong denominator and stored where no component reader looks, and the
+ * resulting figure would be wrong in a way nothing downstream could see.
+ *
+ * A measurement supplied for an axis the registry says is UNMEASURED is also
+ * refused. It would mean a module measured an axis this registry says nothing
+ * measures, one of the two is wrong, and guessing which would make
+ * `measuredDimensionKinds()` — the list the attestation discloses — a claim
+ * nobody checks.
+ */
+export function coverageDimensionReport(input: {
+  supplied: Partial<Record<CoverageDimensionKind, DimensionMeasurement>>;
+  /**
+   * Cells an axis has that nothing scored, by axis. ROLE_CELL's whole point.
+   * Absent is 0, which is "we do not even know how many there are".
+   */
+  knownCells?: Partial<Record<CoverageDimensionKind, number>>;
+}): CoverageDimensionReport {
+  const measurements: DimensionMeasurement[] = [];
+  const caps: DimensionCapBite[] = [];
+
+  for (const dimension of COVERAGE_DIMENSIONS) {
+    const entry = DIMENSION_REGISTRY[dimension];
+    const given = input.supplied[dimension];
+
+    if (!entry.measured) {
+      if (given !== undefined) {
+        throw new Error(
+          `${dimension} is recorded as unmeasured in DIMENSION_REGISTRY and a measurement was ` +
+            'supplied for it — one of the two is wrong, and guessing which would make ' +
+            'measuredDimensionKinds() a claim nobody checks',
+        );
+      }
+      measurements.push(
+        unmeasuredDimensionReading(dimension, input.knownCells?.[dimension] ?? 0),
+      );
+      continue;
+    }
+
+    if (given === undefined) {
+      /*
+       * A MEASURED axis with nothing supplied is NOT_ENUMERATED, not
+       * NO_EXTRACTOR: the extractor exists and this call was not given its
+       * facts, which is a different finding with a different remedy (run a
+       * crawl, versus wait for us to build one). Both are unmeasured and
+       * neither is 0.
+       */
+      measurements.push(
+        unmeasuredDimension({
+          dimension,
+          reason: 'NOT_ENUMERATED',
+          cells: input.knownCells?.[dimension] ?? 0,
+          detail:
+            `${entry.entryPoint} can measure ${dimension}, and this computation was given no ` +
+            'facts to measure it from — no crawl, source read or run report supplied them. The ' +
+            'denominator is unknown rather than zero, so there is no percentage to report.',
+        }),
+      );
+      continue;
+    }
+
+    if (given.dimension !== dimension) {
+      throw new Error(
+        `a ${given.dimension} measurement was supplied under ${dimension} — filing a reading on ` +
+          'another axis counts its cells against the wrong denominator, and nothing downstream ' +
+          'can see that the figure is wrong',
+      );
+    }
+
+    measurements.push(given);
+    caps.push(...given.caps);
+  }
+
+  return {
+    measurements,
+    measured: measuredDimensionKinds(),
+    unmeasured: unmeasuredDimensionKinds(),
+    producers: DIMENSION_REGISTRY,
+    caps,
+    rule: DIMENSIONS_NEVER_SUMMED,
+  };
+}
+
+/** One measurement out of a report, by axis. Null when the axis is not in it. */
+export function dimensionReading(
+  report: CoverageDimensionReport,
+  dimension: CoverageDimensionKind,
+): DimensionMeasurement | null {
+  return report.measurements.find((entry) => entry.dimension === dimension) ?? null;
+}
+
+/**
+ * The axes to DISCLOSE on an attestation, in the keystone's shape.
+ *
+ * Every measurement that measured nothing, with its reason and its sentence
+ * carried through unchanged — so the sentence in an exported document and the
+ * sentence on the authenticated screen cannot diverge. A buyer who reads the
+ * PDF and then logs in must not find a different explanation.
+ *
+ * A measurement with SOME cells measured and some not is NOT listed here: that
+ * is a measurement with a disclosed shortfall, which the per-dimension reading
+ * already carries, and listing it again would make one axis appear twice in a
+ * scope section whose whole job is to be countable.
+ */
+export function dimensionUnmeasuredDisclosures(
+  report: CoverageDimensionReport,
+): AttestationUnmeasured[] {
+  const out: AttestationUnmeasured[] = [];
+  for (const measurement of report.measurements) {
+    if (dimensionWasMeasured(measurement)) continue;
+    const reason = measurement.unmeasuredReason;
+    /*
+     * Nothing measured and NO reason cannot happen through either constructor —
+     * both refuse it — so reaching this branch means a hand-built literal got
+     * in. It is skipped rather than defaulted: inventing `NO_EXTRACTOR` for it
+     * would put our own guess in a procurement document.
+     */
+    if (reason === null) continue;
+    out.push({
+      dimension: measurement.dimension,
+      kind: null,
+      reason,
+      detail:
+        measurement.unmeasuredDetail ??
+        `${measurement.dimension} was not measured and the writer recorded no sentence.`,
+      /*
+       * `cells` is the count we KNOW exist and did not measure, and 0 means we
+       * do not even know how many there are. The keystone's field is nullable
+       * for exactly that, so 0 maps to null rather than being published as "no
+       * cells exist" — which is the opposite claim.
+       */
+      cells: measurement.cells === 0 ? null : measurement.cells,
+    });
+  }
+  return out;
 }

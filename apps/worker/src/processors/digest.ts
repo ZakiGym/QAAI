@@ -49,6 +49,22 @@
  */
 
 import { CronExpressionParser } from 'cron-parser';
+/*
+ * The scope key and the ONE comparability predicate.
+ *
+ * `deltaIsMeaningful` is imported rather than written as
+ * `comparability === 'COMPARABLE'` here for the reason the coverage block in
+ * `renderDigest` gives: four surfaces print this delta and the first one that
+ * answers the question for itself is the one that tells a whole team their
+ * coverage fell when it was our own enumeration that moved.
+ */
+import {
+  HEADLINE_SCOPE_KEY,
+  UNATTRIBUTED_FEATURE,
+  UNOWNED_TEAM,
+  deltaIsMeaningful,
+} from '@qaai/shared';
+import type { SnapshotComparability } from '@qaai/shared';
 import { logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
 // Pure modules from the API workspace — types and functions, no Prisma and no
@@ -148,6 +164,50 @@ export interface Digest {
   /** How many of the new failures reached nobody. */
   unowned: number;
   truncated: boolean;
+  /**
+   * THE COVERAGE LINE. Null means NOT MEASURED, and never 0%.
+   *
+   * `grep -n coverage` in this file returned nothing before this field, which
+   * means the one sentence this company has was absent from the only message
+   * most of a team ever reads about their test suite. A digest that reports
+   * three new failures and says nothing about the 38% of the application
+   * nothing has ever asserted anything about is a digest that makes the larger
+   * fact invisible every morning.
+   *
+   * ── IT DOES NOT MAKE THE DIGEST SPEAK ──────────────────────────────────────
+   *
+   * Deliberately NOT part of `hasSomethingToSay`. A window full of passing runs
+   * must stay quiet, and "your coverage is still 61%" is not news — it is the
+   * same number as yesterday, and a daily message that always has something in
+   * it is a daily message nobody opens. So coverage rides ALONG with a digest
+   * that was already going to be sent, and the day nothing happened the
+   * coverage line is not a reason to send one.
+   */
+  coverage: DigestCoverage | null;
+}
+
+/**
+ * The coverage facts a digest states, and the comparability of its delta.
+ *
+ * The same four facts the check-run summary carries, for the same reason: a
+ * figure, a rung, a delta that is NULL unless the two snapshots are comparable,
+ * and the single most useful rollup. Not the same TYPE, because this file
+ * cannot import from apps/api — and the duplication is named in this round's
+ * handover rather than solved by reaching across a boundary that does not
+ * exist.
+ */
+export interface DigestCoverage {
+  /** The headline. NULL when there was nothing to divide. Never 0, never 100. */
+  percent: number | null;
+  denominator: number;
+  /** The rung the figure is taken at, so it is comparable to anything at all. */
+  tier: string;
+  /** Change in percentage points, or NULL when the two are not comparable. */
+  deltaPercent: number | null;
+  comparability: string;
+  comparabilityDetail: string | null;
+  /** One rollup, not a table. A chat message has about four lines of attention. */
+  rollup: { label: string; percent: number | null; denominator: number } | null;
 }
 
 /**
@@ -321,7 +381,99 @@ export async function collectDigest(
     silentSchedules: await silentSchedules(orgId, projectId, runs.length, until),
     unowned: newFailures.filter((row) => !owners.get(row.testId)?.label).length,
     truncated: results.length >= MAX_RESULTS,
+    coverage: await digestCoverage(projectId),
   };
+}
+
+/**
+ * The coverage line, from the stored snapshot and the stored history row.
+ *
+ * ── READ, NEVER COMPUTED ───────────────────────────────────────────────────
+ *
+ * Both the figure and the delta are read. Computing the figure here would mean
+ * a second implementation of a percentage this product has exactly one of, and
+ * computing the DELTA here would mean subtracting whichever two percentages are
+ * closest to hand — which always succeeds, and is wrong whenever the crawl moved
+ * between the two. `snapshotDelta` made that decision at write time against the
+ * two snapshots' crawl fingerprints and denominator definitions, and this reads
+ * its answer.
+ *
+ * ── NULL IS "NOT MEASURED", AND THAT IS THREE DIFFERENT FACTS ──────────────
+ *
+ * No snapshot, or a read that failed. Both render as the words "not measured"
+ * with the reason, and neither renders as a number. They are collapsed to one
+ * null here rather than kept apart, which is a deliberate limit: the digest has
+ * one line for this and "nothing has been measured" is the sentence a reader
+ * acts on either way. The AUTHENTICATED surfaces keep them apart —
+ * `GET /badges/coverage/:projectId` has NOT_MEASURED and UNAVAILABLE as
+ * separate states, because there the distinction changes whose problem it is.
+ */
+async function digestCoverage(projectId: string): Promise<DigestCoverage | null> {
+  try {
+    const snapshot = await prisma.coverageSnapshot.findFirst({
+      where: { projectId },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, percent: true, denominator: true },
+    });
+    if (snapshot === null) return null;
+
+    const [history, rollup] = await Promise.all([
+      prisma.coverageHistory.findFirst({
+        where: { projectId, scopeKey: HEADLINE_SCOPE_KEY },
+        orderBy: { createdAt: 'desc' },
+        select: { deltaPercent: true, comparability: true, comparabilityDetail: true },
+      }),
+      /*
+       * THE SINGLE MOST USEFUL ROLLUP: the largest bucket that is NOT the
+       * headline. One, not a table, because a chat message has about four lines
+       * of attention and a fifteen-row breakdown in it is a breakdown nobody
+       * reads. Largest by DENOMINATOR and not by percentage: a ranking by
+       * percentage would put the smallest bucket first and read as "your worst
+       * feature", which it is not.
+       */
+      prisma.coverageRollup.findFirst({
+        where: { snapshotId: snapshot.id, scopeKey: { not: HEADLINE_SCOPE_KEY } },
+        orderBy: [{ denominator: 'desc' }, { scopeKey: 'asc' }],
+        select: { feature: true, teamId: true, percent: true, denominator: true },
+      }),
+    ]);
+
+    return {
+      percent: snapshot.percent,
+      denominator: snapshot.denominator,
+      tier: 'ASSERTED',
+      deltaPercent: history?.deltaPercent ?? null,
+      comparability: history?.comparability ?? 'NOT_COMPARED',
+      comparabilityDetail: history?.comparabilityDetail ?? null,
+      rollup:
+        rollup === null
+          ? null
+          : {
+              /*
+               * The sentinels are spelled out as the FINDING they are.
+               * "UNATTRIBUTED" in a chat message is jargon; "surface no feature
+               * could be attributed to" is the sentence a reader acts on — and
+               * an unowned or unattributed bucket being the LARGEST one is the
+               * single most useful thing this line can say.
+               */
+              label:
+                rollup.feature === UNATTRIBUTED_FEATURE
+                  ? 'surface no feature could be attributed to'
+                  : rollup.teamId === UNOWNED_TEAM
+                    ? 'surface nobody owns'
+                    : (rollup.feature ?? rollup.teamId ?? 'one scope'),
+              percent: rollup.percent,
+              denominator: rollup.denominator,
+            },
+    };
+  } catch {
+    /*
+     * The tables do not exist on this deployment (the migration is written and
+     * unapplied). NULL, which renders as "not measured" — never as a figure,
+     * and never as a reason to send a digest that had nothing else to say.
+     */
+    return null;
+  }
 }
 
 const VERDICT_ORDER: Record<string, number> = {
@@ -611,6 +763,50 @@ export function renderDigest(digest: Digest, webUrl: string): string {
   );
 
   section('✅', 'Fixed', digest.fixed, (item) => item.filePath);
+
+  /*
+   * ── THE COVERAGE LINE, ABOVE THE FOOTNOTES AND BELOW THE FAILURES ─────────
+   *
+   * Above the footnotes because it is a headline fact and not a caveat; below
+   * the failures because a red test somebody can fix this morning outranks a
+   * standing figure. The three states are three BRANCHES — "not measured", "no
+   * comparable baseline", and the figure with its delta — because the first one
+   * rendered as `0%` is this product's own lie arriving in a team's chat
+   * channel every morning, where nobody re-reads it after the first time they
+   * have believed it.
+   */
+  if (digest.coverage === null) {
+    lines.push(
+      '',
+      '📐 Coverage: not measured. No snapshot has been stored for this project, so there is no ' +
+        'figure — this is not 0%, and it is not a statement about your application.',
+    );
+  } else {
+    const coverage = digest.coverage;
+    const figure =
+      coverage.percent === null
+        ? 'not measured (the denominator was zero — nothing was enumerated to count)'
+        : `${coverage.percent.toFixed(1)}% of ${coverage.denominator} surface item(s) at ${coverage.tier}`;
+    /*
+     * `deltaIsMeaningful` and not a string comparison: four surfaces print this
+     * delta and the first one that decides for itself what counts as comparable
+     * is the one that reports a regression nobody caused. Two snapshots taken
+     * against different crawls measured different applications.
+     */
+    const change = deltaIsMeaningful(coverage.comparability as SnapshotComparability)
+      ? coverage.deltaPercent === null
+        ? ''
+        : ` (${coverage.deltaPercent >= 0 ? '+' : ''}${coverage.deltaPercent.toFixed(1)} points)`
+      : ` — no comparable baseline: ${coverage.comparabilityDetail ?? 'the two snapshots are not comparable'}`;
+    lines.push('', `📐 Coverage: ${figure}${change}`);
+    if (coverage.rollup) {
+      lines.push(
+        `  • ${coverage.rollup.label}: ${
+          coverage.rollup.percent === null ? 'not measured' : `${coverage.rollup.percent.toFixed(1)}%`
+        } of ${coverage.rollup.denominator}`,
+      );
+    }
+  }
 
   const footnotes: string[] = [];
   if (digest.stillFailing > 0) {

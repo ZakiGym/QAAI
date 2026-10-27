@@ -68,6 +68,39 @@ import {
   TIER_CAP_REASONS,
 } from './coverage-tiers';
 /*
+ * The dimension vocabularies, imported and not restated, for the third time in
+ * this file and with one addition worth naming: `CELL_KIND_DIMENSION`,
+ * `rollupScopeKey` and `deltaIsMeaningful` are imported as VALUES, not just the
+ * lists.
+ *
+ * That is the point. `coverageItemStateSchema` refuses a form cell kind by
+ * asking the record which dimension the kind belongs to, rather than listing
+ * the state kinds a second time; `coverageRollupSchema` refuses a `scopeKey`
+ * that disagrees with its own columns by rebuilding it with the one key
+ * function; and `coverageHistorySchema` refuses a delta by asking the one
+ * comparability predicate. A refinement that reimplemented any of the three
+ * would be a second opinion about the same fact, and the first thing a second
+ * opinion does is diverge — which here means two spellings of a cell key, or a
+ * delta the API refuses and the digest prints.
+ *
+ * coverage-dimensions.ts does NOT import this file, so there is no cycle.
+ */
+import {
+  CELL_KIND_DIMENSION,
+  COVERAGE_CELL_KINDS,
+  COVERAGE_DIMENSIONS,
+  DEPLOYMENT_CAPABILITY_STATUSES,
+  DIMENSION_UNMEASURED_REASONS,
+  FAULT_DETECTION_OUTCOMES,
+  MINIMUM_BACKTEST_DEFECTS,
+  SELF_DEPLOYMENT,
+  SNAPSHOT_COMPARABILITIES,
+  VALIDITY_VERDICTS,
+  deltaIsMeaningful,
+  rollupScopeKey,
+} from './coverage-dimensions';
+import type { CoverageDimensionKind } from './coverage-dimensions';
+/*
  * The findings vocabulary, imported rather than restated. `MAX_FINDINGS` selects
  * on a severity and a kind, and a `z.enum` here that spelled its own four
  * severities would be a THIRD copy of a list the plugins already emit and
@@ -3216,3 +3249,761 @@ export const freshnessDaysSchema = z
   .min(1)
   .max(365)
   .default(DEFAULT_COVERAGE_FRESHNESS_DAYS);
+
+// ─── The dimensions: the write paths for everything below an item ────────────
+
+/**
+ * The seven dimension vocabularies, as validators.
+ *
+ * `z.enum` over the imported lists rather than hand-written literals, for the
+ * third time in this file and for the same reason: these are the ONLY write
+ * paths to `CoverageItemState.kind`, `CoverageRollup.dimension`,
+ * `DeploymentCapability.status` and the rest, and a second copy of a list is a
+ * copy that stops matching. A cell kind added to `COVERAGE_CELL_KINDS` and not
+ * here is a cell no writer can ever store — exactly the shape of the eight
+ * unsaveable gate kinds.
+ *
+ * Two of the seven are NOT Prisma enums and that is deliberate:
+ * `snapshotComparabilitySchema` and `validityVerdictSchema` validate TEXT
+ * columns whose domain is enforced here, at the producer, the same arrangement
+ * `tierCapReasonSchema` has for `TestCoverageEdge.cappedBy`. They are therefore
+ * the ONLY guard those two vocabularies have, which is why
+ * coverage-dimensions.test.ts compares their `.options` back against the lists.
+ */
+export const coverageDimensionSchema = z.enum(COVERAGE_DIMENSIONS);
+export const coverageCellKindSchema = z.enum(COVERAGE_CELL_KINDS);
+export const dimensionUnmeasuredReasonSchema = z.enum(DIMENSION_UNMEASURED_REASONS);
+export const deploymentCapabilityStatusSchema = z.enum(DEPLOYMENT_CAPABILITY_STATUSES);
+export const faultDetectionOutcomeSchema = z.enum(FAULT_DETECTION_OUTCOMES);
+export const snapshotComparabilitySchema = z.enum(SNAPSHOT_COMPARABILITIES);
+export const validityVerdictSchema = z.enum(VALIDITY_VERDICTS);
+
+/**
+ * A cap that BIT, as a count and a reason.
+ *
+ * `atLeastMore` is `.nullable()` and NOT `.default(0)`, and that single choice
+ * is the whole point of the shape. A wall-clock timeout knows it stopped and
+ * does not know what it stopped before, so null is "more existed and we cannot
+ * say how many" — a weaker, still useful sentence. `0` would be the claim that
+ * nothing was hidden, which is the opposite of what a bitten cap means, and it
+ * is the value a reader sums into a total without noticing.
+ */
+export const dimensionCapBiteSchema = z.object({
+  cap: z.string().min(1).max(120),
+  limit: z.number().int().min(0),
+  atLeastMore: z.number().int().min(0).nullable(),
+  /** Always written. A cap with no sentence is a truncation nobody can act on. */
+  detail: z.string().min(1).max(500),
+});
+
+/** One rung of a stored ladder. `percent` is null when there is nothing to divide. */
+const coverageTierTotalsSchema = z.object({
+  tier: coverageTierSchema,
+  atOrAbove: z.number().int().min(0),
+  percent: z.number().min(0).max(100).nullable(),
+});
+
+/**
+ * A whole ladder, as stored or posted.
+ *
+ * `.length(COVERAGE_TIERS.length)` rather than `.min(1)`: the ladder's value is
+ * that "34% passing, 61% navigated" are two readings of ONE measurement, and a
+ * ladder missing a rung is a series a reader would compare across a hole.
+ */
+const coverageLadderSchema = z.object({
+  denominator: z.number().int().min(0),
+  unclaimed: z.number().int().min(0),
+  tiers: z.array(coverageTierTotalsSchema).length(COVERAGE_TIERS.length),
+});
+
+/**
+ * ONE DIMENSION'S READING, and the four refusals that make it honest.
+ *
+ * Each refinement is a specific lie this product cannot afford, and each one
+ * has a named test in coverage-dimensions.test.ts:
+ *
+ *   1. AN UNMEASURED COUNT WITH NO REASON. The cardinal one. An unexplained
+ *      shortfall is read as uncovered by the first consumer that forgets to
+ *      check, which moves the percentage down for something the customer
+ *      neither caused nor can fix.
+ *   2. A REASON WITH NOTHING UNMEASURED. The mirror, and not symmetric
+ *      decoration: a row claiming a limitation it did not hit puts a caveat on
+ *      a report that does not need one, and a reader who finds one false caveat
+ *      stops reading the true ones.
+ *   3. PARTS THAT DO NOT RECONSTRUCT THE WHOLE. `cells` must equal
+ *      `measured + unmeasured`, and `tiers.denominator` must equal `measured` —
+ *      because a ladder divided by `cells` would report every cell we never
+ *      looked at as UNCOVERED, and that is the exact arithmetic the
+ *      `measured`/`unmeasured` split exists to prevent.
+ *   4. CAP_BIT WITH NO CAP. "A cap stopped the measurement short" with no cap
+ *      named is a cap applied without being disclosed, which is rule 10
+ *      verbatim.
+ */
+export const dimensionMeasurementSchema = z
+  .object({
+    dimension: coverageDimensionSchema,
+    cells: z.number().int().min(0),
+    measured: z.number().int().min(0),
+    unmeasured: z.number().int().min(0),
+    /**
+     * REQUIRED AS A PROPERTY, nullable as a VALUE. `.nullable()` with no
+     * `.default(null)` on purpose: a caller who omits the key entirely has not
+     * thought about it, and silently defaulting that to "nothing unmeasured"
+     * is the omission this whole shape is arranged against.
+     */
+    unmeasuredReason: dimensionUnmeasuredReasonSchema.nullable(),
+    unmeasuredDetail: z.string().min(1).max(500).nullable(),
+    tiers: coverageLadderSchema,
+    caps: z.array(dimensionCapBiteSchema).max(20).default([]),
+  })
+  .refine((m) => m.unmeasured === 0 || m.unmeasuredReason !== null, {
+    message:
+      'unmeasured cells with no reason — an unexplained shortfall is read as uncovered by the ' +
+      'first consumer that forgets to check, and an unmeasured axis is NOT 0%',
+    path: ['unmeasuredReason'],
+  })
+  /*
+   * ── `|| m.measured === 0` IS LOAD-BEARING, AND IT WAS MISSING ─────────────
+   *
+   * The rule is right and its first spelling made every unmeasured axis
+   * unwritable. `unmeasuredDimension` — the keystone's own constructor, the one
+   * that exists because it CANNOT produce a zero percent — returns
+   * `{ measured: 0, unmeasured: cells, reason }`, and `cells` defaults to 0
+   * because an axis with no extractor usually cannot say how many cells it has.
+   * So the constructor produced `{ measured: 0, unmeasured: 0, reason:
+   * 'NO_EXTRACTOR' }`, this refinement refused it, and on a project's first
+   * computation all thirteen readings would have failed to persist — measured
+   * by running the constructor against this schema, not inferred.
+   *
+   * The two states the refinement has to tell apart differ by `measured`:
+   *
+   *   measured > 0, unmeasured 0, reason set  → the defect. A reading that DID
+   *     measure its cells and still claims a limitation it never hit.
+   *   measured 0, unmeasured 0, reason set    → the honest empty axis, and the
+   *     reason is the whole content of it. Without it, "we have no extractor
+   *     for this" is indistinguishable from "we measured it and there is
+   *     nothing there" — opposite facts with opposite remedies. The constructor
+   *     says exactly this in its own comment; this clause is what stops the
+   *     schema contradicting it.
+   */
+  .refine((m) => m.unmeasured > 0 || m.unmeasuredReason === null || m.measured === 0, {
+    message:
+      'an unmeasured reason on a reading that measured all of its cells claims a limitation it ' +
+      'did not hit (a reading that measured NOTHING keeps its reason — that is the only thing ' +
+      'telling "no extractor" apart from "measured, and empty")',
+    path: ['unmeasuredReason'],
+  })
+  .refine((m) => m.unmeasuredReason === null || m.unmeasuredDetail !== null, {
+    message: 'a reason code with no sentence is a disclosure only we can read',
+    path: ['unmeasuredDetail'],
+  })
+  .refine((m) => m.cells === m.measured + m.unmeasured, {
+    message: 'cells must equal measured + unmeasured — parts that do not reconstruct the whole',
+    path: ['cells'],
+  })
+  .refine((m) => m.tiers.denominator === m.measured, {
+    message:
+      'the ladder must divide by what was MEASURED, not by every cell — dividing by cells ' +
+      'reports everything we never looked at as uncovered',
+    path: ['tiers', 'denominator'],
+  })
+  .refine((m) => m.unmeasuredReason !== 'CAP_BIT' || m.caps.length > 0, {
+    message: 'CAP_BIT with no cap named is a cap applied without being disclosed',
+    path: ['caps'],
+  });
+
+/**
+ * The cell kinds each per-item table is allowed to store.
+ *
+ * Derived from `CELL_KIND_DIMENSION` rather than listed, so a new kind lands in
+ * the right table automatically and cannot land in both. A state row carrying
+ * `RULE_PATTERN` would be a cell counted on the VALIDATION_RULE denominator and
+ * stored where no rule reader looks — present, counted nowhere, invisible.
+ */
+const STATE_DIMENSIONS: readonly CoverageDimensionKind[] = [
+  'PAGE_STATE',
+  'ERROR_STATE',
+  'DATA_VARIANT',
+  'COMPONENT',
+  'COMPONENT_STATE',
+];
+const FORM_DIMENSIONS: readonly CoverageDimensionKind[] = ['FORM_FIELD', 'VALIDATION_RULE'];
+
+/** The measurement columns every per-cell row carries, with their contract. */
+const cellMeasurement = {
+  /**
+   * NULL IS NOT `DECLARED`. Null means nothing claims this cell at all; the
+   * same rule as `CoverageTierVerdict.tier` and for the same reason — a default
+   * would mint a claim nothing produced.
+   */
+  tier: coverageTierSchema.nullable().default(null),
+  tierCappedBy: tierCapReasonSchema.nullable().default(null),
+  lastConfirmedRunId: z.string().min(1).max(64).nullable().default(null),
+  unmeasuredReason: dimensionUnmeasuredReasonSchema.nullable().default(null),
+  unmeasuredDetail: z.string().min(1).max(500).nullable().default(null),
+};
+
+/**
+ * ONE STATE OF ONE ITEM: its empty state, its 403, its pagination boundary.
+ *
+ * `stateKey` is validated as a non-empty string and NOT re-derived here;
+ * `dimensionCellIdentity` in surface.ts is the one format and the producer calls
+ * it. A second derivation in this file would be a second format, and two
+ * formats make two dimensions silently uncomparable — which is the one thing
+ * the keystone exists to prevent.
+ */
+export const coverageItemStateSchema = z
+  .object({
+    /** `CoverageItem.key`, so the writer can resolve the item without an id. */
+    itemKey: z.string().min(1).max(500),
+    stateKey: z.string().min(1).max(500),
+    kind: coverageCellKindSchema,
+    label: z.string().min(1).max(300),
+    origin: z.enum(SURFACE_SOURCES),
+    evidence: z.string().min(1).max(1_000),
+    parentStateKey: z.string().min(1).max(500).nullable().default(null),
+    /**
+     * NULL MEANS DECLARED AND NEVER OBSERVED. Defaulting it to the request time
+     * would turn every declared state into an observed one, which is the same
+     * collapse `SurfaceVerification` keeps apart between a test existing and a
+     * test running.
+     */
+    observedAtIso: z.string().datetime().nullable().default(null),
+    exercise: surfaceExerciseSchema.nullable().default(null),
+    ...cellMeasurement,
+  })
+  .refine((row) => STATE_DIMENSIONS.includes(CELL_KIND_DIMENSION[row.kind]), {
+    message:
+      'this cell kind belongs to a form dimension, not a state dimension — a row stored in the ' +
+      'wrong table is counted on no denominator and is invisible rather than uncovered',
+    path: ['kind'],
+  })
+  .refine((row) => row.tier === null || row.tier === 'DECLARED' || row.lastConfirmedRunId !== null, {
+    message: 'a tier above DECLARED must name the run that observed it',
+    path: ['lastConfirmedRunId'],
+  })
+  .refine((row) => row.parentStateKey !== row.stateKey, {
+    message: 'a state cannot be reached only through itself',
+    path: ['parentStateKey'],
+  });
+
+/**
+ * THE CONSTRAINTS AS THE READER FOUND THEM — and the three refusals that stop
+ * an absent attribute becoming a number.
+ *
+ * EVERY MEMBER IS `number | null` AND NONE IS OPTIONAL. A writer must say
+ * `maxLength: null` rather than omitting the key, because an omitted key and a
+ * null are the same thing to `JSON.stringify` and NOT the same thing to a
+ * reader that uses `in` or `??`. Making the writer state it is the only way the
+ * distinction survives the round trip.
+ *
+ * `maxLength`, `minLength` and `step` are refused at 0. A maxlength of zero is
+ * not a constraint — it is an absent attribute that a writer turned into a
+ * number, and it would produce a boundary cell nothing can ever satisfy.
+ * `min` and `max` MAY be 0, because zero is a real bound: `min="0"` on a
+ * quantity field is the single most common numeric constraint on the web, and
+ * refusing it would delete the cell that catches a negative-quantity bug.
+ */
+export const formFieldConstraintSchema = z.object({
+  maxLength: z.number().int().min(1).max(1_000_000).nullable(),
+  minLength: z.number().int().min(1).max(1_000_000).nullable(),
+  min: z.number().nullable(),
+  max: z.number().nullable(),
+  step: z.number().positive().nullable(),
+  pattern: z.string().min(1).max(500).nullable(),
+});
+
+/**
+ * ONE FIELD OF ONE FORM, OR ONE VALIDATION RULE DERIVED FROM ONE FIELD.
+ *
+ * `required` is a NULLABLE boolean with NO DEFAULT, which is the single most
+ * important line in this schema. Null means the reader could not read the
+ * attribute; `false` means it looked and the field is optional. `required` is
+ * one of the two boundary cases the register names as counted by nobody, and
+ * reading "we could not tell" as "there is no rule here" removes the cell from
+ * the denominator and raises the percentage.
+ */
+export const coverageFormFieldSchema = z
+  .object({
+    itemKey: z.string().min(1).max(500),
+    fieldKey: z.string().min(1).max(500),
+    kind: coverageCellKindSchema,
+    label: z.string().min(1).max(300),
+    parentFieldKey: z.string().min(1).max(500).nullable().default(null),
+    inputType: z.string().min(1).max(60).nullable().default(null),
+    required: z.boolean().nullable(),
+    semantic: z.string().min(1).max(60).nullable().default(null),
+    /** NULL MEANS THE CONSTRAINTS WERE NEVER READ. See the note above. */
+    constraint: formFieldConstraintSchema.nullable().default(null),
+    constraintsRead: z.boolean(),
+    origin: z.enum(SURFACE_SOURCES),
+    evidence: z.string().min(1).max(1_000),
+    exercise: surfaceExerciseSchema.nullable().default(null),
+    ...cellMeasurement,
+  })
+  .refine((row) => FORM_DIMENSIONS.includes(CELL_KIND_DIMENSION[row.kind]), {
+    message:
+      'this cell kind belongs to a state dimension, not a form dimension — see the note on ' +
+      'coverageItemStateSchema',
+    path: ['kind'],
+  })
+  .refine(
+    (row) => CELL_KIND_DIMENSION[row.kind] !== 'VALIDATION_RULE' || row.parentFieldKey !== null,
+    {
+      message:
+        'a validation rule must name the field it was derived from — a rule with no field is a ' +
+        'cell nothing can ever assert against',
+      path: ['parentFieldKey'],
+    },
+  )
+  .refine((row) => row.constraintsRead || row.constraint === null, {
+    message:
+      'constraints that were never read cannot also have been found — set constraintsRead when ' +
+      'a reader looked',
+    path: ['constraintsRead'],
+  })
+  .refine((row) => row.tier === null || row.tier === 'DECLARED' || row.lastConfirmedRunId !== null, {
+    message: 'a tier above DECLARED must name the run that observed it',
+    path: ['lastConfirmedRunId'],
+  });
+
+/**
+ * "THIS ROUTE OWES AN ACCESSIBILITY TEST" — one obligation, one row.
+ *
+ * There is no default anywhere in this schema that could MINT an obligation.
+ * `obligationsFor` is the one resolver and `DEFAULT_TYPE_OBLIGATIONS` owes
+ * nothing, so an obligation reaches this schema only because a declarer said so
+ * — which is what keeps nineteen test types from becoming nineteen fabricated
+ * denominators per item.
+ */
+export const coverageTypeObligationSchema = z
+  .object({
+    itemKey: z.string().min(1).max(500),
+    testType: z.enum(TEST_TYPES),
+    declaredBy: z.enum(SURFACE_SOURCES),
+    evidence: z.string().min(1).max(1_000),
+    ...cellMeasurement,
+  })
+  .refine((row) => row.tier === null || row.tier === 'DECLARED' || row.lastConfirmedRunId !== null, {
+    message: 'a tier above DECLARED must name the run that observed it',
+    path: ['lastConfirmedRunId'],
+  });
+
+/**
+ * The write path for `Project.typeObligationPolicy`.
+ *
+ * A PUT of the whole object, like `updateCoverageConfigSchema`, and for the same
+ * reason: an obligation policy is read as a whole, and a partial update that
+ * left one axis from one revision beside another from a second would be a debt
+ * nobody reviewed together.
+ *
+ * `.max(TEST_TYPES.length)` per axis, and duplicates refused: an axis declared
+ * to owe the same type twice would count one obligation as two and inflate a
+ * denominator the customer configured by hand.
+ */
+export const typeObligationPolicySchema = z.object({
+  /*
+   * `z.partialRecord` and NOT `z.record`, which is the difference between a
+   * policy and a form a customer cannot submit. zod 4's `z.record` produces a
+   * TOTAL record, so `{ byKind: { ROUTE: ['E2E'] } }` would be refused for
+   * omitting the other eleven axes — and a policy that forces an opinion about
+   * DATA_VARIANT in order to say anything about ROUTE is a policy nobody fills
+   * in. An axis absent here falls back to `DEFAULT_TYPE_OBLIGATIONS`, which
+   * owes nothing.
+   */
+  byKind: z
+    .partialRecord(
+      z.enum(SURFACE_KINDS),
+      z
+        .array(z.enum(TEST_TYPES))
+        .max(TEST_TYPES.length)
+        .refine((types) => new Set(types).size === types.length, {
+          message: 'an axis cannot owe the same test type twice',
+        }),
+    )
+    .default({}),
+});
+
+export const updateTypeObligationPolicySchema = typeObligationPolicySchema;
+
+/**
+ * ONE FEATURE'S OR ONE TEAM'S PERCENTAGE, WITH ITS OWN ARITHMETIC.
+ *
+ * `scopeKey` is accepted and the server derives it with `rollupScopeKey` — the
+ * same arrangement as `SurfaceItem.origin` being derived from `sources`, and
+ * for the same reason: two fields that encode one fact will eventually disagree
+ * about a row and only one of them will be on screen. The refinement below
+ * holds them together at the door.
+ */
+export const coverageRollupSchema = z
+  .object({
+    scopeKey: z.string().min(1).max(500),
+    dimension: coverageDimensionSchema.nullable().default(null),
+    feature: z.string().min(1).max(200).nullable().default(null),
+    /** Null for "not narrowed to a team"; `UNOWNED` for the surface nobody owns. */
+    teamId: z.string().min(1).max(64).nullable().default(null),
+    numerator: z.number().int().min(0),
+    denominator: z.number().int().min(0),
+    /** Null when the denominator is zero. Never 0 and never 100. */
+    percent: z.number().min(0).max(100).nullable(),
+    /** No default: a rollup that does not say which bar it cleared is comparable to nothing. */
+    tier: coverageTierSchema,
+    unmeasured: z.number().int().min(0).default(0),
+    unmeasuredReason: dimensionUnmeasuredReasonSchema.nullable().default(null),
+    unmeasuredDetail: z.string().min(1).max(500).nullable().default(null),
+    caps: z.array(dimensionCapBiteSchema).max(20).default([]),
+    /**
+     * Items deliberately excluded from this bucket, as sentences. A rollup whose
+     * parts do not reconstruct the whole MUST say which items were excluded and
+     * why; without them the only way to notice is to add the buckets up by hand.
+     */
+    exclusions: z.array(z.string().min(1).max(500)).max(50).default([]),
+  })
+  .refine((row) => row.numerator <= row.denominator, {
+    message:
+      'a rollup cannot cover more cells than it has — a numerator above its denominator is the ' +
+      'arithmetic a customer reproduces in a spreadsheet and never trusts us again after',
+    path: ['numerator'],
+  })
+  .refine((row) => row.denominator > 0 || row.percent === null, {
+    message: 'an empty denominator has no percentage — null is not 0 and it is not 100',
+    path: ['percent'],
+  })
+  .refine((row) => row.unmeasured === 0 || row.unmeasuredReason !== null, {
+    message: 'unmeasured cells in a rollup with no reason — the shortfall reads as uncovered',
+    path: ['unmeasuredReason'],
+  })
+  .refine(
+    (row) => row.scopeKey === rollupScopeKey({ dimension: row.dimension, feature: row.feature, teamId: row.teamId }),
+    {
+      message:
+        'scopeKey disagrees with the columns it encodes — derive it with rollupScopeKey rather ' +
+        'than setting both by hand, or the index and the filters will describe different buckets',
+      path: ['scopeKey'],
+    },
+  );
+
+/**
+ * THE DIRECTION OF ONE SUBJECT, AND THE REFUSAL THAT MATTERS MOST IN THIS FILE.
+ *
+ * A DELTA ACROSS TWO CRAWL FINGERPRINTS IS REFUSED. Subtracting two percentages
+ * always succeeds, which is exactly why this has to be a validator and not a
+ * convention: two snapshots taken against different crawls measured different
+ * applications, and "coverage fell 9 points" across them is an artefact of our
+ * own enumeration changing that will be read as a regression by everybody who
+ * sees it — in the PR comment, on the badge, in the digest.
+ */
+export const coverageHistorySchema = z
+  .object({
+    scopeKey: z.string().min(1).max(500),
+    dimension: coverageDimensionSchema.nullable().default(null),
+    feature: z.string().min(1).max(200).nullable().default(null),
+    teamId: z.string().min(1).max(64).nullable().default(null),
+    numerator: z.number().int().min(0),
+    denominator: z.number().int().min(0),
+    percent: z.number().min(0).max(100).nullable(),
+    tier: coverageTierSchema,
+    /** Null makes comparability UNPROVABLE rather than true. */
+    crawlFingerprint: z.string().min(1).max(200).nullable().default(null),
+    previousSnapshotId: z.string().min(1).max(64).nullable().default(null),
+    previousPercent: z.number().min(0).max(100).nullable().default(null),
+    /** Percentage points. Refused unless `comparability` is COMPARABLE. */
+    deltaPercent: z.number().min(-100).max(100).nullable().default(null),
+    comparability: snapshotComparabilitySchema,
+    comparabilityDetail: z.string().min(1).max(500).nullable().default(null),
+  })
+  .refine((row) => row.numerator <= row.denominator, {
+    message: 'a history row cannot cover more cells than it has',
+    path: ['numerator'],
+  })
+  .refine((row) => row.deltaPercent === null || deltaIsMeaningful(row.comparability), {
+    message:
+      'a delta across two measurements that are not comparable — two snapshots from different ' +
+      'crawl fingerprints measured different applications, so the reason goes where the delta ' +
+      'would have been',
+    path: ['deltaPercent'],
+  })
+  .refine((row) => deltaIsMeaningful(row.comparability) || row.comparabilityDetail !== null, {
+    message:
+      'an uncomparable reading must carry the sentence a reader sees instead of the delta',
+    path: ['comparabilityDetail'],
+  })
+  .refine((row) => row.deltaPercent === null || row.previousPercent !== null, {
+    message: 'a delta with nothing to subtract from',
+    path: ['previousPercent'],
+  })
+  .refine(
+    (row) => row.scopeKey === rollupScopeKey({ dimension: row.dimension, feature: row.feature, teamId: row.teamId }),
+    {
+      message: 'scopeKey disagrees with the columns it encodes — see coverageRollupSchema',
+      path: ['scopeKey'],
+    },
+  );
+
+/**
+ * WHICH OF THE NINETEEN TYPES THIS DEPLOYMENT CAN EXECUTE.
+ *
+ * The two refinements are the enum's whole value. A status other than
+ * NOT_CHECKED with no `checkedAt` is a verdict about an image nobody looked at;
+ * NOT_CHECKED WITH a `checkedAt` is a probe that ran and refused to say what it
+ * found. Either one makes "4 of 19 test types are not executable here" a
+ * sentence with nothing behind it.
+ *
+ * `detail` is REQUIRED and is rendered in the coverage report and the preflight
+ * summary, so a probe must never put a credential, cookie, storageState value
+ * or token in it. Truncated and hashed both count as leaks.
+ */
+export const deploymentCapabilitySchema = z
+  .object({
+    /** `<self>` for this image, `pool:<name>` for an on-prem runner pool. */
+    deploymentKey: z.string().min(1).max(200).default(SELF_DEPLOYMENT),
+    testType: z.enum(TEST_TYPES),
+    status: deploymentCapabilityStatusSchema,
+    detail: z.string().min(1).max(500),
+    remedy: z.string().min(1).max(500).nullable().default(null),
+    requiredBinary: z.string().min(1).max(200).nullable().default(null),
+    requiredVersion: z.string().min(1).max(100).nullable().default(null),
+    /** Null for a probe that could not read a version. Never `0.0.0`. */
+    observedVersion: z.string().min(1).max(100).nullable().default(null),
+    checkedAtIso: z.string().datetime().nullable().default(null),
+  })
+  .refine((row) => row.status === 'NOT_CHECKED' || row.checkedAtIso !== null, {
+    message:
+      'a capability verdict must say when it was probed — a cached AVAILABLE for a binary that ' +
+      'has since vanished is the lie this table exists to kill',
+    path: ['checkedAtIso'],
+  })
+  .refine((row) => row.status !== 'NOT_CHECKED' || row.checkedAtIso === null, {
+    message: 'NOT_CHECKED means nobody asked, so it cannot carry the time somebody asked',
+    path: ['checkedAtIso'],
+  })
+  .refine((row) => row.status !== 'WRONG_VERSION' || row.requiredVersion !== null, {
+    message:
+      'WRONG_VERSION with no required range is a refusal a human cannot act on — name the range',
+    path: ['requiredVersion'],
+  });
+
+// ─── The export envelope ────────────────────────────────────────────────────
+
+/**
+ * One axis an attestation did not measure.
+ *
+ * Both `dimension` and `kind` are nullable and at least one is required,
+ * because the two vocabularies name different things and a document has to be
+ * able to disclose either: `SURFACE_KINDS` is the inventory axis ("we do not
+ * enumerate background jobs") and `COVERAGE_DIMENSIONS` is the breakdown axis
+ * ("we do not measure validation rules"). Forcing one would have meant silently
+ * dropping half the disclosures.
+ */
+export const attestationUnmeasuredSchema = z
+  .object({
+    dimension: coverageDimensionSchema.nullable().default(null),
+    kind: z.enum(SURFACE_KINDS).nullable().default(null),
+    reason: dimensionUnmeasuredReasonSchema,
+    detail: z.string().min(1).max(500),
+    /** Cells known to exist and not measured, or null when even the count is unknown. */
+    cells: z.number().int().min(0).nullable(),
+  })
+  .refine((row) => row.dimension !== null || row.kind !== null, {
+    message: 'an unmeasured entry must name the axis it is about',
+    path: ['dimension'],
+  });
+
+/**
+ * THE ATTESTATION, AND WHY THREE FIELDS HAVE NO DEFAULT.
+ *
+ * `scopeStatement`, `unmeasured` and `caps` are REQUIRED with no `.default()`,
+ * which is deliberately stricter than `suiteHealthSnapshotSchema.caveats`.
+ * There an empty list is a positive and verifiable claim that a scan truncated
+ * nothing. Here it would be a claim that nothing was unmeasured, and a reader
+ * given a percentage and no scope does not conclude "scope unknown" — they
+ * conclude "87% of the application, and the other 13% is ordinary untested
+ * code". If nine axes were never measured and a page budget truncated the crawl
+ * at 1,000 URLs, that reader has been told something false by a document
+ * containing no false sentence. Omission is the lie, so the writer must state
+ * the scope or be refused.
+ *
+ * The TYPE-LEVEL half of the same guarantee lives in
+ * packages/shared/src/attestation.ts, where a module-private brand makes
+ * `attest()` the only way to construct one. Two mechanisms, because this
+ * schema guards the wire and the brand guards the code, and neither sees the
+ * other's mistakes.
+ */
+export const coverageAttestationSchema = z
+  .object({
+    snapshotId: z.string().min(1).max(64).nullable().default(null),
+    issuedAtIso: z.string().datetime(),
+    issuedByUserId: z.string().min(1).max(64).nullable().default(null),
+    crawlVersion: z.string().min(1).max(200),
+    crawlFingerprint: z.string().min(1).max(200).nullable().default(null),
+    denominatorDefinition: z.string().min(1).max(2_000),
+    percent: z.number().min(0).max(100).nullable(),
+    denominator: z.number().int().min(0),
+    covered: z.number().int().min(0),
+    scopeStatement: z.string().trim().min(1).max(4_000),
+    unmeasured: z.array(attestationUnmeasuredSchema).max(60),
+    caps: z.array(dimensionCapBiteSchema).max(40),
+    fingerprint: z.string().min(1).max(200),
+  })
+  .refine((row) => row.covered <= row.denominator, {
+    message: 'an attestation cannot cover more of the surface than it measured',
+    path: ['covered'],
+  })
+  .refine((row) => row.denominator > 0 || row.percent === null, {
+    message: 'an empty denominator has no percentage — null is not 0 and it is not 100',
+    path: ['percent'],
+  });
+
+// ─── Measuring the measurer ─────────────────────────────────────────────────
+
+/**
+ * THE BACK-TEST: does "covered" track escaped defects?
+ *
+ * The refinements enforce the honesty that matters most here, because this is
+ * the number a buyer most wants to be flattering. With fewer than
+ * `minimumDefects` the verdict must be INSUFFICIENT_DATA and BOTH rates must be
+ * null — a zero escaped-defect rate on covered surface is the single most
+ * flattering number this product could print, and it is exactly what a
+ * back-test over three tickets produces.
+ *
+ * `verdictDetail` is required on every verdict including SUFFICIENT, because
+ * the sentence has to state the n: "11 defects, below the 30 this comparison
+ * needs" is actionable and "INSUFFICIENT_DATA" is not.
+ */
+export const validityBacktestSchema = z
+  .object({
+    snapshotId: z.string().min(1).max(64).nullable().default(null),
+    windowStartAtIso: z.string().datetime(),
+    windowEndAtIso: z.string().datetime(),
+    defectCount: z.number().int().min(0),
+    coveredSurfaceCount: z.number().int().min(0),
+    uncoveredSurfaceCount: z.number().int().min(0),
+    defectsOnCovered: z.number().int().min(0),
+    defectsOnUncovered: z.number().int().min(0),
+    /** Defects per surface. NULL WHEN INSUFFICIENT — never 0. */
+    escapedRateCovered: z.number().min(0).nullable(),
+    escapedRateUncovered: z.number().min(0).nullable(),
+    verdict: validityVerdictSchema,
+    verdictDetail: z.string().min(1).max(500),
+    /** The threshold that was APPLIED, disclosed rather than implied. */
+    minimumDefects: z.number().int().min(1).default(MINIMUM_BACKTEST_DEFECTS),
+    /** Which tracker and which query. A rate whose input nobody can name is unreproducible. */
+    defectSource: z.string().min(1).max(200),
+    fingerprint: z.string().min(1).max(200),
+  })
+  .refine((row) => row.windowEndAtIso >= row.windowStartAtIso, {
+    message: 'the window ends before it starts',
+    path: ['windowEndAtIso'],
+  })
+  .refine((row) => row.defectsOnCovered + row.defectsOnUncovered <= row.defectCount, {
+    message:
+      'more defects attributed to surfaces than were counted — the parts cannot exceed the whole',
+    path: ['defectCount'],
+  })
+  .refine(
+    (row) =>
+      row.verdict === 'SUFFICIENT' ||
+      (row.escapedRateCovered === null && row.escapedRateUncovered === null),
+    {
+      message:
+        'a rate beside a verdict of INSUFFICIENT_DATA or NOT_ATTEMPTED — the whole point of those ' +
+        'two answers is that there is no number',
+      path: ['escapedRateCovered'],
+    },
+  )
+  .refine((row) => row.verdict !== 'SUFFICIENT' || row.defectCount >= row.minimumDefects, {
+    message:
+      'SUFFICIENT below the threshold this row itself declares — the verdict and the n disagree',
+    path: ['verdict'],
+  });
+
+/**
+ * ONE BENCHMARK RUN: what share of SEEDED defects the suite actually caught.
+ *
+ * The three counts are NULLABLE WITH NO DEFAULT. `0` detected is a result — a
+ * terrible one — and "we did not finish" is not a result at all; defaulting
+ * them would make a crashed bench report a 0% detection rate against the
+ * product's own test suite, which is both false and the most alarming possible
+ * false value.
+ *
+ * `baselineCleanAfter` is nullable for the same reason: a bench that crashed
+ * never re-asserted the baseline, and null there means the run did not finish
+ * rather than that the baseline was dirty.
+ */
+export const benchmarkRunSchema = z
+  .object({
+    /** Taken as an argument, never generated inside the bench: no seed, no benchmark. */
+    seed: z.string().min(1).max(200),
+    suiteId: z.string().min(1).max(64).nullable().default(null),
+    runId: z.string().min(1).max(64).nullable().default(null),
+    faultCount: z.number().int().min(0),
+    detectedCount: z.number().int().min(0).nullable(),
+    missedCount: z.number().int().min(0).nullable(),
+    notExercisedCount: z.number().int().min(0).nullable(),
+    baselineCleanBefore: z.boolean(),
+    baselineCleanAfter: z.boolean().nullable(),
+    startedAtIso: z.string().datetime(),
+    finishedAtIso: z.string().datetime().nullable().default(null),
+    caveats: z.array(z.string().min(1).max(500)).max(40).default([]),
+    fingerprint: z.string().min(1).max(200),
+  })
+  .refine(
+    (row) =>
+      row.detectedCount === null ||
+      row.missedCount === null ||
+      row.notExercisedCount === null ||
+      row.detectedCount + row.missedCount + row.notExercisedCount <= row.faultCount,
+    {
+      message:
+        'more outcomes than faults — the parts cannot exceed the whole, and a bench that cannot ' +
+        'add up is a bench nobody can quote',
+      path: ['faultCount'],
+    },
+  )
+  .refine(
+    (row) =>
+      row.finishedAtIso === null ||
+      (row.detectedCount !== null && row.missedCount !== null && row.notExercisedCount !== null),
+    {
+      message: 'a finished bench must report its counts',
+      path: ['detectedCount'],
+    },
+  )
+  .refine((row) => row.finishedAtIso === null || row.baselineCleanAfter !== null, {
+    message:
+      'a finished bench must re-assert the clean baseline — a fault left switched on makes every ' +
+      'later reading meaningless, so the check at the end is not optional',
+    path: ['baselineCleanAfter'],
+  });
+
+/**
+ * ONE SEEDED DEFECT, AND WHAT THE SUITE DID ABOUT IT.
+ *
+ * `faultClass` is required because the only useful form of this number is per
+ * class: "we catch 90% of broken validations and 20% of silent failures" is a
+ * finding a team acts on, and one blended percentage is a marketing number.
+ *
+ * `detail` is required on every outcome including NOT_EXERCISED — especially
+ * NOT_EXERCISED, which is the outcome a reader is most likely to misread as a
+ * miss and which needs the sentence "no test exercised ROUTE:/refunds".
+ */
+export const benchmarkFaultResultSchema = z
+  .object({
+    faultId: z.string().min(1).max(200),
+    faultClass: z.string().min(1).max(120),
+    /** The `CoverageItem.key` the fault lives on, when the catalogue named one. */
+    surfaceItemKey: z.string().min(1).max(500).nullable().default(null),
+    outcome: faultDetectionOutcomeSchema,
+    detail: z.string().min(1).max(1_000),
+    detectedByTestId: z.string().min(1).max(64).nullable().default(null),
+  })
+  .refine((row) => row.outcome !== 'DETECTED' || row.detectedByTestId !== null, {
+    message:
+      'DETECTED with no test named — a detection nobody can point at is the claim this whole ' +
+      'benchmark exists to replace',
+    path: ['detectedByTestId'],
+  })
+  .refine((row) => row.outcome === 'DETECTED' || row.detectedByTestId === null, {
+    message: 'a test is named as having caught a fault that was not recorded as detected',
+    path: ['outcome'],
+  });

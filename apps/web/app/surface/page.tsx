@@ -6,6 +6,7 @@ import { SECTION_TABS_SLOT_ID } from '../../components/shell/AppShell';
 import { useProject } from '../../components/shell/ProjectContext';
 import { Page, PageHeader, SectionLabel } from '../../components/ui/layout';
 import { AccessAndDrift, useAccessAndDrift } from './AccessAndDrift';
+import { Dimensions, useDimensions } from './Dimensions';
 
 /**
  * The dark-surface screen.
@@ -51,6 +52,14 @@ export default function SurfacePage() {
   }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const access = useAccessAndDrift(projectId, environmentId, loading);
+  /*
+   * Per PROJECT, not per environment, which is why it is not inside the
+   * environment-scoped block below: a form's fields and a component's states
+   * are properties of the repository, and the typed obligations are a property
+   * of the project's own policy. None of the three changes when the reader
+   * picks a different environment.
+   */
+  const dimensions = useDimensions(projectId, loading);
 
   return (
     <Page width="insights">
@@ -92,6 +101,18 @@ export default function SurfacePage() {
           </label>
         )}
         <AccessAndDrift data={access} />
+      </div>
+
+      <div className="border-line mt-[34px] border-t pt-[26px]">
+        <p className="text-ink-dim text-row-sub leading-relaxed">
+          The figure above is one number over surface ITEMS. Beneath it, each axis divides by its
+          own cells — a page state, a form field, a validation rule and a typed obligation are
+          different things to test, so they are never added together. An axis this build does not
+          measure is named as unmeasured rather than scored as zero.
+        </p>
+        <div className="mt-[22px]">
+          <Dimensions data={dimensions} />
+        </div>
       </div>
     </Page>
   );

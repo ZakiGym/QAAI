@@ -142,6 +142,127 @@ export const BASE_URL_DEPENDENT_TEST_TYPES: ReadonlySet<TestType> = new Set<Test
 export type BrowserEngine = 'chromium' | 'firefox' | 'webkit';
 
 /**
+ * A version window a plugin needs, and the flag or behaviour that moved.
+ *
+ * ── Why `below` is nullable and `atLeast` is not ─────────────────────────────
+ *
+ * A floor is something you learn by reading the plugin: it passes a flag, and
+ * that flag landed in some release. A CEILING is something you learn by being
+ * broken — a tool removed the flag in a major — and until that has actually
+ * happened, asserting one would refuse a newer binary that works fine. So
+ * `below: null` means "no upper bound is known", which is a different sentence
+ * from "every future version will work", and the detail string says the first.
+ *
+ * `why` is not decoration: it is what makes a WRONG_VERSION row actionable.
+ * "k6 >= 0.40" tells a reader nothing; "`--summary-export` is how plugins/load.ts
+ * gets its metrics" tells them what breaks if they pin an older one.
+ */
+export interface VersionRange {
+  /** Lowest version known to work, inclusive. */
+  atLeast: string;
+  /** First version known NOT to work, exclusive. Null = no ceiling has been established. */
+  below: string | null;
+  /** The flag, output format or behaviour this plugin depends on. */
+  why: string;
+}
+
+/**
+ * Why a requirement is not satisfied — which is a different question from
+ * whether it is.
+ *
+ * `satisfied: false` alone cannot distinguish "k6 is not installed" from "k6 is
+ * installed and is three majors too old", and those map to DIFFERENT capability
+ * statuses (MISSING vs WRONG_VERSION) with different remedies: one is an
+ * install, the other is an upgrade or a pin. Collapsing them is how a row that
+ * says MISSING sends somebody to install a binary that is already on the image.
+ *
+ * `null` sits beside `satisfied: null`: nothing was established, so there is no
+ * reason to give.
+ */
+export type UnmetReason = 'ABSENT' | 'VERSION' | null;
+
+/**
+ * Parse the leading dotted-numeric version out of a tool's `--version` output.
+ *
+ * Tools do not agree on this and never will: `k6 v0.49.0`, `grpcurl 1.9.1`,
+ * `11.7.1` on its own line, `Chromium 121.0.6167.85`.
+ *
+ * ── THE TOOL'S OWN NAME HAS A DIGIT IN IT ───────────────────────────────────
+ *
+ * The obvious implementation is `/(\d+(?:\.\d+)*)/`, and it reads `k6 v0.49.0`
+ * as version SIX — the `6` in `k6`. That is not a hypothetical: it is the first
+ * thing this function did, and the test
+ * 'reads the version out of whatever the tool decided to print' caught it. The
+ * consequence would have been silent and expensive: `[6]` compares as newer
+ * than a `0.40.0` floor, so every k6 on earth would have passed a version check
+ * that never looked at a version.
+ *
+ * So two rules, and both are load-bearing:
+ *   · the number may not be preceded by an alphanumeric, with a single `v`
+ *     allowed in front of it (`v0.49.0`), which rules out the `6` in `k6`;
+ *   · it must contain AT LEAST ONE DOT. A bare integer in a tool's banner is
+ *     far more likely to be part of its name, a year or a build counter than a
+ *     version, and reading one would be guessing.
+ *
+ * Returns `null` — never `[0]`, never `[]` — when nothing qualifies. A version
+ * that could not be read must stay unreadable all the way to the report:
+ * `0.0.0` would compare as "older than everything" and turn an unparseable
+ * `--version` into a confident WRONG_VERSION against a binary that may be
+ * perfectly current. That is the null-became-zero lie in its most expensive
+ * form, because it refuses a working tool.
+ */
+export function parseVersion(raw: string): number[] | null {
+  const match = /(?<![A-Za-z0-9])v?(\d+(?:\.\d+)+)/.exec(raw);
+  if (!match) return null;
+  const parts = match[1]!.split('.').map((part) => Number.parseInt(part, 10));
+  return parts.some((part) => !Number.isFinite(part)) ? null : parts;
+}
+
+/**
+ * Compare two parsed versions component-wise, treating absent components as 0.
+ *
+ * `1.2` and `1.2.0` are the same version, which is the behaviour every tool's
+ * own `--version` assumes when it prints the short form.
+ */
+export function compareVersions(a: readonly number[], b: readonly number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const left = a[i] ?? 0;
+    const right = b[i] ?? 0;
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Is this observed `--version` output inside the range?
+ *
+ * Tri-state on purpose, and the `null` is the whole reason this is a function
+ * rather than two comparisons: an output this cannot parse is NOT a failure. It
+ * is a tool whose version we could not read, and the only honest answer is "not
+ * checked".
+ */
+export function satisfiesRange(observed: string, range: VersionRange): boolean | null {
+  const found = parseVersion(observed);
+  if (!found) return null;
+  const floor = parseVersion(range.atLeast);
+  if (!floor) return null;
+  if (compareVersions(found, floor) < 0) return false;
+  if (range.below !== null) {
+    const ceiling = parseVersion(range.below);
+    if (!ceiling) return null;
+    if (compareVersions(found, ceiling) >= 0) return false;
+  }
+  return true;
+}
+
+/** One line describing the window, for a refusal a human has to act on. */
+export function describeRange(range: VersionRange): string {
+  return range.below === null
+    ? `>= ${range.atLeast} (no upper bound established)`
+    : `>= ${range.atLeast} and < ${range.below}`;
+}
+
+/**
  * One thing a type needs, and — the field that matters — WHO decides whether
  * this particular test needs it.
  *
@@ -159,7 +280,23 @@ export type BrowserEngine = 'chromium' | 'firefox' | 'webkit';
  * every ENOENT path in packages/runner/src/plugins ends in an install line.
  */
 export type Requirement =
-  | { kind: 'BINARY'; scope: 'TYPE' | 'SPEC'; name: string; install: string; why?: string }
+  | {
+      kind: 'BINARY';
+      scope: 'TYPE' | 'SPEC';
+      name: string;
+      install: string;
+      why?: string;
+      /**
+       * The window this plugin needs, when one has been ESTABLISHED.
+       *
+       * Absent on every entry in `TYPE_REQUIREMENTS` today, and that is a
+       * deliberate empty default rather than an oversight — see the note on
+       * `TYPE_REQUIREMENTS`. A range nobody has verified, asserted here, would
+       * refuse a working binary, and "QAAI refused my k6" is a worse defect
+       * than "QAAI did not check my k6's version and said so".
+       */
+      version?: VersionRange;
+    }
   | { kind: 'BROWSER'; scope: 'TYPE' | 'SPEC'; name: BrowserEngine; install: string; why?: string }
   | { kind: 'PLATFORM'; scope: 'TYPE' | 'SPEC'; platform: string; why: string }
   /** Something only the test's own spec names, or only the tenant's network can reach. */
@@ -172,8 +309,23 @@ export interface RequirementStatus {
    * boolean. See the honesty rules in this file's header.
    */
   satisfied: boolean | null;
+  /**
+   * WHY it is unsatisfied, when it is. Always `null` when `satisfied` is not
+   * `false` — there is no reason to give for a requirement that was met or was
+   * never established. This is what separates MISSING from WRONG_VERSION
+   * downstream; see `UnmetReason`.
+   */
+  unmet: UnmetReason;
   /** One clause, for the report. Says what was looked at, not what was assumed. */
   detail: string;
+  /**
+   * What the version probe actually read back, when it read anything.
+   *
+   * `null` means no version was read — because no range is declared, because
+   * the binary is absent, or because the probe could not tell. All three are
+   * "not measured", and none of them may be rendered as a version.
+   */
+  observedVersion: string | null;
 }
 
 export interface TypeRunnability {
@@ -186,6 +338,13 @@ export interface TypeRunnability {
   runnable: boolean | null;
   /** TYPE-scoped requirements that are definitively absent. Non-empty ⇒ refuse. */
   missing: readonly Requirement[];
+  /**
+   * TYPE-scoped requirements that are PRESENT and outside their declared
+   * window. Non-empty ⇒ refuse, exactly like `missing` — but kept apart from it
+   * because the remedy is an upgrade, not an install, and a row that says
+   * "missing" about an installed binary sends a reader to do the wrong thing.
+   */
+  wrongVersion: readonly Requirement[];
   /** SPEC-scoped requirements that are absent: reported, never a refusal. */
   degraded: readonly Requirement[];
   requirements: readonly RequirementStatus[];
@@ -205,6 +364,27 @@ const PLAYWRIGHT_INSTALL = 'npx playwright install';
  * one: those two report `runnable: true` because there is genuinely nothing
  * left to check, while a type whose only requirements are SPEC-scoped reports
  * `null`, because what it needs depends on a test nobody has read yet.
+ *
+ * ── NOT ONE ENTRY DECLARES A `version`, AND THAT IS THE HONEST DEFAULT ──────
+ *
+ * The WRONG_VERSION machinery is built, probed and reported — and no
+ * requirement here uses it, because no minimum version for k6, Lighthouse,
+ * grpcurl or any mobile driver has ever been ESTABLISHED in this repository.
+ * There is no such figure in the Dockerfile, in docs/, or in the plugins
+ * themselves; `plugins/load.ts` passes `--summary-export` and nobody has
+ * recorded which k6 releases accept it.
+ *
+ * Writing a plausible floor here would be the worst available outcome. It reads
+ * as measurement, it would fire on a customer's working binary, and the row it
+ * produced ("WRONG_VERSION: k6 0.38 is outside >= 0.40") would be a number this
+ * product invented about a tool it never tested. A requirement with no declared
+ * window reports that its version was NOT READ — which is true, and which is a
+ * different sentence from "any version works".
+ *
+ * So this list stays version-free until somebody pins a flag to a release and
+ * can say how they know. The same empty-on-purpose idiom, for the same reason,
+ * as `DEFAULT_TYPE_OBLIGATIONS` and `EXTRACTED_COVERAGE_DIMENSIONS` in
+ * packages/shared/src/coverage-dimensions.ts.
  */
 export const TYPE_REQUIREMENTS: Readonly<Record<TestType, readonly Requirement[]>> = {
   E2E: [
@@ -361,6 +541,24 @@ export interface RunnabilityProbes {
   onPath?: (binary: string) => boolean | null;
   /** Is this Playwright engine's browser actually on disk? `null` = could not tell. */
   browserInstalled?: (engine: BrowserEngine) => boolean | null;
+  /**
+   * The raw `--version` output of a binary, or `null` for "could not tell".
+   *
+   * ── There is deliberately NO DEFAULT for this one ──────────────────────────
+   *
+   * Reading a version means EXECUTING the binary, and this module's standing
+   * promise (see the header: "it never probes what it cannot probe cheaply") is
+   * that it does not. A default implementation here would quietly spawn up to
+   * nineteen processes inside a function whose documented contract is a `stat`,
+   * and several of these tools take seconds to print a version.
+   *
+   * So the logic lives here and the one thin adapter that spawns lives in the
+   * worker (apps/worker/src/processors/preflight.ts), which already has a
+   * process budget and a timeout to put around it. Absent this probe, a
+   * requirement with a declared range reports `satisfied: null` and
+   * NOT_CHECKED — never AVAILABLE, and never WRONG_VERSION.
+   */
+  binaryVersion?: (binary: string) => string | null;
   platform?: string;
 }
 
@@ -450,7 +648,14 @@ async function browserInstalledDefault(engine: BrowserEngine): Promise<boolean |
   return answer;
 }
 
-async function checkRequirement(
+/**
+ * Check ONE requirement. Exported so its tri-state can be tested directly
+ * rather than inferred from a `TypeRunnability` three layers up — the
+ * `satisfied`/`unmet`/`observedVersion` combinations are the part of this file
+ * most likely to be collapsed by a later edit, and a test that can only see the
+ * aggregate cannot tell which of them moved.
+ */
+export async function checkRequirement(
   requirement: Requirement,
   probes: RunnabilityProbes,
 ): Promise<RequirementStatus> {
@@ -458,15 +663,84 @@ async function checkRequirement(
     case 'BINARY': {
       const onPath = probes.onPath ?? onPathDefault;
       const found = onPath(requirement.name);
+      if (found === null) {
+        return {
+          requirement,
+          satisfied: null,
+          unmet: null,
+          observedVersion: null,
+          detail: `whether \`${requirement.name}\` is on PATH could not be determined on this platform, so it is not counted either way`,
+        };
+      }
+      if (!found) {
+        return {
+          requirement,
+          satisfied: false,
+          unmet: 'ABSENT',
+          // Absent, so there is no version. Reporting one here would be reporting
+          // a reading taken from a binary that is not there.
+          observedVersion: null,
+          detail: `\`${requirement.name}\` is not on PATH — install it with: ${requirement.install}`,
+        };
+      }
+
+      /*
+       * On PATH. Whether that is ENOUGH depends on whether a window has been
+       * declared, and the three outcomes below are all genuinely different:
+       *
+       *   no range declared      → satisfied, and the detail says the version
+       *                            was NOT looked at. "We did not check" must
+       *                            never read as "any version works".
+       *   range, no probe        → satisfied: null. The binary is here and its
+       *                            version is unknown, so nothing is claimed in
+       *                            either direction — not AVAILABLE (that would
+       *                            vouch for a version nobody read) and not
+       *                            WRONG_VERSION (that would refuse it blind).
+       *   range, probe answered  → the comparison, with `null` from an
+       *                            unparseable output staying null.
+       */
+      if (!requirement.version) {
+        return {
+          requirement,
+          satisfied: true,
+          unmet: null,
+          observedVersion: null,
+          detail: `\`${requirement.name}\` resolves on PATH (not executed, so "it runs" is not claimed; no version window is declared for it, so its version was not read)`,
+        };
+      }
+
+      const range = requirement.version;
+      const raw = probes.binaryVersion?.(requirement.name) ?? null;
+      if (raw === null) {
+        return {
+          requirement,
+          satisfied: null,
+          unmet: null,
+          observedVersion: null,
+          detail: `\`${requirement.name}\` resolves on PATH, but its version could not be read, and this plugin needs ${describeRange(range)} — so neither its presence nor its suitability is claimed`,
+        };
+      }
+
+      const verdict = satisfiesRange(raw, range);
+      if (verdict === null) {
+        return {
+          requirement,
+          satisfied: null,
+          unmet: null,
+          // Unparseable is not a version. See `parseVersion` on why this is not
+          // allowed to become "0.0.0".
+          observedVersion: null,
+          detail: `\`${requirement.name}\` resolves on PATH and answered \`--version\` with something this build cannot parse as a version, so it is not counted either way (needs ${describeRange(range)})`,
+        };
+      }
       return {
         requirement,
-        satisfied: found,
-        detail:
-          found === null
-            ? `whether \`${requirement.name}\` is on PATH could not be determined on this platform, so it is not counted either way`
-            : found
-              ? `\`${requirement.name}\` resolves on PATH (not executed, so "it runs" is not claimed)`
-              : `\`${requirement.name}\` is not on PATH — install it with: ${requirement.install}`,
+        satisfied: verdict,
+        unmet: verdict ? null : 'VERSION',
+        observedVersion: raw,
+        detail: verdict
+          ? `\`${requirement.name}\` resolves on PATH and reports ${raw}, inside the ${describeRange(range)} this plugin needs`
+          : `\`${requirement.name}\` is installed and reports ${raw}, which is outside the ${describeRange(range)} this plugin needs — ${range.why}. Upgrade it rather than installing it: ${requirement.install}`,
       };
     }
     case 'BROWSER': {
@@ -476,6 +750,13 @@ async function checkRequirement(
       return {
         requirement,
         satisfied: installed,
+        /*
+         * A browser is either downloaded or it is not; Playwright pins the
+         * build to the library version, so there is no "installed but wrong
+         * version" state to report. Hence ABSENT or nothing, never VERSION.
+         */
+        unmet: installed === false ? 'ABSENT' : null,
+        observedVersion: null,
         detail:
           installed === null
             ? `whether Playwright's ${requirement.name} is installed could not be determined here, so it is not counted either way`
@@ -490,6 +771,10 @@ async function checkRequirement(
       return {
         requirement,
         satisfied: ok,
+        // A wrong operating system is a thing that is absent, not a thing that
+        // is out of date. Nobody upgrades their way from Linux to darwin.
+        unmet: ok ? null : 'ABSENT',
+        observedVersion: null,
         detail: ok
           ? `this worker is ${platform}`
           : `this worker is ${platform}, not ${requirement.platform} — ${requirement.why}`,
@@ -499,6 +784,8 @@ async function checkRequirement(
       return {
         requirement,
         satisfied: null,
+        unmet: null,
+        observedVersion: null,
         detail: `${requirement.what} is not checked here: ${requirement.why}`,
       };
   }
@@ -515,7 +802,20 @@ async function checkRequirement(
  */
 export async function checkRunnability(
   types: readonly TestType[],
-  options: { probes?: RunnabilityProbes; pluginless?: (type: TestType) => string | null } = {},
+  options: {
+    probes?: RunnabilityProbes;
+    pluginless?: (type: TestType) => string | null;
+    /**
+     * Override what a type requires, per type.
+     *
+     * The production caller never passes this — `TYPE_REQUIREMENTS` is the
+     * answer. It exists so the version machinery can be exercised against a
+     * declared window without one being typed into the shipped table, where it
+     * would fire on a customer's working binary. See the note on
+     * `TYPE_REQUIREMENTS` about why that table is deliberately version-free.
+     */
+    requirements?: Partial<Record<TestType, readonly Requirement[]>>;
+  } = {},
 ): Promise<TypeRunnability[]> {
   const probes = options.probes ?? {};
   const out: TypeRunnability[] = [];
@@ -527,6 +827,7 @@ export async function checkRunnability(
         type,
         runnable: false,
         missing: [],
+        wrongVersion: [],
         degraded: [],
         requirements: [],
         reason: noPlugin,
@@ -535,13 +836,17 @@ export async function checkRunnability(
     }
 
     const requirements: RequirementStatus[] = [];
-    for (const requirement of TYPE_REQUIREMENTS[type]) {
+    for (const requirement of options.requirements?.[type] ?? TYPE_REQUIREMENTS[type]) {
       requirements.push(await checkRequirement(requirement, probes));
     }
 
-    const missing = requirements
-      .filter((r) => r.satisfied === false && r.requirement.scope === 'TYPE')
-      .map((r) => r.requirement);
+    const unmetAtType = (reason: UnmetReason): Requirement[] =>
+      requirements
+        .filter((r) => r.satisfied === false && r.unmet === reason && r.requirement.scope === 'TYPE')
+        .map((r) => r.requirement);
+
+    const missing = unmetAtType('ABSENT');
+    const wrongVersion = unmetAtType('VERSION');
     const degraded = requirements
       .filter((r) => r.satisfied === false && r.requirement.scope === 'SPEC')
       .map((r) => r.requirement);
@@ -549,22 +854,28 @@ export async function checkRunnability(
 
     /*
      * The tri-state, spelled out so nobody has to reconstruct it:
-     *   something definitively missing → false
-     *   nothing missing and something checked → true
-     *   nothing checkable at all (every requirement SPEC-named) → null
+     *   something definitively missing OR out of range → false
+     *   nothing unmet and something checked → true
+     *   nothing checkable at all (every requirement SPEC-named, or a declared
+     *     version window with no version probe) → null
      * A type with no requirements lands in `true` through the empty-checked
      * arm below, which is correct and is its own case: API needs nothing.
      */
     const runnable =
-      missing.length > 0 ? false : checked.length > 0 || requirements.length === 0 ? true : null;
+      missing.length > 0 || wrongVersion.length > 0
+        ? false
+        : checked.length > 0 || requirements.length === 0
+          ? true
+          : null;
 
     out.push({
       type,
       runnable,
       missing,
+      wrongVersion,
       degraded,
       requirements,
-      reason: runnabilitySentence(type, runnable, requirements, missing, degraded),
+      reason: runnabilitySentence(type, runnable, requirements, missing, wrongVersion, degraded),
     });
   }
 
@@ -574,7 +885,9 @@ export async function checkRunnability(
 function describeRequirement(requirement: Requirement): string {
   switch (requirement.kind) {
     case 'BINARY':
-      return `\`${requirement.name}\` (${requirement.install})`;
+      return requirement.version
+        ? `\`${requirement.name}\` ${describeRange(requirement.version)} (${requirement.install})`
+        : `\`${requirement.name}\` (${requirement.install})`;
     case 'BROWSER':
       return `Playwright's ${requirement.name} (${requirement.install})`;
     case 'PLATFORM':
@@ -589,12 +902,27 @@ function runnabilitySentence(
   runnable: boolean | null,
   requirements: readonly RequirementStatus[],
   missing: readonly Requirement[],
+  wrongVersion: readonly Requirement[],
   degraded: readonly Requirement[],
 ): string {
+  /*
+   * ABSENT is reported BEFORE out-of-range when both apply, because the two
+   * remedies are not interchangeable and the install is the one that has to
+   * happen first. A reader told to upgrade a tool they have not got installed
+   * will go and look for a version of it.
+   */
   if (missing.length > 0) {
     return (
       `This deployment cannot execute ${type} tests: it is missing ` +
       `${missing.map(describeRequirement).join(' and ')}. ` +
+      'Nothing here is a verdict on your application.'
+    );
+  }
+  if (wrongVersion.length > 0) {
+    return (
+      `This deployment cannot execute ${type} tests: it HAS ` +
+      `${wrongVersion.map(describeRequirement).join(' and ')}, at a version outside the ` +
+      'window this plugin needs. That is an upgrade, not an install. ' +
       'Nothing here is a verdict on your application.'
     );
   }
@@ -665,6 +993,127 @@ export interface UrlProbeResult {
 }
 
 export type UrlProbe = (url: string, timeoutMs: number) => Promise<UrlProbeResult>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Where the preflight is allowed to connect.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Who is running this probe, which decides which hosts it may open.
+ *
+ * ── Why this is a parameter and not a rule ──────────────────────────────────
+ *
+ * The base URL is a CUSTOMER-NAMED HOST and this function makes our process
+ * open it. In QAAI's own cloud that is textbook SSRF: a tenant who sets their
+ * base URL to `http://169.254.169.254/` has arranged for our worker to fetch
+ * the cloud metadata endpoint, and `probeBaseUrl`'s detail string would tell
+ * them whether it answered. So in HOSTED mode a private, loopback, link-local
+ * or otherwise non-public target is REFUSED.
+ *
+ * And a blanket refusal would be its own serious defect, which is why there are
+ * two modes rather than one rule. A self-hosted QAAI exists precisely to test
+ * `http://localhost:3000` and `https://app.internal`; refusing those would
+ * break the install for every customer who runs this behind their own firewall,
+ * and they are not attacking themselves — the worker and the target are on the
+ * same side of the boundary. SELF_HOSTED therefore probes the host it was
+ * given, and the check it skips is NAMED in the result rather than silently not
+ * performed.
+ *
+ * It is a parameter and NOT an environment variable because a new env var is
+ * out of scope for this slice (and a security control nobody can discover is
+ * not a control). The caller is the run processor, which already knows which
+ * deployment it is.
+ */
+export type ProbeHostMode = 'HOSTED' | 'SELF_HOSTED';
+
+/** How this module classifies and resolves a host. Injected; no DNS in a unit test. */
+export interface HostGuardIo {
+  classify: (host: string) => { kind: 'address' | 'name' | 'ambiguous'; why?: string };
+  /** Must answer for EVERY address the name has, not the first one. */
+  resolves: (host: string) => Promise<{ ok: boolean; reason: string }>;
+}
+
+export type HostGuardVerdict =
+  | { allowed: true; skipped: boolean; detail: string }
+  | { allowed: false; reason: string };
+
+/**
+ * May this preflight open this host?
+ *
+ * Returns `skipped: true` when the mode means no check was made, so the caller
+ * can SAY that rather than imply a clean bill of health. A guard that passes
+ * silently in the one mode where it does nothing is indistinguishable from a
+ * guard that ran, and that is the "pass that means we did not check" this
+ * product may never print.
+ */
+export async function guardProbeHost(args: {
+  hostname: string;
+  mode: ProbeHostMode;
+  io: HostGuardIo;
+}): Promise<HostGuardVerdict> {
+  if (args.mode === 'SELF_HOSTED') {
+    return {
+      allowed: true,
+      skipped: true,
+      detail:
+        'This deployment is self-hosted, so the base URL was not checked against the private-address rules: ' +
+        'a worker inside your own network is expected to reach your own hosts.',
+    };
+  }
+
+  /*
+   * `ambiguous` is treated exactly as a loopback address, which is the contract
+   * `classifyHost` states and the one a caller gets wrong: `0177.0.0.1`,
+   * `0x7f.0.0.1` and `2130706433` are all 127.0.0.1 to something downstream,
+   * and handing one to a resolver gives the octal form a second chance.
+   */
+  const verdict = args.io.classify(args.hostname);
+  if (verdict.kind === 'ambiguous') {
+    return {
+      allowed: false,
+      reason: `Refusing to probe ${args.hostname}: ${verdict.why ?? 'QAAI will not guess at that host'}.`,
+    };
+  }
+
+  const resolved = await args.io.resolves(args.hostname);
+  if (!resolved.ok) return { allowed: false, reason: resolved.reason };
+
+  /*
+   * Honest about what this is: a CHECK, not a pin. Whoever opens the connection
+   * resolves the name again, so a record set that changes between this call and
+   * the fetch (rebinding, a one-second TTL) can still steer the request
+   * somewhere this function refused. `resolvesPublicly` says the same thing in
+   * its own header, and neither place is allowed to describe it as a guarantee.
+   */
+  return {
+    allowed: true,
+    skipped: false,
+    detail: 'The base URL resolves to a public address.',
+  };
+}
+
+/**
+ * The real classifier and resolver, from @qaai/shared/private-address.
+ *
+ * Imported through the package SUBPATH and not the barrel, deliberately:
+ * private-address.ts reaches for `node:dns` and the barrel is what the web
+ * app's bundler consumes. That is stated in check-wiring.ts, which once
+ * recommended re-exporting this module from the barrel and was telling the
+ * reader to break the web build.
+ *
+ * Built lazily so a unit test that injects its own `HostGuardIo` never loads
+ * `node:dns` at all.
+ */
+export async function defaultHostGuardIo(): Promise<HostGuardIo> {
+  const mod = await import('@qaai/shared/private-address');
+  return {
+    classify: (host) => mod.classifyHost(host),
+    resolves: async (host) => {
+      const verdict = await mod.resolvesPublicly(host);
+      return { ok: verdict.ok, reason: verdict.reason };
+    },
+  };
+}
 
 /**
  * The default prober: one GET, any response counts.
@@ -754,6 +1203,16 @@ export async function probeBaseUrl(args: {
   attempts?: number;
   backoffMs?: number;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Where this is running, which decides whether a private target is refused.
+   *
+   * Defaults to HOSTED — the SAFE default, so a caller that forgets to pass it
+   * gets the refusal rather than the open probe. A self-hosted deployment opts
+   * IN to probing its own network, which is the direction a security default
+   * has to fail.
+   */
+  mode?: ProbeHostMode;
+  hostGuard?: HostGuardIo;
 }): Promise<PreflightCheck> {
   const dependent = [...new Set(args.types)].filter((t) => BASE_URL_DEPENDENT_TEST_TYPES.has(t));
   const base = {
@@ -791,6 +1250,42 @@ export async function probeBaseUrl(args: {
     };
   }
 
+  /*
+   * ── THE GUARD GOES HERE: BEFORE THE FIRST CONNECTION, NOT AFTER IT ─────────
+   *
+   * Everything above this point is parsing. This is the last line before our
+   * process opens a host a customer named, so it is the only place the check
+   * can be. A guard after the fetch is not a guard.
+   */
+  const guard = await guardProbeHost({
+    hostname: parsed.hostname,
+    mode: args.mode ?? 'HOSTED',
+    io: args.hostGuard ?? (await defaultHostGuardIo()),
+  });
+  if (!guard.allowed) {
+    return {
+      name: 'BASE_URL',
+      outcome: 'UNAVAILABLE',
+      kind: 'BLOCKED_BY_ENV',
+      /*
+       * It BLOCKS, and it blocks the same types a dead host does — because the
+       * consequence is identical: those tests were not attempted and nothing
+       * about the application was measured. What differs is the sentence, and
+       * it has to differ: this is a REFUSAL by QAAI, not an outage at the
+       * customer, and a reader sent to check their VPN over this would never
+       * find anything wrong with it.
+       */
+      blocksTypes: dependent,
+      blocksTestIds: [],
+      detail:
+        `${guard.reason} A hosted QAAI worker will not open a private, loopback or link-local ` +
+        `address, so the ${dependent.length} test type(s) in this run that reach the base URL ` +
+        'over HTTP were not attempted. Point the environment at a publicly resolvable host, or ' +
+        'run QAAI inside your own network where that target is reachable. ' +
+        'This is a refusal by QAAI, not an outage in your environment.',
+    };
+  }
+
   const probe = args.probe ?? fetchProbe;
   const timeoutMs = args.timeoutMs ?? PREFLIGHT_TIMEOUT_MS;
   const attempts = Math.max(1, args.attempts ?? PREFLIGHT_PROBE_ATTEMPTS);
@@ -819,7 +1314,12 @@ export async function probeBaseUrl(args: {
       return {
         ...base,
         outcome: 'OK',
-        detail: `${parsed.origin} ${last.detail}${attempt > 1 ? ` on attempt ${attempt} of ${attempts}` : ''}. Any status counts: a 5xx may be the bug under test.`,
+        detail:
+          `${parsed.origin} ${last.detail}${attempt > 1 ? ` on attempt ${attempt} of ${attempts}` : ''}. ` +
+          `Any status counts: a 5xx may be the bug under test.` +
+          // Named, not implied. A degradation that is APPLIED must also be
+          // REPORTED, and "the private-address check did not run" is one.
+          (guard.skipped ? ` ${guard.detail}` : ''),
       };
     }
     if (attempt < attempts) await sleep(backoffMs);
@@ -862,12 +1362,154 @@ export type SessionProbeResult =
       why?: string;
     };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The stored session, checked without using it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * One stored cookie, reduced to the only two fields this check may see.
+ *
+ * ── WHAT IS NOT IN THIS TYPE IS THE POINT ───────────────────────────────────
+ *
+ * There is no `value`. A storageState cookie's value IS the session — it is the
+ * credential — and this module is the one that writes sentences into run
+ * reports, gate comments and PR summaries. A type that cannot hold the secret
+ * cannot leak it: not in a detail string, not truncated, not hashed, and not
+ * down an error path, because there is no field for it to come from. `name` is
+ * kept because "which cookie expired" is the actionable half and a cookie name
+ * is not a secret; `expires` is the question being asked.
+ *
+ * The caller reduces a real Playwright storageState to this. That reduction is
+ * the whole security boundary and it belongs at the edge, not in here.
+ */
+export interface StoredCookie {
+  name: string;
+  /** Unix SECONDS, as Playwright's storageState writes it. `-1` = a session cookie. */
+  expires: number;
+}
+
+export type StorageStateVerdict =
+  /** Usable as far as this check can tell. */
+  | { usable: true; detail: string }
+  /** Definitively unusable: an expiry in the past. */
+  | { usable: false; detail: string }
+  /** Nothing could be established — and this is NOT a refusal. */
+  | { usable: null; detail: string };
+
+/**
+ * Is this stored session already expired?
+ *
+ * ── Why this exists next to a login probe that would find out anyway ────────
+ *
+ * Because it is free and the login is not. `probeIdentities` drives the run's
+ * own session resolver, which for an expired state means a full browser login —
+ * thirty seconds and a browser — to discover something an integer comparison
+ * knew. More importantly it is the difference between a run that reports "your
+ * stored session for 'admin' expired four days ago" and one that reports "could
+ * not sign in", which sends a reader to check a password that never changed.
+ *
+ * ── It may only ever say NO, or say NOTHING ─────────────────────────────────
+ *
+ * An expiry in the past is PROOF of unusability: the browser will not send that
+ * cookie. The converse is not proof of anything — a server can revoke a session
+ * whose cookie has months left, and a state file full of session cookies
+ * (`expires: -1`) carries no expiry to read at all. So `usable: true` is worded
+ * as "nothing here says it is stale", never as "it works", and the login probe
+ * remains the thing that establishes that.
+ *
+ * `now` is injected because a test that depends on the wall clock is a test
+ * that fails at midnight somewhere.
+ */
+export function storageStateVerdict(args: {
+  cookies: readonly StoredCookie[] | null;
+  now: number;
+  /**
+   * How close to expiry counts as expired. A session with four seconds left
+   * will not survive a suite, and reporting it as usable means the run spends
+   * its budget discovering that halfway through.
+   */
+  marginMs?: number;
+}): StorageStateVerdict {
+  if (args.cookies === null) {
+    return {
+      usable: null,
+      detail:
+        'No stored session was available to inspect, so its freshness was not checked. ' +
+        'That is not a verdict on the credential.',
+    };
+  }
+  if (args.cookies.length === 0) {
+    return {
+      usable: null,
+      detail:
+        'The stored session holds no cookies, so there is no expiry to read. ' +
+        'A token-only or origin-storage session is normal and is not checked here.',
+    };
+  }
+
+  const margin = args.marginMs ?? STORAGE_STATE_MARGIN_MS;
+  /*
+   * `expires: -1` is Playwright's session cookie — it has no expiry, so it
+   * cannot be stale, and including it in the "soonest expiry" arithmetic below
+   * would make every session state look like it expired in 1969.
+   */
+  const dated = args.cookies.filter((cookie) => cookie.expires > 0);
+  if (dated.length === 0) {
+    return {
+      usable: null,
+      detail: `All ${args.cookies.length} stored cookie(s) are session cookies with no expiry, so staleness could not be established.`,
+    };
+  }
+
+  const deadline = (args.now + margin) / 1000;
+  const expired = dated.filter((cookie) => cookie.expires <= deadline);
+  if (expired.length > 0) {
+    const soonest = expired.reduce((a, b) => (a.expires <= b.expires ? a : b));
+    return {
+      usable: false,
+      // The cookie NAME and the date. Never the value — see `StoredCookie`.
+      detail:
+        `The stored session is stale: ${expired.length} of ${dated.length} dated cookie(s) have ` +
+        `expired, the earliest being \`${soonest.name}\` at ` +
+        `${new Date(soonest.expires * 1000).toISOString()}. Re-record the session rather than ` +
+        'reading the tests that need it as failures.',
+    };
+  }
+
+  const soonest = dated.reduce((a, b) => (a.expires <= b.expires ? a : b));
+  return {
+    usable: true,
+    detail:
+      `Nothing in the stored session says it is stale; its earliest expiry is ` +
+      `${new Date(soonest.expires * 1000).toISOString()}. Whether the application still accepts ` +
+      'it is a separate question, answered by the login probe.',
+  };
+}
+
+/**
+ * The slack on an expiry check.
+ *
+ * Two minutes: long enough that a session about to die mid-suite is reported as
+ * stale now rather than discovered as a wall of failures in ten minutes' time,
+ * short enough that it never condemns a session that would have been fine.
+ */
+export const STORAGE_STATE_MARGIN_MS = 120_000;
+
 /** An identity the suite needs, and the tests that are meaningless without it. */
 export interface RequiredIdentity {
   profileId: string;
   /** For the sentence; never a credential. */
   label: string;
   testIds: readonly string[];
+  /**
+   * The stored session's cookie EXPIRIES, if the caller has them — reduced to
+   * `StoredCookie`, which has no `value` field by construction.
+   *
+   * `undefined` means the caller did not supply them and the freshness check is
+   * skipped; `null` means there is no stored session at all. Both are "not
+   * checked", neither is a refusal.
+   */
+  cookies?: readonly StoredCookie[] | null;
 }
 
 /**
@@ -886,10 +1528,41 @@ export interface RequiredIdentity {
 export async function probeIdentities(args: {
   identities: readonly RequiredIdentity[];
   signIn: (profileId: string) => Promise<SessionProbeResult>;
+  now?: () => number;
 }): Promise<PreflightCheck[]> {
+  const now = args.now ?? Date.now;
   const checks: PreflightCheck[] = [];
   for (const identity of args.identities) {
     if (identity.testIds.length === 0) continue;
+
+    /*
+     * The free check first, and it SHORT-CIRCUITS the login.
+     *
+     * An expired cookie is proof the stored session cannot work, so driving a
+     * browser login to confirm it would spend thirty seconds learning what the
+     * integer already said — and would report the result as "could not sign
+     * in", which is the wrong diagnosis. Only `usable: false` stops here;
+     * `null` and `true` both fall through to the resolver, because neither
+     * establishes that the session WORKS.
+     */
+    if (identity.cookies !== undefined) {
+      const freshness = storageStateVerdict({ cookies: identity.cookies, now: now() });
+      if (freshness.usable === false) {
+        checks.push({
+          name: 'LOGIN',
+          outcome: 'UNAVAILABLE',
+          kind: 'BLOCKED_BY_ENV',
+          detail:
+            `The stored session for "${identity.label}" cannot be used, so the ` +
+            `${identity.testIds.length} test(s) that run as that role were not attempted. ` +
+            `${freshness.detail} Nothing here is a verdict on your application.`,
+          blocksTypes: [],
+          blocksTestIds: identity.testIds,
+        });
+        continue;
+      }
+    }
+
     let resolved: SessionProbeResult;
     try {
       resolved = await args.signIn(identity.profileId);
@@ -1045,6 +1718,9 @@ export async function environmentPreflight(args: {
   backoffMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
+  /** Defaults to HOSTED inside `probeBaseUrl` — the safe direction. */
+  mode?: ProbeHostMode;
+  hostGuard?: HostGuardIo;
 }): Promise<EnvironmentPreflight> {
   const now = args.now ?? Date.now;
   const startedAt = now();
@@ -1063,6 +1739,8 @@ export async function environmentPreflight(args: {
     attempts: args.attempts,
     backoffMs: args.backoffMs,
     sleep: args.sleep,
+    mode: args.mode,
+    hostGuard: args.hostGuard,
   });
   checks.push(baseUrl);
 
@@ -1079,7 +1757,13 @@ export async function environmentPreflight(args: {
         blocksTestIds: [],
       });
     } else {
-      checks.push(...(await probeIdentities({ identities: args.identities, signIn: args.signIn })));
+      checks.push(
+        ...(await probeIdentities({
+          identities: args.identities,
+          signIn: args.signIn,
+          now: args.now,
+        })),
+      );
     }
   }
 

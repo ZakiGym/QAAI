@@ -1,0 +1,799 @@
+{
+  "version": 1,
+  "application": "@qaai/demo",
+  "$why": [
+    "THE DECLARED SURFACE OF THE DEMO STORE — the only known truth this product has.",
+    "",
+    "Nothing in QAAI has ever compared a reported number to a known truth, which is",
+    "precisely why a catch-all route literal once gave 100% coverage and survived a",
+    "whole round. apps/demo is a real application in this repo, small enough to",
+    "enumerate by hand and complete enough to be worth enumerating: it serves HTML,",
+    "speaks GraphQL, SSE and WebSocket, sends mail, has roles, and carries a planted",
+    "money bug on purpose. This file says what it HAS. packages/cli/src/bench.ts",
+    "diffs QAAI's enumeration against it and reports PRECISION and RECALL as two",
+    "separate numbers, because the two errors are not symmetric:",
+    "",
+    "  A FALSE POSITIVE inflates the denominator. It makes the product look WORSE",
+    "  than it is, and a customer who investigates finds a route that does not",
+    "  exist. Embarrassing, self-correcting.",
+    "",
+    "  A FALSE NEGATIVE inflates the PERCENTAGE. Surface we never enumerated is",
+    "  surface no test is ever asked for, and the number goes UP for it. That is the",
+    "  lie that sells, and it is the one this file exists to make countable.",
+    "",
+    "EXTEND, DO NOT SHRINK. Deleting an entry to make a number go up is the exact",
+    "move this harness exists to prevent, so every entry carries the file it is",
+    "declared in and bench.ts refuses a declaration whose item count fell without",
+    "the demo app losing the source line (see GROUND_TRUTH_MIN_ITEMS)."
+  ],
+  "$compareModes": {
+    "IDENTITY": "The key below is the spelling QAAI's own identity builders produce (surfaceKey + endpointIdentity/canonicalRoute/dimensionCellIdentity), so a missing or extra key is a real finding. Counts toward precision and recall.",
+    "COUNT": "The thing exists but QAAI's identity for it is not derivable from the application — a form id is a file path plus an index within the file, which would couple this declaration to the source ORDER of views.ts and go red on an unrelated edit. Compared as a count per kind, reported separately, never folded into precision or recall.",
+    "NOT_CHECKED": "Declared so the inventory is complete, and deliberately not scored. The reason is on the item. NOT_CHECKED is a real answer; a pass that means we did not check is not."
+  },
+  "$declaredAbsent": {
+    "$why": [
+      "Spellings this application definitively does NOT have. Anything QAAI enumerates",
+      "that matches one of these is a false positive with a NAMED cause, which is a",
+      "different and much more useful finding than 'we enumerated something that is",
+      "not in the declaration' — the second might be a gap in this file.",
+      "",
+      "ROUTE:/* is first on the list on purpose. It is the literal that once produced",
+      "100% coverage, and declaring it absent is what turns its reappearance into a",
+      "failing assertion instead of a flattering number."
+    ],
+    "keys": [
+      "ROUTE:/*",
+      "ROUTE:/:param",
+      "ENDPOINT:GET /*",
+      "AUTH_SURFACE:SIGNUP@/signup",
+      "AUTH_SURFACE:SIGNUP@/register",
+      "AUTH_SURFACE:PASSWORD_RESET@/password/reset",
+      "AUTH_SURFACE:PASSWORD_RESET@/forgot",
+      "AUTH_SURFACE:SSO@/sso"
+    ]
+  },
+  "$axesWithNothingToDeclare": {
+    "$why": [
+      "AN AXIS THIS APPLICATION HAS NO MEMBERS ON. A positive, checkable claim and NOT",
+      "the same sentence as 'we do not measure this axis' — the first is about the demo",
+      "store, the second is about QAAI. Anything enumerated on one of these axes is a",
+      "false positive, so an empty list here has teeth."
+    ],
+    "BACKGROUND_JOB": "The store has no queue consumer, no cron and no webhook receiver. The SSE timer in protocols.ts lives for the duration of one request and the SMTP listener is a server socket, not a job: neither is schedulable or triggerable, which is what the axis counts.",
+    "FLAG_COMBINATION": "There is no flag store and no branch on one. DEMO_PLANTED_BUG is read once at module scope from the environment and is a build-time constant for the life of the process, not a flag a run can vary."
+  },
+  "$axesNotDeclared": {
+    "$why": [
+      "AXES LEFT OUT OF THE GROUND TRUTH, with the reason, because omitting them in",
+      "silence would let the harness score a recall of 100% on a surface it never",
+      "declared. These are reported by bench.ts as NOT_CHECKED, never as 0 and never",
+      "as absent."
+    ],
+    "DEVICE_LOCALE": "The store is one locale (lang=\"en\", no switch, no Accept-Language branch) and one layout. A declaration of exactly one default cell per route would measure QAAI's default-cell arithmetic rather than its enumeration, and would do it 9 times.",
+    "COMPONENT_STATE": "Server-rendered strings with no component boundary. views.ts has functions, not components, so there is no enumerable unit for the axis to count and anything QAAI reported here would be a judgement call rather than a fact this file could adjudicate."
+  },
+  "items": [
+    {
+      "key": "ROUTE:/",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Home",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [{ "stateKey": "default", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": null }]
+    },
+    {
+      "key": "ROUTE:/products",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Product catalogue",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "default", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": "All five products, no ?q." },
+        {
+          "stateKey": "search-no-match",
+          "cellKind": "PAGE_EMPTY",
+          "reachable": true,
+          "note": "?q= something no product matches. Renders the .empty card, not a 404."
+        },
+        { "stateKey": "search-one-match", "cellKind": "DATA_ONE", "reachable": true, "note": "?q=mug matches exactly one." },
+        { "stateKey": "all-products", "cellKind": "DATA_MANY", "reachable": true, "note": "Five products, four of them in stock." }
+      ]
+    },
+    {
+      "key": "ROUTE:/products/:param",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Product detail",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "in-stock", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": "Renders the quantity form." },
+        {
+          "stateKey": "out-of-stock",
+          "cellKind": "DATA_NONE",
+          "reachable": true,
+          "note": "mug-05 has stock 0. The page renders; the add-to-cart form does not. A zero-row fixture for the one affordance on the page, which is what DATA_NONE counts."
+        },
+        { "stateKey": "unknown-id", "cellKind": "ERROR_NOT_FOUND", "reachable": true, "note": "404 with the notFoundPage body." }
+      ]
+    },
+    {
+      "key": "ROUTE:/cart",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Cart",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "with-lines", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": null },
+        { "stateKey": "empty", "cellKind": "PAGE_EMPTY", "reachable": true, "note": "A fresh session. No table, no totals block." },
+        { "stateKey": "one-line", "cellKind": "DATA_ONE", "reachable": true, "note": "orderTotalCents returns the correct total below two lines, planted bug or not." },
+        {
+          "stateKey": "two-or-more-lines",
+          "cellKind": "DATA_MANY",
+          "reachable": true,
+          "note": "WHERE THE PLANTED BUG BITES. With DEMO_PLANTED_BUG on and two distinct line items the order total silently drops the cheapest line while every other figure on the page stays right."
+        }
+      ]
+    },
+    {
+      "key": "ROUTE:/checkout",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Checkout",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "default", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": null },
+        {
+          "stateKey": "empty-cart-redirect",
+          "cellKind": "PAGE_REDIRECTED",
+          "reachable": true,
+          "note": "GET /checkout with an empty cart is a 303 to /cart. Asking for the page lands somewhere else, which is the state and not an error."
+        },
+        {
+          "stateKey": "missing-required-field",
+          "cellKind": "ERROR_VALIDATION",
+          "reachable": true,
+          "note": "POST /checkout re-renders the form with a flash. It names ONLY THE FIRST missing field, so a form with three blanks reports one. Correct behaviour, and the reason `required` has to be a cell per field rather than one per form."
+        }
+      ]
+    },
+    {
+      "key": "ROUTE:/orders/:param",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Order confirmation",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        {
+          "stateKey": "any-order",
+          "cellKind": "PAGE_DEFAULT",
+          "reachable": true,
+          "note": "NO OWNERSHIP CHECK, on purpose. Order ids are sequential, so any caller who guesses one reads someone else's order and their email address. The security-smoke runner should report it."
+        },
+        { "stateKey": "unknown-id", "cellKind": "ERROR_NOT_FOUND", "reachable": true, "note": null }
+      ]
+    },
+    {
+      "key": "ROUTE:/login",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Sign in",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "default", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": "Two forms: password and one-time code." },
+        { "stateKey": "bad-credentials", "cellKind": "ERROR_UNAUTHENTICATED", "reachable": true, "note": "POST /login answers 401 and re-renders with the error flash." }
+      ]
+    },
+    {
+      "key": "ROUTE:/account",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Account",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "with-orders", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": null },
+        { "stateKey": "no-orders", "cellKind": "PAGE_EMPTY", "reachable": true, "note": "A signed-in user who has not ordered. The .empty card." },
+        {
+          "stateKey": "anonymous-redirect",
+          "cellKind": "PAGE_REDIRECTED",
+          "reachable": true,
+          "note": "requireLogin sends a 303 to /login?next=/account. NOT a 401: an unauthenticated visitor never sees an error page here."
+        }
+      ]
+    },
+    {
+      "key": "ROUTE:/admin",
+      "kind": "ROUTE",
+      "compare": "IDENTITY",
+      "label": "Admin",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "admin-with-orders", "cellKind": "PAGE_DEFAULT", "reachable": true, "note": null },
+        { "stateKey": "admin-no-orders", "cellKind": "PAGE_EMPTY", "reachable": true, "note": "The orders table collapses to the .empty card; the inventory table still renders." },
+        { "stateKey": "customer-forbidden", "cellKind": "ERROR_FORBIDDEN", "reachable": true, "note": "403 for a signed-in non-admin. Properly gated, unlike /orders/:id — which is what makes the IDOR finding meaningful." },
+        { "stateKey": "anonymous-redirect", "cellKind": "PAGE_REDIRECTED", "reachable": true, "note": "requireLogin runs before the role check, so anonymous is a redirect and not a 403." }
+      ]
+    },
+
+    {
+      "key": "ENDPOINT:GET /",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /products",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /products",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /products/:param",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /products/:id",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /cart/add",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /cart/add",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /cart/remove",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /cart/remove",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /cart",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /cart",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /checkout",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /checkout",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /checkout",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /checkout",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /orders/:param",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /orders/:id",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /login",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /login",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /login",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /login",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /logout",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /logout",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /login/otp/request",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /login/otp/request",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        {
+          "stateKey": "code-sent",
+          "cellKind": "PAGE_DEFAULT",
+          "reachable": true,
+          "note": "Renders otpPage for ANY address, including one with no account — deliberate, so the endpoint does not confirm which addresses are registered."
+        }
+      ]
+    },
+    {
+      "key": "ENDPOINT:POST /login/otp/verify",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /login/otp/verify",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        { "stateKey": "accepted", "cellKind": "PAGE_REDIRECTED", "reachable": true, "note": "303 to /account." },
+        { "stateKey": "wrong-or-expired-code", "cellKind": "ERROR_UNAUTHENTICATED", "reachable": true, "note": "401, \"That code is not valid.\"" },
+        {
+          "stateKey": "valid-code-no-account",
+          "cellKind": "ERROR_UNAUTHENTICATED",
+          "reachable": true,
+          "note": "Reachable only by requesting a code for an address with no user and then entering it. Two distinct 401s with different bodies, so they are two cells."
+        }
+      ]
+    },
+    {
+      "key": "ENDPOINT:GET /account",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /account",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /admin",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /admin",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:GET /__health",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /__health",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "A test hook, and still surface. An endpoint that reports whether the planted bug is on is exactly the kind of thing that must appear in an inventory rather than be quietly excluded for being ours."
+    },
+    {
+      "key": "ENDPOINT:GET /__mail",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /__mail",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /__reset",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /__reset",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ENDPOINT:POST /graphql",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "POST /graphql",
+      "declaredIn": "src/protocols.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "states": [
+        {
+          "stateKey": "graphql-error-with-http-200",
+          "cellKind": "ERROR_VALIDATION",
+          "reachable": true,
+          "note": "A failed query is HTTP 200 with an `errors` array. Any client asserting on the status code alone calls it a success — which is the whole reason this endpoint is in the demo."
+        }
+      ],
+      "operations": [
+        { "name": "products", "compare": "COUNT", "note": "No arguments. Returns all five." },
+        { "name": "product", "compare": "COUNT", "note": "Takes id, inline or via $variable. A missing product is null data plus an error, not a 404." },
+        { "name": "cart", "compare": "COUNT", "note": "Keyed by the same session cookie GET /cart reads, so the two must agree — a contract test's job." },
+        { "name": "order", "compare": "COUNT", "note": "The SAME missing ownership check as GET /orders/:id. The IDOR is reachable over GraphQL too." }
+      ],
+      "operationsCompareReason": "QAAI has no identity for a GraphQL field: `endpointIdentity` is method plus path, and all four operations share POST /graphql. Declared and counted so the inventory is complete; not scored for precision or recall, because inventing a spelling here would be scoring this file's guess rather than QAAI's enumeration."
+    },
+    {
+      "key": "ENDPOINT:GET /events",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "GET /events (server-sent events)",
+      "declaredIn": "src/protocols.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "Emits open, order.placed, order.packed, order.shipped, done as NAMED events, 300ms apart."
+    },
+    {
+      "key": "ENDPOINT:WS /ws",
+      "kind": "ENDPOINT",
+      "compare": "IDENTITY",
+      "label": "WS /ws (websocket echo)",
+      "declaredIn": "src/protocols.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "DECLARED IN THE KNOWLEDGE THAT IT WILL BE A FALSE NEGATIVE. The upgrade handler is attached to the HTTP server, not to an Express route, and `HTTP_METHODS` has no WS member — so no QAAI extractor can currently produce this key. That is the finding: a protocol QAAI ships a test plugin for and cannot count. Deleting the entry would make the recall figure prettier and the product no better.",
+      "expectedMissBy": ["express-fastify"]
+    },
+
+    {
+      "key": "AUTH_SURFACE:LOGIN@/login",
+      "kind": "AUTH_SURFACE",
+      "compare": "IDENTITY",
+      "label": "Password sign-in",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "AUTH_SURFACE:LOGOUT@/logout",
+      "kind": "AUTH_SURFACE",
+      "compare": "IDENTITY",
+      "label": "Sign out",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "AUTH_SURFACE:LOGIN@/login/otp/request",
+      "kind": "AUTH_SURFACE",
+      "compare": "IDENTITY",
+      "label": "Request a one-time code",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "AUTH_SURFACE:VERIFY@/login/otp/verify",
+      "kind": "AUTH_SURFACE",
+      "compare": "IDENTITY",
+      "label": "Verify a one-time code",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "AUTH_SURFACE:SESSION@/login/totp",
+      "kind": "AUTH_SURFACE",
+      "compare": "IDENTITY",
+      "label": "TOTP second factor",
+      "declaredIn": "src/store.ts",
+      "reachable": false,
+      "unreachableReason": "DELIBERATELY UNREACHABLE. `DemoUser.totpSeed` is a real base32 seed on ada@example.com and NO route verifies it — there is no /login/totp handler. The data model declares a second factor the HTTP surface does not implement. It stays in this file because an enumerator that reports it is CORRECT (the seed is there to be found) and an enumerator that reports it as COVERED is lying, so precision counts it and recall does not.",
+      "expectedMissBy": ["express-fastify"]
+    },
+
+    {
+      "key": "ROLE_CELL:/admin|ROLE=admin",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/admin as admin",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ROLE_CELL:/admin|ROLE=customer",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/admin as customer (403)",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ROLE_CELL:/admin|ROLE=anonymous",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/admin anonymous (303 to /login)",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "`anonymous` is the DEFAULT role value: the store has no row for it and `req.demoUser` is null. Spelled in the app's own casing, as SurfaceDimensionValue.key requires — `customer` and `admin` are the literals in store.ts, not Customer or ADMIN."
+    },
+    {
+      "key": "ROLE_CELL:/account|ROLE=customer",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/account as customer",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+    {
+      "key": "ROLE_CELL:/account|ROLE=admin",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/account as admin",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "An admin has an account page too, and it lists only THEIR orders. A separate cell from the customer one because the filter is per email."
+    },
+    {
+      "key": "ROLE_CELL:/account|ROLE=anonymous",
+      "kind": "ROLE_CELL",
+      "compare": "IDENTITY",
+      "label": "/account anonymous (303 to /login)",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null
+    },
+
+    {
+      "key": "NOTIFICATION:order-receipt",
+      "kind": "NOTIFICATION",
+      "compare": "IDENTITY",
+      "label": "Order receipt",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "Subject \"Your order ORD-nnnn\", from orders@groundcoffee.example, text only. Sent on POST /checkout. The total in the body comes from the same orderTotalCents the page uses, so the planted bug reaches the email as well — a mail assertion catches it."
+    },
+    {
+      "key": "NOTIFICATION:sign-in-code",
+      "kind": "NOTIFICATION",
+      "compare": "IDENTITY",
+      "label": "One-time sign-in code",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "note": "Subject \"Your sign-in code\", from no-reply@groundcoffee.example. The six digits are what `extractCode` pulls out, which is how an EMAIL_OTP test completes the flow."
+    },
+
+    {
+      "key": "ERROR_STATE:not-found-catch-all",
+      "kind": "ERROR_STATE",
+      "compare": "NOT_CHECKED",
+      "label": "The terminal 404 middleware",
+      "declaredIn": "src/index.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "notCheckedReason": "QAAI's route extractor would spell this `/*` or `/:param`, and BOTH of those spellings are on $declaredAbsent.keys because they are the literal that once produced 100% coverage. Giving this real behaviour a key would bless one of them. So it is declared, named, and deliberately not scored: the catch-all is checked by its presence on the absent list, not by matching it here."
+    },
+
+    {
+      "key": "FORM:GET /products#search",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Product search",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        {
+          "fieldKey": "q",
+          "cellKind": "FORM_FIELD",
+          "inputType": "search",
+          "required": false,
+          "semantic": "search",
+          "constraint": null,
+          "note": "Labelled \"Search products\". The submit button beside it is aria-hidden with no accessible name — a deliberate axe violation that ships in the clean baseline, which is why the accessibility fault in the catalogue is a SECOND one on the checkout form rather than this."
+        }
+      ]
+    },
+    {
+      "key": "FORM:POST /cart/add#catalogue-card",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Add to cart, from a catalogue card",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 4,
+      "instancesNote": "ONE TEMPLATE, FOUR RENDERED INSTANCES — one per in-stock product. mug-05 renders no form at all because its stock is 0, which is why this is 4 and not 5. The count comparison compares TEMPLATES; the instance number is recorded so nobody reconciles 4 against 5 and concludes the extractor missed one.",
+      "fields": [
+        { "fieldKey": "productId", "cellKind": "FORM_FIELD", "inputType": "hidden", "required": true, "semantic": "unknown", "constraint": null, "note": null },
+        { "fieldKey": "quantity", "cellKind": "FORM_FIELD", "inputType": "hidden", "required": true, "semantic": "number", "constraint": { "value": "1" }, "note": "Hard-coded 1 on the card; the detail page is where a quantity can be chosen." }
+      ]
+    },
+    {
+      "key": "FORM:POST /cart/add#product-detail",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Add to cart, from the product page",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        {
+          "fieldKey": "quantity",
+          "cellKind": "FORM_FIELD",
+          "inputType": "number",
+          "required": false,
+          "semantic": "number",
+          "constraint": { "min": "1", "max": "per-product stock" },
+          "note": "max is the product's stock, so it differs per page — 12 for the kettle, 5 for the grinder."
+        },
+        { "fieldKey": "quantity", "cellKind": "RULE_RANGE", "inputType": "number", "required": false, "semantic": "number", "constraint": { "min": "1", "max": "per-product stock" }, "note": "THE RULE, as its own cell: min=1 and max=stock are a boundary a test can be written for, and `FORM_FIELD` and `VALIDATION_RULE` are two denominators. The server also clamps server-side (Math.min(product.stock, ...)), so over-max is accepted and silently reduced rather than rejected — the boundary FAULT-OFFBYONE-QUANTITY-CLAMP moves by one." },
+        { "fieldKey": "productId", "cellKind": "FORM_FIELD", "inputType": "hidden", "required": true, "semantic": "unknown", "constraint": null, "note": null }
+      ]
+    },
+    {
+      "key": "FORM:POST /cart/remove#line",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Remove a cart line",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "instancesNote": "One template, one instance per cart line at render time.",
+      "fields": [{ "fieldKey": "productId", "cellKind": "FORM_FIELD", "inputType": "hidden", "required": true, "semantic": "unknown", "constraint": null, "note": null }]
+    },
+    {
+      "key": "FORM:POST /checkout#place-order",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Place order",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        { "fieldKey": "email", "cellKind": "FORM_FIELD", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": null },
+        { "fieldKey": "email", "cellKind": "RULE_REQUIRED", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": null },
+        { "fieldKey": "fullName", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "person_name", "constraint": null, "note": null },
+        { "fieldKey": "fullName", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "person_name", "constraint": null, "note": null },
+        { "fieldKey": "address", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "street_address", "constraint": null, "note": null },
+        { "fieldKey": "address", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "street_address", "constraint": null, "note": null },
+        { "fieldKey": "city", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "city", "constraint": null, "note": null },
+        { "fieldKey": "city", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "city", "constraint": null, "note": null },
+        { "fieldKey": "postalCode", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "postal_code", "constraint": null, "note": null },
+        { "fieldKey": "postalCode", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "postal_code", "constraint": null, "note": null },
+        { "fieldKey": "cardNumber", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "credit_card", "constraint": null, "note": "inputmode=numeric, autocomplete=cc-number, placeholder 4242 4242 4242 4242." },
+        { "fieldKey": "cardNumber", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "credit_card", "constraint": null, "note": null },
+        {
+          "fieldKey": "cardNumber",
+          "cellKind": "RULE_SEMANTIC",
+          "inputType": "text",
+          "required": true,
+          "semantic": "credit_card",
+          "constraint": null,
+          "note": "DECLARED AS A RULE THE APPLICATION DOES NOT ENFORCE. A field whose semantic is credit_card implies a Luhn check; this server accepts \"x\". The cell belongs in the denominator because it is the boundary a test would be written for, and the ANSWER it gets is a defect — and it is a defect the clean baseline already has. No fault in the catalogue touches it: a catalogue entry has to be switchable, and this one is permanently on."
+        }
+      ],
+      "fieldsNote": "Six fields, all `required` in the markup AND re-checked on the server. The server reports only the FIRST missing one, so a test that blanks three fields and asserts three messages fails against correct behaviour — one of the reasons `required` has to be a cell of its own."
+    },
+    {
+      "key": "FORM:POST /login#password",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Sign in with a password",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        { "fieldKey": "email", "cellKind": "FORM_FIELD", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": null },
+        { "fieldKey": "email", "cellKind": "RULE_REQUIRED", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": null },
+        { "fieldKey": "password", "cellKind": "FORM_FIELD", "inputType": "password", "required": true, "semantic": "password", "constraint": null, "note": null },
+        { "fieldKey": "password", "cellKind": "RULE_REQUIRED", "inputType": "password", "required": true, "semantic": "password", "constraint": null, "note": null },
+        {
+          "fieldKey": "next",
+          "cellKind": "FORM_FIELD",
+          "inputType": "hidden",
+          "required": false,
+          "semantic": "url",
+          "constraint": null,
+          "note": "The open-redirect surface. POST /login honours it only when it starts with / and not //, which is the guard FAULT-SECURITY-OPEN-REDIRECT removes."
+        },
+        { "fieldKey": "next", "cellKind": "RULE_SEMANTIC", "inputType": "hidden", "required": false, "semantic": "url", "constraint": null, "note": "Same-origin-path-only. A rule with no HTML attribute behind it, which is exactly the kind `semantic` exists to name." }
+      ]
+    },
+    {
+      "key": "FORM:POST /login/otp/request#email-me-a-code",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Email me a code",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        { "fieldKey": "email", "cellKind": "FORM_FIELD", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": "id is otpEmail, name is email — two forms on one page with the same field name." },
+        { "fieldKey": "email", "cellKind": "RULE_REQUIRED", "inputType": "email", "required": true, "semantic": "email", "constraint": null, "note": null }
+      ]
+    },
+    {
+      "key": "FORM:POST /login/otp/verify#code",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Verify the code",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [
+        { "fieldKey": "code", "cellKind": "FORM_FIELD", "inputType": "text", "required": true, "semantic": "unknown", "constraint": null, "note": "inputmode=numeric, autocomplete=one-time-code." },
+        { "fieldKey": "code", "cellKind": "RULE_REQUIRED", "inputType": "text", "required": true, "semantic": "unknown", "constraint": null, "note": null },
+        {
+          "fieldKey": "code",
+          "cellKind": "RULE_PATTERN",
+          "inputType": "text",
+          "required": true,
+          "semantic": "unknown",
+          "constraint": { "shape": "exactly six digits" },
+          "note": "DECLARED AS A RULE WITH NO ATTRIBUTE. The code is six digits and the markup declares no pattern, no maxlength and no minlength — so a crawl reading attributes finds nothing and `constraintsRead` is the only honest answer. The rule is still real: the server compares against a six-digit string."
+        },
+        {
+          "fieldKey": "code",
+          "cellKind": "RULE_RANGE",
+          "inputType": "text",
+          "required": true,
+          "semantic": "unknown",
+          "constraint": { "expiresAfterMinutes": 10 },
+          "note": "The ten-minute expiry. A boundary nothing in the markup declares and no test can find by reading the page."
+        },
+        { "fieldKey": "email", "cellKind": "FORM_FIELD", "inputType": "hidden", "required": true, "semantic": "email", "constraint": null, "note": null }
+      ]
+    },
+    {
+      "key": "FORM:POST /logout#sign-out",
+      "kind": "FORM",
+      "compare": "COUNT",
+      "label": "Sign out",
+      "declaredIn": "src/views.ts",
+      "reachable": true,
+      "unreachableReason": null,
+      "instances": 1,
+      "fields": [],
+      "fieldsNote": "No fields. A form with no inputs is still a form, and an extractor that counts forms by counting fields misses it — which is why this entry is here rather than being tidied away."
+    }
+  ]
+}

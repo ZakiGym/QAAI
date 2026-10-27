@@ -789,6 +789,23 @@ model Project {
   /// rules it bounds, and a reader that hits it must report the cap AS A COUNT
   /// AND AS A REASON rather than applying half the configuration silently.
   coverageConfig           Json?
+  /// `TypeObligationPolicy` — WHICH TEST TYPES EACH SURFACE AXIS OWES.
+  ///
+  /// NULLABLE WITH NO DEFAULT, and the default in code owes NOTHING. An
+  /// obligation nobody declared is not owed: defaulting every route to owing an
+  /// E2E and an ACCESSIBILITY test would mint 824 obligations for a 412-route
+  /// project on the day of the migration, report every one of them as
+  /// uncovered, and present QAAI's own opinion about what a team should test as
+  /// the team's debt. The number would fall for a reason unconnected to their
+  /// code, which is the one way a coverage product loses a customer in a week.
+  ///
+  /// Null means "this project never stated its obligations" and `{}` means
+  /// "this project considered it and owes nothing" — the same distinction
+  /// `coverageConfig` and `quarantineBudgetPercent` above record, and the UI can
+  /// say which. The domain is `TypeObligationPolicy` /
+  /// `typeObligationPolicySchema` in @qaai/shared, and `obligationsFor` is the
+  /// one resolver, so there is no second place a default could be written down.
+  typeObligationPolicy     Json?
   archivedAt               DateTime?
   createdAt                DateTime    @default(now())
   updatedAt                DateTime    @updatedAt
@@ -843,6 +860,16 @@ model Project {
   roleCrawlAttempts     RoleCrawlAttempt[]
   reEnumerationTriggers ReEnumerationTrigger[]
   surfaceDrifts         SurfaceDriftRecord[]
+
+  /// The number leaving the screen, and the three things that measure the
+  /// measurer. `coverageAttestations` is the exported artefact a buyer is
+  /// handed; `validityBacktests` asks whether "covered" tracks quality against
+  /// this org's own defect history; `benchmarkRuns` records what share of
+  /// SEEDED defects the suite actually caught, which is the ground truth every
+  /// other number in this product rests on and which nothing has ever measured.
+  coverageAttestations CoverageAttestation[]
+  validityBacktests    ValidityBacktest[]
+  benchmarkRuns        BenchmarkRun[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -2472,14 +2499,44 @@ model RunFailureCluster {
 // Visual regression (§4)
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// One approved reference image.
+///
+/// ── THE DEFECT THIS MODEL CARRIED UNTIL `environmentId` EXISTED ─────────────
+///
+/// The unique key was (test, viewport, browser), so STAGING AND PRODUCTION
+/// SHARED A BASELINE. Whichever environment ran first captured the reference,
+/// and every later diff on the other one was measured against it — so a staging
+/// capture silently becomes the production reference, and the red it produces is
+/// permanently false: nobody can fix it by changing the application, because the
+/// application is not what differs. A visual suite that cannot be made green is
+/// a visual suite that gets switched off.
+///
+/// ── WHY THE COLUMN IS TEXT AND NOT A RELATION ───────────────────────────────
+///
+/// Because an environment is deletable and the record of what was measured
+/// where must outlive it — the same argument `TestResultVariant.environment` and
+/// `CoverageItem.environmentId` already record. It also lets the migration
+/// attribute pre-existing rows to `<unattributed>`
+/// (`UNATTRIBUTED_ENVIRONMENT` in @qaai/shared) rather than guessing an
+/// environment for them: attributing a possibly-staging baseline to production
+/// would be inventing the exact fact this column exists to record. A reader must
+/// treat an unattributed baseline as "no reference for any environment,
+/// re-capture required" — the safe failure (one re-approval per test on deploy)
+/// rather than the false-red one.
 model VisualBaseline {
   id            String   @id @default(cuid())
   orgId         String
   projectId     String
   testId        String
-  /// One baseline per (test, viewport, browser).
+  /// One baseline per (test, viewport, browser, environment). The fourth member
+  /// is the whole point — see the note above.
   viewport      String
   browser       String
+  /// The environment this image was captured against, or `<unattributed>` for a
+  /// row that predates the column. NO DEFAULT: a new baseline must name the
+  /// environment it was captured in, because a defaulted sentinel is how the
+  /// shared-reference defect comes back one writer at a time.
+  environmentId String
   imageKey      String
   /// Rectangles to exclude from the diff, from the ignore-region editor.
   ignoreRegions Json     @default("[]")
@@ -2490,8 +2547,11 @@ model VisualBaseline {
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
   test    Test    @relation(fields: [testId], references: [id], onDelete: Cascade)
 
-  @@unique([testId, viewport, browser])
+  @@unique([testId, viewport, browser, environmentId])
   @@index([orgId])
+  /// "every baseline for this environment" — the read a per-environment
+  /// re-approval sweep makes, and the one that was impossible before.
+  @@index([projectId, environmentId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3685,7 +3745,7 @@ model CoverageItem {
   /// disappearing denominator needs an audit trail as much as a growing one.
   retiredAt   DateTime?
 
-  project          Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project          Project                  @relation(fields: [projectId], references: [id], onDelete: Cascade)
   waiver           CoverageWaiver?
   /// Requirements claimed to be covered by this surface. The join that lets the
   /// spec side and the crawl side be reconciled at all: a requirement naming a
@@ -3703,6 +3763,14 @@ model CoverageItem {
   /// diffable truth beneath it, and they are what lets a tier be computed and
   /// coverage be observed to DROP.
   coverageEdges    TestCoverageEdge[]
+  /// What lives BELOW this item, and the reason this round exists. Each of the
+  /// three is a SEPARATE denominator and they are never summed: a route's empty
+  /// state, one of its form's fields and the ACCESSIBILITY test it owes are
+  /// three things to test, and one blended per-item percentage over them would
+  /// be the four-summed-denominators defect rebuilt one level down.
+  states           CoverageItemState[]
+  formFields       CoverageFormField[]
+  typeObligations  CoverageTypeObligation[]
 
   @@unique([projectId, key])
   @@index([orgId])
@@ -3867,8 +3935,835 @@ model CoverageSnapshot {
   runId          String?
 
   /// Things a reader must know before trusting the number.
-  caveats     Json     @default("[]")
+  caveats     Json   @default("[]")
   /// Changes whenever the answer could change.
+  fingerprint String
+
+  /// ── WHAT MAKES A DELTA LEGITIMATE ─────────────────────────────────────────
+  ///
+  /// A delta is the number teams act on — it goes in the PR comment, the badge
+  /// and the digest — and it is the easiest number in this product to compute
+  /// wrongly, because subtracting two percentages always succeeds. Two
+  /// snapshots taken against DIFFERENT crawls, or against different denominator
+  /// definitions, measured different applications; "coverage fell 9 points"
+  /// across them is an artefact of our own enumeration changing and will be read
+  /// as a regression by everybody who sees it.
+  ///
+  /// All three are NULLABLE WITH NO DEFAULT, and null is load-bearing: every
+  /// snapshot written before this migration has none of them, and that state is
+  /// UNCOMPARABLE_FINGERPRINT_MISSING rather than comparable. Defaulting
+  /// `crawlVersion` to the current build would claim an old snapshot was
+  /// measured by today's enumerator.
+  crawlVersion          String?
+  crawlFingerprint      String?
+  /// The sentence that says WHAT WAS DIVIDED BY: which axes, which waivers,
+  /// which scope rules. Without it the percentage has no units, and a scope
+  /// change between two snapshots is invisible.
+  denominatorDefinition String?
+
+  /// The snapshot this one was compared against, and the result of asking
+  /// whether the comparison was allowed. `deltaPercent` is NULL unless
+  /// `comparability` is COMPARABLE — the reason is rendered where the delta
+  /// would have been. Domain: SNAPSHOT_COMPARABILITIES in
+  /// packages/shared/src/coverage-dimensions.ts, enforced at the producer, TEXT
+  /// for the same reason as `TestCoverageEdge.cappedBy`.
+  previousSnapshotId  String?
+  deltaPercent        Float?
+  comparability       String  @default("NOT_COMPARED")
+  comparabilityDetail String?
+
+  createdAt DateTime @default(now())
+
+  project Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// The per-dimension, per-feature and per-team breakdown — each row with ITS
+  /// OWN numerator and denominator, never derived by apportioning this
+  /// snapshot's global one.
+  rollups CoverageRollup[]
+  /// The direction of each of those subjects, with the comparability that says
+  /// whether its delta is allowed to exist.
+  history CoverageHistory[]
+
+  @@index([orgId])
+  @@index([projectId, createdAt])
+  @@index([projectId, commitSha])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The dimensions: what lives BELOW a surface item, and the honesty around it
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The axes a coverage report may be broken down on. Mirrors
+/// COVERAGE_DIMENSIONS in packages/shared/src/coverage-dimensions.ts;
+/// `check:enums` diffs them.
+///
+/// Thirteen, because the previous slice could measure a route, an endpoint, a
+/// form and an auth surface and NOTHING BELOW ONE. A route was one slot
+/// whatever state it was in; a form was one boolean; a PERFORMANCE test marked
+/// a route fully visited exactly as an E2E did. Those are not rounding errors:
+/// an untested empty state, an untested 403 and an untested pagination boundary
+/// were INVISIBLE rather than uncovered, and invisible raises the percentage
+/// while uncovered lowers it.
+///
+/// A dimension in this enum with no extractor is reported as UNMEASURED by
+/// name, never as 0%. `EXTRACTED_COVERAGE_DIMENSIONS` in the shared module is
+/// the list of axes this build actually measures, and it starts EMPTY.
+enum CoverageDimensionKind {
+  PAGE_STATE
+  ERROR_STATE
+  DATA_VARIANT
+  FORM_FIELD
+  VALIDATION_RULE
+  COMPONENT
+  COMPONENT_STATE
+  TEST_TYPE
+  DEVICE_LOCALE
+  FLAG_COMBINATION
+  ROLE_CELL
+  BACKGROUND_JOB
+  NOTIFICATION
+}
+
+/// Every kind of cell that lives below a surface item. Mirrors
+/// COVERAGE_CELL_KINDS in packages/shared/src/coverage-dimensions.ts.
+///
+/// ONE enum and not six, because six dimension modules are written against it
+/// in parallel and the failure this vocabulary exists to prevent is two of them
+/// inventing their own notion of "a page state". `CELL_KIND_DIMENSION` in the
+/// shared module is a `Record` keyed on this union, so a kind cannot be added
+/// without somebody naming the denominator it counts toward — and a kind
+/// counted toward no denominator is counted nowhere, which is the invisible
+/// state again.
+///
+/// PAGE_EMPTY and DATA_NONE are both "nothing here" and are deliberately NOT
+/// one member: the first is a page that rendered with no content, the second is
+/// the same page driven against a zero-row fixture, which is a test somebody
+/// has to write on purpose. A shared spelling would have merged two
+/// denominators the moment two modules wrote rows.
+enum CoverageCellKind {
+  PAGE_DEFAULT
+  PAGE_LOADING
+  PAGE_EMPTY
+  PAGE_SLOW
+  PAGE_INTERSTITIAL
+  PAGE_REDIRECTED
+  ERROR_UNAUTHENTICATED
+  ERROR_FORBIDDEN
+  ERROR_NOT_FOUND
+  ERROR_SERVER
+  ERROR_VALIDATION
+  DATA_NONE
+  DATA_ONE
+  DATA_MANY
+  DATA_PAGE_BOUNDARY
+  DATA_MAXIMUM
+  DATA_MALFORMED
+  FORM_FIELD
+  RULE_REQUIRED
+  RULE_LENGTH
+  RULE_RANGE
+  RULE_STEP
+  RULE_PATTERN
+  RULE_SEMANTIC
+  COMPONENT
+  COMPONENT_DEFAULT
+  COMPONENT_LOADING
+  COMPONENT_EMPTY
+  COMPONENT_ERROR
+  COMPONENT_FORBIDDEN
+  COMPONENT_SLOW
+}
+
+/// WHY A CELL CARRIES NO MEASUREMENT. Mirrors DIMENSION_UNMEASURED_REASONS.
+///
+/// THE honesty column of this whole slice. An unmeasured cell with no reason is
+/// indistinguishable from an uncovered one, which moves the percentage down for
+/// something the customer neither caused nor can fix; and an unmeasured
+/// DIMENSION read as 0% is "0% of your component states are covered", a lie
+/// about the customer's application assembled out of our own silence.
+///
+/// An enum and not TEXT — unlike `CoverageItem.unexercisableReason` and
+/// `TestCoverageEdge.cappedBy`, which are TEXT precisely because nothing
+/// filters on them. This one is filtered on and grouped by: the report lists
+/// the axes we do not measure separately from the ones a cap truncated, because
+/// the first is work for us and the second is a budget to raise.
+enum DimensionUnmeasuredReason {
+  NO_EXTRACTOR
+  NOT_ENUMERATED
+  EXTRACTOR_RETURNED_UNKNOWN
+  HELD_OUT
+  CAP_BIT
+}
+
+/// Whether this deployment can execute a test type at all. Mirrors
+/// DEPLOYMENT_CAPABILITY_STATUSES.
+///
+/// The worker image has no k6, Lighthouse, Stryker, Maestro, Firefox or WebKit,
+/// and the plugins for those types degrade to SKIPPED. So a pass rate and a
+/// coverage percentage can both include tests that ALWAYS skip, and nothing
+/// anywhere said which of the nineteen types a deployment can actually run.
+///
+/// NOT_CHECKED is the member a careless writer would collapse, and it must not
+/// be: reporting an unprobed type as MISSING is a claim about an image nobody
+/// looked at, and reporting it as AVAILABLE lets a cached tick stand in for a
+/// binary that has since vanished. Same rule as `ApiOperationVerification`'s
+/// NOT_PROBED.
+enum DeploymentCapabilityStatus {
+  AVAILABLE
+  MISSING
+  WRONG_VERSION
+  NOT_CHECKED
+}
+
+/// Whether a seeded defect was found. Mirrors FAULT_DETECTION_OUTCOMES.
+///
+/// NOT_EXERCISED is the member that makes the benchmark worth running: a bench
+/// that cannot tell "we had no test for this surface" from "our test ran and
+/// passed anyway" reports both as MISSED and is useless in both directions. The
+/// first is a coverage gap; the second says the tests we DO have are weak, and
+/// that is the finding nobody else in this market can produce.
+///
+/// BASELINE_DIRTY is a refusal rather than a result. A fault left switched on
+/// from a previous run makes every subsequent reading meaningless, so the bench
+/// asserts the clean baseline before AND after and records this instead of a
+/// detection rate it cannot stand behind.
+enum FaultDetectionOutcome {
+  DETECTED
+  MISSED
+  NOT_EXERCISED
+  BASELINE_DIRTY
+}
+
+/// One state of one surface item: its empty state, its 403, its pagination
+/// boundary.
+///
+/// ── THE DEFECT, VERBATIM ────────────────────────────────────────────────────
+///
+/// packages/agent/src/coverage.ts folds every state of a route into one entry
+/// with the comment "because coverage is a property of the route". It is not. A
+/// route serving an empty list, a 403 and a pagination boundary is three things
+/// to test, and before this table the second and third were not UNCOVERED —
+/// they were absent from the inventory, so they lowered nothing and the
+/// percentage was computed as though they did not exist.
+///
+/// ── WHY `stateKey` AND NOT A COMPOSITE OF COLUMNS ───────────────────────────
+///
+/// Because `dimensionCellIdentity` in packages/shared/src/surface.ts is the ONE
+/// cell-key format in this product and a second one would make two dimensions
+/// silently uncomparable. The key is built from the item's identity plus the
+/// state's coordinates, so it is stable across runs, readable in a log, and
+/// pasteable into a waiver file — which is what makes a state diffable and
+/// therefore trendable at all.
+model CoverageItemState {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  itemId    String
+
+  /// `dimensionCellIdentity(item.key, coordinates)`. Unique per item.
+  stateKey String
+  kind     CoverageCellKind
+  label    String
+  /// Which declarer said this state exists. The crawl saw it, the source
+  /// declares a handler, the API document declares the status, or a human said
+  /// so — and the three are different strengths of evidence, which is why this
+  /// reuses `SurfaceSource` rather than a boolean.
+  origin   SurfaceSource
+  /// The sentence justifying the row, same contract as `CoverageItem.evidence`.
+  evidence String
+
+  /// The state this one is only reachable THROUGH, when there is one: a
+  /// validation error behind a submit, a pagination boundary behind page one.
+  /// Null for a state reachable directly.
+  ///
+  /// Not a foreign key to this table's own `id`: the parent may be enumerated
+  /// after the child by a different reader, and a self-referential FK would
+  /// make the write order load-bearing. The key is stable, so the join is safe.
+  parentStateKey String?
+
+  /// When a run or a crawl was OBSERVED in this state. NULL MEANS DECLARED AND
+  /// NEVER OBSERVED, which is the same distinction `SurfaceVerification` draws
+  /// between a test existing and a test running. Defaulting it to the row's
+  /// creation time would turn every declared state into an observed one.
+  observedAt DateTime?
+
+  /// Whether a test may drive this state here, and why not. Same three columns
+  /// and same contract as `CoverageItem`: a state the crawl REFUSED to reach
+  /// (a destructive path, a policy exclusion) stays in the inventory, leaves
+  /// the denominator, and is named — it is not a gap and not a pass.
+  exercisability      SurfaceExercisability?
+  unexercisableReason String?
+  refusedByRule       String?
+  exerciseDetail      String?
+
+  /// The resolved rung for this state. NULL IS NOT `DECLARED` — it means
+  /// nothing claims this state at all, exactly as `TestCoverageEdge`'s section
+  /// header records. A default here would mint a claim nothing produced.
+  tier               CoverageTier?
+  /// Why `tier` is not higher. TEXT, domain `TIER_CAP_REASONS`, enforced at the
+  /// producer — the same judgement as `TestCoverageEdge.cappedBy`.
+  tierCappedBy       String?
+  /// The run that last confirmed the tier. Required in spirit for any tier
+  /// above DECLARED, enforced by `coverageItemStateSchema`.
+  lastConfirmedRunId String?
+  /// Set when this state was NOT measured, with the reason. Nullable because a
+  /// measured state has nothing to explain, and the schema refuses the two
+  /// contradictory combinations.
+  unmeasuredReason   DimensionUnmeasuredReason?
+  unmeasuredDetail   String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  /// Set when the enumerator stops finding it, rather than deleting the row —
+  /// same argument as `CoverageItem.retiredAt`. A state that disappears is as
+  /// much a change in the denominator as one that appears.
+  retiredAt   DateTime?
+
+  item CoverageItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, stateKey])
+  @@index([orgId])
+  /// "every state of this item, by kind" — the read behind a route's state list.
+  @@index([itemId, kind])
+  /// The per-dimension denominator: every PAGE_STATE row in this project. The
+  /// dimension is DERIVED from `kind` through `CELL_KIND_DIMENSION`, so the
+  /// reader filters `kind IN (…)` from that record rather than storing the
+  /// dimension twice and letting the two disagree.
+  @@index([projectId, kind, retiredAt])
+}
+
+/// One field of one form, or one validation rule derived from one field.
+///
+/// ── THE DEFECT, VERBATIM ────────────────────────────────────────────────────
+///
+/// packages/agent/src/coverage.ts marks a whole form "exercised" if any test
+/// mentions its submit label, or one field label near a `.fill()`. So a
+/// fourteen-field checkout form with one test that types into the email box is
+/// 100% of the FORM axis, and `required`, `semantic` and every boundary case
+/// are counted by nobody.
+///
+/// ── WHY FIELDS AND RULES SHARE A TABLE AND NOT A DENOMINATOR ────────────────
+///
+/// The columns are the same — a rule has a key, an origin, evidence and a tier,
+/// exactly as a field does — and `kind` separates the two denominators, with
+/// `parentFieldKey` tying a rule to the field it was derived from. They are
+/// NEVER summed: a field cell and a rule cell are two things to test, and
+/// `FORM_FIELD` and `VALIDATION_RULE` are two entries in
+/// `CoverageDimensionKind` for that reason. A single `formCoverage` percentage
+/// over both would be the four-summed-denominators defect in miniature.
+model CoverageFormField {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  itemId    String
+
+  /// `dimensionCellIdentity(item.key, coordinates)` for the field, or for the
+  /// rule. Unique per item.
+  fieldKey       String
+  /// FORM_FIELD for a field; one of the RULE_* members for a rule.
+  /// `coverageFormFieldSchema` refuses a kind whose dimension is neither
+  /// FORM_FIELD nor VALIDATION_RULE.
+  kind           CoverageCellKind
+  label          String
+  /// Set on a RULE_* row: the FORM_FIELD row it was derived from. Null on a
+  /// field row. The schema requires it for a rule, because a rule with no field
+  /// is a cell nothing can ever assert against.
+  parentFieldKey String?
+
+  /// The input type as the reader found it: `email`, `number`, `tel`. NULL
+  /// means the reader could not tell, which is not the same as `text`.
+  inputType String?
+
+  /// WHETHER THE FIELD IS REQUIRED — AND THE THREE STATES THAT MATTER.
+  ///
+  /// NULL means the reader could not tell. `false` means it looked and the
+  /// field is optional. Collapsing null into false is the specific defect this
+  /// column exists to avoid: `required` is one of the two boundary cases the
+  /// register names as counted by nobody, and reading "we could not read the
+  /// attribute" as "there is no rule here" removes the cell from the
+  /// denominator and raises the percentage.
+  required Boolean?
+
+  /// What the field MEANS, when the reader could tell: EMAIL, PHONE, CARD,
+  /// DATE, POSTCODE. TEXT and not an enum — nothing filters rows on it, the
+  /// domain is enforced at the producer, and the same judgement is already
+  /// recorded on `CoverageItem.unexercisableReason`. NULL is "not classified",
+  /// which is why the semantic rules it implies are UNMEASURED rather than
+  /// absent.
+  semantic String?
+
+  /// The constraints as the crawl or the source found them: maxlength,
+  /// minlength, min, max, step, pattern.
+  ///
+  /// NULL MEANS THE CONSTRAINTS WERE NEVER READ, and that is a different fact
+  /// from a field with no constraints. `detectForms` in
+  /// packages/shared/src/codebase.ts reads none of them on the source path, so
+  /// ten of twenty boundary classes are unreachable from there — a KNOWN open
+  /// gap, and one the report must be able to NAME rather than present as a
+  /// field with nothing to test. Inside the object every member is
+  /// `number | null` and never absent, and `maxLength`/`minLength`/`step` are
+  /// refused at 0: a maxlength of zero is not a constraint, it is an absent
+  /// attribute that a writer turned into a number. `min` and `max` MAY be 0,
+  /// because zero is a real bound.
+  constraint      Json?
+  /// Whether anything even tried to read the constraints. `false` with a NULL
+  /// `constraint` is the honest state for the source path; `true` with a NULL
+  /// constraint is a reader bug, and the schema refuses it.
+  constraintsRead Boolean @default(false)
+
+  origin   SurfaceSource
+  evidence String
+
+  exercisability      SurfaceExercisability?
+  unexercisableReason String?
+  refusedByRule       String?
+  exerciseDetail      String?
+
+  /// Same contract as `CoverageItemState` above: NULL is no claim, never
+  /// DECLARED, and a rule is only ASSERTED when a test asserts the rule's
+  /// OUTCOME rather than filling the input.
+  tier               CoverageTier?
+  tierCappedBy       String?
+  lastConfirmedRunId String?
+  unmeasuredReason   DimensionUnmeasuredReason?
+  unmeasuredDetail   String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  item CoverageItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, fieldKey])
+  @@index([orgId])
+  @@index([itemId, kind])
+  @@index([projectId, kind, retiredAt])
+}
+
+/// "THIS ROUTE OWES AN ACCESSIBILITY TEST" AS A FACT ABOUT THE ROUTE.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// Coverage is type-blind: a PERFORMANCE test marks /checkout fully visited
+/// exactly as an E2E does, so "routes with an ACCESSIBILITY test: 3 of 14"
+/// cannot be said. Nineteen test types against one boolean.
+///
+/// ── WHY A ROW PER OBLIGATION AND NOT A GLOBAL DEFAULT ───────────────────────
+///
+/// Because nineteen fabricated denominators is a worse defect than one boolean.
+/// Defaulting every route to owing an E2E and an ACCESSIBILITY test would mint
+/// 824 obligations for a 412-route project on the day of the migration, report
+/// them all as uncovered, and present QAAI's own opinion about what a team
+/// should test as the team's debt. So `DEFAULT_TYPE_OBLIGATIONS` in the shared
+/// module is EMPTY for every axis, a project states its own in
+/// `Project.typeObligationPolicy`, and an obligation nobody declared is NOT
+/// OWED and has no row here.
+///
+/// An obligation that IS owed and cannot be measured — no extractor, or a test
+/// type this deployment cannot execute — is UNMEASURED with the reason on the
+/// row. It is never counted as covered and never silently dropped.
+model CoverageTypeObligation {
+  id        String   @id @default(cuid())
+  orgId     String
+  projectId String
+  itemId    String
+  testType  TestType
+
+  /// Which declarer said this item owes this type. `SurfaceSource` rather than
+  /// a new enum: a project policy a human configured is MANUAL, a requirement
+  /// that demands an accessibility check is REQUIREMENT, and a detector that
+  /// read it out of the repo is SOURCE. Reusing the declarer vocabulary means
+  /// the strength of the claim is already ranked and already drift-guarded.
+  declaredBy SurfaceSource
+  evidence   String
+
+  tier               CoverageTier?
+  tierCappedBy       String?
+  lastConfirmedRunId String?
+  /// Set when the obligation could not be measured. HELD_OUT is the one to read
+  /// carefully: an obligation this deployment cannot EXECUTE (see
+  /// `DeploymentCapability`) leaves the denominator with a reason, which is the
+  /// difference between "4 of 19 test types are not executable here" and a
+  /// percentage quietly computed over tests that always skip.
+  unmeasuredReason   DimensionUnmeasuredReason?
+  unmeasuredDetail   String?
+
+  firstSeenAt DateTime  @default(now())
+  lastSeenAt  DateTime  @updatedAt
+  retiredAt   DateTime?
+
+  item CoverageItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([itemId, testType])
+  @@index([orgId])
+  /// "every route that owes an ACCESSIBILITY test, and which of them have one".
+  @@index([projectId, testType, retiredAt])
+}
+
+/// ONE FEATURE'S OR ONE TEAM'S PERCENTAGE, WITH ITS OWN NUMERATOR AND
+/// DENOMINATOR.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// Gaps carry a `feature` string and the totals are global only, so "Payments
+/// is at 31%, owned by Team Billing" cannot be said and one global percentage
+/// can be assigned to nobody.
+///
+/// ── THE TWO RULES THAT MAKE THIS HONEST ─────────────────────────────────────
+///
+/// 1. A FEATURE'S PERCENTAGE IS COMPUTED FROM ITS OWN NUMERATOR AND
+///    DENOMINATOR, stored here, never by re-summing a global one. That is why
+///    both columns are on the row rather than only a percent: a percentage
+///    whose inputs are not beside it cannot be checked, and a rollup derived by
+///    apportioning a global denominator is the four-summed-denominators defect
+///    wearing a different hat.
+/// 2. UNOWNED SURFACE IS A FINDING, NOT AN ERROR. "31% of the surface has no
+///    owner" is the most useful sentence a rollup produces, so it gets the
+///    named `UNOWNED` bucket rather than being distributed among the teams that
+///    do own things or dropped — either of which makes the finding disappear.
+///
+/// ── WHY `scopeKey` IS A COLUMN ──────────────────────────────────────────────
+///
+/// PostgreSQL treats NULLs in a unique index as DISTINCT, so a unique on
+/// (snapshotId, dimension, feature, teamId) would let the headline row — all
+/// three null — be written an unbounded number of times and the writer's upsert
+/// would silently stop being idempotent. Every duplicate is a second
+/// denominator for the same subject, which is how one screen comes to disagree
+/// with another about the same percentage. So the identity is the NOT NULL text
+/// `rollupScopeKey` builds, and the three nullable columns stay beside it as
+/// what a reader filters on.
+model CoverageRollup {
+  id         String @id @default(cuid())
+  orgId      String
+  projectId  String
+  snapshotId String
+
+  /// `rollupScopeKey({ dimension, feature, teamId })`. HEADLINE for the global
+  /// row. Unique per snapshot.
+  scopeKey  String
+  /// Null for a rollup across every dimension.
+  dimension CoverageDimensionKind?
+  /// Null for a rollup not narrowed to a feature; `UNATTRIBUTED` for the
+  /// surface no feature could be attributed to, spelled exactly as
+  /// apps/api/src/routes/issues.ts already spells it.
+  feature   String?
+  /// Null for a rollup not narrowed to a team; `UNOWNED` for the surface nobody
+  /// owns. NOT a foreign key: the bucket sentinel is not a team id, and the
+  /// evidence of what was unowned must outlive a deleted team.
+  teamId    String?
+
+  /// Its OWN arithmetic. Both stored, so the division is checkable.
+  numerator   Int
+  denominator Int
+  /// `numerator / denominator`, one decimal, or NULL when the denominator is
+  /// zero. Null is not 0 and not 100 — an empty denominator means nothing on
+  /// this axis was in scope for this bucket, and printing either number would
+  /// be a claim about the customer's application made from our own silence.
+  percent     Float?
+  /// The rung the percentage was taken at, so two rollups cannot silently be
+  /// one at PASSING and one at NAVIGATED. No default: a rollup that does not
+  /// say which bar it cleared is not comparable to any other.
+  tier        CoverageTier
+
+  /// Cells not measured in this bucket, and why. The same pair as everywhere
+  /// else in this slice, because a rollup is the surface a reader is most
+  /// likely to quote and therefore the one that can least afford an unexplained
+  /// shortfall.
+  unmeasured       Int                        @default(0)
+  unmeasuredReason DimensionUnmeasuredReason?
+  unmeasuredDetail String?
+
+  /// DimensionCapBite[] — every cap that BIT, as a count AND a reason.
+  /// Defaulted to `[]` here and nowhere among the counts above: an empty cap
+  /// list is a positive and verifiable claim that nothing was truncated,
+  /// whereas an empty COUNT would be a claim about the customer's application.
+  caps Json @default("[]")
+
+  /// Items deliberately excluded from this bucket, as sentences. A rollup whose
+  /// parts do not reconstruct the whole MUST say which items were excluded and
+  /// why; without this column the only way to notice is to add the buckets up
+  /// by hand and find they do not reach the total.
+  exclusions Json @default("[]")
+
+  createdAt DateTime @default(now())
+
+  snapshot CoverageSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@unique([snapshotId, scopeKey])
+  @@index([orgId])
+  /// "this feature over time" and "this team over time" — the trend reads.
+  @@index([projectId, scopeKey, createdAt])
+  @@index([projectId, dimension, createdAt])
+}
+
+/// THE DIRECTION OF ONE SUBJECT'S NUMBER, AND WHETHER A DELTA IS ALLOWED TO
+/// EXIST AT ALL.
+///
+/// ── WHY THIS IS NOT A PAIR OF COLUMNS ON CoverageSnapshot ───────────────────
+///
+/// Because "when did Payments first drop below 50%" is a question about a
+/// SUBJECT, not about a snapshot, and first-seen on the snapshot would make it
+/// unanswerable. The snapshot carries its own crawl fingerprint and its own
+/// comparability (see the columns added to it in this migration); this table
+/// carries one row per subject per snapshot so a feature, a team and a
+/// dimension each have a history of their own.
+///
+/// ── THE RULE THAT MATTERS MORE THAN THE TABLE ───────────────────────────────
+///
+/// `deltaPercent` IS NULL UNLESS `comparability` IS COMPARABLE. A delta is the
+/// number teams act on — it goes in the PR comment, the badge and the digest —
+/// and it is the easiest number in this product to compute wrongly, because
+/// subtracting two percentages always succeeds. Two snapshots taken against
+/// different crawls measured different applications: "coverage fell 9 points"
+/// across them is an artefact of our own enumeration changing, and it will be
+/// read as a regression by everybody who sees it. So the reason is rendered
+/// where the delta would have been.
+model CoverageHistory {
+  id         String @id @default(cuid())
+  orgId      String
+  projectId  String
+  snapshotId String
+
+  /// `rollupScopeKey` — the same format and the same function as
+  /// `CoverageRollup.scopeKey`, so a feature's rollup and a feature's history
+  /// are provably about the same bucket. Two key formats would be two features
+  /// with the same name.
+  scopeKey  String
+  dimension CoverageDimensionKind?
+  feature   String?
+  teamId    String?
+
+  numerator   Int
+  denominator Int
+  percent     Float?
+  tier        CoverageTier
+
+  /// The crawl this reading was taken against. NULL means the writer recorded
+  /// none, which makes comparability UNPROVABLE rather than true — see
+  /// UNCOMPARABLE_FINGERPRINT_MISSING.
+  crawlFingerprint String?
+
+  /// When this subject was first measured at all. The column that makes "it has
+  /// been below 50% since the 3rd" a sentence the product can say.
+  firstSeenAt DateTime @default(now())
+
+  previousSnapshotId  String?
+  previousPercent     Float?
+  /// Percentage points. NULL whenever `comparability` is not COMPARABLE, and
+  /// also NULL when either side has no percentage — a measurement with no
+  /// figure has no change, and 0 would claim nothing changed between a number
+  /// and an absence.
+  deltaPercent        Float?
+  /// SNAPSHOT_COMPARABILITIES in packages/shared/src/coverage-dimensions.ts.
+  /// TEXT and not an enum: nothing filters rows on it and the domain is
+  /// enforced at the producer, the same judgement as
+  /// `TestCoverageEdge.cappedBy`. Defaulted to NOT_COMPARED, which is the
+  /// honest default — a row written by a writer that never compared anything
+  /// has not established comparability, and COMPARABLE as a default would
+  /// produce confident deltas across unknown boundaries.
+  comparability       String  @default("NOT_COMPARED")
+  comparabilityDetail String?
+
+  createdAt DateTime @default(now())
+
+  snapshot CoverageSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@unique([snapshotId, scopeKey])
+  @@index([orgId])
+  @@index([projectId, scopeKey, createdAt])
+}
+
+/// WHICH OF THE NINETEEN TEST TYPES THIS DEPLOYMENT CAN ACTUALLY EXECUTE.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// The worker image has no k6, no Lighthouse, no Stryker, no Maestro, no
+/// Firefox and no WebKit. Those plugins degrade to SKIPPED, so a pass rate and
+/// a coverage percentage can both contain tests that can never fail, and
+/// nothing anywhere tells anyone which types are in that state. A percentage
+/// with un-failable tests in it is a pass that means "we did not check".
+///
+/// ── WHY `deploymentKey` IS TEXT WITH A SENTINEL ─────────────────────────────
+///
+/// The unique key is (deploymentKey, testType) and PostgreSQL treats NULLs as
+/// DISTINCT, so a nullable column there would let the same probe be written
+/// twice and the upsert would stop being idempotent. `<self>` is this
+/// deployment's own image; `pool:<name>` is a customer's on-prem runner pool,
+/// which genuinely has different binaries. Same angle-bracket convention as
+/// `TestResultVariant`'s `<unvaried>`.
+///
+/// `orgId` IS NULLABLE here and nowhere else in this slice: the cloud image is
+/// a property of the INSTALL and belongs to no org, while a runner pool belongs
+/// to one. A btree indexes nulls, so the `orgId IS NULL OR orgId = $1` a
+/// correct reader writes is answered from the index.
+model DeploymentCapability {
+  id            String                     @id @default(cuid())
+  orgId         String?
+  deploymentKey String                     @default("<self>")
+  testType      TestType
+  status        DeploymentCapabilityStatus
+
+  /// What a human needs in order to fix it: the exact binary, the exact version
+  /// range, the exact install line the image would need. Required, because
+  /// "MISSING" with no detail is a status nobody can act on.
+  ///
+  /// NEVER A CREDENTIAL. This field is rendered in the coverage report and in
+  /// the preflight summary, so a probe that embedded a token, a cookie or a
+  /// storageState value here would be publishing it. Truncated and hashed both
+  /// count as leaks.
+  detail          String
+  remedy          String?
+  requiredBinary  String?
+  /// The range the plugin needs, and what was found. Both nullable: a probe
+  /// that could not read a version says so rather than writing `0.0.0`.
+  requiredVersion String?
+  observedVersion String?
+
+  /// When the probe ran. NULL MEANS NEVER PROBED, and the schema refuses any
+  /// status other than NOT_CHECKED beside a null — a cached AVAILABLE for a
+  /// binary that has since vanished is exactly the lie this table exists to
+  /// kill, so the age of the answer is part of the answer.
+  checkedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([deploymentKey, testType])
+  @@index([orgId])
+  /// "what can this deployment run" — the read the coverage denominator makes
+  /// before it will score a type obligation.
+  @@index([deploymentKey, status])
+}
+
+/// THE SIGNED, DATED, SCOPED EXPORT — the artefact a buyer is handed.
+///
+/// ── WHY THE SCOPE COLUMNS HAVE NO DEFAULTS ──────────────────────────────────
+///
+/// An attestation that does not say what was NOT measured is worse than no
+/// attestation, because a reader given a percentage and no scope does not
+/// conclude "scope unknown" — they conclude "87% of the application, and the
+/// other 13% is ordinary untested code". If in fact nine axes were never
+/// measured, four test types cannot execute here and a page budget truncated
+/// the crawl at 1,000 URLs, the reader has been told something false by a
+/// document containing no false sentence. Omission is the lie.
+///
+/// So `scopeStatement`, `unmeasured` and `caps` are NOT NULL WITH NO DEFAULT:
+/// the INSERT fails without them. That is deliberately stricter than
+/// `SuiteHealthSnapshot.caveats`, which defaults to `[]` correctly — there an
+/// empty list is a verifiable claim that a scan truncated nothing, here it
+/// would be a claim that nothing was unmeasured in a round that added thirteen
+/// axes. The type-level half lives in packages/shared/src/attestation.ts, where
+/// a module-private brand makes `attest()` the only way to construct one.
+model CoverageAttestation {
+  id         String  @id @default(cuid())
+  orgId      String
+  projectId  String
+  snapshotId String?
+
+  /// Stable over (denominator definition, crawl version, item set), so two
+  /// attestations can be compared without reading them, and so a customer can
+  /// recompute it and check our arithmetic. `attestationCanonicalText` names
+  /// exactly what goes in and what deliberately does not — the clock and the
+  /// issuer are OUT, because two exports of one measurement are one claim.
+  fingerprint           String
+  /// The enumerator that produced the inventory. Required: two attestations
+  /// from different crawl versions are not comparable, and a document that does
+  /// not say which crawl produced it cannot be checked against a later one.
+  crawlVersion          String
+  crawlFingerprint      String?
+  /// THE SENTENCE THAT SAYS WHAT WAS DIVIDED BY: which axes are in the
+  /// denominator, which waivers were applied, which scope rules the customer
+  /// configured. Without it the percentage on this document has no units.
+  denominatorDefinition String
+
+  /// The headline. NULL, not zero, when there was nothing to divide.
+  percent     Float?
+  denominator Int
+  covered     Int
+
+  scopeStatement String
+  /// AttestationUnmeasured[] — the axes NOT measured, each with its reason and
+  /// its sentence.
+  unmeasured     Json
+  /// DimensionCapBite[] — every cap that BIT, as a count AND a reason.
+  caps           Json
+
+  issuedByUserId String?
+  issuedAt       DateTime @default(now())
+  /// The share token this attestation was published under, when one was
+  /// minted. TEXT and not a relation: a share can be revoked and deleted, and
+  /// the record that an attestation was published must outlive the link.
+  shareId        String?
+
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One attestation per claim per project. Re-exporting an unchanged
+  /// measurement returns the same row rather than minting a second document
+  /// that says the same thing with a different id — which is what makes
+  /// "is this the PDF you were sent?" answerable.
+  @@unique([projectId, fingerprint])
+  @@index([orgId])
+  @@index([projectId, issuedAt])
+}
+
+/// DOES "COVERED" PREDICT QUALITY? — the back-test, with its n always beside
+/// it.
+///
+/// ── WHY THE HONESTY RULES ARE COLUMNS AND NOT CONVENTIONS ───────────────────
+///
+/// This is the question a buyer actually asks, and it is the question most
+/// easily answered with a flattering correlation computed over four defects. So
+/// the sample size is stored, the threshold that was APPLIED is stored, and the
+/// two rates are NULLABLE: with too few defects the answer is
+/// INSUFFICIENT_DATA and both rates are null, never a number.
+///
+/// ── A BINDING NOTE ON WORDING ───────────────────────────────────────────────
+///
+/// Nothing in this product may present this as a CAUSAL claim. The columns are
+/// named `escapedRate*` and the verdict says SUFFICIENT; there is no column
+/// called `predicts` and there must not be one. A correlation between coverage
+/// and escaped defects is evidence worth reporting and is not proof that the
+/// coverage caused the quality.
+model ValidityBacktest {
+  id         String  @id @default(cuid())
+  orgId      String
+  projectId  String
+  snapshotId String?
+
+  /// The window the defects were counted over. Both required: a rate with no
+  /// window is a rate over an unknown period.
+  windowStartAt DateTime
+  windowEndAt   DateTime
+
+  /// THE n, ALWAYS. Every number below is meaningless without these four.
+  defectCount           Int
+  coveredSurfaceCount   Int
+  uncoveredSurfaceCount Int
+  defectsOnCovered      Int
+  defectsOnUncovered    Int
+
+  /// Defects per surface, on each side. NULL WHEN INSUFFICIENT — never 0. A
+  /// zero escaped-defect rate on covered surface is the most flattering number
+  /// this product could print, and it is exactly what a back-test over three
+  /// tickets would produce.
+  escapedRateCovered   Float?
+  escapedRateUncovered Float?
+
+  /// VALIDITY_VERDICTS in packages/shared/src/coverage-dimensions.ts. TEXT with
+  /// the domain enforced at the producer — nothing filters rows on it, so an
+  /// enum here would be a sixth new Postgres type whose only job is to need a
+  /// drift guard. NOT_ATTEMPTED is distinct from INSUFFICIENT_DATA: one says we
+  /// did not look, the other says we looked and there is not enough.
+  verdict        String
+  verdictDetail  String
+  /// The threshold that was applied, disclosed rather than implied, so a reader
+  /// can see why 29 defects produced INSUFFICIENT_DATA.
+  minimumDefects Int
+  /// Where the defect rows came from — which tracker, which query. A rate whose
+  /// input nobody can name is a rate nobody can reproduce.
+  defectSource   String
+
   fingerprint String
   createdAt   DateTime @default(now())
 
@@ -3876,7 +4771,119 @@ model CoverageSnapshot {
 
   @@index([orgId])
   @@index([projectId, createdAt])
-  @@index([projectId, commitSha])
+}
+
+/// "WE FIND N% OF SEEDED DEFECTS" — the only ground truth any coverage claim
+/// rests on.
+///
+/// ── WHY THIS TABLE EXISTS ───────────────────────────────────────────────────
+///
+/// Nothing in this product has ever compared a reported number to a known
+/// truth, which is precisely why a catch-all route literal once gave 100%
+/// coverage and survived. The demo application in this repo has a KNOWN
+/// surface and a catalogue of individually switchable defects; this table is
+/// the record of switching them on one at a time and finding out.
+///
+/// ── THE TWO COLUMNS THAT MAKE IT A BENCHMARK RATHER THAN A DEMO ─────────────
+///
+/// `seed` — a benchmark you cannot reproduce from a seed is not a benchmark.
+/// `baselineCleanBefore` / `baselineCleanAfter` — a fault left switched on from
+/// a previous run makes every subsequent reading meaningless, so the clean
+/// baseline is asserted at both ends and `baselineCleanAfter` is NULLABLE
+/// because a bench that crashed never re-asserted it. Null there means the run
+/// did not finish, which is not the same as a dirty baseline.
+model BenchmarkRun {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// Reproducibility. Taken as an argument, never generated inside the bench.
+  seed    String
+  suiteId String?
+  /// The suite run the bench drove, when it drove one.
+  runId   String?
+
+  faultCount        Int
+  /// NULL WHEN THE BENCH DID NOT COMPLETE. 0 detected is a result — a terrible
+  /// one — and "we did not finish" is not a result at all; defaulting these to
+  /// 0 would make a crashed bench report a 0% detection rate against the
+  /// product's own test suite.
+  detectedCount     Int?
+  missedCount       Int?
+  /// Faults whose surface no test exercised. Reported SEPARATELY and excluded
+  /// from both halves of the detection rate: counting it as MISSED blames the
+  /// assertions for a coverage gap, and counting it as DETECTED is fiction.
+  notExercisedCount Int?
+
+  baselineCleanBefore Boolean
+  baselineCleanAfter  Boolean?
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  /// Every cap that bit and every degradation that applied, as sentences.
+  caveats     Json     @default("[]")
+  fingerprint String
+  createdAt   DateTime @default(now())
+
+  project      Project                @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  faultResults BenchmarkFaultResult[]
+
+  @@index([orgId])
+  @@index([projectId, createdAt])
+}
+
+/// One seeded defect, and what the suite did about it.
+///
+/// A ROW PER FAULT and not a count on the run, because the only useful form of
+/// this number is PER FAULT CLASS: "we catch 90% of broken validations and 20%
+/// of silent failures" is a finding a team acts on, and one blended percentage
+/// is a marketing number. `faultClass` is what the rate is grouped by.
+model BenchmarkFaultResult {
+  id             String @id @default(cuid())
+  orgId          String
+  benchmarkRunId String
+
+  /// The catalogue entry's stable id, so the same fault is comparable across
+  /// runs and a regression in OUR detection is visible.
+  faultId        String
+  /// The class the rate is grouped by: a broken validation, a 500 on one path,
+  /// a missing a11y label, a wrong total, an off-by-one page size, a silent
+  /// failure, a flaky race. TEXT with the domain in the catalogue, because the
+  /// catalogue is data in the demo app and a Postgres enum would need a
+  /// migration every time somebody wrote a new fault.
+  faultClass     String
+  /// The `CoverageItem.key` the fault lives on. TEXT and not a relation: the
+  /// evidence of what was benchmarked must outlive a retired item, the same
+  /// argument `TestResultVariant.environment` records.
+  surfaceItemKey String?
+
+  outcome          FaultDetectionOutcome
+  /// The sentence that justifies the outcome, in the terms a reader can check:
+  /// which test went red, or why nothing exercised the surface.
+  detail           String
+  /// The test that caught it, when one did. TEXT for the same reason.
+  detectedByTestId String?
+
+  createdAt DateTime @default(now())
+
+  /// `benchmarkRun` and not `run`, and the reason is a live collision rather
+  /// than taste — the same judgement `Project.specRequirements` records. The
+  /// nested-read heuristic in scripts/check-wiring.ts treats `run: true` in any
+  /// production source as a read of whatever model a relation field called
+  /// `run` points at, and `run: true` appears in three routes that have nothing
+  /// to do with benchmarks. With this field named `run`, the checker reported
+  /// BenchmarkRun as "read by agent.ts, dom-diff.ts and issues.ts" — which
+  /// would have gone quiet about a benchmark table with no read path at all.
+  benchmarkRun BenchmarkRun @relation(fields: [benchmarkRunId], references: [id], onDelete: Cascade)
+
+  /// One result per fault per run. The constraint is what makes the bench's
+  /// write idempotent on a retry, and what stops one fault being counted twice
+  /// in its class rate.
+  @@unique([benchmarkRunId, faultId])
+  @@index([orgId])
+  /// "the detection rate per class" — the only honest shape of the number.
+  @@index([benchmarkRunId, faultClass])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

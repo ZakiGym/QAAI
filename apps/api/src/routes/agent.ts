@@ -40,6 +40,29 @@ import {
   reachabilityFromPolicy,
   roleHadNoExtraSurface,
 } from '@qaai/shared';
+/*
+ * The self-measurement vocabulary. `MINIMUM_BACKTEST_DEFECTS` is reported
+ * rather than implied — a threshold a reader cannot see is a threshold they
+ * cannot argue with — and `VALIDITY_VERDICT_LABELS` is imported so the sentence
+ * on this endpoint and the sentence on the stored row cannot diverge.
+ */
+import { MINIMUM_BACKTEST_DEFECTS, VALIDITY_VERDICT_LABELS } from '@qaai/shared';
+import type { ValidityVerdict } from '@qaai/shared';
+/*
+ * THE RATES, every one of them a pure function over rows these handlers read.
+ *
+ * Imported rather than inlined so that there is exactly ONE implementation of
+ * each with its own test. A handler that divided here would be a second answer
+ * to the same question served from the same product, which is how two screens
+ * come to disagree about how accurate we are.
+ */
+import {
+  generationSurvival,
+  loadLatestValidityBacktest,
+  triageAccuracy,
+  yieldTelemetry,
+  type GeneratedTestRow,
+} from '../lib/accuracy.js';
 import { loginCapabilities } from '@qaai/runner';
 import {
   applyHealDiff,
@@ -2270,5 +2293,393 @@ agentRouter.get('/auth-profile-kinds', async (req, res) => {
      * still be unavailable on the runner that picks the job up.
      */
     note: 'This is the capability FLOOR for this install, read from the sign-in path as it is configured today. A runner with a mailbox, an OTP sink, a CDP session or a mock issuer attached can honour more.',
+  });
+});
+
+// ─── Measuring the measurer ──────────────────────────────────────────────────
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE SELF-MEASUREMENT ROUTES
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * Every other number this API serves is a claim about the CUSTOMER'S
+ * application. These four are claims about QAAI, and until `lib/accuracy.ts`
+ * landed there were none: no ground truth, no seeded-fault benchmark, no
+ * back-test against the customer's own bug history, no keep-rate for generated
+ * tests, no triage override rate. The consequence was not theoretical — a
+ * catch-all route literal once produced 100% coverage and survived a whole
+ * round, because nothing anywhere was checking the measurement against a known
+ * answer.
+ *
+ * ── THESE ARE THIN CALLERS, DELIBERATELY ───────────────────────────────────
+ *
+ * Every rate below is computed by a pure function in `lib/accuracy.ts` over
+ * rows these handlers read. No handler does arithmetic on a percentage: there
+ * is one implementation of each rate, with its own test, and these are its
+ * door. A handler that divided here would be a second answer to the same
+ * question, served from the same product.
+ *
+ * ── INSUFFICIENT_DATA IS A 200 WITH A NAMED REASON ─────────────────────────
+ *
+ * Not a 404, not an empty object and never a zero. "We looked and there is not
+ * enough" and "we did not look" are different answers with different remedies,
+ * and both are more useful than silence — a buyer reading an empty response as
+ * the first when it is the second is the failure this whole vocabulary exists
+ * to prevent. So every payload here carries its own n, the threshold that was
+ * APPLIED, and a sentence.
+ *
+ * ── AND NOTHING HERE MAY BE PRESENTED AS CAUSAL ────────────────────────────
+ *
+ * Binding rather than stylistic, and it is why the fields are named
+ * `escapedRate*` and the verdict says `SUFFICIENT`: a correlation between
+ * coverage and escaped defects is evidence worth reporting and is not proof
+ * that the coverage caused the quality. There is no field called `predicts`
+ * anywhere below and there must not be one.
+ */
+
+/** Verdicts read per accuracy request. A cap, therefore disclosed when it bites. */
+const MAX_ACCURACY_VERDICTS = 5_000;
+/** Generated tests read per keep-rate request. Same contract. */
+const MAX_GENERATED_TESTS = 5_000;
+
+/**
+ * GET /verdicts/accuracy — HOW OFTEN A HUMAN OVERRULED THE TRIAGE MODEL.
+ *
+ * ── PER VERDICT KIND, AND THERE IS NO SINGLE NUMBER ────────────────────────
+ *
+ * "85% accurate" is unactionable and usually wrong in a specific way: a model
+ * that is right about FLAKE (the common case) and wrong about ENV_ISSUE (the
+ * rare one) scores well and is useless, because ENV_ISSUE is the verdict that
+ * stops a team investigating a bug that is not theirs. Four rates make that
+ * visible; one hides it. So `triageAccuracy` reports a rate per kind and the
+ * totals are COUNTS — which a reader can re-divide, unlike a percentage, which
+ * they cannot un-blend.
+ *
+ * ── A MUTE IS NOT AN ACCEPTANCE ────────────────────────────────────────────
+ *
+ * `muted` is its own column. A human who muted a signature did not agree with
+ * the verdict, they stopped hearing about it, and folding those into `accepted`
+ * would make the model look better the more people switched it off.
+ */
+agentRouter.get('/verdicts/accuracy', async (req, res) => {
+  const rows = await prisma.triageVerdict.findMany({
+    orderBy: { createdAt: 'desc' },
+    take: MAX_ACCURACY_VERDICTS,
+    // Named, so dropping one from this select is a type error at the call below
+    // rather than a field that quietly reads as undefined and shifts a rate.
+    select: { id: true, verdict: true, reviewState: true, overriddenTo: true },
+  });
+
+  const accuracy = triageAccuracy(rows);
+  const capped = rows.length === MAX_ACCURACY_VERDICTS;
+
+  res.json({
+    ...accuracy,
+    /*
+     * THE n, BESIDE EVERY RATE. `reviewed` is the denominator of
+     * `overridePercent`, and a rate over three reviews is not a rate — so the
+     * figure and the count it was taken over travel together or not at all.
+     */
+    n: accuracy.totals.reviewed,
+    /** The sentence, with the n in it. An override percent alone is not actionable. */
+    why:
+      `${accuracy.totals.reviewed} verdict(s) have been reviewed by a human: ` +
+      `${accuracy.totals.accepted} accepted, ${accuracy.totals.overridden} overridden, ` +
+      `${accuracy.totals.muted} muted and ${accuracy.totals.pending} still pending. ` +
+      'A MUTE is not an acceptance — a human who muted a signature stopped hearing about it ' +
+      'rather than agreeing — and PENDING is in neither half of any rate here. There is ' +
+      'deliberately no single accuracy figure: a model that is right about FLAKE and wrong about ' +
+      'ENV_ISSUE scores well blended and is useless, because ENV_ISSUE is the verdict that stops ' +
+      'a team investigating a bug that is not theirs.' +
+      (accuracy.overriddenWithNoReplacement > 0
+        ? ` ${accuracy.overriddenWithNoReplacement} row(s) say OVERRIDDEN and name no replacement verdict — a data defect, reported rather than counted as an acceptance, which is the direction that would flatter the model.`
+        : '') +
+      (capped
+        ? ` The read was capped at ${MAX_ACCURACY_VERDICTS} verdict(s), so these counts are a lower bound over the most recent window.`
+        : ''),
+    caps: capped
+      ? [
+          {
+            cap: 'MAX_ACCURACY_VERDICTS',
+            limit: MAX_ACCURACY_VERDICTS,
+            // NULL, not 0: the read stopped at the limit and cannot say what
+            // was behind it, and 0 would claim nothing was hidden.
+            atLeastMore: null,
+            detail: `the verdict read stopped at ${MAX_ACCURACY_VERDICTS} rows, so at least one more exists`,
+          },
+        ]
+      : [],
+  });
+});
+
+/**
+ * GET /generation/survival — THE KEEP-RATE FOR GENERATED TESTS.
+ *
+ * "Does QAAI write tests a team keeps?" is the question that decides whether
+ * the generator is worth having, and it had no answer anywhere in the product.
+ *
+ * ── NEVER_RUN IS IN NEITHER HALF OF THE FRACTION ───────────────────────────
+ *
+ * A generated test nobody has executed is not a kept test and not a rejected
+ * one, so it is excluded from `rated` and reported as its own count. Counting
+ * it as KEPT would make the generator look better the less anybody used it,
+ * which is the exact direction a vendor metric fails in.
+ *
+ * ── BY COHORT, TYPE AND PRODUCER, AND ONE BLENDED `overall` ────────────────
+ *
+ * The `overall` row is the only blended figure here and it is defensible
+ * because it is ONE population — unlike a blended fault-detection rate across
+ * classes, which averages unlike things. A reader needs the total n, and three
+ * groupings beside it are what make a bad producer or a bad week visible.
+ */
+agentRouter.get('/generation/survival', async (req, res) => {
+  const generated = await prisma.test.findMany({
+    where: {
+      // `source: 'AI'` on the FIRST version is what makes a test generated, and
+      // the versions carry it — so the filter is on the relation rather than on
+      // a column Test does not have.
+      versions: { some: { source: 'AI' } },
+      filePath: { not: { startsWith: FIXTURE_PREFIX } },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: MAX_GENERATED_TESTS,
+    select: {
+      id: true,
+      type: true,
+      disabledAt: true,
+      quarantined: true,
+      createdAt: true,
+      versions: {
+        orderBy: { createdAt: 'asc' },
+        select: { source: true, createdAt: true, producer: true },
+      },
+      results: {
+        orderBy: { createdAt: 'asc' },
+        take: 1,
+        select: { status: true },
+      },
+    },
+  });
+
+  const rows: GeneratedTestRow[] = generated.map((test) => {
+    const first = test.versions[0];
+    return {
+      testId: test.id,
+      type: test.type,
+      /*
+       * NULL when the row predates the column, which is NOT the same as "an
+       * unknown model wrote it": `generationSurvival` groups nulls under a
+       * named bucket rather than attributing them to whichever producer is
+       * most common.
+       */
+      producer: first?.producer ?? null,
+      generatedAt: first?.createdAt ?? test.createdAt,
+      /*
+       * Every version AFTER the generated one, in order. This is what makes
+       * REWRITTEN_BY_HUMAN observable at all — a generated test a person later
+       * rewrote is the strongest negative signal the generator has, and it is
+       * invisible from the test row alone.
+       */
+      laterSources: test.versions.slice(1).map((version) => version.source),
+      disabledAt: test.disabledAt,
+      quarantined: test.quarantined,
+      /*
+       * NULL means it has never run, which is NOT the same as passing and is
+       * the distinction the whole metric turns on.
+       */
+      firstRunStatus: test.results[0]?.status ?? null,
+    };
+  });
+
+  const survival = generationSurvival(rows);
+  const capped = generated.length === MAX_GENERATED_TESTS;
+
+  res.json({
+    ...survival,
+    n: survival.overall.total,
+    rated: survival.overall.rated,
+    why:
+      `${survival.overall.total} generated test(s), of which ${survival.overall.rated} can be ` +
+      'rated. NEVER_RUN is in neither half of the keep-rate: a generated test nobody has ' +
+      'executed is not kept and not rejected, and counting it as kept would make the generator ' +
+      'look better the less anybody used it. `survivalPercent` is NULL rather than 0 when ' +
+      'nothing could be rated.' +
+      (capped
+        ? ` The read was capped at ${MAX_GENERATED_TESTS} test(s), so these counts are a lower bound over the most recent window.`
+        : ''),
+  });
+});
+
+/**
+ * GET /projects/:projectId/yield — ACCEPTANCE, HEAL SUCCESS AND FIRST-RUN PASS.
+ *
+ * Each over its DECIDED population, with the pending count beside it. Dividing
+ * by the total instead is the mistake that makes every one of these drift
+ * downward as a review queue grows: a team that accepted every proposal it
+ * looked at and has forty waiting would read as 20% acceptance. So PENDING is
+ * its own number and NULL is the answer when nothing has been decided — not 0,
+ * which would say every proposal was rejected.
+ */
+agentRouter.get('/projects/:projectId/yield', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const [proposals, heals, firstRuns] = await Promise.all([
+    prisma.planItem.findMany({
+      // `testPlan`, not `plan`: the relation field on PlanItem is named after
+      // the model (TestPlan), and `plan` is the local variable name the
+      // approval endpoint happens to use for the row.
+      where: { testPlan: { projectId } },
+      select: { id: true, state: true },
+      take: MAX_GENERATED_TESTS,
+    }),
+    prisma.healProposal.findMany({
+      where: { test: { projectId } },
+      select: { id: true, state: true },
+      take: MAX_GENERATED_TESTS,
+    }),
+    /*
+     * The FIRST run of each generated test, and only of generated tests. A
+     * first-run pass rate over hand-written tests would be a rate about the
+     * customer's work filed under a metric about ours.
+     */
+    prisma.test.findMany({
+      where: {
+        projectId,
+        versions: { some: { source: 'AI' } },
+        filePath: { not: { startsWith: FIXTURE_PREFIX } },
+      },
+      select: {
+        id: true,
+        results: { orderBy: { createdAt: 'asc' }, take: 1, select: { status: true } },
+      },
+      take: MAX_GENERATED_TESTS,
+    }),
+  ]);
+
+  const telemetry = yieldTelemetry({
+    proposals,
+    heals,
+    /*
+     * A generated test with NO result contributes no first run, rather than a
+     * failing one. `firstRunPassPercent` divides by the first runs that
+     * happened, and inventing a FAILED row for a test nobody executed would
+     * report our generator as worse than it is for a reason that is the
+     * customer's CI schedule.
+     */
+    firstRuns: firstRuns.flatMap((test) =>
+      test.results[0] ? [{ testId: test.id, status: test.results[0].status }] : [],
+    ),
+  });
+
+  res.json({
+    ...telemetry,
+    why:
+      'Each rate divides by its DECIDED population and the pending count sits beside it. ' +
+      'Dividing by the total instead makes every one of these drift downward as a review queue ' +
+      'grows — a team that accepted everything it looked at and has forty waiting would read as ' +
+      '20% acceptance. NULL means nothing has been decided yet, which is not 0%: 0% would say ' +
+      'every proposal was rejected. A FLAKY first run is counted and excluded: it is neither a ' +
+      'pass nor a failure. A SUPERSEDED heal is in neither half either — it was replaced by a ' +
+      'newer proposal for the same test, so nobody judged it, and counting it as a failure would ' +
+      'make the heal success rate fall every time the healer retried.',
+  });
+});
+
+/**
+ * GET /projects/:projectId/validity — DOES "COVERED" PREDICT QUALITY?
+ *
+ * ── THE QUESTION A BUYER ACTUALLY ASKS, AND ITS HONEST ANSWER ──────────────
+ *
+ * It is also the question most easily answered with a flattering correlation
+ * computed over four defects. So `INSUFFICIENT_DATA` is a first-class verdict
+ * with the n beside it, `NOT_ATTEMPTED` is distinct from it — one says "we
+ * looked and there is not enough", the other says "we did not look" — and both
+ * rates are NULL rather than numbers whenever the verdict is not SUFFICIENT.
+ *
+ * ── A 200 WITH A NAMED REASON, NEVER A 404 AND NEVER A ZERO ────────────────
+ *
+ * A 404 would read as "this project does not support the question". An empty
+ * object would read as "there is nothing to report". Both are wrong in the
+ * same direction: a buyer reading silence as "they looked and it was fine" is
+ * exactly the inference this vocabulary exists to deny.
+ *
+ * ── AND IT IS NOT A CAUSAL CLAIM ───────────────────────────────────────────
+ *
+ * The back-test is computed by `backtestValidity` and WRITTEN by the bench
+ * (`qaai bench`), not here: it needs the customer's own defect history, which
+ * arrives through a tracker integration and not through an HTTP GET. This is
+ * the read, and when nothing has been written the verdict is NOT_ATTEMPTED —
+ * the one answer that is about us rather than about their data.
+ */
+agentRouter.get('/projects/:projectId/validity', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const actor = actorOf(req);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  /*
+   * The tenant-scoped client, passed as the narrow `AccuracyClient` the
+   * accuracy module declares. No cast: the module takes the two delegates it
+   * needs as an injected interface precisely so it can be tested without a
+   * database, and a cast here would have hidden the day one of those delegate
+   * signatures stopped matching.
+   */
+  const record = await loadLatestValidityBacktest(prisma, {
+    orgId: actor.orgId,
+    projectId,
+  });
+
+  if (record === null) {
+    res.json({
+      /*
+       * NOT_ATTEMPTED, which is a verdict about US and not about their data,
+       * and is deliberately distinct from INSUFFICIENT_DATA. The remedy for
+       * this one is connecting a tracker and running `qaai bench`; the remedy
+       * for the other is waiting for more defects.
+       */
+      verdict: 'NOT_ATTEMPTED',
+      verdictDetail: VALIDITY_VERDICT_LABELS.NOT_ATTEMPTED,
+      defectCount: null,
+      escapedRateCovered: null,
+      escapedRateUncovered: null,
+      minimumDefects: MINIMUM_BACKTEST_DEFECTS,
+      defectSource: null,
+      why:
+        'No back-test has been run for this project, so whether covered surface escapes fewer ' +
+        'defects than uncovered surface is NOT MEASURED here. That is a statement about QAAI and ' +
+        'not about your application: the comparison needs your own defect history, which arrives ' +
+        'through a tracker integration, and it is computed by `qaai bench`. Read this as "we did ' +
+        'not look", which is a different answer from "we looked and there is not enough data" — ' +
+        'and both are different from a result.',
+    });
+    return;
+  }
+
+  res.json({
+    ...record,
+    /*
+     * The threshold that was APPLIED, echoed from the stored row rather than
+     * from the constant. They should agree; if a row was written under an older
+     * threshold they will not, and the row's own value is the one that explains
+     * the verdict it carries. Reporting today's constant beside yesterday's
+     * verdict is a doc comment contradicting the code under it, in data.
+     */
+    minimumDefects: record.minimumDefects,
+    currentMinimumDefects: MINIMUM_BACKTEST_DEFECTS,
+    why:
+      `${record.defectCount} defect(s) in the window, against a floor of ${record.minimumDefects}. ` +
+      `${VALIDITY_VERDICT_LABELS[record.verdict as ValidityVerdict] ?? record.verdict} ` +
+      'Both rates are NULL rather than numbers unless the verdict is SUFFICIENT. This is a ' +
+      'CORRELATION and is reported as one: nothing here claims the coverage caused the quality, ' +
+      'and there is no field that says it did.',
   });
 });

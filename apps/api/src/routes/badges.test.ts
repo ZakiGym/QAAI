@@ -119,6 +119,14 @@ const KNOWN_FILTERS: Record<string, Set<string>> = {
   run: new Set(['id', 'orgId', 'projectId', 'status']),
   triageVerdict: new Set(['id', 'orgId', 'reviewState']),
   healProposal: new Set(['id', 'orgId', 'state']),
+  coverageSnapshot: new Set(['id', 'orgId', 'projectId']),
+  /*
+   * `scopeKey` is in here because the coverage badge reads the HEADLINE scope
+   * and not whichever history row is newest: a per-feature row would carry that
+   * feature's delta, and a badge showing one feature's change as the project's
+   * is the shape of wrong answer nobody would catch from the number alone.
+   */
+  coverageHistory: new Set(['id', 'orgId', 'projectId', 'scopeKey']),
 };
 
 function matchesCondition(value: unknown, cond: unknown): boolean {
@@ -156,6 +164,8 @@ interface Store {
   run: Row[];
   triageVerdict: Row[];
   healProposal: Row[];
+  coverageSnapshot: Row[];
+  coverageHistory: Row[];
 }
 
 /**
@@ -204,6 +214,15 @@ function makeDb(store: Store): Row {
     run: model('run', true),
     triageVerdict: model('triageVerdict', false),
     healProposal: model('healProposal', false),
+    /*
+     * `findMany: false` on both, for the same reason as the two above: the
+     * coverage badge reads ONE snapshot and ONE history row, and a regression
+     * to a list fetch must fail rather than pass. A badge that pulls thirty
+     * snapshots to read one percentage is the defect this whole router exists
+     * to remove.
+     */
+    coverageSnapshot: model('coverageSnapshot', false),
+    coverageHistory: model('coverageHistory', false),
   };
 }
 
@@ -247,11 +266,109 @@ const HEALS: Row[] = [
   { id: 'h4', orgId: 'org_2', state: 'PROPOSED' },
 ];
 
+/**
+ * Coverage fixtures, one project per state the badge has to be able to say.
+ *
+ *   proj_a : MEASURED, with a COMPARABLE delta
+ *   proj_b : MEASURED, with an UNCOMPARABLE one (the crawl changed under it)
+ *   proj_c : EMPTY_DENOMINATOR — measured, and nothing was enumerated to count
+ *   proj_d : no rows at all → NOT_MEASURED
+ */
+const SNAPSHOTS: Row[] = [
+  {
+    id: 'snap_a_old',
+    orgId: 'org_1',
+    projectId: 'proj_a',
+    percent: 55,
+    denominator: 400,
+    covered: 220,
+    createdAt: at('2026-01-01T01:00:00Z'),
+  },
+  {
+    id: 'snap_a',
+    orgId: 'org_1',
+    projectId: 'proj_a',
+    percent: 61.4,
+    denominator: 412,
+    covered: 253,
+    createdAt: at('2026-01-02T01:00:00Z'),
+  },
+  {
+    id: 'snap_b',
+    orgId: 'org_1',
+    projectId: 'proj_b',
+    percent: 48,
+    denominator: 100,
+    covered: 48,
+    createdAt: at('2026-01-02T01:00:00Z'),
+  },
+  /*
+   * MEASURED and EMPTY. `percent: null` with `denominator: 0` is a project the
+   * enumerator reached nothing in — a crawl to fix, not a figure to improve —
+   * and it is deliberately a different state from "nothing was ever measured".
+   */
+  {
+    id: 'snap_c',
+    orgId: 'org_1',
+    projectId: 'proj_c',
+    percent: null,
+    denominator: 0,
+    covered: 0,
+    createdAt: at('2026-01-02T01:00:00Z'),
+  },
+];
+
+const HISTORY: Row[] = [
+  {
+    id: 'hist_a',
+    orgId: 'org_1',
+    projectId: 'proj_a',
+    scopeKey: 'HEADLINE',
+    deltaPercent: 6.4,
+    comparability: 'COMPARABLE',
+    comparabilityDetail: 'the same crawl and the same denominator, so the change is real',
+    createdAt: at('2026-01-02T01:00:00Z'),
+  },
+  /*
+   * A row that CARRIES a delta and is NOT comparable. The most important
+   * fixture in this file: the number is right there in the column, and the
+   * badge must refuse to publish it — because the two snapshots were taken
+   * against different crawls and measured different applications.
+   */
+  {
+    id: 'hist_b',
+    orgId: 'org_1',
+    projectId: 'proj_b',
+    scopeKey: 'HEADLINE',
+    deltaPercent: -9,
+    comparability: 'UNCOMPARABLE_CRAWL_CHANGED',
+    comparabilityDetail: 'the crawl fingerprint changed between the two',
+    createdAt: at('2026-01-02T01:00:00Z'),
+  },
+  /*
+   * A per-FEATURE row for proj_a, NEWER than the headline one. The badge must
+   * not pick it up: it would report the payments feature's change as the
+   * project's, which nobody could catch from the number alone.
+   */
+  {
+    id: 'hist_a_feature',
+    orgId: 'org_1',
+    projectId: 'proj_a',
+    scopeKey: 'FEATURE=payments',
+    deltaPercent: 40,
+    comparability: 'COMPARABLE',
+    comparabilityDetail: 'the payments feature only',
+    createdAt: at('2026-01-03T01:00:00Z'),
+  },
+];
+
 function install(): void {
   h.prisma = makeDb({
     run: RUNS.map((row) => ({ ...row })),
     triageVerdict: VERDICTS.map((row) => ({ ...row })),
     healProposal: HEALS.map((row) => ({ ...row })),
+    coverageSnapshot: SNAPSHOTS.map((row) => ({ ...row })),
+    coverageHistory: HISTORY.map((row) => ({ ...row })),
   });
 }
 
@@ -370,5 +487,120 @@ describe('GET /badges', () => {
       'run.findFirst',
       'triageVerdict.count',
     ]);
+  });
+});
+
+// ─── The coverage badge ──────────────────────────────────────────────────────
+
+/**
+ * A badge that renders 0% for "not measured yet" is the product's own lie in an
+ * image — and worse than the same lie on a screen, because an image has no room
+ * for a caveat, a README outlives the conversation that produced it, and nobody
+ * re-reads a badge they have already believed.
+ *
+ * So every case below asserts a BRANCH rather than a rounding: four states, and
+ * `percent` is null in three of them.
+ */
+describe('GET /badges/coverage/:projectId', () => {
+  beforeEach(() => {
+    install();
+    asOrg('org_1');
+  });
+
+  it('reports a measured project with its figure and its comparable delta', async () => {
+    const { status, body } = await get('/badges/coverage/proj_a');
+
+    expect(status).toBe(200);
+    expect(body.state).toBe('MEASURED');
+    expect(body.percent).toBe(61.4);
+    expect(body.denominator).toBe(412);
+    expect(body.covered).toBe(253);
+    expect(body.deltaPercent).toBe(6.4);
+    expect(body.comparability).toBe('COMPARABLE');
+    // No reason to print, because the delta itself is the answer.
+    expect(body.comparabilityDetail).toBeNull();
+  });
+
+  it('reads the HEADLINE history row, not whichever row is newest', async () => {
+    /*
+     * `hist_a_feature` is newer and says +40. Publishing it would report the
+     * payments feature's change as the project's, which is a wrong answer
+     * nobody could catch from the number alone.
+     */
+    const { body } = await get('/badges/coverage/proj_a');
+    expect(body.deltaPercent).toBe(6.4);
+    expect(body.deltaPercent).not.toBe(40);
+  });
+
+  it('REFUSES a delta across two crawl fingerprints, and says why instead', async () => {
+    /*
+     * The number is in the column. Subtracting two percentages always succeeds,
+     * which is exactly why this has to be a refusal: the two snapshots measured
+     * different applications, and "coverage fell 9 points" would be read as a
+     * regression by everybody who saw it.
+     */
+    const { body } = await get('/badges/coverage/proj_b');
+
+    expect(body.state).toBe('MEASURED');
+    expect(body.percent).toBe(48);
+    expect(body.deltaPercent).toBeNull();
+    expect(body.comparability).toBe('UNCOMPARABLE_CRAWL_CHANGED');
+    expect(String(body.comparabilityDetail)).toContain('crawl fingerprint changed');
+  });
+
+  it('says EMPTY_DENOMINATOR, with NO percentage, when nothing was enumerated', async () => {
+    const { body } = await get('/badges/coverage/proj_c');
+
+    expect(body.state).toBe('EMPTY_DENOMINATOR');
+    // NOT 0, and not 100. The remedy is a crawl, and the label says so.
+    expect(body.percent).toBeNull();
+    expect(body.label).toBe('nothing to measure');
+    expect(String(body.why)).toContain('no percentage');
+  });
+
+  it('says NOT_MEASURED, with NO percentage, for a project nothing has measured', async () => {
+    const { body } = await get('/badges/coverage/proj_d');
+
+    expect(body.state).toBe('NOT_MEASURED');
+    expect(body.percent).toBeNull();
+    expect(body.denominator).toBeNull();
+    expect(body.label).toBe('not measured');
+    // The sentence a renderer shows instead of a figure, and it names the trap.
+    expect(String(body.why)).toContain('NOT 0%');
+  });
+
+  it('never returns a numeric percentage in any state but MEASURED', async () => {
+    /*
+     * The property, asserted over every state rather than per case: there is
+     * deliberately no field on this payload a renderer could `?? 0` its way out
+     * of, because the one that ships is the one that does.
+     */
+    for (const project of ['proj_c', 'proj_d']) {
+      const { body } = await get(`/badges/coverage/${project}`);
+      expect(body.state, project).not.toBe('MEASURED');
+      expect(body.percent, project).toBeNull();
+    }
+  });
+
+  it('is scoped to the org, so another tenant\u2019s project reads NOT_MEASURED', async () => {
+    /*
+     * `proj_a` exists in org_1 and the id is in the URL. From org_2 the scoped
+     * client counts org_2's rows — of which there are none — so this comes back
+     * as NOT_MEASURED rather than as another tenant's coverage, and the
+     * endpoint is not an existence oracle for other people's projects.
+     */
+    asOrg('org_2');
+    const { body } = await get('/badges/coverage/proj_a');
+
+    expect(body.state).toBe('NOT_MEASURED');
+    expect(body.percent).toBeNull();
+  });
+
+  it('reads one snapshot and one history row, never a list', async () => {
+    await get('/badges/coverage/proj_a');
+    // `findMany: false` on both delegates would have thrown; this asserts the
+    // positive side — the reads that happened are the two single-row ones.
+    expect(h.ops).toContain('coverageSnapshot.findFirst');
+    expect(h.ops).toContain('coverageHistory.findFirst');
   });
 });

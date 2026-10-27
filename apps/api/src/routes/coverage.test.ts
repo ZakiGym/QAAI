@@ -22,6 +22,15 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+/*
+ * The attestation is built through `attest` and never as a literal, which is
+ * the whole point of the brand: `CoverageAttestation` is nominal, `attest` is
+ * the only door, and an object with every field right still cannot be assigned
+ * to it. A test that cast a literal would be testing a shape the production
+ * path cannot produce — and in particular one with no disclosures in it, which
+ * is the shape a writer in a hurry assembles.
+ */
+import { attest, measuredDimension, unmeasuredDimension } from '@qaai/shared';
 
 type Row = Record<string, any>;
 
@@ -399,7 +408,14 @@ const closure = (gapId: string, projectId = 'proj_1'): Row | undefined =>
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
-const { coverageRouter, resetCoverageCache } = await import('./coverage.js');
+const {
+  coverageRouter,
+  resetCoverageCache,
+  attestationCsv,
+  attestationHtml,
+  csvField,
+  axesWithAReading,
+} = await import('./coverage.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 
 const app = express();
@@ -917,5 +933,334 @@ describe('the kind filter’s vocabulary comes from GAP_KINDS', () => {
     // can give.
     expect(status).toBe(400);
     expect(JSON.stringify(body)).toContain('NOT_A_KIND');
+  });
+});
+
+// ─── The attestation document ────────────────────────────────────────────────
+
+/**
+ * The artifact a buyer is handed, and the four things it may not do.
+ *
+ * Both renderers are pure over an envelope, so every case here is a literal.
+ * What is being tested is not the layout — the owner is designing that later —
+ * but the disclosures, because a document that loses one of them is worse than
+ * no document: a buyer reads silence about scope as zero risk.
+ */
+describe('the coverage attestation document', () => {
+  /*
+   * Built through `attest` and NOT as a literal, which is the point of the
+   * brand: `CoverageAttestation` is nominal, `attest` is the only door, and an
+   * object with every field right still cannot be assigned to it. A test that
+   * cast a literal would be testing a shape the production path cannot produce.
+   */
+  const build = (over: Partial<Parameters<typeof attest>[0]> = {}) =>
+    attest(
+      {
+        projectId: 'proj_1',
+        snapshotId: 'snap_1',
+        issuedAtIso: '2026-10-26T09:00:00.000Z',
+        issuedByUserId: 'user_1',
+        crawlVersion: 'enumerate.4',
+        crawlFingerprint: 'crawl_abc',
+        denominatorDefinition: '412 CoverageItem(s) across 4 axis/axes',
+        percent: 61.4,
+        denominator: 412,
+        covered: 253,
+        scopeStatement: 'This document states what QAAI measured.',
+        unmeasured: [
+          {
+            dimension: 'ROLE_CELL',
+            kind: null,
+            reason: 'NO_EXTRACTOR',
+            detail: 'the cells are enumerated and nothing matches a test to one of them',
+            cells: 198,
+          },
+          {
+            dimension: 'PAGE_STATE',
+            kind: null,
+            reason: 'NOT_ENUMERATED',
+            detail: 'no crawl supplied the facts',
+            cells: null,
+          },
+        ],
+        caps: [
+          {
+            cap: 'maxFields',
+            limit: 60,
+            atLeastMore: 240,
+            detail: 'at least 240 more form fields existed',
+          },
+          {
+            cap: 'MAX_COMPONENTS',
+            limit: 5000,
+            atLeastMore: null,
+            detail: 'the component read stopped at the limit and cannot say what was behind it',
+          },
+        ],
+        ...over,
+      },
+      ['ROUTE:/a', 'ROUTE:/b'],
+      (text) => `digest(${text.length})`,
+    );
+
+  describe('as CSV', () => {
+    it('states the crawl version, the denominator definition and the fingerprint', () => {
+      const csv = attestationCsv(build());
+      expect(csv).toContain('enumerate.4');
+      expect(csv).toContain('412 CoverageItem(s) across 4 axis/axes');
+      expect(csv).toContain('fingerprint');
+    });
+
+    it('names every unmeasured axis with its reason', () => {
+      const csv = attestationCsv(build());
+      expect(csv).toContain('ROLE_CELL');
+      expect(csv).toContain('NO_EXTRACTOR');
+      expect(csv).toContain('PAGE_STATE');
+      expect(csv).toContain('NOT_ENUMERATED');
+    });
+
+    it('names every cap that bit, as a count AND a reason', () => {
+      const csv = attestationCsv(build());
+      expect(csv).toContain('maxFields');
+      expect(csv).toContain('240');
+      expect(csv).toContain('at least 240 more form fields existed');
+      // The cap that cannot say how much it hid is still DISCLOSED, with an
+      // empty count rather than a zero — 0 would claim nothing was hidden.
+      expect(csv).toContain('MAX_COMPONENTS');
+      expect(csv).toContain('cannot say what was behind it');
+    });
+
+    it('leaves an unknown count EMPTY rather than writing a zero', () => {
+      /*
+       * A zero in a spreadsheet cell is a number somebody averages, charts and
+       * quotes. `atLeastMore: null` means "more existed and we cannot say how
+       * many", and `cells: null` means "we do not even know how many there
+       * are" — both are visible absences here and neither is a figure.
+       */
+      const csv = attestationCsv(build());
+      /*
+       * The CAP_THAT_BIT row specifically. `MAX_COMPONENTS` also appears in the
+       * SCOPE section — `attestationScopeLines` renders every cap as a sentence
+       * there too, which is deliberate: a reader who stops after the scope
+       * section has still been told. Matching on the section name is what keeps
+       * this assertion about the structured row.
+       */
+      const capRow = csv
+        .split('\n')
+        .find((line) => line.startsWith('"CAP_THAT_BIT"') && line.includes('MAX_COMPONENTS'));
+      // `"5000",,` — the limit, then an EMPTY cell where the hidden count would
+      // be. A `0` there would claim nothing was hidden.
+      expect(capRow).toContain('"5000",,');
+      const axisRow = csv.split('\n').find((line) => line.includes('"PAGE_STATE"'));
+      // The axis whose cell count is unknown ends with an empty cell, not a 0:
+      // 0 would be published as "no page states exist", the opposite claim.
+      expect(axisRow?.endsWith(',')).toBe(true);
+    });
+
+    it('leaves the percentage empty and SAYS SO when there is nothing to divide', () => {
+      const csv = attestationCsv(build({ percent: null, denominator: 0, covered: 0 }));
+      expect(csv).toContain('percentIsNull');
+      expect(csv).toContain('This is NOT 0% and NOT 100%');
+    });
+
+    it('cannot be turned into a formula by a value a customer controls', () => {
+      /*
+       * A field beginning `=`, `+`, `-` or `@` is EXECUTED by Excel and Sheets
+       * when the file is opened. Our own sentences never start that way; a
+       * customer's feature name can, and a coverage document that runs code
+       * when a buyer opens it is not a document we can send.
+       */
+      expect(csvField('=SUM(A1:A9)')).toBe(`"'=SUM(A1:A9)"`);
+      expect(csvField('+1')).toBe(`"'+1"`);
+      expect(csvField('-2')).toBe(`"'-2"`);
+      expect(csvField('@cmd')).toBe(`"'@cmd"`);
+      // And an ordinary value is NOT mangled, which is the other half: a guard
+      // that quoted everything would make every cell unreadable.
+      expect(csvField('Payments')).toBe('"Payments"');
+    });
+
+    it('quotes a comma and a newline so a disclosure cannot forge a column', () => {
+      expect(csvField('a,b')).toBe('"a,b"');
+      expect(csvField('a"b')).toBe('"a""b"');
+      expect(csvField('a\nb')).toBe('"a\nb"');
+    });
+
+    it('writes an empty cell for null, not the word null', () => {
+      expect(csvField(null)).toBe('');
+      expect(csvField(0)).toBe('"0"');
+    });
+  });
+
+  describe('as a print-ready page', () => {
+    const dimensions = {
+      report: {
+        measurements: [
+          measuredDimension({ dimension: 'FORM_FIELD', measuredCells: ['ASSERTED', null] }),
+          unmeasuredDimension({
+            dimension: 'ROLE_CELL',
+            reason: 'NO_EXTRACTOR',
+            detail: 'the cells are enumerated and nothing matches a test to one of them',
+            cells: 198,
+          }),
+        ],
+        measured: ['FORM_FIELD'] as never,
+        unmeasured: ['ROLE_CELL'] as never,
+        producers: {} as never,
+        caps: [],
+        rule: 'Each dimension divides by ITS OWN cells.',
+      },
+      formFieldRows: [],
+      itemStateRows: [],
+      obligationCells: [],
+      byTestType: [],
+      caveats: [],
+    };
+
+    it('renders an unmeasured axis as WORDS, never as a percentage', () => {
+      const html = attestationHtml({ attestation: build(), dimensions: dimensions as never });
+      expect(html).toContain('>not measured<');
+      // The measured axis DOES get a figure, so the two are visually distinct
+      // rather than one branch apart in a reader's head.
+      expect(html).toContain('50.0% of 2');
+    });
+
+    it('states the scope section ABOVE the breakdown', () => {
+      /*
+       * A document whose percentage is on page 1 and whose "one of two axes was
+       * measured" is on page 3 is a document that gets screenshotted at page 1.
+       */
+      const html = attestationHtml({ attestation: build(), dimensions: dimensions as never });
+      expect(html.indexOf('Scope')).toBeLessThan(html.indexOf('Breakdown by dimension'));
+    });
+
+    it('refuses to be indexed, because it is a private document', () => {
+      const html = attestationHtml({ attestation: build(), dimensions: dimensions as never });
+      expect(html).toContain('noindex, nofollow');
+    });
+
+    it('says the figure is absent rather than zero when the denominator is empty', () => {
+      const html = attestationHtml({
+        attestation: build({ percent: null, denominator: 0, covered: 0 }),
+        dimensions: dimensions as never,
+      });
+      expect(html).toContain('NOT MEASURED');
+      expect(html).toContain('NOT 0% and NOT 100%');
+    });
+
+    it('escapes a value a customer controls, so a feature name cannot inject markup', () => {
+      const html = attestationHtml({
+        attestation: build({
+          denominatorDefinition: '<script>alert(1)</script>',
+        }),
+        dimensions: dimensions as never,
+      });
+      expect(html).not.toContain('<script>alert(1)</script>');
+      expect(html).toContain('&lt;script&gt;');
+    });
+
+    it('prints the never-summed rule where a combined figure would go', () => {
+      const html = attestationHtml({ attestation: build(), dimensions: dimensions as never });
+      expect(html).toContain('ITS OWN cells');
+    });
+  });
+});
+
+/**
+ * THE SCOPE STATEMENT'S TWO HALVES MUST PARTITION THE AXES.
+ *
+ * Every test in the block above drives the two PURE RENDERERS with a
+ * hand-built envelope. Nothing drove `buildAttestation`, which is the only
+ * thing that assembles one — and the defect that survived behind that gap was
+ * in the assembly, not the rendering:
+ *
+ *   `measuredAxes` was `report.measured`, i.e. `measuredDimensionKinds()`, the
+ *   axes a module in packages/agent CAN measure. Seven of those twelve have no
+ *   adapter in this build and come back NOT_ENUMERATED, so the same seven axes
+ *   were counted in "across 12 measured axis/axes" AND listed in "8 axis/axes
+ *   were not measured at all" — over a 13-axis vocabulary, 12 + 8 = 20.
+ *
+ * These assertions are made against the REAL registry rather than a literal
+ * list, so they keep tracking the product as adapters land: the day an adapter
+ * is written for PAGE_STATE the counts move and the invariant still holds.
+ */
+describe('the axes an attestation says it measured', () => {
+  it('counts only the axes that produced a reading, never the ones a module merely could', async () => {
+    const { coverageDimensionReport, dimensionUnmeasuredDisclosures } = await import(
+      '@qaai/agent'
+    );
+    const { measuredDimension } = await import('@qaai/shared');
+
+    /*
+     * The five axes this deployment holds an adapter for. The other eight come
+     * back unmeasured, which is the whole point of the fixture: it reproduces
+     * the real shape rather than a tidy one.
+     */
+    const adapted = [
+      'FORM_FIELD',
+      'VALIDATION_RULE',
+      'COMPONENT',
+      'COMPONENT_STATE',
+      'TEST_TYPE',
+    ] as const;
+    const supplied: Record<string, unknown> = {};
+    for (const dimension of adapted) {
+      supplied[dimension] = measuredDimension({
+        dimension,
+        measuredCells: ['ASSERTED', null],
+        unmeasured: 0,
+        unmeasuredReason: null,
+        unmeasuredDetail: null,
+        caps: [],
+      });
+    }
+
+    const report = coverageDimensionReport({ supplied: supplied as never });
+    const measured = axesWithAReading(report);
+    const unmeasuredNames = dimensionUnmeasuredDisclosures(report).map((entry) =>
+      String(entry.dimension ?? entry.kind),
+    );
+
+    // The outcome, not the capability: five, not the registry's twelve.
+    expect(measured).toEqual([...adapted]);
+    expect(measured.length).toBeLessThan(report.measured.length);
+
+    /*
+     * THE INVARIANT. The two halves of the scope sentence partition the
+     * vocabulary: every axis is in exactly one, so the counts can never sum to
+     * more than there are axes and no axis can appear in both.
+     */
+    expect(measured.filter((axis) => unmeasuredNames.includes(axis))).toEqual([]);
+    expect(measured.length + unmeasuredNames.length).toBe(report.measurements.length);
+  });
+
+  it('counts an axis with a partial reading as measured, because it has a denominator', async () => {
+    /*
+     * A reading with SOME cells measured is MEASURED with a disclosed
+     * shortfall, and `dimensionUnmeasuredDisclosures` deliberately leaves it
+     * off the unmeasured list. Both halves must agree about which side it falls
+     * on, or the partition breaks for the one case that is neither extreme.
+     */
+    const { measuredDimension, unmeasuredDimension } = await import('@qaai/shared');
+    const partial = {
+      measurements: [
+        // Three cells measured, two of them unclaimed, two more never looked at:
+        // a reading with a DISCLOSED SHORTFALL, which is measured.
+        measuredDimension({
+          dimension: 'FORM_FIELD',
+          measuredCells: ['ASSERTED', null, null],
+          unmeasured: 2,
+          unmeasuredReason: 'CAP_BIT',
+          unmeasuredDetail: 'a take of 3 fields bit; at least 2 more existed',
+          caps: [],
+        }),
+        unmeasuredDimension({
+          dimension: 'PAGE_STATE',
+          reason: 'NOT_ENUMERATED',
+          detail: 'no crawl supplied the states of any route',
+          cells: 0,
+        }),
+      ],
+    };
+    expect(axesWithAReading(partial)).toEqual(['FORM_FIELD']);
   });
 });

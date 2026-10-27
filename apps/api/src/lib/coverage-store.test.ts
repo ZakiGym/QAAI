@@ -139,7 +139,35 @@ type ModelName =
    * vanish, and "retired" is unobservable against a fake that does not hold
    * the rows.
    */
-  | 'testCoverageEdge';
+  | 'testCoverageEdge'
+  /*
+   * ── THE FIVE DELEGATES THE DIMENSION PASS NEEDS ──────────────────────────
+   *
+   * `project` is read for `typeObligationPolicy` and `ownershipRule` for the
+   * one ownership matcher; the other three are the write paths this round
+   * added. Every one of them is a REAL delegate in this fake rather than a
+   * stub, for the reason the `testCoverageEdge` comment above gives: the
+   * properties that matter — a cell RETIRED rather than deleted, a sweep
+   * SCOPED by cell kind so another producer's rows survive, a rollup upsert
+   * that is idempotent on its scope key — are only observable against a fake
+   * that holds the rows.
+   *
+   * None of them goes on a `tx` object, and that is checked rather than
+   * assumed: `persistDimensionCells` and `persistRollups` run their upserts
+   * directly on `prisma`, not inside `$transaction`, because each cell is
+   * independent and a transaction over twenty thousand of them would hold a
+   * write lock long enough to matter. `persistExecution` elsewhere in this
+   * product does use `$transaction`, and a delegate it needs would have to go
+   * on `tx` — at the top level it changes nothing and surfaces as unrelated
+   * broken tests.
+   */
+  | 'project'
+  | 'ownershipRule'
+  | 'coverageFormField'
+  | 'coverageItemState'
+  | 'coverageTypeObligation'
+  | 'coverageRollup'
+  | 'coverageHistory';
 
 const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
   codebaseSnapshot: new Set(['id', 'orgId', 'projectId']),
@@ -175,6 +203,45 @@ const KNOWN_FILTERS: Record<ModelName, Set<string>> = {
    * filter would make deleting that scope from the query undetectable.
    */
   testCoverageEdge: new Set(['id', 'orgId', 'projectId', 'itemId', 'testId', 'source', 'retiredAt']),
+  project: new Set(['id', 'orgId']),
+  ownershipRule: new Set(['id', 'orgId', 'projectId']),
+  coverageFormField: new Set([
+    'id',
+    'orgId',
+    'projectId',
+    'itemId',
+    'fieldKey',
+    'kind',
+    'retiredAt',
+  ]),
+  /*
+   * `kind` is in here DELIBERATELY and it is the most load-bearing entry in
+   * this record. `CoverageItemState` has more than one producer — this pass
+   * writes the COMPONENT_* cells and the page-state adapter writes PAGE_*,
+   * ERROR_* and DATA_* into the same table — so the retirement sweep is scoped
+   * to the cell kinds it produced. A fake that shrugged at the filter would
+   * make deleting that scope from the query undetectable, and the deletion
+   * would retire another producer's cells on every recompute.
+   */
+  coverageItemState: new Set([
+    'id',
+    'orgId',
+    'projectId',
+    'itemId',
+    'stateKey',
+    'kind',
+    'retiredAt',
+  ]),
+  coverageTypeObligation: new Set([
+    'id',
+    'orgId',
+    'projectId',
+    'itemId',
+    'testType',
+    'retiredAt',
+  ]),
+  coverageRollup: new Set(['id', 'orgId', 'projectId', 'snapshotId', 'scopeKey', 'dimension']),
+  coverageHistory: new Set(['id', 'orgId', 'projectId', 'snapshotId', 'scopeKey']),
 };
 
 interface Store {
@@ -189,6 +256,14 @@ interface Store {
   componentState: Row[];
   /** The provenance edges. See the delegate's comment in `makeDb`. */
   testCoverageEdge: Row[];
+  project: Row[];
+  ownershipRule: Row[];
+  /** The three cell tables, and the two rollup tables. See `ModelName`. */
+  coverageFormField: Row[];
+  coverageItemState: Row[];
+  coverageTypeObligation: Row[];
+  coverageRollup: Row[];
+  coverageHistory: Row[];
 }
 
 function matchesCondition(value: unknown, cond: unknown): boolean {
@@ -324,6 +399,69 @@ function makeDb(store: Store): Row {
         const found = sortRows(select(where), orderBy)[0];
         return found ? projectRow(name, found, sel, store) : null;
       },
+      /**
+       * `findUnique`, whose `where` is a UNIQUE SELECTOR and not a filter.
+       *
+       * Matched literally, like `upsert`'s, because Prisma's unique selector is
+       * not a filter and the real extension leaves it alone — which also means
+       * the ambient org is NOT merged into it. That is the behaviour the store
+       * depends on when it reads `Project.typeObligationPolicy` by id, and
+       * routing this through the filter machinery instead would make a project
+       * id look unfindable under a tenant the fixture never set.
+       *
+       * It honours `select`, like every other read here: a fake that ignored
+       * it would make deleting a field from a query undetectable, and two
+       * defects survived a whole slice behind select-blind fakes.
+       */
+      findUnique: async ({ where, select: sel }: Row = {}) => {
+        h.ops.push(`${name}.findUnique`);
+        const unique = (where ?? {}) as Row;
+        const found = store[name].find((row) =>
+          Object.entries(unique).every(([key, value]) => row[key] === value),
+        );
+        return found ? projectRow(name, found, sel, store) : null;
+      },
+      /**
+       * `count`, which never leaves the store with more than a number.
+       *
+       * Filtered like a read, so `retiredAt: null` and the per-kind scopes are
+       * applied — a count that shrugged at them would report retired cells as
+       * live and the breakdown would never fall.
+       */
+      count: async ({ where }: Row = {}) => {
+        h.ops.push(`${name}.count`);
+        return select(where).length;
+      },
+      /**
+       * `groupBy`, in the one shape the store uses: `by: ['kind']` with
+       * `_count: { _all: true }`.
+       *
+       * A real grouping and not a stub, because the per-dimension stored-cell
+       * counts are derived from the CELL KIND through `CELL_KIND_DIMENSION` —
+       * one vocabulary, one mapping — and a fake that returned a flat total
+       * would make it impossible to see a kind filed on the wrong axis.
+       */
+      groupBy: async ({ by, where }: Row = {}) => {
+        h.ops.push(`${name}.groupBy`);
+        const keys = (by ?? []) as string[];
+        const buckets = new Map<string, { row: Row; count: number }>();
+        for (const row of select(where)) {
+          const identity = keys.map((key) => String(row[key])).join('\u0000');
+          const existing = buckets.get(identity);
+          if (existing) {
+            existing.count += 1;
+            continue;
+          }
+          buckets.set(identity, {
+            row: Object.fromEntries(keys.map((key) => [key, row[key]])),
+            count: 1,
+          });
+        }
+        return [...buckets.values()].map((bucket) => ({
+          ...bucket.row,
+          _count: { _all: bucket.count },
+        }));
+      },
       findMany: async ({ where, orderBy, select: sel, take }: Row = {}) => {
         h.ops.push(`${name}.findMany`);
         const rows = sortRows(select(where), orderBy);
@@ -348,6 +486,19 @@ function makeDb(store: Store): Row {
            * un-retires it" and "one edge per source" both unobservable.
            */
           where.itemId_testId_source ??
+          /*
+           * The dimension pass's four compound uniques, named for the same
+           * reason: left to the `where` fallback the nested object would be
+           * compared against a column that does not exist, never match, and
+           * turn every upsert into an insert — making "re-seeing a retired cell
+           * un-retires it" and "one row per (snapshot, scope)" both
+           * unobservable, and the second one is the idempotency the headline
+           * rollup depends on.
+           */
+          where.itemId_fieldKey ??
+          where.itemId_stateKey ??
+          where.itemId_testType ??
+          where.snapshotId_scopeKey ??
           where) as Row;
         const found = store[name].find((row) =>
           Object.entries(unique).every(([key, value]) => row[key] === value),
@@ -406,6 +557,13 @@ function makeDb(store: Store): Row {
      * only observable against a fake that holds the rows.
      */
     testCoverageEdge: model('testCoverageEdge'),
+    project: model('project'),
+    ownershipRule: model('ownershipRule'),
+    coverageFormField: model('coverageFormField'),
+    coverageItemState: model('coverageItemState'),
+    coverageTypeObligation: model('coverageTypeObligation'),
+    coverageRollup: model('coverageRollup'),
+    coverageHistory: model('coverageHistory'),
     /*
      * The store calls `$transaction` with an ARRAY of operations. Prisma's are
      * lazy and only run when the transaction opens; the fake's have already
@@ -592,6 +750,29 @@ function seed(overrides: Partial<Store> = {}): Store {
     componentItem: [],
     componentState: [],
     testCoverageEdge: [],
+    /*
+     * ONE PROJECT ROW, with NO `typeObligationPolicy` KEY.
+     *
+     * Absent is the honest default and it is the fixture's own assertion: a
+     * project that never configured a policy owes NOTHING on the TEST_TYPE
+     * axis, so its denominator is empty and its figure is null. A fixture that
+     * defaulted the column to a policy would mint an obligation per axis per
+     * item and report QAAI's opinion about what a team should test as the
+     * team's debt — 824 fabricated gaps on a 412-route project.
+     */
+    project: [{ id: PROJECT, orgId: ORG }],
+    /*
+     * NO OWNERSHIP RULES, which is NO_RULES and not "nobody owns it". Every
+     * surface then buckets under UNOWNED and the store says which of the two
+     * that is, because the remedy for the first is a conversation and the
+     * remedy for the second is three lines of configuration.
+     */
+    ownershipRule: [],
+    coverageFormField: [],
+    coverageItemState: [],
+    coverageTypeObligation: [],
+    coverageRollup: [],
+    coverageHistory: [],
     ...overrides,
   };
   return store;
@@ -2119,5 +2300,270 @@ describe('loadExecutions — an unreadable quarantine is not an empty one', () =
   it('says nothing of the kind when the read worked', async () => {
     const result = await compute({ persist: true });
     expect(result.snapshot.caveats.join(' ')).not.toContain('Quarantine could not be read');
+  });
+});
+
+// ─── The dimension cells ─────────────────────────────────────────────────────
+
+/**
+ * The write path for the three cell tables, and the two properties of it that
+ * nothing else in this file can see.
+ *
+ * Both were found by MUTATION: removing the `kind` scope from the state sweep
+ * and removing the capability caveat each left this suite green, which means
+ * the most dangerous line in the writer and the most important disclosure in
+ * the computation were both enforced by nothing but a comment.
+ */
+describe('computeCoverage — the dimension cells', () => {
+  it('writes a form-field cell per field, keyed on the item it hangs off', async () => {
+    await compute({ persist: true });
+
+    // The seed's one source form has two fields. One cell each, plus the rule
+    // cells derived from them — so "more than the field count" is the correct
+    // assertion, and the two field cells themselves are the floor.
+    expect(store.coverageFormField.length).toBeGreaterThanOrEqual(2);
+    for (const row of store.coverageFormField) {
+      expect(row.itemId, 'every cell hangs off a CoverageItem row').toBeTruthy();
+      expect(row.retiredAt).toBeNull();
+      // `constraintsRead: false` is the honest state of the SOURCE path:
+      // `detectForms` reads no maxlength, minlength, min, max, step or
+      // pattern, so the constraint classes are UNMEASURED rather than absent.
+      // `true` with no constraint would be the flattering answer.
+      if (row.kind === 'FORM_FIELD') expect(row.constraintsRead).toBe(false);
+    }
+  });
+
+  it('RETIRES a stale cell rather than deleting it, so coverage can fall with a trail', async () => {
+    await compute({ persist: true });
+    const before = store.coverageFormField.length;
+    expect(before).toBeGreaterThan(0);
+
+    /*
+     * Plant a cell this computation will not produce. It must come back
+     * RETIRED and still be present: a deleted cell is a cell whose
+     * disappearance nobody can explain, and the next recompute would mint a new
+     * row with a reset history.
+     */
+    const planted = {
+      id: 'ff_stale',
+      orgId: ORG,
+      projectId: PROJECT,
+      itemId: store.coverageItem[0]!.id,
+      fieldKey: 'STALE#gone',
+      kind: 'FORM_FIELD',
+      retiredAt: null,
+    };
+    store.coverageFormField.push(planted as never);
+
+    await compute({ persist: true });
+
+    expect(store.coverageFormField).toContain(planted);
+    expect(planted.retiredAt).not.toBeNull();
+  });
+
+  it('SCOPES the state sweep by cell kind, so another producer\u2019s cells survive', async () => {
+    /*
+     * ── THE MOST DANGEROUS LINE IN THE WRITER ────────────────────────────────
+     *
+     * `CoverageItemState` has MORE THAN ONE producer: this pass writes the
+     * COMPONENT_* cells, and the page-state, error-state and data-variant
+     * adapters write PAGE_*, ERROR_* and DATA_* rows into the same table. An
+     * unscoped `notIn` sweep would retire every one of the other producer's
+     * cells on every recompute, and the next recompute would un-retire them —
+     * a table that oscillates, which is worse than one that is stale because
+     * the stale one is at least reproducible.
+     *
+     * Found by mutation: deleting the `kind: { in: ... }` clause left this
+     * whole suite green.
+     */
+    await compute({ persist: true });
+
+    const foreign = {
+      id: 'state_from_another_producer',
+      orgId: ORG,
+      projectId: PROJECT,
+      itemId: store.coverageItem[0]!.id,
+      stateKey: 'ROUTE:/orders#empty',
+      // A PAGE_STATE cell. Not this pass's to retire.
+      kind: 'PAGE_EMPTY',
+      retiredAt: null,
+    };
+    store.coverageItemState.push(foreign as never);
+
+    await compute({ persist: true });
+
+    expect(foreign.retiredAt, 'a PAGE_EMPTY cell is not this pass\u2019s to retire').toBeNull();
+  });
+
+  it('writes NO typed obligation when the project declared no policy', async () => {
+    /*
+     * AN OBLIGATION NOBODY DECLARED IS NOT OWED. `DEFAULT_TYPE_OBLIGATIONS`
+     * owes nothing and the seed's project row has no `typeObligationPolicy`,
+     * so the TEST_TYPE denominator is EMPTY and its figure is null. A default
+     * here would mint an obligation per axis per item on migration day and
+     * report QAAI's opinion about what a team should test as the team's debt.
+     */
+    const result = await compute({ persist: true });
+
+    expect(store.coverageTypeObligation).toEqual([]);
+    const testType = result.dimensions?.report.measurements.find(
+      (entry) => entry.dimension === 'TEST_TYPE',
+    );
+    expect(testType?.cells).toBe(0);
+    expect(testType?.measured).toBe(0);
+  });
+
+  it('mints typed obligations once the project declares a policy, and no more', async () => {
+    store.project[0]!.typeObligationPolicy = { byKind: { ROUTE: ['ACCESSIBILITY'] } };
+
+    const result = await compute({ persist: true });
+
+    // Two routes in the seed, one obligation each, and NOTHING on the
+    // endpoint, the form or the auth surface — the policy named ROUTE only.
+    expect(store.coverageTypeObligation).toHaveLength(2);
+    for (const row of store.coverageTypeObligation) {
+      expect(row.testType).toBe('ACCESSIBILITY');
+      // MANUAL, because a type-obligation policy is a thing a human
+      // configured. SOURCE would claim a detector read it out of the repo,
+      // which is a stronger claim than was made.
+      expect(row.declaredBy).toBe('MANUAL');
+    }
+    const testType = result.dimensions?.report.measurements.find(
+      (entry) => entry.dimension === 'TEST_TYPE',
+    );
+    expect(testType?.cells).toBe(2);
+  });
+
+  it('treats an unreadable policy as NO policy, and says so', async () => {
+    // Half a policy is a denominator the customer did not configure. An empty
+    // one at least says which it is.
+    store.project[0]!.typeObligationPolicy = { byKind: 'not an object' };
+
+    const result = await compute({ persist: true });
+
+    expect(store.coverageTypeObligation).toEqual([]);
+    expect(result.snapshot.caveats.join(' ')).toContain('could not be read');
+    expect(result.snapshot.caveats.join(' ')).toContain('Half a policy');
+  });
+
+  it('reports every axis it could not enumerate, by name, as a caveat', async () => {
+    /*
+     * The axes with a producer in `DIMENSION_REGISTRY` and no adapter in this
+     * build. Reported BESIDE the number, because silence about an axis reads as
+     * "nothing to report" — the direction that flatters a coverage product.
+     */
+    const result = await compute({ persist: true });
+    const caveats = result.snapshot.caveats.join(' ');
+
+    expect(caveats).toContain('were NOT enumerated by this computation');
+    expect(caveats).toContain('PAGE_STATE');
+    expect(caveats).toContain('This is a gap in QAAI, not in your test suite');
+  });
+
+  it('discloses that it could not read what this deployment can EXECUTE', async () => {
+    /*
+     * Found by mutation: suppressing this caveat left the suite green.
+     *
+     * The fake has no `deploymentCapability` delegate, so the read throws and
+     * the facts are null — which is the state of every deployment until the
+     * migration lands. NOT_CHECKED stays IN the denominator, and the sentence
+     * has to say so: dropping an unprobed type would let a deployment that
+     * never ran a preflight shed every obligation it could not prove it could
+     * run, and the percentage would RISE for a preflight nobody executed.
+     */
+    const result = await compute({ persist: true });
+    const caveats = result.snapshot.caveats.join(' ');
+
+    expect(caveats).toContain('What this deployment can EXECUTE could not be read');
+    expect(caveats).toContain('stays in the coverage denominator');
+    expect(caveats).toContain('must NOT be read as "every type is available"');
+  });
+
+  it('produces no combined dimension figure, and prints the reason instead', async () => {
+    const result = await compute({ persist: true });
+    const report = result.dimensions!.report;
+
+    // Thirteen axes, thirteen denominators, and nowhere a total.
+    expect(report.measurements).toHaveLength(13);
+    for (const forbidden of ['percent', 'total', 'overall', 'score']) {
+      expect(Object.keys(report), forbidden).not.toContain(forbidden);
+    }
+    expect(report.rule).toContain('ITS OWN cells');
+  });
+
+  it('stores the crawl version and the denominator definition on the snapshot', async () => {
+    /*
+     * The two halves of COMPARABILITY. Every snapshot written before these
+     * columns existed has them null, and `snapshotDelta` reads that as
+     * UNCOMPARABLE_FINGERPRINT_MISSING rather than as comparable — "we cannot
+     * establish comparability" and "we established they are not comparable"
+     * are different claims, and a confident delta across an unknown boundary
+     * is the one this product cannot afford.
+     */
+    await compute({ persist: true });
+    const snapshot = store.coverageSnapshot[0]!;
+
+    expect(snapshot.crawlVersion).toBe('enumerate.4');
+    expect(snapshot.crawlFingerprint).toBeTruthy();
+    expect(String(snapshot.denominatorDefinition)).toContain('CoverageItem(s) across');
+  });
+
+  it('writes a headline rollup and a history row, and the first has no baseline', async () => {
+    await compute({ persist: true });
+
+    const headline = store.coverageRollup.find((row) => row.scopeKey === 'HEADLINE');
+    expect(headline).toBeDefined();
+    expect(headline!.denominator).toBeGreaterThan(0);
+
+    const history = store.coverageHistory.find((row) => row.scopeKey === 'HEADLINE');
+    expect(history).toBeDefined();
+    /*
+     * UNCOMPARABLE_NO_BASELINE on the first measurement, with a NULL delta. A
+     * first measurement has nothing to compare, which is true and useless — so
+     * it is reported as its own state rather than as a drift event on day one.
+     */
+    expect(history!.comparability).toBe('UNCOMPARABLE_NO_BASELINE');
+    expect(history!.deltaPercent).toBeNull();
+  });
+
+  it('is idempotent on (snapshot, scope), so a rollup cannot be written twice', async () => {
+    /*
+     * PostgreSQL treats NULLs in a unique index as DISTINCT, which is why the
+     * key is one TEXT column built by `rollupScopeKey` and not three nullable
+     * ones: `UNIQUE(snapshotId, dimension, feature, teamId)` would let the
+     * all-null headline row be written unboundedly, and every duplicate is a
+     * second denominator for the same subject.
+     */
+    await compute({ persist: true });
+    const first = store.coverageRollup.filter((row) => row.scopeKey === 'HEADLINE');
+    expect(first).toHaveLength(1);
+
+    await compute({ persist: true });
+    // A second computation writes a second SNAPSHOT, so one headline row per
+    // snapshot is correct — what must never happen is two for one snapshot.
+    const bySnapshot = new Map<string, number>();
+    for (const row of store.coverageRollup) {
+      if (row.scopeKey !== 'HEADLINE') continue;
+      const key = String(row.snapshotId);
+      bySnapshot.set(key, (bySnapshot.get(key) ?? 0) + 1);
+    }
+    for (const [snapshotId, count] of bySnapshot) {
+      expect(count, `snapshot ${snapshotId}`).toBe(1);
+    }
+  });
+
+  it('says every surface is UNOWNED because nobody wrote a rule, not because nobody owns it', async () => {
+    /*
+     * NO_RULES is not "nobody owns it" — it is "nobody has said". The remedy
+     * for the first is a conversation and for the second three lines of
+     * configuration, and QAAI invents no default owner: the first time a
+     * default pages the wrong person, the feature gets switched off.
+     */
+    const result = await compute({ persist: true });
+    const caveats = result.snapshot.caveats.join(' ');
+
+    expect(caveats).toContain('No ownership rule exists for this project');
+    expect(caveats).toContain('nobody has said who owns this');
+    expect(caveats).toContain('NOT as "nobody owns it"');
   });
 });

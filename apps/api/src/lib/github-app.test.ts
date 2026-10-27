@@ -35,6 +35,7 @@ import {
   appJwt,
   buildAnnotations,
   buildCheckOutput,
+  coverageSection,
   chunkAnnotations,
   conclusionFor,
   gatingFailures,
@@ -980,5 +981,174 @@ describe('buildAnnotations', () => {
     expect(chunks).toHaveLength(MAX_ANNOTATIONS / ANNOTATIONS_PER_REQUEST);
     expect(chunks.every((c) => c.length <= ANNOTATIONS_PER_REQUEST)).toBe(true);
     expect(chunks.flat()).toHaveLength(annotations.length);
+  });
+});
+
+// ─── Coverage in the merge box ───────────────────────────────────────────────
+
+/**
+ * The one sentence this company has, in the place a team actually looks.
+ *
+ * Every case here was found by MUTATION: printing `0%` for unmeasured
+ * coverage, publishing an uncomparable delta, and dropping the section
+ * altogether each left this whole file green. So the rule that four surfaces
+ * share was enforced by nothing but a comment, in the surface where a wrong
+ * number gets argued about by a whole team on a pull request.
+ */
+describe('coverageSection', () => {
+  const measured = {
+    percent: 61.4,
+    denominator: 412,
+    covered: 253,
+    tier: 'ASSERTED',
+    deltaPercent: 6.4,
+    comparability: 'COMPARABLE',
+    comparabilityDetail: null,
+    rollup: null,
+    note: null,
+  };
+
+  it('says NOT MEASURED in words when there is no coverage at all', () => {
+    /*
+     * ABSENT IS NOT ZERO. A check run that printed "Coverage 0%" because a
+     * migration had not landed would be the product's own lie in a merge box,
+     * seen by everybody on the team, in a place nobody re-reads.
+     */
+    const lines = coverageSection(undefined).join('\n');
+
+    expect(lines).toContain('not measured');
+    expect(lines).toContain('not 0%');
+    expect(lines).not.toMatch(/\d+\.\d%/);
+  });
+
+  it('says NOT MEASURED in words when the denominator was zero', () => {
+    const lines = coverageSection({ ...measured, percent: null }).join('\n');
+
+    expect(lines).toContain('**not measured**');
+    // The one assertion that kills `(percent ?? 0).toFixed(1)`.
+    expect(lines).not.toContain('0.0%');
+  });
+
+  it('prints the figure, the denominator and the rung it was taken at', () => {
+    const lines = coverageSection(measured).join('\n');
+
+    expect(lines).toContain('**61.4%**');
+    expect(lines).toContain('412 surface item(s)');
+    // The rung, so the number has units. A percentage with no rung is one two
+    // readers interpret two ways.
+    expect(lines).toContain('ASSERTED');
+  });
+
+  it('prints a signed delta when the two snapshots are comparable', () => {
+    expect(coverageSection(measured).join('\n')).toContain('(+6.4 points)');
+    expect(coverageSection({ ...measured, deltaPercent: -2.5 }).join('\n')).toContain(
+      '(-2.5 points)',
+    );
+  });
+
+  it('REFUSES a delta across two crawl fingerprints and prints the reason', () => {
+    /*
+     * The number is in the field. Subtracting two percentages always succeeds,
+     * which is exactly why this has to be a refusal: the two snapshots measured
+     * different applications, and "coverage fell 9 points" on a pull request is
+     * a regression nobody caused and everybody will argue about.
+     */
+    const lines = coverageSection({
+      ...measured,
+      deltaPercent: -9,
+      comparability: 'UNCOMPARABLE_CRAWL_CHANGED',
+      comparabilityDetail: 'the crawl fingerprint changed between the two',
+    }).join('\n');
+
+    expect(lines).toContain('**no comparable baseline**');
+    expect(lines).toContain('crawl fingerprint changed');
+    expect(lines).not.toContain('-9.0 points');
+  });
+
+  it('tells a COMPARABLE pair with no delta apart from an uncomparable one', () => {
+    // COMPARABLE with a null delta is a real state, not a contradiction: the
+    // two ARE the same measurement and one of them has no figure, because its
+    // denominator was zero. Reporting that as NOT_COMPARED would blame the
+    // comparison for an empty denominator.
+    const lines = coverageSection({ ...measured, deltaPercent: null }).join('\n');
+
+    expect(lines).toContain('no change to report');
+    expect(lines).toContain('denominator was zero');
+    expect(lines).not.toContain('no comparable baseline');
+  });
+
+  it('prints one rollup, and renders an unmeasured bucket as words', () => {
+    const named = coverageSection({
+      ...measured,
+      rollup: { label: 'surface nobody owns', percent: 12.5, covered: 16, denominator: 128 },
+    }).join('\n');
+    expect(named).toContain('surface nobody owns');
+    expect(named).toContain('12.5% of 128');
+
+    const unmeasuredBucket = coverageSection({
+      ...measured,
+      rollup: { label: 'the payments feature', percent: null, covered: 0, denominator: 40 },
+    }).join('\n');
+    expect(unmeasuredBucket).toContain('not measured of 40');
+  });
+
+  it('prints the note verbatim, which is how a cap that bit reaches a PR', () => {
+    const lines = coverageSection({
+      ...measured,
+      note: 'maxFields capped at 60: at least 240 more form fields existed.',
+    }).join('\n');
+
+    expect(lines).toContain('at least 240 more form fields existed');
+  });
+
+  it('escapes a pipe, so a feature name cannot forge a markdown column', () => {
+    const lines = coverageSection({
+      ...measured,
+      rollup: { label: 'a|b', percent: 10, covered: 1, denominator: 10 },
+    }).join('\n');
+
+    expect(lines).toContain('a\\|b');
+  });
+});
+
+describe('buildCheckOutput — coverage reaches the merge box', () => {
+  it('puts the coverage line in the summary table beside the result counts', () => {
+    /*
+     * In the SAME table as "9 passed · 1 failed", not in a section below it: a
+     * figure below the fold is a figure nobody scrolls to, and the point is
+     * that the two are read in one glance — the second is what says what the
+     * first is a proportion of.
+     */
+    const out = buildCheckOutput(
+      evidence({
+        coverage: {
+          percent: 61.4,
+          denominator: 412,
+          covered: 253,
+          tier: 'ASSERTED',
+          deltaPercent: 6.4,
+          comparability: 'COMPARABLE',
+          comparabilityDetail: null,
+          rollup: null,
+          note: null,
+        },
+      }),
+    );
+
+    expect(out.summary).toContain('| Coverage | **61.4%**');
+    expect(out.summary.indexOf('| Coverage')).toBeGreaterThan(out.summary.indexOf('| Result |'));
+  });
+
+  it('still states coverage when the project has none, rather than omitting it', () => {
+    /*
+     * The mutation that killed this test dropped the section entirely. Silence
+     * about coverage in a merge box reads as "nothing to report", which is the
+     * direction that flatters a coverage product — and it makes a gap invisible
+     * at the exact moment somebody could close it.
+     */
+    const out = buildCheckOutput(evidence());
+
+    expect(out.summary).toContain('not measured');
+    expect(out.summary).toContain('not 0%');
   });
 });

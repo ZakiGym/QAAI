@@ -41,9 +41,18 @@
 import { FIXTURE_PREFIX, SURFACE_SOURCES } from '@qaai/shared';
 import type {
   CodebaseAnalysis,
+  ComparabilityInput,
   ComponentStateKind,
+  CoverageAttestation,
+  CoverageDimensionKind,
+  CoverageLadder,
+  DialectId,
+  DimensionCapBite,
+  DimensionUnmeasuredReason,
   FlowMap,
+  FormField,
   SourceComponent,
+  SourceFormField,
   SurfaceExercisability,
   SurfaceItem,
   SurfaceItemCoverage,
@@ -51,24 +60,82 @@ import type {
   SurfaceSnapshot,
   SurfaceSource,
   SurfaceWaiver,
+  TestType,
+  TypeObligationPolicy,
   UnexercisableReason,
 } from '@qaai/shared';
+import type { DeploymentCapabilityStatus } from '@qaai/shared';
 import { NON_HAPPY_PATH_STATES, componentHasOwnAxis, surfaceKey } from '@qaai/shared';
+/*
+ * The dimension vocabulary, the comparability decision and the write-path
+ * schemas.
+ *
+ * Every one of these is imported rather than restated, and the two that matter
+ * most are `snapshotDelta` and the three cell schemas. `snapshotDelta` is the
+ * ONE place two snapshots are allowed to be subtracted — a delta across two
+ * crawl fingerprints is refused, because subtracting two percentages always
+ * succeeds and "coverage fell 9 points" over two different crawls is an
+ * artefact of our own enumeration that everybody reads as a regression. The
+ * schemas are run against every row BEFORE its upsert, so a reading the
+ * database would refuse is refused here with the field named rather than
+ * arriving as a constraint violation nobody can read.
+ */
 import {
+  CELL_KIND_DIMENSION,
+  COVERAGE_DIMENSIONS,
+  HEADLINE_SCOPE_KEY,
+  SELF_DEPLOYMENT,
+  TEST_TYPES,
+  capabilityCounts,
+  attestationPayload,
+  coverageFormFieldSchema,
+  coverageItemStateSchema,
+  coverageRollupSchema,
+  coverageTypeObligationSchema,
+  dimensionWasMeasured,
+  resolveDialect,
+  snapshotDelta,
+  typeObligationPolicySchema,
+} from '@qaai/shared';
+import {
+  DIMENSION_REGISTRY,
+  MAX_ROLLUP_ROWS,
   RECONCILE_AXES,
+  analyseFieldCoverage,
   analyseSurfaceCoverage,
   buildSurfaceInventory,
+  buildTypeObligationMatrix,
+  canonicalRoute,
   componentStateIdentity,
+  coverageDimensionReport,
+  fieldCoverageCellKinds,
+  formIdentity,
   missingAxes,
   rankUncovered,
   reconcileSurface,
+  resolveTypeObligations,
+  rollupCoverage,
+  routeFeatureName,
+  type ComponentCoverageItem,
+  type CoverageDimensionReport,
+  type CoverageRollupRow,
+  type CoverageTestInput,
+  type DeploymentCapabilityFact,
+  type DimensionRegistryEntry,
+  type FieldCoverageField,
+  type FieldCoverageForm,
+  type FormFieldCellRow,
+  type ItemStateCellRow,
   type ReconcileAxis,
   type ReconcileEntry,
   type ReconcileSourceInput,
   type ReconciliationReport,
+  type RollupItem,
   type SurfaceInventory,
   type SurfaceSourceAsked,
   type TestExecutionFact,
+  type TypeObligationCell,
+  type TypeObligationTotals,
 } from '@qaai/agent';
 /*
  * THE ONE QUESTION EVERY GATE, COUNTER AND CHECK MUST ASK, imported rather than
@@ -81,6 +148,15 @@ import { quarantineSuppresses } from '@qaai/runner';
 import { Prisma } from '../generated/prisma/client.js';
 import { prisma } from './prisma.js';
 import { toCoverageInputs } from '../routes/coverage.js';
+/*
+ * THE ONE OWNERSHIP MATCHER. Imported rather than reimplemented for the same
+ * reason `quarantineSuppresses` is: `assignOwner` is what the notify processor,
+ * the morning digest and the ticket filer all route through, so the team a
+ * rollup bucket names is the team a page would actually reach. A second
+ * matcher here would be a second answer to "who owns /checkout", which is the
+ * question an unattributed-surface finding exists to make answerable.
+ */
+import { OWNERSHIP_RULE_SELECT, assignOwner, type OwnershipRuleInput } from './ownership.js';
 
 /**
  * The declarers this computation reads for itself.
@@ -105,6 +181,33 @@ const MAX_OBSERVED_ITEMS = 20_000;
 
 /** Component rows written per computation. Disclosed when it bites. */
 const MAX_COMPONENTS = 5_000;
+
+/**
+ * THE VERSION OF THE ENUMERATOR THAT PRODUCED THE INVENTORY.
+ *
+ * Not the application's version and not the crawl's `FlowMap.version` — this is
+ * the version of the CODE that decided what counts as a surface. It is required
+ * on an attestation because two attestations from different enumerator versions
+ * are not comparable even when they agree: a release that starts counting
+ * background jobs moves the denominator for reasons that have nothing to do
+ * with the customer's application, and a document that does not say which
+ * enumerator produced it cannot be checked against a later one.
+ *
+ * A CONSTANT in this file, and BUMPED BY HAND when the enumeration rules
+ * change. Derived alternatives were considered and are all worse: the package
+ * version moves on every release including ones that touch nothing here, and a
+ * hash of the enumerator's source would change on a comment and make every
+ * stored snapshot uncomparable with every other. Bumping it is a reviewed
+ * decision, which is what it should be — it invalidates every delta in the
+ * product.
+ *
+ * `enumerate.4` is the fourth enumeration round: the crawl frontier, the five
+ * non-crawl declarers, the per-role matrix, and this round's per-cell
+ * dimensions. Its natural home is beside `buildSurfaceInventory` in
+ * packages/agent, and that move is named in this round's handover rather than
+ * done by reaching into a file this slice does not own.
+ */
+export const CRAWL_VERSION = 'enumerate.4';
 
 /**
  * Whether this computation is entitled to retire anything.
@@ -247,6 +350,19 @@ export interface ComputedCoverage {
    * the same reason as `inventory` above.
    */
   components?: ComponentInventory;
+  /**
+   * THE BREAKDOWN BENEATH THE HEADLINE: all thirteen axes, each with its own
+   * denominator and NO combined figure.
+   *
+   * Optional for the same reason as `inventory` above — this is the contract
+   * `ComputeCoverageFn` in apps/worker names, and the implementation answering
+   * may be an older build. Absent is "the implementation that answered did not
+   * report this", which is true and checkable; required would make this field a
+   * claim about an implementation we do not control.
+   */
+  dimensions?: MeasuredDimensions;
+  /** The per-scope rollups this computation produced. Headline first. */
+  rollups?: CoverageRollupRow[];
 }
 
 // ─── Loading the inputs ──────────────────────────────────────────────────────
@@ -259,6 +375,34 @@ export interface ComputedCoverage {
  * denominator this feature exists to replace. The inventory says so in a
  * caveat rather than quietly reporting a smaller number.
  */
+/**
+ * The project's declared type-obligation policy, and nothing inferred.
+ *
+ * NULLABLE WITH NO DEFAULT, which is the whole design: "this project never
+ * thought about which test types its surfaces owe" and "this project chose E2E
+ * only" stay distinguishable, and `DEFAULT_TYPE_OBLIGATIONS` owes NOTHING. A
+ * default here would mint an obligation per axis per item on the day of the
+ * migration — 824 fabricated gaps on a 412-route project — and report QAAI's
+ * opinion about what a team should test as the team's debt.
+ *
+ * A stored shape that does not parse is read as NO POLICY and the failure is
+ * disclosed, rather than being partially honoured: half a policy is a
+ * denominator the customer did not configure.
+ */
+async function loadTypeObligationPolicy(
+  projectId: string,
+): Promise<{ policy: TypeObligationPolicy | null; unreadable: boolean }> {
+  const row = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { typeObligationPolicy: true },
+  });
+  const raw = row?.typeObligationPolicy ?? null;
+  if (raw === null) return { policy: null, unreadable: false };
+  const parsed = typeObligationPolicySchema.safeParse(raw);
+  if (!parsed.success) return { policy: null, unreadable: true };
+  return { policy: parsed.data, unreadable: false };
+}
+
 async function loadAnalysis(projectId: string): Promise<{
   analysis: CodebaseAnalysis | null;
   analysisId: string | null;
@@ -512,6 +656,22 @@ interface LoadedExecutions {
   facts: TestExecutionFact[];
   /** Null when the read succeeded. The error's message when it did not. */
   quarantineUnavailable: string | null;
+  /**
+   * The test ids whose quarantine is IN FORCE, as `quarantineSuppresses`
+   * answered it.
+   *
+   * Returned rather than kept local, because the dimension pass needs the same
+   * answer and `CoverageTestInput` carries no quarantine column. Re-deriving it
+   * there from `Test.quarantined` would be the fourth place in this product
+   * with its own opinion about whether a suppression is in force — and an
+   * EXPIRED quarantine gates again, which is exactly the case a second
+   * implementation gets wrong.
+   *
+   * EMPTY WHEN THE READ FAILED, which is why `quarantineUnavailable` travels
+   * beside it: an empty set means "nothing is suppressed" and that is the
+   * flattering answer, so the two fields are read together or not at all.
+   */
+  suppressed: ReadonlySet<string>;
 }
 
 async function loadExecutions(projectId: string): Promise<LoadedExecutions> {
@@ -615,7 +775,11 @@ async function loadExecutions(projectId: string): Promise<LoadedExecutions> {
       quarantined: true,
     });
   }
-  return { facts: [...latest.values()], quarantineUnavailable: quarantineRead.error };
+  return {
+    facts: [...latest.values()],
+    quarantineUnavailable: quarantineRead.error,
+    suppressed,
+  };
 }
 
 /** Waivers, keyed by surface key, with their owner attached. */
@@ -1080,6 +1244,7 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
     tests,
     executions,
     waivers,
+    obligationPolicy,
   ] = await Promise.all([
     loadAnalysis(projectId),
     loadFlowMap(projectId),
@@ -1094,6 +1259,7 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
     }),
     loadExecutions(projectId),
     loadWaivers(projectId),
+    loadTypeObligationPolicy(projectId),
   ]);
 
   const coverageInputs = toCoverageInputs(tests);
@@ -1211,6 +1377,98 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
     );
   }
 
+  /*
+   * ── THE DIMENSIONS, MEASURED BESIDE THE HEADLINE AND NEVER INTO IT ────────
+   *
+   * The figure above is `result.totals.percent`, and it does not move. This is
+   * the breakdown BENEATH it: thirteen axes, each dividing by its own cells.
+   * Folding any of them into that denominator would let a project with 40 form
+   * fields and 14 routes have its number decided by its forms.
+   *
+   * WHAT `result.totals.percent` IS NOT: a weighted mean. An earlier version of
+   * this comment called it "a weighted mean over ITEMS" and that was false.
+   * `totalsForItems` (packages/shared/src/surface.ts) computes it as
+   * `coveragePercent(sum(covered), sum(denominator))` over the four
+   * MEASURED_SURFACE_KINDS — there is no weight table on that path. It is a
+   * ratio of summed incommensurable denominators, which
+   * `summedKindPercent`'s doc comment in packages/agent/src/surface-coverage.ts
+   * sets out at length, measured: holding ROUTE at 5/10, adding uncovered
+   * ENDPOINT rows moves it 50% → 0.5% without the suite changing.
+   * `CoverageHeadline` in packages/agent/src/coverage.ts is the figure that has
+   * published weights, and it is a DIFFERENT number from this one. Keeping the
+   * two straight is the point of this note: the dimensions below are honest
+   * about their own denominators, and that is not the same as this field being
+   * honest about its.
+   *
+   * Computed even when `persist` is false, because a dry-run gate needs the
+   * same breakdown the stored snapshot carries — a gate that compares a figure
+   * computed one way against a stored figure computed another way is a gate
+   * that fails for reasons nobody can reproduce.
+   */
+  /*
+   * The capability set, read BEFORE the dimensions, because the TEST_TYPE
+   * denominator subtracts from it. A null set supplies no facts at all, which
+   * leaves every type NOT_CHECKED and IN the denominator — the conservative
+   * direction, and the one that stops a deployment with no preflight shedding
+   * obligations it never proved it could run.
+   */
+  const capabilities = await deploymentCapabilityFacts();
+  const dimensions = await measureDimensions({
+    projectId,
+    analysis,
+    flowMap,
+    ...(capabilities ? { capabilities: capabilities.facts } : {}),
+    items: inventory.items,
+    tests: coverageInputs,
+    waivers,
+    typeObligationPolicy: obligationPolicy.policy,
+    quarantined: executions.suppressed,
+    /*
+     * The dialect, resolved from the FIRST test's path, and NULL when there are
+     * no tests. Null is not "assume Playwright": it makes every claim that
+     * depends on finding an assertion UNMEASURED rather than absent, which is
+     * the conservative direction — a suite we cannot read assertions in must
+     * not have its cells scored as covered on no evidence.
+     */
+    dialect: tests[0] ? resolveDialect({ filePath: tests[0].filePath }) : null,
+    nowIso: new Date().toISOString(),
+  });
+  caveats.push(...dimensions.caveats);
+  caveats.push(
+    capabilities === null
+      ? 'What this deployment can EXECUTE could not be read (the migration that mints DeploymentCapability is not applied here), so every one of the 19 test types is treated as NOT_CHECKED and stays in the coverage denominator. That is the conservative direction: an unprobed type must not be able to shed an obligation it never proved it could run. It must NOT be read as "every type is available".'
+      : capabilities.sentence,
+  );
+  if (obligationPolicy.unreadable) {
+    caveats.push(
+      "This project's stored type-obligation policy could not be read, so it was treated as NO " +
+        'POLICY and the TEST_TYPE denominator is empty rather than partial. Half a policy is a ' +
+        'denominator the customer did not configure, and an empty one at least says so.',
+    );
+  }
+
+  /*
+   * ── THE ROLLUPS ──────────────────────────────────────────────────────────
+   *
+   * Per feature and per team, over the ITEM axis rather than over the cells,
+   * and at ONE named rung. The rung is required with no default: a rollup that
+   * does not say which bar it cleared is comparable to no other rollup, and two
+   * rows silently taken at NAVIGATED and PASSING look identical on screen.
+   *
+   * ASSERTED is the rung, because it is the weakest one that means a test says
+   * something about the item rather than merely reaching it — which is the
+   * sentence a team acts on in a PR comment.
+   */
+  const ownership = await attributeOwnership({ orgId, projectId, entries: result.entries });
+  const rollups = rollupCoverage({
+    dimension: null,
+    tier: 'ASSERTED',
+    items: result.entries.map((entry) =>
+      rollupItemFor(entry, waivers, ownership.teamByKey.get(entry.item.key) ?? null),
+    ),
+  });
+  caveats.push(...ownership.caveats, rollups.attribution.sentence, rollups.reconciliation.detail);
+
   const snapshot: SurfaceSnapshot = {
     // Null until persist() returns an id. A GET leaves it null on purpose.
     id: null,
@@ -1237,6 +1495,10 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
       projectId,
       entries: result.entries,
       snapshot,
+      dimensions,
+      rollups: rollups.rows,
+      crawlFingerprint: inventory.fingerprint,
+      denominatorDefinition: denominatorDefinitionOf(inventory, result.totals.denominator),
       /*
        * THE GATE ON THE SWEEP. Retirement means "every item this computation
        * did not see is gone", and that is only true when the union saw
@@ -1258,6 +1520,8 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
     snapshot,
     unmeasuredKinds: missingAxes(),
     snapshotId,
+    dimensions,
+    rollups: rollups.rows,
     inventory: {
       participation: inventory.participation,
       complete: inventory.complete,
@@ -1279,6 +1543,14 @@ async function persist(input: {
   snapshot: SurfaceSnapshot;
   /** False when the union was partial. See decision 4 in the header. */
   mayRetire: boolean;
+  /** The per-axis breakdown, whose cells go into the three cell tables. */
+  dimensions: MeasuredDimensions;
+  /** The per-scope rollups. Headline first. */
+  rollups: readonly CoverageRollupRow[];
+  /** The crawl identity this measurement was taken against. */
+  crawlFingerprint: string;
+  /** The sentence that says what was divided by. Half of comparability. */
+  denominatorDefinition: string;
 }): Promise<string> {
   const { orgId, projectId, entries, snapshot, mayRetire } = input;
   const seenKeys = entries.map((entry) => entry.item.key);
@@ -1403,7 +1675,101 @@ async function persist(input: {
     );
   }
 
-  return finishSnapshot({ orgId, projectId, snapshot, seenKeys, mayRetire });
+  /*
+   * ── THE CELL TABLES ──────────────────────────────────────────────────────
+   *
+   * Written AFTER the items, because every cell hangs off a `CoverageItem.id`
+   * that the upserts above had to produce first. Fault-isolated and counted for
+   * the same reason `persistCoverageEdges` is: the inventory and the snapshot
+   * are the deliverable, and an unavailable cell table must cost the BREAKDOWN
+   * rather than the measurement.
+   */
+  const cellWrite = await persistDimensionCells({
+    orgId,
+    projectId,
+    measured: input.dimensions,
+  });
+  if (cellWrite.failed > 0) {
+    snapshot.caveats.push(
+      `The per-cell breakdown was NOT fully recorded for this snapshot: ${cellWrite.failed} of ` +
+        `${cellWrite.attempted} dimension cell(s) could not be written ` +
+        `(${cellWrite.firstError ?? 'no error reported'}). The percentages above are unaffected — ` +
+        'they were computed before any of this was stored — and what is missing is the per-cell ' +
+        'detail that lets a reader name WHICH form field or WHICH typed obligation is uncovered. ' +
+        'Retirement of stale cells was skipped for this run, because a partial write followed by ' +
+        '"retire everything I did not write" is how a breakdown deletes itself.',
+    );
+  }
+  if (cellWrite.truncated) {
+    snapshot.caveats.push(
+      `The dimension cell write stopped at ${MAX_DIMENSION_CELL_WRITES} row(s), so at least one ` +
+        'more cell exists than is stored. The MEASUREMENT is over everything the dimension ' +
+        'modules measured and is not truncated; what is cut is the stored row list, so the ' +
+        'per-cell screens are a lower bound while the percentages are not. Retirement was ' +
+        'skipped: sweeping after a cut list would retire exactly the cells this cap hid, and the ' +
+        'figure would rise because our own budget bit.',
+    );
+  }
+
+  const snapshotId = await finishSnapshot({
+    orgId,
+    projectId,
+    snapshot,
+    seenKeys,
+    mayRetire,
+    crawlFingerprint: input.crawlFingerprint,
+    denominatorDefinition: input.denominatorDefinition,
+  });
+
+  /*
+   * ── THE ROLLUPS AND THE HISTORY ROW ──────────────────────────────────────
+   *
+   * Written LAST, because both hang off the snapshot id, and `previous` is read
+   * here rather than passed in so that the comparison is against whatever
+   * snapshot was second-newest at the moment this one landed. Reading it
+   * earlier would compare against a snapshot a concurrent recompute may
+   * already have superseded — and the lane is serialised at concurrency 1 for
+   * exactly that reason, so this is a belt to that brace.
+   */
+  const previous = await prisma.coverageSnapshot.findFirst({
+    where: { projectId, id: { not: snapshotId } },
+    orderBy: { createdAt: 'desc' },
+    select: {
+      id: true,
+      percent: true,
+      crawlFingerprint: true,
+      denominatorDefinition: true,
+    },
+  });
+  const rollupWrite = await persistRollups({
+    orgId,
+    projectId,
+    snapshotId,
+    rows: input.rollups,
+    current: {
+      crawlFingerprint: input.crawlFingerprint,
+      denominatorDefinition: input.denominatorDefinition,
+    },
+    previous,
+  });
+  if (rollupWrite.failed > 0) {
+    snapshot.caveats.push(
+      `${rollupWrite.failed} of ${rollupWrite.attempted} rollup row(s) could not be written ` +
+        `(${rollupWrite.firstError ?? 'no error reported'}), so the per-feature and per-team ` +
+        'breakdown for this snapshot is incomplete. The headline is unaffected. A rollup that is ' +
+        'missing buckets must not be read as a rollup whose buckets are empty.',
+    );
+  }
+  if (rollupWrite.truncated) {
+    snapshot.caveats.push(
+      `More than ${MAX_ROLLUP_ROWS} rollup buckets exist and only the largest ${MAX_ROLLUP_ROWS} ` +
+        'were stored. The headline bucket is never one of the dropped ones, and the dropped count ' +
+        'is reported by the rollup itself — "the maths is wrong" and "we only showed you the ' +
+        'biggest 500" are different sentences with different remedies.',
+    );
+  }
+
+  return snapshotId;
 }
 
 /**
@@ -1560,6 +1926,18 @@ async function finishSnapshot(input: {
   snapshot: SurfaceSnapshot;
   seenKeys: string[];
   mayRetire: boolean;
+  /**
+   * The crawl identity and the denominator definition, STORED, because they are
+   * the two halves of comparability.
+   *
+   * Every snapshot written before these columns existed has them NULL, and
+   * `snapshotDelta` reads that as `UNCOMPARABLE_FINGERPRINT_MISSING` rather
+   * than as comparable — "we cannot establish comparability" and "we
+   * established they are not comparable" are different claims, and a confident
+   * delta across an unknown boundary is the one this product cannot afford.
+   */
+  crawlFingerprint: string;
+  denominatorDefinition: string;
 }): Promise<string> {
   const { orgId, projectId, snapshot, seenKeys, mayRetire } = input;
   /*
@@ -1607,6 +1985,16 @@ async function finishSnapshot(input: {
       runId: snapshot.inputs.runId,
       caveats: snapshot.caveats,
       fingerprint: snapshot.fingerprint,
+      /*
+       * `crawlVersion` is the ENUMERATOR's version and `crawlFingerprint` is
+       * the identity of the inventory it produced. Two different facts: the
+       * first says which code measured, the second says which application was
+       * measured, and an attestation needs both to be checkable against a later
+       * one.
+       */
+      crawlVersion: CRAWL_VERSION,
+      crawlFingerprint: input.crawlFingerprint,
+      denominatorDefinition: input.denominatorDefinition,
     },
     select: { id: true },
   });
@@ -1736,4 +2124,1519 @@ export async function snapshotTrend(projectId: string, limit = 30) {
 export async function latestSnapshot(projectId: string) {
   const [snapshot] = await snapshotTrend(projectId, 1);
   return snapshot ?? null;
+}
+
+// ─── Attribution: which feature, and whose team ──────────────────────────────
+
+/**
+ * WHOSE TEAM OWNS EACH SURFACE, through the one matcher this product has.
+ *
+ * `assignOwner` in apps/api/src/lib/ownership.ts is the function that refuses to
+ * return a bare null, and it is the same one the notify processor, the digest
+ * and the ticket filer route through — so the team a rollup bucket names and
+ * the team a page gets routed to are the same team. A second matcher here would
+ * be a second answer to "who owns /checkout", which is the question an
+ * unattributed-surface finding exists to make answerable.
+ *
+ * ── THE LIMIT, STATED RATHER THAN DISCOVERED ───────────────────────────────
+ *
+ * `OwnableTest` is a TEST: a file path, a suite id and a feature. A
+ * `CoverageItem` has a file path (for a source-declared surface) and a feature,
+ * and NO suite — so `testId` and `suiteId` rules can never match a surface.
+ * That is a real shortfall and it is disclosed as a count, because a project
+ * that routes entirely by `testId` would see every surface land in UNOWNED and
+ * the honest reading of that is "QAAI cannot attribute this", not "nobody owns
+ * your application".
+ *
+ * A surface with NO file path cannot be matched at all — a crawled route has no
+ * source location — and those are counted separately for the same reason.
+ */
+async function attributeOwnership(input: {
+  orgId: string;
+  projectId: string;
+  entries: readonly SurfaceItemCoverage[];
+}): Promise<{ teamByKey: Map<string, string | null>; caveats: string[] }> {
+  const teamByKey = new Map<string, string | null>();
+  const caveats: string[] = [];
+
+  const rules = (await prisma.ownershipRule.findMany({
+    where: { orgId: input.orgId, projectId: input.projectId },
+    orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
+    // The SHARED select. A copy that forgot `position` would resolve
+    // last-match-wins against a column that is always 0.
+    select: OWNERSHIP_RULE_SELECT,
+  })) as OwnershipRuleInput[];
+
+  if (rules.length === 0) {
+    /*
+     * NO RULES is not "nobody owns it" — it is "nobody has said". Every item
+     * goes to UNOWNED and the sentence says which of the two this is, because
+     * the remedy for the first is a conversation and the remedy for the second
+     * is three lines of configuration.
+     */
+    caveats.push(
+      'No ownership rule exists for this project, so every surface is bucketed under UNOWNED in ' +
+        'the rollup. Read that as "nobody has said who owns this", NOT as "nobody owns it": QAAI ' +
+        'invents no default owner, because the first time a default pages the wrong person the ' +
+        'feature gets switched off.',
+    );
+    for (const entry of input.entries) teamByKey.set(entry.item.key, null);
+    return { teamByKey, caveats };
+  }
+
+  const identityOnly = rules.filter(
+    (rule) => rule.pathPattern === null && rule.feature === null,
+  ).length;
+  let unmatchable = 0;
+
+  for (const entry of input.entries) {
+    const filePath = entry.item.file;
+    if (filePath === null) {
+      unmatchable += 1;
+      teamByKey.set(entry.item.key, null);
+      continue;
+    }
+    const assignment = assignOwner(
+      {
+        /*
+         * An EMPTY id and a NULL suite, deliberately. A surface is not a test:
+         * it has no test id and belongs to no suite, so a `testId` or `suiteId`
+         * rule must not match it by accident. Passing the item key as the id
+         * would risk exactly that the first time somebody wrote a rule whose
+         * `testId` happened to equal a surface key.
+         */
+        id: '',
+        filePath,
+        suiteId: null,
+        feature: featureOfItem(entry.item),
+      },
+      rules,
+    );
+    const owner = assignment.owner;
+    teamByKey.set(entry.item.key, owner?.kind === 'TEAM' ? owner.teamId : null);
+  }
+
+  if (identityOnly > 0) {
+    caveats.push(
+      `${identityOnly} of ${rules.length} ownership rule(s) route by test id or suite id, which ` +
+        'cannot match a SURFACE — a coverage item has a file path and a feature and belongs to no ' +
+        'suite. Surfaces those rules would have covered are bucketed under UNOWNED. That is a ' +
+        'limit of QAAI\u2019s attribution, not a statement about your org chart.',
+    );
+  }
+  if (unmatchable > 0) {
+    caveats.push(
+      `${unmatchable} surface(s) carry no source location — a crawled route has none — so no ` +
+        'path-pattern rule can be evaluated against them and they are bucketed under UNOWNED.',
+    );
+  }
+
+  return { teamByKey, caveats };
+}
+
+/**
+ * THE FEATURE A SURFACE BELONGS TO, or null for "nobody attributed it".
+ *
+ * Null is bucketed under `UNATTRIBUTED_FEATURE` by the rollup rather than
+ * guessed at, and "31% of the surface has no feature" is a finding worth
+ * reporting rather than noise worth hiding.
+ *
+ * Read off `item.meta.feature` when a declarer wrote one, and otherwise derived
+ * from the first path segment of the item's route — which is the same rule
+ * `routeFeatureName` in packages/agent/src/coverage.ts already applies to gaps,
+ * so a gap and its rollup bucket agree about which feature they are about. Two
+ * spellings of "payments" is two different 31%.
+ */
+function featureOfItem(item: SurfaceItem): string | null {
+  const meta = item.meta as Record<string, unknown> | undefined;
+  const declared = meta?.feature;
+  if (typeof declared === 'string' && declared.length > 0) return declared;
+  const route = typeof meta?.route === 'string' ? meta.route : typeof meta?.path === 'string' ? meta.path : null;
+  return routeFeatureName(route);
+}
+
+/**
+ * One coverage entry as a rollup row's input.
+ *
+ * `tier` here is the rung the ENTRY reached, and the mapping from
+ * `SurfaceStatus` is deliberately conservative at both ends:
+ *
+ *   COVERED            → ASSERTED. A test asserts something about it and a run
+ *                        executed it. PASSING would need the run's verdict,
+ *                        which `SurfaceVerification` carries and which the
+ *                        rollup is not taking a position on.
+ *   ASSERTED_NOT_RUN   → DECLARED. Written is not run: a static match proves a
+ *                        test NAMES this item, not that anything executed it.
+ *   UNCOVERED, UNKNOWN → null, which is MEASURED AND UNCLAIMED and stays in the
+ *                        denominator. UNKNOWN in particular is a hole in OUR
+ *                        knowledge, and taking it out would let the number rise
+ *                        every time our extractor got worse.
+ *   WAIVED             → excluded, with the waiver's own reason and owner.
+ *   UNEXERCISABLE /    → excluded, with the rule that refused it named.
+ *   REFUSED
+ */
+function rollupItemFor(
+  entry: SurfaceItemCoverage,
+  waivers: Readonly<Record<string, SurfaceWaiver>>,
+  teamId: string | null,
+): RollupItem {
+  const waiver = waivers[entry.item.key];
+  const exercise = entry.item.exercise ?? null;
+  const excluded: RollupItem['excluded'] =
+    entry.status === 'WAIVED' || waiver !== undefined
+      ? {
+          reason: 'HELD_OUT',
+          detail:
+            `waived by ${waiver?.byEmail ?? waiver?.byUserId ?? 'an unrecorded owner'}: ` +
+            `${waiver?.reason ?? 'no reason recorded'}` +
+            (waiver?.expiresAtIso ? `, expiring ${waiver.expiresAtIso}` : ', with NO expiry'),
+        }
+      : exercise !== null && (exercise.state === 'UNEXERCISABLE' || exercise.state === 'REFUSED')
+        ? {
+            reason: 'HELD_OUT',
+            detail:
+              `${exercise.state}: ${exercise.detail}` +
+              (exercise.rule ? ` (refused by ${exercise.rule})` : ''),
+          }
+        : null;
+
+  return {
+    key: entry.item.key,
+    // Null: this is an AXIS-level rollup over CoverageItems themselves rather
+    // than over the cells beneath them, which is what the rollup module's
+    // `dimension: null` means.
+    dimension: null,
+    tier:
+      excluded !== null
+        ? null
+        : entry.status === 'COVERED'
+          ? 'ASSERTED'
+          : entry.status === 'ASSERTED_NOT_RUN'
+            ? 'DECLARED'
+            : null,
+    feature: featureOfItem(entry.item),
+    teamId,
+    excluded,
+  };
+}
+
+/**
+ * THE SENTENCE THAT SAYS WHAT WAS DIVIDED BY.
+ *
+ * Without it the percentage on an attestation is a number with no units, and
+ * `attest` refuses an empty one. It is also one half of the comparability
+ * decision: two snapshots whose denominator DEFINITIONS differ are not
+ * comparable however close their percentages are, so this string is compared
+ * verbatim by `snapshotDelta` and must be derived from the inventory rather
+ * than hand-written per call site — a sentence that varies by caller would make
+ * every snapshot uncomparable with every other.
+ */
+function denominatorDefinitionOf(inventory: SurfaceInventory, denominator: number): string {
+  const axes = [...new Set(inventory.items.map((item) => item.kind))].sort();
+  const heldOut = inventory.heldOut;
+  return (
+    `${denominator} CoverageItem(s) across ${axes.length} axis/axes (${axes.join(', ')}), ` +
+    `declared by ${inventory.participation.filter((p) => p.participation === 'LOADED').length} of ` +
+    `${inventory.participation.length} declarer(s); union ` +
+    `${inventory.complete === null ? 'completeness UNKNOWN' : inventory.complete ? 'complete' : 'PARTIAL'}; ` +
+    `${heldOut.unexercisable} unexercisable and ${heldOut.refused} refused item(s) held out of the ` +
+    'division with a reason; waived items leave the denominator with an owner and an expiry.'
+  );
+}
+
+// ─── The dimensions: adapters, a write path and a read path ──────────────────
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE DIMENSION ADAPTERS, AND WHY THEY ARE HERE AND NOT IN packages/agent
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * Every dimension module in packages/agent takes its facts as a narrow injected
+ * record — a list of forms, a list of components, a list of tests — and nothing
+ * else, because rule 8 of this codebase says so and because 629 lines of
+ * `crawler.ts` had almost no tests for want of that. The price is that somebody
+ * has to translate stored artefacts into those records, and this file is the
+ * only one in the repo that holds all four inputs at once: the source analysis,
+ * the latest crawl, the Test rows and the run report.
+ *
+ * ── A TASK THAT MINTS A TABLE OWES IT A WRITE PATH AND A READ PATH ──────────
+ *
+ * Two consecutive keystones shipped models with no door, `check:wiring` called
+ * them DISCONNECTED, and neither slice could ship. "The next round will read
+ * it" is not a door. So all three of the cell tables get both halves here:
+ * `persistDimensionCells` writes `CoverageFormField`, `CoverageItemState` and
+ * `CoverageTypeObligation`, and `dimensionBreakdown` reads them back.
+ *
+ * ── WHAT IS ADAPTED AND WHAT IS HONESTLY NOT ────────────────────────────────
+ *
+ * Five of the twelve measured axes have an adapter here, because their facts
+ * are in artefacts this file already loads:
+ *
+ *   FORM_FIELD, VALIDATION_RULE  the crawl's `FormModel.fields` (which carry
+ *                                maxlength, min, max, step and pattern) and the
+ *                                source analysis's `SourceForm.fields` (which
+ *                                carry none of them — hence `constraintsRead:
+ *                                false`, which is a disclosure and not a bug)
+ *   COMPONENT, COMPONENT_STATE   the stored `ComponentItem` / `ComponentState`
+ *                                rows the component pass above writes
+ *   TEST_TYPE                    `Project.typeObligationPolicy` plus the Test
+ *                                rows, plus the deployment's capability set
+ *
+ * The other seven axes have a producer in `DIMENSION_REGISTRY` and NO adapter
+ * in this build, and that is reported as `NOT_ENUMERATED` by
+ * `coverageDimensionReport` — the extractor exists and was given no facts,
+ * which is a different finding from "we have no extractor" and has a different
+ * remedy. Neither is 0%. The adapters each need an artefact this file does not
+ * load (`FlowNode.structure` for the state axes, `VariantAttribution` for the
+ * device and flag axes, `analysis.backgroundSurfaces` for the async axes, the
+ * stored `AccessMatrixCell` rows for roles), and each is a thin field-for-field
+ * translation named in this round's handover rather than half-built here.
+ */
+
+/**
+ * WHAT THIS DEPLOYMENT CAN EXECUTE, read from `DeploymentCapability`.
+ *
+ * ── WHY THE API READS THE ROWS AND DOES NOT CALL THE PROBER ────────────────
+ *
+ * The prober lives in `apps/worker/src/processors/preflight.ts` — it `stat`s
+ * PATH and shells out for `--version`, which is the worker's job and not a
+ * thing to do on an API thread while somebody is waiting for a page. So the
+ * worker writes the rows and this reads them, and the read is deliberately
+ * dumber than the prober: it takes whatever was last written and reports when.
+ *
+ * ── EVERY TYPE APPEARS, AND AN UNPROBED ONE IS NOT_CHECKED ─────────────────
+ *
+ * The loop is over `TEST_TYPES` and not over the rows that happen to exist,
+ * which is the whole correctness of it: a loop over the table can only report
+ * types somebody already wrote a row for, so a half-probed deployment would
+ * look complete and the nineteen in "4 of 19" would be however many rows there
+ * were.
+ *
+ * NOT_CHECKED COUNTS. `capabilityCounts` keeps it in the denominator, and the
+ * reason is the one that decides whether this whole feature is honest: dropping
+ * an unprobed type would let a deployment that never ran a preflight silently
+ * shed every obligation it could not prove it could run, and the percentage
+ * would RISE for a preflight nobody executed.
+ *
+ * ── NULL IS "CANNOT ANSWER" ────────────────────────────────────────────────
+ *
+ * The migration that mints the table is written and unapplied in this tree. On
+ * a deployment where it has not landed this returns null, and
+ * `measureDimensions` then supplies NO capability facts — which leaves every
+ * type NOT_CHECKED and in the denominator, the conservative direction. It must
+ * never be read as "every type is available".
+ */
+export async function deploymentCapabilityFacts(): Promise<{
+  facts: DeploymentCapabilityFact[];
+  /** The oldest `checkedAt` in the set, or NULL when nothing was ever probed. */
+  measuredAt: Date | null;
+  /** Types whose obligations leave the denominator, each with its reason. */
+  nonExecutable: Array<{ testType: TestType; status: string; reason: string }>;
+  /** Probed and inconclusive, or never probed. Reported, still in the denominator. */
+  notChecked: TestType[];
+  sentence: string;
+} | null> {
+  let rows: Array<{
+    testType: TestType;
+    status: DeploymentCapabilityStatus;
+    detail: string;
+    checkedAt: Date | null;
+  }>;
+  try {
+    rows = await prisma.deploymentCapability.findMany({
+      where: { deploymentKey: SELF_DEPLOYMENT },
+      select: { testType: true, status: true, detail: true, checkedAt: true },
+    });
+  } catch {
+    return null;
+  }
+
+  const byType = new Map(rows.map((row) => [row.testType, row]));
+  const facts: DeploymentCapabilityFact[] = [];
+  const nonExecutable: Array<{ testType: TestType; status: string; reason: string }> = [];
+  const notChecked: TestType[] = [];
+
+  for (const testType of TEST_TYPES) {
+    const row = byType.get(testType);
+    const status = row?.status ?? 'NOT_CHECKED';
+    const detail =
+      row?.detail ??
+      'No capability probe has ever run for this type on this deployment, so whether it can be executed here is NOT MEASURED. It stays in the coverage denominator.';
+    facts.push({ testType, status, detail });
+    if (!capabilityCounts(status)) {
+      nonExecutable.push({ testType, status, reason: detail });
+      continue;
+    }
+    if (status === 'NOT_CHECKED') notChecked.push(testType);
+  }
+
+  const measuredAt = rows.reduce<Date | null>(
+    (oldest, row) =>
+      row.checkedAt === null ? oldest : oldest === null || row.checkedAt < oldest ? row.checkedAt : oldest,
+    null,
+  );
+
+  /*
+   * THREE FACTS, NEVER FOLDED INTO ONE: how many types cannot execute here, how
+   * many are unresolved, and when (or whether) any of it was measured. A reader
+   * given only the first would read silence on the other two as "everything
+   * else is fine".
+   */
+  const total = TEST_TYPES.length;
+  const sentence =
+    measuredAt === null
+      ? `None of the ${total} test types has been probed on this deployment, so which of them it can execute is NOT MEASURED. Every type stays in the coverage denominator: an unprobed type must not be able to shed an obligation it never proved it could run.`
+      : `${
+          nonExecutable.length === 0
+            ? `All ${total} test types are executable on this deployment.`
+            : `${nonExecutable.length} of ${total} test types are not executable here: ${nonExecutable
+                .map((entry) => `${entry.testType} (${entry.status})`)
+                .join(', ')}. Their obligations leave the coverage denominator with this reason — they are not counted as covered, and they are not silently dropped.`
+        }${
+          notChecked.length === 0
+            ? ''
+            : ` ${notChecked.length} type(s) could not be established either way: NOT_CHECKED is not a verdict about this image, and those stay IN the denominator.`
+        } Measured at ${measuredAt.toISOString()}.`;
+
+  return { facts, measuredAt, nonExecutable, notChecked, sentence };
+}
+
+/** The axes this file can currently supply facts for. The rest are NOT_ENUMERATED. */
+export const ADAPTED_DIMENSIONS: readonly CoverageDimensionKind[] = [
+  'FORM_FIELD',
+  'VALIDATION_RULE',
+  'COMPONENT',
+  'COMPONENT_STATE',
+  'TEST_TYPE',
+];
+
+/**
+ * How many cells one dimension write will store.
+ *
+ * A cap, therefore disclosed: when it bites it is reported as a COUNT and a
+ * REASON on the snapshot's caveats, so a reader can see "at least 1,400 more
+ * form-field cells existed" rather than reading a truncated denominator as the
+ * whole application. The limit is on the WRITE and not on the measurement — the
+ * percentage is computed over everything the modules measured, and only the
+ * stored row list is cut — which is why the two numbers can differ and why the
+ * caveat says which is which.
+ */
+const MAX_DIMENSION_CELL_WRITES = 20_000;
+
+/**
+ * Turn a crawled form's field into the narrow record `coverage-fields.ts` takes.
+ *
+ * ── THE THREE-STATE ATTRIBUTES ARE PRESERVED, NOT FLATTENED ────────────────
+ *
+ * `FormField.maxLength` and friends are OPTIONAL and distinguish three states:
+ * absent means this crawl predates the capture, null means the crawl looked and
+ * the page declares nothing, a value means the page declares it. Collapsing
+ * absent onto null here would re-import exactly the lie those optionals exist
+ * to prevent — a field nobody read would be reported as a field with no
+ * constraints, which is a measurement we never took.
+ *
+ * So `constraintsRead` is true only when the crawl actually captured the
+ * attributes (any of the six is present, even as null), and `min`/`max`/`step`
+ * are passed through `numericBound`, which names the ones the numeric column
+ * cannot hold rather than coercing them to NaN or dropping them.
+ */
+function fieldFromCrawl(field: FormField): FieldCoverageField {
+  const captured =
+    field.maxLength !== undefined ||
+    field.minLength !== undefined ||
+    field.min !== undefined ||
+    field.max !== undefined ||
+    field.step !== undefined ||
+    field.pattern !== undefined;
+
+  /*
+   * The slug type is MODULE-PRIVATE in coverage-fields.ts — `type
+   * ConstraintSlug` with no `export` — while the interface field that uses it
+   * is public. So it is derived from the interface rather than named, which
+   * keeps the compiler checking the slugs against the module's own list
+   * instead of against a copy of it here. The missing export line is in this
+   * round's handover.
+   */
+  type Slug = NonNullable<FieldCoverageField['unreadableConstraints']>[number];
+  const unreadable: Slug[] = [];
+  /*
+   * `min`, `max` and `step` are STRINGS on the wire, because the attributes are
+   * not numbers: `min` is "2024-01-01" on a date input and "08:00" on a time
+   * input. `FormFieldConstraintReading` types them as numbers, so a date bound
+   * cannot be stored — and both alternatives are lies. Dropping it reports a
+   * field with nothing to test; `Number("2024-01-01")` is NaN and would report
+   * a bound of NaN. So the slug is NAMED, the cell is unmeasured with
+   * `EXTRACTOR_RETURNED_UNKNOWN`, and the detail says which attribute we could
+   * not keep.
+   */
+  const numericBound = (raw: string | null | undefined, slug: Slug): number | null => {
+    if (raw === undefined || raw === null || raw === '') return null;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed)) return parsed;
+    unreadable.push(slug);
+    return null;
+  };
+
+  return {
+    name: field.name,
+    label: field.label,
+    inputType: field.inputType,
+    required: field.required,
+    semantic: field.semantic,
+    constraintsRead: captured,
+    constraint: captured
+      ? {
+          maxLength: field.maxLength ?? null,
+          minLength: field.minLength ?? null,
+          min: numericBound(field.min, 'min'),
+          max: numericBound(field.max, 'max'),
+          step: numericBound(field.step, 'step'),
+          pattern: field.pattern ?? null,
+        }
+      : null,
+    ...(unreadable.length > 0 ? { unreadableConstraints: unreadable } : {}),
+  };
+}
+
+/**
+ * The same, for a form read out of the SOURCE.
+ *
+ * `constraintsRead: false` is not an oversight and must not be "fixed" by
+ * passing an all-null constraint object: `detectForms` in
+ * packages/shared/src/codebase.ts reads no `maxlength`, `minlength`, `min`,
+ * `max`, `step` or `pattern` at all, so six constraint classes are unreachable
+ * from this declarer. False with a null constraint means "nobody looked", which
+ * owes one unmeasured cell per class; true with an all-null constraint would
+ * mean "we looked and the page declares nothing", which owes no cells. The
+ * second is the flattering answer and it is not true.
+ */
+function fieldFromSource(field: SourceFormField): FieldCoverageField {
+  return {
+    name: field.name,
+    label: field.label,
+    inputType: field.inputType,
+    required: field.required,
+    semantic: field.semantic,
+    constraint: null,
+    constraintsRead: false,
+  };
+}
+
+/**
+ * Every form whose `CoverageItem` row exists, with its fields.
+ *
+ * ── THE DROP THAT IS COUNTED RATHER THAN SILENT ────────────────────────────
+ *
+ * `FieldCoverageForm.itemKey` is required, because a field cell with no
+ * registry row to hang on cannot be written and a denominator of rows nothing
+ * can store is not a denominator. The inventory does not necessarily hold both
+ * declarers' forms: when a source analysis exists, `buildSurfaceInventory`
+ * takes the FORM axis from the source list ONLY, so the crawl's forms have no
+ * item of their own. Emitting them anyway would mint cells against keys that
+ * name nothing, which is the dangling reference `ComponentState.coverageItemKey`
+ * already has to report rather than enforce.
+ *
+ * So a form whose key is not in the inventory is DROPPED and COUNTED, and the
+ * count becomes a caveat. Dropped-and-counted is a disclosure; dropped-and-
+ * silent is a smaller denominator with no explanation, which is the direction
+ * that flatters the number.
+ */
+function formsForFieldCoverage(input: {
+  analysis: CodebaseAnalysis | null;
+  flowMap: FlowMap | null;
+  /** Every live `CoverageItem.key`, so a form with no row is dropped and counted. */
+  itemKeys: ReadonlySet<string>;
+}): { forms: FieldCoverageForm[]; droppedNoItem: number } {
+  const forms: FieldCoverageForm[] = [];
+  let droppedNoItem = 0;
+
+  const push = (form: FieldCoverageForm): void => {
+    if (!input.itemKeys.has(form.itemKey)) {
+      droppedNoItem += 1;
+      return;
+    }
+    forms.push(form);
+  };
+
+  for (const form of input.analysis?.forms ?? []) {
+    push({
+      itemKey: surfaceKey('FORM', formIdentity(form)),
+      name: form.name,
+      /*
+       * NULL, and it WIDENS the match rather than narrowing it. A source form
+       * has no route attached, so there is nothing to scope a test's mention by
+       * — and `analyseFieldCoverage` discloses that as a caveat rather than
+       * silently treating the mention as a match on every page.
+       */
+      route: null,
+      source: 'SOURCE',
+      fields: form.fields.map(fieldFromSource),
+    });
+  }
+
+  for (const node of input.flowMap?.nodes ?? []) {
+    for (const form of node.forms) {
+      push({
+        itemKey: surfaceKey('FORM', `${canonicalRoute(node.route)}#${form.id}`),
+        name: form.name,
+        route: canonicalRoute(node.route),
+        source: 'CRAWL',
+        fields: form.fields.map(fieldFromCrawl),
+      });
+    }
+  }
+
+  return { forms, droppedNoItem };
+}
+
+/**
+ * The stored component inventory, as the narrow records the module takes.
+ *
+ * Read back from `ComponentItem` / `ComponentState` rather than from
+ * `analysis.components`, and the difference matters: `persistComponents` above
+ * is what decides which components are live and which are retired, and it is
+ * what wrote the `coverageItemKey` each state cell has to be stored against.
+ * Measuring from the analysis instead would measure a set the database does not
+ * hold, and the two would disagree the first time a component was retired.
+ *
+ * ── `states: null` IS NOT `states: []` ─────────────────────────────────────
+ *
+ * A component with no state ROWS has `states: null` here, meaning NOBODY
+ * ENUMERATED ITS STATES, which owes one unmeasured cell on the COMPONENT_STATE
+ * axis. `[]` would mean a reader looked and the component declares none, which
+ * owes nothing. We cannot tell the two apart from the rows alone — a component
+ * row exists either way — so the conservative reading is taken: null, which
+ * LOWERS the measured share rather than flattering it.
+ */
+async function componentsForFieldCoverage(input: {
+  projectId: string;
+  itemKeys: ReadonlySet<string>;
+}): Promise<{ components: ComponentCoverageItem[]; truncated: boolean }> {
+  const rows = await prisma.componentItem.findMany({
+    where: { projectId: input.projectId, retiredAt: null },
+    orderBy: [{ modulePath: 'asc' }, { exportName: 'asc' }],
+    take: MAX_COMPONENTS,
+    select: {
+      modulePath: true,
+      exportName: true,
+      kind: true,
+      hasCatalogueEntry: true,
+      evidence: true,
+      states: {
+        where: { retiredAt: null },
+        select: { kind: true, source: true, evidence: true, coverageItemKey: true },
+      },
+    },
+  });
+
+  const components = rows.map((row): ComponentCoverageItem => {
+    /*
+     * The component's own cell hangs off the COMPONENT_STATE item of its
+     * DEFAULT state, because that is the only registry key a component row
+     * carries — `componentStateIdentity` keys on (module, export, KIND) and
+     * there is no COMPONENT item kind. A component none of whose states has a
+     * stored key reaches the module with `itemKey: null`, which it reports as
+     * NOT_ENUMERATED with the dangling reference named, rather than minting
+     * cells nothing can store.
+     */
+    const keyed = row.states.find(
+      (state) => state.coverageItemKey !== null && input.itemKeys.has(state.coverageItemKey),
+    );
+    return {
+      itemKey: keyed?.coverageItemKey ?? null,
+      modulePath: row.modulePath,
+      exportName: row.exportName,
+      kind: row.kind,
+      source: 'SOURCE',
+      hasCatalogueEntry: row.hasCatalogueEntry,
+      states:
+        row.states.length === 0
+          ? null
+          : row.states.map((state) => ({
+              kind: state.kind,
+              source: state.source,
+              evidence: state.evidence,
+            })),
+    };
+  });
+
+  return { components, truncated: rows.length === MAX_COMPONENTS };
+}
+
+/**
+ * Everything one dimension pass produced: the report, the rows it wants stored,
+ * and the disclosures it owes.
+ */
+export interface MeasuredDimensions {
+  /** All thirteen axes, each with its own denominator and no combined figure. */
+  report: CoverageDimensionReport;
+  /** `CoverageFormField` rows: the FORM_FIELD and VALIDATION_RULE cells. */
+  formFieldRows: FormFieldCellRow[];
+  /** `CoverageItemState` rows: the COMPONENT and COMPONENT_STATE cells. */
+  itemStateRows: ItemStateCellRow[];
+  /** `CoverageTypeObligation` cells: one surface owing one typed test. */
+  obligationCells: readonly TypeObligationCell[];
+  /** The per-type ladders — "routes with an ACCESSIBILITY test: 3 of 14". */
+  byTestType: readonly TypeObligationTotals[];
+  /** Every sentence this pass owes the reader, caps that bit included. */
+  caveats: string[];
+}
+
+/**
+ * Measure every axis this file can supply facts for, and NAME the rest.
+ *
+ * `capabilities` is injected rather than read here, and that is the one wiring
+ * decision in this function worth the comment: the prober lives in
+ * apps/worker/src/processors/preflight.ts, which this app cannot import, and
+ * the fallback when no caller supplies it is NOT "assume every type runs". An
+ * absent capability set leaves every type `NOT_CHECKED`, which `capabilityCounts`
+ * deliberately KEEPS in the denominator — dropping an unprobed type would let a
+ * deployment that never ran a preflight shed every obligation it could not
+ * prove it could run, and the percentage would rise for a preflight nobody
+ * executed.
+ */
+export async function measureDimensions(input: {
+  projectId: string;
+  analysis: CodebaseAnalysis | null;
+  flowMap: FlowMap | null;
+  items: readonly SurfaceItem[];
+  tests: readonly CoverageTestInput[];
+  /**
+   * The test ids whose quarantine is IN FORCE, as `quarantineSuppresses`
+   * answered it.
+   *
+   * A SET and not a flag on the test, because `CoverageTestInput` deliberately
+   * carries no quarantine column — the one question "is this suppression in
+   * force" is answered by `quarantineSuppresses` in packages/runner, and a
+   * fourth place in this product with its own opinion about it is how a
+   * quarantined test came to close a gap.
+   */
+  quarantined: ReadonlySet<string>;
+  waivers: Readonly<Record<string, SurfaceWaiver>>;
+  /** The project's declared obligation policy. NULL means it never configured one. */
+  typeObligationPolicy: TypeObligationPolicy | null;
+  /** The dialect the suite is written in. NULL makes assertion claims unmeasured. */
+  dialect: DialectId | null;
+  /** What this deployment can execute. Absent leaves every type NOT_CHECKED. */
+  capabilities?: readonly DeploymentCapabilityFact[];
+  nowIso: string;
+}): Promise<MeasuredDimensions> {
+  const caveats: string[] = [];
+  const itemKeys = new Set(input.items.map((item) => item.key));
+
+  // ── FORM_FIELD, VALIDATION_RULE, COMPONENT, COMPONENT_STATE ──────────────
+  const { forms, droppedNoItem } = formsForFieldCoverage({
+    analysis: input.analysis,
+    flowMap: input.flowMap,
+    itemKeys,
+  });
+  if (droppedNoItem > 0) {
+    caveats.push(
+      `${droppedNoItem} form(s) were found by a declarer and have no CoverageItem row, so their ` +
+        'fields are not in the FORM_FIELD or VALIDATION_RULE denominator. A field cell with no ' +
+        'registry row cannot be stored, and minting one against a key that names nothing would ' +
+        'be a dangling reference rather than a measurement. This happens by design when a ' +
+        'source analysis exists: the inventory then takes the FORM axis from the source list ' +
+        "only, so the crawl's forms have no item of their own.",
+    );
+  }
+
+  const { components, truncated: componentsTruncated } = await componentsForFieldCoverage({
+    projectId: input.projectId,
+    itemKeys,
+  });
+  const fieldCaps: DimensionCapBite[] = [];
+  if (componentsTruncated) {
+    fieldCaps.push({
+      cap: 'MAX_COMPONENTS',
+      limit: MAX_COMPONENTS,
+      /*
+       * NULL, not 0. The read stopped at the limit and cannot say what was
+       * behind it; 0 would be the claim that nothing was hidden, which is the
+       * opposite of what a bitten cap means.
+       */
+      atLeastMore: null,
+      detail:
+        `the component read stopped at ${MAX_COMPONENTS} rows, so at least one more component ` +
+        'exists and the COMPONENT and COMPONENT_STATE denominators are a lower bound',
+    });
+  }
+
+  const fieldResult = analyseFieldCoverage({
+    forms,
+    components,
+    tests: input.tests.map((test) => ({
+      id: test.id,
+      code: test.code ?? null,
+      routes: test.routes,
+      quarantined: input.quarantined.has(test.id),
+    })),
+    dialect: input.dialect,
+    nowIso: input.nowIso,
+    caps: fieldCaps,
+  });
+  caveats.push(...fieldResult.caveats);
+
+  // ── TEST_TYPE ────────────────────────────────────────────────────────────
+  const subjects = input.items.map((item) => ({
+    key: item.key,
+    kind: item.kind,
+    exercise: item.exercise ?? null,
+    waived: input.waivers[item.key] !== undefined,
+  }));
+  const typeMatrix = buildTypeObligationMatrix({
+    items: subjects,
+    obligations: resolveTypeObligations({
+      items: subjects,
+      policy: input.typeObligationPolicy,
+    }),
+    /*
+     * NO EDGES ARE SUPPLIED, AND THAT IS A MEASURED STATE RATHER THAN A GAP IN
+     * THIS WIRING. A `TypedCoverageEdge` needs the TYPE OF THE TEST on the
+     * link, and `persistCoverageEdges` above writes `TestCoverageEdge` rows
+     * with no test type on them — the column does not exist. So every declared
+     * obligation reads as measured-and-unclaimed, which is the conservative
+     * direction: the cells stay IN the denominator and nothing is scored as
+     * covered on evidence we do not hold. The alternative — crediting an
+     * untyped edge to every type — is the exact defect the TEST_TYPE axis was
+     * built to remove, where a PERFORMANCE test marks /checkout fully visited
+     * as an E2E does.
+     */
+    ...(input.capabilities ? { capabilities: input.capabilities } : {}),
+  });
+  if (typeMatrix.measurement.measured > 0) {
+    caveats.push(
+      `TEST_TYPE: ${typeMatrix.measurement.measured} typed obligation(s) are in the denominator ` +
+        'and none is claimed by a test, because `TestCoverageEdge` carries no test type — the ' +
+        'links exist and cannot say whether the test that made them was an E2E or a PERFORMANCE ' +
+        'run. Crediting an untyped link to every type is the defect this axis exists to remove, ' +
+        'so the obligations are counted and unclaimed rather than scored.',
+    );
+  }
+  if (typeMatrix.refused.length > 0) {
+    caveats.push(
+      `TEST_TYPE: ${typeMatrix.refused.length} declared obligation(s) named an axis this ` +
+        'dimension does not refine and were REFUSED rather than minted — an obligation on a ' +
+        'cell rather than on a surface is how fabricated denominators get built out of a real one.',
+    );
+  }
+
+  const report = coverageDimensionReport({
+    supplied: {
+      FORM_FIELD: fieldResult.measurements.FORM_FIELD,
+      VALIDATION_RULE: fieldResult.measurements.VALIDATION_RULE,
+      COMPONENT: fieldResult.measurements.COMPONENT,
+      COMPONENT_STATE: fieldResult.measurements.COMPONENT_STATE,
+      TEST_TYPE: typeMatrix.measurement,
+    },
+  });
+
+  /*
+   * THE AXES WITH A PRODUCER AND NO ADAPTER, NAMED ONCE, WITH THEIR MODULES.
+   *
+   * `coverageDimensionReport` already reports each of them as NOT_ENUMERATED
+   * with its own sentence, so this caveat is not the disclosure — it is the
+   * SUMMARY, on the snapshot, beside the number, so that a reader of the
+   * headline sees how much of the breakdown is missing without walking
+   * thirteen measurements. Silence about an axis reads as "nothing to report",
+   * which is the direction that flatters a coverage product.
+   */
+  const unadapted = report.measured.filter(
+    (dimension) => !ADAPTED_DIMENSIONS.includes(dimension),
+  );
+  if (unadapted.length > 0) {
+    caveats.push(
+      `${unadapted.length} of ${report.measured.length} measurable dimension(s) were NOT ` +
+        `enumerated by this computation: ${unadapted.join(', ')}. A module in packages/agent can ` +
+        'measure each of them and this deployment holds no adapter that supplies its facts — so ' +
+        'their denominators are UNKNOWN rather than zero, and none of them has a percentage. ' +
+        'This is a gap in QAAI, not in your test suite.',
+    );
+  }
+
+  return {
+    report,
+    formFieldRows: fieldResult.formFieldRows,
+    itemStateRows: fieldResult.itemStateRows,
+    obligationCells: typeMatrix.cells,
+    byTestType: typeMatrix.byType,
+    caveats,
+  };
+}
+
+/** What a dimension write managed, so a partial one can be disclosed. */
+export interface DimensionWriteResult {
+  attempted: number;
+  written: number;
+  failed: number;
+  /**
+   * The first error's message, which is how a table that does not exist at all
+   * is told apart from one row failing a foreign key. The two have the same
+   * shape in the counts and completely different remedies.
+   */
+  firstError: string | null;
+  /** True when MAX_DIMENSION_CELL_WRITES cut the row list. Reported, never silent. */
+  truncated: boolean;
+}
+
+/**
+ * ── THE WRITE PATH FOR THE THREE CELL TABLES ────────────────────────────────
+ *
+ * `CoverageFormField`, `CoverageItemState` and `CoverageTypeObligation`, from
+ * the rows the dimension modules produced. Every row is parsed through its own
+ * zod schema BEFORE the upsert, so a reading the database would refuse is
+ * refused here with the field named rather than failing as a constraint
+ * violation nobody can read.
+ *
+ * ── FAULT-ISOLATED, AND THE FAILURE IS COUNTED ──────────────────────────────
+ *
+ * The migration that mints these three tables is written and UNAPPLIED in this
+ * tree, so the delegates exist on the generated client and the TABLES do not:
+ * every statement below throws until somebody deploys. The inventory and the
+ * snapshot are the deliverable and are already written, so an unavailable cell
+ * table must cost the BREAKDOWN and not the measurement — exactly the trade
+ * `persistCoverageEdges` above makes, for the same reason and in the same
+ * shape.
+ *
+ * What it must never do is fail quietly. The reason goes onto the snapshot's
+ * own caveats, beside the number, because "we recorded none of the per-cell
+ * detail behind this figure" is a fact about how defensible the figure is.
+ *
+ * ── RETIREMENT IS SCOPED BY `kind`, AND THAT IS LOAD-BEARING ────────────────
+ *
+ * `CoverageItemState` is written by MORE THAN ONE PRODUCER: this pass stores
+ * the COMPONENT_* cells, and the page-state, error-state and data-variant
+ * adapters store PAGE_*, ERROR_* and DATA_* cells into the same table. So the
+ * sweep is scoped to the cell kinds THIS pass produces and sets `retiredAt`; an
+ * unscoped `deleteMany` would remove another producer's cells on every
+ * recompute, and the rows would come back on the next one — a table that
+ * oscillates is worse than one that is stale, because the stale one is at least
+ * reproducible.
+ *
+ * And the sweep is skipped entirely unless every row landed, for the reason
+ * decision 4 in this file's header gives: a partial write followed by "retire
+ * everything I did not write" is how an audit trail deletes itself.
+ */
+async function persistDimensionCells(input: {
+  orgId: string;
+  projectId: string;
+  measured: MeasuredDimensions;
+}): Promise<DimensionWriteResult> {
+  const { orgId, projectId, measured } = input;
+
+  const keys = [
+    ...measured.formFieldRows.map((row) => row.itemKey),
+    ...measured.itemStateRows.map((row) => row.itemKey),
+    ...measured.obligationCells.map((cell) => cell.itemKey),
+  ];
+  const itemRows = await prisma.coverageItem.findMany({
+    where: { projectId, key: { in: [...new Set(keys)] } },
+    select: { id: true, key: true },
+  });
+  const itemIdByKey = new Map(itemRows.map((row) => [row.key, row.id]));
+
+  let attempted = 0;
+  let failed = 0;
+  let firstError: string | null = null;
+  const writtenFieldKeys: string[] = [];
+  const writtenStateKeys: string[] = [];
+  const writtenObligations: string[] = [];
+  let budget = MAX_DIMENSION_CELL_WRITES;
+
+  const attempt = async (what: () => Promise<void>): Promise<boolean> => {
+    attempted += 1;
+    try {
+      await what();
+      return true;
+    } catch (error) {
+      failed += 1;
+      firstError ??= error instanceof Error ? error.message : String(error);
+      return false;
+    }
+  };
+
+  for (const row of measured.formFieldRows) {
+    if (budget <= 0) break;
+    const itemId = itemIdByKey.get(row.itemKey);
+    // An item whose upsert did not land this round has no id to hang a cell
+    // off. Skipping is correct: the next recompute writes both, and a cell
+    // pointing at nothing is worse than a missing one.
+    if (itemId === undefined) continue;
+    budget -= 1;
+    const ok = await attempt(async () => {
+      const parsed = coverageFormFieldSchema.parse(row);
+      const data = {
+        orgId,
+        projectId,
+        kind: parsed.kind,
+        label: parsed.label,
+        parentFieldKey: parsed.parentFieldKey,
+        inputType: parsed.inputType,
+        /*
+         * `required` and `constraint` are written as NULL when the reader could
+         * not read them, and `constraintsRead` is what tells that apart from a
+         * page that declares nothing. Writing `false` for an unread `required`
+         * would report every unreadable field as optional, which removes a rule
+         * cell per field and raises the measured share for a reader bug.
+         */
+        required: parsed.required,
+        /*
+         * `Prisma.DbNull` and not `null`. A nullable Json column distinguishes
+         * SQL NULL from the JSON value `null`, and the client refuses a bare
+         * `null`; `DbNull` is the column being empty, which here means the
+         * constraints were never read. `constraintsRead` beside it is what
+         * tells that apart from a page that declares none.
+         */
+        constraint:
+          parsed.constraint === null
+            ? Prisma.DbNull
+            : (parsed.constraint as unknown as Prisma.InputJsonValue),
+        constraintsRead: parsed.constraintsRead,
+        semantic: parsed.semantic,
+        origin: parsed.origin,
+        evidence: parsed.evidence,
+        exercisability: parsed.exercise?.state ?? null,
+        unexercisableReason: parsed.exercise?.reason ?? null,
+        refusedByRule: parsed.exercise?.rule ?? null,
+        exerciseDetail: parsed.exercise?.detail ?? null,
+        tier: parsed.tier,
+        tierCappedBy: parsed.tierCappedBy,
+        lastConfirmedRunId: parsed.lastConfirmedRunId,
+        unmeasuredReason: parsed.unmeasuredReason,
+        unmeasuredDetail: parsed.unmeasuredDetail,
+        retiredAt: null,
+      };
+      await prisma.coverageFormField.upsert({
+        where: { itemId_fieldKey: { itemId, fieldKey: parsed.fieldKey } },
+        create: { ...data, itemId, fieldKey: parsed.fieldKey },
+        update: data,
+      });
+    });
+    if (ok) writtenFieldKeys.push(row.fieldKey);
+  }
+
+  for (const row of measured.itemStateRows) {
+    if (budget <= 0) break;
+    const itemId = itemIdByKey.get(row.itemKey);
+    if (itemId === undefined) continue;
+    budget -= 1;
+    const ok = await attempt(async () => {
+      const parsed = coverageItemStateSchema.parse(row);
+      const data = {
+        orgId,
+        projectId,
+        kind: parsed.kind,
+        label: parsed.label,
+        origin: parsed.origin,
+        evidence: parsed.evidence,
+        parentStateKey: parsed.parentStateKey,
+        /*
+         * NULL means DECLARED AND NEVER OBSERVED, and it is not the request
+         * time. Stamping a declared state with `new Date()` would report a
+         * state nobody drove as a state we watched happen, which is the
+         * written-is-not-run rule broken in one column.
+         */
+        observedAt: parsed.observedAtIso === null ? null : new Date(parsed.observedAtIso),
+        exercisability: parsed.exercise?.state ?? null,
+        unexercisableReason: parsed.exercise?.reason ?? null,
+        refusedByRule: parsed.exercise?.rule ?? null,
+        exerciseDetail: parsed.exercise?.detail ?? null,
+        tier: parsed.tier,
+        tierCappedBy: parsed.tierCappedBy,
+        lastConfirmedRunId: parsed.lastConfirmedRunId,
+        unmeasuredReason: parsed.unmeasuredReason,
+        unmeasuredDetail: parsed.unmeasuredDetail,
+        retiredAt: null,
+      };
+      await prisma.coverageItemState.upsert({
+        where: { itemId_stateKey: { itemId, stateKey: parsed.stateKey } },
+        create: { ...data, itemId, stateKey: parsed.stateKey },
+        update: data,
+      });
+    });
+    if (ok) writtenStateKeys.push(row.stateKey);
+  }
+
+  for (const cell of measured.obligationCells) {
+    if (budget <= 0) break;
+    const itemId = itemIdByKey.get(cell.itemKey);
+    if (itemId === undefined) continue;
+    budget -= 1;
+    const ok = await attempt(async () => {
+      const parsed = coverageTypeObligationSchema.parse({
+        itemKey: cell.itemKey,
+        testType: cell.testType,
+        declaredBy: cell.declaredBy,
+        evidence: cell.evidence,
+        tier: cell.tier,
+        tierCappedBy: cell.tierCappedBy,
+        lastConfirmedRunId: cell.lastConfirmedRunId,
+        unmeasuredReason: cell.unmeasuredReason,
+        unmeasuredDetail: cell.unmeasuredDetail,
+      });
+      const data = {
+        orgId,
+        projectId,
+        declaredBy: parsed.declaredBy,
+        evidence: parsed.evidence,
+        tier: parsed.tier,
+        tierCappedBy: parsed.tierCappedBy,
+        lastConfirmedRunId: parsed.lastConfirmedRunId,
+        unmeasuredReason: parsed.unmeasuredReason,
+        unmeasuredDetail: parsed.unmeasuredDetail,
+        retiredAt: null,
+      };
+      await prisma.coverageTypeObligation.upsert({
+        where: { itemId_testType: { itemId, testType: parsed.testType } },
+        create: { ...data, itemId, testType: parsed.testType },
+        update: data,
+      });
+    });
+    if (ok) writtenObligations.push(`${cell.itemKey}\u0000${cell.testType}`);
+  }
+
+  const truncated = budget <= 0;
+  const written = writtenFieldKeys.length + writtenStateKeys.length + writtenObligations.length;
+
+  /*
+   * THE SWEEP. Only when nothing failed and nothing was truncated — a cut row
+   * list followed by "retire everything I did not write" would retire the cells
+   * the cap hid, and the figure would rise because our own budget bit.
+   */
+  if (failed === 0 && !truncated) {
+    await attempt(async () => {
+      await prisma.coverageFormField.updateMany({
+        where: {
+          projectId,
+          retiredAt: null,
+          ...(writtenFieldKeys.length > 0 ? { fieldKey: { notIn: writtenFieldKeys } } : {}),
+        },
+        data: { retiredAt: new Date() },
+      });
+    });
+    await attempt(async () => {
+      await prisma.coverageItemState.updateMany({
+        where: {
+          projectId,
+          retiredAt: null,
+          /*
+           * SCOPED BY `kind` to the cells THIS pass produces. The page-state,
+           * error-state and data-variant adapters write PAGE_*, ERROR_* and
+           * DATA_* rows into this same table, and an unscoped sweep would
+           * retire another producer's cells on every recompute.
+           */
+          kind: { in: [...fieldCoverageCellKinds()] },
+          ...(writtenStateKeys.length > 0 ? { stateKey: { notIn: writtenStateKeys } } : {}),
+        },
+        data: { retiredAt: new Date() },
+      });
+    });
+  }
+
+  return { attempted, written, failed, firstError, truncated };
+}
+
+/**
+ * ── THE ROLLUP WRITE PATH: `CoverageRollup` AND `CoverageHistory` ───────────
+ *
+ * One row per (snapshot, scope), where a scope is the headline, one dimension,
+ * one feature, one team, or a combination. `rollupScopeKey` builds the identity
+ * and it is NEVER spelled here — the schema's own refinement recomputes it from
+ * the columns and refuses the row if the two disagree, which is the guard.
+ *
+ * ── WHY THE KEY IS ONE TEXT COLUMN AND NOT THREE NULLABLE ONES ─────────────
+ *
+ * PostgreSQL treats NULLs in a unique index as DISTINCT, so
+ * `UNIQUE(snapshotId, dimension, feature, teamId)` would let the headline row —
+ * all three null — be written an unbounded number of times, and this upsert
+ * would silently stop being idempotent. Every duplicate is a second
+ * denominator for the same subject, which is how one screen comes to disagree
+ * with another about one percentage.
+ *
+ * ── THE HISTORY ROW CARRIES COMPARABILITY, NOT A DELTA WE WANTED ───────────
+ *
+ * `snapshotDelta` decides whether the two snapshots may be subtracted at all,
+ * and a delta across two crawl fingerprints is NULL with the reason in its
+ * place. Subtracting two percentages always succeeds, which is exactly why the
+ * decision has to be a function and not a convention: "coverage fell 9 points"
+ * over two different crawls is an artefact of our own enumeration changing, and
+ * it will be read as a regression by everybody who sees it — in the PR comment,
+ * on the badge, in the digest.
+ */
+async function persistRollups(input: {
+  orgId: string;
+  projectId: string;
+  snapshotId: string;
+  rows: readonly CoverageRollupRow[];
+  /** The comparability inputs for THIS snapshot. */
+  current: ComparabilityInput;
+  /** The previous snapshot, when there is one. Null is the no-baseline case. */
+  previous: {
+    id: string;
+    percent: number | null;
+    crawlFingerprint: string | null;
+    denominatorDefinition: string | null;
+  } | null;
+}): Promise<DimensionWriteResult> {
+  const { orgId, projectId, snapshotId, rows } = input;
+  let attempted = 0;
+  let failed = 0;
+  let written = 0;
+  let firstError: string | null = null;
+
+  for (const row of rows.slice(0, MAX_ROLLUP_ROWS)) {
+    attempted += 1;
+    try {
+      const parsed = coverageRollupSchema.parse(row);
+      const data = {
+        orgId,
+        projectId,
+        dimension: parsed.dimension,
+        feature: parsed.feature,
+        teamId: parsed.teamId,
+        numerator: parsed.numerator,
+        denominator: parsed.denominator,
+        percent: parsed.percent,
+        tier: parsed.tier,
+        unmeasured: parsed.unmeasured,
+        unmeasuredReason: parsed.unmeasuredReason,
+        unmeasuredDetail: parsed.unmeasuredDetail,
+        /*
+         * Spread into plain objects rather than cast: Prisma's Json input type
+         * rejects a typed interface array, and a cast here would silence the
+         * one check that notices if `DimensionCapBite` ever gains a
+         * non-serialisable field.
+         */
+        caps: parsed.caps.map((cap) => ({ ...cap })),
+        exclusions: [...parsed.exclusions],
+      };
+      await prisma.coverageRollup.upsert({
+        where: { snapshotId_scopeKey: { snapshotId, scopeKey: parsed.scopeKey } },
+        create: { ...data, snapshotId, scopeKey: parsed.scopeKey },
+        update: data,
+      });
+      written += 1;
+    } catch (error) {
+      failed += 1;
+      firstError ??= error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /*
+   * THE HISTORY ROW FOR THE HEADLINE SCOPE. One per (snapshot, scope), and only
+   * for the headline today: a per-feature history needs the previous
+   * snapshot's per-feature rollups read back, which is a second query per
+   * bucket and buys nothing until a surface renders a per-feature trend. The
+   * headline is what the PR comment, the badge and the digest all quote.
+   */
+  const headline = rows.find((row) => row.scopeKey === HEADLINE_SCOPE_KEY);
+  if (headline !== undefined) {
+    attempted += 1;
+    try {
+      const delta = snapshotDelta({
+        current: { ...input.current, percent: headline.percent },
+        previous:
+          input.previous === null
+            ? null
+            : {
+                crawlFingerprint: input.previous.crawlFingerprint,
+                denominatorDefinition: input.previous.denominatorDefinition,
+                percent: input.previous.percent,
+              },
+      });
+      const data = {
+        orgId,
+        projectId,
+        dimension: headline.dimension,
+        feature: headline.feature,
+        teamId: headline.teamId,
+        numerator: headline.numerator,
+        denominator: headline.denominator,
+        percent: headline.percent,
+        /*
+         * The rung the figure was taken at, required with no default: a history
+         * row that does not say which bar it cleared is comparable to no other
+         * row, and two rows silently taken at NAVIGATED and PASSING look
+         * identical on a trend line.
+         */
+        tier: headline.tier,
+        previousSnapshotId: input.previous?.id ?? null,
+        previousPercent: input.previous?.percent ?? null,
+        /*
+         * NULL unless COMPARABLE, by construction: `snapshotDelta` returns null
+         * for every uncomparable pair and the reason travels in `comparability`
+         * and `comparabilityDetail`. Nothing here recomputes a subtraction.
+         */
+        deltaPercent: delta.deltaPercent,
+        crawlFingerprint: input.current.crawlFingerprint,
+        comparability: delta.comparability,
+        comparabilityDetail: delta.detail,
+      };
+      await prisma.coverageHistory.upsert({
+        where: { snapshotId_scopeKey: { snapshotId, scopeKey: HEADLINE_SCOPE_KEY } },
+        create: { ...data, snapshotId, scopeKey: HEADLINE_SCOPE_KEY, firstSeenAt: new Date() },
+        update: data,
+      });
+      written += 1;
+    } catch (error) {
+      failed += 1;
+      firstError ??= error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  return {
+    attempted,
+    written,
+    failed,
+    firstError,
+    truncated: rows.length > MAX_ROLLUP_ROWS,
+  };
+}
+
+// ─── Reading the dimensions back ─────────────────────────────────────────────
+
+/** One axis as the API and the web app read it. No `percent` — see below. */
+export interface StoredDimension {
+  dimension: CoverageDimensionKind;
+  cells: number;
+  measured: number;
+  unmeasured: number;
+  unmeasuredReason: DimensionUnmeasuredReason | null;
+  unmeasuredDetail: string | null;
+  /** The ladder over the MEASURED cells only. Null percent at every empty rung. */
+  tiers: CoverageLadder;
+  caps: DimensionCapBite[];
+  /**
+   * TRUE when an extractor produced tiers for at least one cell. The predicate
+   * every renderer asks before printing a figure, so that "not measured" and
+   * "0%" are one BRANCH apart rather than one rounding apart.
+   */
+  wasMeasured: boolean;
+  /** Which module answers for this axis, or why nothing does. */
+  producer: DimensionRegistryEntry;
+}
+
+export interface StoredDimensionBreakdown {
+  /** All thirteen axes, each with its own denominator. */
+  dimensions: StoredDimension[];
+  /** Printed where a combined figure would go. */
+  rule: string;
+  /** Every cap that bit, across every axis, as a count AND a reason. */
+  caps: DimensionCapBite[];
+  /**
+   * How many stored cells back each axis, by axis, from the three cell tables.
+   *
+   * NULL means THIS DEPLOYMENT CANNOT ANSWER — the migration that mints the
+   * tables is written and unapplied — and must never render as "no cells
+   * exist". An empty aggregate would read as a project whose breakdown is
+   * genuinely empty, which is the opposite of the truth and the worse of the
+   * two wrong answers.
+   */
+  storedCells: Record<CoverageDimensionKind, number> | null;
+  why: string;
+}
+
+/**
+ * ── THE READ PATH FOR THE THREE CELL TABLES ─────────────────────────────────
+ *
+ * The counterpart of `persistDimensionCells`. It exists in the SAME round as
+ * the write path because a table with only one of the two is what `check:wiring`
+ * calls DISCONNECTED, and two consecutive keystones shipped models that way.
+ *
+ * ── WHY COUNTS AND NOT A LIST ───────────────────────────────────────────────
+ *
+ * The per-cell list is paged by `GET /coverage/:projectId/dimensions/:dimension`
+ * — filters before the cap, a stable cursor, and the cap that bit reported in
+ * the payload. A second un-paged list here would be a second answer to the same
+ * question, and the one that is not walkable is the one that would get quoted.
+ *
+ * ── `storedCells: null` IS NOT AN EMPTY RECORD ──────────────────────────────
+ *
+ * Same contract as `coverageProvenance` above and for the same reason.
+ */
+export async function dimensionBreakdown(input: {
+  projectId: string;
+  measured: MeasuredDimensions;
+}): Promise<StoredDimensionBreakdown> {
+  const dimensions = input.measured.report.measurements.map(
+    (measurement): StoredDimension => ({
+      dimension: measurement.dimension,
+      cells: measurement.cells,
+      measured: measurement.measured,
+      unmeasured: measurement.unmeasured,
+      unmeasuredReason: measurement.unmeasuredReason,
+      unmeasuredDetail: measurement.unmeasuredDetail,
+      tiers: measurement.tiers,
+      caps: measurement.caps,
+      wasMeasured: dimensionWasMeasured(measurement),
+      producer: DIMENSION_REGISTRY[measurement.dimension],
+    }),
+  );
+
+  let storedCells: Record<CoverageDimensionKind, number> | null = null;
+  let why =
+    'Each figure is read off its own dimension ladder, over its own denominator. An axis with ' +
+    '`wasMeasured: false` has NO percentage — it is not 0%, and the reason says whether that is ' +
+    'our missing extractor, a crawl nobody ran, or a cap that bit.';
+  try {
+    const [fieldGroups, stateGroups, obligations] = await Promise.all([
+      prisma.coverageFormField.groupBy({
+        by: ['kind'],
+        where: { projectId: input.projectId, retiredAt: null },
+        _count: { _all: true },
+      }),
+      prisma.coverageItemState.groupBy({
+        by: ['kind'],
+        where: { projectId: input.projectId, retiredAt: null },
+        _count: { _all: true },
+      }),
+      prisma.coverageTypeObligation.count({
+        where: { projectId: input.projectId, retiredAt: null },
+      }),
+    ]);
+
+    /*
+     * The dimension is DERIVED from the cell kind through `CELL_KIND_DIMENSION`
+     * and never stored twice. One cell vocabulary and one mapping, so a reader
+     * cannot file a COMPONENT_LOADING row under COMPONENT_STATE here while a
+     * writer files it under COMPONENT there.
+     */
+    const counts = Object.fromEntries(
+      COVERAGE_DIMENSIONS.map((dimension) => [dimension, 0]),
+    ) as Record<CoverageDimensionKind, number>;
+    for (const group of [...fieldGroups, ...stateGroups]) {
+      counts[CELL_KIND_DIMENSION[group.kind]] += group._count._all;
+    }
+    counts.TEST_TYPE += obligations;
+    storedCells = counts;
+  } catch {
+    /*
+     * The tables do not exist on this deployment (the migration is written and
+     * unapplied). Not an empty answer — NO answer.
+     */
+    why +=
+      ' The per-cell tables could not be read on this deployment, so `storedCells` is NULL rather ' +
+      'than zero: the migration that mints CoverageFormField, CoverageItemState and ' +
+      'CoverageTypeObligation is written and not yet applied here. Read NULL as "cannot answer", ' +
+      'never as "no cells exist".';
+  }
+
+  return {
+    dimensions,
+    rule: input.measured.report.rule,
+    caps: input.measured.report.caps,
+    storedCells,
+    why,
+  };
+}
+
+// ─── The attestation: write, read, and the one claim per fingerprint ─────────
+
+/**
+ * Store an attestation, or return the one that already says this.
+ *
+ * `@@unique([projectId, fingerprint])` is what makes "is this the document you
+ * were sent?" answerable: the fingerprint is stable over (denominator
+ * definition, crawl version, item set), so re-exporting an unchanged
+ * measurement returns the SAME row rather than minting a second document that
+ * says the same thing with a different id. The clock and the issuer are
+ * deliberately OUT of the fingerprint — two exports of one measurement are one
+ * claim — which is why this is an upsert on the fingerprint and not a create.
+ *
+ * ── THE ENVELOPE CANNOT BE BUILT WITHOUT ITS SCOPE STATEMENT ────────────────
+ *
+ * `CoverageAttestation` (the type) is nominal: `attest` is the only door, and
+ * it throws on an empty scope statement, an empty denominator definition, a
+ * numerator above its denominator and a percentage on an empty denominator. So
+ * this function takes the ATTESTED value and cannot be handed a hand-assembled
+ * literal with no disclosures in it — which is the shape a writer in a hurry
+ * produces, and it compiles.
+ */
+export async function storeAttestation(input: {
+  orgId: string;
+  projectId: string;
+  attestation: CoverageAttestation;
+}): Promise<{ id: string; created: boolean } | null> {
+  const payload = attestationPayload(input.attestation);
+  const data = {
+    orgId: input.orgId,
+    projectId: input.projectId,
+    snapshotId: payload.snapshotId,
+    crawlVersion: payload.crawlVersion,
+    crawlFingerprint: payload.crawlFingerprint,
+    denominatorDefinition: payload.denominatorDefinition,
+    percent: payload.percent,
+    denominator: payload.denominator,
+    covered: payload.covered,
+    scopeStatement: payload.scopeStatement,
+    unmeasured: payload.unmeasured.map((entry) => ({ ...entry })),
+    caps: payload.caps.map((cap) => ({ ...cap })),
+    issuedByUserId: payload.issuedByUserId,
+  };
+  try {
+    const existing = await prisma.coverageAttestation.findUnique({
+      where: { projectId_fingerprint: { projectId: input.projectId, fingerprint: payload.fingerprint } },
+      select: { id: true },
+    });
+    if (existing) return { id: existing.id, created: false };
+    const row = await prisma.coverageAttestation.create({
+      data: { ...data, fingerprint: payload.fingerprint },
+      select: { id: true },
+    });
+    return { id: row.id, created: true };
+  } catch {
+    /*
+     * The table does not exist on this deployment. NULL, and the caller
+     * discloses it: an export that could not be RECORDED is still a valid
+     * document — every claim in it was computed — and the thing that is missing
+     * is the record that we issued it. Refusing to serve the document would
+     * cost the customer the artifact to protect our own bookkeeping.
+     */
+    return null;
+  }
+}
+
+/** The attestations issued for a project, newest first. The read half. */
+export async function storedAttestations(
+  projectId: string,
+  limit = 20,
+): Promise<Array<{
+  id: string;
+  fingerprint: string;
+  percent: number | null;
+  denominator: number;
+  covered: number;
+  crawlVersion: string;
+  crawlFingerprint: string | null;
+  issuedAt: Date;
+  scopeStatement: string;
+}> | null> {
+  try {
+    return await prisma.coverageAttestation.findMany({
+      where: { projectId },
+      orderBy: { issuedAt: 'desc' },
+      take: limit,
+      /*
+       * `unmeasured` and `caps` are deliberately NOT selected. They are the
+       * whole scope section of a document and this is a LIST — serving them on
+       * every row would make a page of twenty attestations several hundred
+       * kilobytes of repeated disclosure, and the list's job is to let a reader
+       * pick the fingerprint they want.
+       */
+      select: {
+        id: true,
+        fingerprint: true,
+        percent: true,
+        denominator: true,
+        covered: true,
+        crawlVersion: true,
+        crawlFingerprint: true,
+        issuedAt: true,
+        scopeStatement: true,
+      },
+    });
+  } catch {
+    // NULL is "this deployment cannot answer", never "none were issued".
+    return null;
+  }
 }

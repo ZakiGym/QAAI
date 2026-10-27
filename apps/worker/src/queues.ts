@@ -51,7 +51,59 @@ export interface AnalyzeSourceJob {
   autoApprove?: boolean;
 }
 
+/**
+ * THE CAPABILITY PREFLIGHT: "which of the nineteen test types can this image
+ * actually execute?"
+ *
+ * ── THE LIE THIS QUEUE EXISTS TO KILL ──────────────────────────────────────
+ *
+ * The worker image has no k6, no Lighthouse, no Stryker, no Maestro, no Firefox
+ * and no WebKit. The plugins for those types do not crash — they degrade to
+ * SKIPPED and say so politely, once, in a result row nothing aggregates. So a
+ * pass rate could be computed over tests that CANNOT FAIL, and a coverage
+ * percentage could count obligations this deployment has no way of
+ * discharging. `processors/preflight.ts` answers that for all nineteen and
+ * writes a `DeploymentCapability` row each; this is how it gets asked.
+ *
+ * ── WHY A QUEUE AND NOT A STARTUP CALL ─────────────────────────────────────
+ *
+ * Because A CACHED `AVAILABLE` FOR A BINARY THAT HAS SINCE VANISHED IS A LIE
+ * ABOUT THE IMAGE. Somebody rebuilds the container without k6 and a row
+ * written at boot keeps vouching for it until the process restarts. So the
+ * probe is a repeatable job on a short cadence, the rows carry their own
+ * `checkedAt`, and the AGE of the answer is part of the answer.
+ *
+ * NOT in `QUEUE_NAMES` for the same reason as `ANALYZE_SOURCE_QUEUE` above and
+ * `RETENTION_QUEUE`: this wave does not own packages/shared/src/constants.ts.
+ * The literal is exported so a producer and the consumer share one constant
+ * instead of two strings that drift.
+ */
+export const PREFLIGHT_QUEUE = 'qaai.preflight';
+
+/**
+ * One capability probe.
+ *
+ * `deploymentKey` carries the sentinel `<self>` for this image and
+ * `pool:<name>` for a customer's own runner pool, which is why it is a FIELD
+ * rather than being assumed: a cloud worker and an on-prem pool have different
+ * binaries installed, and one set of rows for both would report the cloud's
+ * missing k6 as the customer's.
+ *
+ * Ids and flags only, like every other payload (see the header of
+ * packages/shared/src/jobs.ts). There is nothing to carry: the probe reads the
+ * filesystem it is running on, which is the whole point of running it there.
+ */
+export interface PreflightJob {
+  /** `'<self>'` for this image. A runner pool passes `pool:<name>`. */
+  deploymentKey?: string;
+  /** Null for the cloud image, which belongs to no org. A pool belongs to one. */
+  orgId?: string | null;
+  /** Bypass the freshness window. The sweep never does; an operator can. */
+  force?: boolean;
+}
+
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
+const preflightQueue = new Queue(PREFLIGHT_QUEUE, { connection });
 const exploreQueue = new Queue(QUEUE_NAMES.explore, { connection });
 const analyzeSourceQueue = new Queue(ANALYZE_SOURCE_QUEUE, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
@@ -310,6 +362,60 @@ export async function enqueueDelivery(job: DeliveryJob): Promise<void> {
 }
 
 /**
+ * Ask for a capability probe now.
+ *
+ * The job id pins ONE probe per deployment key in flight, with both removal
+ * flags — the lesson `enqueueExplore` above paid for: a retained terminal job
+ * with a fixed id silently swallows every later enqueue for as long as the key
+ * lives in Redis, which would turn "one probe per deployment in flight" into
+ * "one probe per deployment EVER" and freeze the capability set at whatever the
+ * image held the first time a worker booted. That is precisely the stale
+ * `AVAILABLE` this feature exists to prevent.
+ *
+ * `attempts: 1`: the probe is idempotent and cheap, so the next scheduled sweep
+ * is always a better answer than a retry of this one — and a retry storm here
+ * means nineteen `--version` subprocesses per attempt.
+ */
+export async function enqueuePreflight(job: PreflightJob = {}): Promise<void> {
+  await preflightQueue.add(PREFLIGHT_QUEUE, job, {
+    jobId: `preflight-${job.deploymentKey ?? '<self>'}`,
+    attempts: 1,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
+
+/**
+ * Arm the capability sweep.
+ *
+ * Every fifteen minutes, which is deliberately shorter than it looks like it
+ * needs to be: `CAPABILITY_FRESH_MS` is ten minutes, so each sweep finds the
+ * rows stale and re-probes, and the stored `checkedAt` is never more than a
+ * quarter of an hour behind the image. A daily sweep would mean a container
+ * rebuilt at 09:00 keeps vouching for a binary it no longer has until the next
+ * morning, and every coverage figure computed in between would have counted
+ * obligations nothing could discharge.
+ *
+ * It is cheap enough to mean it: a `stat` per PATH entry plus at most one
+ * `--version` per binary with a declared version window.
+ *
+ * Armed on every boot, de-duplicated by `jobId`, so a restart cannot
+ * double-schedule — the same contract as the scheduler and flake sweeps.
+ */
+export async function armPreflightSweep(): Promise<void> {
+  await preflightQueue.add(
+    'tick',
+    {},
+    {
+      repeat: { every: 15 * 60_000 },
+      jobId: 'qaai-preflight-tick',
+      removeOnComplete: 20,
+      removeOnFail: 20,
+    },
+  );
+}
+
+/**
  * Arm the scheduler sweep. A BullMQ repeatable job survives restarts and
  * de-duplicates by key, so calling this on every boot is safe and means the
  * sweep exists as long as a worker does.
@@ -355,5 +461,6 @@ export async function closeProducers(): Promise<void> {
     bisectQueue.close(),
     analyzeSourceQueue.close(),
     exploreQueue.close(),
+    preflightQueue.close(),
   ]);
 }

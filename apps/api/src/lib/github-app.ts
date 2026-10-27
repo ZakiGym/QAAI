@@ -50,6 +50,18 @@ import { createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import { githubRepoSlug, redactSecrets } from './issues.js';
 
 export { githubRepoSlug, redactSecrets };
+/*
+ * THE ONE COMPARABILITY PREDICATE, imported rather than spelled as
+ * `comparability === 'COMPARABLE'` here.
+ *
+ * Five surfaces print a coverage delta and this is the one that lands in a
+ * pull request, where a wrong one gets argued about by a whole team. Two
+ * snapshots taken against different crawls measured different applications, so
+ * the subtraction is refused and the reason is printed in its place —
+ * `deltaIsMeaningful` is where that decision is made, once.
+ */
+import { deltaIsMeaningful } from '@qaai/shared';
+import type { SnapshotComparability } from '@qaai/shared';
 
 // ─── Contract with the queue ─────────────────────────────────────────────────
 
@@ -559,6 +571,128 @@ export interface CheckEvidence {
   failures: CheckFailure[];
   /** Cockpit origin, for the link out of the merge box. */
   webUrl: string;
+  /**
+   * THE COVERAGE LINE. Optional, and absent means something specific.
+   *
+   * `grep -n coverage` in this file returned NOTHING before this field: the one
+   * sentence this company has never appeared in the place a team actually looks
+   * at, which is the merge box of their own pull request. A check run that
+   * reports "48 passed" and says nothing about what was never tested is a check
+   * run that makes a gap invisible at the exact moment somebody could close it.
+   *
+   * ABSENT IS NOT ZERO AND NOT "FINE". The producer leaves it off when no
+   * snapshot exists for the project, or when this deployment cannot read the
+   * stored breakdown, and `coverageSection` renders that as the words "not
+   * measured" with the reason. A check that printed "Coverage 0%" because a
+   * migration had not landed would be the product's own lie in a merge box,
+   * seen by everybody on the team.
+   */
+  coverage?: CheckCoverage;
+}
+
+/**
+ * The coverage facts a check run states, and the comparability of its delta.
+ *
+ * ── `delta` IS NULL UNLESS THE TWO SNAPSHOTS ARE COMPARABLE ────────────────
+ *
+ * Subtracting two percentages always succeeds, which is exactly why this has to
+ * be two fields. Two snapshots taken against DIFFERENT CRAWLS measured
+ * different applications: "coverage fell 9 points" across them is an artefact
+ * of our own enumeration changing, and it will be read as a regression by
+ * everybody who sees it — and then argued about in a PR thread. So the delta is
+ * null, `comparability` carries the reason, and `coverageSection` prints the
+ * reason where the number would have gone.
+ */
+export interface CheckCoverage {
+  /** The headline. NULL when there was nothing to divide. Never 0, never 100. */
+  percent: number | null;
+  denominator: number;
+  covered: number;
+  /** The rung the figure is taken at, so it is comparable to anything at all. */
+  tier: string;
+  /** Change in percentage points, or NULL. See the note above. */
+  deltaPercent: number | null;
+  /** A `SnapshotComparability` value. Decided at write time, never here. */
+  comparability: string;
+  /** The sentence printed where an uncomparable delta would go. */
+  comparabilityDetail: string | null;
+  /**
+   * THE SINGLE MOST USEFUL ROLLUP, already chosen by the producer.
+   *
+   * One, not a table: a merge box has about four lines of attention and a
+   * fifteen-row breakdown in it is a breakdown nobody reads. `label` is the
+   * bucket ("the payments feature", "surface nobody owns") and the two counts
+   * are its own numerator and denominator — never another bucket's, and never
+   * summed with the headline's.
+   */
+  rollup: { label: string; percent: number | null; covered: number; denominator: number } | null;
+  /**
+   * Why the figure above is absent or limited, when it is. Rendered verbatim.
+   *
+   * The one place a cap that bit, an unapplied migration or an unmeasured axis
+   * reaches a pull request. Every cap in this product is reported as a count
+   * AND a reason, and this is the reason's door into the merge box.
+   */
+  note: string | null;
+}
+
+/**
+ * The coverage lines of a check-run summary, or the honest absence of them.
+ *
+ * ── THE RULE THIS FUNCTION ENFORCES, IN ONE PLACE ──────────────────────────
+ *
+ * Four surfaces print this figure — the check-run summary, the PR comment, the
+ * badge and the daily digest — and the first one that decides for itself what
+ * "not measured" looks like is the one that prints 0%. So the rendering lives
+ * HERE, every surface calls it, and the three states are three BRANCHES rather
+ * than three roundings:
+ *
+ *   percent === null   → the words "not measured", with the reason.
+ *   delta uncomparable → the comparability sentence, where a number would go.
+ *   both present       → the figure and the signed delta.
+ */
+export function coverageSection(coverage: CheckCoverage | undefined): string[] {
+  if (coverage === undefined) {
+    return [
+      '',
+      '_Coverage: **not measured** for this project. No coverage snapshot has been stored, so ' +
+        'there is no figure to report — this is not 0%, and it is not a statement about your ' +
+        'application._',
+    ];
+  }
+
+  const figure =
+    coverage.percent === null
+      ? '**not measured**'
+      : `**${coverage.percent.toFixed(1)}%**`;
+
+  /*
+   * The delta, or the reason instead of it. `deltaIsMeaningful` is the one
+   * predicate and it is imported rather than spelled as a string comparison
+   * here: five surfaces ask this question and the first one that answers it for
+   * itself is the one that shows a team a regression nobody caused.
+   */
+  const change = deltaIsMeaningful(coverage.comparability as SnapshotComparability)
+    ? coverage.deltaPercent === null
+      ? ' (no change to report — one side has no percentage, because its denominator was zero)'
+      : ` (${coverage.deltaPercent >= 0 ? '+' : ''}${coverage.deltaPercent.toFixed(1)} points)`
+    : ` (**no comparable baseline** — ${coverage.comparabilityDetail ?? 'the two snapshots are not comparable'})`;
+
+  const lines = [
+    '',
+    `| Coverage | ${figure} of ${coverage.denominator} surface item(s) at ${cell(coverage.tier)}${cell(change)} |`,
+  ];
+  if (coverage.rollup) {
+    lines.push(
+      `| ${cell(coverage.rollup.label)} | ${
+        coverage.rollup.percent === null
+          ? 'not measured'
+          : `${coverage.rollup.percent.toFixed(1)}%`
+      } of ${coverage.rollup.denominator} |`,
+    );
+  }
+  if (coverage.note) lines.push('', `_${cell(coverage.note)}_`);
+  return lines;
 }
 
 const VERDICT_LABEL: Record<string, string> = {
@@ -807,7 +941,16 @@ export function buildCheckOutput(e: CheckEvidence): CheckOutput {
       `| Environment | ${cell(e.environment.name)} (${cell(e.environment.kind)}) |`,
     );
   }
-  summaryLines.push(`| Commit | \`${cell(e.run.commitSha.slice(0, 7))}\` |`, '');
+  summaryLines.push(`| Commit | \`${cell(e.run.commitSha.slice(0, 7))}\` |`);
+  /*
+   * THE COVERAGE LINES, INSIDE the same table as the result counts and not in a
+   * section below it. A figure in its own block below the fold is a figure
+   * nobody scrolls to; the point of putting it here is that "48 passed" and
+   * "61% of your surface has a test" are read in the same glance, because the
+   * second is the one that says what the first is a proportion of.
+   */
+  summaryLines.push(...coverageSection(e.coverage).filter((line) => line !== ''));
+  summaryLines.push('');
   /*
    * Stated in the summary, not only in the title, and stated as a FAILURE
    * rather than as a skip. A quarantined test that failed is not a test that

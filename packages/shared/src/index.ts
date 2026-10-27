@@ -100,3 +100,32 @@ export * from './auth-profiles';
  * building, no zod and no `node:` builtin.
  */
 export * from './measurement-rows';
+/*
+ * The coverage LADDER, the coverage DIMENSIONS and the ATTESTATION envelope.
+ *
+ * All three are contracts between packages that cannot see each other's source,
+ * which is the test this barrel applies: `coverage-tiers.ts` is the rung
+ * vocabulary the agent's measurements are expressed in, the API's write paths
+ * validate against and the web app renders; `coverage-dimensions.ts` is the
+ * axis vocabulary six dimension modules in packages/agent, the rollup writer in
+ * apps/api and the preflight prober in apps/worker all have to mean the same
+ * thing by; `attestation.ts` is the envelope the export route builds and the
+ * digest signs. Until these lines existed, `COVERAGE_DIMENSIONS`,
+ * `measuredDimension`, `dimensionPercentAt` and `attest` were reachable only by
+ * relative path ACROSS the workspace boundary — which compiles, bypasses the
+ * package entry point, and leaves the keystone's compiler-enforced presence
+ * records enforced on files nobody imports as a package. Nine files did exactly
+ * that in one round.
+ *
+ * All three pass this barrel's standing test: types, closed vocabularies and
+ * pure arithmetic, plus zod in neither of them and no `node:` builtin anywhere
+ * — `attestation.ts` takes its digest as an INJECTED `ContentDigest` for
+ * precisely that reason, so importing it here cannot 500 a page that reads a
+ * value from @qaai/shared.
+ *
+ * Order is deliberate: `coverage-tiers` first, because the other two import
+ * `CoverageLadder` and `CoverageTier` from it.
+ */
+export * from './coverage-tiers';
+export * from './coverage-dimensions';
+export * from './attestation';

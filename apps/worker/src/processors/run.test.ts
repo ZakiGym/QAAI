@@ -100,6 +100,16 @@ const h = vi.hoisted(
     /** Every base-URL probe attempt, so the retry policy is observable. */
     probeCalls: number;
     /**
+     * What the injected host guard says about the base URL's hostname.
+     *
+     * Defaults to publicly resolvable, which is what `staging.example.com`
+     * stands in for in every fixture here. Overriding it to `{ ok: false }` is
+     * how a test drives the SSRF REFUSAL path — a hosted worker declining to
+     * open a private or link-local target — without a DNS lookup and without
+     * stubbing out the decision that is under test.
+     */
+    hostResolves: { ok: boolean; reason: string };
+    /**
      * Test types this build has NO plugin for.
      *
      * The registry answers every type, which is why the loop's own
@@ -145,6 +155,7 @@ const h = vi.hoisted(
     probe: async () => ({ reached: true, status: 200, detail: 'answered HTTP 200' }),
     probes: { onPath: () => true, browserInstalled: () => true, platform: 'linux' },
     probeCalls: 0,
+    hostResolves: { ok: true, reason: 'every address this name resolves to is public' },
     pluginless: new Set<string>(),
     measurements: new Map<string, { variants?: unknown[]; metrics?: unknown[] }>(),
     warned: [],
@@ -182,7 +193,20 @@ vi.mock('../context.js', () => ({
 vi.mock('../queues.js', () => ({
   ANALYZE_SOURCE_QUEUE: 'qaai.analyze-source',
   DELIVERY_JOB: 'delivery',
+  /*
+   * The capability-preflight queue. Present because the one test in this file
+   * that imports `../index.js` — for the permanently-failed handler — executes
+   * every `register(...)` in it at import time, and a queue name missing from
+   * this mock is a module-level TypeError rather than a skipped registration.
+   *
+   * The LITERAL rather than a re-export of the real constant, matching the two
+   * above: this is a full mock on purpose, so that importing the entrypoint
+   * cannot open a Redis connection, and a partial mock would drag in
+   * `new Queue(...)` for every producer in that file.
+   */
+  PREFLIGHT_QUEUE: 'qaai.preflight',
   armFlakeTick: async () => {},
+  armPreflightSweep: async () => {},
   armScheduleTick: async () => {},
   closeProducers: async () => {},
   enqueueNotify: async (job: {
@@ -253,6 +277,31 @@ vi.mock('@qaai/runner', async () => {
         // No real waiting between retry attempts; the policy is asserted by
         // counting attempts, not by timing them.
         sleep: async () => {},
+        /*
+         * ── THE THIRD IMPURE EDGE, INJECTED LIKE THE OTHER TWO ────────────
+         *
+         * `probeBaseUrl` grew an SSRF guard whose default IO resolves the host
+         * through real DNS, and this wrapper did not know about it — so every
+         * test in this file was making a live `dns.resolve` call for
+         * `staging.example.com`. That is a reserved example domain and does not
+         * resolve, so `HOSTED` mode refused the probe, the BASE_URL check came
+         * back UNAVAILABLE, and the run processor correctly declined to execute
+         * a single test. Eighty tests went red on a DNS lookup, which is the
+         * exact failure rule 8 of this codebase exists to prevent: a module's
+         * I/O is an injected narrow interface so its logic is testable with a
+         * fake.
+         *
+         * The guard itself still RUNS — this is not a stub that agrees with
+         * whatever the processor does. `classify` reports a NAME, `resolves`
+         * reports publicly-resolvable, and the real `guardProbeHost` decides,
+         * so the decision logic under test is the production one over inputs
+         * this file controls. A test that needs the refusal path drives it by
+         * overriding `h.hostResolves`.
+         */
+        hostGuard: {
+          classify: () => ({ kind: 'name' as const }),
+          resolves: async () => h.hostResolves,
+        },
       }),
     runnabilityFor: (
       types: readonly string[],

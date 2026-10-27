@@ -23,11 +23,14 @@ import { config, connection, logger, prisma } from './context.js';
 import {
   ANALYZE_SOURCE_QUEUE,
   DELIVERY_JOB,
+  PREFLIGHT_QUEUE,
   armFlakeTick,
+  armPreflightSweep,
   armScheduleTick,
   closeProducers,
   type AnalyzeSourceJob,
   type DeliveryJob,
+  type PreflightJob,
 } from './queues.js';
 import { processAnalyzeSource } from './processors/analyze-source.js';
 import { processExplore } from './processors/explore.js';
@@ -43,6 +46,7 @@ import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
 import { processBisect } from './processors/bisect.js';
 import { armCheckSweep, processChecks } from './processors/checks.js';
 import { processDigestTick } from './processors/digest.js';
+import { ensureDeploymentCapabilities } from './processors/preflight.js';
 import {
   RETENTION_QUEUE,
   armRetentionSweep,
@@ -448,6 +452,93 @@ register<ActionEventJob>(ACTIONS_QUEUE, config.concurrency, (payload) =>
 register<RecomputeCoverageJob>(RECOMPUTE_COVERAGE_QUEUE, 1, async (payload) => {
   await processRecomputeCoverage(payload);
 });
+
+/*
+ * ── THE CAPABILITY PREFLIGHT ────────────────────────────────────────────────
+ *
+ * "Which of the nineteen test types can this image actually EXECUTE?" There is
+ * no k6, no Lighthouse, no Stryker, no Maestro, no Firefox and no WebKit in the
+ * worker image, and the plugins for those types degrade to SKIPPED rather than
+ * failing — so a pass rate could be computed over tests that CANNOT FAIL, and
+ * the coverage denominator could count typed obligations this deployment has no
+ * way of discharging. `processors/preflight.ts` writes a `DeploymentCapability`
+ * row per type and `deploymentCapabilityFacts` in the API subtracts from the
+ * denominator with a REASON per subtraction.
+ *
+ * Concurrency 1, and not for load: two probes of the same deployment key race
+ * over the same nineteen rows, and the loser's `checkedAt` would be written
+ * after the winner's with an older reading behind it. The coalescing job id
+ * makes that unlikely; serialising the lane makes it impossible within a
+ * worker.
+ *
+ * Without this registration `enqueuePreflight` and the repeatable sweep below
+ * both enqueue into a queue nobody drains, the capability rows are never
+ * written, every type reads NOT_CHECKED for ever, and the coverage report says
+ * "none of the 19 test types has been probed on this deployment" permanently.
+ * That is the bisect-queue defect; `npm run check:wiring` fails if the line is
+ * removed.
+ *
+ * Wrapped in an arrow for the same reason as the backup tick: `register`'s
+ * second argument is the BullMQ Job, and that slot in
+ * `ensureDeploymentCapabilities` is `ProbeCapabilitiesArgs` — the test seam for
+ * injecting a fake filesystem — so a Job landing in it would be a silent no-op
+ * today and a confusing bug the day the two types grow a matching field.
+ */
+register<PreflightJob>(PREFLIGHT_QUEUE, 1, async (payload) => {
+  const { probe, capabilities } = await ensureDeploymentCapabilities({
+    ...(payload.deploymentKey === undefined ? {} : { deploymentKey: payload.deploymentKey }),
+    ...(payload.orgId === undefined ? {} : { orgId: payload.orgId }),
+    ...(payload.force === undefined ? {} : { force: payload.force }),
+  });
+  /*
+   * The SENTENCE, logged, because it is the one an operator needs and because
+   * it is the thing nothing else in this process says out loud: "4 of 19 test
+   * types are not executable here" with the reasons. `fromCache` travels with
+   * it so a surprising row is traceable to whether anything was actually
+   * probed — a cached answer and a fresh one are different claims about the
+   * image.
+   */
+  logger.info(
+    {
+      deploymentKey: probe.deploymentKey,
+      fromCache: probe.fromCache,
+      checkedAt: probe.checkedAt,
+      nonExecutable: capabilities.nonExecutable.length,
+      notChecked: capabilities.notChecked.length,
+      why: probe.why,
+    },
+    capabilities.sentence,
+  );
+});
+/*
+ * Repeatable, de-duplicated by job key, so arming it on every boot is safe.
+ *
+ * Without it the only probes that happen are the ones somebody asks for by
+ * hand — and a capability set nobody refreshes is exactly the stale `AVAILABLE`
+ * this feature exists to prevent: a container rebuilt without k6 keeps
+ * vouching for it, and every coverage figure in between counts an obligation
+ * nothing can discharge.
+ */
+void armPreflightSweep().catch((err) =>
+  logger.error({ err }, 'could not arm the capability preflight sweep'),
+);
+
+/*
+ * ── A DEFECT THIS REGISTRATION MADE OBVIOUS, AND DELIBERATELY NOT FIXED ────
+ *
+ * Every `register(...)` above arms its own sweep on the line after it, and
+ * there is no equivalent anywhere in this file for the METRICS PUBLISHER: the
+ * worker exposes no `/metrics` and starts nothing that scrapes or pushes one,
+ * so every queue depth, job duration and failure count this process knows is
+ * visible only in a log line. An operator cannot alert on "the recompute lane
+ * has been backed up for an hour", which is the condition under which the
+ * coverage number silently stops moving.
+ *
+ * It is NOT fixed here, on purpose: it is a PLATFORM-round item with its own
+ * blast radius (a port to bind, a scrape config, a decision between pull and
+ * push), and wiring it in the same change as a coverage processor would put two
+ * unrelated risks behind one review. Reported rather than silently left.
+ */
 
 logger.info(
   {

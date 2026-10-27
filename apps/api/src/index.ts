@@ -59,6 +59,7 @@ import { measurementsRouter } from './routes/measurements.js';
 import { domDiffRouter } from './routes/dom-diff.js';
 import { reproRouter } from './routes/repro.js';
 import { suiteHealthRouter } from './routes/suite-health.js';
+import { reportsRouter } from './routes/reports.js';
 import { traceRouter } from './routes/trace.js';
 import { trafficRouter } from './routes/traffic.js';
 import { healthRouter, queueHealthRouter } from './routes/health.js';
@@ -168,6 +169,35 @@ registerSamlVerifier(xmlCryptoSamlVerifier);
 
 app.use('/sso', ssoRouter);
 app.use('/projects', projectsRouter);
+/*
+ * THE REPORTER REGISTRY'S DOOR, AND WHY IT IS ABOVE `runsRouter`.
+ *
+ * `reports.ts` declares `/:runId/report`, NOT the full `/runs/:runId/report`,
+ * so it has to be mounted at `/runs` — and reports.ts's own header says so:
+ * "MOUNT THIS ROUTER AT `/runs` AHEAD OF `runsRouter`."
+ *
+ * It was mounted at `/` instead, under a comment claiming it declared the full
+ * path. It does not, so the door opened on the WRONG URL: `/runs/:runId/report`
+ * fell through `runsRouter` (which declares no `:runId/report`) and then missed
+ * `/:runId/report` at the root, because `/runs/run_1/report` is three segments
+ * and that route matches two — a flat 404 on the only URL every comment, the
+ * test file and any client uses, while the router squatted on `/:runId/report`
+ * at the root where nothing asks for it. Driven both ways:
+ * `GET /runs/run_1/report` → 404, `GET /run_1/report` → 200.
+ *
+ * AHEAD of `runsRouter` rather than after it, which is the part that is easy to
+ * get wrong in the other direction: `runsRouter.use(requireAuth)` is a
+ * ROUTER-level guard, so mounting below it would run `requireAuth` once there,
+ * fall through for want of a matching route, and run it again on this router's
+ * own route. `runsRouter` declares no `:runId/report`, so mounting above
+ * shadows nothing of it.
+ *
+ * Five finished, tested reporters sat behind `REPORTERS` and `renderReport`
+ * with no caller outside their own tests for several slices. Correct code with
+ * no door is indistinguishable from code that does not exist — and a door at a
+ * URL that 404s is the same thing with a line of wiring to point at.
+ */
+app.use('/runs', reportsRouter);
 app.use('/runs', runsRouter);
 app.use('/copilot', copilotRouter);
 app.use('/settings', settingsRouter);

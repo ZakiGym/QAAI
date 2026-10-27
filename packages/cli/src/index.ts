@@ -395,6 +395,7 @@ Usage:
   qaai deploy-check --env <id> [opts]   Post-deploy smoke run (exit 1 on failure)
   qaai status <runId>                   Print the status of a run
   qaai coverage --project <id>          What has nothing ever tested? (--min to gate)
+  qaai bench [--app-root <path>]        How accurate is QAAI itself? (\`qaai bench\` for detail)
   qaai backup <create|verify|restore>   Back up or restore the database
   qaai runner [--api-url <url>]         Run tests inside your own network
 
@@ -498,6 +499,29 @@ async function main(): Promise<number> {
     case 'runner': {
       const { runnerMain } = await import('./runner.js');
       return runnerMain(rest);
+    }
+    /*
+     * `qaai bench` — the harness that measures the MEASURER, and the only
+     * command here whose subject is QAAI rather than the customer's
+     * application: ground-truth precision and recall against
+     * apps/demo/src/surface.json, and seeded-fault detection per fault class.
+     *
+     * It was built, tested and reachable from nothing but its own test file, so
+     * `check:wiring` reported it under `package-exports` — this codebase's
+     * signature defect, and a particularly bad one here: a catch-all route
+     * literal once produced 100% coverage and survived a whole round precisely
+     * because nothing was checking the measurement against a known answer.
+     *
+     * Lazy like `coverage`, `backup` and `runner`, and for the same reason: it
+     * pulls in a JUnit parser and a child-process runner, and `qaai status`
+     * should not pay to load either. Its exit codes are its own
+     * (`BENCH_EXIT.USAGE`, and a nonzero when a precision or recall FLOOR is
+     * breached), so the command owns the whole mapping and returns the code
+     * rather than throwing.
+     */
+    case 'bench': {
+      const { cmdBench } = await import('./bench.js');
+      return cmdBench(opts, rest);
     }
     case 'help':
     case '--help':
