@@ -48,6 +48,29 @@ import {
  */
 import { MINIMUM_BACKTEST_DEFECTS, VALIDITY_VERDICT_LABELS } from '@qaai/shared';
 import type { ValidityVerdict } from '@qaai/shared';
+import { suiteChangeProposalSchema, testCorrectionSchema } from '@qaai/shared';
+/*
+ * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
+ * and is recorded as one — this file already carries the same note for
+ * `suite-health.js`. `packages/shared/src/index.ts` has no
+ * `export * from './artifact-set'`, and the obvious one-line fix does NOT
+ * compile: `artifact-set.ts` and `requirements.ts` both export a type named
+ * `ContentDigest` and `requirements` is already in that barrel, so a star
+ * export is TS2308 on it. The working edit is in this round's handover.
+ */
+import {
+  APPLYABLE_STATES,
+  CHANGE_ALTERS_BEHAVIOUR,
+  WRITABLE_BY_OWNERSHIP,
+  corpusScope,
+  corpusWhere,
+  proposalProblems,
+} from '../../../../packages/shared/src/artifact-set.js';
+import type {
+  ArtifactLedgerEntry,
+  SuiteChangeState,
+} from '../../../../packages/shared/src/artifact-set.js';
+import { createHash } from 'node:crypto';
 /*
  * THE RATES, every one of them a pure function over rows these handlers read.
  *
@@ -72,12 +95,29 @@ import {
   healKindOf,
   planSupersede,
   postCheckCode,
+  resolveEcosystem,
   verificationRunTag,
   HEAL_VERIFY_STATES,
   SCENARIO_KIND_LIST,
   SCENARIO_KIND_RISK,
   type ScenarioKind,
 } from '@qaai/agent';
+/*
+ * THE CRAFT (§3.2c). Every one of these was flagged `package-exports` by
+ * `check:wiring` when it landed, or is reachable only through a module that
+ * was: built, tested, and called by nothing. These imports and the handlers at
+ * the foot of this file are what make them reached.
+ */
+import {
+  MAX_CORPUS_ROWS,
+  analyzeSuiteHealth,
+  correctionFromVersions,
+  mergeNearDuplicates,
+  refactorBlocked,
+  refactorFeed,
+  summariseCorpus,
+} from '@qaai/agent';
+import type { RefactorContext, RefactorFeed, SuiteHealthReport } from '@qaai/agent';
 import type { OpenHeal, PostCheck } from '@qaai/agent';
 /*
  * The one import still reached by path, and a narrower reason than before:
@@ -2909,5 +2949,849 @@ agentRouter.get('/projects/:projectId/scenario-capability', async (req, res) => 
       'conditions" are different sentences, and an absence reported as a zero reads as a clean ' +
       'bill of health. A kind listed as available can still produce nothing — that means the ' +
       'enumerator looked and found none, which is a real and different answer.',
+  });
+});
+
+// ─── The craft (§3.2c): corrections, ownership and suite-change proposals ────
+
+/*
+ * THREE TABLES THIS ROUND MINTED AND NOTHING READ OR WROTE.
+ *
+ * `TestCorrection`, `GeneratedArtifact` and `SuiteChangeProposal` all landed as
+ * schema with no writer and no reader — correct code connected to nothing,
+ * which is this codebase's signature defect and what `check:wiring` exists to
+ * catch. These handlers are the doors.
+ *
+ * The sentence worth remembering while reading them: EVERY ROW BELOW HOLDS
+ * CUSTOMER TEST CODE OR A QUOTE OF IT. Nothing in it leaves the project
+ * boundary — `corpusScope` and `corpusWhere` are the only way to build a corpus
+ * query and both ids are required, so one that could cross projects does not
+ * compile — and nothing in it reaches a model except through the fence.
+ */
+
+/**
+ * How many tests one corpus sync pairs.
+ *
+ * FIVE HUNDRED. Each one costs a version-history read and a line-based diff of
+ * two files, so a 5,000-test project would be a request that holds a connection
+ * open for minutes. The cap BIT is reported as `testsNotExamined`, because a
+ * sync that examined 500 of 5,000 and reported "12 corrections" would read as
+ * twelve corrections in the whole project.
+ */
+export const MAX_CORPUS_SYNC_TESTS = 500;
+
+/** Versions read per test. A test with more history than this has its oldest ignored. */
+const MAX_VERSIONS_PER_TEST = 50;
+
+/**
+ * THE CORRECTION CORPUS, WRITTEN.
+ *
+ * The diff between the version QAAI wrote and the first human version after it
+ * is free supervision; it has been sitting in `TestVersion.source` for the life
+ * of this product and was read by nothing. This is the write path, and without
+ * it the whole learning half of the round is decoration.
+ *
+ * ── WHY THIS IS A SYNC AND NOT A SAVE HOOK, SAID PLAINLY ───────────────────
+ *
+ * The right moment to classify a correction is the moment a human saves over a
+ * generated test, and that happens in `PUT /projects/:projectId/tests/:testId`
+ * in routes/projects.ts — a file this change does not own. The exact one-call
+ * edit is in this round's handover. This endpoint is idempotent by the table's
+ * own `@@unique([testId, generatedVersionId, humanVersionId])`, so running it
+ * after the fact produces the same rows the hook would have; what it cannot do
+ * is notice a save the moment it happens.
+ *
+ * ── EVERY REFUSAL IS NAMED AND COUNTED ────────────────────────────────────
+ *
+ * `correctionFromVersions` has six named refusals and none of them is a failure:
+ * `NO_HUMAN_VERSION` is the common case for a new test, `NO_VERSION_OF_OURS` is
+ * an imported suite, `NO_CHANGE` is a reviewer who saved without editing. They
+ * are returned as counts BY NAME rather than summed into "skipped", because
+ * "nobody has reviewed these yet" and "we could not read these" are different
+ * sentences and only one of them is a problem.
+ *
+ * ── AND IT FLIPS THE OWNERSHIP LEDGER ──────────────────────────────────────
+ *
+ * A recorded correction IS the evidence that a human has taken our file over,
+ * so the `GeneratedArtifact` row at that path becomes `HUMAN_EDITED` — which is
+ * the fact that makes the next git sync refuse to overwrite their edit. Doing it
+ * here rather than in a separate pass means the two cannot disagree: there is no
+ * state in which a correction is recorded and the ledger still says the file is
+ * ours.
+ */
+agentRouter.post(
+  '/projects/:projectId/corrections/sync',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true, primaryLanguage: true, primaryFramework: true },
+    });
+    if (!project) throw notFound('Project');
+
+    /*
+     * Only tests that HAVE a human version. The filter is the whole cost
+     * control: in a project where nobody has edited anything this reads zero
+     * version histories instead of five hundred.
+     */
+    const reviewedWhere = { projectId, versions: { some: { source: 'HUMAN' as const } } };
+    const [examined, reviewedTotal] = await Promise.all([
+      prisma.test.findMany({
+        where: reviewedWhere,
+        orderBy: { updatedAt: 'desc' },
+        take: MAX_CORPUS_SYNC_TESTS,
+        select: { id: true, filePath: true, feature: true, type: true },
+      }),
+      /*
+       * AN EXACT COUNT, not `take: cap + 1`.
+       *
+       * The `cap + 1` trick establishes "there are more" and nothing else, so
+       * reporting `tests.length - cap` from it would print 1 over a project with
+       * five thousand — a cap applied without being disclosed, wearing the
+       * costume of a disclosure. One extra indexed count answers it exactly, and
+       * the number is what tells a reader whether "12 corrections" describes the
+       * project or a window of it.
+       */
+      prisma.test.count({ where: reviewedWhere }),
+    ]);
+    const testsNotExamined = Math.max(0, reviewedTotal - examined.length);
+
+    const ecosystem = resolveEcosystem({
+      language: project.primaryLanguage,
+      framework: project.primaryFramework,
+      testType: 'E2E',
+      runner: null,
+    });
+
+    let recorded = 0;
+    let unchanged = 0;
+    const refusals: Record<string, number> = {};
+    const ownershipFlipped: string[] = [];
+
+    for (const test of examined) {
+      const versions = await prisma.testVersion.findMany({
+        where: { testId: test.id },
+        orderBy: { version: 'desc' },
+        take: MAX_VERSIONS_PER_TEST,
+        select: { id: true, version: true, code: true, source: true },
+      });
+
+      const pairing = correctionFromVersions({
+        testId: test.id,
+        versions,
+        /*
+         * `TestVersion` has no path column, so a file move cannot be observed
+         * and BOTH paths are omitted rather than one being supplied. One
+         * without the other would make FILE_MOVED an artefact of which half the
+         * query happened to select; omitting both makes
+         * `pathMoveObservable: false` the honest answer — "we did not look".
+         */
+        surface: test.feature,
+        filePath: test.filePath,
+        ecosystemId: ecosystem.id,
+      });
+
+      if (!pairing.ok) {
+        refusals[pairing.refusal] = (refusals[pairing.refusal] ?? 0) + 1;
+        continue;
+      }
+
+      /*
+       * ── THE VALIDATOR DOES NOT CARRY THE TWO VERSION IDS, AND IT MUST ──────
+       *
+       * `TestCorrection` requires `generatedVersionId` and `humanVersionId`
+       * (NOT NULL, no default) and `testCorrectionSchema` is `.strict()` and
+       * declares NEITHER — so the validated object cannot be stored and the
+       * strict schema rejects a row that carries them. That is a
+       * producer-versus-validator disagreement of exactly the family that cost
+       * six earlier agents a slice each, and it is the whole reason this write
+       * path exists: a test that asserted the schema's spelling would not have
+       * found it, because the question is whether the value can be STORED.
+       *
+       * Handled here rather than hidden: the correction FIELDS go through the
+       * schema, which is the thing that enforces `humanVersion >
+       * generatedVersion`, the kinds/items agreement and the unclassified
+       * disclosure; the two ids are added after it, from the pairing, which is
+       * the only place that knows them. The two-line schema edit that makes
+       * this unnecessary is in this round's handover — schemas.ts is another
+       * change's file.
+       */
+      const row = testCorrectionSchema.safeParse({
+        ...pairing.pairing.correction,
+        orgId: actor.orgId,
+        projectId,
+      });
+      if (!row.success) {
+        /*
+         * A REFUSAL AT THE VALIDATOR IS LOGGED WITH ITS NAME, not dropped. A
+         * producer and its validator disagreeing is the defect family that cost
+         * six agents a slice each: every one of them wrote zero rows for a whole
+         * run behind one `logger.warn` with no name in it.
+         */
+        refusals.SCHEMA_REFUSED = (refusals.SCHEMA_REFUSED ?? 0) + 1;
+        logger.warn(
+          {
+            projectId,
+            testId: test.id,
+            issue: row.error.issues[0]?.message,
+            path: row.error.issues[0]?.path,
+          },
+          'a classified correction was refused by testCorrectionSchema and not stored',
+        );
+        continue;
+      }
+
+      const data = {
+        ...row.data,
+        generatedVersionId: pairing.pairing.oursVersionId,
+        humanVersionId: pairing.pairing.humanVersionId,
+      };
+
+      const existing = await prisma.testCorrection.findFirst({
+        where: {
+          testId: test.id,
+          generatedVersionId: data.generatedVersionId,
+          humanVersionId: data.humanVersionId,
+        },
+        select: { id: true, classifierVersion: true },
+      });
+      if (existing) {
+        /*
+         * UPDATE rather than insert, and the reason is the group-by: re-running
+         * the classifier over the same pair must not accumulate rows, or every
+         * count the corpus reports includes our own re-runs.
+         */
+        if (existing.classifierVersion === data.classifierVersion) {
+          unchanged += 1;
+          continue;
+        }
+        await prisma.testCorrection.update({ where: { id: existing.id }, data });
+        recorded += 1;
+      } else {
+        await prisma.testCorrection.create({ data });
+        recorded += 1;
+      }
+
+      /*
+       * THE OWNERSHIP TRANSITION. A recorded correction is the evidence that a
+       * human has taken our file over, and `HUMAN_EDITED` is what stops the next
+       * git sync overwriting their edit. `updateMany` with the ownership in the
+       * WHERE clause, deliberately: it is a one-way transition, and a row that
+       * already says HUMAN_AUTHORED must not be rewritten to say we once owned
+       * it.
+       */
+      const flip = await prisma.generatedArtifact.updateMany({
+        where: { projectId, path: test.filePath, ownership: 'QAAI_OWNED' },
+        data: {
+          ownership: 'HUMAN_EDITED',
+          humanEditedAt: new Date(),
+          /*
+           * The human's bytes, hashed. Not stored: `GeneratedArtifact` holds no
+           * file bodies, for the reason the schema records — a lost database
+           * must not be a lost repository.
+           */
+          /*
+           * The HUMAN's bytes, hashed. This is the value a later sync compares
+           * against to answer "has it changed again since they took it over" —
+           * so it has to be the human version's code and not the test row's,
+           * which may have moved on. The bytes themselves are not stored, for
+           * the reason the schema records: a lost database must not be a lost
+           * repository.
+           */
+          humanEditedHash: createHash('sha256')
+            .update(
+              versions.find((row) => row.id === pairing.pairing.humanVersionId)?.code ?? '',
+            )
+            .digest('hex'),
+        },
+      });
+      if (flip.count > 0) ownershipFlipped.push(test.filePath);
+    }
+
+    await audit({
+      actor,
+      action: 'corrections.sync',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: { recorded, unchanged, refusals, testsExamined: examined.length, testsNotExamined },
+    });
+
+    res.json({
+      projectId,
+      recorded,
+      unchanged,
+      testsExamined: examined.length,
+      /** A cap that BIT. Non-zero means the counts above describe a window. */
+      testsNotExamined,
+      /**
+       * Every refusal BY NAME. `NO_HUMAN_VERSION` and `NO_VERSION_OF_OURS` are
+       * the ordinary cases and are not failures; `DIALECT_UNREADABLE`,
+       * `CODE_TOO_LARGE` and `SCHEMA_REFUSED` are.
+       */
+      refusals,
+      /** Files whose ownership moved to the human, so QAAI will no longer write them. */
+      ownershipFlipped,
+      why:
+        'The diff between the version QAAI wrote and the first human version after it is the only ' +
+        'record of what reviewers always change about what we write. A refusal here is usually ' +
+        'not a failure: NO_HUMAN_VERSION means nobody has reviewed that test yet.',
+    });
+  },
+);
+
+/**
+ * WHAT REVIEWERS IN THIS PROJECT KEEP CHANGING.
+ *
+ * The same `summariseCorpus` the generator reads, so the number on this screen
+ * and the instruction in the prompt cannot disagree — one group-by over one
+ * table, which is the only thing that makes them the same claim.
+ *
+ * The briefing text is deliberately NOT returned. It is prompt material
+ * containing fenced quotes of customer source, and a screen that rendered it
+ * would be rendering QAAI's instructions to itself as though they were advice
+ * to the reader.
+ */
+agentRouter.get('/projects/:projectId/corrections', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const actor = actorOf(req);
+  const scope = corpusScope(actor.orgId, projectId);
+  const rows = await prisma.testCorrection.findMany({
+    where: corpusWhere(scope),
+    orderBy: { createdAt: 'desc' },
+    take: MAX_CORPUS_ROWS,
+    select: {
+      orgId: true,
+      projectId: true,
+      testId: true,
+      generatedVersion: true,
+      humanVersion: true,
+      generatedVersionId: true,
+      humanVersionId: true,
+      kinds: true,
+      items: true,
+      surface: true,
+      addedLines: true,
+      removedLines: true,
+      unclassifiedCount: true,
+      itemsOmitted: true,
+      classifierVersion: true,
+      createdAt: true,
+    },
+  });
+
+  const signal = summariseCorpus(
+    scope,
+    /*
+     * `items` is a Prisma `JsonValue` and `CorrectionItem[]` on the other side.
+     * The cast is on the WHOLE array argument rather than per row, so there is
+     * one place where the Json column is asserted to be the shape the classifier
+     * wrote — and `testCorrectionSchema` is what guarantees it, because nothing
+     * reaches that column except through it.
+     */
+    rows.map((row) => ({ ...row, createdAt: row.createdAt.toISOString() })) as never,
+  );
+
+  res.json({
+    projectId,
+    state: signal.state,
+    corpusSize: signal.corpusSize,
+    byKind: signal.byKind,
+    patterns: signal.patterns,
+    locatorMigrations: signal.locatorMigrations,
+    surfacesDeleted: signal.surfacesDeleted,
+    /**
+     * REPORTED SEPARATELY AND NEVER FED BACK. A human weakening our assertion
+     * is not a lesson to assert less, which is why `CORRECTION_IS_ACTIONABLE`
+     * has `ASSERTION_WEAKENED: false` and why no pattern can be sourced from it.
+     */
+    weakenings: signal.weakenings,
+    unclassified: signal.unclassified,
+    /** Rows from another project, rejected at run time and counted rather than averaged in. */
+    rowsRejected: signal.rowsRejected,
+    /** Older rows the window did not read. */
+    rowsOmitted: signal.rowsOmitted,
+    /** Rows whose own item cap bit, so their kind breakdown is a sample. */
+    rowsSampled: signal.rowsSampled,
+    /** More than one means part of any trend is our own deploys. */
+    classifierVersions: signal.classifierVersions,
+  });
+});
+
+/**
+ * THE OWNERSHIP LEDGER, READ.
+ *
+ * Two readers need it and they are different: a HUMAN, who wants to know which
+ * of their files QAAI believes it owns, and the GIT SYNC, which needs exactly
+ * one fact per path before it may write or delete anything (see
+ * `RepoOwnership` in apps/api/src/lib/git.ts, whose `verdictFor` this answers).
+ *
+ * NO FILE BODIES. `GeneratedArtifact` stores a hash and not the bytes, for the
+ * reason the schema records: a lost database must not be a lost repository, and
+ * a copy of the customer's suite in our tables would be a liability with no
+ * consumer.
+ */
+agentRouter.get('/projects/:projectId/artifacts', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const rows = await prisma.generatedArtifact.findMany({
+    where: { projectId },
+    orderBy: [{ ownership: 'asc' }, { path: 'asc' }],
+    take: 2_000,
+    select: {
+      path: true,
+      role: true,
+      ownership: true,
+      testId: true,
+      contentHash: true,
+      bytes: true,
+      imports: true,
+      humanEditedAt: true,
+      firstWrittenAt: true,
+      lastWrittenAt: true,
+    },
+  });
+
+  const byOwnership = { QAAI_OWNED: 0, HUMAN_EDITED: 0, HUMAN_AUTHORED: 0 };
+  for (const row of rows) byOwnership[row.ownership] += 1;
+
+  res.json({
+    projectId,
+    artifacts: rows,
+    counts: byOwnership,
+    /**
+     * EXACTLY ONE OWNERSHIP STATE PERMITS A WRITE, and the number is derived
+     * from `WRITABLE_BY_OWNERSHIP` rather than written here, so a change to that
+     * record cannot leave this sentence stale.
+     *
+     * IT IS THE VERDICT HALF ONLY, and the field name says less than a reader
+     * would assume — hence `writableIfUnchanged`. A row is minted by
+     * `ledgerRowsFor` from the generated set alone, with no view of the
+     * repository, so a QAAI_OWNED verdict here is a claim about a path and not a
+     * measurement of what is at it. The sync's own gate
+     * (`replaceDecision` in lib/git.ts) additionally requires the bytes on the
+     * branch to hash to `contentHash`, which this endpoint cannot know without
+     * fetching the branch. So this is an upper bound.
+     */
+    writableIfUnchanged: rows.filter((row) => WRITABLE_BY_OWNERSHIP[row.ownership]).length,
+    why:
+      'A path with no row here is UNRECORDED, which is NOT a permission: QAAI will neither write ' +
+      'nor delete it. Absence is "not ours", which is the fail-closed direction — the opposite of ' +
+      'inferring ownership from a file being absent from our tree. A QAAI_OWNED row is not a ' +
+      'permission on its own either: the sync compares the bytes on the branch against this ' +
+      "row's contentHash and refuses the write when a human has changed the file in the " +
+      'repository, which is the only place such an edit can be noticed.',
+  });
+});
+
+/**
+ * How many tests one proposal pass reads. The same cap and the same reason as
+ * the suite-health report's: a deterministic order and a bounded read, so two
+ * calls a second apart propose the same changes.
+ */
+const MAX_PROPOSAL_TESTS = 2_000;
+
+/** The columns `SuiteHealthTestInput` needs, and nothing else. */
+const PROPOSAL_TEST_SELECT = {
+  id: true,
+  name: true,
+  filePath: true,
+  type: true,
+  priority: true,
+  feature: true,
+  tags: true,
+  code: true,
+  spec: true,
+  flakeRate: true,
+  quarantined: true,
+  consecutiveFailures: true,
+} as const;
+
+/**
+ * THE ONLY PATH FROM A SUITE-HEALTH FINDING TO A CHANGE.
+ *
+ * `suite-health.ts` has named duplicate clusters and weak assertions since it
+ * was written and NOTHING COULD ACT ON THEM: the suite only ever grew. This is
+ * the door — `refactorFeed` turns the findings into typed candidates and
+ * `mergeNearDuplicates` turns a candidate into a proposal carrying its own
+ * revert record.
+ *
+ * ── WHAT IT WILL AND WILL NOT PROPOSE TODAY, AND WHY ───────────────────────
+ *
+ * MERGE_NEAR_DUPLICATES only. The other two are refused for reasons that are
+ * facts about this request rather than gaps in the engine, and both are
+ * reported as counts:
+ *
+ *   EXTRACT_FIXTURE      invents a path for its helper, so its revert entry
+ *                        claims nothing was there — and reverting such an entry
+ *                        DELETES the file. `RefactorContext.knownPaths` is the
+ *                        fact that makes the claim checkable, it is a directory
+ *                        listing of the customer's tree, and an HTTP handler
+ *                        materialises no checkout. `null` is not empty: the
+ *                        operation refuses with TREE_UNKNOWN rather than
+ *                        assuming a path is free because nobody said otherwise.
+ *   STRENGTHEN_ASSERTION blocks on `STRENGTHENING_UNVERIFIED` until
+ *                        `verifyStrengthening` has actually RUN the stronger
+ *                        assertion. A strengthening that was not run has an
+ *                        unknown verdict, and "unknown" stored as a proposal is
+ *                        the pass that means "we did not check". It needs a
+ *                        runner, which is the worker's and not this handler's.
+ *
+ * So the response carries `declined` and `needsVerification` with their reasons.
+ * A finding silently not acted on reads as a finding nobody found, which is the
+ * state this endpoint exists to leave.
+ */
+agentRouter.post(
+  '/projects/:projectId/suite-changes',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    const where = {
+      projectId,
+      disabledAt: null,
+      filePath: { not: { startsWith: FIXTURE_PREFIX } },
+    } as const;
+    const tests = await prisma.test.findMany({
+      where,
+      // Deterministic, for the reason the suite-health reading gives: two calls
+      // a second apart must propose the same changes or nothing can be traced.
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: MAX_PROPOSAL_TESTS,
+      select: PROPOSAL_TEST_SELECT,
+    });
+
+    const report: SuiteHealthReport = analyzeSuiteHealth({ tests });
+    const feed: RefactorFeed = refactorFeed(report);
+
+    /*
+     * The ledger, narrowed to what `RefactorContext` reads. It decides whether
+     * a file the proposal rewrites is one QAAI may rewrite at all — and absence
+     * of a row is UNRECORDED, which is not writable, so a merge over a human's
+     * file is refused rather than proposed.
+     */
+    const ledger: ArtifactLedgerEntry[] = (
+      await prisma.generatedArtifact.findMany({
+        where: { projectId },
+        select: { path: true, role: true, ownership: true, contentHash: true, imports: true },
+      })
+    ).map((row) => ({
+      path: row.path,
+      role: row.role,
+      ownership: row.ownership,
+      contentHash: row.contentHash,
+      imports: row.imports,
+    }));
+
+    const ctx: RefactorContext = {
+      digest: (input: string) => createHash('sha256').update(input).digest('hex'),
+      ledger,
+      /*
+       * NULL, AND NULL IS NOT EMPTY. Nobody listed the customer's working tree
+       * in this request, so a merge may rewrite a path a test row already points
+       * at and an extraction may not invent one. The operation decides; this
+       * handler does not pretend to know.
+       */
+      knownPaths: null,
+    };
+
+    const byId = new Map(tests.map((test) => [test.id, test]));
+    const stored: Array<{ id: string; kind: string; title: string; paths: string[] }> = [];
+    const refused: Array<{ testIds: readonly string[]; problems: string[] }> = [];
+
+    for (const candidate of feed.merges) {
+      const members = candidate.testIds
+        .map((id) => byId.get(id))
+        .filter((test): test is (typeof tests)[number] => test !== undefined)
+        .map((test) => ({ test }));
+      if (members.length !== candidate.testIds.length) {
+        /*
+         * A cluster member outside the bounded read. Reported rather than
+         * merged: merging the members we happen to hold is the "three of five"
+         * failure `refactorFeed` already refuses an incomplete scan for.
+         */
+        refused.push({
+          testIds: candidate.testIds,
+          problems: [
+            `only ${members.length} of ${candidate.testIds.length} cluster members were inside this request's ${MAX_PROPOSAL_TESTS}-test read, and merging a subset leaves near-duplicates behind`,
+          ],
+        });
+        continue;
+      }
+
+      const outcome = mergeNearDuplicates({ members, finding: candidate.finding }, ctx);
+      if (refactorBlocked(outcome) || outcome.proposal === null) {
+        refused.push({
+          testIds: candidate.testIds,
+          problems: outcome.problems.map((problem) => `${problem.kind}: ${problem.why}`),
+        });
+        continue;
+      }
+
+      /*
+       * THE VALIDATOR THE WRITE PATH ACTUALLY RUNS. `suiteChangeProposalSchema`
+       * delegates to `proposalProblems`, which refuses a revert record that
+       * misses a file the proposal changes, one that claims prior bytes for a
+       * file it creates, and a proposal that proposes nothing. A refusal here is
+       * a bug in the engine and is logged WITH ITS NAME rather than dropped.
+       */
+      /*
+       * ── THE VALIDATOR CARRIES NO TENANCY, AND THAT IS DELIBERATE ──────────
+       *
+       * `suiteChangeProposalSchema` is `.strict()` and declares no `orgId`,
+       * `projectId` or `paths`: it validates the PROPOSAL — the two artifact
+       * sets, the revert record and their agreement — not the row. Passing the
+       * tenancy keys through it would be rejected, and `paths` is the row's
+       * index over the JSON rather than part of the proposal's meaning.
+       *
+       * So the proposal is validated alone and the row is assembled from it.
+       * `paths` comes from the REVERT RECORD, not from `after`: the revert
+       * record is the authority on which paths this proposal touches —
+       * `proposalProblems` refuses one that misses any of them — so deriving
+       * the index from `after` would let a row be findable by a different set
+       * of paths than the one that can be put back.
+       */
+      const parsed = suiteChangeProposalSchema.safeParse(outcome.proposal);
+      if (!parsed.success) {
+        logger.warn(
+          {
+            projectId,
+            testIds: candidate.testIds,
+            issue: parsed.error.issues[0]?.message,
+            path: parsed.error.issues[0]?.path,
+            problems: proposalProblems(outcome.proposal).map((problem) => problem.kind),
+          },
+          'a refactor proposal was refused by suiteChangeProposalSchema and not stored',
+        );
+        refused.push({
+          testIds: candidate.testIds,
+          problems: [`SCHEMA_REFUSED: ${parsed.error.issues[0]?.message ?? 'unknown reason'}`],
+        });
+        continue;
+      }
+
+      const row = await prisma.suiteChangeProposal.create({
+        data: {
+          orgId: actor.orgId,
+          projectId,
+          kind: parsed.data.kind,
+          state: 'PROPOSED',
+          title: parsed.data.title,
+          rationale: parsed.data.rationale,
+          before: parsed.data.before,
+          after: parsed.data.after,
+          paths: parsed.data.revert.paths,
+          dependentTestIds: parsed.data.dependentTestIds,
+          dependentPaths: parsed.data.dependentPaths,
+          revert: parsed.data.revert,
+        },
+        select: { id: true, kind: true, title: true, paths: true },
+      });
+      stored.push({ id: row.id, kind: row.kind, title: row.title, paths: row.paths });
+    }
+
+    await audit({
+      actor,
+      action: 'suite-changes.propose',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: {
+        proposed: stored.length,
+        refused: refused.length,
+        declined: feed.declined.length,
+        testsRead: tests.length,
+      },
+    });
+
+    res.json({
+      projectId,
+      proposed: stored,
+      /** Candidates the engine itself refused, each with its named problems. */
+      refused,
+      /** Findings `refactorFeed` would not even offer, each with its reason. */
+      declined: feed.declined,
+      /**
+       * Weak assertions that COULD be strengthened and cannot be proposed from
+       * here: the stronger assertion has to be RUN before anyone may call it a
+       * strengthening, and this handler has no runner.
+       */
+      needsVerification: feed.strengthenings.length,
+      /**
+       * Fixture extraction is unavailable in this request, not unimplemented.
+       * It invents a path, so it needs a listing of the customer's working tree
+       * to prove nothing is there — and `null` is not empty.
+       */
+      extractionUnavailable:
+        'Fixture extraction needs a listing of your working tree to prove the helper path is free: ' +
+        'reverting a creation DELETES the file, so a false "nothing was here" would delete a ' +
+        'human’s. Nothing was proposed for it.',
+      /** Caps that BIT, as counts. */
+      omitted: feed.omitted,
+      testsRead: tests.length,
+      duplicateScanComplete: report.limits.duplicateScanComplete,
+    });
+  },
+);
+
+/**
+ * The review queue. Newest first, with everything a reviewer needs to decide
+ * and nothing they do not.
+ *
+ * `before` and `after` are returned IN FULL, because a proposal a reviewer
+ * cannot read the diff of is a proposal they will reject on principle — which
+ * is the correct instinct and makes the whole feature pointless. They are the
+ * customer's own test code, which they already have.
+ */
+agentRouter.get('/projects/:projectId/suite-changes', async (req, res) => {
+  const projectId = String(req.params.projectId);
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  const state = typeof req.query.state === 'string' ? req.query.state : null;
+  const rows = await prisma.suiteChangeProposal.findMany({
+    where: {
+      projectId,
+      ...(state !== null && (SUITE_CHANGE_STATE_SET as Set<string>).has(state)
+        ? { state: state as SuiteChangeState }
+        : {}),
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 200,
+    select: {
+      id: true,
+      kind: true,
+      state: true,
+      title: true,
+      rationale: true,
+      before: true,
+      after: true,
+      paths: true,
+      dependentTestIds: true,
+      dependentPaths: true,
+      decidedBy: true,
+      decidedAt: true,
+      appliedAt: true,
+      revertedAt: true,
+      blockedReason: true,
+      createdAt: true,
+    },
+  });
+
+  res.json({
+    projectId,
+    proposals: rows.map((row) => ({
+      ...row,
+      /**
+       * DOES THIS CHANGE WHAT THE SUITE CHECKS? It decides the review bar, and
+       * it is read from `CHANGE_ALTERS_BEHAVIOUR` rather than restated, so this
+       * screen and the apply path cannot disagree about it.
+       */
+      altersBehaviour: CHANGE_ALTERS_BEHAVIOUR[row.kind],
+      /** Whether this row may be applied AS IT STANDS. Only APPROVED may. */
+      applyable: APPLYABLE_STATES[row.state],
+    })),
+    why:
+      'Nothing here deletes a test. A "duplicate" that differs in one assertion is frequently the ' +
+      'only test that catches a regression, so the vocabulary has no DELETE member at all and a ' +
+      'merge keeps every assertion both members made.',
+  });
+});
+
+/** The states a `?state=` filter may name. Derived, so it cannot drift. */
+const SUITE_CHANGE_STATE_SET: ReadonlySet<SuiteChangeState> = new Set(
+  Object.keys(APPLYABLE_STATES) as SuiteChangeState[],
+);
+
+const suiteChangeDecisionSchema = z.object({
+  /**
+   * APPROVED or REJECTED. Nothing here applies a proposal: approving it is a
+   * decision, applying it is a write to the customer's repository, and the two
+   * being one button is how a reviewer approves a diff and discovers it landed.
+   */
+  decision: z.enum(['APPROVED', 'REJECTED']),
+  note: z.string().max(1_000).optional(),
+});
+
+/**
+ * Approve or reject one proposal.
+ *
+ * ── APPROVAL IS NOT APPLICATION ────────────────────────────────────────────
+ *
+ * `APPLYABLE_STATES` has exactly one `true` key and it is APPROVED — not
+ * PROPOSED, which is the producer's own opinion of its work. This endpoint
+ * moves a row INTO that state and writes nothing to any repository: the apply
+ * path re-reads the ledger at the instant of the write, because a proposal
+ * approved on Monday may be approved against bytes somebody changed on Tuesday.
+ */
+agentRouter.post('/suite-changes/:proposalId/decide', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = suiteChangeDecisionSchema.parse(req.body);
+  const proposalId = String(req.params.proposalId);
+
+  const proposal = await prisma.suiteChangeProposal.findUnique({
+    where: { id: proposalId },
+    select: { id: true, projectId: true, state: true, kind: true, paths: true },
+  });
+  if (!proposal) throw notFound('Proposal');
+  if (proposal.state !== 'PROPOSED') {
+    throw conflict(
+      `This proposal is ${proposal.state}, so there is nothing to decide. A decided proposal is kept rather than reopened, because the trail of what was approved and what happened next is the only evidence that refactoring is worth offering at all.`,
+    );
+  }
+
+  const updated = await prisma.suiteChangeProposal.update({
+    where: { id: proposalId },
+    data: {
+      state: input.decision,
+      decidedBy: actor.userId || null,
+      decidedAt: new Date(),
+    },
+    select: { id: true, state: true, kind: true },
+  });
+
+  await audit({
+    actor,
+    action: 'suite-changes.decide',
+    targetType: 'SuiteChangeProposal',
+    targetId: proposalId,
+    metadata: {
+      projectId: proposal.projectId,
+      kind: proposal.kind,
+      decision: input.decision,
+      paths: proposal.paths,
+      ...(input.note === undefined ? {} : { note: input.note.slice(0, 200) }),
+    },
+  });
+
+  res.json({
+    proposal: updated,
+    applyable: APPLYABLE_STATES[updated.state],
+    why:
+      'Approving is a decision; applying is a write to your repository. They are deliberately two ' +
+      'steps, and the apply path re-reads the ownership ledger at the instant of the write — a ' +
+      'proposal approved on Monday may be approved against bytes somebody changed on Tuesday.',
   });
 });

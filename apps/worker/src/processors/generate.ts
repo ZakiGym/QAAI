@@ -29,11 +29,29 @@
  * throw when a batch produced nothing at all.
  */
 
-import { GenerationRefused, generateTest } from '@qaai/agent';
-import type { AdmissionInput } from '@qaai/agent';
+import { GenerationRefused, generateTest, summariseCorpus } from '@qaai/agent';
+import type { AdmissionInput, CorrectionSignal } from '@qaai/agent';
+import { MAX_CORPUS_ROWS } from '@qaai/agent';
 import { z } from 'zod';
-import { principalSchema } from '@qaai/shared';
+import { principalSchema, styleProfileSchema } from '@qaai/shared';
 import type { FlowMap, GenerateJob, Priority, TestType } from '@qaai/shared';
+/*
+ * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
+ * and is recorded as one — `routes/agent.ts` carries the same note for
+ * `suite-health.js`. `packages/shared/src/index.ts` has no
+ * `export * from './artifact-set'`, and the obvious one-line fix does NOT
+ * compile: `artifact-set.ts` and `requirements.ts` both export a type named
+ * `ContentDigest` and `requirements` is already in that barrel, so a star
+ * export is TS2308 on it. The working edit is in this round's handover.
+ */
+import {
+  SHARED_ROLES,
+  corpusScope,
+  corpusWhere,
+} from '../../../../packages/shared/src/artifact-set.js';
+import type { ArtifactRole, ArtifactSet } from '../../../../packages/shared/src/artifact-set.js';
+import type { StyleProfile } from '../../../../packages/shared/src/style-profile.js';
+import { createHash } from 'node:crypto';
 import { llm, logger, prisma } from '../context.js';
 import { secretsFor } from '../vault.js';
 
@@ -61,6 +79,22 @@ export const GENERATE_AUDIT_ACTIONS = { refused: 'generate.refused' } as const;
  * produces — and never a generation that times out or exhausts the worker.
  */
 export const DUPLICATE_CANDIDATE_CAP = 200;
+
+/**
+ * Artifact roles that belong to no single test, so their ledger row carries
+ * `testId: null`.
+ *
+ * Derived from `SHARED_ROLES` in packages/shared/src/artifact-set.ts rather than
+ * listed again, so a role whose sharedness changes there cannot keep its old
+ * meaning here. Attaching a shared page object to the first spec that imported
+ * it would make deleting that test look like permission to delete the page
+ * object.
+ */
+export const SHARED_ARTIFACT_ROLES: ReadonlySet<ArtifactRole> = new Set(
+  (Object.entries(SHARED_ROLES) as Array<[ArtifactRole, boolean]>)
+    .filter(([, shared]) => shared)
+    .map(([role]) => role),
+);
 
 /** One validated actor, as `principalSchema` defines it. */
 export type PlanItemPrincipal = z.infer<typeof principalSchema>;
@@ -235,6 +269,252 @@ export async function duplicateCandidates(args: {
 }
 
 /**
+ * THIS REPOSITORY'S OWN CONVENTIONS, READ OUT OF THE CACHE.
+ *
+ * `Project.styleProfile` is a cached `StyleProfile` and `styleProfileComputedAt`
+ * is NULL exactly when it is. Nothing computed it before this round, so the
+ * commonest answer here is "none", and that answer travels as `null` — which
+ * `generateTest` turns into a REVIEW FLAG rather than into silence.
+ *
+ * ── A STORED BLOB IS NOT A PROFILE UNTIL IT PARSES ─────────────────────────
+ *
+ * The column is Json, so it holds whatever a previous writer put there — and
+ * `styleProfileSchema` does not merely shape-check: it re-derives every
+ * confidence from the evidence counts beside it and refuses a mismatch. A
+ * profile that failed that check is a profile whose confidences somebody chose
+ * rather than computed, and feeding it to the prompt would state a HIGH-
+ * confidence convention over one file.
+ *
+ * So an unparseable blob becomes NO profile plus a flag that SAYS so, exactly
+ * as {@link readPlanItemPrincipals} handles an unreadable actor list, and for
+ * the same reason: the alternative is either losing the whole generation or
+ * putting an unchecked value in front of the model.
+ */
+export function readStyleProfile(
+  raw: unknown,
+  computedAt: Date | null,
+): { profile: StyleProfile | null; flag: string | null } {
+  if (raw === null || raw === undefined) return { profile: null, flag: null };
+
+  const parsed = styleProfileSchema.safeParse(raw);
+  if (!parsed.success) {
+    return {
+      profile: null,
+      flag: `This project has a stored house-style profile and it did not validate (${
+        parsed.error.issues[0]?.message ?? 'unknown reason'
+      }), so none of it was stated to the generator and this test was written to the ecosystem defaults. Nothing from that column was passed through unchecked.`,
+    };
+  }
+  /*
+   * The pair is checked, not assumed. The schema comment on the column says
+   * `styleProfileComputedAt` is NULL exactly when `styleProfile` is NULL, and a
+   * profile with no date is a profile of unknown age — which is the one fact
+   * that decides whether it is worth stating at all.
+   */
+  if (computedAt === null) {
+    return {
+      profile: null,
+      flag:
+        'This project has a stored house-style profile with no computed-at date, so how old it is ' +
+        'cannot be answered. A profile computed before a repository’s last fifty commits makes ' +
+        'every generated test wrong in the same way, so it was not used.',
+    };
+  }
+  return { profile: parsed.data as StyleProfile, flag: null };
+}
+
+/**
+ * WHAT REVIEWERS IN THIS PROJECT KEEP CHANGING.
+ *
+ * ── THE PROJECT BOUNDARY, AND WHY IT IS THREE THINGS AND NOT A COMMENT ─────
+ *
+ * This corpus is customer test code. `corpusScope` is the only constructor for
+ * the branded scope and requires BOTH ids, `corpusWhere` is the only way to get
+ * a where-clause out of it, and `summariseCorpus` re-checks every row against
+ * the scope at RUN TIME and reports `rowsRejected`. The compile-time half is
+ * defeated by any caller that builds a raw query; the run-time half catches it
+ * and COUNTS it rather than averaging it in.
+ *
+ * ── THE WINDOW, DISCLOSED ──────────────────────────────────────────────────
+ *
+ * `MAX_CORPUS_ROWS` newest-first. Reviewer behaviour changes, so a four-year-old
+ * correction is not evidence about this quarter's reviewers — and the opposite
+ * rule applies to exemplars, which are chosen by SIMILARITY and never by
+ * recency. Both are deliberate and both are stated in their own modules.
+ * `signal.rowsOmitted` carries how many older rows were not read.
+ */
+async function reviewerSignal(args: {
+  orgId: string;
+  projectId: string;
+}): Promise<CorrectionSignal | null> {
+  const scope = corpusScope(args.orgId, args.projectId);
+  const rows = await prisma.testCorrection.findMany({
+    where: corpusWhere(scope),
+    orderBy: { createdAt: 'desc' },
+    take: MAX_CORPUS_ROWS,
+    /*
+     * Narrowed deliberately, and `select` is what makes a Prisma fake able to
+     * prove a field was dropped from this query. The row's `before`/`after`
+     * quotes live inside `items`; nothing else on the table is read.
+     */
+    select: {
+      orgId: true,
+      projectId: true,
+      testId: true,
+      generatedVersion: true,
+      humanVersion: true,
+      generatedVersionId: true,
+      humanVersionId: true,
+      kinds: true,
+      items: true,
+      surface: true,
+      addedLines: true,
+      removedLines: true,
+      unclassifiedCount: true,
+      itemsOmitted: true,
+      classifierVersion: true,
+      createdAt: true,
+    },
+  });
+  if (rows.length === 0) return null;
+
+  return summariseCorpus(
+    scope,
+    /*
+     * `items` is a Prisma `JsonValue` here and `CorrectionItem[]` on the other
+     * side. The cast is on the WHOLE array argument rather than per row, so
+     * there is ONE place where the Json column is asserted to be the shape the
+     * classifier wrote — and `testCorrectionSchema` is what guarantees it,
+     * because nothing reaches that column except through it.
+     */
+    rows.map((row) => ({ ...row, createdAt: row.createdAt.toISOString() })) as never,
+  );
+}
+
+/**
+ * One row of the ownership ledger, as this processor writes it.
+ *
+ * NAMED rather than inlined on the return type, and the reason is narrow: the
+ * two `.map()` calls below build object literals, and an inline return type
+ * does not flow into them — `role` widens to `string` and the array stops being
+ * assignable. The alternative was `'PAGE_OBJECT' as ArtifactRole` on one
+ * literal, which eslint correctly reports as unnecessary at the point it is
+ * written and which the compiler then needs anyway. A name satisfies both.
+ */
+interface LedgerRow {
+  orgId: string;
+  projectId: string;
+  path: string;
+  role: ArtifactRole;
+  /**
+   * The two states this processor may record. `HUMAN_EDITED` is NOT one of
+   * them: it is a transition a human's own save earns, written where that save
+   * is seen (see the corrections sync in apps/api/src/routes/agent.ts), and a
+   * generation that could write it would be claiming somebody edited a file it
+   * has just created.
+   */
+  ownership: 'QAAI_OWNED' | 'HUMAN_AUTHORED';
+  testId: string | null;
+  contentHash: string;
+  bytes: number;
+  imports: string[];
+}
+
+/**
+ * THE OWNERSHIP LEDGER ROWS ONE GENERATED SET OWES.
+ *
+ * Written AFTER the `Test` row and NOT in the same transaction, and the
+ * direction of the failure is why that is safe: a missing ledger row resolves
+ * `UNRECORDED`, `UNRECORDED` is not writable, and the next sync therefore
+ * REFUSES to touch the file rather than overwriting it. A failed ledger write
+ * degrades into "QAAI will not claim this file", which is the fail-closed
+ * direction.
+ *
+ * ── WHAT THIS FUNCTION CANNOT CHECK, AND WHAT CARRIES THE CLAIM INSTEAD ─────
+ *
+ * It has NO parameter through which the customer's repository could be
+ * consulted, and the generate processor materialises no workspace, so at the
+ * moment these rows are written NOTHING HAS LOOKED AT THESE PATHS. A path a
+ * human has owned for months therefore earns a `QAAI_OWNED` row. An earlier
+ * version of this comment claimed the reverse — that a row for a file nobody
+ * created "would be a recorded permission to overwrite whatever lands at that
+ * path, and that is the one failure this table exists to prevent" — which was
+ * a description of the intent, not of this code.
+ *
+ * What makes the blind row harmless is the OTHER column. `contentHash` is the
+ * digest of the bytes IN THE SET, so the row says "QAAI wrote exactly these
+ * bytes here" and nothing weaker; `replaceDecision` in apps/api/src/lib/git.ts
+ * — the one gate both of `pushRepo`'s passes go through — refuses any write or
+ * delete whose branch bytes do not hash to it, with the reason BYTES_DIVERGED.
+ * So the verdict alone authorises nothing, which is proved end to end over this
+ * exact producer in generate.claim.verify.test.ts.
+ *
+ * `skipDuplicates`, because `@@unique([projectId, path])` is the invariant that
+ * stops two rows answering "may QAAI write this": if a row is already there,
+ * the EXISTING fact wins. A row saying HUMAN_EDITED must never be downgraded to
+ * QAAI_OWNED by a later generation at the same path — which is exactly what an
+ * upsert would do.
+ */
+export function ledgerRowsFor(args: {
+  set: ArtifactSet;
+  /** Stamped explicitly: the worker's Prisma client carries no tenancy extension. */
+  orgId: string;
+  /** Repo-relative paths this set IMPORTS that are a human's, per `ArtifactPlan.recordAsTheirs`. */
+  recordAsTheirs: readonly string[];
+  projectId: string;
+  testId: string;
+  /** Roles that belong to exactly one spec. A shared file belongs to neither. */
+  sharedRoles: ReadonlySet<ArtifactRole>;
+}): LedgerRow[] {
+  const digest = (input: string): string => createHash('sha256').update(input).digest('hex');
+  const rows: LedgerRow[] = args.set.artifacts.map((artifact) => ({
+    orgId: args.orgId,
+    projectId: args.projectId,
+    path: artifact.path,
+    role: artifact.role,
+    ownership: 'QAAI_OWNED' as const,
+    /*
+     * NULL for a shared role. A page object two specs import belongs to
+     * neither, and attaching it to the first one would make deleting that test
+     * look like permission to delete the page object.
+     */
+    testId: args.sharedRoles.has(artifact.role) ? null : args.testId,
+    contentHash: digest(artifact.content),
+    bytes: artifact.content.length,
+    imports: [...artifact.imports],
+  }));
+
+  /*
+   * THE HUMAN FILES THIS SET IMPORTS, recorded as HUMAN_AUTHORED.
+   *
+   * Two things go wrong without these rows and the first bites immediately:
+   * `artifactSetProblems` resolves an import against the set or against the
+   * LEDGER, so a spec importing a human's page object — a file that plainly
+   * exists and is in neither — is refused with UNRESOLVED_IMPORT for ever. The
+   * second is slower and worse: with no row at that path a later run resolves
+   * it UNRECORDED, and UNRECORDED is the state a reservation may claim.
+   *
+   * `contentHash` is the EMPTY-STRING digest and the comment says so rather
+   * than letting a reader think we hashed their file: we have not read it, and
+   * the hash on a HUMAN_AUTHORED row is never compared against anything —
+   * `WRITABLE_BY_OWNERSHIP` refuses the write before any hash is consulted.
+   */
+  const theirs: LedgerRow[] = args.recordAsTheirs.map((path) => ({
+    orgId: args.orgId,
+    projectId: args.projectId,
+    path,
+    role: 'PAGE_OBJECT',
+    ownership: 'HUMAN_AUTHORED' as const,
+    testId: null,
+    contentHash: digest(''),
+    bytes: 0,
+    imports: [] as string[],
+  }));
+
+  return [...rows, ...theirs];
+}
+
+/**
  * A refusal, made visible to the human who approved the plan item.
  *
  * Three channels, because the thing being prevented is a refusal that looks
@@ -307,9 +587,35 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
 
   const project = await prisma.project.findFirst({
     where: { id: projectId, orgId },
-    select: { id: true, primaryLanguage: true, primaryFramework: true },
+    select: {
+      id: true,
+      primaryLanguage: true,
+      primaryFramework: true,
+      // The two columns this round minted. See `readStyleProfile` for why the
+      // date is read alongside the blob rather than trusted to agree with it.
+      styleProfile: true,
+      styleProfileComputedAt: true,
+    },
   });
   if (!project) throw new Error(`Project ${projectId} not found for org ${orgId}`);
+
+  /*
+   * ── WHAT THIS PROJECT HAS TAUGHT US, READ ONCE PER BATCH ───────────────────
+   *
+   * Both are per-project facts, not per-item ones: the house style is a property
+   * of the repository and the reviewer signal is a property of its reviewers. A
+   * batch of ten items reading them ten times would be ten identical queries,
+   * and — worse — ten chances for two items in one batch to be generated against
+   * different answers.
+   *
+   * Every absence here is reported rather than silent. `generateTest` turns a
+   * null profile and a null signal into review flags on each test it writes
+   * (`houseStyleFlags`), because a test written with no knowledge of the
+   * repository's conventions and a test that matched them perfectly are
+   * indistinguishable in the output.
+   */
+  const style = readStyleProfile(project.styleProfile, project.styleProfileComputedAt);
+  const correctionSignal = await reviewerSignal({ orgId, projectId });
 
   const plan = await prisma.testPlan.findFirst({
     where: { id: testPlanId, orgId },
@@ -450,6 +756,48 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
           availableSecretNames: secretNames,
           existing: candidates.existing,
           /*
+           * THE TWO LEARNED CHANNELS. Both may be null and neither is silently
+           * so — see the batch-level read above.
+           */
+          styleProfile: style.profile,
+          correctionSignal,
+          /*
+           * NO `repository`, AND NO MULTI-FILE PLAN, AND IT IS A DECISION.
+           *
+           * `planArtifacts` decides where a page object goes from THEIR
+           * layout — the ledger and the style profile — and it reads the
+           * repository for two things a generate job cannot answer:
+           * `filesUnder`, to find a page object that already exists so a second
+           * `CartPage` is never minted, and `diskStateAt`, to say what a shared
+           * file's dependents would lose when it is replaced.
+           *
+           * An `ArtifactRepository` that answered `[]` and `ABSENT` for both
+           * would be a pass that means "we did not check", with a file write at
+           * the end of it: a repository with a hand-written `CartPage` would
+           * get a second one, which this round's rule TWO says is worse than
+           * having none. The honest answer is UNREADABLE, and a plan over
+           * UNREADABLE bytes is refused with DISK_UNREADABLE — so passing one
+           * buys a refusal rather than a plan.
+           *
+           * Note what is NOT the reason: a brand-new set's paths are never read
+           * from disk at all. "A NEW path is already occupied by a human's
+           * file" is caught by `resolveAgainstRepository`'s reservations on the
+           * APPLY path, which is also where the ledger half of
+           * `artifactSetProblems` is asked.
+           *
+           * So the plan is not computed, the set is a set of one, and
+           * `houseStyle.planned` plus a review flag SAY the setup is inline and
+           * why. The missing piece is the same one `GenerateTestArgs.toolchain`
+           * names: `repo-materialise.ts` already does the hard part
+           * (`materialiseRepoWorkspace`), and the exact wiring — one workspace
+           * per BATCH rather than per item, `toolchainFor({ repoRoot })` for
+           * the four checkout gates, a `diskStateAt` prefetched through
+           * `nodeWorkspaceFileReader` so the synchronous interface can be
+           * honoured, and a `filesUnder` with the same per-segment symlink
+           * refusal — is in this round's handover. It costs a tarball per batch,
+           * which is why it is a decision and not an oversight.
+           */
+          /*
            * No `toolchain`. SYNTAX, TYPECHECK, FORMAT and LINT need the
            * customer's own prettier/eslint/tsc, which need their repository on
            * disk — and a generate job never materialises one. All four
@@ -463,6 +811,12 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
       );
 
       const reviewFlags = [...generated.reviewFlags];
+      /*
+       * A stored profile that did not validate is a flag, not a throw. Appended
+       * HERE rather than at the batch level because a review flag lives on a
+       * test row, and there is no batch-level place for a human to read one.
+       */
+      if (style.flag !== null) reviewFlags.push(style.flag);
 
       /*
        * The actors travel from the item onto the test. See
@@ -587,6 +941,68 @@ export async function processGenerate(job: GenerateJob): Promise<void> {
         where: { id: item.id },
         data: { state: 'GENERATED', generatedTestId: test.id },
       });
+
+      /*
+       * ── THE OWNERSHIP LEDGER ───────────────────────────────────────────────
+       *
+       * The single fact `pushRepo` lacked. Without a row here, the next git
+       * sync resolves this path `UNRECORDED`, refuses to write it and refuses to
+       * delete it — which is safe and useless: a test QAAI generated would
+       * never reach the customer's branch.
+       *
+       * BEST-EFFORT, AND THE DIRECTION OF THE FAILURE IS WHY THAT IS SAFE. A
+       * missing row means QAAI will not claim the file. A row written for a path
+       * nothing examined is NOT a permission to overwrite what lands there — the
+       * verdict is half the fact and the `contentHash` beside it is the other
+       * half, which `replaceDecision` compares against the branch's own bytes
+       * before anything is written or deleted. So a failure is logged at error
+       * and flagged on nothing — the test row is already correct, and the honest
+       * consequence is that the file will not sync until the ledger catches up.
+       *
+       * `skipDuplicates` is the invariant, not a convenience: `@@unique([
+       * projectId, path])` exists so there is ONE answer to "may QAAI write
+       * this", and an existing row — including a HUMAN_EDITED one — must win
+       * over a later generation at the same path. An upsert here would
+       * downgrade a human's claim back to QAAI_OWNED, which is the worst
+       * failure available in this schema.
+       */
+      try {
+        const rows = ledgerRowsFor({
+          set: generated.artifacts,
+          recordAsTheirs: generated.artifactPlan?.recordAsTheirs ?? [],
+          orgId,
+          projectId,
+          testId: test.id,
+          sharedRoles: SHARED_ARTIFACT_ROLES,
+        });
+        const written = await prisma.generatedArtifact.createMany({
+          data: rows,
+          skipDuplicates: true,
+        });
+        if (written.count < rows.length) {
+          /*
+           * A path somebody already has a recorded fact about. Reported as a
+           * count rather than swallowed: it means a previous row — possibly a
+           * HUMAN_EDITED one — holds that path, so this generation's file will
+           * not be synced to it, and that is a thing a human should be able to
+           * find out from the log rather than from a file that never appears.
+           */
+          logger.warn(
+            {
+              testId: test.id,
+              planned: rows.length,
+              recorded: written.count,
+              paths: rows.map((row) => row.path),
+            },
+            'some generated paths already had an ownership row; the existing fact was kept',
+          );
+        }
+      } catch (err) {
+        logger.error(
+          { err, testId: test.id, filePath: generated.filePath },
+          'could not record the ownership ledger rows for a generated test; it will not be written to the customer repository until they exist',
+        );
+      }
 
       created += 1;
       logger.info(

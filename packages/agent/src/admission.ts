@@ -58,6 +58,29 @@
 
 import { FRAMEWORKS_BY_LANGUAGE } from '@qaai/shared';
 import type { DialectId, Language, PlanItem, Priority, TestType, UiFramework } from '@qaai/shared';
+/*
+ * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
+ * and is recorded as one — `artifacts.ts`, `page-objects.ts` and `refactor.ts`
+ * all carry the same note this round, and `boundaries.ts` set the precedent.
+ *
+ * `packages/shared/src/index.ts` has no `export * from './artifact-set'`, and
+ * the obvious one-line fix DOES NOT COMPILE: `artifact-set.ts` and
+ * `requirements.ts` both export a type named `ContentDigest` and `requirements`
+ * is already in that barrel, so a star export is TS2308 on it. The working edit
+ * is in this round's handover.
+ */
+import {
+  PROBLEM_BLOCKS_SET,
+  artifactSetProblems,
+  orderedForApply,
+} from '@qaai/shared';
+import type {
+  ArtifactRole,
+  ArtifactSet,
+  ArtifactSetContext,
+  ArtifactSetProblem,
+  GeneratedArtifact,
+} from '@qaai/shared';
 import {
   assertionExampleFor,
   blankStringsAndComments,
@@ -2034,6 +2057,442 @@ export async function admit(input: AdmissionInput): Promise<AdmissionReport> {
     revisePrompt: verdict === 'REVISE' ? revisePromptFor({ gates, item, dialectId }) : null,
     code,
     correctedFilePath: path.correctedFilePath,
+  };
+}
+
+// ─── admitSet: the gate over a multi-file artifact set ──────────────────────
+
+/**
+ * THE GATES WHOSE VERDICT IS NOT ABOUT THIS ROLE, AND WHY EACH ONE IS NOT.
+ *
+ * A spec admitted without its page object does not run, so a SET is admitted
+ * only if every artifact clears. The trouble is that four of the twelve gates
+ * ask a question that is FALSE BY DEFINITION of some roles: a page object is
+ * DEFINED as locators and actions with no assertions, so ASSERTIONS fails it —
+ * and ASSERTIONS is a HARD fail, so a correct page object would refuse every
+ * set it appears in, for ever.
+ *
+ * ── THE RULE THIS OBEYS, AND THE ONE IT REFUSED TO BREAK ───────────────────
+ *
+ * `admit` IS CALLED UNCHANGED on every artifact and NOTHING IS SUPPRESSED. The
+ * full twelve-gate report comes back on {@link ArtifactAdmission.report}, every
+ * UNAVAILABLE still says it could not run, and the single conditional
+ * suppression (MUTATION) stays exactly where `admit` put it. What this record
+ * decides is only which gates' findings COUNT TOWARDS THE SET'S VERDICT, and
+ * every gate it sets aside is NAMED in {@link SetAdmissionReport.setAside} with
+ * its reason — so "we did not count this" is a disclosed list and never a pass.
+ *
+ * It is a different thing from UNAVAILABLE on purpose. UNAVAILABLE means the
+ * check could not run; this means the check ran and asked a question about a
+ * property this file is not supposed to have. Conflating the two would make a
+ * page object's report say a gate was unreachable when it was simply irrelevant.
+ *
+ * ── WHY EACH GATE, PER ROLE ────────────────────────────────────────────────
+ *
+ *   ASSERTIONS      Only a SPEC asserts. Every other role exists to be imported
+ *                   by one, and an assertion in a fixture is a defect in its
+ *                   own right.
+ *   FIDELITY        Traces the approved plan item into the artefact's text.
+ *                   Only the SPEC implements the item; a dataset of thirty
+ *                   e-mail addresses shares no words with "the order
+ *                   confirmation shows a total of $42.00" and never will.
+ *   PATH_CONVENTION Answers "will the runner collect this file". The runner
+ *                   collects SPECS. A page object AT a spec path would be
+ *                   collected and run as a test with no tests in it, so
+ *                   "correcting" a page object onto one is the defect, not the
+ *                   fix.
+ *   DUPLICATE       Asks "do you already have this test". A page object two
+ *                   specs share is the GOAL of this round; reporting it as a
+ *                   duplicate would refuse exactly the thing being built.
+ *
+ * Everything else judges every role, and deliberately: a `@qaai/` import in a
+ * fixture still means the file does not run in the customer's repository, a
+ * fixed sleep in a helper is still a flake source, and a brittle locator in a
+ * page object is the single most consequential place to have one.
+ *
+ * Compiler-enforced over every role, so an eighth role cannot be added without
+ * someone deciding what judges it. The run-time parity against `ARTIFACT_ROLES`
+ * is in admission.test.ts — one without the other passes while the two
+ * disagree.
+ */
+export const GATES_NOT_ABOUT_ROLE = {
+  DATASET: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+  HELPER: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+  FIXTURE: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+  PAGE_OBJECT: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+  SPEC: [],
+  SNAPSHOT: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+  CONFIG_FRAGMENT: ['ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION', 'DUPLICATE'],
+} as const satisfies Record<ArtifactRole, readonly GateId[]>;
+
+/** The one sentence a human reads beside a set-aside gate. */
+const SET_ASIDE_WHY: Record<GateId, string> = {
+  ASSERTIONS: 'only the spec in a set asserts; this file exists to be imported by one',
+  FIDELITY: 'only the spec implements the approved plan item',
+  PATH_CONVENTION: 'the runner collects specs, and this file must not be collected',
+  DUPLICATE: 'a shared file is meant to be shared; duplication is a question about tests',
+  SYNTAX: 'judged on every role',
+  TYPECHECK: 'judged on every role',
+  FORMAT: 'judged on every role',
+  LINT: 'judged on every role',
+  LOCATORS: 'judged on every role',
+  NO_LOCK_IN: 'judged on every role',
+  NO_FIXED_SLEEP: 'judged on every role',
+  MUTATION: 'judged on every role',
+};
+
+/** One gate's finding, kept out of a role's verdict and said out loud. */
+export interface SetAsideGate {
+  readonly path: string;
+  readonly role: ArtifactRole;
+  readonly gate: GateId;
+  readonly status: GateStatus;
+  readonly why: string;
+}
+
+/** What the gate concluded about ONE file in the set. */
+export interface ArtifactAdmission {
+  readonly path: string;
+  readonly role: ArtifactRole;
+  /**
+   * The WHOLE report from `admit`, all twelve gates, nothing removed. A caller
+   * that wants the line numbers reads this; the set's verdict is computed from
+   * `judged` below.
+   */
+  readonly report: AdmissionReport;
+  /** The gates that counted towards this artifact's verdict. */
+  readonly judged: readonly GateId[];
+  /** This artifact's verdict over `judged` alone. */
+  readonly verdict: AdmissionVerdict;
+  /** The content as admitted — FORMAT may have rewritten it. */
+  readonly code: string;
+}
+
+export interface SetAdmissionReport {
+  /**
+   * The SET's verdict, and it is the WORST of its artifacts' — plus REFUSE for
+   * any structural problem. A spec admitted without its page object does not
+   * run, so there is no shape of this in which four files of a five-file set
+   * are admitted.
+   */
+  readonly verdict: AdmissionVerdict;
+  readonly artifacts: readonly ArtifactAdmission[];
+  /**
+   * The set's own structural refusals — a duplicate path, a path escape, a
+   * write to a file QAAI does not own, a stale base. Non-empty means REFUSE:
+   * none of these is a thing one more model call fixes.
+   */
+  readonly setProblems: readonly ArtifactSetProblem[];
+  /**
+   * FALSE when no ledger was supplied, in which case the five refusals in
+   * {@link PROBLEM_NEEDS_LEDGER} were NOT ASKED. It is not a pass: a caller
+   * about to write files reads this and refuses to, and the apply path asks
+   * them with the ledger in hand.
+   */
+  readonly ledgerChecked: boolean;
+  /** Every gate finding kept out of a role's verdict, with its reason. */
+  readonly setAside: readonly SetAsideGate[];
+  /** Every artifact's flags, each prefixed with the file it is about. */
+  readonly reviewFlags: readonly string[];
+  /** The instructions for one more attempt, naming each file. Null unless REVISE. */
+  readonly revisePrompt: string | null;
+  /**
+   * The set as admitted: ordered for apply, each artifact's content replaced by
+   * its own `report.code`, so a caller writes the FORMATTED bytes and every
+   * line number in every report refers to what is on disk.
+   */
+  readonly set: ArtifactSet;
+}
+
+export interface AdmitSetInput {
+  readonly set: ArtifactSet;
+  readonly testType: TestType;
+  /** The plan item a human approved. Traced against the SPEC only; see {@link GATES_NOT_ABOUT_ROLE}. */
+  readonly item: PlanItem | null;
+  readonly language?: Language | null;
+  readonly ecosystemId?: string | null;
+  /** The SPEC's spec, for spec-driven and hybrid types. */
+  readonly spec?: unknown;
+  readonly attempt?: number;
+  readonly existing?: AdmissionInput['existing'];
+  readonly toolchain?: ToolchainGates;
+  readonly mutation?: AdmissionInput['mutation'];
+  readonly revisable?: boolean;
+  /**
+   * The ledger and the working-tree reader, for the half of
+   * `artifactSetProblems` a schema cannot answer.
+   *
+   * OMITTING IT IS NOT FREE AND IS NOT A PASS. The five refusals in
+   * {@link PROBLEM_NEEDS_LEDGER} are simply not asked, `ledgerChecked` comes
+   * back false, and a review flag says so — see that record for why refusing a
+   * freshly generated set on a missing ledger would mean a project could never
+   * receive its first test.
+   *
+   * Supplying an EMPTY ledger is a different statement from supplying none: "I
+   * looked and there was nothing" refuses a write to an unclaimed path, which
+   * is what the apply path wants.
+   */
+  readonly context?: ArtifactSetContext;
+}
+
+/**
+ * WHICH REFUSALS NEED A LEDGER TO BE DECIDABLE AT ALL.
+ *
+ * `artifactSetProblems` fails closed on an omitted ledger, which is right for
+ * an APPLY and wrong for a GENERATION: a declared set claims `QAAI_OWNED`/`NEW`
+ * on every artifact (see `declaredArtifactSet`), so with no ledger in hand every
+ * one of them comes back WRITE_TO_UNOWNED and STALE_BASE — and refusing a
+ * freshly generated set on that basis would mean a project could never receive
+ * its first test.
+ *
+ * So when no `context` is supplied this function checks the LEDGER-FREE half
+ * only and reports `ledgerChecked: false`, which is exactly what
+ * `artifactSetSchema` in packages/shared/src/schemas.ts already does for the
+ * same reason. That schema holds the same list as a module-private `Set` of
+ * string literals, so THERE ARE TWO COPIES OF THIS CLASSIFICATION IN THE
+ * REPOSITORY and that is this codebase's `ASSERTION_KEY`-versus-`specAssertions`
+ * defect arriving in the ownership layer. This one is a compiler-enforced record
+ * rather than a `Set<string>`, so a thirteenth problem kind cannot be added
+ * without being classified; the handover asks for schemas.ts to import it and
+ * delete its own.
+ *
+ * `ledgerChecked: false` IS NOT A PASS. It says the five refusals below were
+ * not asked, and the apply path asks them with the ledger in hand before a byte
+ * is written.
+ */
+export const PROBLEM_NEEDS_LEDGER = {
+  DUPLICATE_PATH: false,
+  PATH_ESCAPE: false,
+  WRITE_TO_UNOWNED: true,
+  MISSING_BASE_HASH: false,
+  BASE_HASH_ON_NEW: false,
+  STALE_BASE: true,
+  UNRESOLVED_IMPORT: true,
+  APPLY_ORDER: false,
+  SHARED_EXPORT_REMOVED: true,
+  SHARED_SURFACE_UNREADABLE: true,
+  SET_SIZE: false,
+  ARTIFACT_SIZE: false,
+} as const satisfies Record<ArtifactSetProblem['kind'], boolean>;
+
+/** Worst-first, so `Math.max` over the ranks is the set's verdict. */
+const VERDICT_SEVERITY: Record<AdmissionVerdict, number> = {
+  ADMIT: 0,
+  ADMIT_WITH_FLAGS: 1,
+  REVISE: 2,
+  REFUSE: 3,
+};
+
+const SEVERITY_VERDICT: readonly AdmissionVerdict[] = [
+  'ADMIT',
+  'ADMIT_WITH_FLAGS',
+  'REVISE',
+  'REFUSE',
+];
+
+/**
+ * Admit or refuse an artifact SET.
+ *
+ * ── A SET IS ONE LOGICAL CHANGE ────────────────────────────────────────────
+ *
+ * `PROBLEM_BLOCKS_SET` in artifact-set.ts is `true` for every member, and this
+ * function is where that decision is cashed: applying four files of a five-file
+ * set leaves a repository that does not build, and a spec whose page object was
+ * refused fails its first run on an import error — which reads to a human as a
+ * broken generated test rather than as an interrupted write. So the set's
+ * verdict is the worst of its parts and there is no partial admission.
+ *
+ * ── WHAT IS NOT CHANGED, DELIBERATELY ──────────────────────────────────────
+ *
+ * Every semantic `admit` owns is `admit`'s still, because this function CALLS
+ * it rather than reimplementing it:
+ *
+ *   · a check that could not run is UNAVAILABLE and never PASS;
+ *   · the single conditional suppression — MUTATION unwired is hidden, MUTATION
+ *     wired-and-unavailable is flagged — is inside `admit` and untouched;
+ *   · `revisable: false` collapses REVISE, through the same `verdictFor`;
+ *   · the HARD/SOFT/TERMINAL classes and `FINAL_ATTEMPT` are the same constants.
+ *
+ * The one thing this function adds is {@link GATES_NOT_ABOUT_ROLE}, and it adds
+ * nothing to the per-artifact report: it decides which findings are counted,
+ * and it names every finding it did not count.
+ *
+ * ── ORDER, AND WHY IT IS FIXED FIRST ───────────────────────────────────────
+ *
+ * The set is run through `orderedForApply` before anything else, so APPLY_ORDER
+ * can never be the reason a set is refused: a deterministic sort is the fix, and
+ * refusing a correct set over the sequence a producer listed it in would be a
+ * refusal nobody can act on. Every other structural problem IS a producer bug
+ * or a moved ledger, and both are refusals.
+ */
+export async function admitSet(input: AdmitSetInput): Promise<SetAdmissionReport> {
+  const attempt = input.attempt ?? 1;
+  const revisable = input.revisable ?? true;
+  const ordered = orderedForApply(input.set);
+
+  /*
+   * The structural half. Computed against the ORDERED set, with whatever
+   * context the caller supplied — and `artifactSetProblems` fails closed on
+   * every omitted input, which is its property and not this function's.
+   */
+  const ledgerChecked = input.context?.ledger !== undefined;
+  const setProblems = artifactSetProblems(ordered, input.context ?? {}).filter(
+    (problem) =>
+      PROBLEM_BLOCKS_SET[problem.kind] && (ledgerChecked || !PROBLEM_NEEDS_LEDGER[problem.kind]),
+  );
+
+  const artifacts: ArtifactAdmission[] = [];
+  const setAside: SetAsideGate[] = [];
+  const reviewFlags: string[] = [];
+  const revisePieces: string[] = [];
+  const admitted: GeneratedArtifact[] = [];
+
+  for (const artifact of ordered.artifacts) {
+    const notAbout = new Set<GateId>(GATES_NOT_ABOUT_ROLE[artifact.role]);
+    const isSpec = artifact.role === 'SPEC';
+
+    const report = await admit({
+      code: artifact.content,
+      filePath: artifact.path,
+      testType: input.testType,
+      /*
+       * The plan item travels with the SPEC alone. Handing it to a page object
+       * would make FIDELITY compare an English assertion against a file of
+       * locators — a FAIL that is a fact about the role, which is precisely
+       * what FIDELITY is set aside for below. Passing null instead means the
+       * gate reports UNAVAILABLE, which is `admit`'s existing behaviour for a
+       * heal and is the honest answer: there was nothing to trace.
+       */
+      item: isSpec ? input.item : null,
+      language: input.language ?? null,
+      ecosystemId: input.ecosystemId ?? null,
+      /*
+       * A spec-driven type keeps its assertions in `spec` and not in `code`,
+       * and only the SPEC has one. Giving a fixture the spec would let the
+       * ASSERTIONS gate read the SPEC's assertions and report them as the
+       * fixture's.
+       */
+      ...(isSpec ? { spec: input.spec } : {}),
+      attempt,
+      /*
+       * DUPLICATE is only asked of the SPEC, and the candidate list is only
+       * supplied there. Handing it to a page object would compare a file of
+       * locators against a suite of tests, and the gate is set aside for that
+       * role anyway — so passing it would be paying for a comparison nobody
+       * reads.
+       */
+      ...(isSpec && input.existing !== undefined ? { existing: input.existing } : {}),
+      ...(input.toolchain !== undefined ? { toolchain: input.toolchain } : {}),
+      ...(isSpec && input.mutation !== undefined ? { mutation: input.mutation } : {}),
+      revisable,
+    });
+
+    for (const gate of report.gates) {
+      if (!notAbout.has(gate.gate)) continue;
+      /*
+       * Only a finding worth knowing about is listed. A gate that PASSED and
+       * was not counted is not news, and a list containing every set-aside PASS
+       * would be four lines per artifact that nobody reads — which is the
+       * MUTATION-flag failure mode this file already names.
+       */
+      if (gate.status === 'PASS') continue;
+      setAside.push({
+        path: artifact.path,
+        role: artifact.role,
+        gate: gate.gate,
+        status: gate.status,
+        why: `${gate.gate} came back ${gate.status} on this ${artifact.role} and was not counted: ${
+          SET_ASIDE_WHY[gate.gate]
+        }.`,
+      });
+    }
+
+    const judgedGates = report.gates.filter((gate) => !notAbout.has(gate.gate));
+    const verdict = verdictFor(judgedGates, attempt, revisable);
+    const dialectId = resolveDialect({
+      filePath: artifact.path,
+      ecosystemId: input.ecosystemId ?? null,
+      language: input.language ?? null,
+    });
+
+    /*
+     * Flags and the revise prompt are recomputed over the JUDGED gates, by the
+     * same two functions `admit` uses — not copied out of `report`, whose own
+     * verdict was computed over all twelve. A page object's report says REFUSE
+     * (no assertions) and its judged verdict says ADMIT, so `report.reviewFlags`
+     * would carry "admitted despite failing a check" about a check that is not
+     * about it.
+     */
+    for (const flag of reviewFlagsFor(judgedGates, verdict, input.mutation !== undefined)) {
+      reviewFlags.push(`${artifact.path}: ${flag}`);
+    }
+    if (verdict === 'REVISE') {
+      const prompt = revisePromptFor({
+        gates: judgedGates,
+        item: isSpec ? input.item : null,
+        dialectId,
+      });
+      if (prompt.length > 0) {
+        revisePieces.push(`── ${artifact.path} (${artifact.role}) ──\n${prompt}`);
+      }
+    }
+
+    artifacts.push({
+      path: artifact.path,
+      role: artifact.role,
+      report,
+      judged: judgedGates.map((gate) => gate.gate),
+      verdict,
+      code: report.code,
+    });
+    // The FORMATTED bytes, so the caller writes what the report's line numbers
+    // refer to. Same rule `generateCodeTest` already follows for one file.
+    admitted.push({ ...artifact, content: report.code });
+  }
+
+  const worst = artifacts.reduce(
+    (acc, entry) => Math.max(acc, VERDICT_SEVERITY[entry.verdict]),
+    VERDICT_SEVERITY.ADMIT,
+  );
+  /*
+   * A structural problem is terminal. Not a REVISE: "two artifacts write to the
+   * same path", "this writes a file QAAI does not own" and "the ledger has
+   * moved" are not things a model is being asked to fix — the first two are
+   * producer bugs and the third means the set must be recomputed against the
+   * ledger as it now stands. A REVISE here would be a verdict the caller could
+   * only loop on.
+   */
+  const verdict: AdmissionVerdict =
+    setProblems.length > 0 ? 'REFUSE' : (SEVERITY_VERDICT[worst] ?? 'REFUSE');
+
+  for (const problem of setProblems) {
+    reviewFlags.push(
+      `${problem.path || '(the set)'}: ${problem.kind} — ${problem.why} Nothing in this set was applied.`,
+    );
+  }
+
+  if (!ledgerChecked) {
+    reviewFlags.push(
+      `No ownership ledger was supplied, so ${
+        Object.values(PROBLEM_NEEDS_LEDGER).filter(Boolean).length
+      } of this set's refusals could not be asked — whether any of these paths may be written is undecided here, and the apply path decides it.`,
+    );
+  }
+
+  return {
+    verdict,
+    artifacts,
+    setProblems,
+    ledgerChecked,
+    setAside,
+    reviewFlags,
+    revisePrompt:
+      verdict === 'REVISE' && revisePieces.length > 0
+        ? `${revisePieces.length} file(s) in this generated set were not accepted. Fix every one and return the COMPLETE set again.\n\n${revisePieces.join(
+            '\n\n',
+          )}`
+        : null,
+    set: { ...ordered, artifacts: admitted },
   };
 }
 

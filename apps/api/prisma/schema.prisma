@@ -780,6 +780,35 @@ model Project {
   primaryFramework         UiFramework @default(PLAYWRIGHT)
   /// GateRule[] — see packages/shared types.
   gateRules                Json        @default("[]")
+  /// THIS REPOSITORY'S OWN TEST CONVENTIONS, COMPUTED. StyleProfile —
+  /// packages/shared/src/style-profile.ts.
+  ///
+  /// ── Why two columns on Project and not a table ────────────────────────────
+  ///
+  /// The profile is a CACHE of facts that live in the customer's repository: the
+  /// assertion library their tests use, the fixture mechanism they actually
+  /// reach for, the test-id attribute their locators are built on. It is one per
+  /// scope, recomputed WHOLESALE from the files rather than amended, never
+  /// queried by field, and worthless once the repository has moved on. A table
+  /// would be one row per project whose only query is by projectId, plus a
+  /// second place for the computed-at timestamp to drift from.
+  ///
+  /// NULL means NOT COMPUTED, and the generator must then state no house style
+  /// at all and fall back to the ecosystem default. `{}` would be a profile
+  /// that confidently reports no conventions, which is a different and false
+  /// claim — see `emptyStyleProfile`, which reports UNKNOWN for every field and
+  /// `filesRead: 0`, and is what an actual scan of nothing produces.
+  ///
+  /// NO DEFAULT, deliberately: `ADD COLUMN ... NULL` with no default is
+  /// metadata-only in PostgreSQL 11+, so this migration does not rewrite a
+  /// table every customer has rows in.
+  styleProfile             Json?
+  /// When the profile was last computed. NULL exactly when `styleProfile` is
+  /// NULL. Separate from the JSON so staleness is answerable in SQL — a profile
+  /// computed before a repository's last fifty commits is a profile that will
+  /// make every generated test wrong in the same way, and nothing can notice
+  /// that if the date is buried in a blob.
+  styleProfileComputedAt   DateTime?
   /// Org-level opt-in to auto-approving SELECTOR_ONLY heals (§3.4).
   autoApproveSelectorHeals Boolean     @default(false)
   /// How much of this suite may be quarantined, as a percent, before
@@ -928,6 +957,15 @@ model Project {
   coverageAttestations CoverageAttestation[]
   validityBacktests    ValidityBacktest[]
   benchmarkRuns        BenchmarkRun[]
+
+  /// THE CRAFT. `generatedArtifacts` is the ownership ledger that stops QAAI
+  /// overwriting a human's file; `testCorrections` is what reviewers always
+  /// change about what we write; `suiteChangeProposals` is the only way a test
+  /// that already exists can be changed. See the section at the foot of this
+  /// file.
+  generatedArtifacts   GeneratedArtifact[]
+  testCorrections      TestCorrection[]
+  suiteChangeProposals SuiteChangeProposal[]
 
   @@unique([orgId, slug])
   @@index([orgId])
@@ -7302,4 +7340,414 @@ model SuiteHealthSnapshot {
   /// The trend, which is the only reason the table exists.
   @@index([projectId, createdAt])
   @@index([projectId, commitSha])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The craft (§3.2c) — multi-file generated output, who owns each file, what
+// reviewers change about it, and what QAAI may only ever PROPOSE.
+//
+// THE DEFECT THESE FOUR TABLES AND TWO COLUMNS CLOSE
+//
+// `generatedTestSchema` carried one `code` and one `filePath`, so a page object,
+// a shared fixture or a dataset file was impossible BY CONSTRUCTION — while five
+// prompts in packages/agent/src/ecosystem-prompts.ts tell the model to use page
+// objects. Setup was therefore copy-pasted into every spec, which is both the
+// thing reviewers delete tests for and the thing that makes a suite
+// unmaintainable. Meanwhile `pushRepo` (apps/api/src/lib/git.ts:143) `git rm`s
+// every tracked file absent from the tree it is handed, because it INFERS
+// ownership from absence — so it erases a human's edits in the same branch.
+//
+// THE RULE EVERY TABLE BELOW EXISTS TO ENFORCE
+//
+// OWNERSHIP IS A RECORDED FACT. Not inferable from a path, not from a file's
+// contents, not from the fact that QAAI once wrote something there. The absence
+// of a `GeneratedArtifact` row means NOT OURS, which is the fail-closed
+// direction and the opposite of what `pushRepo` does. The vocabulary, the
+// writable-by-ownership record and every refusal live in
+// packages/shared/src/artifact-set.ts; these are the rows.
+//
+// WHY NOT A MANIFEST IN THE CUSTOMER'S REPOSITORY
+//
+// It was the other option and it is a security hole. A manifest is a file in a
+// repository an attacker may be able to write, and the question it answers is
+// "may QAAI overwrite this file" — so a manifest as the AUTHORITY turns one
+// pull request into a write primitive over a human's fixture file. The row is
+// the authority; a manifest may only ever be a convenience mirror of it, never
+// read back as a fact.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What one file in a generated set IS. See ARTIFACT_ROLES in
+/// packages/shared/src/artifact-set.ts, which owns the apply-order rank and the
+/// shared/not-shared record.
+///
+/// EARNS A POSTGRES TYPE because it is GROUPED ON: "how much of what we own is
+/// shared infrastructure and how much is specs" is the maintainability question
+/// this whole round is about, and it is the number that says whether page
+/// objects are actually being produced or whether setup is still being
+/// copy-pasted. It is also FILTERED ON — "the page object for this route" — by
+/// every apply path.
+enum ArtifactRole {
+  DATASET
+  HELPER
+  FIXTURE
+  PAGE_OBJECT
+  SPEC
+  SNAPSHOT
+  CONFIG_FRAGMENT
+}
+
+/// WHO OWNS ONE FILE. The single fact `pushRepo` lacked.
+///
+/// Three members and no "nobody recorded anything": a row cannot say that there
+/// is no row. That state is `UNRECORDED` in `OWNERSHIP_VERDICTS`, which exists
+/// only in memory, and conflating the two is how a missing record would come to
+/// read as a recorded permission.
+///
+/// EARNS A POSTGRES TYPE because the write path FILTERS on it on every apply
+/// ("everything I may write") and the cockpit GROUPS on it ("everything a human
+/// has taken over from us"). A value missing from this enum could not be
+/// stored, which for HUMAN_EDITED means the row that stops QAAI overwriting a
+/// human's edit would fail to insert — and the next generation run would find a
+/// QAAI_OWNED row and overwrite the edit. That is the worst failure in this
+/// schema, and it is why this enum and not a TEXT column.
+enum ArtifactOwnership {
+  /// QAAI wrote it and the bytes on disk are still the bytes QAAI wrote.
+  QAAI_OWNED
+  /// QAAI wrote it once; a human has changed it since. Proposals only, for ever.
+  HUMAN_EDITED
+  /// A human's file, recorded as such on purpose, so a collision is reportable.
+  HUMAN_AUTHORED
+}
+
+/// WHAT REVIEWERS ALWAYS CHANGE. See CORRECTION_KINDS in
+/// packages/shared/src/artifact-set.ts, which owns the actionability record.
+///
+/// EARNS A POSTGRES TYPE because the question the corpus exists to answer is
+/// literally `GROUP BY kind`: "9 of your last 10 corrections were locators" is
+/// an instruction to change the locator strategy, and that sentence is a
+/// grouped count or it is nothing.
+///
+/// UNCLASSIFIED is a member on purpose. A diff the classifier cannot name must
+/// be COUNTED: dropping it is a failure suppressed without being counted, and
+/// forcing it into the nearest bucket is a measurement that was not measured.
+enum CorrectionKind {
+  LOCATOR_CHANGED
+  ASSERTION_STRENGTHENED
+  ASSERTION_WEAKENED
+  WAIT_REMOVED
+  HELPER_SUBSTITUTED
+  FILE_MOVED
+  DATA_EXTRACTED
+  TEST_SPLIT
+  TEST_DELETED
+  NAMING_CHANGED
+  FORMATTING_ONLY
+  UNCLASSIFIED
+}
+
+/// WHAT QAAI MAY ASK TO CHANGE ABOUT TESTS THAT ALREADY EXIST.
+///
+/// THERE IS DELIBERATELY NO DELETE MEMBER. packages/agent/src/suite-health.ts
+/// rule ONE: nothing in this product deletes a test and nothing is allowed to
+/// say that deleting one is safe, because a "duplicate" that differs in one
+/// assertion is frequently the only test that catches a regression and a test
+/// is not recoverable once it is gone. MERGE_NEAR_DUPLICATES is as far as this
+/// vocabulary goes, and a merge keeps every assertion both members made.
+///
+/// EARNS A POSTGRES TYPE because the acceptance rate per kind is the only
+/// evidence that refactoring is worth offering at all — "they approve 90% of
+/// EXTRACT_FIXTURE and 10% of SPLIT_TEST" is a grouped count, and it is what
+/// decides which proposals QAAI should keep making.
+enum SuiteChangeKind {
+  EXTRACT_FIXTURE
+  EXTRACT_PAGE_OBJECT
+  EXTRACT_DATASET
+  MERGE_NEAR_DUPLICATES
+  STRENGTHEN_ASSERTION
+  REMOVE_FIXED_SLEEP
+  REPLACE_BRITTLE_LOCATOR
+  PARAMETERISE_CASES
+  SPLIT_TEST
+  MOVE_FILE
+  ADOPT_HOUSE_STYLE
+}
+
+/// Where a proposal is in its life.
+///
+/// A SEPARATE ENUM FROM `ProposalState`, which has PENDING / APPLIED /
+/// REJECTED and is `AgentProposal`'s column. Widening that one would change the
+/// domain of a live table for a different feature's benefit; this vocabulary
+/// needs two states it does not have, and both matter:
+///
+///   REVERTED — the proposal was applied and put back. Distinguishable from
+///   REJECTED, because a revert after an apply is evidence that the proposal
+///   was WRONG, and "rejected before anyone tried it" is not.
+///   BLOCKED — cannot be applied as written, because a dependent moved or the
+///   base bytes changed. Nobody decided it; the world did, so it is not
+///   REJECTED.
+///
+/// EARNS A POSTGRES TYPE for the reason `ProposalState` does: every list in the
+/// cockpit filters on it, and a state the database accepts and TypeScript
+/// cannot name would be a proposal that appears in no list at all.
+enum SuiteChangeState {
+  PROPOSED
+  APPROVED
+  APPLIED
+  REVERTED
+  REJECTED
+  SUPERSEDED
+  BLOCKED
+}
+
+/// THE OWNERSHIP LEDGER: one row per file QAAI has a recorded fact about.
+///
+/// A row exists for a path only when somebody RECORDED something about it.
+/// Absence is "not ours" — see the section header. The three ownership states
+/// are all represented as rows, including HUMAN_AUTHORED, because "QAAI does
+/// not own this" being a fact rather than the absence of a fact is what makes a
+/// collision at that path reportable instead of silent.
+///
+/// `imports` IS THE DEPENDENCY EDGE, AND IT IS STORED ON THE DEPENDENT. A
+/// shared artifact (a page object two specs import) has more than one
+/// dependent, so replacing it is a change to every dependent. The edge is
+/// recorded as "what THIS file imports" rather than as a `dependents` list on
+/// the shared file, because the import statement is IN the dependent: a
+/// `dependents` list is a derived fact that goes stale the moment a spec is
+/// rewritten without touching the page object, while `imports` is rewritten by
+/// the same act that changes it. "Who depends on X" is then
+/// `where: { projectId, imports: { has: x } }` — see `dependentsOf`.
+///
+/// NO INDEX ON `imports`, DELIBERATELY. A Postgres GIN index is what that
+/// containment query would want, and `schema.prisma` cannot express one without
+/// an `ops` class this repo has never used — so declaring it in hand-written
+/// SQL only would introduce drift that `prisma migrate diff` would report for
+/// ever. The query is already bounded by `projectId`, which IS indexed, and a
+/// project holds hundreds of artifacts rather than millions. A scan over
+/// hundreds of rows is cheaper than permanent schema drift.
+///
+/// THE FILE BODIES ARE NOT STORED, the same decision `CodebaseSnapshot` records
+/// and for a sharper reason: `contentHash` is what makes "the bytes on disk are
+/// still the bytes we wrote" decidable, and a copy of the customer's test suite
+/// in our database would be a liability with no consumer. A lost database must
+/// not be a lost repository.
+model GeneratedArtifact {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// Repo-relative. No `..`, no leading separator, no backslash — enforced by
+  /// `artifactPath` in packages/shared/src/schemas.ts on every write path, and
+  /// again by `artifactSetProblems`.
+  path      String
+  role      ArtifactRole
+  ownership ArtifactOwnership
+
+  /// The spec this artifact belongs to, when it belongs to exactly one. NULL
+  /// for every SHARED role — a page object two specs import belongs to neither,
+  /// and attaching it to the first one would make deleting that test look like
+  /// permission to delete the page object.
+  testId String?
+
+  /// Digest of the bytes QAAI last wrote here. The optimistic-concurrency token
+  /// that makes "never destroy human work" structural: a change computed
+  /// against a different hash is refused rather than applied.
+  contentHash String
+  /// Size of what QAAI wrote, for the audit trail. Not a cap and not a measure
+  /// of the file on disk now, which may differ — that difference is the point.
+  bytes       Int    @default(0)
+
+  /// Repo-relative paths THIS file imports from the project. See the note above.
+  imports String[] @default([])
+
+  /// When a human took it over, and what their version hashed to.
+  ///
+  /// Both NULL for a file QAAI still owns, and both set together. Kept rather
+  /// than deleting the row, so the history — "we generated this, they adopted
+  /// it" — survives and the next generation run cannot mistake it for a file it
+  /// still owns.
+  humanEditedAt   DateTime?
+  humanEditedHash String?
+
+  /// The run that produced it, for provenance. NULL for a row recorded by an
+  /// import or by a human marking a path as theirs.
+  writtenByRunId String?
+
+  firstWrittenAt DateTime @default(now())
+  lastWrittenAt  DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// ONE FACT PER PATH PER PROJECT. Two rows for one path would be two answers
+  /// to "may QAAI write this", and the permissive one would win by whichever
+  /// the query happened to return first.
+  @@unique([projectId, path])
+  @@index([orgId])
+  @@index([projectId, role])
+  /// "Everything I may write" and "everything a human has taken over".
+  @@index([projectId, ownership])
+  @@index([testId])
+}
+
+/// THE CORRECTION CORPUS: the diff between what the generator wrote and what the
+/// first human did to it, classified.
+///
+/// `TestVersion.source` has carried "GENERATOR" | "HEAL" | "HUMAN" | "IMPORT"
+/// since that column existed, so the supervision has been sitting in the
+/// database for the life of this product and is read by nothing. The
+/// classification is the product: a raw diff blob teaches nothing, because
+/// nobody can ask it "do reviewers rewrite our locators, or our assertions?"
+/// and get a number.
+///
+/// PRIVACY, AND WHY IT IS STRUCTURAL RATHER THAN A POLICY
+///
+/// This is customer test code. Nothing in it may leave the customer's project
+/// boundary, be aggregated across organisations, or be used for anything other
+/// than that project's own generation. `projectId` is NOT NULL with no default,
+/// so an orphan row cannot exist for a cross-project query to pick up;
+/// `corpusScope` and `corpusWhere` in packages/shared/src/artifact-set.ts are
+/// the only way to build a where-clause for this table and both ids are
+/// required, so a query that could cross projects does not compile; and
+/// `summariseCorrections` re-checks every row against the scope at run time and
+/// reports what it rejected rather than averaging it in.
+///
+/// AND IT IS UNTRUSTED TEXT. A human "correction" is attacker-influenced input
+/// wherever a pull request can be opened, and this corpus is read back into a
+/// prompt whose output is written into the repository. So `items` holds BOUNDED
+/// QUOTES (MAX_CORRECTION_QUOTE_CHARS) and never a file, and nothing in it may
+/// reach a model except through `fenceUntrusted`.
+model TestCorrection {
+  id        String @id @default(cuid())
+  orgId     String
+  /// REQUIRED. The project boundary, as a constraint and not a convention.
+  projectId String
+  testId    String
+
+  /// `TestVersion.version` of the GENERATOR row and of the first HUMAN row
+  /// after it. Numbers rather than only ids, so the ordering invariant
+  /// (`humanVersion > generatedVersion`) is checkable without a join.
+  generatedVersion   Int
+  humanVersion       Int
+  /// The two rows themselves, for the diff view.
+  generatedVersionId String
+  humanVersionId     String
+
+  /// The DISTINCT kinds present in `items`, so the group-by can be indexed.
+  /// Never empty: a diff the classifier could not name carries UNCLASSIFIED.
+  kinds CorrectionKind[]
+  /// CorrectionItem[] — packages/shared/src/artifact-set.ts. The classified
+  /// diff, with a bounded quote of each side.
+  items Json            @default("[]")
+
+  /// The surface key the test was about. NULL is "the test declared none", not
+  /// "none exists" — a correction with no surface is still supervision about
+  /// how we write, just not about what we cover.
+  surface String?
+
+  addedLines   Int @default(0)
+  removedLines Int @default(0)
+  /// How many items the classifier could not name. DISCLOSED rather than
+  /// hidden: a corpus reporting "100% locator changes" over a diff it mostly
+  /// failed to read is the lie this column exists to prevent.
+  unclassifiedCount Int @default(0)
+  /// Classified changes MAX_CORRECTION_ITEMS refused to keep. A CAP THAT BIT,
+  /// reported as a count: without it the corpus reads a 200-line rewrite as
+  /// sixty tidy corrections and the sixty look like the whole story. A row with
+  /// a non-zero value has a kind breakdown that is a SAMPLE, not a census.
+  itemsOmitted      Int @default(0)
+
+  /// Which version of the classifier produced this. Without it, improving a
+  /// detector silently rewrites the meaning of every historical row and the
+  /// trend line becomes an artefact of our own deploys.
+  classifierVersion Int @default(1)
+
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One correction per (test, generated version, human version). Re-running
+  /// the classifier over the same pair must UPDATE rather than accumulate, or
+  /// the group-by counts our own re-runs.
+  @@unique([testId, generatedVersionId, humanVersionId])
+  @@index([orgId])
+  /// The question the table exists for, scoped to one project by construction.
+  @@index([projectId, createdAt])
+  @@index([projectId, testId])
+}
+
+/// A CHANGE QAAI WANTS TO MAKE TO TESTS THAT ALREADY EXIST, held for a human.
+///
+/// `suite-health.ts` has named duplicate clusters and weak assertions since it
+/// was written and NOTHING COULD ACT ON THEM — there was no shape for "I would
+/// like to change tests that already exist, here is what it would look like,
+/// and here is how to put it back". This is that shape. It also carries the
+/// third artifact disposition: a PROPOSED_EDIT to a file QAAI does not own is
+/// the same thing to a reviewer as a refactor of an existing test — a change
+/// QAAI wants and may not make — so it is the same table rather than a second
+/// one that would need the same revert record and the same review screen.
+///
+/// `revert` IS NOT NULLABLE, AND THAT IS THE POINT. A refactor nobody can
+/// revert will not be approved, so the shape makes it unstorable rather than
+/// leaving a reviewer to notice. `suiteChangeProposalSchema` refuses a record
+/// without an entry for every path the proposal touches, and the entries carry
+/// the BYTES rather than a hash — a hash proves a revert was possible and does
+/// not perform one.
+model SuiteChangeProposal {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  kind  SuiteChangeKind
+  state SuiteChangeState @default(PROPOSED)
+
+  title     String
+  /// Why, in QAAI's own words, with the suite-health finding it acts on named.
+  rationale String
+
+  /// ArtifactSet — packages/shared/src/artifact-set.ts. The files as they are
+  /// and as they would be. Both, because a reviewer reads a diff and because
+  /// applying `after` against a tree that no longer matches `before` is the
+  /// defect the whole ownership model exists to prevent.
+  before Json
+  after  Json
+
+  /// Every repo-relative path this proposal touches, lifted out of the JSON so
+  /// a second proposal over the same files is findable without parsing it.
+  paths String[] @default([])
+
+  /// THE BLAST RADIUS, disclosed by the producer (`dependentsAffected`) rather
+  /// than discovered by a reviewer. A page-object replacement with an empty
+  /// dependent list is either a page object nothing imports — in which case the
+  /// rationale should say so — or a blast radius nobody computed.
+  dependentTestIds String[] @default([])
+  dependentPaths   String[] @default([])
+
+  /// RevertRecord — packages/shared/src/artifact-set.ts. NOT NULL. See above.
+  revert Json
+
+  /// Who decided, when, and what happened after.
+  decidedBy  String?
+  decidedAt  DateTime?
+  appliedAt  DateTime?
+  revertedAt DateTime?
+  revertedBy String?
+
+  /// A later proposal covering the same files. Set together with state
+  /// SUPERSEDED, so the trail does not vanish.
+  supersededById String?
+  /// Why it cannot be applied as written. Set together with state BLOCKED, and
+  /// required by nothing but the reviewer's sanity: a BLOCKED row with no reason
+  /// is a proposal nobody can unblock.
+  blockedReason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  /// The review queue.
+  @@index([projectId, state, createdAt])
+  /// The acceptance rate per kind, which is the evidence that refactoring is
+  /// worth offering at all.
+  @@index([projectId, kind, state])
 }

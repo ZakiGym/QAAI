@@ -1921,3 +1921,204 @@ export interface CoverageDimensionReport {
   why: string;
   caveats: string[];
 }
+
+// ─── The craft (§3.2c): ownership, corrections and suite-change proposals ────
+
+/*
+ * CORRECTNESS ONLY. These shapes exist so the cockpit can render three tables
+ * that landed with no door, and every field a reader could mistake for a
+ * measurement is carried with the thing that makes it one:
+ *
+ *   · an ownership verdict is a RECORDED FACT, and the absence of a row is
+ *     UNRECORDED — which is not a permission;
+ *   · a corpus state of INSUFFICIENT_DATA is an answer, and the counts stay
+ *     underneath it because counts are facts;
+ *   · a proposal's `applyable` is read from the API, not computed here. A
+ *     screen that decided for itself whether a change may be applied would be a
+ *     second opinion about a write to the customer's repository.
+ */
+
+/** The three states a ledger ROW can record. A path with no row is UNRECORDED. */
+export type ArtifactOwnershipView = 'QAAI_OWNED' | 'HUMAN_EDITED' | 'HUMAN_AUTHORED';
+
+export interface GeneratedArtifactView {
+  path: string;
+  role: string;
+  ownership: ArtifactOwnershipView;
+  /** The spec this file belongs to, or null for a file more than one imports. */
+  testId: string | null;
+  /** A digest of what QAAI wrote. Never the bytes — see the model's own note. */
+  contentHash: string;
+  bytes: number;
+  imports: string[];
+  /** Set the moment a human took it over. Non-null ⟹ QAAI may only propose. */
+  humanEditedAt: string | null;
+  firstWrittenAt: string;
+  lastWrittenAt: string;
+}
+
+export interface ArtifactLedgerView {
+  projectId: string;
+  artifacts: GeneratedArtifactView[];
+  counts: Record<ArtifactOwnershipView, number>;
+  /**
+   * AN UPPER BOUND, which is why it is not called `writable`. It is the number
+   * of rows whose OWNERSHIP VERDICT permits a write — exactly the QAAI_OWNED
+   * ones — and a verdict is half the permission. The sync also requires the
+   * bytes on the branch to hash to the row's `contentHash`, which this endpoint
+   * cannot know without fetching the branch, so a file a human changed in the
+   * repository is counted here and still refused there.
+   */
+  writableIfUnchanged: number;
+  /** Render it: it is the sentence that explains why an absent path is safe. */
+  why: string;
+}
+
+export function artifactLedger(projectId: string): Promise<ArtifactLedgerView> {
+  return api(`/projects/${projectId}/artifacts`);
+}
+
+export interface CorrectionSignalView {
+  projectId: string;
+  /** INSUFFICIENT_DATA is an ANSWER, not an empty result. Render it as one. */
+  state: 'INSUFFICIENT_DATA' | 'NO_PATTERN' | 'PATTERN';
+  corpusSize: number;
+  byKind: Record<string, number>;
+  patterns: Array<{
+    pattern: string;
+    rows: number;
+    share: number;
+    detail: string | null;
+    instruction: string;
+  }>;
+  locatorMigrations: Array<{ from: string | null; to: string | null; rows: number }>;
+  surfacesDeleted: Array<{ surface: string; rows: number }>;
+  /**
+   * Reported SEPARATELY and never fed back into generation: a human weakening
+   * our assertion is not a lesson to assert less. A screen that merged this
+   * into `byKind` would be inviting the opposite reading.
+   */
+  weakenings: number;
+  unclassified: number;
+  /** Rows from another project, rejected at run time and counted, not averaged in. */
+  rowsRejected: number;
+  /** Older rows the window did not read. Non-zero ⟹ the counts describe a window. */
+  rowsOmitted: number;
+  /** Rows whose own item cap bit, so their kind breakdown is a sample. */
+  rowsSampled: number;
+  /** More than one ⟹ part of any trend is QAAI's own deploys. */
+  classifierVersions: number[];
+}
+
+export function correctionSignal(projectId: string): Promise<CorrectionSignalView> {
+  return api(`/projects/${projectId}/corrections`);
+}
+
+export interface CorrectionSyncResult {
+  projectId: string;
+  recorded: number;
+  unchanged: number;
+  testsExamined: number;
+  /** A cap that BIT. Non-zero ⟹ the counts above describe a window. */
+  testsNotExamined: number;
+  /** Every refusal BY NAME. `NO_HUMAN_VERSION` is the ordinary case, not a failure. */
+  refusals: Record<string, number>;
+  /** Files whose ownership moved to the human, so QAAI will no longer write them. */
+  ownershipFlipped: string[];
+  why: string;
+}
+
+export function syncCorrections(projectId: string): Promise<CorrectionSyncResult> {
+  return api(`/projects/${projectId}/corrections/sync`, { method: 'POST' });
+}
+
+/** One file as a proposal would leave it. Enough to render a diff, no more. */
+export interface ProposedArtifactView {
+  role: string;
+  path: string;
+  content: string;
+  /**
+   * `PROPOSED_EDIT` is the one that must look different: it is a change to a
+   * file QAAI does NOT own, and it can never be written — only approved by the
+   * person whose file it is.
+   */
+  disposition: 'NEW' | 'UPDATE_OWNED' | 'PROPOSED_EDIT';
+  ownership: ArtifactOwnershipView | 'UNRECORDED';
+  why: string;
+}
+
+export interface SuiteChangeProposalView {
+  id: string;
+  kind: string;
+  state: 'PROPOSED' | 'APPROVED' | 'APPLIED' | 'REVERTED' | 'REJECTED' | 'SUPERSEDED' | 'BLOCKED';
+  title: string;
+  rationale: string;
+  before: { dialect: string | null; artifacts: ProposedArtifactView[] };
+  after: { dialect: string | null; artifacts: ProposedArtifactView[] };
+  paths: string[];
+  /** The blast radius the producer computed, not one a reviewer has to discover. */
+  dependentTestIds: string[];
+  dependentPaths: string[];
+  decidedBy: string | null;
+  decidedAt: string | null;
+  appliedAt: string | null;
+  revertedAt: string | null;
+  blockedReason: string | null;
+  createdAt: string;
+  /** Does this change what the suite CHECKS? It decides the review bar. */
+  altersBehaviour: boolean;
+  /**
+   * May this row be applied AS IT STANDS? Read from the API's own
+   * `APPLYABLE_STATES`, never computed here.
+   */
+  applyable: boolean;
+}
+
+export interface SuiteChangeListView {
+  projectId: string;
+  proposals: SuiteChangeProposalView[];
+  why: string;
+}
+
+export function suiteChanges(
+  projectId: string,
+  state?: SuiteChangeProposalView['state'],
+): Promise<SuiteChangeListView> {
+  const query = state ? `?state=${encodeURIComponent(state)}` : '';
+  return api(`/projects/${projectId}/suite-changes${query}`);
+}
+
+export interface SuiteChangeProposeResult {
+  projectId: string;
+  proposed: Array<{ id: string; kind: string; title: string; paths: string[] }>;
+  /** Candidates the refactor engine refused, each with its named problems. */
+  refused: Array<{ testIds: string[]; problems: string[] }>;
+  /** Findings the feed would not even offer, each with its reason. */
+  declined: Array<{ operation: string; testIds: string[]; why: string }>;
+  /** Weak assertions that need a verification run before they may be proposed. */
+  needsVerification: number;
+  /** Why fixture extraction is unavailable in this request. Render it. */
+  extractionUnavailable: string;
+  omitted: { merges: number; strengthenings: number };
+  testsRead: number;
+  /** FALSE ⟹ the cluster list is a floor and no merge was proposed from it. */
+  duplicateScanComplete: boolean;
+}
+
+export function proposeSuiteChanges(projectId: string): Promise<SuiteChangeProposeResult> {
+  return api(`/projects/${projectId}/suite-changes`, { method: 'POST' });
+}
+
+export function decideSuiteChange(
+  proposalId: string,
+  decision: 'APPROVED' | 'REJECTED',
+): Promise<{
+  proposal: { id: string; state: SuiteChangeProposalView['state']; kind: string };
+  applyable: boolean;
+  why: string;
+}> {
+  return api(`/suite-changes/${proposalId}/decide`, {
+    method: 'POST',
+    body: JSON.stringify({ decision }),
+  });
+}

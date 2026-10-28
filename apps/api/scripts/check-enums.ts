@@ -185,6 +185,40 @@ const TEST_TYPE_DECL_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/test-type-decl.ts', import.meta.url),
 );
 
+/*
+ * The craft vocabulary: what QAAI produces, WHO OWNS EACH FILE, what reviewers
+ * change about it, and what QAAI may only ever propose. In @qaai/shared and NOT
+ * in constants.ts for the same reason as the eleven above -- `artifact-set.ts`
+ * holds the apply-order rank, the shared/not-shared record,
+ * `WRITABLE_BY_OWNERSHIP` (the one fact `pushRepo` lacked), the correction
+ * classifier and every refusal beside the vocabulary, and those are the only
+ * code that interprets it.
+ *
+ * `ARTIFACT_DISPOSITIONS`, `OWNERSHIP_VERDICTS` and the whole of
+ * `style-profile.ts` are deliberately NOT paired below, and neither is an
+ * omission:
+ *
+ *   * `ARTIFACT_DISPOSITIONS` is a REQUEST made against a ledger that may have
+ *     moved, re-derived by `dispositionFor` on every apply rather than stored.
+ *     There is no column for it to drift from.
+ *   * `OWNERSHIP_VERDICTS` is `ARTIFACT_OWNERSHIPS` plus `UNRECORDED`, which
+ *     means "there is no row" -- a state a row cannot be in, by construction.
+ *   * `STYLE_CONFIDENCES`, `NAMING_CONVENTIONS`, `FIXTURE_MECHANISMS`,
+ *     `SETUP_IDIOMS`, `LOCATOR_STRATEGIES`, `IMPORT_STYLES`, `QUOTE_STYLES`,
+ *     `SEMICOLON_STYLES` and `PARAMETERISATIONS` all live INSIDE
+ *     `Project.styleProfile` JSON rather than in a column -- the same argument
+ *     `BROWSER_ENGINES` and `UNIQUENESS_SCOPES` carry above.
+ *
+ * Every one of those has its run-time parity against its own zod schema's
+ * `.options` in packages/shared/src/artifact-set.test.ts and
+ * packages/shared/src/style-profile.test.ts, and its compiler half as a
+ * `satisfies Record<K, V>` presence record in the module. Both halves, because
+ * one without the other passes while the two disagree.
+ */
+const ARTIFACT_SET_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/artifact-set.ts', import.meta.url),
+);
+
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
  * mirrors each.
@@ -212,7 +246,8 @@ const PAIRS: Array<{
     | 'coverageDimensions'
     | 'principals'
     | 'browserMatrix'
-    | 'testTypeDecl';
+    | 'testTypeDecl'
+    | 'artifactSet';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -674,6 +709,53 @@ const PAIRS: Array<{
     tsConst: 'UNASSERTED_REASONS',
     source: 'testTypeDecl',
   },
+  /*
+   * ── The craft (this round) ────────────────────────────────────────────────
+   *
+   * Five, and every one is here for the house reason: it is GROUPED ON or
+   * FILTERED ON, which is what earns a Postgres type instead of a TEXT column
+   * with a producer guard.
+   */
+  // WHAT ONE GENERATED FILE IS. Grouped on to answer the question this whole
+  // round turns on -- "how much of what we own is shared infrastructure and how
+  // much is specs", i.e. whether page objects are actually being produced or
+  // setup is still being copy-pasted into every spec. A role the database
+  // accepts and TypeScript cannot name lands outside both `ARTIFACT_ROLE_RANK`
+  // and `SHARED_ROLES`, which means an artifact that would be applied in the
+  // wrong order AND never checked for a broken dependent.
+  { prismaEnum: 'ArtifactRole', tsConst: 'ARTIFACT_ROLES', source: 'artifactSet' },
+  // WHO OWNS ONE FILE, and the highest-stakes pair in this file. A value
+  // MISSING from the Prisma enum cannot be stored, so the HUMAN_EDITED row that
+  // records "a human has taken this file over" would fail to insert -- and the
+  // next generation run would find the old QAAI_OWNED row, conclude it still
+  // owns the file, and overwrite a human's work. That is the exact defect
+  // `pushRepo` already commits by inferring ownership from absence, and this
+  // ledger exists to stop it. The other direction is the same shape: a verdict
+  // TypeScript cannot name falls outside `WRITABLE_BY_OWNERSHIP`, where `true`
+  // appears exactly once.
+  { prismaEnum: 'ArtifactOwnership', tsConst: 'ARTIFACT_OWNERSHIPS', source: 'artifactSet' },
+  // WHAT REVIEWERS ALWAYS CHANGE. The corpus's entire question is `GROUP BY
+  // kind` -- "9 of your last 10 corrections were locators" is a grouped count
+  // or it is nothing. A kind TypeScript cannot name falls outside
+  // `CORRECTION_IS_ACTIONABLE`, so a correction that should have changed how we
+  // generate is counted as noise; a kind the database rejects means the
+  // classifier's honest UNCLASSIFIED row cannot be written at all, and a
+  // classifier that cannot record what it failed to read has no way to report a
+  // failure except by not reporting one.
+  { prismaEnum: 'CorrectionKind', tsConst: 'CORRECTION_KINDS', source: 'artifactSet' },
+  // WHAT QAAI MAY ASK TO CHANGE ABOUT EXISTING TESTS. Grouped on because the
+  // acceptance rate per kind is the only evidence that refactoring is worth
+  // offering at all. A kind TypeScript cannot name falls outside
+  // `CHANGE_ALTERS_BEHAVIOUR`, which decides the review bar -- so a merge that
+  // could drop an assertion would be reviewed as though it were a rename.
+  { prismaEnum: 'SuiteChangeKind', tsConst: 'SUITE_CHANGE_KINDS', source: 'artifactSet' },
+  // WHERE A PROPOSAL IS IN ITS LIFE. Every review list filters on it, so a
+  // state the database accepts and TypeScript cannot name is a proposal that
+  // appears in no list -- and a state outside `APPLYABLE_STATES`, where
+  // APPROVED is the only `true`, is a proposal that can never be applied or one
+  // that could be applied without a human, depending on which direction the
+  // drift went.
+  { prismaEnum: 'SuiteChangeState', tsConst: 'SUITE_CHANGE_STATES', source: 'artifactSet' },
 ];
 
 /*
@@ -782,6 +864,7 @@ const coverageDimensions = readFileSync(COVERAGE_DIMENSIONS_FILE, 'utf8');
 const principals = readFileSync(PRINCIPALS_FILE, 'utf8');
 const browserMatrix = readFileSync(BROWSER_MATRIX_FILE, 'utf8');
 const testTypeDecl = readFileSync(TEST_TYPE_DECL_FILE, 'utf8');
+const artifactSet = readFileSync(ARTIFACT_SET_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -796,7 +879,8 @@ const SOURCES: Record<
   | 'coverageDimensions'
   | 'principals'
   | 'browserMatrix'
-  | 'testTypeDecl',
+  | 'testTypeDecl'
+  | 'artifactSet',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -813,6 +897,7 @@ const SOURCES: Record<
   principals: { text: principals, label: 'shared/principals.ts' },
   browserMatrix: { text: browserMatrix, label: 'shared/browser-matrix.ts' },
   testTypeDecl: { text: testTypeDecl, label: 'shared/test-type-decl.ts' },
+  artifactSet: { text: artifactSet, label: 'shared/artifact-set.ts' },
 };
 const problems: string[] = [];
 

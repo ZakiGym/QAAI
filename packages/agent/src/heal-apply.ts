@@ -49,9 +49,29 @@ import { extname } from 'node:path';
 import { applyPatch } from 'diff';
 import { countAssertions, findTestBlocks, resolveDialect, type DialectId } from '@qaai/shared';
 import type { Language, TestType } from '@qaai/shared';
-import { FINAL_ATTEMPT, admit } from './admission.js';
-import type { AdmissionReport, GateId, GateOutcome, ToolchainGates } from './admission.js';
+import { FINAL_ATTEMPT, admit, admitSet } from './admission.js';
+import type {
+  AdmissionReport,
+  GateId,
+  GateOutcome,
+  GateStatus,
+  SetAdmissionReport,
+  ToolchainGates,
+} from './admission.js';
 import { toolchainFor } from './toolchain.js';
+/*
+ * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
+ * and is recorded as one — `admission.ts`, `generator.ts`, `artifacts.ts`,
+ * `page-objects.ts` and `refactor.ts` all carry the same note this round.
+ * `packages/shared/src/index.ts` has no `export * from './artifact-set'`, and
+ * the one-line fix is TS2308 on it: `artifact-set.ts` and `requirements.ts`
+ * both export a type named `ContentDigest`. TYPE-ONLY here, so it is erased at
+ * build time and reaches no runtime code across the boundary.
+ */
+import type {
+  ArtifactSet,
+  ArtifactSetContext,
+} from '@qaai/shared';
 
 export interface ApplyResult {
   ok: boolean;
@@ -532,6 +552,223 @@ export interface PostCheckInput {
  *    and did not answer, which is a fact about this file, and the unattended
  *    path declines.
  */
+/**
+ * What the gates found about a multi-file change.
+ *
+ * ── WHY A SECOND SHAPE AND NOT A LOOP OVER {@link postCheckCode} ───────────
+ *
+ * Because the VERDICT is about the set and not about the files. A heal or a
+ * refactor that rewrites a spec and the page object it imports is ONE change: a
+ * spec applied without its page object fails its first run on an import error,
+ * which reads to a human as a broken test rather than as an interrupted write.
+ * A caller folding N `PostCheck`s together would have to decide that, and would
+ * decide it differently from the next caller.
+ *
+ * Every semantic {@link postCheckCode} owns is preserved, because this calls the
+ * same `admitSet` that calls the same `admit`:
+ *
+ *   · SYNTAX FAIL is the one refusal, on every path, reviewed or not — and now
+ *     a SYNTAX FAIL on ANY artifact refuses the whole set, for the reason
+ *     above;
+ *   · ASSERTIONS FAIL is a flag and never a refusal (`applyHealDiff` is the
+ *     single authority on never-weaken, which is a RELATIVE question `admit`
+ *     cannot ask);
+ *   · the unattended path is held stricter than the reviewed one;
+ *   · a structurally unavailable gate does not block auto-apply, and a gate
+ *     that could have run and did not, does.
+ *
+ * What it ADDS is the set's own refusals — a duplicate path, a write to a file
+ * QAAI does not own, a stale base — and those ARE refusals on every path: none
+ * of them is a thing a human approving a diff can make safe, and the last one
+ * means the change was computed against bytes somebody has since replaced.
+ */
+export interface SetPostCheck {
+  /** Whether this SET may be written at all, by a human approving it or not. */
+  allowed: boolean;
+  refusal?: string;
+  autoApplyAllowed: boolean;
+  autoApplyDeclined?: string;
+  /** Plain sentences, each prefixed with the file it is about. */
+  flags: string[];
+  /** One line per artifact naming what ran and what did not. */
+  checks: string;
+  /** The whole set report, for a caller that wants line numbers per file. */
+  report: SetAdmissionReport;
+}
+
+export interface PostCheckSetInput {
+  set: ArtifactSet;
+  testType: TestType;
+  /** The SPEC's spec, for a spec-driven or hybrid type. */
+  spec?: unknown;
+  language?: Language | null;
+  ecosystemId?: string | null;
+  toolchain?: ToolchainGates;
+  /**
+   * The ledger and the working tree. OMITTING IT IS NOT A PASS: the five
+   * ownership refusals are then not asked, `report.ledgerChecked` is false, and
+   * {@link SetPostCheck.autoApplyAllowed} is false as a result — an unattended
+   * write to a path nobody checked the ownership of is the exact defect the
+   * ownership model exists to prevent.
+   */
+  context?: ArtifactSetContext;
+}
+
+export async function postCheckSet(input: PostCheckSetInput): Promise<SetPostCheck> {
+  const report = await admitSet({
+    set: input.set,
+    testType: input.testType,
+    // No plan item: a heal and a refactor both change tests that already exist.
+    item: null,
+    language: input.language ?? null,
+    ecosystemId: input.ecosystemId ?? null,
+    spec: input.spec,
+    attempt: FINAL_ATTEMPT,
+    toolchain: input.toolchain ?? postCheckToolchain(),
+    context: input.context,
+    /*
+     * There is no revise loop here for the same reason `postCheckCode` asks for
+     * the terminal attempt: the Healer produced a DIFF and the refactor engine
+     * produced a deterministic rewrite, so there is nothing to hand a
+     * `revisePrompt` to.
+     */
+    revisable: false,
+  });
+
+  const structural = new Set<GateId>(STRUCTURALLY_UNAVAILABLE);
+  const flags: string[] = [];
+  const checkLines: string[] = [];
+  let syntaxFailure: { path: string; why: string } | null = null;
+  let blocker: { path: string; gate: GateId; status: GateStatus; why: string } | null = null;
+
+  for (const artifact of report.artifacts) {
+    const notAbout = new Set<GateId>(artifact.report.gates.map((gate) => gate.gate));
+    for (const id of artifact.judged) notAbout.delete(id);
+
+    /*
+     * Per artifact, because `syntaxIsReachableWithoutACheckout` is a question
+     * about THIS file's extension: a `.ts` spec's parse is reachable in process
+     * and a `.py` fixture's is not, and treating the set's answer as one would
+     * either block auto-apply on every polyglot set or claim a parse that never
+     * ran.
+     */
+    const perFile = new Set(structural);
+    if (
+      input.toolchain === undefined &&
+      !syntaxIsReachableWithoutACheckout(artifact.path)
+    ) {
+      perFile.add('SYNTAX');
+    }
+
+    const judged = artifact.report.gates.filter(
+      (gate) => artifact.judged.includes(gate.gate) && !perFile.has(gate.gate),
+    );
+    const syntax = artifact.report.gates.find((gate) => gate.gate === 'SYNTAX');
+    if (syntax?.status === 'FAIL' && syntaxFailure === null) {
+      syntaxFailure = {
+        path: artifact.path,
+        why: syntax.detail[0] ?? syntax.why,
+      };
+    }
+
+    const ranIds = new Set<GateId>(
+      judged.filter((gate) => gate.status !== 'UNAVAILABLE').map((gate) => gate.gate),
+    );
+    const ran = artifact.report.gates.filter((g) => ranIds.has(g.gate)).map((g) => GATE_LABEL[g.gate]);
+    const notRun = artifact.report.gates
+      .filter((g) => !ranIds.has(g.gate))
+      .map((g) => GATE_LABEL[g.gate]);
+    checkLines.push(
+      `${artifact.path} (${artifact.role}): checked ${ran.join(', ') || 'nothing'}; not checked ${
+        notRun.join(', ') || 'nothing'
+      }.`,
+    );
+
+    for (const gate of judged) {
+      if (gate.status === 'PASS') continue;
+      flags.push(
+        gate.status === 'FAIL'
+          ? `${artifact.path}: this change fails a check a generated test would have been sent back for: ${gate.why}`
+          : `${artifact.path}: ${gate.why}`,
+      );
+      blocker ??= { path: artifact.path, gate: gate.gate, status: gate.status, why: gate.why };
+    }
+  }
+
+  // The gates that were set aside because they are not about a role. Said out
+  // loud rather than dropped — see `GATES_NOT_ABOUT_ROLE`.
+  for (const aside of report.setAside) flags.push(`${aside.path}: ${aside.why}`);
+  for (const problem of report.setProblems) {
+    flags.push(`${problem.path || '(the set)'}: ${problem.kind} — ${problem.why}`);
+  }
+
+  const checks = checkLines.join(' ');
+
+  if (syntaxFailure !== null) {
+    return {
+      allowed: false,
+      refusal: `"${syntaxFailure.path}" does not parse, so applying this change would replace a test that fails with a readable error by a file the runner cannot load at all — along with every other test in it. ${syntaxFailure.why}`,
+      autoApplyAllowed: false,
+      autoApplyDeclined: `"${syntaxFailure.path}" does not parse.`,
+      flags,
+      checks,
+      report,
+    };
+  }
+
+  if (report.setProblems.length > 0) {
+    const first = report.setProblems[0]!;
+    /*
+     * A STRUCTURAL REFUSAL IS A REFUSAL ON EVERY PATH, including a reviewed
+     * one, and that is the one place this differs from `postCheckCode`'s "only
+     * SYNTAX refuses". A human approving a diff cannot make "two artifacts write
+     * to one path" or "the bytes this was computed against have been replaced"
+     * safe — approving the second DISCARDS whatever replaced them, which is the
+     * work this whole model exists to protect.
+     */
+    return {
+      allowed: false,
+      refusal: `This change may not be applied: ${first.kind} at "${first.path || '(the set)'}" — ${first.why}`,
+      autoApplyAllowed: false,
+      autoApplyDeclined: `${first.kind} at "${first.path || '(the set)'}".`,
+      flags,
+      checks,
+      report,
+    };
+  }
+
+  /*
+   * `ledgerChecked: false` DECLINES THE UNATTENDED PATH and does not block the
+   * reviewed one. A human approving the diff is the premise auto-apply lacks,
+   * and an unattended write to a path whose ownership nobody checked is the
+   * `pushRepo` defect with a different caller.
+   */
+  if (!report.ledgerChecked) {
+    return {
+      allowed: true,
+      autoApplyAllowed: false,
+      autoApplyDeclined:
+        'No ownership ledger was supplied, so whether QAAI may write these paths is undecided. An unattended write to a path nobody checked the ownership of is how a human’s file gets overwritten.',
+      flags,
+      checks,
+      report,
+    };
+  }
+
+  return {
+    allowed: true,
+    autoApplyAllowed: blocker === null,
+    autoApplyDeclined: blocker
+      ? `Applying this without a human needs every check that can run to pass; "${
+          GATE_LABEL[blocker.gate]
+        }" on ${blocker.path} came back ${blocker.status}. ${blocker.why}`
+      : undefined,
+    flags,
+    checks,
+    report,
+  };
+}
+
 export async function postCheckCode(input: PostCheckInput): Promise<PostCheck> {
   const report = await admit({
     code: input.code,

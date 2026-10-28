@@ -216,3 +216,22 @@ export * from './provider-catalogue';
  */
 export * from './browser-matrix';
 export * from './test-type-decl';
+
+/*
+ * THE CRAFT VOCABULARY, published last because every name here is new.
+ *
+ * Both modules import only types from `./dialect` and `./ecosystems`, which are
+ * published far above, so neither line adds a cycle and the order between the
+ * two does not matter (they do not import each other).
+ *
+ * WHY THIS LINE IS NOT A TIDY-UP. Without it, `@qaai/agent` reached this
+ * vocabulary by RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY —
+ * `from '../../shared/src/artifact-set'` in style-learner.ts, admission.ts,
+ * artifacts.ts and page-objects.ts. That compiles and it is wrong twice: the
+ * import bypasses the package's declared surface, so `@qaai/shared` cannot tell
+ * which of its own names are public; and a file reached only that way is a file
+ * `check-wiring`'s package-exports ratchet cannot reason about. The keystone
+ * marked this blocking for all four builders and nobody wrote it.
+ */
+export * from './artifact-set';
+export * from './style-profile';

@@ -82,6 +82,58 @@ import {
   fabricatedEnvironmentFields,
 } from './browser-matrix';
 import type { BrowserEnvironment } from './browser-matrix';
+/*
+ * The craft vocabularies — what QAAI produces, who owns it, what reviewers
+ * change about it, and the repository's own conventions. Imported rather than
+ * restated for the reason every other vocabulary import in this file carries,
+ * and sharpest here because the refusals are the product: a
+ * `z.enum(['NEW','UPDATE_OWNED','PROPOSED_EDIT'])` written out below would be a
+ * second copy of the disposition list, and the first thing a second copy does
+ * is stop matching — at which point an artifact QAAI may not write becomes an
+ * artifact no writer can refuse.
+ *
+ * `artifactSetProblems`, `proposalProblems` and `styleProfileProblems` are
+ * imported as VALUES and not merely as lists, for the reason the matrix import
+ * above records: a refinement that reimplemented "may QAAI write this file" or
+ * "is this confidence supported by its evidence" would be a second opinion
+ * about the same fact. Neither module imports this one, so there is no cycle.
+ */
+import {
+  ARTIFACT_DISPOSITIONS,
+  ARTIFACT_OWNERSHIPS,
+  ARTIFACT_ROLES,
+  CORRECTION_CLASSIFIER_VERSION,
+  CORRECTION_KINDS,
+  MAX_ARTIFACTS_PER_SET,
+  MAX_ARTIFACT_CHARS,
+  MAX_ARTIFACT_IMPORTS,
+  MAX_ARTIFACT_PATH_CHARS,
+  MAX_CORRECTION_ITEMS,
+  MAX_CORRECTION_QUOTE_CHARS,
+  OWNERSHIP_VERDICTS,
+  SUITE_CHANGE_KINDS,
+  SUITE_CHANGE_STATES,
+  artifactSetProblems,
+  proposalProblems,
+} from './artifact-set';
+import type { ArtifactSet } from './artifact-set';
+import {
+  FIXTURE_MECHANISMS,
+  IMPORT_STYLES,
+  LOCATOR_STRATEGIES,
+  MAX_STYLE_EXAMPLES,
+  MAX_STYLE_EXAMPLE_CHARS,
+  NAMING_CONVENTIONS,
+  PARAMETERISATIONS,
+  QUOTE_STYLES,
+  SEMICOLON_STYLES,
+  SETUP_IDIOMS,
+  STYLE_CONFIDENCES,
+  styleProfileProblems,
+} from './style-profile';
+import type { StyleProfile } from './style-profile';
+import { DIALECT_IDS } from './dialect';
+import { ECOSYSTEM_IDS } from './ecosystems';
 import {
   DATA_EFFECTS,
   DEVICE_NEEDS,
@@ -1050,18 +1102,15 @@ export const approvePlanSchema = z.object({
 
 // ─── Generation (§3.2) ───────────────────────────────────────────────────────
 
-export const generatedTestSchema = z.object({
-  name: z.string().min(1).max(160),
-  filePath: z
-    .string()
-    .min(1)
-    .max(300)
-    // Traversal guard: generated paths are written to disk and committed to PRs.
-    .refine((p) => !p.includes('..') && !p.startsWith('/'), 'must be a relative path without ..'),
-  code: z.string().min(1),
-  /** Selectors the generator was not confident about; surfaced for review. */
-  reviewFlags: z.array(z.string()).default([]),
-});
+/*
+ * `generatedTestSchema` LIVES AT THE BOTTOM OF THIS FILE NOW, under "The
+ * craft", and that is a forced move rather than a preference: it carries an
+ * `artifacts: artifactSetSchema` and `artifactSetSchema` is declared down there
+ * beside the rest of the artifact vocabulary. A `const` cannot be used before
+ * its declaration, and hoisting the artifact schemas up here would drag the
+ * disposition, ownership and role enums into the middle of the PLAN section —
+ * which is where the next person would stop being able to find either of them.
+ */
 
 // ─── Hand-authored tests (§8 editor) ─────────────────────────────────────────
 
@@ -6233,3 +6282,572 @@ export const testResultVariantCellSchema = z
       path: ['matrixCell'],
     },
   );
+
+// ─── The craft: artifact sets, corrections, proposals and the house style ────
+
+/*
+ * THE FIVE WRITE PATHS FOR THIS ROUND'S VOCABULARY.
+ *
+ * Each closed union below is declared as a `z.enum(LIST)` over the list the
+ * vocabulary module owns, never as a second list written out here. That is what
+ * makes the run-time parity tests in artifact-set.test.ts and
+ * style-profile.test.ts meaningful: they compare `<schema>.options` against the
+ * same arrays the compiler-enforced presence records are keyed on, and eight
+ * GateRule kinds shipped UNSAVEABLE FOR TWO SLICES because only one of the two
+ * halves existed. `check:wiring` cannot see that class of defect — a schema and
+ * a union that disagree are both reached, both tested and both wrong.
+ */
+
+export const artifactRoleSchema = z.enum(ARTIFACT_ROLES);
+export const artifactDispositionSchema = z.enum(ARTIFACT_DISPOSITIONS);
+export const artifactOwnershipSchema = z.enum(ARTIFACT_OWNERSHIPS);
+export const ownershipVerdictSchema = z.enum(OWNERSHIP_VERDICTS);
+export const correctionKindSchema = z.enum(CORRECTION_KINDS);
+export const suiteChangeKindSchema = z.enum(SUITE_CHANGE_KINDS);
+export const suiteChangeStateSchema = z.enum(SUITE_CHANGE_STATES);
+export const styleConfidenceSchema = z.enum(STYLE_CONFIDENCES);
+export const namingConventionSchema = z.enum(NAMING_CONVENTIONS);
+export const fixtureMechanismSchema = z.enum(FIXTURE_MECHANISMS);
+export const setupIdiomSchema = z.enum(SETUP_IDIOMS);
+export const locatorStrategySchema = z.enum(LOCATOR_STRATEGIES);
+export const importStyleSchema = z.enum(IMPORT_STYLES);
+export const quoteStyleSchema = z.enum(QUOTE_STYLES);
+export const semicolonStyleSchema = z.enum(SEMICOLON_STYLES);
+export const parameterisationSchema = z.enum(PARAMETERISATIONS);
+
+/**
+ * A repo-relative path for a generated artifact.
+ *
+ * The traversal guard is REPEATED rather than shared with `relativeFilePath`
+ * above, because the bound differs (`MAX_ARTIFACT_PATH_CHARS` is owned by
+ * artifact-set.ts, which also enforces it in `artifactSetProblems`) and because
+ * a backslash is refused here and not there: an artifact path is joined against
+ * a working tree on a machine whose separator we do not control, and
+ * `pages\\login.ts` is one path on Windows and one filename on Linux.
+ */
+const artifactPath = z
+  .string()
+  .min(1)
+  .max(MAX_ARTIFACT_PATH_CHARS)
+  .refine(
+    (p) => !p.includes('..') && !p.startsWith('/') && !p.includes('\\') && !/^[A-Za-z]:/.test(p),
+    'must be a relative path with no "..", no leading separator and no backslash',
+  );
+
+export const generatedArtifactSchema = z
+  .object({
+    role: artifactRoleSchema,
+    path: artifactPath,
+    content: z.string().min(1).max(MAX_ARTIFACT_CHARS),
+    disposition: artifactDispositionSchema,
+    /**
+     * The RECORDED ownership verdict this disposition was derived from.
+     *
+     * Required, with no default. A default of `UNRECORDED` would be the safe
+     * value and would still be wrong: it would let a producer omit the field
+     * and have the write path invent the fact that decides whether a human's
+     * file may be overwritten. A fact nobody recorded must be absent, which
+     * here means the parse fails.
+     */
+    ownership: ownershipVerdictSchema,
+    imports: z.array(artifactPath).max(MAX_ARTIFACT_IMPORTS).default([]),
+    /** The digest of the bytes this change was computed against. See the type. */
+    basedOnHash: z.string().min(1).max(128).nullable().default(null),
+    why: z.string().min(1).max(300),
+  })
+  .strict();
+
+/**
+ * THE MULTI-FILE GENERATED OUTPUT.
+ *
+ * The refusals are asked of `artifactSetProblems` rather than restated here, so
+ * a producer that checks before writing and this write path cannot disagree —
+ * the same arrangement `testTypeDeclarationSchema` uses with
+ * `declarationProblems`, and for the same reason.
+ *
+ * ── WHAT THIS SCHEMA CAN AND CANNOT REFUSE, SAID OUT LOUD ──────────────────
+ *
+ * A schema has no ledger and no working tree, so it runs
+ * `artifactSetProblems(set)` with NEITHER. That call fails closed: every path
+ * resolves `UNRECORDED`, so an artifact claiming `NEW` or `UPDATE_OWNED` is
+ * refused here with `WRITE_TO_UNOWNED` and `STALE_BASE`, and a shared
+ * replacement is refused with `SHARED_SURFACE_UNREADABLE`.
+ *
+ * THAT IS DELIBERATELY TOO STRICT FOR A FRESH GENERATION, which is why the
+ * ledger-dependent half is excluded below by name: a generated set is parsed
+ * BEFORE anything looks at the repository, and a parse that refused every new
+ * file would make the shape unusable. The excluded problems are exactly the
+ * ones that need a ledger, and the apply path MUST re-run
+ * `artifactSetProblems` with the real ledger and the real `priorContent`
+ * before writing anything. A doc comment that implied this schema alone makes a
+ * write safe would be one of the lies this product cannot afford, so: IT DOES
+ * NOT. It refuses what can be decided from the bytes in hand.
+ */
+const LEDGER_DEPENDENT_PROBLEMS = new Set([
+  'WRITE_TO_UNOWNED',
+  'STALE_BASE',
+  'UNRESOLVED_IMPORT',
+  'SHARED_EXPORT_REMOVED',
+  'SHARED_SURFACE_UNREADABLE',
+]);
+
+export const artifactSetSchema = z
+  .object({
+    artifacts: z.array(generatedArtifactSchema).min(1).max(MAX_ARTIFACTS_PER_SET),
+    /** Null is "we could not tell", never a default dialect. See `resolveDialect`. */
+    dialect: z.enum(DIALECT_IDS).nullable().default(null),
+  })
+  .strict()
+  .superRefine((set, ctx) => {
+    for (const problem of artifactSetProblems(set)) {
+      if (LEDGER_DEPENDENT_PROBLEMS.has(problem.kind)) continue;
+      ctx.addIssue({
+        code: 'custom',
+        message: `${problem.kind}: ${problem.why}`,
+        path: ['artifacts'],
+      });
+    }
+  });
+
+/**
+ * A generated test, as the model returns it.
+ *
+ * ── WHY BOTH SHAPES EXIST, AND WHICH ONE IS AUTHORITATIVE ──────────────────
+ *
+ * `code` and `filePath` are the ONLY shape this product has ever had, and five
+ * prompts in packages/agent/src/ecosystem-prompts.ts tell the model to use page
+ * objects while that shape makes a page object impossible to return. So
+ * `artifacts` is added and `code`/`filePath` are KEPT, because the alternative
+ * is one change that rewrites `admit`, `Test.code`, the runner, the cockpit
+ * editor, `inline-edit.ts`, `heal-apply.ts` and the importer — and a keystone
+ * that breaks every caller is not a migration path, it is a break with a
+ * comment on it.
+ *
+ * THE SINGLE-FILE FIELDS STAY AUTHORITATIVE. `Test.code` is one column and one
+ * runner collects one file; the set says what ELSE the generation needs. The
+ * refinement below is what stops the two from ever disagreeing: when a set is
+ * present it must contain exactly one SPEC, and that SPEC's path and content
+ * must be byte-identical to `filePath` and `code`. A reader that has never
+ * heard of sets keeps working on exactly the bytes it worked on before; a
+ * reader that has calls `artifactSetOf` and never branches.
+ *
+ * `artifacts` is OPTIONAL and never nullable, for the reason
+ * `createTestSchema.matrixCells` records: a single-file generation declares no
+ * set at all, and that is the ordinary case rather than a missing value to be
+ * guessed at.
+ */
+export const generatedTestSchema = z
+  .object({
+    name: z.string().min(1).max(160),
+    filePath: z
+      .string()
+      .min(1)
+      .max(300)
+      // Traversal guard: generated paths are written to disk and committed to PRs.
+      .refine((p) => !p.includes('..') && !p.startsWith('/'), 'must be a relative path without ..'),
+    code: z.string().min(1),
+    /** Selectors the generator was not confident about; surfaced for review. */
+    reviewFlags: z.array(z.string()).default([]),
+    /**
+     * The other files this test needs: its page object, its fixture, its
+     * dataset. See the note above on why the single-file fields remain.
+     */
+    artifacts: artifactSetSchema.optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.artifacts) return;
+    const specs = value.artifacts.artifacts.filter((artifact) => artifact.role === 'SPEC');
+    if (specs.length !== 1) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          `an artifact set attached to a generated test must contain exactly one SPEC; this one ` +
+          `has ${specs.length}. The SPEC is the file the runner collects and the file \`code\` ` +
+          'holds, so zero of them is a generation with no test in it and two is a generation ' +
+          'whose `code` column cannot represent it',
+        path: ['artifacts'],
+      });
+      return;
+    }
+    const spec = specs[0];
+    if (spec === undefined) return;
+    if (spec.path !== value.filePath) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          `the set's SPEC is at ${spec.path} and \`filePath\` is ${value.filePath}. The ` +
+          'single-file fields are authoritative, so two answers to "where does this test live" ' +
+          'is a row that will be written to one path and run from another',
+        path: ['artifacts'],
+      });
+    }
+    if (spec.content !== value.code) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          "the set's SPEC content is not byte-identical to `code`. `Test.code` is what the " +
+          'editor shows and the runner runs; a set that disagrees with it means the file on ' +
+          'disk and the row in the database are different tests',
+        path: ['artifacts'],
+      });
+    }
+  });
+
+/**
+ * The set for a generated test, whichever shape it arrived in.
+ *
+ * Here rather than in artifact-set.ts because it is the only function that
+ * needs to know about `generatedTestSchema`, and artifact-set.ts deliberately
+ * knows nothing about the wire shape. Callers use this and never branch on
+ * `artifacts === undefined`, which is the whole point of keeping both.
+ */
+export function artifactSetOf(generated: {
+  readonly filePath: string;
+  readonly code: string;
+  readonly artifacts?: ArtifactSet;
+}): ArtifactSet {
+  return (
+    generated.artifacts ?? {
+      dialect: null,
+      artifacts: [
+        {
+          role: 'SPEC' as const,
+          path: generated.filePath,
+          content: generated.code,
+          disposition: 'NEW' as const,
+          ownership: 'QAAI_OWNED' as const,
+          imports: [],
+          basedOnHash: null,
+          why: 'The generated test.',
+        },
+      ],
+    }
+  );
+}
+
+// ─── The correction corpus ───────────────────────────────────────────────────
+
+export const correctionItemSchema = z
+  .object({
+    kind: correctionKindSchema,
+    line: z.number().int().min(1).nullable().default(null),
+    /**
+     * UNTRUSTED TEXT on both sides, bounded at the schema as well as at the
+     * classifier. A human "correction" is attacker-influenced input wherever a
+     * pull request can be opened, and this corpus is read back into a prompt
+     * whose output is written into the repository — so the bound is enforced at
+     * the write path too, not only by the producer that happens to call
+     * `classifyCorrection`.
+     */
+    before: z.string().max(MAX_CORRECTION_QUOTE_CHARS),
+    after: z.string().max(MAX_CORRECTION_QUOTE_CHARS),
+  })
+  .strict();
+
+/**
+ * THE WRITE PATH FOR ONE CORRECTION.
+ *
+ * ── THE PROJECT BOUNDARY IS STRUCTURAL, IN THREE PLACES ────────────────────
+ *
+ * This corpus is customer test code. Nothing in it may leave the customer's
+ * project boundary, be aggregated across organisations, or be used for anything
+ * other than that project's own generation.
+ *
+ *   1. `projectId` is REQUIRED here and NOT NULL in `TestCorrection` — not
+ *      nullable, not defaulted. A row with no project cannot be stored, so
+ *      there is no orphan set for a cross-project query to pick up.
+ *   2. `corpusWhere` in artifact-set.ts is the only way to build a where-clause
+ *      for the table, and `corpusScope` is the only way to build its argument.
+ *      Both ids are required, so a query that could cross projects does not
+ *      compile.
+ *   3. `summariseCorrections` re-checks every row against the scope at run time
+ *      and REPORTS what it rejected. The compile-time half is defeated by any
+ *      caller that builds a raw query; the run-time half catches it and counts
+ *      it rather than averaging it in.
+ *
+ * ── `kinds` MAY NOT BE EMPTY ───────────────────────────────────────────────
+ *
+ * An empty list reads as "the reviewer changed nothing", which is a null that
+ * became zero: the corpus would report a clean generation where in fact a human
+ * rewrote the file in a way the classifier could not name. `UNCLASSIFIED` is
+ * the honest value and `classifyCorrection` emits it, so the schema can insist.
+ */
+export const testCorrectionSchema = z
+  .object({
+    orgId: z.string().min(1).max(64),
+    /** Required. See note 1 above. */
+    projectId: z.string().min(1).max(64),
+    testId: z.string().min(1).max(64),
+    generatedVersion: z.number().int().min(1),
+    humanVersion: z.number().int().min(1),
+    kinds: z.array(correctionKindSchema).min(1).max(CORRECTION_KINDS.length),
+    items: z.array(correctionItemSchema).max(MAX_CORRECTION_ITEMS).default([]),
+    /** Null is "the test declared no surface", not "no surface exists". */
+    surface: z.string().min(1).max(500).nullable().default(null),
+    addedLines: z.number().int().min(0),
+    removedLines: z.number().int().min(0),
+    unclassifiedCount: z.number().int().min(0),
+    /**
+     * A CAP THAT BIT, REPORTED. `MAX_CORRECTION_ITEMS` refused this many
+     * classified changes, so a non-zero value means the kind breakdown on this
+     * row is a sample rather than a census. Required rather than defaulted:
+     * a default of 0 would let a producer that never counted claim nothing was
+     * dropped, which is a null that became zero.
+     */
+    itemsOmitted: z.number().int().min(0),
+    classifierVersion: z.number().int().min(1).max(CORRECTION_CLASSIFIER_VERSION),
+  })
+  .strict()
+  .refine((row) => row.humanVersion > row.generatedVersion, {
+    message:
+      'the human version must come after the generated one. A correction is what a reviewer did ' +
+      'to what we wrote; the other order is not a correction, it is a regeneration over a ' +
+      "human's work, and recording it as supervision would teach the generator from itself",
+    path: ['humanVersion'],
+  })
+  .refine(
+    (row) => row.unclassifiedCount === row.items.filter((i) => i.kind === 'UNCLASSIFIED').length,
+    {
+      message:
+        'unclassifiedCount does not match the items. It is the disclosure that stops a corpus ' +
+        'reporting "100% locator changes" over a diff it mostly failed to read, so it may not be ' +
+        'computed independently of the items it counts',
+      path: ['unclassifiedCount'],
+    },
+  )
+  .refine(
+    (row) => new Set(row.kinds).size === row.kinds.length,
+    { message: 'kinds is the DISTINCT set present in items; a repeat makes the group-by wrong', path: ['kinds'] },
+  )
+  .refine(
+    (row) => row.items.length === 0 || row.kinds.every((kind) => row.items.some((i) => i.kind === kind)),
+    {
+      message:
+        'kinds names a kind no item carries. The kinds array exists only so the group-by can be ' +
+        'indexed; a kind with no item behind it is a number with no evidence',
+      path: ['kinds'],
+    },
+  );
+
+// ─── Suite-change proposals ──────────────────────────────────────────────────
+
+/**
+ * ONE ENTRY OF THE REVERSIBILITY RECORD.
+ *
+ * A discriminated union on `existed`, because the two arms carry different
+ * obligations and a single optional-field shape would let a proposal claim to
+ * be revertible while carrying nothing to revert to. `existed: true` owes the
+ * BYTES — not a hash. A hash proves a revert was possible; it does not perform
+ * one.
+ */
+export const revertEntrySchema = z.discriminatedUnion('existed', [
+  z.object({ path: artifactPath, existed: z.literal(false) }).strict(),
+  z
+    .object({
+      path: artifactPath,
+      existed: z.literal(true),
+      priorContent: z.string().max(MAX_ARTIFACT_CHARS),
+      priorHash: z.string().min(1).max(128),
+      /** Null when QAAI had no ledger row for it, which is itself the fact to restore. */
+      priorOwnership: artifactOwnershipSchema.nullable().default(null),
+    })
+    .strict(),
+]);
+
+export const revertRecordSchema = z
+  .object({
+    /**
+     * `min(1)` here is a BACKSTOP and not the live refusal, which is worth
+     * saying because a mutation removing it survived every test in this round.
+     * `artifactSetSchema` requires at least one artifact, so every proposal
+     * touches at least one path, so `proposalProblems` always reports
+     * REVERT_INCOMPLETE before this bound can be the sole reason — the two
+     * checks are redundant TODAY. It is kept because the redundancy is
+     * one-directional: if an empty artifact set ever becomes legal, this is the
+     * only thing left standing between "a proposal" and "a proposal nobody can
+     * revert".
+     */
+    entries: z.array(revertEntrySchema).min(1).max(MAX_ARTIFACTS_PER_SET * 2),
+    paths: z.array(artifactPath).min(1).max(MAX_ARTIFACTS_PER_SET * 2),
+  })
+  .strict();
+
+/**
+ * THE WRITE PATH FOR A PROPOSED CHANGE TO TESTS THAT ALREADY EXIST.
+ *
+ * ── A PROPOSAL WITH NO REVERSIBILITY RECORD CANNOT BE STORED ───────────────
+ *
+ * `revert` is required, `entries` and `paths` are both `min(1)`, and
+ * `proposalProblems` refuses a record that does not have an entry for every
+ * path the proposal touches. A refactor nobody can revert will not be approved,
+ * so the shape makes it unstorable rather than leaving it to a reviewer to
+ * notice — which is the difference between a rule and a hope.
+ *
+ * ── THE BLAST RADIUS IS DISCLOSED, NOT DISCOVERED ──────────────────────────
+ *
+ * `dependentTestIds` and `dependentPaths` are what the producer computed with
+ * `dependentsAffected`. The schema cannot verify them (it has no ledger), and
+ * saying otherwise would be a doc comment contradicting its code; what it CAN
+ * do is refuse a proposal that touches a SHARED role and discloses nothing,
+ * because a page-object replacement with an empty dependent list is either a
+ * page object nothing imports — in which case say so with a rationale — or a
+ * blast radius nobody computed.
+ */
+export const suiteChangeProposalSchema = z
+  .object({
+    kind: suiteChangeKindSchema,
+    state: suiteChangeStateSchema.default('PROPOSED'),
+    title: z.string().min(1).max(200),
+    rationale: z.string().min(1).max(2_000),
+    before: artifactSetSchema,
+    after: artifactSetSchema,
+    dependentTestIds: z.array(z.string().min(1).max(64)).max(500).default([]),
+    dependentPaths: z.array(artifactPath).max(500).default([]),
+    revert: revertRecordSchema,
+  })
+  .strict()
+  .superRefine((proposal, ctx) => {
+    for (const problem of proposalProblems(proposal)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `${problem.kind}: ${problem.why}`,
+        path: problem.kind.startsWith('REVERT') ? ['revert'] : ['after'],
+      });
+    }
+  })
+  .refine((proposal) => proposal.state !== 'APPLIED' || proposal.revert.entries.length > 0, {
+    message:
+      'an APPLIED proposal with no revert entries is a change already on disk that nothing can ' +
+      'put back. The record is written BEFORE the apply, never after it',
+    path: ['revert'],
+  });
+
+// ─── The house-style profile ─────────────────────────────────────────────────
+
+/**
+ * One field of the profile.
+ *
+ * A factory rather than fourteen hand-written objects, so a field cannot be
+ * declared with a different bound from its neighbours — which is how
+ * `filesConsidered` would come to be unbounded on one field and capped on the
+ * rest.
+ */
+function styleObservationSchema<T extends z.ZodTypeAny>(value: T) {
+  return z
+    .object({
+      /** Null ⟺ confidence UNKNOWN. The refinement below refuses them apart. */
+      value: value.nullable(),
+      confidence: styleConfidenceSchema,
+      filesSeen: z.number().int().min(0).max(1_000_000),
+      filesConsidered: z.number().int().min(0).max(1_000_000),
+      examples: z
+        .array(z.string().max(MAX_STYLE_EXAMPLE_CHARS))
+        .max(MAX_STYLE_EXAMPLES)
+        .default([]),
+      /** The formatter that owns this field. Non-null means "do not state it as a rule". */
+      deferredTo: z.string().min(1).max(60).nullable().default(null),
+    })
+    .strict();
+}
+
+const fileLayoutSchema = z
+  .object({
+    root: z.string().max(MAX_ARTIFACT_PATH_CHARS),
+    filename: z.string().min(1).max(120),
+    colocated: z.boolean(),
+  })
+  .strict();
+
+const repositoryHelperSchema = z
+  .object({
+    /**
+     * An identifier, because a helper NAME is the one part of this profile a
+     * generated file interpolates into code. `styleProfileProblems` refuses the
+     * same shape; both exist because a profile can arrive from an import path
+     * that never called the producer.
+     */
+    name: z
+      .string()
+      .min(1)
+      .max(80)
+      .regex(/^[A-Za-z_$][A-Za-z0-9_$]*$/, 'a helper name is interpolated into generated code'),
+    path: artifactPath,
+    /** UNTRUSTED CUSTOMER SOURCE. Rendered only through `fenceUntrusted`. */
+    signature: z.string().max(300),
+    usedInFiles: z.number().int().min(0).max(1_000_000),
+  })
+  .strict();
+
+const testLengthSchema = z
+  .object({
+    medianLines: z.number().int().min(0).max(100_000),
+    p90Lines: z.number().int().min(0).max(100_000),
+  })
+  .strict();
+
+/**
+ * THE WRITE PATH FOR A COMPUTED HOUSE-STYLE PROFILE.
+ *
+ * ── THE REFUSAL THIS ROUND ASKED FOR BY NAME ───────────────────────────────
+ *
+ * A style field with HIGH confidence and an evidence count of one. It is
+ * refused twice over, and both are deliberate:
+ *
+ *   · `confidenceFor` cannot return anything but UNKNOWN below
+ *     `MIN_EVIDENCE_FILES`, so a profile built by the computer cannot contain
+ *     one.
+ *   · `styleProfileProblems` refuses it anyway, because a profile can also
+ *     arrive from a plugin, an import, or a hand-written row — and a guard that
+ *     only holds on the path that did not need it is decoration.
+ *
+ * `CONFIDENCE_NOT_COMPUTED` is the sharpest of the refusals and the least
+ * obvious: the stored confidence must be exactly what `confidenceFor` derives
+ * from the stored counts. Without it the counts become decoration printed
+ * beside a confidence somebody chose, which is the precise shape of "a thing
+ * reported as measured that was not measured".
+ */
+export const styleProfileSchema = z
+  .object({
+    scopeRoot: z.string().max(MAX_ARTIFACT_PATH_CHARS).default(''),
+    filesRead: z.number().int().min(0).max(1_000_000),
+    /**
+     * Files the scan found and did not read. REPORTED, never subtracted: a
+     * profile built from 12 of 240 files because a cap bit is a different thing
+     * from a profile built from a 12-file repository, and only one of them
+     * should be believed.
+     */
+    filesSkipped: z
+      .array(
+        z
+          .object({ path: z.string().max(MAX_ARTIFACT_PATH_CHARS), reason: z.string().min(1).max(200) })
+          .strict(),
+      )
+      .max(500)
+      .default([]),
+
+    runner: styleObservationSchema(z.enum(ECOSYSTEM_IDS as readonly [string, ...string[]])),
+    assertionIdiom: styleObservationSchema(z.enum(DIALECT_IDS)),
+    fileLayout: styleObservationSchema(fileLayoutSchema),
+    naming: styleObservationSchema(namingConventionSchema),
+    fixtureMechanism: styleObservationSchema(fixtureMechanismSchema),
+    setupIdiom: styleObservationSchema(setupIdiomSchema),
+    locatorStrategy: styleObservationSchema(locatorStrategySchema),
+    testIdAttribute: styleObservationSchema(z.string().min(1).max(60)),
+    importStyle: styleObservationSchema(importStyleSchema),
+    importAlias: styleObservationSchema(z.string().min(1).max(60)),
+    quoteStyle: styleObservationSchema(quoteStyleSchema),
+    semicolonStyle: styleObservationSchema(semicolonStyleSchema),
+    parameterisation: styleObservationSchema(parameterisationSchema),
+    testLength: styleObservationSchema(testLengthSchema),
+    helpers: z.array(repositoryHelperSchema).max(200).default([]),
+  })
+  .strict()
+  .superRefine((profile, ctx) => {
+    for (const problem of styleProfileProblems(profile as unknown as StyleProfile)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `${problem.kind}: ${problem.why}`,
+        path: [problem.field],
+      });
+    }
+  });

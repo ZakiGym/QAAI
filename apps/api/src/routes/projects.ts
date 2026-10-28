@@ -1477,7 +1477,30 @@ projectsRouter.post(
       integrationId: integration.id,
       branch: result.branch,
       commitSha: result.commitSha,
+      /*
+       * THE INTENT AND THE CHANGE ARE TWO NUMBERS, AND THIS ROW USED TO CARRY
+       * ONLY THE FIRST.
+       *
+       * `fileCount` is the size of QAAI's tree — what the push MEANT to sync —
+       * and `pushRepo`'s own doc comment says so. Since ownership gates every
+       * write, it is no longer the number of files that moved: with no
+       * ownership reader supplied every path already on the branch resolves
+       * UNRECORDED and is REFUSED, so a second push of the same project writes
+       * nothing and this row said `files: 40` about it. An audit row is the
+       * only durable record of the push, and one that reports an intent as
+       * though it were a result is a thing reported as measured that was not.
+       *
+       * `ownershipKnown` is here for the same reason: 0 written because nothing
+       * was permitted and 0 written because nothing had changed are different
+       * outcomes, and only this flag distinguishes them.
+       */
       files: result.fileCount,
+      filesWritten: result.filesWritten,
+      filesCreated: result.filesCreated,
+      filesDeleted: result.filesDeleted.length,
+      refused: result.refusedCount,
+      kept: result.keptCount,
+      ownershipKnown: result.ownershipKnown,
     },
   });
 

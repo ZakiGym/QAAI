@@ -1540,11 +1540,28 @@ export function findDuplicates(
     // mode this field exists to prevent.
     complete: !capped && skippedCommonTokens.length === 0 && ineligible.length === 0,
     ineligible,
+    /*
+     * NON-NULL WHENEVER `complete` IS FALSE, and the third arm is why this
+     * comment exists: the ineligibility filter above is one of the three things
+     * that can make a scan incomplete and it was the ONLY one with no sentence
+     * behind it. A one-test suite is the smallest case that reaches it, and it
+     * reported `complete: false` with `incompleteReason: null` — so every
+     * downstream reader had to invent a reason, and `refactorFeed` invented
+     * "a cap was reached", which was false.
+     *
+     * `scoreSuiteHealth` papered over the null with `?? 'no test could be
+     * compared'`, which is nearly right and is not the measurement: the real
+     * answer names HOW MANY tests were never compared and why.
+     */
     incompleteReason: capped
       ? `the pair scan stopped at ${maxPairs} candidate comparisons`
       : skippedCommonTokens.length > 0
         ? `${skippedCommonTokens.length} behaviour token(s) are shared by more than ${maxPostings} tests and were not expanded`
-        : null,
+        : ineligible.length > 0
+          ? `${ineligible.length} of ${behaviors.length} test(s) were never eligible to be compared (${
+              ineligible[0]?.reason ?? 'no reason recorded'
+            })`
+          : null,
     pairsCompared: candidates.size,
     skippedCommonTokens: skippedCommonTokens.slice(0, 20),
     omittedPairs: Math.max(0, scored.length - pairs.length),
@@ -2600,6 +2617,252 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
       minSimilarity: options.minSimilarity ?? DEFAULT_MIN_SIMILARITY,
       findingsCapped: weakAssertions.length >= MAX_FINDINGS,
     },
+  };
+}
+
+// ─── Feeding the refactor engine ─────────────────────────────────────────────
+
+/**
+ * WHAT THIS MODULE HAS NAMED AND NOTHING COULD EVER ACT ON.
+ *
+ * This file has reported duplicate clusters and weak assertions since it was
+ * written, and there was no path from a finding to a change: the suite only ever
+ * grew. `refactor.ts` is now the engine — `extractFixture`,
+ * `mergeNearDuplicates`, `strengthenAssertions` — and this function is the only
+ * sanctioned way to turn THIS module's findings into ITS inputs.
+ *
+ * ── WHY IT IS HERE AND NOT IN refactor.ts ──────────────────────────────────
+ *
+ * Because the selection rules below are statements about what a FINDING means,
+ * and this file owns the findings. `membersDiffer`, `assertionsDiffer`,
+ * `PLUGIN_ASSERTED_TYPES` and the severity ladder are all declared above; a
+ * second reading of them in refactor.ts would be a second opinion about which
+ * findings are safe to act on, and the permissive one would win the first time
+ * they drifted.
+ *
+ * ── THE FOUR REFUSALS, EACH ONE A WAY THIS COULD DESTROY WORK ───────────────
+ *
+ * ONE. A CLUSTER WHOSE MEMBERS DIFFER IS NOT MERGED. `membersDiffer` means at
+ * least one member asserts something the others do not, and that member is
+ * frequently the only test that catches a regression. Rule ONE of this file is
+ * that nothing deletes a test and nothing may claim deleting one is safe; a
+ * merge over differing members is that claim wearing a different word.
+ *
+ * TWO. A CLUSTER SPANNING FILES IS NOT MERGED. `mergeNearDuplicates` requires
+ * every member in one file, and a merge across files would have to delete a
+ * file — see rule ONE again.
+ *
+ * THREE. AN INCOMPLETE SCAN PROPOSES NOTHING. When a cap bit,
+ * `DuplicateScan.complete` is false and the cluster list is a FLOOR: a cluster
+ * of three may really be a cluster of five, and merging three of five produces
+ * two near-duplicates where there were five. `scoreSuiteHealth` already refuses
+ * to grade duplication off an incomplete scan, and this refuses to act on one.
+ *
+ * FOUR. A FINDING ABOUT A TEST WHOSE SOURCE WAS NOT READ COMPLETELY IS NOT
+ * ACTED ON. `unanalyzed` names them, and a refactor computed from a partial
+ * reading would rewrite bytes nobody saw.
+ *
+ * Model-free, pure, and every refusal is RETURNED rather than logged — see
+ * {@link RefactorFeed.declined}, because a finding silently not acted on reads
+ * as a finding nobody found.
+ */
+
+/** A finding this function declined to turn into a proposal, and why. */
+export interface DeclinedFinding {
+  /** `EXTRACT_FIXTURE`, `MERGE_NEAR_DUPLICATES` or `STRENGTHEN_ASSERTION`. */
+  readonly operation: 'EXTRACT_FIXTURE' | 'MERGE_NEAR_DUPLICATES' | 'STRENGTHEN_ASSERTION';
+  /** The tests the declined finding was about. */
+  readonly testIds: readonly string[];
+  readonly why: string;
+}
+
+/** One merge this feed is willing to ask `mergeNearDuplicates` for. */
+export interface MergeCandidate {
+  readonly testIds: readonly string[];
+  /** The finding, quoted into the proposal's rationale verbatim. */
+  readonly finding: string;
+}
+
+/** One strengthening this feed is willing to ask `strengthenAssertions` for. */
+export interface StrengthenCandidate {
+  readonly testId: string;
+  readonly kind: WeakAssertionKind;
+  readonly severity: Severity;
+  readonly finding: string;
+}
+
+export interface RefactorFeed {
+  readonly merges: readonly MergeCandidate[];
+  readonly strengthenings: readonly StrengthenCandidate[];
+  /** Every finding that was NOT turned into a candidate, with the reason. */
+  readonly declined: readonly DeclinedFinding[];
+  /**
+   * How many candidates {@link MAX_REFACTOR_CANDIDATES} refused to emit, per
+   * operation. A cap that BIT, reported as a count — a caller that saw ten
+   * merges must be able to tell "there were ten" from "there were ten of
+   * ninety".
+   */
+  readonly omitted: { readonly merges: number; readonly strengthenings: number };
+}
+
+/**
+ * How many candidates of each kind one call emits.
+ *
+ * TWENTY. Each one becomes a `SuiteChangeProposal` a human has to read, and a
+ * review queue of two hundred proposals is a review queue nobody opens — which
+ * would leave the findings exactly as unactioned as they were before this
+ * existed. The number of findings is unbounded; the number a human will look at
+ * in one sitting is not.
+ */
+export const MAX_REFACTOR_CANDIDATES = 20;
+
+/**
+ * Only these weak-assertion kinds are worth proposing a strengthening for.
+ *
+ * A `Record` over the whole vocabulary so a seventh kind cannot be added
+ * without a decision. The two that are `false` are not oversights:
+ *
+ *   NO_NEGATIVE_PATH   asks for a test that does not exist. That is a plan item
+ *                      and a new test, not a rewrite of this one, and proposing
+ *                      it here would offer to "strengthen" a test by adding a
+ *                      scenario it was never about.
+ *   SWALLOWED_ASSERTION is an assertion inside a `try`/`catch` or behind a
+ *                      conditional. Removing the swallow changes CONTROL FLOW,
+ *                      and `strengthenAssertions` only ever adds or tightens an
+ *                      assertion — proposing it would produce a diff that does
+ *                      not do what the proposal's title says.
+ */
+export const WEAKNESS_IS_STRENGTHENABLE = {
+  NO_ASSERTIONS: true,
+  TRANSPORT_ONLY: true,
+  EXISTENCE_ONLY: true,
+  VOLATILE_ASSERTION: true,
+  SWALLOWED_ASSERTION: false,
+  NO_NEGATIVE_PATH: false,
+} as const satisfies Record<WeakAssertionKind, boolean>;
+
+export function refactorFeed(report: SuiteHealthReport): RefactorFeed {
+  const merges: MergeCandidate[] = [];
+  const strengthenings: StrengthenCandidate[] = [];
+  const declined: DeclinedFinding[] = [];
+  let mergesOmitted = 0;
+  let strengtheningsOmitted = 0;
+
+  /*
+   * `unanalyzed` carries the tests whose source was not read completely. A
+   * refactor over one of those rewrites bytes nobody saw, so a finding touching
+   * one is declined by NAME rather than by being absent.
+   */
+  const unread = new Set(report.unanalyzed.map((entry) => entry.testId));
+
+  // ── Merges ──
+  if (!report.limits.duplicateScanComplete) {
+    /*
+     * Refusal THREE, and it is reported once rather than per cluster: the
+     * cluster list is a floor, so every cluster in it may be a subset of a
+     * bigger one. "Nothing was proposed" and "the scan was partial" are
+     * different sentences and this is the one that is true.
+     */
+    declined.push({
+      operation: 'MERGE_NEAR_DUPLICATES',
+      testIds: report.duplicateClusters.flatMap((cluster) => cluster.testIds),
+      why:
+        /*
+         * The note is non-null whenever the scan is incomplete — see
+         * `findDuplicates`, whose third arm exists because this sentence used to
+         * read "a cap was reached" over a scan where no cap had been reached.
+         * The fallback is kept as a backstop and names ITSELF rather than
+         * inventing a cause.
+         */
+        `The duplicate scan did not complete (${
+          report.limits.duplicateScanNote ?? 'the scan reported no reason, which is itself a defect'
+        }), so every cluster in it is a FLOOR rather than a total — a cluster of three may ` +
+        'really be a cluster of five, and merging three of five leaves two near-duplicates ' +
+        'where there were five. No merge was proposed from this scan.',
+    });
+  } else {
+    for (const cluster of report.duplicateClusters) {
+      const files = new Set(cluster.members.map((member) => member.filePath));
+      const touchesUnread = cluster.testIds.some((id) => unread.has(id));
+
+      if (cluster.membersDiffer) {
+        declined.push({
+          operation: 'MERGE_NEAR_DUPLICATES',
+          testIds: cluster.testIds,
+          why:
+            'At least one member of this cluster asserts something the others do not, so merging ' +
+            'it would drop a check. A duplicate that differs in one assertion is frequently the ' +
+            'only test that catches a regression. A human should compare them.',
+        });
+        continue;
+      }
+      if (files.size > 1) {
+        declined.push({
+          operation: 'MERGE_NEAR_DUPLICATES',
+          testIds: cluster.testIds,
+          why: `This cluster spans ${files.size} files (${[...files].join(', ')}). A merge across files would have to delete one, and nothing in this product deletes a test file.`,
+        });
+        continue;
+      }
+      if (touchesUnread) {
+        declined.push({
+          operation: 'MERGE_NEAR_DUPLICATES',
+          testIds: cluster.testIds,
+          why: "At least one member's source was not read completely, so a merge would rewrite bytes nobody analysed.",
+        });
+        continue;
+      }
+      if (merges.length >= MAX_REFACTOR_CANDIDATES) {
+        mergesOmitted += 1;
+        continue;
+      }
+      merges.push({
+        testIds: cluster.testIds,
+        finding: `${cluster.size} tests in ${cluster.members[0]?.filePath ?? 'one file'} walk the same routes (${cluster.sharedRoutes.join(', ') || 'none recorded'}) and make the same assertions. ${cluster.recommendation}`,
+      });
+    }
+  }
+
+  // ── Strengthenings ──
+  for (const finding of report.weakAssertions) {
+    if (!WEAKNESS_IS_STRENGTHENABLE[finding.kind]) {
+      declined.push({
+        operation: 'STRENGTHEN_ASSERTION',
+        testIds: [finding.testId],
+        why:
+          finding.kind === 'NO_NEGATIVE_PATH'
+            ? 'A missing error path is a new test, not a rewrite of this one. Propose a plan item for it instead.'
+            : 'The assertion is swallowed by control flow, and removing the swallow changes what the test does rather than what it checks. A human should unwrap it.',
+      });
+      continue;
+    }
+    if (unread.has(finding.testId)) {
+      declined.push({
+        operation: 'STRENGTHEN_ASSERTION',
+        testIds: [finding.testId],
+        why: "This test's source was not read completely, so a rewrite would change bytes nobody analysed.",
+      });
+      continue;
+    }
+    if (strengthenings.length >= MAX_REFACTOR_CANDIDATES) {
+      strengtheningsOmitted += 1;
+      continue;
+    }
+    strengthenings.push({
+      testId: finding.testId,
+      kind: finding.kind,
+      severity: finding.severity,
+      finding: `[${finding.severity}] ${finding.kind} in "${finding.testName}"${
+        finding.line === null ? '' : ` at line ${finding.line}`
+      }: ${finding.why} ${finding.assertInstead}`,
+    });
+  }
+
+  return {
+    merges,
+    strengthenings,
+    declined,
+    omitted: { merges: mergesOmitted, strengthenings: strengtheningsOmitted },
   };
 }
 

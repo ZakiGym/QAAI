@@ -44,6 +44,18 @@ import type { FlowMap, Language, PlanItem, Priority, TestResultStatus, UiFramewo
 import { generateTest } from './generator.js';
 import type { GeneratedTest } from './generator.js';
 import type { CallContext, LlmService } from './llm.js';
+/*
+ * ALIASED, and the collision is worth a line: this file already has a local
+ * `MAX_FENCE_CHARS` (2,000) and it means a MARKDOWN code fence — the ``` block
+ * `pullFences` pulls out of a bug report. The imported one is the untrusted-
+ * span ceiling (20,000). Two different things called a fence in one file, so
+ * neither keeps the bare name.
+ */
+import {
+  MAX_FENCE_CHARS as MAX_UNTRUSTED_SPAN_CHARS,
+  composePrompt,
+  untrusted,
+} from './untrusted.js';
 
 // ─── Limits ──────────────────────────────────────────────────────────────────
 
@@ -1772,6 +1784,15 @@ export const reportEnrichmentSchema = z.object({
   /** Why the model read it this way — shown to the user, never acted on. */
   reading: z.string().max(600),
 });
+/*
+ * OPEN, AND NAMED RATHER THAN LEFT IMPLIED: this schema carries no field for
+ * the fence disclosure `enrichReport` now produces. The `[TRUNCATED: n ...]`
+ * note reaches the MODEL, so the model is never reasoning over a silently
+ * truncated report — but the CALLER cannot learn that the report was cut,
+ * which is what `ConvertResult.truncatedSources` exists for one module over.
+ * Adding the field changes this schema and every consumer of it, so it is
+ * recorded here instead of half-done.
+ */
 export type ReportEnrichment = z.infer<typeof reportEnrichmentSchema>;
 
 const ENRICH_SYSTEM = `You are reading a bug report inside QAAI, an AI QA engineer.
@@ -1805,19 +1826,53 @@ export async function enrichReport(
 ): Promise<ReportEnrichment> {
   const { text, extracted } = args;
 
-  const prompt = `BUG REPORT AS PASTED
-${text.slice(0, 20_000)}
+  /*
+   * EVERY SPAN BELOW IS FENCED, and this call site is why `BUG_REPORT` is a
+   * member of `UNTRUSTED_PROVENANCES`.
+   *
+   * This prompt used to read `${text.slice(0, 20_000)}` — the pasted report
+   * interpolated raw under a bare `BUG REPORT AS PASTED` heading with no
+   * delimiters. That is the same shape, and the same 20,000, as the
+   * `importer.ts` defect this round was written to close: a bug report is
+   * whatever its reporter typed, and on a public issue tracker the reporter is
+   * anybody. The parser's findings are fenced too, because `title`, `steps`,
+   * `selectors`, `urls` and `errorStrings` were all extracted VERBATIM from
+   * the same text — our field names around their values does not make the
+   * values ours.
+   *
+   * The slice was also SILENT: a 50,000-character report lost 30,000 of itself
+   * with nothing saying so, to the model or to anyone. `fence` emits a
+   * `[TRUNCATED: n ...]` note with the limit and the reason, so the model is
+   * told the report is cut off rather than reasoning over a sentence that
+   * stops mid-word. See the open note on `ReportEnrichment` for the half of
+   * that disclosure this signature still cannot carry.
+   */
+  const parserFindings = [
+    `  title:     ${extracted.title ?? '(none)'}`,
+    `  steps:     ${extracted.steps.length > 0 ? extracted.steps.map((step, i) => `\n    ${i + 1}. ${step}`).join('') : '(none found)'}`,
+    `  expected:  ${extracted.expected ?? '(none found)'}`,
+    `  actual:    ${extracted.actual ?? '(none found)'}`,
+    `  urls:      ${[...extracted.urls, ...extracted.paths].join(', ') || '(none)'}`,
+    `  selectors: ${extracted.selectors.join(', ') || '(none)'}`,
+    `  errors:    ${extracted.errorStrings.join(' | ') || '(none)'}`,
+  ].join('\n');
 
-WHAT THE PARSER ALREADY FOUND (do not contradict it)
-  title:     ${extracted.title ?? '(none)'}
-  steps:     ${extracted.steps.length > 0 ? extracted.steps.map((s, i) => `\n    ${i + 1}. ${s}`).join('') : '(none found)'}
-  expected:  ${extracted.expected ?? '(none found)'}
-  actual:    ${extracted.actual ?? '(none found)'}
-  urls:      ${[...extracted.urls, ...extracted.paths].join(', ') || '(none)'}
-  selectors: ${extracted.selectors.join(', ') || '(none)'}
-  errors:    ${extracted.errorStrings.join(' | ') || '(none)'}
-
-Fill in what is missing. Repeat what is already there unchanged.`;
+  const { text: prompt } = composePrompt([
+    { kind: 'OURS', text: 'BUG REPORT AS PASTED' },
+    {
+      kind: 'DATA',
+      span: untrusted({ provenance: 'BUG_REPORT', text }),
+      maxChars: MAX_UNTRUSTED_SPAN_CHARS,
+    },
+    {
+      kind: 'OURS',
+      text:
+        'WHAT THE PARSER ALREADY FOUND (do not contradict it). The field names are ours; every ' +
+        'value beside them was taken verbatim out of the report above, so the block is fenced too.',
+    },
+    { kind: 'DATA', span: untrusted({ provenance: 'BUG_REPORT', text: parserFindings }) },
+    { kind: 'OURS', text: 'Fill in what is missing. Repeat what is already there unchanged.' },
+  ]);
 
   return llm.structured(ctx, {
     tier: 'cheap',

@@ -48,6 +48,13 @@ import { MODEL_FREE_TEST_TYPES, NEW_TEST_TEMPLATES, TEST_TYPES } from '@qaai/sha
 import type { ExecutableTest, FlowMap, PlanItem, TestType } from '@qaai/shared';
 import { pluginFor } from '@qaai/runner';
 import type { CallContext, StructuredOptions } from '@qaai/agent';
+/*
+ * Reached by a relative path across the workspace boundary, which is a defect
+ * and is recorded as one in the module under test: `packages/shared/src/index.ts`
+ * does not export `./style-profile`, and the one-line fix is TS2308 because
+ * `artifact-set.ts` and `requirements.ts` both export `ContentDigest`.
+ */
+import { emptyStyleProfile } from '../../../../packages/shared/src/style-profile.js';
 
 /*
  * The worker's context opens Postgres, Redis and the LLM at import time, so it
@@ -94,8 +101,14 @@ vi.mock('../context.js', () => {
   };
 });
 
-const { DUPLICATE_CANDIDATE_CAP, GENERATE_AUDIT_ACTIONS, duplicateCandidates, processGenerate } =
-  await import('./generate.js');
+const {
+  DUPLICATE_CANDIDATE_CAP,
+  GENERATE_AUDIT_ACTIONS,
+  SHARED_ARTIFACT_ROLES,
+  duplicateCandidates,
+  ledgerRowsFor,
+  processGenerate,
+} = await import('./generate.js');
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -402,27 +415,134 @@ function matchesWhere(row: Record<string, unknown>, where: Record<string, unknow
   return true;
 }
 
-function fakeWorld(options: { items?: Array<Record<string, unknown>>; tests?: FakeTest[] } = {}): {
+/**
+ * A row reduced to the fields a `select` asked for.
+ *
+ * SELECT-BLIND FAKES ARE WHY THIS EXISTS. A fake that returns the whole row
+ * makes DELETING A FIELD FROM A QUERY UNDETECTABLE — the assertion downstream
+ * still finds the field, because the fake supplied it and the real client would
+ * not have. Two defects survived a whole slice behind exactly that.
+ */
+function selected<T extends Record<string, unknown>>(
+  row: T,
+  select: Record<string, boolean> | undefined,
+): Partial<T> {
+  if (!select) return row;
+  const out: Record<string, unknown> = {};
+  for (const [key, wanted] of Object.entries(select)) {
+    if (wanted) out[key] = row[key];
+  }
+  return out as Partial<T>;
+}
+
+function fakeWorld(
+  options: {
+    items?: Array<Record<string, unknown>>;
+    tests?: FakeTest[];
+    /** `Project.styleProfile`, as a Json column holds it — anything at all. */
+    styleProfile?: unknown;
+    styleProfileComputedAt?: Date | null;
+    /** Rows in the correction corpus for this project. */
+    corrections?: Array<Record<string, unknown>>;
+    /** Ownership rows already in the ledger, which an insert must not overwrite. */
+    artifacts?: Array<Record<string, unknown>>;
+  } = {},
+): {
   tests: FakeTest[];
   created: Array<Record<string, unknown>>;
   planItemUpdates: Array<{ id: string; data: Record<string, unknown> }>;
   audits: Array<Record<string, unknown>>;
   candidateQueries: Array<Record<string, unknown>>;
+  /** Every ownership row the processor asked to create. */
+  artifactWrites: Array<Record<string, unknown>>;
+  /** The corpus queries, so the project boundary can be asserted on. */
+  correctionQueries: Array<Record<string, unknown>>;
 } {
   const tests: FakeTest[] = options.tests ? [...options.tests] : [];
   const created: Array<Record<string, unknown>> = [];
   const planItemUpdates: Array<{ id: string; data: Record<string, unknown> }> = [];
   const audits: Array<Record<string, unknown>> = [];
   const candidateQueries: Array<Record<string, unknown>> = [];
+  const artifactWrites: Array<Record<string, unknown>> = [];
+  const correctionQueries: Array<Record<string, unknown>> = [];
+  const ledger: Array<Record<string, unknown>> = options.artifacts ? [...options.artifacts] : [];
   let clock = Date.parse('2026-10-01T00:00:00.000Z');
 
   h.prisma = {
     project: {
-      findFirst: async () => ({
-        id: 'p1',
-        primaryLanguage: 'TYPESCRIPT',
-        primaryFramework: 'PLAYWRIGHT',
-      }),
+      findFirst: async ({ select }: { select?: Record<string, boolean> } = {}) =>
+        selected(
+          {
+            id: 'p1',
+            primaryLanguage: 'TYPESCRIPT',
+            primaryFramework: 'PLAYWRIGHT',
+            styleProfile: options.styleProfile ?? null,
+            /*
+             * `in` and not `??`: `null` is a MEANING here — "stored with no
+             * date", which the processor must refuse — and `null ?? default`
+             * would silently replace it with a date, making that branch
+             * untestable.
+             */
+            styleProfileComputedAt:
+              'styleProfileComputedAt' in options
+                ? options.styleProfileComputedAt
+                : options.styleProfile === undefined || options.styleProfile === null
+                  ? null
+                  : new Date('2026-10-20T00:00:00.000Z'),
+          },
+          select,
+        ),
+    },
+    /*
+     * The correction corpus. `select` is honoured, so a field dropped from the
+     * processor's query stops arriving here.
+     */
+    testCorrection: {
+      findMany: async ({
+        where,
+        take,
+        select,
+      }: {
+        where: Record<string, unknown>;
+        take?: number;
+        select?: Record<string, boolean>;
+      }) => {
+        correctionQueries.push({ where, take });
+        return (options.corrections ?? [])
+          .filter((row) => matchesWhere(row, where ?? {}))
+          .slice(0, take ?? undefined)
+          .map((row) => selected(row, select));
+      },
+    },
+    /*
+     * The ownership ledger. `skipDuplicates` is MODELLED rather than ignored:
+     * the existing fact at a path must win over a later generation, and an
+     * upsert-shaped fake would hide a processor that downgraded a HUMAN_EDITED
+     * row back to QAAI_OWNED.
+     */
+    generatedArtifact: {
+      findMany: async ({ where, select }: { where: Record<string, unknown>; select?: Record<string, boolean> }) =>
+        ledger.filter((row) => matchesWhere(row, where ?? {})).map((row) => selected(row, select)),
+      createMany: async ({
+        data,
+        skipDuplicates,
+      }: {
+        data: Array<Record<string, unknown>>;
+        skipDuplicates?: boolean;
+      }) => {
+        let count = 0;
+        for (const row of data) {
+          artifactWrites.push(row);
+          const clash = ledger.some(
+            (existing) => existing.projectId === row.projectId && existing.path === row.path,
+          );
+          if (clash && skipDuplicates) continue;
+          if (clash) throw new Error('unique constraint on (projectId, path)');
+          ledger.push(row);
+          count += 1;
+        }
+        return { count };
+      },
     },
     testPlan: { findFirst: async () => ({ id: 'plan1', flowMapId: 'fm1' }) },
     flowMap: {
@@ -485,7 +605,15 @@ function fakeWorld(options: { items?: Array<Record<string, unknown>>; tests?: Fa
     },
   };
 
-  return { tests, created, planItemUpdates, audits, candidateQueries };
+  return {
+    tests,
+    created,
+    planItemUpdates,
+    audits,
+    candidateQueries,
+    artifactWrites,
+    correctionQueries,
+  };
 }
 
 function existingTest(over: Partial<FakeTest> = {}): FakeTest {
@@ -993,5 +1121,330 @@ describe('the provenance a generated test is born with', () => {
     expect(world.planItemUpdates).toEqual([
       { id: 'item-checkout', data: { state: 'GENERATED', generatedTestId: 'already' } },
     ]);
+  });
+});
+
+// ─── The craft: ownership, house style, and the project boundary ─────────────
+
+/*
+ * THE THREE SURFACES THIS ROUND MINTED AND NOTHING WROTE TO.
+ *
+ * `GeneratedArtifact`, `Project.styleProfile` and `TestCorrection` all landed as
+ * schema with no writer and no reader, which is this codebase's signature
+ * defect. These tests are about the WIRING of each one, and every one is
+ * written so that unwiring it turns the test red.
+ */
+describe('the ownership ledger a generated test is born with', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  /*
+   * THE SINGLE FACT `pushRepo` LACKED. Without a row here the next git sync
+   * resolves this path UNRECORDED, refuses to write it and refuses to delete it
+   * — safe, and useless: a test QAAI generated would never reach the branch.
+   */
+  it('records the generated spec as QAAI_OWNED, with its hash and its bytes', async () => {
+    const world = fakeWorld();
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect(world.artifactWrites).toHaveLength(1);
+    const row = world.artifactWrites[0]!;
+    expect(row.path).toBe(CHECKOUT_PATH);
+    expect(row.role).toBe('SPEC');
+    expect(row.ownership).toBe('QAAI_OWNED');
+    expect(row.testId).toBe('test-1');
+    expect(row.orgId).toBe('org1');
+    expect(row.projectId).toBe('p1');
+    // The hash is the optimistic-concurrency token: it is what makes "the bytes
+    // on disk are still the bytes we wrote" decidable at all.
+    expect(String(row.contentHash)).toMatch(/^[0-9a-f]{64}$/);
+    expect(row.bytes).toBe(CHECKOUT_CODE.length);
+  });
+
+  /*
+   * THE WORST FAILURE AVAILABLE IN THIS SCHEMA. A human took our file over, the
+   * row says HUMAN_EDITED, and a later generation at the same path must NOT
+   * downgrade it — because the next sync would then overwrite their edit.
+   */
+  it('never downgrades an existing ownership row, and says it kept it', async () => {
+    const world = fakeWorld({
+      artifacts: [
+        {
+          orgId: 'org1',
+          projectId: 'p1',
+          path: CHECKOUT_PATH,
+          role: 'SPEC',
+          ownership: 'HUMAN_EDITED',
+          contentHash: 'theirs',
+          imports: [],
+        },
+      ],
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    // The test row was still created — nothing about the ledger stops that.
+    expect(world.created).toHaveLength(1);
+    // And the existing fact survived, with the shortfall reported as a count.
+    const kept = h.log.find((line) => /the existing fact was kept/.test(line.msg));
+    expect(kept).toBeDefined();
+    expect((kept?.obj as { planned: number; recorded: number }).planned).toBe(1);
+    expect((kept?.obj as { planned: number; recorded: number }).recorded).toBe(0);
+  });
+});
+
+describe("the project's own house style", () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  it('is read from the cache and reaches the prompt', async () => {
+    /*
+     * A profile with ONE measured field, and the evidence counts that justify
+     * its confidence — `styleProfileSchema` re-derives the confidence from those
+     * counts and refuses a mismatch, so a hand-written profile has to be
+     * arithmetically honest to parse at all.
+     */
+    const profile = {
+      ...emptyStyleProfile(''),
+      filesRead: 5,
+      testIdAttribute: {
+        value: 'data-qa',
+        confidence: 'HIGH' as const,
+        filesSeen: 5,
+        filesConsidered: 5,
+        examples: [],
+        deferredTo: null,
+      },
+    };
+    fakeWorld({ styleProfile: profile });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect(h.prompts[0]).toContain('data-qa');
+  });
+
+  /*
+   * A stored blob that does not validate is a blob whose confidences somebody
+   * CHOSE rather than computed, and stating it would tell the model a
+   * HIGH-confidence convention over one file. So it becomes NO profile plus a
+   * flag — the same shape an unreadable actor list already gets.
+   */
+  it('becomes a review flag, not a throw, when the stored blob does not validate', async () => {
+    const world = fakeWorld({ styleProfile: { scopeRoot: '', filesRead: 'five' } });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect(world.created).toHaveLength(1);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/stored house-style profile and it did not validate/);
+    expect(flags).toMatch(/Nothing from that column was passed through unchecked/);
+  });
+
+  it('refuses a profile whose age cannot be answered', async () => {
+    const world = fakeWorld({
+      styleProfile: emptyStyleProfile(''),
+      styleProfileComputedAt: null,
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect((world.created[0]!.reviewFlags as string[]).join('\n')).toMatch(
+      /no computed-at date/,
+    );
+  });
+
+  it('says on the test that nobody has measured this repository', async () => {
+    const world = fakeWorld();
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/nobody has computed this repository's own/);
+    expect(flags).toMatch(/setup is inline rather than extracted/);
+  });
+});
+
+describe('the correction corpus', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  /*
+   * THE PROJECT BOUNDARY. `corpusWhere` is the only way to build this
+   * where-clause and both ids are required, so a query that could cross
+   * projects does not compile — and this asserts the clause that reaches Prisma
+   * really does carry both, with no symbol key on it.
+   */
+  it('is queried inside one project, newest first, within a window', async () => {
+    const world = fakeWorld({ corrections: [] });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect(world.correctionQueries).toHaveLength(1);
+    const query = world.correctionQueries[0]!;
+    expect(query.where).toEqual({ orgId: 'org1', projectId: 'p1' });
+    expect(Object.getOwnPropertySymbols(query.where as object)).toEqual([]);
+    expect(query.take).toBeGreaterThan(0);
+  });
+
+  it('reports that nothing was supplied, rather than looking like a clean suite', async () => {
+    const world = fakeWorld({ corrections: [] });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job);
+
+    expect((world.created[0]!.reviewFlags as string[]).join('\n')).toMatch(
+      /What reviewers in this project keep changing/,
+    );
+  });
+});
+
+
+// ─── The ledger rows one set owes ───────────────────────────────────────────
+
+/*
+ * TESTED DIRECTLY, AND THE REASON IS WORTH RECORDING: `processGenerate` passes
+ * no `repository`, so it never produces a multi-artifact set and the two
+ * branches below are unreachable THROUGH it today. Driving them through the
+ * processor would mean asserting on a shape production cannot currently
+ * produce; `ledgerRowsFor` is a pure exported function and the invariants are
+ * about it, so they are pinned where they live. The missing wiring — one
+ * materialised checkout per batch — is in this round's handover.
+ */
+describe('ledgerRowsFor', () => {
+  const set = {
+    dialect: 'JS_EXPECT' as const,
+    artifacts: [
+      {
+        role: 'PAGE_OBJECT' as const,
+        path: 'pages/cart.page.ts',
+        content: 'export class CartPage {}',
+        disposition: 'NEW' as const,
+        ownership: 'QAAI_OWNED' as const,
+        imports: [],
+        basedOnHash: null,
+        why: 'the page object',
+      },
+      {
+        role: 'SPEC' as const,
+        path: 'tests/cart.spec.ts',
+        content: 'test("x", () => {});',
+        disposition: 'NEW' as const,
+        ownership: 'QAAI_OWNED' as const,
+        imports: ['pages/cart.page.ts'],
+        basedOnHash: null,
+        why: 'the spec',
+      },
+    ],
+  };
+
+  /*
+   * A page object two specs import belongs to NEITHER. Attaching it to the
+   * first spec that happened to need it would make deleting that test look like
+   * permission to delete the page object.
+   */
+  it('attaches a shared role to no test at all', () => {
+    const rows = ledgerRowsFor({
+      set,
+      recordAsTheirs: [],
+      orgId: 'org1',
+      projectId: 'p1',
+      testId: 'test_1',
+      sharedRoles: SHARED_ARTIFACT_ROLES,
+    });
+
+    expect(rows.find((row) => row.role === 'PAGE_OBJECT')?.testId).toBeNull();
+    expect(rows.find((row) => row.role === 'SPEC')?.testId).toBe('test_1');
+  });
+
+  /*
+   * THE ROWS THE APPLY PATH OWES FOR SOMEBODY ELSE'S FILES. Without them
+   * `artifactSetProblems` refuses a spec that imports a human's page object
+   * with UNRESOLVED_IMPORT for ever — the import resolves against the set or
+   * against the LEDGER, and a file that plainly exists is in neither. Worse and
+   * slower: with no row, a later run resolves that path UNRECORDED, and
+   * UNRECORDED is the state a reservation may CLAIM.
+   */
+  it('records a human file this set imports as theirs, so a reservation cannot claim it', () => {
+    const rows = ledgerRowsFor({
+      set,
+      recordAsTheirs: ['pages/their-login.page.ts'],
+      orgId: 'org1',
+      projectId: 'p1',
+      testId: 'test_1',
+      sharedRoles: SHARED_ARTIFACT_ROLES,
+    });
+
+    const theirs = rows.find((row) => row.path === 'pages/their-login.page.ts');
+    expect(theirs).toBeDefined();
+    expect(theirs?.ownership).toBe('HUMAN_AUTHORED');
+    expect(theirs?.testId).toBeNull();
+    // Their bytes were never read, so nothing claims to have hashed them.
+    expect(theirs?.bytes).toBe(0);
+  });
+
+  it('derives the shared roles from the vocabulary rather than listing them again', () => {
+    // A SPEC is not shared — nothing imports a spec — and a SNAPSHOT belongs to
+    // exactly the spec that compares against it.
+    expect(SHARED_ARTIFACT_ROLES.has('PAGE_OBJECT')).toBe(true);
+    expect(SHARED_ARTIFACT_ROLES.has('FIXTURE')).toBe(true);
+    expect(SHARED_ARTIFACT_ROLES.has('SPEC')).toBe(false);
+    expect(SHARED_ARTIFACT_ROLES.has('SNAPSHOT')).toBe(false);
   });
 });

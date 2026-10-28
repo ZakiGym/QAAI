@@ -283,6 +283,110 @@ export * from './coverage-async.js';
  * agent's is "did the control request prove the endpoint is live", the runner's
  * is "was the control attempted at all".
  */
+/*
+ * ── THE CRAFT MODULES ───────────────────────────────────────────────────────
+ *
+ * Six modules, and `check:wiring` flagged `artifacts.ts`, `corrections.ts` and
+ * `refactor.ts` under `package-exports` the moment they landed: built,
+ * typechecked, documented as serving the generator, and reachable from nothing
+ * but their own test files. That is this codebase's signature defect and these
+ * lines are half the cure; the other half is that every one of them is also
+ * REACHED by a real call path, which is what `generator.ts`,
+ * `apps/worker/src/processors/generate.ts` and `apps/api/src/routes/agent.ts`
+ * do in this same change. A barrel line alone would make them public and still
+ * uncalled, which is a prettier shape of the same defect.
+ *
+ * `style-learner.ts`, `page-objects.ts` and `untrusted.ts` were NOT flagged,
+ * and that is the part worth recording: `corrections.ts` imports the first,
+ * `artifacts.ts` imports the second and `importer.ts` imports the third, so the
+ * ratchet reads them as reached while the front door is shut — rule E, "it has
+ * tests is not a read path", in its quieter form. They are listed because their
+ * SHAPES are what apps/api and apps/worker have to speak: the ownership
+ * verdicts, the exemplar selection, the fenced span.
+ *
+ * What each one buys:
+ *
+ *   `untrusted`      the fence. Customer source, page text, commit messages and
+ *                    review comments reach a prompt through `composePrompt` or
+ *                    not at all, and `UntrustedSpan` has no string member, so
+ *                    the next call site gets a compile error rather than
+ *                    repeating the defect quietly.
+ *   `style-learner`  the model-free house-style profile and the exemplar
+ *                    selector. A test in the project's own dialect is the one a
+ *                    reviewer keeps.
+ *   `corrections`    the correction corpus: what reviewers always change about
+ *                    what we write, which has been sitting in
+ *                    `TestVersion.source` unread for the life of the product.
+ *   `page-objects`   the page object synthesised from the crawl, with its
+ *                    locator brittleness and its quoters.
+ *   `artifacts`      which files one generated test IS, and where they go —
+ *                    from their ledger and their layout, never from ours.
+ *   `refactor`       the only path from a suite-health finding to a change.
+ *                    Extract a fixture, merge near-duplicates, strengthen an
+ *                    assertion — each with a revert record carrying the BYTES.
+ *
+ * ── ORDER AND CYCLES, CHECKED ───────────────────────────────────────────────
+ *
+ * Import order: `untrusted` depends on nothing, `style-learner` on
+ * `ecosystems`/`dialect` in @qaai/shared, `corrections` on `style-learner` and
+ * `ecosystem-prompts`, `page-objects` on @qaai/shared, `artifacts` on
+ * `page-objects` and `ecosystem-prompts`, `refactor` on `suite-health` and
+ * `dialect`. Every one of those is above or beside it, so no line adds a cycle.
+ * None of the six imports a `node:` builtin — verified by grep, not asserted —
+ * so none can break a consumer that bundles this package.
+ *
+ * ── THE ONE NAME THAT COLLIDES, AND IT IS RESOLVED RATHER THAN CLAIMED ──────
+ *
+ * `__internal`. `admission.ts` (above) and `refactor.ts` both export a
+ * test-only bag under that name, which makes a star export of the second TS2308
+ * on this file — which is how the collision was found rather than asserted. The
+ * explicit re-export below chooses `admission.ts`'s, which this barrel already
+ * published, so nothing that compiles today stops compiling;
+ * `refactor.test.ts` reaches its own by relative path and is unaffected.
+ *
+ * Two near-misses recorded so nobody re-introduces them, both already resolved
+ * by their authors: `CorrectionPattern` (published by `triage.ts` for a
+ * from→to verdict override) became `ReviewerPattern` in `corrections.ts`, and
+ * `namingOf` (`artifacts.ts`, over a profile) is distinct from
+ * `namingConventionOf` (`style-learner.ts`, over a path). `tsc -p
+ * packages/agent/tsconfig.json` reports no other TS2308 on this file.
+ */
+/*
+ * `suite-health.js` was NEVER in this barrel, and the consequence is recorded
+ * in apps/api/src/routes/agent.ts, which reaches `SuiteHealthTestInput` by a
+ * relative path across the workspace boundary with a comment saying it is
+ * type-only for exactly that reason. `refactorFeed` is a VALUE that same file
+ * now needs — the only path from a suite-health finding to a change — so the
+ * front door is opened rather than a second runtime relative import being
+ * added.
+ *
+ * It must go ABOVE `refactor.js`, which imports it, and above `artifacts.js`
+ * for readability; `admission.js` (further up) already imports it, so this line
+ * adds no cycle it did not have. No name collides: checked against this
+ * barrel's existing graph and confirmed by `tsc -p packages/agent/tsconfig.json`
+ * reporting no TS2308 on this file.
+ */
+export * from './suite-health.js';
+/*
+ * ONE NAME COLLIDES AND IT IS RESOLVED RATHER THAN CLAIMED. `traffic.js` and
+ * `suite-health.js` both export a `JourneyCoverage`, which makes the star above
+ * TS2308 on this file — which is how the collision was found. They are two
+ * different questions: traffic's is "how much of this journey did real users
+ * take", suite-health's is "how much of it does the suite walk". The line below
+ * keeps `traffic.js`'s, which this barrel has published for several rounds, so
+ * nothing that compiles today stops compiling; suite-health's stays reachable
+ * by relative path from its own tests and from `refactor.ts`, which imports it
+ * directly.
+ */
+export type { JourneyCoverage } from './traffic.js';
+export * from './untrusted.js';
+export * from './style-learner.js';
+export * from './corrections.js';
+export * from './page-objects.js';
+export * from './artifacts.js';
+export * from './refactor.js';
+export { __internal } from './admission.js';
+
 export * from './synthetic-factory.js';
 export * from './walks.js';
 export * from './fault-scenarios.js';
