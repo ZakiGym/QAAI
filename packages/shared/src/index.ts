@@ -235,3 +235,44 @@ export * from './test-type-decl';
  */
 export * from './artifact-set';
 export * from './style-profile';
+
+/*
+ * ── THE SUPPRESSION AND OWNERSHIP VOCABULARIES ──────────────────────────────
+ *
+ * THE DEFECT THESE TWO LINES CLOSED, and it was lesson A in its purest form.
+ * Before them, FOUR modules in @qaai/agent reached this vocabulary by RELATIVE
+ * PATH ACROSS THE WORKSPACE BOUNDARY — `../../shared/src/suppression.js` in
+ * known-issues.ts, env-issue.ts, obsolete.ts and drift.ts — which compiles,
+ * bypasses the package entry point, and leaves `SUPPRESSION_KIND_RULES`'s
+ * compile-enforced presence record enforced on a file nobody imports as a
+ * package. Written in the past tense on purpose: every one of those imports now
+ * says `@qaai/shared`, and so do the principals and boundaries imports in
+ * multi-actor.ts, authz-probe.ts, boundaries.ts and runner's tenancy.ts, which
+ * had been carrying the same note about `./principals` for a round. A barrel
+ * line that lands while nine files still bypass it has closed nothing.
+ *
+ * It matters more here than for any vocabulary above, because this is the one
+ * about SUPPRESSION: `isInForce` is the single function that decides whether an
+ * expired mute still silences a failure, and a second copy of that decision
+ * reached by a path the package cannot see is exactly the hole the whole
+ * vocabulary exists to close.
+ *
+ * ── THE STANDING TEST THIS BARREL APPLIES, CHECKED RATHER THAN CLAIMED ──────
+ *
+ * Closed vocabularies, `satisfies Record<…>` tables and pure predicates; no
+ * `node:` builtin in either file (grepped, not assumed), so neither can 500 a
+ * page that reads a value from @qaai/shared. `suppression.ts` imports types
+ * from `./types` and values from `./ownership`, and `ownership.ts` imports
+ * types from `./types` alone — all published far above — so no line adds a
+ * cycle, and `ownership` going first is the import order.
+ *
+ * NAME COLLISIONS: none against the names this barrel already published.
+ * Two traps recorded because they are NOT errors here. `RetirementProposal` is
+ * a MODEL name in Prisma and an INTERFACE in @qaai/agent's obsolete.ts;
+ * neither is exported from here (this file publishes `RETIREMENT_STATES` and
+ * `retirementDenominatorEffect`). And `OwnerProvenance` is published here while
+ * `OwnerRef`/`OwnershipState` stay in `./types`, which is why ownership.ts
+ * imports them rather than restating them.
+ */
+export * from './ownership';
+export * from './suppression';

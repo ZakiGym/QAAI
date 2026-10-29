@@ -17,18 +17,28 @@ import type { RolePassResult } from './explore.js';
  * None of the three functions under test touches it; they are pure, which is
  * why they were extracted in the first place.
  */
+/*
+ * `prisma` is a PROXY over a mutable bag rather than the `{}` it used to be,
+ * because one function in this module genuinely talks to the database:
+ * `recordObsolescenceSignals`, which is what compares the suite against the
+ * crawl that just landed and files the `ObsoleteTestSignal` rows. A static `{}`
+ * made that function untestable, and an untestable writer of the one table that
+ * decides whether a test gets retired is not an acceptable trade.
+ */
+const db: { prisma: Record<string, Record<string, (args?: never) => unknown>> } = { prisma: {} };
 vi.mock('../context.js', () => ({
   config: { anthropicApiKey: '' },
   connection: {},
   llm: {},
   logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
-  prisma: {},
+  prisma: new Proxy({}, { get: (_t, k: string) => db.prisma[k] }),
   publishEvent: () => {},
 }));
 vi.mock('../vault.js', () => ({ secretsFor: async () => ({}) }));
 vi.mock('../queues.js', () => ({ enqueueGenerate: async () => {} }));
 
-const { adjudicateExplore, enumerationCompleteness, mergeFlowMaps } = await import('./explore.js');
+const { adjudicateExplore, enumerationCompleteness, mergeFlowMaps, recordObsolescenceSignals } =
+  await import('./explore.js');
 
 /**
  * WHAT THESE TESTS COVER, AND WHAT THEY DO NOT.
@@ -1125,5 +1135,253 @@ describe('roleAttemptReport — the one answer that must be allowed to be NULL',
     expect(report.routesNewToThisRole).toBeNull();
     expect(report.routesReached).toBeNull();
     expect(report.outcome).toBe('LOGIN_FAILED');
+  });
+});
+
+// ─── The obsolescence comparison, which DOES talk to the database ────────────
+
+/*
+ * THE DEFECT THESE TESTS HOLD. Nothing compared an existing test's routes
+ * against a NEW crawl, so a removed feature left a test that still counted as
+ * coverage and every rename cost a failing run plus a strong-model heal to
+ * rediscover. The comparison is a set difference with no model in it, which is
+ * why it runs with no API key.
+ *
+ * The rule they protect is the brake: ONE crawl may never retire a test. A new
+ * signal starts at one confirmation, which is below the threshold by
+ * construction, and the unique key `(testId, kind, reference)` is what makes
+ * "two consecutive crawls agreed" a fact rather than a count of rows.
+ */
+describe('comparing the suite against the crawl that just landed', () => {
+  interface Row {
+    [key: string]: unknown;
+  }
+
+  function installDb(over: { tests?: Row[]; items?: Row[]; signals?: Row[] } = {}): {
+    signals: Row[];
+    upserts: Row[];
+    resolved: Row[];
+  } {
+    const signals = over.signals ?? [];
+    const upserts: Row[] = [];
+    const resolved: Row[] = [];
+    db.prisma = {
+      test: { findMany: async () => (over.tests ?? []) },
+      coverageItem: {
+        count: async () => ((over.items ?? []).length > 0 ? 1 : 0),
+        findMany: async () => (over.items ?? []),
+      },
+      obsoleteTestSignal: {
+        findMany: async () => signals.filter((row) => row.resolvedAt == null),
+        upsert: async (args: Row = {}) => {
+          upserts.push(args);
+          /*
+           * The UNIQUE is enforced, because the whole brake depends on it: a
+           * fake that inserted a second row for one (test, kind, reference)
+           * would make "two consecutive crawls agreed" indistinguishable from
+           * "one crawl saw two things", which is the mistake that would retire
+           * a live feature.
+           */
+          const key = (args.where as Row).testId_kind_reference as Row;
+          const found = signals.find(
+            (row) =>
+              row.testId === key.testId &&
+              row.kind === key.kind &&
+              row.reference === key.reference,
+          );
+          if (found) Object.assign(found, args.update as Row);
+          else signals.push({ id: `sig_${signals.length}`, ...(args.create as Row) });
+          return {};
+        },
+        updateMany: async (args: Row = {}) => {
+          const ids = ((args.where as Row).id as Row).in as string[];
+          for (const row of signals.filter((r) => ids.includes(r.id as string))) {
+            Object.assign(row, args.data as Row);
+            resolved.push(row);
+          }
+          return { count: resolved.length };
+        },
+      },
+    };
+    return { signals, upserts, resolved };
+  }
+
+  const testRow = (over: Row = {}): Row => ({
+    id: 't1',
+    name: 'checkout works',
+    filePath: 'tests/checkout.spec.ts',
+    type: 'E2E',
+    priority: 'P1',
+    feature: null,
+    tags: [],
+    code: "test('x', async ({ page }) => { await page.goto('/gone'); });",
+    spec: null,
+    flakeRate: 0,
+    quarantined: false,
+    consecutiveFailures: 0,
+    ...over,
+  });
+
+  /*
+   * ACCEPTED, explicitly. A map with no adjudication cannot support a
+   * retirement at all — nothing has established that it enumerated the
+   * application rather than a login wall — so every test below that expects a
+   * signal has to hand over a crawl that was adjudicated, exactly as
+   * `processExplore` does when it builds the map it stores.
+   */
+  const accepted = (flowMap: FlowMap): FlowMap => ({
+    ...flowMap,
+    acceptance: {
+      state: 'ACCEPTED',
+      reasons: [],
+      degradations: [],
+      comparedToVersion: null,
+      previousNodeCount: null,
+    },
+  });
+
+  const args = (flowMap: FlowMap) => ({
+    orgId: 'org',
+    projectId: 'p',
+    flowMapId: 'fm_1',
+    flowMap: accepted(flowMap),
+  });
+
+  it('opens a signal at ONE confirmation, which can never retire a test on its own', async () => {
+    const { signals } = installDb({
+      tests: [testRow()],
+      items: [{ key: 'ROUTE:/live', origin: 'SOURCE_ONLY', retiredAt: null }],
+    });
+
+    const result = await recordObsolescenceSignals(args(map(['/live'])));
+
+    expect(result.withheldBecause).toBeNull();
+    expect(result.opened).toBe(1);
+    expect(result.confirmed).toBe(0);
+    // The brake: one crawl, one confirmation, and the threshold is two.
+    expect(result.admissible).toBe(0);
+    expect(signals[0]!.confirmations).toBe(1);
+    expect(signals[0]!.kind).toBe('ROUTE_GONE');
+    expect(signals[0]!.reference).toBe('/gone');
+    // The kind's own number, not the caller's.
+    expect(signals[0]!.confidence).toBeTypeOf('number');
+  });
+
+  it('a second crawl that agrees INCREMENTS the row rather than filing another', async () => {
+    const { signals } = installDb({
+      tests: [testRow()],
+      items: [{ key: 'ROUTE:/live', origin: 'SOURCE_ONLY', retiredAt: null }],
+      signals: [
+        {
+          id: 'sig_0',
+          testId: 't1',
+          kind: 'ROUTE_GONE',
+          reference: '/gone',
+          confirmations: 1,
+          resolvedAt: null,
+        },
+      ],
+    });
+
+    const result = await recordObsolescenceSignals(args(map(['/live'])));
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.confirmations).toBe(2);
+    expect(result.opened).toBe(0);
+    expect(result.confirmed).toBe(1);
+    expect(result.admissible).toBe(1);
+  });
+
+  /*
+   * REAPPEARED is the common and honest outcome, and the row is RESOLVED rather
+   * than deleted: "we nearly retired this test twice" has to stay answerable,
+   * and a deleted row would make a flapping route look like a fresh discovery
+   * every time.
+   */
+  it('resolves a signal that stopped being true instead of deleting it', async () => {
+    const { signals, resolved } = installDb({
+      tests: [testRow()],
+      items: [{ key: 'ROUTE:/gone', origin: 'SOURCE_ONLY', retiredAt: null }],
+      signals: [
+        {
+          id: 'sig_0',
+          testId: 't1',
+          kind: 'ROUTE_GONE',
+          reference: '/gone',
+          confirmations: 1,
+          resolvedAt: null,
+        },
+      ],
+    });
+
+    // The route is back in the crawl, so the signal is no longer true.
+    const result = await recordObsolescenceSignals(args(map(['/gone'])));
+
+    expect(result.reappeared).toBe(1);
+    expect(resolved).toHaveLength(1);
+    expect(signals[0]!.resolution).toBe('REAPPEARED');
+    expect(signals).toHaveLength(1);
+  });
+
+  /*
+   * NO SOURCE ANALYSIS MEANS NO SIGNAL, AND NO RESOLUTION EITHER. With nothing
+   * having read the code, "the source does not declare this route" is the
+   * absence of a detector rather than a fact — and a crawl that may not
+   * contribute a confirmation may not contribute the opposite one, or a bot
+   * wall would clear the evidence behind a real retirement every time.
+   */
+  it('withholds every signal — and every resolution — when no source analysis has run', async () => {
+    const { signals, resolved } = installDb({
+      tests: [testRow()],
+      items: [],
+      signals: [
+        {
+          id: 'sig_0',
+          testId: 't1',
+          kind: 'ROUTE_GONE',
+          reference: '/gone',
+          confirmations: 1,
+          resolvedAt: null,
+        },
+      ],
+    });
+
+    const result = await recordObsolescenceSignals(args(map(['/live'])));
+
+    expect(result.withheldBecause).not.toBeNull();
+    expect(result.opened).toBe(0);
+    expect(result.reappeared).toBe(0);
+    expect(resolved).toHaveLength(0);
+    // The existing evidence is untouched, not cleared.
+    expect(signals[0]!.confirmations).toBe(1);
+    expect(signals[0]!.resolvedAt).toBeNull();
+  });
+
+  /*
+   * A TRUNCATED CRAWL SAYS NOTHING ABOUT WHAT IS GONE. "We stopped looking" and
+   * "it is not there" are the two facts this whole path exists to keep apart.
+   */
+  it('withholds every signal when the crawl did not finish', async () => {
+    installDb({
+      tests: [testRow()],
+      items: [{ key: 'ROUTE:/live', origin: 'SOURCE_ONLY', retiredAt: null }],
+    });
+
+    const truncated: FlowMap = { ...map(['/live']), truncatedReason: 'page budget reached' };
+    const result = await recordObsolescenceSignals(args(truncated));
+
+    expect(result.withheldBecause).not.toBeNull();
+    expect(result.opened).toBe(0);
+  });
+
+  it('files nothing for a fixture, which is test data and not a test', async () => {
+    const { signals } = installDb({
+      tests: [testRow({ filePath: 'fixtures/checkout.json' })],
+      items: [{ key: 'ROUTE:/live', origin: 'SOURCE_ONLY', retiredAt: null }],
+    });
+
+    const result = await recordObsolescenceSignals(args(map(['/live'])));
+    expect(result.opened).toBe(0);
+    expect(signals).toHaveLength(0);
   });
 });

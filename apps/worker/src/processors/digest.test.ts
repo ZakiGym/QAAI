@@ -27,6 +27,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { summariseSuppressions } from '@qaai/shared';
 
 const h = vi.hoisted((): { prisma: Record<string, unknown>; log: string[] } => ({
   prisma: {},
@@ -77,6 +78,14 @@ const digestOf = (newFailures: DigestItem[]): Digest => ({
   until: UNTIL,
   runs: { total: 1, red: 1 },
   /*
+   * NOTHING SUPPRESSED, stated rather than omitted. `summariseSuppressions([])`
+   * is used instead of a hand-written object so the fixture cannot disagree
+   * with the summariser about what "nothing" looks like — including its
+   * `Nothing was suppressed.` sentence, which is the thing that distinguishes a
+   * surface that asked from one that forgot to.
+   */
+  suppressions: summariseSuppressions([]),
+  /*
    * NULL, which is NOT MEASURED, and that is the honest default for a fixture:
    * a project with no stored snapshot has no coverage figure. The renderer
    * prints the words rather than a number for it, which the test below asserts
@@ -110,8 +119,15 @@ function db(opts: {
   window?: Array<Record<string, unknown>>;
   /** What `priorOutcomes` sees before the window. Defaults to nothing. */
   prior?: Array<Record<string, unknown>>;
-}): { ruleQuery: Array<Record<string, unknown>> } {
+  /**
+   * `SuppressionEvent` rows for this window's runs. Defaults to NONE, which is
+   * the honest default and the one that makes "Nothing was suppressed." the
+   * fixture's answer rather than a missing field.
+   */
+  ledger?: Array<Record<string, unknown>>;
+}): { ruleQuery: Array<Record<string, unknown>>; ledgerQuery: Array<Record<string, unknown>> } {
   const ruleQuery: Array<Record<string, unknown>> = [];
+  const ledgerQuery: Array<Record<string, unknown>> = [];
   const prisma = h.prisma;
 
   prisma.project = {
@@ -140,8 +156,20 @@ function db(opts: {
   };
   prisma.user = { findMany: async () => opts.users ?? [] };
   prisma.team = { findMany: async () => opts.teams ?? [] };
+  /*
+   * The suppression ledger. The QUERY is captured as well as answered, because
+   * the window scoping is the property worth holding: these rows are scoped by
+   * RUN ID and not by a date range on the ledger, so a finaliser redelivered
+   * the next morning cannot file a suppression against the wrong day.
+   */
+  prisma.suppressionEvent = {
+    findMany: async (args: Record<string, unknown>) => {
+      ledgerQuery.push(args);
+      return opts.ledger ?? [];
+    },
+  };
 
-  return { ruleQuery };
+  return { ruleQuery, ledgerQuery };
 }
 
 /** One `TestResult` row as `collectDigest`'s window scan selects it. */
@@ -348,6 +376,80 @@ describe('collectDigest resolves ownership through the shared helpers', () => {
     expect(digest!.fixed[0]!.ownerState).toBeNull();
     // And the thing that WAS listed still carries its real state.
     expect(digest!.newFailures[0]!.ownerState).toBe('OWNED');
+  });
+
+  /*
+   * ── "47 FAILURES BY 3 KNOWN ISSUES" ──────────────────────────────────────
+   *
+   * THE DEFECT: a digest listing three new failures while a mute silenced forty
+   * is a digest that makes the larger fact invisible every morning, and this is
+   * the message most of a team ever reads about their suite. The file's own
+   * opening line is that a suppression nobody can audit is one nobody should
+   * trust; until this landed, the file could not say the sentence.
+   */
+  it('counts what went quiet, by kind, and says it on the digest', async () => {
+    db({
+      ledger: [
+        { kind: 'MUTE', sourceId: 'ki_1', suppressed: 40, inForce: true },
+        { kind: 'MUTE', sourceId: 'ki_2', suppressed: 7, inForce: true },
+        { kind: 'QUARANTINE', sourceId: 't9', suppressed: 2, inForce: true },
+      ],
+    });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.suppressions.suppressed).toBe(49);
+    // DISTINCT mutes, not ledger rows: two rows, two `sourceId`s, two issues.
+    expect(digest!.suppressions.disclosure).toContain('47 failures by 2 known issues');
+    expect(digest!.suppressions.disclosure).toContain('2 failures by 1 quarantined test');
+    expect(renderDigest(digest!, 'https://app.test')).toContain('Suppressed in this window');
+  });
+
+  /*
+   * THE ROW THAT PROVES AN EXPIRY WORKED silenced nothing, and is still
+   * reported. Hiding it is what makes an expiry arrive as a surprise outage.
+   */
+  it('reports an expired suppression that silenced nothing', async () => {
+    db({ ledger: [{ kind: 'MUTE', sourceId: 'ki_3', suppressed: 0, inForce: false }] });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.suppressions.suppressed).toBe(0);
+    expect(digest!.suppressions.expired).toBe(1);
+    expect(renderDigest(digest!, 'https://app.test')).toContain('expired and silenced nothing');
+  });
+
+  /*
+   * ZERO IS IN THE DATA AND NOT IN THE MESSAGE, deliberately — and both halves
+   * matter. `summariseSuppressions` says "Nothing was suppressed." so an API
+   * reader can tell a surface that ASKED from one that forgot; a chat message
+   * that says it every single morning is a line a team stops reading, and then
+   * the mornings that DO matter get skipped with it.
+   */
+  it('keeps the zero out of the chat message while still stating it in the data', async () => {
+    db({});
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.suppressions.disclosure).toBe('Nothing was suppressed.');
+    expect(renderDigest(digest!, 'https://app.test')).not.toContain('Suppressed in this window');
+  });
+
+  /*
+   * SCOPED BY RUN ID, not by a date range on the ledger. A finaliser redelivered
+   * the next morning writes its row then, and a digest that read
+   * `createdAt BETWEEN since AND until` would attribute that suppression to the
+   * wrong day — or miss it entirely.
+   */
+  it('scopes the ledger to this window’s runs rather than to a date range', async () => {
+    const { ledgerQuery } = db({});
+
+    await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(ledgerQuery).toHaveLength(1);
+    const where = (ledgerQuery[0]!.where ?? {}) as Record<string, unknown>;
+    expect(where.runId).toEqual({ in: ['run1'] });
+    expect(where.createdAt).toBeUndefined();
   });
 
   it('still labels a rule whose user row has gone, rather than reporting it unowned', async () => {

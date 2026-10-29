@@ -30,6 +30,9 @@ const heal = (over: Partial<Heal> = {}): Heal => ({
   confidence: 0.9,
   state: 'PROPOSED',
   createdAt: '2026-10-24T00:00:00.000Z',
+  // NULL and not omitted: "no pull request" is the fixture's claim, and an
+  // absent field would be the type widening rather than the fact being stated.
+  pullRequest: null,
   test: { id: 't_1', name: 'checkout → pay', filePath: 'tests/pay.spec.ts', code: '' },
   preview: {
     kind: 'RETIREMENT',

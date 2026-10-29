@@ -418,6 +418,51 @@ export const ROLE_RANK: Record<OrgRole, number> = {
 export const ENVIRONMENT_KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
 export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number];
 
+/**
+ * EVERY THIRD-PARTY SYSTEM QAAI TALKS TO. Mirrors Prisma `IntegrationKind`.
+ *
+ * ── WHY THIS EXISTS ALONGSIDE THE FOUR LISTS BELOW ──────────────────────────
+ *
+ * The four lists under it — GIT_, GRID_, VISUAL_, CHAT_ — are CAPABILITY lists:
+ * each one answers "what can QAAI actually do with this kind?", and a member is
+ * absent from them on purpose when no code path can deliver to it (PAGERDUTY's
+ * comment below is the worked example). Their union is 15 of the enum's 18
+ * members, so JIRA, LINEAR and PAGERDUTY were in no list at all.
+ *
+ * This one is the STORAGE mirror: what the column can hold. Three columns store
+ * `IntegrationKind` — `Integration.kind`, `TrackerIssue.provider` and
+ * `PullRequestRecord.provider` — and until this list existed there was no
+ * complete TypeScript name for any of them, so `check-enums` could not pair the
+ * enum and nothing would have caught a member added to the schema and never
+ * mentioned in the code. The enum naming the two trackers QAAI files tickets
+ * into had three members TypeScript could not say out loud.
+ *
+ * So the two kinds of list answer different questions and both are needed. A
+ * capability list says what works; this one says what is legal to store. Adding
+ * a member here does NOT make it creatable — the creation paths validate
+ * against the capability lists, which is the behaviour that was already right.
+ */
+export const INTEGRATION_KINDS = [
+  'GITHUB',
+  'GITLAB',
+  'BITBUCKET',
+  'BROWSERSTACK',
+  'SAUCE_LABS',
+  'LAMBDATEST',
+  'PERFECTO',
+  'APPLITOOLS',
+  'PERCY',
+  'CHROMATIC',
+  'SLACK',
+  'MSTEAMS',
+  'DISCORD',
+  'JIRA',
+  'LINEAR',
+  'PAGERDUTY',
+  'WEBHOOK',
+] as const;
+export type IntegrationKind = (typeof INTEGRATION_KINDS)[number];
+
 /** The git providers QAAI can push a materialised repo to (token-based). */
 export const GIT_INTEGRATION_KINDS = ['GITHUB', 'GITLAB', 'BITBUCKET'] as const;
 export type GitIntegrationKind = (typeof GIT_INTEGRATION_KINDS)[number];

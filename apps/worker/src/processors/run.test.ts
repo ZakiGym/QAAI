@@ -205,6 +205,16 @@ vi.mock('../queues.js', () => ({
    * `new Queue(...)` for every producer in that file.
    */
   PREFLIGHT_QUEUE: 'qaai.preflight',
+  /*
+   * The suppression expiry sweep's queue, present for the same reason as the
+   * two above: the one test here that imports `../index.js` runs every
+   * `register(...)` at import time, so a name missing from this mock is a
+   * module-level TypeError rather than a skipped registration — which is how
+   * one absent constant turned the permanently-failed handler's test red with a
+   * message about a mock.
+   */
+  SUPPRESSION_QUEUE: 'qaai.suppression',
+  armSuppressionSweep: async () => {},
   armFlakeTick: async () => {},
   armPreflightSweep: async () => {},
   armScheduleTick: async () => {},
@@ -627,6 +637,27 @@ interface Db {
   verdicts: Map<string, { verdict: string; overriddenTo: string | null; reviewState: string }>;
   /** Every `TestResultVariant` row that exists, as the writer leaves it. */
   variantRows: MeasuredRow[];
+  /**
+   * The suppression ledger, as the finaliser reads it.
+   *
+   * A REAL STORE and not an empty stub: the finaliser folds these rows into
+   * `runOutcome`'s suppression summary, which is the sentence the CLI prints
+   * and the GitHub check shows — "47 failures by 3 known issues". A stub that
+   * always answered `[]` would make deleting that read invisible, and a run
+   * that passed while a known issue silenced forty failures would go back to
+   * saying nothing.
+   */
+  suppressionEvents: MeasuredRow[];
+  /**
+   * Every `where` the ledger read was given.
+   *
+   * CAPTURED AND NOT JUST ANSWERED, because the QUARANTINE exclusion lives in
+   * TWO places — this read and `runOutcome` — and mutation proved the second
+   * one alone made the first undetectable. Two guards for one rule is
+   * defensible; two guards of which only one is covered is a guard that can be
+   * deleted with the suite still green.
+   */
+  suppressionQueries: MeasuredRow[];
   /** Every `TestMetricSample` row that exists. */
   readingRows: MeasuredRow[];
   /**
@@ -819,6 +850,8 @@ function fakeDb(
       runRow({ id: 'run3', status: 'QUEUED' }),
     ],
     variantRows: [],
+    suppressionEvents: [],
+    suppressionQueries: [],
     readingRows: [],
     measurementOps: [],
   };
@@ -1022,6 +1055,25 @@ function fakeDb(
     run: runModel,
     testResult: resultModel,
     organization: { findUniqueOrThrow: async () => ({ plan: 'TEAM' }) },
+    /*
+     * The ledger read. `select` and the QUARANTINE exclusion are both honoured,
+     * because both are load-bearing: `sourceId` is what makes "3 known issues"
+     * a count of DISTINCT mutes rather than of rows, and a quarantine row
+     * reaching `runOutcome` would double the one total a release decision
+     * reads (the counter already carries it).
+     */
+    suppressionEvent: {
+      findMany: async (
+        args: { where?: Record<string, unknown>; select?: Record<string, boolean> } = {},
+      ) => {
+        db.suppressionQueries.push((args.where ?? {}));
+        const not = (args.where?.kind as { not?: string } | undefined)?.not;
+        return db.suppressionEvents
+          .filter((row) => row.runId === args.where?.runId && row.orgId === args.where?.orgId)
+          .filter((row) => not === undefined || row.kind !== not)
+          .map((row) => projectRow(row, args.select));
+      },
+    },
     // Fixture rows and the auth profile: absent, which is the common case and
     // keeps these tests about the lifecycle rather than the workspace.
     test: {
@@ -2100,6 +2152,72 @@ describe('a run whose only failure is a quarantined test', () => {
     quarantinedFailureDb();
     await processRun(job());
     expect(h.triaged.map((t) => t.testResultId)).toContain('r_t2');
+  });
+
+  /*
+   * ── THE LEDGER REACHES THE GATE, COUNTED ─────────────────────────────────
+   *
+   * This is the WIRING assertion, and it is the one this round exists for: a
+   * known issue silenced forty failures during triage, and until the finaliser
+   * read the ledger the run that followed said nothing about them. The summary
+   * is composed by `runOutcome`, which is the only function allowed to answer
+   * "did this run pass", so the sentence reaches the CLI, the GitHub check and
+   * the cockpit by the one path all three already use.
+   *
+   * The quarantine numbers are asserted ALONGSIDE, because the two must not
+   * merge: the counter carries quarantine and the ledger carries the rest, and
+   * a total that counted either one twice is the lie this assertion forbids.
+   */
+  it('folds the suppression ledger into the frame beside the quarantine count', async () => {
+    const db = quarantinedFailureDb();
+    db.suppressionEvents.push(
+      { orgId: ORG, runId: RUN, kind: 'MUTE', sourceId: 'ki_1', suppressed: 40, inForce: true },
+      { orgId: ORG, runId: RUN, kind: 'MUTE', sourceId: 'ki_2', suppressed: 7, inForce: true },
+      // The row that PROVES an expiry worked: it silenced nothing, and it is
+      // still reported rather than being an absence a reader must guess about.
+      { orgId: ORG, runId: RUN, kind: 'MUTE', sourceId: 'ki_3', suppressed: 0, inForce: false },
+      // Another run's row must not be counted into this one.
+      { orgId: ORG, runId: 'other', kind: 'MUTE', sourceId: 'ki_9', suppressed: 99, inForce: true },
+    );
+    await processRun(job());
+
+    const [finished] = published('run.finished');
+    const verdict = finished!.data.verdict as { suppressedFailures: number; reason: string };
+    // 47 from the two live mutes, plus the one quarantined failure.
+    expect(verdict.suppressedFailures).toBe(48);
+    expect(verdict.reason).toContain('47 failures by 2 known issues');
+    expect(verdict.reason).toContain('1 suppression has expired and silenced nothing');
+    expect(verdict.reason).toContain('quarantined');
+  });
+
+  /*
+   * A QUARANTINE ROW IN THE LEDGER IS NOT COUNTED TWICE. The finaliser excludes
+   * the kind at the read, because `counts.quarantinedFailed` already carries it
+   * and `tallyResult` is its only writer.
+   */
+  it('does not double-count a quarantine the counter already carries', async () => {
+    const db = quarantinedFailureDb();
+    db.suppressionEvents.push({
+      orgId: ORG,
+      runId: RUN,
+      kind: 'QUARANTINE',
+      sourceId: 't2',
+      suppressed: 1,
+      inForce: true,
+    });
+    await processRun(job());
+
+    const [finished] = published('run.finished');
+    expect((finished!.data.verdict as { suppressedFailures: number }).suppressedFailures).toBe(1);
+    /*
+     * AND THE EXCLUSION IS AT THE READ, asserted separately because
+     * `runOutcome` filters QUARANTINE a second time: with only the total
+     * asserted, deleting this filter was invisible, which mutation testing is
+     * what caught. The read is the first guard and it is the one that keeps the
+     * finaliser from carrying a kind it has no business summing.
+     */
+    expect(db.suppressionQueries).toHaveLength(1);
+    expect(db.suppressionQueries[0]!.kind).toEqual({ not: 'QUARANTINE' });
   });
 });
 

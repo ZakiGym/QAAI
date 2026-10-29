@@ -107,7 +107,9 @@ vi.mock('@qaai/agent', async (orig) => {
   };
 });
 
-const { processTriage, CLUSTER_VERDICT_WAIT } = await import('./triage.js');
+const { processTriage, processSuppressionSweep, CLUSTER_VERDICT_WAIT } = await import(
+  './triage.js'
+);
 const { failureClusterKey, verificationRunTag } = await import('@qaai/agent');
 const { signatureOf, extractFacets } = await import('../../../api/src/lib/cluster.js');
 
@@ -193,6 +195,17 @@ interface Store {
   runFailureCluster: Row[];
   healProposal: Row[];
   testVersionUpdates: Row[];
+  /** The durable mutes this project has written. */
+  knownIssue: Row[];
+  /** Retirement proposals, for the expiry sweep. */
+  retirementProposal: Row[];
+  /** One row per (issue, run, cause) — the EVIDENCE behind `matchCount`. */
+  knownIssueMatch: Row[];
+  /**
+   * The counted ledger. The row that matters most is the boring one:
+   * `inForce: false, suppressed: 0` is the only durable proof an expiry worked.
+   */
+  suppressionEvent: Row[];
   /** Runs this process created — the verification of an unattended heal. */
   runs: Row[];
   /** `UsageRecord` upserts, so a run created here is also a run metered. */
@@ -287,6 +300,15 @@ function model(
         if ('not' in c) return source[key] !== c.not;
         if ('gt' in c) return source[key] instanceof Date && source[key] > (c.gt as Date);
         if ('gte' in c) return source[key] instanceof Date && source[key] >= (c.gte as Date);
+        /*
+         * `lte` and `lt`, which the expiry sweep's reads are built on. Modelled
+         * rather than shrugged at: a fake that ignored the bound would hand the
+         * sweep every proposal and every mute in the store, so "it leaves a
+         * proposal whose window is still open alone" would pass for a sweep
+         * that expired everything.
+         */
+        if ('lte' in c) return source[key] instanceof Date && source[key] <= (c.lte as Date);
+        if ('lt' in c) return source[key] instanceof Date && source[key] < (c.lt as Date);
         if (hydrate) return matchesNested(source[key], c);
         throw new Error(`fake prisma: unsupported ${name} filter ${key}=${JSON.stringify(cond)}`);
       }
@@ -296,6 +318,47 @@ function model(
 
   const read = (row: Row | undefined): Row | null =>
     row ? (hydrate ? hydrate(row) : row) : null;
+
+  /**
+   * `select`, PROJECTED rather than ignored.
+   *
+   * A SELECT-BLIND FAKE MAKES DELETING A FIELD FROM A QUERY UNDETECTABLE: the
+   * processor's own result read already hand-rolls this projection, with a
+   * comment recording the column that went unread behind a fake that handed
+   * back whole rows. The known-issue read selects eleven columns and drops any
+   * one of them changes a mute's owner, its expiry or its match count, so the
+   * same rule is applied here to every model.
+   *
+   * A nested `{ select: … }` recurses, so the cause join's
+   * `testResult: { select: { testId: true } }` is modelled too — without it,
+   * the near tier's test-id half could be deleted with every test still green.
+   */
+  const project = (row: Row, select: Row | undefined): Row => {
+    if (!select) return row;
+    const out: Row = {};
+    for (const [field, want] of Object.entries(select)) {
+      if (!want) continue;
+      const value = row[field];
+      if (want !== true && typeof want === 'object' && 'select' in (want as Row)) {
+        const inner = (want as Row).select as Row;
+        /*
+         * A TO-MANY relation projects ELEMENT-WISE. Treating the array as one
+         * object is not a near-miss: it returns a plain object, so `.length`
+         * and `.filter` vanish and the member count silently reads zero — which
+         * is how `sizeCause` came to tell the model a 200-test cause had one
+         * member while every test stayed green.
+         */
+        out[field] = Array.isArray(value)
+          ? value.map((entry) => project(entry as Row, inner))
+          : value && typeof value === 'object'
+            ? project(value as Row, inner)
+            : value;
+      } else {
+        out[field] = value;
+      }
+    }
+    return out;
+  };
 
   return {
     findUnique: async (args: Row = {}) => read(matchUnique(args.where ?? {})),
@@ -318,7 +381,31 @@ function model(
           return dir === 'desc' ? -cmp : cmp;
         });
       }
-      return typeof args.take === 'number' ? out.slice(0, args.take) : out;
+      const page = typeof args.take === 'number' ? out.slice(0, args.take) : out;
+      return page.map((r) => project(r, args.select as Row | undefined));
+    },
+    count: async (args: Row = {}) => rows().filter((r) => matchesWhere(r, args.where)).length,
+    /*
+     * `upsert`, with the UNIQUE actually enforced.
+     *
+     * The suppression ledger's idempotence is the whole reason these rows can
+     * be trusted as a count: `SuppressionEvent` has
+     * `@@unique([runId, kind, targetKey])` and `KnownIssueMatch`
+     * `@@unique([knownIssueId, runId, clusterKey])`, so a redelivered triage
+     * job must UPDATE the row it already wrote. A fake whose upsert always
+     * inserted would make a doubled count — which is exactly as dishonest as a
+     * missing one — invisible.
+     */
+    upsert: async (args: Row = {}) => {
+      const found = matchUnique(args.where ?? {});
+      if (found) {
+        applyData(found, args.update as Row);
+        return found;
+      }
+      const data = { ...(args.create as Row) };
+      const row = { id: data.id ?? nextId(String(name)), ...defaults, ...data };
+      rows().push(row);
+      return row;
     },
     create: async (args: Row = {}) => {
       const data = { ...(args.data as Row) };
@@ -363,6 +450,10 @@ function installDb(): void {
     runFailureCluster: [],
     healProposal: [],
     testVersionUpdates: [],
+    knownIssue: [],
+    retirementProposal: [],
+    knownIssueMatch: [],
+    suppressionEvent: [],
     runs: [],
     metered: [],
     transactions: [],
@@ -478,6 +569,33 @@ function installDb(): void {
       firstSeenInProject: false,
       verdictId: null,
       resolvedAt: null,
+    }),
+    /*
+     * ── THE DURABLE MUTE'S THREE TABLES ────────────────────────────────────
+     *
+     * Real models, not stubs, because every property worth asserting about
+     * them is a property of a WRITE: the ledger row that proves an expiry
+     * worked, the match row a redelivery must not double, and the denormalised
+     * `matchCount` that has to agree with the matches it sums. A stub would let
+     * all three be deleted with the suite still green.
+     */
+    knownIssue: model('knownIssue', [['id']], undefined, {
+      matchCount: 0,
+      firstMatchedAt: null,
+      lastMatchedAt: null,
+      revokedAt: null,
+      ownerTeamId: null,
+      ownerUserId: null,
+      createdAt: new Date('2026-10-20T12:00:00.000Z'),
+    }),
+    retirementProposal: model('retirementProposal', [['id']], undefined, {
+      state: 'PROPOSED',
+    }),
+    knownIssueMatch: model('knownIssueMatch', [['knownIssueId', 'runId', 'clusterKey']], undefined, {
+      occurrences: 1,
+    }),
+    suppressionEvent: model('suppressionEvent', [['runId', 'kind', 'targetKey']], undefined, {
+      suppressed: 0,
     }),
     project: { findUnique: async () => ({ autoApproveSelectorHeals: true }) },
     flowMap: { findFirst: async () => null },
@@ -996,6 +1114,214 @@ describe('a muted cause', () => {
 
     expect(h.triageCalls).toHaveLength(1);
     expect(verdictFor('tr_muted')).toBeTruthy();
+  });
+});
+
+// ─── (d2) The durable mute ───────────────────────────────────────────────────
+
+/*
+ * THE DEFECT THESE TESTS HOLD. `VerdictReviewState.MUTED` was written by two
+ * endpoints and read by nothing, so the next run of a cause somebody had
+ * already triaged minted a fresh verdict and bought a fresh strong-model heal.
+ * The fix is only worth anything if the question is asked BEFORE the model
+ * call, so that is what is asserted: `h.triageCalls` empty, not merely a row
+ * missing afterwards.
+ */
+describe('a cause a known issue already names', () => {
+  const YEAR_MS = 365 * 86_400_000;
+
+  function knownIssue(over: Row = {}): Row {
+    const row = {
+      id: `ki_${store.knownIssue.length}`,
+      orgId: 'org',
+      projectId: 'p1',
+      title: 'Checkout button flaky in staging',
+      reason: 'upstream payment sandbox is down; fix lands next sprint',
+      signatures: [keyOf(OUTAGE(0))],
+      ownerUserId: 'user_1',
+      ownerTeamId: null,
+      ownerProvenance: 'EXPLICIT_ASSIGNMENT',
+      expiresAt: new Date(Date.now() + 7 * 86_400_000),
+      revokedAt: null,
+      matchCount: 0,
+      firstMatchedAt: null,
+      lastMatchedAt: null,
+      createdAt: new Date('2026-10-20T12:00:00.000Z'),
+      ...over,
+    };
+    store.knownIssue.push(row);
+    return row;
+  }
+
+  const ledger = (): Row[] => store.suppressionEvent;
+
+  it('skips the strong-model call, which is the whole saving', async () => {
+    const issue = knownIssue();
+    seedResult();
+    await run('tr_0');
+
+    expect(h.triageCalls).toHaveLength(0);
+    expect(verdictFor('tr_0')).toBeUndefined();
+    expect(store.healProposal).toHaveLength(0);
+    expect(claim(keyOf(OUTAGE(0))).suppressed).toBe(true);
+    // The event names the issue, so the cockpit can say WHY it went quiet.
+    const event = h.events.find((e) => e.type === 'verdict.suppressed');
+    expect(event!.data.knownIssueId).toBe(issue.id);
+  });
+
+  /*
+   * COUNTED, NEVER SILENT. A failure suppressed without being counted is the
+   * one lie this round must not ship, so the occurrence, the signature's
+   * `suppressedCount`, the match row and the ledger row are all asserted — and
+   * the denormalised `matchCount` is asserted against the match rows it sums.
+   */
+  it('counts what it swallowed, in the ledger and on the issue', async () => {
+    const issue = knownIssue();
+    seedResult();
+    await run('tr_0');
+
+    expect(signature(keyOf(OUTAGE(0))).suppressedCount).toBe(1);
+    expect(store.knownIssueMatch).toHaveLength(1);
+    expect(store.knownIssueMatch[0]!.clusterKey).toBe(keyOf(OUTAGE(0)));
+    expect(store.knownIssue.find((i) => i.id === issue.id)!.matchCount).toBe(1);
+    expect(store.knownIssue.find((i) => i.id === issue.id)!.firstMatchedAt).toBeInstanceOf(Date);
+
+    expect(ledger()).toHaveLength(1);
+    const row = ledger()[0]!;
+    expect(row.kind).toBe('MUTE');
+    expect(row.targetScope).toBe('SIGNATURE');
+    expect(row.targetKey).toBe(keyOf(OUTAGE(0)));
+    expect(row.inForce).toBe(true);
+    expect(row.suppressed).toBe(1);
+    expect(row.ownerUserId).toBe('user_1');
+    expect(row.ownerProvenance).toBe('EXPLICIT_ASSIGNMENT');
+    // Copied, never composed: the row must still read correctly after the mute
+    // has been revoked or deleted.
+    expect(row.reason).toBe('upstream payment sandbox is down; fix lands next sprint');
+  });
+
+  /*
+   * THE ROW THAT PROVES AN EXPIRY WORKED. An expired mute suppresses nothing —
+   * the failure is red again with no human action — and the ledger still gets a
+   * row, with `inForce: false` and `suppressed: 0`. Without it, "the expiry
+   * fired" and "nothing ever looked" are the same absence of a row.
+   */
+  it('stops suppressing when it expires, and SAYS so in the ledger', async () => {
+    knownIssue({ expiresAt: new Date(Date.now() - 1000) });
+    seedResult();
+    await run('tr_0');
+
+    expect(h.triageCalls).toHaveLength(1);
+    expect(verdictFor('tr_0')).toBeTruthy();
+    expect(ledger()).toHaveLength(1);
+    expect(ledger()[0]!.inForce).toBe(false);
+    expect(ledger()[0]!.suppressed).toBe(0);
+    // Not the mute's own reason, which would read as though it still applied.
+    expect(String(ledger()[0]!.reason)).toContain('red again');
+    // Nothing was counted against the issue, because nothing was suppressed.
+    expect(store.knownIssueMatch).toHaveLength(0);
+    expect(store.knownIssue[0]!.matchCount).toBe(0);
+  });
+
+  /*
+   * REVOCATION BEATS A FUTURE EXPIRY. An expired mute ran out; a revoked one
+   * was judged wrong, and only the second says anything about the decision.
+   */
+  it('stops suppressing the moment it is revoked, whatever its expiry says', async () => {
+    knownIssue({ expiresAt: new Date(Date.now() + YEAR_MS), revokedAt: new Date(Date.now() - 1) });
+    seedResult();
+    await run('tr_0');
+
+    expect(h.triageCalls).toHaveLength(1);
+    expect(ledger()[0]!.inForce).toBe(false);
+  });
+
+  /*
+   * A MUTE NAMES A CAUSE, NOT A TEST. A different failure on the same test is
+   * not the muted cause, and a mute that silenced it would be the blind spot
+   * this whole vocabulary exists to prevent.
+   */
+  it('does not touch a different cause on the same test', async () => {
+    knownIssue({ signatures: [keyOf(OTHER_CAUSE)] });
+    seedResult();
+    await run('tr_0');
+
+    expect(h.triageCalls).toHaveLength(1);
+    expect(verdictFor('tr_0')).toBeTruthy();
+    expect(store.knownIssueMatch).toHaveLength(0);
+  });
+
+  /*
+   * A RE-TRIAGE OVERRIDES THE MUTE, exactly as it overrides the signature
+   * mute above: a mute from which no reviewer can ask a question is a trap.
+   */
+  it('is overridden by a human asking for a fresh look', async () => {
+    knownIssue();
+    seedResult();
+    store.triageVerdict.push({
+      id: 'v_old',
+      orgId: 'org',
+      testResultId: 'tr_0',
+      verdict: 'REAL_BUG',
+      confidence: 0.5,
+      explanation: 'old',
+      evidence: [],
+      model: 'stub',
+      revision: 1,
+      runId: 'run_1',
+      clusterKey: keyOf(OUTAGE(0)),
+      reviewState: 'PENDING',
+      retriageRequestedAt: new Date(),
+      retriageRequestedBy: 'user_2',
+      retriageReason: 'this looks like a real regression now',
+      splitFromClusterKey: null,
+      createdAt: new Date('2026-10-24T12:00:00.000Z'),
+    });
+
+    await run('tr_0');
+    expect(h.triageCalls).toHaveLength(1);
+  });
+
+  /*
+   * ONE ROW PER CAUSE PER RUN, and the count SUMS ACROSS MEMBERS.
+   *
+   * The two halves pull in opposite directions and the constraint settles it.
+   * `SuppressionEvent` is unique on `(runId, kind, targetKey)`, so a 200-test
+   * outage under one mute gets ONE row — and that row has to read 200, not 1,
+   * or "47 failures suppressed by 3 known issues" is unanswerable. So the write
+   * is an `increment`, and the row is the cause's total rather than one
+   * member's.
+   *
+   * WHAT THAT COSTS, stated rather than papered over: the increment rides on
+   * BullMQ's at-least-once delivery, so a redelivered triage job counts its
+   * member twice — reported here as the behaviour it is. It is the same
+   * property every counter in `claimCause` already has
+   * (`occurrenceCount`, `suppressedCount`, `members`), for the same reason, and
+   * fixing it needs a per-member claim column this round does not own. The
+   * direction of the error is the safe one: it over-states what a mute
+   * silenced, so a mute never looks quieter than it was.
+   */
+  it('writes one row per cause per run, and sums the members into it', async () => {
+    // Two causes under ONE mute. `OUTAGE(n)` varies only in the tokens the
+    // clusterer scrubs, so a second cause needs genuinely different text.
+    const issue = knownIssue({ signatures: [keyOf(OUTAGE(0)), keyOf(OTHER_CAUSE)] });
+    seedResult();
+    // A SECOND member of the SAME cause: same error text, different result.
+    seedResult({ id: 'tr_same', testId: 't_other', errorMessage: OUTAGE(0) });
+    await run('tr_0');
+    await run('tr_same');
+
+    expect(ledger()).toHaveLength(1);
+    expect(store.knownIssueMatch).toHaveLength(1);
+    expect(ledger()[0]!.suppressed).toBe(2);
+    expect(store.knownIssue.find((i) => i.id === issue.id)!.matchCount).toBe(2);
+    // The claim is the UNIQUE, not a de-duplication we perform: a second cause
+    // the same mute also names gets its OWN row, because the ledger's job is to
+    // say which cause fired.
+    seedResult({ id: 'tr_other', testId: 't_third', errorMessage: OTHER_CAUSE });
+    await run('tr_other');
+    expect(ledger()).toHaveLength(2);
+    expect(store.knownIssueMatch).toHaveLength(2);
   });
 });
 
@@ -1832,11 +2158,34 @@ describe('a test that already has an open heal proposal', () => {
    * one test is the other half of the queue-clutter defect.
    */
   it('proposes afresh when the open one no longer applies, and supersedes it atomically', async () => {
-    const stale = openProposal({ diff: STALE_DIFF });
+    /*
+     * TWO RUNS, because supersession is now keyed on the CAUSE and a cause is
+     * something only a real verdict carries. Run one writes the verdict and the
+     * proposal exactly as production does; the file then changes underneath the
+     * diff (STALE_DIFF), and run two is the same test failing the same way on
+     * the next build — which is the scenario the queue-clutter defect was
+     * reported from.
+     *
+     * The previous shape seeded a proposal pointing at a verdict id that did
+     * not exist, so its cause read NULL, and it passed only because the old
+     * guard had no notion of a cause at all. A fixture that cannot say which
+     * cause a proposal answers cannot test a rule about causes.
+     */
+    // Not auto-applied, because an AUTO_APPLIED proposal is not OPEN and this
+    // test is about an open one going stale.
+    h.auto = false;
     seedResult({ testId: 't1', test: specTest() });
     await run('tr_0');
+    const stale = store.healProposal[0]!;
+    expect(stale.state).toBe('PROPOSED');
+    expect(stale.verdictId).toBe(verdictFor('tr_0')!.id);
+    stale.diff = STALE_DIFF;
+    store.transactions.length = 0;
 
-    expect(h.healCalls).toBe(1);
+    seedResult({ id: 'tr_1', testId: 't1', test: specTest() });
+    await run('tr_1');
+
+    expect(h.healCalls).toBe(2);
     expect(store.healProposal).toHaveLength(2);
 
     const fresh = store.healProposal.find((p) => p.id !== stale.id)!;
@@ -1844,13 +2193,32 @@ describe('a test that already has an open heal proposal', () => {
     expect(stale.supersededById).toBe(fresh.id);
     expect(stale.decidedAt).toBeInstanceOf(Date);
     /*
-     * TWO transactions in the whole job, each of two statements: the occurrence
-     * counters, then the heal. The second one is the claim being made here —
-     * the new row and the closing of the old one move together or not at all —
-     * and the exact list is asserted so splitting it into two awaits fails
-     * rather than leaving a plausible-looking `at(-1)` behind.
+     * TWO transactions in the second job, each of two statements: the
+     * occurrence counters, then the heal. The second one is the claim being
+     * made here — the new row and the closing of the old one move together or
+     * not at all — and the exact list is asserted so splitting it into two
+     * awaits fails rather than leaving a plausible-looking `at(-1)` behind.
      */
     expect(store.transactions).toEqual([2, 2]);
+  });
+
+  /*
+   * THE CAUSE LANE'S REFUSAL, which is the half a boolean guard cannot express.
+   *
+   * A proposal written before `TriageVerdict.clusterKey` existed cannot be
+   * shown to answer this cause, so it is LEFT ALONE rather than closed: closing
+   * it would discard the only answer some other cause has, with nobody having
+   * reviewed it. The fresh proposal is still made, because this cause has none.
+   */
+  it('never supersedes a proposal whose cause it cannot be shown to share', async () => {
+    const legacy = openProposal({ diff: STALE_DIFF, verdictId: null });
+    seedResult({ testId: 't1', test: specTest() });
+    await run('tr_0');
+
+    expect(h.healCalls).toBe(1);
+    expect(store.healProposal).toHaveLength(2);
+    expect(legacy.state).toBe('PROPOSED');
+    expect(legacy.supersededById).toBeNull();
   });
 
   it('leaves an open proposal of its own alone when nothing is stale', async () => {
@@ -1954,5 +2322,118 @@ describe('an unattended heal', () => {
     expect(heal.verifyState).toBeNull();
     expect(heal.appliedVersion).toBeNull();
     expect(store.runs).toHaveLength(0);
+  });
+});
+
+// ─── The expiry sweep ────────────────────────────────────────────────────────
+
+/*
+ * THE RULE THIS HOLDS: nothing is suppressed for ever by accident. The sweep is
+ * NOT the enforcement point — `isInForce` refuses an expired suppression at
+ * every read, so the sweep being late changes nothing about whether a failure
+ * is red — and that is exactly why these tests are about the two things a
+ * read-time check cannot do: close a proposal nobody reviewed, and tell the
+ * owner.
+ */
+describe('the suppression expiry sweep', () => {
+  const past = (ms: number): Date => new Date(Date.now() - ms);
+  const future = (ms: number): Date => new Date(Date.now() + ms);
+
+  function proposal(over: Row = {}): Row {
+    const row = {
+      id: `rp_${store.retirementProposal.length}`,
+      orgId: 'org',
+      projectId: 'p1',
+      testId: 't1',
+      state: 'PROPOSED',
+      expiresAt: past(1000),
+      ...over,
+    };
+    store.retirementProposal.push(row);
+    return row;
+  }
+
+  it('closes a retirement proposal nobody reviewed, so the queue stops lying', async () => {
+    const stale = proposal();
+    const result = await processSuppressionSweep();
+
+    expect(result.proposalsExpired).toBe(1);
+    expect(stale.state).toBe('EXPIRED');
+  });
+
+  /*
+   * AN APPLIED RETIREMENT IS NOT PENDING. It has already disabled the test and
+   * re-opened its surfaces; expiring it would silently un-decide a decision
+   * somebody made, and the coverage number would then be wrong in the generous
+   * direction.
+   */
+  it('never touches a retirement somebody already decided', async () => {
+    const applied = proposal({ state: 'APPLIED', expiresAt: past(86_400_000) });
+    const rejected = proposal({ state: 'REJECTED', expiresAt: past(86_400_000) });
+    const result = await processSuppressionSweep();
+
+    expect(result.proposalsExpired).toBe(0);
+    expect(applied.state).toBe('APPLIED');
+    expect(rejected.state).toBe('REJECTED');
+  });
+
+  it('leaves a proposal whose window is still open alone', async () => {
+    const live = proposal({ expiresAt: future(86_400_000) });
+    const result = await processSuppressionSweep();
+
+    expect(result.proposalsExpired).toBe(0);
+    expect(live.state).toBe('PROPOSED');
+  });
+
+  /*
+   * THE CLOCK IS THE SWEEP'S OWN. A repeatable job that sat in the queue for an
+   * hour would otherwise evaluate "has this expired" against an hour-old
+   * instant — a cached clock, which is how a suppression outlives its expiry.
+   * The payload's `at` is carried for the log line and read as time by nothing.
+   */
+  it('evaluates the expiry against its own clock, not the job payload', async () => {
+    const stale = proposal({ expiresAt: past(1000) });
+    const result = await processSuppressionSweep({
+      at: new Date(Date.now() - 7 * 86_400_000).toISOString(),
+    });
+
+    expect(result.proposalsExpired).toBe(1);
+    expect(stale.state).toBe('EXPIRED');
+  });
+
+  /*
+   * THE MUTES ARE REPORTED AND NOT REWRITTEN. Flipping a column here would
+   * create a second answer to "is this in force" that could disagree with
+   * `isInForce`, which is the one comparison this product may only have once.
+   */
+  it('separates the mutes that are over from the ones about to be, and writes neither', async () => {
+    store.knownIssue.push(
+      { id: 'ki_over', orgId: 'org', projectId: 'p1', expiresAt: past(1), revokedAt: null, matchCount: 12, ownerUserId: 'u1', ownerTeamId: null, ownerProvenance: 'EXPLICIT_ASSIGNMENT' },
+      { id: 'ki_soon', orgId: 'org', projectId: 'p1', expiresAt: future(86_400_000), revokedAt: null, matchCount: 3, ownerUserId: 'u1', ownerTeamId: null, ownerProvenance: 'EXPLICIT_ASSIGNMENT' },
+      // Outside the warning horizon: not news yet.
+      { id: 'ki_far', orgId: 'org', projectId: 'p1', expiresAt: future(30 * 86_400_000), revokedAt: null, matchCount: 0, ownerUserId: 'u1', ownerTeamId: null, ownerProvenance: 'EXPLICIT_ASSIGNMENT' },
+      // REVOKED is a different fact — judged wrong rather than run out, and
+      // somebody already knows. Reporting it as a surprise expiry every five
+      // minutes for ever would train a reader to ignore the whole line.
+      { id: 'ki_revoked', orgId: 'org', projectId: 'p1', expiresAt: past(1), revokedAt: past(2), matchCount: 9, ownerUserId: 'u1', ownerTeamId: null, ownerProvenance: 'EXPLICIT_ASSIGNMENT' },
+    );
+
+    const result = await processSuppressionSweep();
+
+    expect(result.mutesExpired).toBe(1);
+    expect(result.mutesExpiringSoon).toBe(1);
+    // Read, not written: every row is exactly as it was.
+    expect(store.knownIssue.find((i) => i.id === 'ki_over')!.revokedAt).toBeNull();
+    expect(store.knownIssue.find((i) => i.id === 'ki_over')!.expiresAt).toBeInstanceOf(Date);
+  });
+
+  it('reports zero out loud rather than returning nothing at all', async () => {
+    const result = await processSuppressionSweep();
+    expect(result).toEqual({
+      proposalsExpired: 0,
+      mutesExpired: 0,
+      mutesExpiringSoon: 0,
+      capped: false,
+    });
   });
 });

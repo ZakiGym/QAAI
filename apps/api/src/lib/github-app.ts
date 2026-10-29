@@ -44,6 +44,7 @@
  * quietly never appears is indistinguishable from a green build.
  */
 
+import type { GitHost, HostRefusal } from './pull-request.js';
 import { createHmac, createSign, timingSafeEqual } from 'node:crypto';
 // One repo-slug parser for the whole codebase. It rejects `..`, a foreign host
 // and embedded credentials; every path built here starts from its output.
@@ -1473,4 +1474,169 @@ export function parseCheckRunEvent(payload: unknown): CheckRunEvent {
 export function isRerunRequest(event: CheckRunEvent): boolean {
   if (event.action === 'rerequested') return true;
   return event.action === 'requested_action' && event.requestedAction === RERUN_ACTION_ID;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The git HOST, so a loop can end somewhere a reviewer looks.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ── WHY THE HOST SEAM LIVES HERE AND NOT IN `git.ts` ────────────────────────
+ *
+ * There is exactly ONE of these, by instruction, and this is the file for it.
+ * `git.ts` speaks the git PROTOCOL — isomorphic-git, a clone directory, a push
+ * over https — and knows nothing about an API. Opening a pull request is an API
+ * call, and every part of making one safely already exists in this file: the
+ * injected {@link FetchLike}, the installation token, {@link GITHUB_API_HOST}
+ * pinned so a redirect cannot carry the token elsewhere, and
+ * {@link describeFailure}, which turns a host's answer into OUR prose rather
+ * than quoting a body whoever answered chose.
+ *
+ * Putting it in `git.ts` would have meant a second fetch seam, a second place
+ * that knows the API host, and a second idea of what a credential may appear
+ * in — which is how a token ends up in an error path.
+ */
+
+/** GitHub's cap on a PR body. Ours is far below it; this is the hard wall. */
+const GITHUB_MAX_BODY_CHARS = 65_536;
+
+/**
+ * Map a GitHub status onto the CLOSED refusal vocabulary.
+ *
+ * NO HOST PROSE CROSSES THIS LINE. The body is chosen by whoever answered, it
+ * routinely echoes the request that carried the token, and
+ * `PullRequestRecord.failureNote` is a column humans read and other prompts may
+ * quote. So the status is classified and the message is ours — which is the
+ * same rule `describeFailure` above already applies to the checks path.
+ */
+export function pullRequestRefusalFor(status: number): HostRefusal {
+  if (status === 401) return 'UNAUTHENTICATED';
+  if (status === 403) return 'RATE_LIMITED';
+  if (status === 404) return 'NOT_FOUND';
+  if (status === 422) return 'ALREADY_EXISTS';
+  if (status === 429) return 'RATE_LIMITED';
+  if (status >= 301 && status <= 308) return 'REFUSED_REDIRECT';
+  if (status >= 500) return 'UNREACHABLE';
+  return 'UNKNOWN';
+}
+
+/**
+ * The {@link GitHost} for github.com, over an injected `fetch`.
+ *
+ * `apiHostFromCustomerConfig` is FALSE and that is not a formality: github.com
+ * has exactly one API host and this function pins it, so `openPullRequest` has
+ * nothing to classify for SSRF. A self-hosted provider whose host comes out of
+ * an editable config row must declare `true` and let `openPullRequest` run
+ * `classifyHost` before anything connects.
+ *
+ * The TOKEN is taken as a value and never logged, never echoed, never put in a
+ * returned note. It is interpolated into the `Authorization` header and nowhere
+ * else — in particular not into the URL, which would put it in a redirect's
+ * `Referer` and in every proxy log on the way.
+ */
+export function githubPullRequestHost(args: {
+  token: string;
+  fetchImpl?: FetchLike;
+}): GitHost {
+  const fetchImpl = args.fetchImpl ?? ((url, init) => fetch(url, init));
+  const headers = {
+    authorization: `Bearer ${args.token}`,
+    accept: 'application/vnd.github+json',
+    'user-agent': 'qaai',
+    'x-github-api-version': '2022-11-28',
+  };
+
+  return {
+    provider: 'GITHUB',
+    apiHost: GITHUB_API_HOST,
+    apiHostFromCustomerConfig: false,
+
+    async openPullRequest({ target, title, body }) {
+      /*
+       * `redirect: 'manual'`, so a 3xx is CLASSIFIED rather than followed. The
+       * token is in the header, and `fetch` re-sends headers across a redirect:
+       * a host that answers 301 to its own choice of location would otherwise be
+       * handed the customer's installation token. This is the same reasoning
+       * `repoHttpsUrl` in git.ts applies to the clone URL.
+       */
+      let response: Response;
+      try {
+        response = await fetchImpl(`https://${GITHUB_API_HOST}/repos/${target.repo}/pulls`, {
+          method: 'POST',
+          headers: { ...headers, 'content-type': 'application/json' },
+          redirect: 'manual',
+          body: JSON.stringify({
+            title,
+            // Bounded again at the wire. `buildPullRequestBody` already caps far
+            // below this, and a second bound here is what makes the cap a
+            // property of the REQUEST rather than of one composer.
+            body: body.slice(0, GITHUB_MAX_BODY_CHARS),
+            head: target.branch,
+            base: target.baseRef,
+          }),
+        });
+      } catch {
+        /*
+         * The thrown error object is deliberately never read. A fetch
+         * implementation's error carries the URL it was opening and, in several
+         * runtimes, the request headers with it — and this path's whole job is
+         * that a credential never reaches a log or a column.
+         */
+        return { ok: false, refusal: 'UNREACHABLE' };
+      }
+
+      if (!response.ok) return { ok: false, refusal: pullRequestRefusalFor(response.status) };
+
+      const json = (await response.json().catch(() => null)) as {
+        number?: unknown;
+        html_url?: unknown;
+      } | null;
+      if (typeof json?.number !== 'number' || typeof json.html_url !== 'string') {
+        /*
+         * A 201 whose body we cannot read is NOT a success with a missing url.
+         * Recording OPEN with `url: null` would be a PR nobody can find
+         * presented as a finished loop; UNKNOWN keeps the record FAILED and
+         * retryable, and the adopt path below finds the PR if it really exists.
+         */
+        return { ok: false, refusal: 'UNKNOWN' };
+      }
+      return { ok: true, pr: { number: json.number, url: json.html_url, state: 'OPEN' } };
+    },
+
+    async findOpenPullRequest(target) {
+      /*
+       * THE ADOPT READ, and it is what makes the whole path idempotent against
+       * a host that already has the PR: a 422 from `openPullRequest` means
+       * "there is one for this head", and without this a retry would report
+       * FAILED for a branch that is already under review.
+       *
+       * `head` is `owner:branch`, both from QAAI's OWN records — the repo off
+       * the integration row and the branch off `branchNameFor` — so no part of
+       * this query can be influenced by test output or a model.
+       */
+      const owner = target.repo.split('/')[0] ?? '';
+      const query = new URLSearchParams({
+        head: `${owner}:${target.branch}`,
+        base: target.baseRef,
+        state: 'open',
+        per_page: '1',
+      });
+      let response: Response;
+      try {
+        response = await fetchImpl(
+          `https://${GITHUB_API_HOST}/repos/${target.repo}/pulls?${query.toString()}`,
+          { method: 'GET', headers, redirect: 'manual' },
+        );
+      } catch {
+        return null;
+      }
+      if (!response.ok) return null;
+      const rows = (await response.json().catch(() => null)) as
+        | ReadonlyArray<{ number?: unknown; html_url?: unknown }>
+        | null;
+      const first = Array.isArray(rows) ? rows[0] : undefined;
+      if (typeof first?.number !== 'number' || typeof first.html_url !== 'string') return null;
+      return { number: first.number, url: first.html_url, state: 'OPEN' };
+    },
+  };
 }

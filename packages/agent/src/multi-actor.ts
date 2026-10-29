@@ -62,29 +62,23 @@ import { createHash } from 'node:crypto';
 import { ANONYMOUS_ROLE, isRouteAccessMeasured, roleKey } from '@qaai/shared';
 import type { PlanItem, Priority, TestType } from '@qaai/shared';
 /*
- * ── THIS IMPORT CROSSES THE WORKSPACE BOUNDARY AND MUST NOT STAY THAT WAY ───
+ * The principal vocabulary, through the package barrel.
  *
- * `packages/shared/src/principals.ts` is NOT on its package barrel:
- * `packages/shared/src/index.ts` has no `export * from './principals'` line, so
- * `Principal`, `bindDestructiveStep` and `DEFAULT_PRINCIPAL_NAME` are not
- * reachable through `@qaai/shared` at all. A relative path compiles, bypasses
- * the package entry point, and leaves the keystone's compiler-enforced presence
- * records enforced on a file nobody imports as a package — nine files did
- * exactly this in one round and it is a named lesson of this build.
- *
- * It is written this way because `index.ts` belongs to another change in this
- * round, and the one-line fix is in this slice's handover. The moment that line
- * lands, this import becomes `from '@qaai/shared'` and nothing else changes.
+ * It was a relative path across the workspace boundary for one round — the
+ * thing nine files did in one round, and a named lesson of this build, because
+ * a relative path compiles while bypassing the package entry point and leaves
+ * the keystone's compiler-enforced presence records guarding a file nobody
+ * imports as a package. The barrel line landed; the import is ordinary again.
  */
 import {
   DEFAULT_PRINCIPAL_NAME,
   bindDestructiveStep,
-} from '../../shared/src/principals';
+} from '@qaai/shared';
 import type {
   DestructiveStepKind,
   DisposabilityRefusal,
   Principal,
-} from '../../shared/src/principals';
+} from '@qaai/shared';
 import type { AccessMatrix, AccessMatrixCell } from './access-matrix.js';
 
 // ─── A. The patterns ─────────────────────────────────────────────────────────

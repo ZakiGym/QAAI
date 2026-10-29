@@ -587,3 +587,327 @@ describe('the ownership vocabulary is re-exported, not just moved', () => {
     }
   });
 });
+
+// ─── Provenance: how well we know, not just who ──────────────────────────────
+
+/*
+ * WHAT THESE PROVE, in order of how expensive the bug would be:
+ *
+ *   1. A WEAK ANSWER IS NOT AN ASSIGNMENT. A bulk-imported glob, a git-blame
+ *      guess and an inherited owner all produce `kind: 'SUGGESTED'` and
+ *      `pageable: false`. The expensive version of this bug is a digest paging
+ *      the payments team on the strength of a catch-all `tests/**`, which
+ *      teaches the payments team to filter the digest — after which the feature
+ *      is worse than not having it.
+ *   2. A FALLBACK NEVER OVERRIDES A RULE. git blame speaks only when no rule
+ *      matched. A fallback that won would move ownership on every re-run.
+ *   3. `ownerProvenance` IS ACTUALLY WRITTEN. The column was minted by the
+ *      keystone and a minted column owes a writer in the same round; the test
+ *      asserts on the column, not on the function's return shape.
+ *   4. AN UNUSABLE RULE SURVIVES EVERY PATH. Routing may have silently stopped
+ *      for twenty other tests, and an answer reached by blame must still say so.
+ */
+
+import {
+  ASSIGNMENT_KINDS,
+  KIND_BY_STRENGTH,
+  MAX_CODEOWNERS_LINES,
+  PROVENANCE_BY_SUBJECT,
+  consensusProvenance,
+  parseCodeowners,
+  provenanceOfMatch,
+  routeOwner,
+  routeOwnershipFor,
+  routingResolution,
+  verdictRoutingColumns,
+} from './ownership.js';
+
+describe('every rule subject earns a provenance, and the tables cannot disagree', () => {
+  it('names every subject, and every value is a RULE_ provenance', async () => {
+    const { OWNER_PROVENANCES } = await import(
+      '../../../../packages/shared/src/ownership.js'
+    );
+    const subjects = Object.keys(PROVENANCE_BY_SUBJECT).sort();
+    expect(subjects).toEqual(['FEATURE', 'PATH', 'SUITE', 'TEST']);
+    for (const provenance of Object.values(PROVENANCE_BY_SUBJECT)) {
+      // A spelling that is not in the shared vocabulary would be stored in a
+      // Prisma enum column and fail at the database, not here.
+      expect(OWNER_PROVENANCES).toContain(provenance);
+      expect(provenance.startsWith('RULE_')).toBe(true);
+    }
+  });
+
+  it('ranks a test rule above a path rule, the same order the shared file declares', async () => {
+    const { provenanceRank } = await import('../../../../packages/shared/src/ownership.js');
+    expect(provenanceRank(PROVENANCE_BY_SUBJECT.TEST)).toBeLessThan(
+      provenanceRank(PROVENANCE_BY_SUBJECT.SUITE),
+    );
+    expect(provenanceRank(PROVENANCE_BY_SUBJECT.SUITE)).toBeLessThan(
+      provenanceRank(PROVENANCE_BY_SUBJECT.FEATURE),
+    );
+    expect(provenanceRank(PROVENANCE_BY_SUBJECT.FEATURE)).toBeLessThan(
+      provenanceRank(PROVENANCE_BY_SUBJECT.PATH),
+    );
+  });
+
+  it('agrees with mayPage about which strengths may be shown as an assignment', async () => {
+    const { OWNER_PROVENANCES, OWNER_PROVENANCE_STRENGTH, mayPage } = await import(
+      '../../../../packages/shared/src/ownership.js'
+    );
+    /*
+     * The derivation, checked rather than asserted. `KIND_BY_STRENGTH` is meant
+     * to be `mayPage` with a different name; a second threshold here is how a
+     * catch-all glob comes to page again after somebody "tunes" one of the two.
+     */
+    for (const provenance of OWNER_PROVENANCES) {
+      const kind = KIND_BY_STRENGTH[OWNER_PROVENANCE_STRENGTH[provenance]];
+      expect(ASSIGNMENT_KINDS).toContain(kind);
+      expect(kind === 'ASSIGNED').toBe(mayPage(provenance));
+    }
+  });
+});
+
+describe('a bulk-imported glob is a suggestion, not an assignment', () => {
+  const pathRule = rule({ id: 'rule_glob', pathPattern: 'tests/**', ownerTeamId: 'team_payments' });
+
+  it('is ASSIGNED when a person wrote the rule in QAAI', () => {
+    const routed = routeOwner(test(), [pathRule]);
+    expect(routed.provenance).toBe('RULE_PATH');
+    expect(routed.kind).toBe('ASSIGNED');
+    expect(routed.pageable).toBe(true);
+    expect(routed.humanSet).toBe(false);
+  });
+
+  it('is SUGGESTED when the same rule arrived from a repository CODEOWNERS file', () => {
+    const routed = routeOwner(test(), [pathRule], {
+      codeownersRuleIds: new Set(['rule_glob']),
+    });
+    // Same owner, same rule, same match — a different thing to say about it.
+    expect(routed.owner).toEqual({ kind: 'TEAM', teamId: 'team_payments' });
+    expect(routed.provenance).toBe('CODEOWNERS_IMPORT');
+    expect(routed.kind).toBe('SUGGESTED');
+    expect(routed.pageable).toBe(false);
+  });
+
+  it('downgrades only the rule that was imported', () => {
+    expect(
+      provenanceOfMatch({ ruleId: 'rule_a', subject: 'PATH' }, new Set(['rule_b'])),
+    ).toBe('RULE_PATH');
+    expect(provenanceOfMatch({ ruleId: 'rule_b', subject: 'TEST' }, new Set(['rule_b']))).toBe(
+      'CODEOWNERS_IMPORT',
+    );
+  });
+});
+
+describe('an explicit assignment is the only human answer', () => {
+  it('beats every rule and is the one provenance a suppression may hang on', () => {
+    const routed = routeOwner(test(), [rule({ pathPattern: 'tests/**', ownerTeamId: 'team_x' })], {
+      explicit: { owner: { kind: 'USER', userId: 'user_dana' }, byLabel: 'Dana' },
+    });
+    expect(routed.owner).toEqual({ kind: 'USER', userId: 'user_dana' });
+    expect(routed.provenance).toBe('EXPLICIT_ASSIGNMENT');
+    expect(routed.humanSet).toBe(true);
+    expect(routed.note).toContain('Dana');
+  });
+
+  it('carries the unusable-rule warning even though it did not consult a rule', () => {
+    // A project can route this one failure by hand and still have a broken rule
+    // that has stopped routing twenty others. Swallowing that is the whole
+    // failure mode this file is arranged against.
+    const broken = rule({ id: 'rule_bad', pathPattern: null, ownerTeamId: null });
+    const routed = routeOwner(test(), [broken], {
+      explicit: { owner: { kind: 'USER', userId: 'user_dana' } },
+    });
+    expect(routed.unusable).toHaveLength(1);
+    expect(routed.note).toContain('could not be evaluated');
+  });
+});
+
+describe('a weak fallback speaks only when no rule did', () => {
+  it('does not override a matching rule with git blame', () => {
+    const routed = routeOwner(test(), [rule({ pathPattern: 'tests/**', ownerTeamId: 'team_pay' })], {
+      lastEditor: { userId: 'user_whoever' },
+    });
+    expect(routed.owner).toEqual({ kind: 'TEAM', teamId: 'team_pay' });
+    expect(routed.provenance).toBe('RULE_PATH');
+  });
+
+  it('uses git blame when nothing matched, as a SUGGESTION', () => {
+    const routed = routeOwner(test(), [rule({ pathPattern: 'other/**' })], {
+      lastEditor: { userId: 'user_whoever' },
+    });
+    expect(routed.state).toBe('OWNED');
+    expect(routed.provenance).toBe('LAST_EDITOR');
+    expect(routed.kind).toBe('SUGGESTED');
+    expect(routed.pageable).toBe(false);
+    expect(routed.note).toContain('suggestion');
+  });
+
+  it('prefers an inherited owner to git blame', () => {
+    const routed = routeOwner(test(), [], {
+      inherited: { owner: { kind: 'TEAM', teamId: 'team_parent' }, fromLabel: 'its suite' },
+      lastEditor: { userId: 'user_whoever' },
+    });
+    expect(routed.provenance).toBe('INHERITED');
+    expect(routed.owner).toEqual({ kind: 'TEAM', teamId: 'team_parent' });
+  });
+
+  it('reports UNOWNED with provenance NONE when there is nothing to fall back to', () => {
+    const routed = routeOwner(test(), []);
+    expect(routed.state).toBe('NO_RULES');
+    expect(routed.provenance).toBe('NONE');
+    expect(routed.kind).toBe('UNOWNED');
+    expect(routed.owner).toBeNull();
+  });
+
+  it('keeps RULES_UNUSABLE visible rather than reporting NO_MATCH', () => {
+    const routed = routeOwner(test(), [rule({ id: 'rule_bad', pathPattern: null, ownerTeamId: null })]);
+    expect(routed.state).toBe('RULES_UNUSABLE');
+    expect(routed.kind).toBe('UNOWNED');
+  });
+});
+
+describe('the verdict carries the provenance it was routed by', () => {
+  it('writes ownerProvenance beside ownerState, never one without the other', () => {
+    const routed = routeOwner(test(), [rule({ testId: 'test_1', ownerUserId: 'user_dana', ownerTeamId: null })]);
+    const columns = verdictRoutingColumns(routed, new Date('2026-10-29T00:00:00Z'));
+    expect(columns.ownerProvenance).toBe('RULE_TEST');
+    expect(columns.ownerState).toBe('OWNED');
+    expect(columns.assigneeUserId).toBe('user_dana');
+    // Both ids on every write: a re-route from a user to a team must CLEAR the
+    // user, or the row keeps paging whoever used to own it.
+    expect(columns.assigneeTeamId).toBeNull();
+    expect(columns.assignedAt.toISOString()).toBe('2026-10-29T00:00:00.000Z');
+  });
+
+  it('writes NONE rather than null when routing ran and found nobody', () => {
+    // NULL means "nothing has tried to route this verdict yet". An unowned
+    // failure that looks un-routed is how it stops being looked for.
+    const columns = verdictRoutingColumns(routeOwner(test(), []));
+    expect(columns.ownerProvenance).toBe('NONE');
+    expect(columns.ownerState).toBe('NO_RULES');
+  });
+
+  it('resolves to the shared OwnerResolution shape, coherently', async () => {
+    const { resolutionIsCoherent } = await import('../../../../packages/shared/src/ownership.js');
+    for (const routed of [
+      routeOwner(test(), [rule({ pathPattern: 'tests/**' })]),
+      routeOwner(test(), []),
+      routeOwner(test(), [], { lastEditor: { userId: 'user_x' } }),
+    ]) {
+      const resolution = routingResolution('FAILURE', routed);
+      expect(resolution.subject).toBe('FAILURE');
+      expect(resolutionIsCoherent(resolution)).toEqual({ coherent: true });
+    }
+  });
+
+  it('routes a list, keyed by test id', () => {
+    const routed = routeOwnershipFor(
+      [test({ id: 't1' }), test({ id: 't2', filePath: 'other/x.spec.ts', suiteId: null, feature: null })],
+      [rule({ pathPattern: 'tests/**', ownerTeamId: 'team_pay' })],
+      (t) => (t.id === 't2' ? { lastEditor: { userId: 'user_x' } } : {}),
+    );
+    expect(routed.get('t1')?.provenance).toBe('RULE_PATH');
+    expect(routed.get('t2')?.provenance).toBe('LAST_EDITOR');
+  });
+});
+
+describe('importing a repository CODEOWNERS file', () => {
+  it('parses handles, teams and emails and keeps the line number', () => {
+    const parsed = parseCodeowners(
+      ['# comment', '', 'tests/checkout/** @acme/payments', '*.visual.ts @dana dana@acme.com'].join('\n'),
+    );
+    expect(parsed.skipped).toEqual([]);
+    expect(parsed.entries).toEqual([
+      { line: 3, pathPattern: 'tests/checkout/**', owners: ['@acme/payments'] },
+      { line: 4, pathPattern: '*.visual.ts', owners: ['@dana', 'dana@acme.com'] },
+    ]);
+  });
+
+  it('refuses a line this dialect cannot express rather than reinterpreting it', () => {
+    const parsed = parseCodeowners(['!tests/skip/** @acme/payments', 'src/[abc]/** @dana'].join('\n'));
+    expect(parsed.entries).toEqual([]);
+    expect(parsed.skipped.map((s) => s.line)).toEqual([1, 2]);
+    // The sentence names the fix, because an import drops a thousand of these
+    // at once and "invalid" is not something a human can act on.
+    expect(parsed.skipped[0]!.reason).toContain('Negated patterns');
+    expect(parsed.skipped[1]!.reason).toContain('Character ranges');
+  });
+
+  it('skips a section header rather than flattening its optional reviewers into owners', () => {
+    const parsed = parseCodeowners('[Payments]\ntests/** @acme/payments');
+    expect(parsed.entries).toHaveLength(1);
+    expect(parsed.skipped[0]!.reason).toContain('approval counts');
+  });
+
+  it('refuses a half-parsed line rather than importing the half that parsed', () => {
+    const parsed = parseCodeowners('tests/** @acme/payments some-garbage');
+    expect(parsed.entries).toEqual([]);
+    expect(parsed.skipped[0]!.reason).toContain('not imported');
+  });
+
+  it('reports a line with no owner rather than storing a rule that routes nowhere', () => {
+    const parsed = parseCodeowners('tests/**');
+    expect(parsed.entries).toEqual([]);
+    expect(parsed.skipped[0]!.reason).toContain('routes nowhere');
+  });
+
+  it('REPORTS the line cap when it bites, with the count of what was not read', () => {
+    /*
+     * A cap applied without being disclosed is one of the lies this product
+     * cannot afford: an import that silently stopped would leave a project
+     * believing it had routed a directory it had not.
+     */
+    const lines = Array.from({ length: MAX_CODEOWNERS_LINES + 3 }, (_, i) => `d${i}/** @acme/t`);
+    const parsed = parseCodeowners(lines.join('\n'));
+    expect(parsed.entries).toHaveLength(MAX_CODEOWNERS_LINES);
+    expect(parsed.truncated).not.toBeNull();
+    expect(parsed.truncated!.lines).toBe(3);
+    expect(parsed.truncated!.reason).toContain('still unowned');
+  });
+
+  it('reports null truncation when nothing was cut, rather than zero', () => {
+    expect(parseCodeowners('tests/** @acme/t').truncated).toBeNull();
+  });
+});
+
+describe('a ticket for many tests claims the weakest provenance behind it', () => {
+  const routed = (over: Partial<OwnershipRuleInput>, ctx = {}) =>
+    routeOwner(test(), [rule(over)], ctx);
+
+  it('is as weak as the weakest owned member, never as strong as the strongest', () => {
+    const strong = routeOwner(test(), [], {
+      explicit: { owner: { kind: 'TEAM', teamId: 'team_pay' } },
+    });
+    const weak = routed({ id: 'r', pathPattern: 'tests/**', ownerTeamId: 'team_pay' }, {
+      codeownersRuleIds: new Set(['r']),
+    });
+    // Taking the strongest would let one explicit assignment launder a glob's
+    // guess into an assignment nobody made.
+    expect(consensusProvenance([strong, strong, weak])).toEqual({
+      provenance: 'CODEOWNERS_IMPORT',
+      kind: 'SUGGESTED',
+    });
+    expect(consensusProvenance([strong, strong])).toEqual({
+      provenance: 'EXPLICIT_ASSIGNMENT',
+      kind: 'ASSIGNED',
+    });
+  });
+
+  it('is not weakened by a member nobody owns', () => {
+    const owned = routed({ pathPattern: 'tests/**', ownerTeamId: 'team_pay' });
+    const nobody = routeOwner(test({ filePath: 'elsewhere/x.spec.ts' }), []);
+    expect(consensusProvenance([owned, nobody])).toEqual({
+      provenance: 'RULE_PATH',
+      kind: 'ASSIGNED',
+    });
+  });
+
+  it('reports NONE / UNOWNED when nothing is owned, rather than picking a member', () => {
+    expect(consensusProvenance([routeOwner(test(), [])])).toEqual({
+      provenance: 'NONE',
+      kind: 'UNOWNED',
+    });
+    expect(consensusProvenance([])).toEqual({ provenance: 'NONE', kind: 'UNOWNED' });
+  });
+});

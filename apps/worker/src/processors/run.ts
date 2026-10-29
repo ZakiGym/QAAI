@@ -51,6 +51,7 @@ import type {
   RunCountsWithQuarantine,
   SessionProbeResult,
 } from '@qaai/runner';
+import type { SuppressionKind, SuppressionTally } from '@qaai/shared';
 import { loadProjectPlugins, resolveTestPlugin } from '../lib/plugin-loading.js';
 import {
   testNeedsRepository,
@@ -1900,6 +1901,99 @@ async function stampNotRun(
   }
 }
 
+/**
+ * How many suppression-ledger rows one run's summary is folded from.
+ *
+ * A BOUND that is reported when it bites, never a silent take. One row per
+ * (cause, kind) per run, so a 200-test outage under three mutes writes three —
+ * past this cap a run had thousands of distinct suppressed causes, which is
+ * itself the finding, and the summary under-counts rather than lying about
+ * having seen everything.
+ */
+export const SUPPRESSION_LEDGER_SCAN_CAP = 2_000;
+
+/**
+ * This run's suppressions, tallied by kind, for `runOutcome`.
+ *
+ * FOLDED IN TYPESCRIPT RATHER THAN BY `groupBy`, and the reason is the number
+ * that matters: `suppressions` is DISTINCT suppressing rows, not ledger rows. A
+ * `groupBy(['kind'])` with `_count` would report three known issues as three
+ * when they silenced one cause each and as one when one mute silenced three
+ * causes — and the headline sentence is "47 failures by 3 known issues", so the
+ * second number has to be distinct `sourceId`s. Prisma cannot count distinct
+ * values inside a group-by, so the rows are read and folded here.
+ *
+ * QUARANTINE ROWS ARE EXCLUDED at the source. `runOutcome` synthesises the
+ * quarantine tally from `counts.quarantinedFailed`, which `tallyResult` is the
+ * only writer of; letting a ledger row through as well would double the one
+ * total a release decision reads.
+ */
+async function suppressionTalliesFor(
+  orgId: string,
+  runId: string,
+): Promise<{ tallies: SuppressionTally[]; capped: number | null }> {
+  const rows = await prisma.suppressionEvent
+    .findMany({
+      where: { orgId, runId, kind: { not: 'QUARANTINE' } },
+      take: SUPPRESSION_LEDGER_SCAN_CAP + 1,
+      select: { kind: true, sourceId: true, suppressed: true, inForce: true },
+    })
+    .catch((err: unknown) => {
+      /*
+       * A read that failed is NOT "nothing was suppressed". The finalisation
+       * must not fail over a summary, so the error is logged and the summary is
+       * omitted — which makes `runOutcome` say "Nothing was suppressed.", and
+       * that is the one arm of this function that is not honest. It is
+       * reachable only if the ledger table is unreadable while the rest of the
+       * finalisation's writes succeed; the log line is what a reader has.
+       */
+      logger.error(
+        { err, runId },
+        'could not read the suppression ledger; this run’s summary will under-report what was silenced',
+      );
+      return null;
+    });
+  if (rows === null) return { tallies: [], capped: null };
+
+  const capped = rows.length > SUPPRESSION_LEDGER_SCAN_CAP ? rows.length : null;
+  if (capped !== null) {
+    logger.warn(
+      { runId, cap: SUPPRESSION_LEDGER_SCAN_CAP, read: capped },
+      'the suppression ledger read hit its cap; the run’s suppression summary under-counts',
+    );
+  }
+
+  const byKind = new Map<
+    SuppressionKind,
+    { suppressed: number; live: Set<string>; dead: Set<string> }
+  >();
+  for (const row of rows.slice(0, SUPPRESSION_LEDGER_SCAN_CAP)) {
+    /*
+     * NO CAST. `SuppressionEvent.kind` is a Postgres enum, so Prisma already
+     * types it as the union and an assertion here would only hide the day the
+     * two vocabularies stop agreeing — which is exactly the thing a drift guard
+     * exists to make loud.
+     */
+    const kind: SuppressionKind = row.kind;
+    const tally = byKind.get(kind) ?? { suppressed: 0, live: new Set(), dead: new Set() };
+    tally.suppressed += row.suppressed;
+    // `sourceId` is nullable in the schema; a row with none still counts as one
+    // suppression, identified by nothing, rather than being dropped.
+    (row.inForce ? tally.live : tally.dead).add(row.sourceId ?? `<unidentified:${kind}>`);
+    byKind.set(kind, tally);
+  }
+
+  return {
+    capped,
+    tallies: [...byKind.entries()].map(([kind, tally]) => ({
+      kind,
+      suppressions: tally.live.size,
+      suppressed: tally.suppressed,
+      expired: tally.dead.size,
+    })),
+  };
+}
+
 /** A test, as the preflight needs to see it. */
 interface PreflightTest {
   id: string;
@@ -2335,6 +2429,21 @@ async function finalizeRun(args: {
       ? { at: stop.stopRequestedAt, reason: stop.stopReason ?? null }
       : null;
 
+  /*
+   * ── THE SUPPRESSION LEDGER, READ ONCE, BEFORE THE GATE ───────────────────
+   *
+   * "47 failures suppressed by 3 known issues" has to appear on the surface a
+   * release decision is made from, or a team learns to ignore the board — which
+   * is the one thing that would make this product worse than nothing. Until
+   * this read existed, `runOutcome` could only see QUARANTINE, so a run that
+   * passed while a known issue silenced forty failures said nothing at all.
+   *
+   * Read BEFORE the gate, because `runOutcome` composes the sentence the CLI
+   * prints and the GitHub check shows, and a sentence computed after the
+   * verdict is a sentence the verdict cannot mention.
+   */
+  const suppressions = await suppressionTalliesFor(orgId, run.id);
+
   const gateResult = await evaluateRunGates(
     orgId,
     rows,
@@ -2435,7 +2544,12 @@ async function finalizeRun(args: {
    * came to suppress the signal without stopping the gate. `runOutcome` is the
    * only function allowed to answer the question; see packages/runner/gates.ts.
    */
-  const outcome = runOutcome({ counts, gatePassed: gateResult.passed, forcedStatus: forced });
+  const outcome = runOutcome({
+    counts,
+    gatePassed: gateResult.passed,
+    forcedStatus: forced,
+    suppressions: suppressions.tallies,
+  });
   const status = outcome.status;
 
   /*

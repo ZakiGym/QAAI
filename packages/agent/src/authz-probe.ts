@@ -58,17 +58,14 @@
  * network.
  */
 
-import { isSafeProbeMethod } from '../../shared/src/principals';
-import type { Principal, SafeProbeMethod } from '../../shared/src/principals';
+import { isSafeProbeMethod } from '@qaai/shared';
+import type { Principal, SafeProbeMethod } from '@qaai/shared';
 import type { Finding } from '@qaai/shared';
 
 /*
- * The two imports above cross the workspace boundary, which is a defect and is
- * recorded as one. `packages/shared/src/principals.ts` is not on its package
- * barrel — `packages/shared/src/index.ts` has no `export * from './principals'`
- * — so none of the principal vocabulary is reachable through `@qaai/shared`.
- * `index.ts` belongs to another change in this round; the one-line fix is in
- * this slice's handover, and when it lands both lines become `@qaai/shared`.
+ * `isSafeProbeMethod` is ASKED and never re-derived. Which verbs a probe may
+ * use is the one decision standing between an authorization sweep and a sweep
+ * that changes a customer's data, and two opinions about it is one too many.
  */
 
 // ─── 1. Where an id came from ────────────────────────────────────────────────

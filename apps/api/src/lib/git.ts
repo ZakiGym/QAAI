@@ -88,6 +88,19 @@ import type {
   OwnershipVerdict,
 } from '../../../../packages/shared/src/artifact-set.js';
 import type { RepoTree } from './repo-export.js';
+/*
+ * The PR library's own seam types. Imported rather than restated so a change to
+ * `PullRequestStore` is a compile error here instead of a store that silently
+ * stops satisfying it — which is the whole value of the interface being the
+ * projection.
+ */
+import type {
+  AuditSink,
+  PullRequestRecordRow,
+  PullRequestStore,
+} from './pull-request.js';
+import { PR_RECORD_STATES } from '@qaai/shared';
+import type { PrRecordState } from '@qaai/shared';
 
 /**
  * The username each provider expects alongside a personal access token. The
@@ -1124,4 +1137,303 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The PullRequestRecord store.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The narrow Prisma surface this store needs, DECLARED rather than imported.
+ *
+ * Structural, so the caller hands in its own client (which already carries the
+ * org-scoping extension from lib/prisma.ts) and this module keeps its one
+ * property: no `node:` client singleton, nothing to mock globally, and a test
+ * that supplies three methods instead of a whole Prisma client.
+ */
+export interface PullRequestDb {
+  integration: {
+    findFirst(args: unknown): Promise<{
+      id: string;
+      kind: string;
+      enabled: boolean;
+      config: unknown;
+    } | null>;
+  };
+  pullRequestRecord: {
+    findFirst(args: unknown): Promise<StoredPrRecord | null>;
+    create(args: unknown): Promise<StoredPrRecord>;
+    update(args: unknown): Promise<StoredPrRecord>;
+  };
+  healProposal: {
+    update(args: unknown): Promise<unknown>;
+  };
+}
+
+/**
+ * The row as POSTGRES holds it, with `state` a plain string.
+ *
+ * `PullRequestRecord.state` is TEXT with its domain enforced at the producer
+ * (`PR_RECORD_STATES`), which the schema records as a deliberate choice: a new
+ * Prisma enum with no entry in check-enums' PAIRS list is an enum with no drift
+ * guard. The consequence is here: what comes back is a `string`, and turning it
+ * into a `PrRecordState` is a NARROWING that can fail — a row written by a
+ * future version, or by hand, must not silently read as a valid state.
+ */
+interface StoredPrRecord {
+  id: string;
+  orgId: string;
+  projectId: string;
+  repo: string;
+  branch: string;
+  baseRef: string;
+  purpose: string;
+  causeKey: string;
+  state: string;
+  number: number | null;
+  url: string | null;
+}
+
+/**
+ * Narrow a stored row onto {@link PullRequestRecordRow}.
+ *
+ * An unrecognised `state` becomes FAILED and is NOT passed through. FAILED is
+ * the safe arm: it means "this cause has a record and QAAI does not believe a
+ * PR is open for it", so the idempotence claim still holds (no second PR is
+ * opened for the cause) while nothing claims a url or an open review that
+ * cannot be substantiated. Defaulting to OPEN would be a PR reported as
+ * awaiting review on the strength of a value nothing in this version wrote.
+ */
+function narrowPrRecord(row: StoredPrRecord): PullRequestRecordRow {
+  const state = (PR_RECORD_STATES as readonly string[]).includes(row.state)
+    ? (row.state as PrRecordState)
+    : 'FAILED';
+  return { ...row, state };
+}
+
+/** The `Integration.config` keys this reads. Anything else is ignored. */
+interface GitIntegrationConfig {
+  repo?: unknown;
+  defaultBranch?: unknown;
+  baseBranch?: unknown;
+  pullRequests?: unknown;
+}
+
+/** Prisma's unique-constraint code, detected structurally. */
+function isUniqueConflict(err: unknown): boolean {
+  return Boolean(err && typeof err === 'object' && (err as { code?: unknown }).code === 'P2002');
+}
+
+/**
+ * `PullRequestStore`, over Prisma.
+ *
+ * ── THE TARGET COMES FROM QAAI'S OWN RECORDS, AND THAT IS THE SAFETY RULE ───
+ *
+ * `repo` and `baseRef` are read off the `Integration` row an org admin
+ * configured. NOTHING about the destination is derived from test output, page
+ * text, customer source or a model: the branch is composed by `branchNameFor`
+ * from a hash, the repo and base come from here, and the only attacker-
+ * influenceable text that reaches a PR at all is inside the fenced spans of its
+ * BODY. A target chosen by the thing being described is how a tool that opens
+ * PRs becomes a tool that opens them in somebody else's repository.
+ *
+ * ── AND IT HAPPENS ONLY ON A PATH THE CUSTOMER TURNED ON ────────────────────
+ *
+ * `pullRequestsEnabled` is `config.pullRequests === true` — an explicit true,
+ * not "not false". A missing key means an org that configured a git integration
+ * before pull requests existed, and inheriting an outward-facing write into
+ * their repository from a default is exactly the consent this product may not
+ * assume.
+ */
+export function pullRequestStore(
+  db: PullRequestDb,
+  args: {
+    /**
+     * The branch the CALLER pushed, which `openPullRequest` re-derives from the
+     * cause key and compares against.
+     *
+     * Taken as a parameter rather than composed here, and the comparison is the
+     * reason: the library re-composes the branch with `branchNameFor` and
+     * refuses when the two differ, so this value is the caller's claim "this is
+     * the branch I actually pushed" and the library's derivation is the check on
+     * it. A store that composed the branch itself would make both sides of that
+     * comparison the same computation, and the check would always pass — which
+     * is how a PR gets opened against a branch nobody pushed.
+     */
+    pushedBranch: string;
+  },
+): PullRequestStore {
+  return {
+    async loadTarget({ orgId, projectId, integrationId }) {
+      /*
+       * `projectId: { in: [projectId, null] }` — the integration is this
+       * project's or the ORG's. Dropping the filter entirely would let one
+       * project's PR be opened through another project's integration, which is
+       * the destination coming from somewhere other than QAAI's own records
+       * about THIS project.
+       */
+      const row = await db.integration.findFirst({
+        where: { id: integrationId, orgId, OR: [{ projectId }, { projectId: null }] },
+        select: { id: true, kind: true, enabled: true, config: true },
+      });
+      if (!row || !row.enabled) return null;
+      if (row.kind !== 'GITHUB' && row.kind !== 'GITLAB' && row.kind !== 'BITBUCKET') return null;
+
+      const config = (row.config ?? {}) as GitIntegrationConfig;
+      const repo = typeof config.repo === 'string' ? config.repo : null;
+      if (!repo) return null;
+      /*
+       * `baseBranch`, NOT `defaultBranch`. `parseGitConfig` in lib/integrations.ts
+       * defaults `defaultBranch` to `qaai/tests`, which is the branch QAAI
+       * PUSHES TO — using it as the base would open a pull request from QAAI's
+       * own branch into QAAI's own branch, or worse, propose merging a heal into
+       * the test-sync branch instead of the trunk. `main` is the fallback and it
+       * is a guess the record carries, so a reader can see what was assumed.
+       */
+      const baseRef = typeof config.baseBranch === 'string' ? config.baseBranch : 'main';
+
+      return {
+        integrationId: row.id,
+        provider: row.kind,
+        repo,
+        branch: args.pushedBranch,
+        baseRef,
+        pullRequestsEnabled: config.pullRequests === true,
+      };
+    },
+
+    async findByCauseKey({ orgId, causeKey }) {
+      const row = await db.pullRequestRecord.findFirst({
+        where: { orgId, causeKey },
+        select: PR_RECORD_COLUMNS,
+      });
+      return row === null ? null : narrowPrRecord(row);
+    },
+
+    async claim(args) {
+      try {
+        const row = await db.pullRequestRecord.create({
+          data: {
+            orgId: args.orgId,
+            projectId: args.projectId,
+            provider: args.provider,
+            integrationId: args.integrationId,
+            repo: args.repo,
+            branch: args.branch,
+            baseRef: args.baseRef,
+            purpose: args.purpose,
+            causeKey: args.causeKey,
+            /*
+             * REQUESTED before the host is called. A crash between this insert
+             * and the API call then leaves a row that says "we were about to"
+             * rather than a claimed PR nobody can find — and the row is what
+             * stops a retry opening a second one in the customer's repository.
+             */
+            state: 'REQUESTED',
+            fileCount: args.filePaths.length,
+            filePaths: [...args.filePaths],
+            preservedPaths: [...args.preservedPaths],
+            openedBy: args.openedBy,
+          },
+          select: PR_RECORD_COLUMNS,
+        });
+        return { created: true, row: narrowPrRecord(row) };
+      } catch (err) {
+        if (!isUniqueConflict(err)) throw err;
+        /*
+         * `@@unique([orgId, causeKey])` refused it, so somebody else claimed
+         * this cause. The WINNER is returned rather than a bare `false`: a
+         * false with no row would make a concurrent claim indistinguishable
+         * from a vanished one, and the loser could only guess what exists.
+         */
+        const winner = await db.pullRequestRecord.findFirst({
+          where: { orgId: args.orgId, causeKey: args.causeKey },
+          select: PR_RECORD_COLUMNS,
+        });
+        if (!winner) throw err;
+        return { created: false, row: narrowPrRecord(winner) };
+      }
+    },
+
+    async settle({ id, state, number, url, failureNote }) {
+      const row = await db.pullRequestRecord.update({
+        where: { id },
+        data: {
+          state,
+          // `undefined` leaves a column alone; `null` clears it. Both are
+          // reachable and they mean different things, so neither is coalesced.
+          ...(number === undefined ? {} : { number }),
+          ...(url === undefined ? {} : { url }),
+          ...(failureNote === undefined ? {} : { failureNote }),
+        },
+        select: PR_RECORD_COLUMNS,
+      });
+      return narrowPrRecord(row);
+    },
+
+    async attachToHeal({ healId, prRecordId, url }) {
+      /*
+       * BOTH COLUMNS OR NEITHER, in one statement. `prUrl` is the denormalised
+       * copy the heal list renders without a join and `prRecordId` points at
+       * the row that owns the idempotence key — a url with no record id is a PR
+       * whose second apply cannot find it, which is how a second PR gets opened
+       * for one cause.
+       */
+      await db.healProposal.update({
+        where: { id: healId },
+        data: { prUrl: url, prRecordId },
+      });
+    },
+  };
+}
+
+/**
+ * The columns `PullRequestRecordRow` names, and only those.
+ *
+ * A shared constant rather than four copies: the row type is the projection, so
+ * a column added to the type and forgotten in one query would be `undefined` at
+ * one reader and present at the others.
+ */
+const PR_RECORD_COLUMNS = {
+  id: true,
+  orgId: true,
+  projectId: true,
+  repo: true,
+  branch: true,
+  baseRef: true,
+  purpose: true,
+  causeKey: true,
+  state: true,
+  number: true,
+  url: true,
+} as const;
+
+/**
+ * `AuditSink`, over Prisma.
+ *
+ * An outward-facing write into a customer's systems is recorded in the audit
+ * trail, which is not optional — it is how "QAAI opened a PR in our repo at
+ * 03:12" becomes checkable rather than something a reviewer has to take on
+ * trust. `userId` is the actor when a human asked and NULL when a background
+ * path did; a null is "nobody asked, QAAI decided", which is a different and
+ * more interesting fact than a missing column.
+ */
+export function pullRequestAudit(
+  db: { auditLog: { create(args: unknown): Promise<unknown> } },
+  args: { orgId: string; userId: string | null },
+): AuditSink {
+  return {
+    async record(entry) {
+      await db.auditLog.create({
+        data: {
+          orgId: args.orgId,
+          userId: args.userId,
+          action: entry.action,
+          targetType: entry.targetType,
+          targetId: entry.targetId,
+          metadata: entry.metadata as object,
+        },
+      });
+    },
+  };
 }

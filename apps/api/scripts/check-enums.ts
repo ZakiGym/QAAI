@@ -27,7 +27,9 @@ import { config as loadEnv } from 'dotenv';
 loadEnv({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
 
 const SCHEMA = fileURLToPath(new URL('../prisma/schema.prisma', import.meta.url));
-const CONSTANTS = fileURLToPath(new URL('../../../packages/shared/src/constants.ts', import.meta.url));
+const CONSTANTS = fileURLToPath(
+  new URL('../../../packages/shared/src/constants.ts', import.meta.url),
+);
 const TYPES = fileURLToPath(new URL('../../../packages/shared/src/types.ts', import.meta.url));
 // Not every mirror lives in @qaai/shared. RunnerJobStatus is declared next to
 // the lease and reaper logic that is its only reader, and moving it here just to
@@ -44,7 +46,9 @@ const SSO = fileURLToPath(new URL('../src/lib/sso.ts', import.meta.url));
  * wagging the dog — the same judgement the RUNNERS entry above records.
  */
 const SURFACE = fileURLToPath(new URL('../../../packages/shared/src/surface.ts', import.meta.url));
-const FLOW_MAP = fileURLToPath(new URL('../../../packages/shared/src/flow-map.ts', import.meta.url));
+const FLOW_MAP = fileURLToPath(
+  new URL('../../../packages/shared/src/flow-map.ts', import.meta.url),
+);
 /*
  * The non-crawl enumeration vocabularies, in @qaai/shared for the same reason
  * and NOT in constants.ts either. `requirements.ts` is the spec side (what a
@@ -218,6 +222,58 @@ const TEST_TYPE_DECL_FILE = fileURLToPath(
 const ARTIFACT_SET_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/artifact-set.ts', import.meta.url),
 );
+/*
+ * The suppression vocabulary: every way this product makes a red thing stop
+ * being red, and why a test looks obsolete. In @qaai/shared and NOT in
+ * constants.ts for the same reason as the twelve above -- `suppression.ts` holds
+ * the single `isInForce` check, the per-kind rule table (scope, ceiling,
+ * denominator effect, whether a human must own it), the exact-key mute matcher
+ * and the disclosure sentence beside the vocabulary, and those are the only code
+ * that interprets it.
+ *
+ * `DENOMINATOR_EFFECTS`, `SUPPRESSION_TARGET_SCOPES`, `SUPPRESSION_REFUSALS` and
+ * `SUPPRESSION_FORCE_STATES` are deliberately NOT paired below, and none of the
+ * four is an omission:
+ *
+ *   * `DENOMINATOR_EFFECTS` is a FUNCTION of the kind (`denominatorEffectOf`).
+ *     Storing it would be two facts in one field -- a row and the disclosure
+ *     beside it computed from different values, which is the defect
+ *     `houseStyle.planned` already shipped once. There is no column to drift
+ *     from.
+ *   * `SUPPRESSION_TARGET_SCOPES` is TEXT on `SuppressionEvent.targetScope`,
+ *     derivable from the kind for four of the five, and nothing groups on it.
+ *   * `SUPPRESSION_REFUSALS` and `SUPPRESSION_FORCE_STATES` are answers computed
+ *     per request. A refusal is never stored; a force state is `isInForce` read
+ *     against the clock, and a stored copy would be the expired-mute bug with a
+ *     column behind it.
+ *
+ * All four have their run-time parity against their own zod schema's `.options`
+ * in packages/shared/src/suppression.test.ts, and their compiler half as a
+ * `satisfies Record<K, V>` presence record in the module. Both halves, because
+ * one without the other passes while the two disagree.
+ */
+const SUPPRESSION_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/suppression.ts', import.meta.url),
+);
+/*
+ * The ownership vocabulary: HOW an owner was decided. The matching itself --
+ * patterns, precedence, the rule table -- stays in apps/api/src/lib/ownership.ts,
+ * which the web app cannot import; this file is the half both the API and the
+ * cockpit read, and it holds the strength table that decides which answers may
+ * page somebody and which may own a suppression.
+ *
+ * `OWNER_STRENGTHS` and `OWNABLE_SUBJECTS` are NOT paired below. Neither is a
+ * column: a strength is `OWNER_PROVENANCE_STRENGTH[provenance]`, so storing it
+ * would be the derived-value defect again, and a subject is which table the row
+ * is in. `OWNERSHIP_STATES` is not paired either and for a different reason --
+ * `TriageVerdict.ownerState`, `TrackerIssue.ownerState`,
+ * `RetirementProposal.ownerState` and `SuppressionEvent.ownerState` are all
+ * TEXT with the domain enforced at the producer, exactly as
+ * `MutationSurvivor.reason` is.
+ */
+const OWNERSHIP_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/ownership.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -247,7 +303,9 @@ const PAIRS: Array<{
     | 'principals'
     | 'browserMatrix'
     | 'testTypeDecl'
-    | 'artifactSet';
+    | 'artifactSet'
+    | 'suppression'
+    | 'ownership';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -268,6 +326,24 @@ const PAIRS: Array<{
   { prismaEnum: 'TestResultStatus', tsConst: 'TEST_RESULT_STATUSES' },
   { prismaEnum: 'Verdict', tsConst: 'VERDICTS' },
   { prismaEnum: 'Language', tsConst: 'LANGUAGES' },
+  /*
+   * WHICH THIRD-PARTY SYSTEM QAAI IS TALKING TO — unpaired for the life of this
+   * repo, and found by the durable half of `check-enums.suppression.test.ts`
+   * ("pair every enum the new models store") when `PullRequestRecord.provider`
+   * became the THIRD column to store it, after `Integration.kind` and
+   * `TrackerIssue.provider`.
+   *
+   * It had no mirror to pair against: constants.ts held four CAPABILITY lists
+   * (GIT_/GRID_/VISUAL_/CHAT_INTEGRATION_KINDS) whose union was fifteen of the
+   * seventeen members, so JIRA, LINEAR and PAGERDUTY were values TypeScript
+   * could not name. `INTEGRATION_KINDS` is the storage mirror those four were
+   * never meant to be — a capability list says what works, a storage mirror
+   * says what is legal to store, and the capability lists keep their jobs.
+   *
+   * The LIVE half is not blocked on a deploy: every member has been in the
+   * database since the init migration and this round adds none.
+   */
+  { prismaEnum: 'IntegrationKind', tsConst: 'INTEGRATION_KINDS' },
   { prismaEnum: 'RunShardStatus', tsConst: 'RunShardStatus', source: 'types', kind: 'union' },
   // Dunning (§9). The webhook writes it and the UI will eventually render it;
   // a database value TypeScript does not know about would be an org whose
@@ -756,6 +832,40 @@ const PAIRS: Array<{
   // that could be applied without a human, depending on which direction the
   // drift went.
   { prismaEnum: 'SuiteChangeState', tsConst: 'SUITE_CHANGE_STATES', source: 'artifactSet' },
+  /*
+   * SUPPRESSION AND OWNERSHIP. The four enums behind "something red that will
+   * not be treated as red" and "whose failure is this".
+   *
+   *   `SuppressionKind`        "47 failures suppressed by 3 known issues" is a
+   *                            group-by over `SuppressionEvent.kind`, and that
+   *                            sentence is what keeps the feature honest. A
+   *                            value missing from this type could not be
+   *                            STORED, which means a suppression of that kind
+   *                            would apply and record NOTHING -- a failure
+   *                            suppressed without being counted, which is the
+   *                            one lie this product cannot afford.
+   *   `OwnerProvenance`        filtered on every suppression write (only
+   *                            EXPLICIT_ASSIGNMENT may own one) and grouped in
+   *                            the cockpit: "how many of our owners did a
+   *                            person actually set, and how many did one
+   *                            catch-all glob?" Stored on four tables.
+   *   `ObsolescenceSignalKind` grouped. Route-gone versus locator-not-found is
+   *                            the difference between a real cleanup list and a
+   *                            crawl that forgot to log in, and only the first
+   *                            may ever justify retiring a test.
+   *   `RetirementState`        every review list filters on it, and a state
+   *                            outside `RETIREMENT_SUPPRESSING_STATES` is a
+   *                            retirement that either never stops a test or
+   *                            stops one nobody approved.
+   */
+  { prismaEnum: 'SuppressionKind', tsConst: 'SUPPRESSION_KINDS', source: 'suppression' },
+  {
+    prismaEnum: 'ObsolescenceSignalKind',
+    tsConst: 'OBSOLESCENCE_SIGNAL_KINDS',
+    source: 'suppression',
+  },
+  { prismaEnum: 'RetirementState', tsConst: 'RETIREMENT_STATES', source: 'suppression' },
+  { prismaEnum: 'OwnerProvenance', tsConst: 'OWNER_PROVENANCES', source: 'ownership' },
 ];
 
 /*
@@ -865,6 +975,8 @@ const principals = readFileSync(PRINCIPALS_FILE, 'utf8');
 const browserMatrix = readFileSync(BROWSER_MATRIX_FILE, 'utf8');
 const testTypeDecl = readFileSync(TEST_TYPE_DECL_FILE, 'utf8');
 const artifactSet = readFileSync(ARTIFACT_SET_FILE, 'utf8');
+const suppression = readFileSync(SUPPRESSION_FILE, 'utf8');
+const ownership = readFileSync(OWNERSHIP_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -880,7 +992,9 @@ const SOURCES: Record<
   | 'principals'
   | 'browserMatrix'
   | 'testTypeDecl'
-  | 'artifactSet',
+  | 'artifactSet'
+  | 'suppression'
+  | 'ownership',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -898,14 +1012,15 @@ const SOURCES: Record<
   browserMatrix: { text: browserMatrix, label: 'shared/browser-matrix.ts' },
   testTypeDecl: { text: testTypeDecl, label: 'shared/test-type-decl.ts' },
   artifactSet: { text: artifactSet, label: 'shared/artifact-set.ts' },
+  suppression: { text: suppression, label: 'shared/suppression.ts' },
+  ownership: { text: ownership, label: 'shared/ownership.ts' },
 };
 const problems: string[] = [];
 
 for (const { prismaEnum, tsConst, source = 'constants', kind = 'array' } of PAIRS) {
   const { text, label } = SOURCES[source];
   const fromPrisma = prismaEnumMembers(schema, prismaEnum);
-  const fromTs =
-    kind === 'union' ? tsUnionMembers(text, tsConst) : tsConstMembers(text, tsConst);
+  const fromTs = kind === 'union' ? tsUnionMembers(text, tsConst) : tsConstMembers(text, tsConst);
 
   // A missing declaration is drift too — silently skipping it is how a renamed
   // enum stops being checked without anyone noticing.

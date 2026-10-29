@@ -394,3 +394,38 @@ export * from './auth-lifecycle.js';
 export * from './multi-actor.js';
 export * from './authz-probe.js';
 export * from './gap-closure.js';
+
+/*
+ * ── THE FOUR CLOSURE MODULES THIS ROUND LANDED ──────────────────────────────
+ *
+ * Every one of them is imported by a PROCESSOR in apps/worker, which is a
+ * workspace that cannot see this package's source: `known-issues.js` and
+ * `env-issue.js` by processors/triage.ts, `drift.js` by processors/explore.ts,
+ * and `mutant-closure.js` by processors/close-loop.ts. Until these lines
+ * existed `check:wiring` reported all four `package-exports` disconnected —
+ * "nothing but a test file imports it" — which is this codebase's signature
+ * defect stated by the ratchet itself, and the deflake/obsolete comment far
+ * above records the same four-way mistake being made one round earlier.
+ *
+ * ORDER: `known-issues.js` imports from `./triage.js` (the cluster vocabulary)
+ * and `env-issue.js` from `./untrusted.js`, both published above, so no line
+ * here adds a cycle.
+ *
+ * NAME COLLISIONS, CHECKED BOTH WAYS AND NOT ASSUMED. Every exported name in
+ * the four files was greped against every `export const|function|interface|
+ * type|class` already reachable from this barrel. The near-misses worth
+ * recording, because each one is two different questions under one word and a
+ * future star export of a fifth module could collide with either:
+ *   · `DriftWarning`/`DriftCheck`/`driftCheck` belong to `obsolete.js` (a
+ *     retirement-grade audit) while `DRIFT_STATES`/`driftReport` belong to
+ *     `drift.js` (per-locator repairability). Different shapes, no shared name.
+ *   · `RetirementProposal` is obsolete.js's interface; `drift.js` exports no
+ *     such name, and @qaai/shared publishes neither.
+ *   · `MUTANT_CLASSES` (mutant-closure.js) against `mutation-gate.js`'s score
+ *     vocabulary: no overlap.
+ * `tsc -p packages/agent/tsconfig.json` reports no TS2308 on this file.
+ */
+export * from './known-issues.js';
+export * from './env-issue.js';
+export * from './drift.js';
+export * from './mutant-closure.js';

@@ -825,3 +825,85 @@ describe('probeCapabilities and the terminal capability', () => {
     expect(capabilities.toolchains).toContain('node');
   });
 });
+
+// ─── 5c. The redirect, which is the fifth thing a security team would not forgive ─
+
+describe('a 3xx is a failure and never a destination', () => {
+  let dir = '';
+  let realFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'qaai-redirect-'));
+    realFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /**
+   * WHY THIS TEST EXISTS: `redirect: 'manual'` in runner.ts survived being
+   * mutated to `'follow'` with all 449 tests in this package still green.
+   *
+   * The agent holds a runner token and sends it as `authorization` on every
+   * call. With `'follow'`, undici resolves the hop itself, the explicit 3xx
+   * refusal below it becomes DEAD CODE, and the sentence at the top of
+   * runner.ts — "Redirects are refused rather than followed" — becomes a doc
+   * comment that contradicts the code under it. The header-stripping undici
+   * does on a cross-origin hop is a mitigation owned by somebody else's
+   * library, not a property this agent asserts, and `--api-url` pointing at a
+   * host that answers 302 is exactly the configuration a customer gets wrong.
+   *
+   * So both halves are pinned: the OPTION we pass, and the OUTCOME when a
+   * redirect arrives anyway.
+   */
+  it('passes redirect:manual on every call, and never fetches the redirect target', async () => {
+    const seen: Array<{ url: string; redirect: string | undefined; auth: string | null }> =
+      [];
+
+    globalThis.fetch = (async (input: string, init?: RequestInit) => {
+      const headers = new Headers(init?.headers ?? {});
+      seen.push({ url: input, redirect: init?.redirect, auth: headers.get('authorization') });
+      // Every call is answered with a redirect to somebody else's host. If the
+      // agent follows one, the attacker's origin shows up in `seen`.
+      return new Response(null, {
+        status: 302,
+        headers: { location: 'https://attacker.example/collect' },
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    const config = parseRunnerConfig(
+      {
+        workspaceRoot: dir,
+        terminal: false,
+        executors: { default: { command: 'qaai-no-such-executor', args: [], report: 'junit.xml' } },
+        capabilities: { browsers: [], toolchains: [] },
+      },
+      'test',
+    );
+
+    const agent = new RunnerAgent({
+      endpoint: pinEndpoint('http://localhost:4000'),
+      token: 'qaai_rt_testtoken',
+      config,
+      log: () => {},
+      maxCycles: 1,
+    });
+    await agent.loop();
+
+    // It did try to talk to QAAI, so this test is not vacuously green.
+    expect(seen.length).toBeGreaterThan(0);
+
+    for (const call of seen) {
+      // The option itself. This is the assertion the surviving mutant needed.
+      expect(call.redirect, call.url).toBe('manual');
+      // Nothing was sent to the host the redirect named.
+      expect(call.url, 'the agent followed a redirect').not.toContain('attacker.example');
+    }
+
+    // And the token only ever went to the pinned origin.
+    for (const call of seen.filter((entry) => entry.auth !== null)) {
+      expect(new URL(call.url).origin).toBe('http://localhost:4000');
+    }
+  });
+});

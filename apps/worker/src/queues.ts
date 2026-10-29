@@ -81,6 +81,28 @@ export interface AnalyzeSourceJob {
 export const PREFLIGHT_QUEUE = 'qaai.preflight';
 
 /**
+ * The suppression expiry sweep.
+ *
+ * ── WHY A SWEEP AND NOT ONLY THE READ-TIME CHECK ───────────────────────────
+ *
+ * `isInForce` already refuses an expired suppression at every read, so an
+ * expiry takes effect with nobody doing anything — that is the design and this
+ * sweep does not change it. What the read-time check CANNOT do is tell anyone.
+ * An expiry that arrives as a surprise outage teaches a team to set the next one
+ * for a year, which is how "temporary" mutes become permanent; and a
+ * `RetirementProposal` nobody reviewed would sit PROPOSED for ever, pretending
+ * to be a decision somebody is about to make.
+ *
+ * So the sweep's job is the part that needs a clock of its own: move the
+ * expired proposals to EXPIRED, and report the mutes that are about to stop
+ * suppressing to the humans who own them.
+ *
+ * NOT in `QUEUE_NAMES` for the same reason as `ANALYZE_SOURCE_QUEUE` above and
+ * `RETENTION_QUEUE`: this wave does not own packages/shared/src/constants.ts.
+ */
+export const SUPPRESSION_QUEUE = 'qaai.suppression';
+
+/**
  * One capability probe.
  *
  * `deploymentKey` carries the sentinel `<self>` for this image and
@@ -104,6 +126,7 @@ export interface PreflightJob {
 
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
 const preflightQueue = new Queue(PREFLIGHT_QUEUE, { connection });
+const suppressionQueue = new Queue(SUPPRESSION_QUEUE, { connection });
 const exploreQueue = new Queue(QUEUE_NAMES.explore, { connection });
 const analyzeSourceQueue = new Queue(ANALYZE_SOURCE_QUEUE, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
@@ -451,6 +474,30 @@ export async function armFlakeTick(): Promise<void> {
   );
 }
 
+/**
+ * Arm the suppression expiry sweep. Same repeatable-job reasoning as the
+ * scheduler, at the flake sweep's cadence: an expiry that is five minutes late
+ * being ANNOUNCED has already taken effect at every read, so nothing is
+ * suppressed in the meantime and there is nothing to gain from ticking every
+ * minute.
+ *
+ * `removeOnComplete` AND `removeOnFail`, both, like every arm above: a fixed
+ * `jobId` is a Redis key, and a repeatable job whose failed record is kept
+ * under that key is a job that never runs again.
+ */
+export async function armSuppressionSweep(): Promise<void> {
+  await suppressionQueue.add(
+    'tick',
+    { at: new Date().toISOString() },
+    {
+      repeat: { every: 5 * 60_000 },
+      jobId: 'qaai-suppression-tick',
+      removeOnComplete: 20,
+      removeOnFail: 20,
+    },
+  );
+}
+
 export async function closeProducers(): Promise<void> {
   await Promise.all([
     generateQueue.close(),
@@ -462,5 +509,6 @@ export async function closeProducers(): Promise<void> {
     analyzeSourceQueue.close(),
     exploreQueue.close(),
     preflightQueue.close(),
+    suppressionQueue.close(),
   ]);
 }

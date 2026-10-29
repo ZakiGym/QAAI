@@ -65,6 +65,14 @@ import {
   deltaIsMeaningful,
 } from '@qaai/shared';
 import type { SnapshotComparability } from '@qaai/shared';
+/*
+ * The ONE suppression summariser. This file's opening line is "a suppression
+ * nobody can audit is a suppression nobody should trust", and a digest with its
+ * own idea of how to phrase "47 failures by 3 known issues" would be the second
+ * phrasing of the one sentence every surface is supposed to say identically.
+ */
+import { summariseSuppressions } from '@qaai/shared';
+import type { SuppressionKind, SuppressionSummary } from '@qaai/shared';
 import { logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
 // Pure modules from the API workspace — types and functions, no Prisma and no
@@ -184,6 +192,31 @@ export interface Digest {
    * coverage line is not a reason to send one.
    */
   coverage: DigestCoverage | null;
+  /**
+   * WHAT WENT QUIET, AND WHY — counted, by kind, for the window.
+   *
+   * THE DEFECT THIS CLOSES: a digest listing three new failures while a known
+   * issue silenced forty is a digest that makes the larger fact invisible every
+   * morning, and this is the message most of a team ever reads about their
+   * suite. "A suppression nobody can audit is a suppression nobody should
+   * trust" is this file's own opening line; until this field existed the file
+   * could not say the sentence.
+   *
+   * NEVER NULL, because `summariseSuppressions` reports zero OUT LOUD
+   * ("Nothing was suppressed."). A surface that renders nothing when nothing
+   * was suppressed is indistinguishable from one that forgot to ask.
+   *
+   * ── IT DOES NOT MAKE THE DIGEST SPEAK ─────────────────────────────────────
+   *
+   * Like `coverage`, and for a sharper reason: a mute that is working silences
+   * failures every single day, so letting it into `hasSomethingToSay` would
+   * turn a quiet window into a daily message about a decision somebody already
+   * made — and a daily message that always has something in it is one nobody
+   * opens. It rides along with a digest that was going to be sent anyway. The
+   * EXPIRY is the part somebody must act on, and that is the expiry sweep's job
+   * (it has an owner for every row); here it is reported, not alerted.
+   */
+  suppressions: SuppressionSummary;
 }
 
 /**
@@ -281,6 +314,59 @@ export async function collectDigest(
     select: { id: true, status: true, finishedAt: true },
   });
 
+  /*
+   * ── THE SUPPRESSION LEDGER FOR THE WINDOW ─────────────────────────────────
+   *
+   * Scoped to THIS WINDOW'S RUNS and not to a date range on the ledger itself.
+   * `SuppressionEvent.createdAt` is when the row was written, which is almost
+   * always the same instant — but a finaliser that was redelivered the next
+   * morning would file a row dated outside the window it belongs to, and the
+   * digest would then attribute a suppression to the wrong day. The run ids are
+   * the window.
+   *
+   * FOLDED HERE rather than by `groupBy`, for the reason the run finaliser
+   * records: `suppressions` is DISTINCT suppressing rows, and a group-by with
+   * `_count` would report three mutes as three when they silenced one cause
+   * each and as one when one mute silenced three causes. The headline is "47
+   * failures by 3 known issues", so the second number has to be distinct
+   * `sourceId`s and Prisma cannot count distinct inside a group-by.
+   */
+  const ledger =
+    runs.length === 0
+      ? []
+      : await prisma.suppressionEvent.findMany({
+          where: { orgId, runId: { in: runs.map((run) => run.id) } },
+          take: MAX_RESULTS,
+          select: { kind: true, sourceId: true, suppressed: true, inForce: true },
+        });
+  /*
+   * Keyed by the UNION and not by `string`, so no cast is needed below.
+   * `SuppressionEvent.kind` is a Postgres enum and Prisma types it as the
+   * union already; a `as SuppressionKind` on the way out of a string-keyed map
+   * would be an unchecked claim at the one place a new kind should become a
+   * compile error.
+   */
+  const byKind = new Map<
+    SuppressionKind,
+    { suppressed: number; live: Set<string>; dead: Set<string> }
+  >();
+  for (const row of ledger) {
+    const tally = byKind.get(row.kind) ?? { suppressed: 0, live: new Set(), dead: new Set() };
+    tally.suppressed += row.suppressed;
+    // `sourceId` is nullable; a row with none still counts as ONE suppression
+    // identified by nothing, rather than being dropped from the count.
+    (row.inForce ? tally.live : tally.dead).add(row.sourceId ?? `<unidentified:${row.kind}>`);
+    byKind.set(row.kind, tally);
+  }
+  const suppressions = summariseSuppressions(
+    [...byKind.entries()].map(([kind, tally]) => ({
+      kind,
+      suppressions: tally.live.size,
+      suppressed: tally.suppressed,
+      expired: tally.dead.size,
+    })),
+  );
+
   const results = (await prisma.testResult.findMany({
     where: { orgId, runId: { in: runs.map((run) => run.id) } },
     orderBy: { createdAt: 'asc' },
@@ -370,6 +456,7 @@ export async function collectDigest(
     since,
     until,
     runs: { total: runs.length, red: runs.filter((run) => run.status !== 'PASSED').length },
+    suppressions,
     // Real bugs before environment noise, then alphabetical so two consecutive
     // digests list the same failure in the same place.
     newFailures: newFailures.sort(byVerdictThenName).map(item),
@@ -817,6 +904,19 @@ export function renderDigest(digest: Digest, webUrl: string): string {
   if (digest.unowned > 0 && digest.newFailures.length > 0) {
     // Said plainly, because an unowned failure is the one that sits for a week.
     footnotes.push(`${digest.unowned} of the new failures have no owner.`);
+  }
+  /*
+   * THE SENTENCE THAT KEEPS THIS HONEST: "47 failures by 3 known issues."
+   *
+   * Only when something was actually suppressed or has expired —
+   * `summariseSuppressions` says "Nothing was suppressed." out loud and that
+   * belongs in the API's own answer, where a reader can tell it apart from a
+   * surface that forgot to ask. In a chat message that a team reads every
+   * morning, a line saying nothing happened every morning is a line they stop
+   * reading, which is how the ones that DO matter get skipped too.
+   */
+  if (digest.suppressions.suppressed > 0 || digest.suppressions.expired > 0) {
+    footnotes.push(`Suppressed in this window: ${digest.suppressions.disclosure}`);
   }
   if (digest.truncated) {
     footnotes.push(

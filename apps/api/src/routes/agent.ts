@@ -129,6 +129,13 @@ import type {
   SuiteHealthReport,
 } from '@qaai/agent';
 import type { OpenHeal, PostCheck } from '@qaai/agent';
+// The fence. A heal's explanation is a MODEL's own output, and this is what
+// stops it reaching a pull-request body as a bare string.
+import { untrusted } from '@qaai/agent';
+// The one function that decides whether a suppression is in force. Asked, never
+// re-implemented: a second comparison of `expiresAt` is a second chance to get
+// the boundary wrong, and this is the rule the whole vocabulary rests on.
+import { forceStateOf } from '@qaai/shared';
 /*
  * THIS IMPORT USED TO BE A RELATIVE PATH, UNDER A COMMENT THAT WAS FALSE.
  *
@@ -141,6 +148,20 @@ import type { OpenHeal, PostCheck } from '@qaai/agent';
  */
 import type { SuiteHealthTestInput } from '@qaai/agent';
 import { effectivePlan, startRun } from '../lib/start-run.js';
+/*
+ * ── THE OUTWARD-FACING WRITE, AND THE ONE SEAM IT GOES THROUGH ─────────────
+ *
+ * `openPullRequest` is the policy, `githubPullRequestHost` is the ONE injected
+ * git-host seam (it lives in github-app.ts, which already has the injected
+ * fetch, the installation token and the pinned API host), and
+ * `pullRequestStore`/`pullRequestAudit` are its Prisma halves in git.ts. There
+ * is deliberately no second path: a PR composed anywhere else would be a second
+ * place that decides what a repository, a branch and a base ref may be.
+ */
+import { openPullRequest, prCauseKey, branchNameFor } from '../lib/pull-request.js';
+import { githubPullRequestHost } from '../lib/github-app.js';
+import { pullRequestAudit, pullRequestStore, repoHttpsUrl } from '../lib/git.js';
+import { openToken, parseGitConfig } from '../lib/integrations.js';
 import {
   budgetForEnvironment,
   dimensionsForProject,
@@ -930,6 +951,27 @@ function healVersionMessage(
  * nobody could check, is false, which is the whole point of this feature: a heal
  * recorded APPLIED while still red tells a human the problem is handled.
  */
+/**
+ * The pull request this heal reached a reviewer through, or null.
+ *
+ * NULL IS "NO PULL REQUEST", NOT "NOT OPENED YET" — and the distinction is why
+ * this returns an object rather than a bare string. `HealProposal.prUrl` was
+ * documented as "the PR opened when the repo is connected" and nothing wrote
+ * it for several rounds; now that something does, a reader has to be able to
+ * tell "QAAI has not been asked to open one" from "one exists at this url".
+ *
+ * `recordId` rides along because it is the idempotence key's row: a url with no
+ * record id is a PR whose second apply cannot find it, so a surface that showed
+ * one without the other would be showing half of what makes "one PR per cause"
+ * true.
+ */
+function pullRequestOf(heal: { prUrl: string | null; prRecordId: string | null }): {
+  url: string;
+  recordId: string | null;
+} | null {
+  return heal.prUrl === null ? null : { url: heal.prUrl, recordId: heal.prRecordId };
+}
+
 function verificationOf(heal: {
   state: string;
   verifyState: string | null;
@@ -1158,6 +1200,7 @@ agentRouter.get('/heals', async (req, res) => {
               'No code check applies: a retirement changes no code. The evidence is the comparison against the newest crawl, recorded on the proposal.',
           },
           verification: verificationOf(heal),
+          pullRequest: pullRequestOf(heal),
         };
       }
 
@@ -1216,6 +1259,7 @@ agentRouter.get('/heals', async (req, res) => {
           kind: 'PATCH' as const,
         },
         verification: verificationOf(heal),
+        pullRequest: pullRequestOf(heal),
       };
     }),
   );
@@ -1511,6 +1555,322 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
       ...check.flags,
       check.checks,
     ].join(' '),
+  });
+});
+
+// ─── The suppression roster ──────────────────────────────────────────────────
+
+/** Known issues per read, and the cap is disclosed. */
+const KNOWN_ISSUE_PAGE = 100;
+
+/** Recent matches shown per issue — the EVIDENCE behind the headline count. */
+const KNOWN_ISSUE_MATCHES_PER_ISSUE = 5;
+
+/**
+ * Every durable mute on this project, what it has silenced, and when it stops.
+ *
+ * ── WHY THIS READ HAS TO EXIST ─────────────────────────────────────────────
+ *
+ * `KnownIssue.matchCount` is a denormalised SUM of `KnownIssueMatch`, and until
+ * this route existed the matches were written and read by nothing — rows piling
+ * up behind a headline nobody could check. The headline is what a human uses to
+ * decide whether to renew a mute, so a headline with no readable evidence is
+ * exactly the kind of number this product may not ship: "muted and gone" and
+ * "muted and still firing forty times a day" would be the same row.
+ *
+ * ── EVERY SUPPRESSION IS VISIBLE, INCLUDING THE DEAD ONES ──────────────────
+ *
+ * `forceState` is computed per row with `forceStateOf`, so an EXPIRED mute and
+ * a REVOKED one are different answers — the first ran out, the second was
+ * judged wrong, and only the second says anything about the decision. Neither is
+ * filtered out: a roster that showed only the live mutes would make an expiry
+ * arrive as a surprise outage, which is how a team learns to set the next one
+ * for a year.
+ */
+agentRouter.get('/projects/:projectId/known-issues', async (req, res) => {
+  const actor = actorOf(req);
+  const projectId = String(req.params.projectId);
+  const now = new Date();
+
+  const rows = await prisma.knownIssue.findMany({
+    where: { projectId },
+    // Soonest expiry first: the row that is about to stop suppressing is the
+    // one somebody has to act on, and it is the one a long list buries.
+    orderBy: { expiresAt: 'asc' },
+    take: KNOWN_ISSUE_PAGE + 1,
+    select: {
+      id: true,
+      title: true,
+      reason: true,
+      signatures: true,
+      expiresAt: true,
+      revokedAt: true,
+      revokedBy: true,
+      revokedReason: true,
+      ownerUserId: true,
+      ownerTeamId: true,
+      ownerProvenance: true,
+      matchCount: true,
+      firstMatchedAt: true,
+      lastMatchedAt: true,
+      trackerIssueId: true,
+      createdBy: true,
+      createdAt: true,
+    },
+  });
+  const capped = rows.length > KNOWN_ISSUE_PAGE;
+  const page = rows.slice(0, KNOWN_ISSUE_PAGE);
+
+  /*
+   * ONE read for every issue's recent matches rather than a read per issue.
+   * `take` is per QUERY and not per issue, so the slice below is what bounds
+   * each one — and the issue's own `matchCount` is the authority on the TOTAL,
+   * which is why a short list here can never read as "that is all of them".
+   */
+  const matches =
+    page.length === 0
+      ? []
+      : await prisma.knownIssueMatch.findMany({
+          where: { knownIssueId: { in: page.map((row) => row.id) } },
+          orderBy: { matchedAt: 'desc' },
+          take: KNOWN_ISSUE_PAGE * KNOWN_ISSUE_MATCHES_PER_ISSUE,
+          select: {
+            knownIssueId: true,
+            runId: true,
+            clusterKey: true,
+            occurrences: true,
+            matchedAt: true,
+          },
+        });
+
+  res.json({
+    projectId,
+    orgId: actor.orgId,
+    /*
+     * The cap, stated. `100 known issues` on a project with four hundred is a
+     * number that gets read as all of them, and a count with no "more exist"
+     * beside it is how a cap becomes a silent claim.
+     */
+    capped,
+    pageSize: KNOWN_ISSUE_PAGE,
+    knownIssues: page.map((row) => {
+      const mine = matches.filter((match) => match.knownIssueId === row.id);
+      return {
+        id: row.id,
+        title: row.title,
+        reason: row.reason,
+        signatures: row.signatures,
+        owner: row.ownerUserId
+          ? { kind: 'USER' as const, userId: row.ownerUserId }
+          : row.ownerTeamId
+            ? { kind: 'TEAM' as const, teamId: row.ownerTeamId }
+            : null,
+        ownerProvenance: row.ownerProvenance,
+        /*
+         * The ONE function that decides whether a suppression is in force, asked
+         * here rather than re-implemented. A roster that compared `expiresAt`
+         * itself would be a second answer to the question, and the boundary (`>`
+         * and not `>=`: a mute expiring exactly now is OVER) is the one
+         * comparison this product may only have in a single place.
+         */
+        forceState: forceStateOf(row, now),
+        expiresAt: row.expiresAt,
+        revokedAt: row.revokedAt,
+        revokedBy: row.revokedBy,
+        revokedReason: row.revokedReason,
+        /** Failures silenced over this mute's whole life. The headline. */
+        matchCount: row.matchCount,
+        firstMatchedAt: row.firstMatchedAt,
+        lastMatchedAt: row.lastMatchedAt,
+        trackerIssueId: row.trackerIssueId,
+        createdBy: row.createdBy,
+        createdAt: row.createdAt,
+        /** The evidence, and `matchesShown < matchCount` is the honest reading. */
+        recentMatches: mine.slice(0, KNOWN_ISSUE_MATCHES_PER_ISSUE),
+        matchesShown: Math.min(mine.length, KNOWN_ISSUE_MATCHES_PER_ISSUE),
+      };
+    }),
+  });
+});
+
+// ─── The loop ends somewhere a reviewer looks ────────────────────────────────
+
+/**
+ * Open the pull request for an applied heal.
+ *
+ * ── THE DEFECT THIS CLOSES ─────────────────────────────────────────────────
+ *
+ * `HealProposal.prUrl` was documented as "the PR opened when the repo is
+ * connected" and NOTHING wrote it. `pushRepo` writes a branch and stops there,
+ * so every loop in this product ended in the database: a reviewer had to come
+ * to QAAI to find out QAAI had a fix for them, which is the opposite of how a
+ * reviewer works. This is the one path by which something QAAI produced reaches
+ * a person by the route people already use.
+ *
+ * ── WHY A SEPARATE, EXPLICIT ENDPOINT AND NOT A STEP INSIDE `decide` ───────
+ *
+ * Opening a pull request is an OUTWARD-FACING WRITE into the customer's
+ * systems. It is gated three times over and all three are deliberate: the
+ * route needs MEMBER, `pullRequestsEnabled` must be an explicit `true` on the
+ * integration, and a human has to ask for it. Folding it into `decide` would
+ * make approving a heal — an in-QAAI act — silently also write to GitHub, and
+ * a customer who turned on heals in January would discover it in March.
+ *
+ * ── IDEMPOTENCE ────────────────────────────────────────────────────────────
+ *
+ * One PR per cause, enforced by `@@unique([orgId, causeKey])` and not by this
+ * route remembering. A second call returns ALREADY_RECORDED with the url the
+ * first one got; a host that already has a PR for the head is ADOPTED rather
+ * than refused. Two PRs for one cause in somebody's repository is the mistake
+ * that makes a team switch the integration off.
+ */
+agentRouter.post('/heals/:healId/pull-request', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const integrationId = String(req.body?.integrationId ?? '');
+  if (!integrationId) throw badRequest('integrationId is required');
+
+  const heal = await prisma.healProposal.findUnique({
+    where: { id: String(req.params.healId) },
+    select: {
+      id: true,
+      orgId: true,
+      testId: true,
+      state: true,
+      prUrl: true,
+      verdictId: true,
+      explanation: true,
+      test: { select: { projectId: true, filePath: true } },
+    },
+  });
+  if (!heal) throw notFound('Heal proposal');
+  /*
+   * APPLIED or AUTO_APPLIED only. A PROPOSED heal's diff is not in the
+   * repository, so a pull request for it would describe a change the branch
+   * does not contain — and the reviewer would be reading a body about a patch
+   * that is not in the diff below it.
+   */
+  if (heal.state !== 'APPLIED' && heal.state !== 'AUTO_APPLIED') {
+    throw conflict(
+      `This heal is ${heal.state}. A pull request describes a change that is already in the branch, so apply it first.`,
+    );
+  }
+
+  /*
+   * THE CAUSE, FROM QAAI'S OWN RECORDS. The cluster key of the verdict this
+   * heal answers, or the test id when the heal predates the column — never
+   * anything derived from the failure text, the page, or the model's output.
+   * `prCauseKey` hashes it, `branchNameFor` composes the branch from the hash,
+   * and `openPullRequest` re-derives that branch and refuses if it differs. So
+   * there is no string anywhere on this path that attacker-influenced text
+   * could put a repository, a branch or a ref into.
+   */
+  const verdict = heal.verdictId
+    ? await prisma.triageVerdict.findUnique({
+        where: { id: heal.verdictId },
+        select: { clusterKey: true },
+      })
+    : null;
+  const causeKey = prCauseKey(
+    'HEAL',
+    heal.test.projectId,
+    verdict?.clusterKey ?? `test:${heal.testId}`,
+  );
+  const branch = branchNameFor({ purpose: 'HEAL', causeKey });
+
+  const integration = await prisma.integration.findFirst({
+    where: { id: integrationId, orgId: actor.orgId },
+    select: { id: true, kind: true, enabled: true, config: true, configEnc: true },
+  });
+  if (!integration) throw notFound('Integration');
+  if (integration.kind !== 'GITHUB') {
+    throw badRequest(
+      'QAAI can open pull requests on GitHub today. The branch is pushed for every provider.',
+    );
+  }
+  if (!integration.configEnc) throw badRequest('That integration has no token stored');
+
+  const config = parseGitConfig(integration.config);
+  /*
+   * HOST-PINNED BEFORE THE TOKEN IS DECRYPTED, exactly as the push route does
+   * it: a repointed remote must not be able to cause the token to be produced
+   * at all, because a host that answers 401 is handed it on the retry.
+   */
+  try {
+    repoHttpsUrl('GITHUB', config.repo);
+  } catch (err) {
+    throw badRequest(err instanceof Error ? err.message : 'Invalid repository');
+  }
+
+  const result = await openPullRequest(
+    {
+      store: pullRequestStore(prisma, { pushedBranch: branch }),
+      host: githubPullRequestHost({
+        token: openToken(
+          integration.configEnc,
+          config.keyVersion ?? 1,
+          actor.orgId,
+          integration.id,
+        ),
+      }),
+      audit: pullRequestAudit(prisma, { orgId: actor.orgId, userId: actor.userId }),
+    },
+    {
+      orgId: actor.orgId,
+      projectId: heal.test.projectId,
+      purpose: 'HEAL',
+      causeKey,
+      integrationId: integration.id,
+      filePaths: [heal.test.filePath],
+      // Nothing was preserved: a heal patches one file QAAI owns. The push
+      // path is where a human's file is refused, and it reports its own list.
+      preservedPaths: [],
+      /*
+       * THE ONLY UNTRUSTED TEXT ON THIS PATH, and it is FENCED. A heal's
+       * explanation is a model's own output; quoted raw into a PR body it could
+       * carry instructions to whoever — or whatever — reads the pull request
+       * next. `untrusted()` makes it a span whose text cannot reach a template
+       * literal, and `buildPullRequestBody` is what quotes and bounds it.
+       */
+      spans: [
+        untrusted({
+          /*
+           * RUNNER_OUTPUT, and that is a COMPROMISE worth naming rather than
+           * hiding. A heal explanation is a MODEL's prose about a failure, and
+           * `UNTRUSTED_PROVENANCES` has no MODEL_OUTPUT member — so the nearest
+           * true label is the run output the model was summarising, which is
+           * what the text is derived from and is untrusted for the same reason.
+           * The fence is identical either way; only the disclosure's wording is
+           * less precise than it should be. The vocabulary addition is in this
+           * round's `needsFromOtherFiles`.
+           */
+          provenance: 'RUNNER_OUTPUT',
+          text: heal.explanation,
+          origin: heal.test.filePath,
+        }),
+      ],
+      healId: heal.id,
+      actorUserId: actor.userId,
+    },
+  );
+
+  res.json({
+    outcome: result.outcome,
+    url: result.url,
+    note: result.note,
+    hostRefusal: result.hostRefusal,
+    /*
+     * zod PATHS, never zod messages, and the TOTAL beside the capped list so a
+     * truncated list cannot read as the whole one. zod composes some of its own
+     * messages out of the offending input, which is how a stored value once
+     * turned into the literal flag text of an injected instruction.
+     */
+    refusalPaths: result.refusalPaths,
+    refusalTotal: result.refusalTotal,
+    /*
+     * What the body left out, carried through rather than dropped: a quote that
+     * was truncated and does not say so is a body a reviewer reads as complete.
+     */
+    disclosures: result.body?.disclosures ?? null,
   });
 });
 

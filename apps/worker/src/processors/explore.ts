@@ -23,6 +23,8 @@ import {
   withResumePoint,
 } from '@qaai/agent';
 import { signalsFromFlowMap } from '@qaai/agent';
+import { auditTestsAgainstCrawl, obsolescenceSignalsFor } from '@qaai/agent';
+import type { PriorObsolescenceSignal, SuiteHealthTestInput } from '@qaai/agent';
 import type { AuthProfileChoice, CrawlOutcome, TypeSignals, TypeVerdict } from '@qaai/agent';
 import { signInWithProfile } from '@qaai/runner';
 import type { LoginFailure, LoginResult } from '@qaai/runner';
@@ -42,6 +44,9 @@ import type {
 } from '@qaai/shared';
 import {
   ANONYMOUS_ROLE,
+  FIXTURE_PREFIX,
+  OBSOLESCENCE_MIN_CONFIRMATIONS,
+  obsolescenceConfidenceFor,
   roleHadNoExtraSurface,
   roleKey,
 } from '@qaai/shared';
@@ -1873,6 +1878,34 @@ export async function processExplore(job: ExploreJob): Promise<void> {
   });
 
   /*
+   * ── WHAT THIS CRAWL SAYS ABOUT THE TESTS WE ALREADY HAVE ──────────────────
+   *
+   * THE PRODUCTION CALL SITE for the obsolescence comparison, and it is here
+   * rather than in a nightly sweep because this is the moment the map changed:
+   * the crawl has just landed, the graph is in memory, and a test whose route
+   * or locator is gone can be noticed before the next run pays a failing test
+   * plus a strong-model heal to discover the same rename.
+   *
+   * It must NOT be able to fail the crawl. The map is the valuable part — it is
+   * the coverage denominator — and a comparison against it is worth nothing if
+   * it can lose it. So the error is logged and the explore job continues, which
+   * also means a project with no tests yet, or no source analysis, costs
+   * nothing here.
+   */
+  const obsolescence = await recordObsolescenceSignals({
+    orgId,
+    projectId,
+    flowMapId: stored.id,
+    flowMap,
+  }).catch((err: unknown) => {
+    logger.error(
+      { err, projectId, flowMapId: stored.id },
+      'could not compare the suite against the new crawl; no obsolescence signal was recorded, and none was resolved',
+    );
+    return null;
+  });
+
+  /*
    * ── THE ATTEMPT ROWS: ONE PER ROLE, WHATEVER HAPPENED ──────────────────────
    *
    * Written for EVERY pass, including the ones that never got a session, and
@@ -2293,6 +2326,20 @@ export async function processExplore(job: ExploreJob): Promise<void> {
         ),
       },
       /*
+       * ── WHAT THE NEW MAP SAYS ABOUT THE OLD TESTS ─────────────────────────
+       *
+       * On the frame, because this is the only moment the comparison is cheap
+       * and the only surface that shows a crawl's consequences. NULL when the
+       * comparison itself failed, which is a different fact from "nothing looks
+       * obsolete" and must not render as it: a reader of `null` knows nobody
+       * looked, a reader of `opened: 0` knows somebody did.
+       *
+       * `admissible` is the only number that could lead to a retirement, and it
+       * is a count of signals that TWO crawls have agreed about — never this
+       * crawl's own opinion.
+       */
+      obsolescence,
+      /*
        * The matrix, with the NOT_PROBED count FIRST. That ordering is the
        * product: "25 of 412" is the sentence, and on this axis the sentence is
        * "this role was never asked about 94 of them" — which must be at least
@@ -2375,4 +2422,355 @@ export async function processExplore(job: ExploreJob): Promise<void> {
       });
     }
   }
+}
+
+// ─── Obsolescence: what this crawl says about the tests we already have ──────
+
+/**
+ * How many tests one crawl compares against the new map.
+ *
+ * A BOUND, reported when it bites. Past it the comparison is a PAGE of the
+ * suite, so "no test looks obsolete" would be a claim about the first N tests
+ * dressed up as a claim about the suite — which is why the count and the cap
+ * are both logged rather than only the count.
+ */
+export const OBSOLESCENCE_TEST_SCAN_CAP = 400;
+
+/** The same bound on the SOURCE side of the argument. See `declaredRoutes`. */
+export const OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP = 2_000;
+
+/** How many signal rows one crawl may file or refresh. */
+export const OBSOLESCENCE_SIGNAL_WRITE_CAP = 500;
+
+export interface ObsolescenceSweepResult {
+  /** Null when signals were derived; otherwise WHY none were, never "nothing was wrong". */
+  withheldBecause: string | null;
+  /** Rows filed for the first time. */
+  opened: number;
+  /** Rows a second (or later) crawl agreed with — `confirmations` went up. */
+  confirmed: number;
+  /** Rows that stopped being true: the route came back, or the crawl reached it. */
+  reappeared: number;
+  /** Signals now at or above `OBSOLESCENCE_MIN_CONFIRMATIONS`. */
+  admissible: number;
+  /** TRUE when a cap bit, so every count above is a floor. */
+  capped: boolean;
+}
+
+/**
+ * Compare the existing tests against the crawl that just landed, and record
+ * what is gone.
+ *
+ * ── THE DEFECT THIS CLOSES ─────────────────────────────────────────────────
+ *
+ * Nothing compared an existing test's routes and locators against a NEW
+ * FlowMap, so a removed feature left a test that still counted as coverage, and
+ * every rename cost a failing run plus a strong-model heal that could have been
+ * prevented. This is the cheapest possible place to notice: the crawl has just
+ * finished, the map is in memory, and the comparison is a set difference with
+ * no model in it at all.
+ *
+ * ── WHY ROWS AND NOT A VERDICT ─────────────────────────────────────────────
+ *
+ * One crawl may never retire a test. `obsolescenceSignalsFor` starts a new
+ * signal at ONE confirmation, which is below `OBSOLESCENCE_MIN_CONFIRMATIONS`
+ * by construction, so an admissible retirement needs two consecutive crawls to
+ * agree — and the unique key `(testId, kind, reference)` is what makes
+ * "agreed" a fact rather than a count of rows that happen to exist. A crawl
+ * that cannot support a retirement at all (truncated, bot-walled, no source
+ * analysis) contributes NO confirmation, because two degraded crawls would
+ * otherwise retire a test between them.
+ *
+ * ── AND WHY A SIGNAL THAT STOPPED BEING TRUE IS RESOLVED, NOT DELETED ──────
+ *
+ * REAPPEARED is the common and honest outcome: the route came back, or this
+ * crawl simply reached it. The row is kept so "we nearly retired this test
+ * twice" stays answerable, and the confirmations stop accumulating — which is
+ * the brake that keeps a flaky crawl from retiring a live feature over a month.
+ */
+export async function recordObsolescenceSignals(args: {
+  orgId: string;
+  projectId: string;
+  flowMapId: string;
+  flowMap: FlowMap;
+}): Promise<ObsolescenceSweepResult> {
+  const { orgId, projectId, flowMapId, flowMap } = args;
+  const now = new Date();
+
+  const testRows = await prisma.test.findMany({
+    where: { orgId, projectId, disabledAt: null },
+    orderBy: { createdAt: 'asc' },
+    take: OBSOLESCENCE_TEST_SCAN_CAP + 1,
+    select: {
+      id: true,
+      name: true,
+      filePath: true,
+      type: true,
+      priority: true,
+      feature: true,
+      tags: true,
+      code: true,
+      spec: true,
+      flakeRate: true,
+      quarantined: true,
+      consecutiveFailures: true,
+    },
+  });
+  const testsCapped = testRows.length > OBSOLESCENCE_TEST_SCAN_CAP;
+  const tests = testRows.slice(0, OBSOLESCENCE_TEST_SCAN_CAP);
+
+  /*
+   * `declaredRoutes` is NULL when no source analysis has run, and null is not
+   * an empty list: with nothing having read the code, "the source does not
+   * declare this route" is the absence of a detector rather than a fact about
+   * the application. The probe is for a SOURCE-origin item of any kind, because
+   * an application whose code declares no page routes at all would otherwise
+   * read as having no source analysis.
+   */
+  const sourceItems = await prisma.coverageItem.count({
+    where: { orgId, projectId, origin: { in: ['SOURCE_ONLY', 'BOTH'] } },
+  });
+  const routeItemRows = await prisma.coverageItem.findMany({
+    where: { orgId, projectId, kind: 'ROUTE' },
+    orderBy: { key: 'asc' },
+    take: OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP + 1,
+    select: { key: true, origin: true, retiredAt: true },
+  });
+  const routeItemsCapped = routeItemRows.length > OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP;
+  const routeItems = routeItemRows.slice(0, OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP);
+  const routeOf = (key: string): string => key.replace(/^ROUTE:/, '');
+
+  const report = auditTestsAgainstCrawl({
+    // Fixtures are test data, not tests.
+    tests: tests
+      .filter((test) => !test.filePath.startsWith(FIXTURE_PREFIX))
+      .map((test) => test as unknown as SuiteHealthTestInput),
+    flowMap,
+    declaredRoutes:
+      sourceItems > 0
+        ? routeItems.filter((item) => item.origin !== 'CRAWL_ONLY').map((item) => routeOf(item.key))
+        : null,
+    /*
+     * The source-side fence. Beyond the cap the declared list is a PAGE of the
+     * project's route items rather than the list, so "the source does not
+     * declare this route" stops being a fact — and every retirement that would
+     * have rested on it is withheld rather than proposed on a truncated read.
+     */
+    declaredRoutesTruncatedReason: routeItemsCapped
+      ? `QAAI read the first ${OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP} route items of this project and there are more`
+      : null,
+    retiredRoutes: routeItems
+      .filter((item) => item.retiredAt !== null)
+      .map((item) => routeOf(item.key)),
+  });
+
+  const prior = await prisma.obsoleteTestSignal.findMany({
+    where: { orgId, projectId, resolvedAt: null },
+    take: OBSOLESCENCE_SIGNAL_WRITE_CAP + 1,
+    select: { id: true, testId: true, kind: true, reference: true, confirmations: true },
+  });
+  const priorCapped = prior.length > OBSOLESCENCE_SIGNAL_WRITE_CAP;
+  const live = prior.slice(0, OBSOLESCENCE_SIGNAL_WRITE_CAP);
+
+  const signals = obsolescenceSignalsFor(
+    report,
+    live.map((row): PriorObsolescenceSignal => ({
+      testId: row.testId,
+      kind: row.kind,
+      reference: row.reference,
+      confirmations: row.confirmations,
+    })),
+  );
+
+  const capped = testsCapped || routeItemsCapped || priorCapped;
+
+  /*
+   * ── THE SOURCE-SIDE GATE, ADDED HERE BECAUSE THE DERIVER DOES NOT HAVE IT ──
+   *
+   * `obsolescenceSignalsFor` withholds on `report.retirementBlockedBy`, which
+   * is computed from the CRAWL alone (`retirementBlockedBy` takes a
+   * `CrawlSurface`). It does NOT consider `report.sourceAnalysed`, and the
+   * consequence is the exact failure its own withholding comment describes:
+   * with no source analysis every route reads `declared: false`, so a route the
+   * crawl did not reach is filed as ROUTE_GONE — the strongest signal in the
+   * vocabulary and the one that may retire a test on its own — on the ABSENCE
+   * OF A DETECTOR rather than on a fact about the application. Two such crawls
+   * would then confirm each other and `retirementAdmissible` would say yes.
+   *
+   * `auditTestsAgainstCrawl` does gate `test.retirement` on `sourceAnalysed`,
+   * which is why this has never retired anything; but the SIGNALS it writes are
+   * durable and accumulate, so a project that acquires source analysis later
+   * would inherit two confirmations nobody is entitled to.
+   *
+   * Gated at the caller rather than patched in the deriver, which is another
+   * agent's file this round — the needed change is in `needsFromOtherFiles`.
+   * The wording deliberately echoes the deriver's own, because it is the same
+   * rule: a signal from a crawl that cannot support a retirement would still
+   * count towards one.
+   */
+  if (!report.sourceAnalysed) {
+    const why =
+      'No obsolescence signal was recorded from this crawl: no source analysis has run for this ' +
+      'project, so "the source does not declare this route" is the absence of a detector rather ' +
+      'than a fact about the application. A signal recorded on that basis would still count ' +
+      'towards a retirement.';
+    logger.info(
+      { projectId, flowMapId, withheldBecause: why, capped },
+      'no obsolescence signal was recorded from this crawl, and none was resolved either',
+    );
+    return {
+      withheldBecause: why,
+      opened: 0,
+      confirmed: 0,
+      reappeared: 0,
+      admissible: 0,
+      capped,
+    };
+  }
+
+  if (signals.withheldBecause !== null) {
+    /*
+     * NOTHING IS RESOLVED EITHER. A crawl that may not contribute a
+     * confirmation may not contribute the opposite one: reading "this crawl
+     * could not reach the route" as "the route came back" would clear the
+     * evidence behind a real retirement every time a bot wall appeared.
+     */
+    logger.info(
+      { projectId, flowMapId, withheldBecause: signals.withheldBecause, capped },
+      'no obsolescence signal was recorded from this crawl, and none was resolved either',
+    );
+    return {
+      withheldBecause: signals.withheldBecause,
+      opened: 0,
+      confirmed: 0,
+      reappeared: 0,
+      admissible: 0,
+      capped,
+    };
+  }
+
+  const seen = new Set<string>();
+  let opened = 0;
+  let confirmed = 0;
+  let written = 0;
+  let writeCapped = false;
+
+  for (const test of signals.tests) {
+    for (const signal of test.signals) {
+      if (written >= OBSOLESCENCE_SIGNAL_WRITE_CAP) {
+        writeCapped = true;
+        break;
+      }
+      seen.add(`${test.testId}\u0000${signal.kind}\u0000${signal.reference}`);
+      written += 1;
+      /*
+       * UPSERT on `(testId, kind, reference)`, which is the schema's own unique
+       * key. A second crawl that still cannot find the same route INCREMENTS
+       * this row rather than filing another one — a second row would make "two
+       * consecutive crawls agreed" into "two rows exist", and two rows exist
+       * after one crawl that saw two different things.
+       *
+       * `confirmations` is SET from the value the deriver computed rather than
+       * incremented here, so the number in the database and the number the
+       * threshold was evaluated against cannot differ.
+       */
+      const existing = live.find(
+        (row) =>
+          row.testId === test.testId &&
+          row.kind === signal.kind &&
+          row.reference === signal.reference,
+      );
+      if (existing) confirmed += 1;
+      else opened += 1;
+      await prisma.obsoleteTestSignal.upsert({
+        where: {
+          testId_kind_reference: {
+            testId: test.testId,
+            kind: signal.kind,
+            reference: signal.reference,
+          },
+        },
+        create: {
+          orgId,
+          projectId,
+          testId: test.testId,
+          kind: signal.kind,
+          reference: signal.reference,
+          /*
+           * The kind's own number, from the ONE function allowed to answer. A
+           * caller that could supply its own confidence could file a
+           * LOCATOR_GONE at 0.95 and clear the rule that a weak signal never
+           * retires a test on its own.
+           */
+          confidence: obsolescenceConfidenceFor(signal.kind),
+          lastFlowMapId: flowMapId,
+          confirmations: signal.confirmations,
+          lastSeenAt: now,
+        },
+        update: {
+          confirmations: signal.confirmations,
+          lastFlowMapId: flowMapId,
+          lastSeenAt: now,
+          // A row that had been resolved and is true again re-opens rather than
+          // staying closed with a stale resolution beside a live count.
+          resolvedAt: null,
+          resolution: null,
+        },
+      });
+    }
+    if (writeCapped) break;
+  }
+
+  /*
+   * ── THE RESOLUTIONS ──────────────────────────────────────────────────────
+   *
+   * Only safe because the withheld arm returned above: this crawl was entitled
+   * to say the surface is gone, so it is equally entitled to say the surface is
+   * back. Resolved rather than deleted — "we nearly retired this test twice" is
+   * a fact worth keeping, and a deleted row would make a flapping route look
+   * like a fresh discovery every time.
+   *
+   * SKIPPED ENTIRELY WHEN A WRITE CAP BIT, because past the cap "this signal
+   * was not re-derived" and "this signal is no longer true" are the same
+   * absence, and resolving on that confusion would clear real evidence.
+   */
+  let reappeared = 0;
+  if (!writeCapped) {
+    const gone = live.filter(
+      (row) => !seen.has(`${row.testId}\u0000${row.kind}\u0000${row.reference}`),
+    );
+    if (gone.length > 0) {
+      const resolved = await prisma.obsoleteTestSignal.updateMany({
+        where: { id: { in: gone.map((row) => row.id) }, resolvedAt: null },
+        data: { resolvedAt: now, resolution: 'REAPPEARED', lastFlowMapId: flowMapId },
+      });
+      reappeared = resolved.count;
+    }
+  }
+
+  const result: ObsolescenceSweepResult = {
+    withheldBecause: null,
+    opened,
+    confirmed,
+    reappeared,
+    admissible: signals.confirmed,
+    capped: capped || writeCapped,
+  };
+  logger.info(
+    {
+      projectId,
+      flowMapId,
+      ...result,
+      byKind: signals.counts,
+      minConfirmations: OBSOLESCENCE_MIN_CONFIRMATIONS,
+      testsCompared: report.tests.length,
+      testsCapped,
+      routeItemsCapped,
+      writeCapped,
+    },
+    result.capped
+      ? 'obsolescence signals recorded, and a cap bit — every count is a floor'
+      : 'obsolescence signals recorded against the new crawl',
+  );
+  return result;
 }

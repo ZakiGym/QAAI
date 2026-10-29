@@ -47,7 +47,7 @@ import {
   type ObservedId,
   type ReadEndpoint,
 } from './authz-probe.js';
-import type { Principal } from '../../shared/src/principals';
+import type { Principal } from '@qaai/shared';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
 

@@ -35,7 +35,13 @@
  * facts and this product refuses to print them as the same number.
  */
 
-import { BLOCKING_VERDICTS, FINDING_KINDS, FINDING_SEVERITIES } from '@qaai/shared';
+import {
+  BLOCKING_VERDICTS,
+  FINDING_KINDS,
+  FINDING_SEVERITIES,
+  summariseSuppressions,
+} from '@qaai/shared';
+import type { SuppressionSummary, SuppressionTally } from '@qaai/shared';
 import type {
   FindingKind,
   FindingSeverity,
@@ -1839,8 +1845,30 @@ export interface RunOutcome {
   status: RunTerminalStatus;
   /** The one boolean every consumer keys off. `false` means the build goes red. */
   passed: boolean;
-  /** How many failures were suppressed, so no surface has to pretend they were not there. */
+  /**
+   * How many failures were suppressed, so no surface has to pretend they were
+   * not there.
+   *
+   * QUARANTINE PLUS EVERY OTHER KIND. It used to be `counts.quarantinedFailed`
+   * alone, which was correct while quarantine was the only thing that could
+   * make a red thing stop being red; a known issue, an ENV_ISSUE and a
+   * retirement all do now, and a total that counted one of the five would make
+   * the other four invisible on the surface a release decision is made from.
+   * `suppressions` below breaks it down by kind.
+   */
   suppressedFailures: number;
+  /**
+   * Every suppression that applied to this run, counted by kind, with the
+   * sentence this product says out loud: "47 failures by 3 known issues."
+   *
+   * NEVER NULL and never omitted, because a surface that renders nothing when
+   * nothing was suppressed is indistinguishable from one that forgot to ask —
+   * `summariseSuppressions` says "Nothing was suppressed." out loud for exactly
+   * that reason. A caller that passes no tallies gets that sentence, which is
+   * the honest answer for a run with no suppressions and also the answer this
+   * function can give without inventing a measurement.
+   */
+  suppressions: SuppressionSummary;
   /**
    * One sentence, printable verbatim. The CLI prints it, the check shows it, and
    * a run that passed WITH suppressed failures says so instead of saying nothing.
@@ -1867,14 +1895,69 @@ export function runOutcome(args: {
   gatePassed: boolean;
   /** Set when the verdict is not the tests': a cancel, or a run that blew up. */
   forcedStatus?: 'CANCELLED' | 'ERRORED' | null;
+  /**
+   * The non-quarantine suppressions that applied to this run, as a group-by
+   * over `SuppressionEvent` returns them: one tally per kind.
+   *
+   * QUARANTINE IS NOT PASSED HERE. It arrives as `counts.quarantinedFailed`,
+   * which `tallyResult` is the only writer of, and this function derives its
+   * tally from that single number — because quarantine counted twice, once from
+   * the counter and once from a ledger row, would be a doubled total on the one
+   * surface a release decision is made from. Lesson: two facts in one field is
+   * a defect even when both values are correct, and so is one fact in two.
+   *
+   * OPTIONAL, and absent means "this caller has no ledger to read" rather than
+   * "nothing was suppressed": the two are indistinguishable in the TOTAL, which
+   * is why the breakdown names the kinds it actually saw and the quarantine
+   * tally is always present.
+   */
+  suppressions?: readonly SuppressionTally[];
 }): RunOutcome {
   const { counts, gatePassed } = args;
   const forced = args.forcedStatus ?? null;
-  const suppressed = Math.max(0, counts.quarantinedFailed);
-  const suppressedNote =
-    suppressed > 0
-      ? ` ${suppressed} failing test(s) were quarantined, so they did not fail the build — they are still failing.`
+  const quarantined = Math.max(0, counts.quarantinedFailed);
+
+  /*
+   * The quarantine tally is SYNTHESISED from the counter rather than read from
+   * the ledger, and that is the whole reason this function cannot be handed a
+   * QUARANTINE tally by a caller. `suppressions` is the number of DISTINCT
+   * suppressions, and a run has no way to count distinct quarantines from a
+   * failure total — so it reports the failures and, honestly, the same number
+   * of quarantines, since each quarantined failure is one quarantined test.
+   */
+  const tallies: SuppressionTally[] = [
+    ...(quarantined > 0
+      ? [
+          {
+            kind: 'QUARANTINE' as const,
+            suppressions: quarantined,
+            suppressed: quarantined,
+            expired: 0,
+          },
+        ]
+      : []),
+    ...(args.suppressions ?? []).filter((tally) => tally.kind !== 'QUARANTINE'),
+  ];
+  const suppressions = summariseSuppressions(tallies);
+  const suppressed = suppressions.suppressed;
+
+  /*
+   * The quarantine sentence is KEPT VERBATIM, because four other surfaces print
+   * it and a reader who has learned what it means should not have to learn
+   * again. The suppression disclosure is appended beside it rather than
+   * replacing it: it is the only line that names the other four kinds, and a
+   * run that passed while a known issue silenced forty failures has to say so
+   * here — this `reason` is what the CLI prints and the check shows.
+   */
+  const quarantineNote =
+    quarantined > 0
+      ? ` ${quarantined} failing test(s) were quarantined, so they did not fail the build — they are still failing.`
       : '';
+  const otherSuppressed = suppressed - quarantined;
+  const suppressedNote =
+    otherSuppressed > 0 || suppressions.expired > 0
+      ? `${quarantineNote} ${suppressions.disclosure}`
+      : quarantineNote;
 
   if (forced === 'CANCELLED') {
     return {
@@ -1883,6 +1966,7 @@ export function runOutcome(args: {
       // `passed: false` keeps a cancel out of the "it was green" column.
       passed: false,
       suppressedFailures: suppressed,
+      suppressions,
       reason: `The run was cancelled, so it has no verdict.${suppressedNote}`,
     };
   }
@@ -1892,6 +1976,7 @@ export function runOutcome(args: {
       status: 'ERRORED',
       passed: false,
       suppressedFailures: suppressed,
+      suppressions,
       reason: `The run did not finish, so nothing was measured.${suppressedNote}`,
     };
   }
@@ -1901,6 +1986,7 @@ export function runOutcome(args: {
       status: 'FAILED',
       passed: false,
       suppressedFailures: suppressed,
+      suppressions,
       reason: `${counts.failed} test(s) failed.${suppressedNote}`,
     };
   }
@@ -1910,6 +1996,7 @@ export function runOutcome(args: {
       status: 'FAILED',
       passed: false,
       suppressedFailures: suppressed,
+      suppressions,
       reason: `Every test that gates passed, and a quality gate blocked the run.${suppressedNote}`,
     };
   }
@@ -1918,6 +2005,7 @@ export function runOutcome(args: {
     status: 'PASSED',
     passed: true,
     suppressedFailures: suppressed,
+    suppressions,
     reason: `${counts.passed} test(s) passed and nothing that gates failed.${suppressedNote}`,
   };
 }

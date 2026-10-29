@@ -967,6 +967,16 @@ model Project {
   testCorrections      TestCorrection[]
   suiteChangeProposals SuiteChangeProposal[]
 
+  /// WHERE A LOOP ENDS. `knownIssues` is the durable mute that stops a triaged
+  /// failure being re-judged and re-healed every run; `pullRequests` is the
+  /// record behind the PR nothing used to open, and the idempotence key that
+  /// stops a retried CI step opening a second one; `recordingPromotions` is how
+  /// a recorded test stays distinguishable from a generated one. See the
+  /// section at the foot of this file.
+  knownIssues         KnownIssue[]
+  pullRequests        PullRequestRecord[]
+  recordingPromotions RecordingPromotion[]
+
   @@unique([orgId, slug])
   @@index([orgId])
 }
@@ -1652,6 +1662,13 @@ model Test {
   /// reason coverage CAN fall at all.
   coverageEdges    TestCoverageEdge[]
 
+  /// "Is this test's surface still there?" — the signals a crawl comparison
+  /// produced, and the retirement somebody was asked to approve. Nothing used
+  /// to notice a test whose routes were gone, so a removed feature left a test
+  /// that still counted as coverage.
+  obsolescenceSignals ObsoleteTestSignal[]
+  retirementProposals RetirementProposal[]
+
   @@index([orgId])
   @@index([projectId, type])
   @@index([suiteId])
@@ -2299,16 +2316,26 @@ model TriageVerdict {
   /// unowned. States are OWNED / NO_RULES / NO_MATCH / RULES_UNUSABLE
   /// (OWNERSHIP_STATES in src/lib/ownership.ts); null means nothing has tried
   /// to route this verdict yet, which is a third thing again.
-  assigneeUserId String?
-  assigneeTeamId String?
+  assigneeUserId  String?
+  assigneeTeamId  String?
   /// The rule that won, so "why does the payments team own this?" has an answer.
-  ownerRuleId    String?
-  ownerState     String?
+  ownerRuleId     String?
+  ownerState      String?
+  /// HOW the owner was decided (`OWNER_PROVENANCES`, packages/shared/src/ownership.ts).
+  ///
+  /// THE DEFECT THIS CLOSES: every surface rendered an owner identically, so
+  /// "Dana owns this because Dana said so" and "the payments team owns this
+  /// because somebody once wrote a catch-all glob" were the same pixel — and a
+  /// digest that pages a team on the strength of a catch-all teaches that team
+  /// to filter the digest. Null means nothing has tried to route this verdict
+  /// yet, which is the same thing `ownerState`'s null means and is why the two
+  /// are written together or not at all.
+  ownerProvenance OwnerProvenance?
   /// The reason sentence, shown verbatim. Carries the unusable-rule warning
   /// when routing may have stopped silently.
-  ownerNote      String?
-  assignedAt     DateTime?
-  createdAt      DateTime  @default(now())
+  ownerNote       String?
+  assignedAt      DateTime?
+  createdAt       DateTime         @default(now())
 
   /// ─── A verdict is about a CAUSE, not about a result (§3.3) ──────────────
   ///
@@ -2372,6 +2399,20 @@ model TriageVerdict {
   /// selector in the other. A split verdict is never overwritten by a later
   /// cluster attach; see apps/worker/src/processors/triage.ts.
   splitFromClusterKey String?
+
+  /// The `KnownIssue` that silenced this failure, when `reviewState` is MUTED.
+  ///
+  /// `VerdictReviewState.MUTED` on its own is NOT a suppression and never was:
+  /// it was written by two endpoints and read by nothing. It suppresses only
+  /// while a known issue that is IN FORCE backs it (`reviewStateSuppresses`,
+  /// packages/shared/src/suppression.ts), and this column is which one — so an
+  /// expired mute leaves a verdict that says MUTED, names the issue that
+  /// expired, and goes red again.
+  ///
+  /// A plain id and not a relation: the verdict's record of having been muted
+  /// must survive the mute being deleted, and a cascade here would erase the
+  /// evidence along with the decision.
+  knownIssueId String?
 
   testResult TestResult @relation(fields: [testResultId], references: [id], onDelete: Cascade)
 
@@ -2475,8 +2516,20 @@ model HealProposal {
   state       HealState @default(PROPOSED)
   decidedBy   String?
   decidedAt   DateTime?
-  /// PR opened when the repo is connected.
+  /// The PR's url, denormalised for display.
+  ///
+  /// The doc comment here used to read "PR opened when the repo is connected"
+  /// and NOTHING WROTE IT — a doc comment that contradicted the code under it.
+  /// `PullRequestRecord` is the writer, `prRecordId` points at it, and this
+  /// column is a copy of that row's `url` kept so the heal list does not join.
+  /// NULL means no PR, which is still the common case: a heal on a project with
+  /// no git integration cannot have one, and that must not read as a PR nobody
+  /// can find.
   prUrl       String?
+  /// The `PullRequestRecord` this heal was opened as, when one was. The
+  /// idempotence key lives on that row, so a second apply of the same heal
+  /// finds the PR already open instead of opening another.
+  prRecordId  String?
   createdAt   DateTime  @default(now())
 
   /// The proposal that replaced this one, when `state` is SUPERSEDED. Kept as a
@@ -5036,12 +5089,12 @@ model DeploymentBrowserCapability {
 
   /// Null for the cloud image, which belongs to no org. A runner pool belongs to
   /// one — the same contract, and the same reason, as on DeploymentCapability.
-  orgId String?
+  orgId         String?
   /// `'<self>'` for this image; `pool:<name>` for a customer's own runner pool.
   /// A sentinel rather than a nullable column because the unique key is below
   /// and PostgreSQL treats NULLs there as DISTINCT, which would let one probe be
   /// written twice and stop the upsert being idempotent.
-  deploymentKey String @default("<self>")
+  deploymentKey String  @default("<self>")
 
   /// `ENGINE` | `CHANNEL` | `DEVICE_PRESET`. See the note above on why this is
   /// TEXT.
@@ -7161,6 +7214,15 @@ model TestResultVariant {
   testResult TestResult         @relation(fields: [testResultId], references: [id], onDelete: Cascade)
   metrics    TestMetricSample[]
 
+  /// The cell's identity. THE ONE CONSTRAINT IN THIS ROUND THAT MUST BE NAMED
+  /// EXPLICITLY: Prisma's derived name for a six-column unique is
+  /// "TestResultVariant_testResultId_browser_viewport_locale_role_environment_key",
+  /// which is 75 bytes, and PostgreSQL TRUNCATES at 63 SILENTLY. A truncated
+  /// name is one Prisma's introspection disagrees with for ever — an earlier
+  /// round paid for exactly that with permanent phantom drift on every
+  /// `migrate dev`. The two other uniques in this round are left to Prisma
+  /// because they fit.
+  @@unique([testResultId, browser, viewport, locale, role, environment], map: "TestResultVariant_cell_key")
   /// "How many of this run's cells did we refuse, and for which of the six
   /// reasons" -- the one read that makes `cellStatus` a GROUP BY instead of a
   /// regex over a sentence, and therefore the one thing standing between a
@@ -7177,15 +7239,6 @@ model TestResultVariant {
   /// per-run question is answered through this same index plus a filter. Add the
   /// project-wide one with the surface that asks it.
   @@index([runId, cellStatus])
-  /// The cell's identity. THE ONE CONSTRAINT IN THIS ROUND THAT MUST BE NAMED
-  /// EXPLICITLY: Prisma's derived name for a six-column unique is
-  /// "TestResultVariant_testResultId_browser_viewport_locale_role_environment_key",
-  /// which is 75 bytes, and PostgreSQL TRUNCATES at 63 SILENTLY. A truncated
-  /// name is one Prisma's introspection disagrees with for ever — an earlier
-  /// round paid for exactly that with permanent phantom drift on every
-  /// `migrate dev`. The two other uniques in this round are left to Prisma
-  /// because they fit.
-  @@unique([testResultId, browser, viewport, locale, role, environment], map: "TestResultVariant_cell_key")
   @@index([orgId])
   /// "This run's failures, by cell" — the matrix view's own query.
   @@index([runId, status])
@@ -7636,15 +7689,15 @@ model TestCorrection {
   kinds CorrectionKind[]
   /// CorrectionItem[] — packages/shared/src/artifact-set.ts. The classified
   /// diff, with a bounded quote of each side.
-  items Json            @default("[]")
+  items Json             @default("[]")
 
   /// The surface key the test was about. NULL is "the test declared none", not
   /// "none exists" — a correction with no surface is still supervision about
   /// how we write, just not about what we cover.
   surface String?
 
-  addedLines   Int @default(0)
-  removedLines Int @default(0)
+  addedLines        Int @default(0)
+  removedLines      Int @default(0)
   /// How many items the classifier could not name. DISCLOSED rather than
   /// hidden: a corpus reporting "100% locator changes" over a diff it mostly
   /// failed to read is the lie this column exists to prevent.
@@ -7750,4 +7803,660 @@ model SuiteChangeProposal {
   /// The acceptance rate per kind, which is the evidence that refactoring is
   /// worth offering at all.
   @@index([projectId, kind, state])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Suppression, ownership, obsolescence and the records that let a loop END
+// somewhere a human will see it (§3.3, §3.4, §7, §8)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHAT THIS SECTION CLOSES. Every model here exists because a loop produced a
+// finding and had nowhere to put it:
+//
+//  · `VerdictReviewState.MUTED` was written by two endpoints and read by
+//    NOTHING, so the next run of an already-triaged failure minted a fresh
+//    verdict and a fresh strong-model heal. `KnownIssue` is the durable mute.
+//  · Nothing flagged a test whose routes or locators are gone from the latest
+//    crawl, so a removed feature left a test that still counted as coverage and
+//    every rename cost a failing run plus a heal that could have been
+//    prevented. `ObsoleteTestSignal` and `RetirementProposal` are that path,
+//    and `HealRisk.RETIRE` finally has a counterpart on the other side of it.
+//  · `HealProposal.prUrl` is documented as "PR opened when the repo is
+//    connected" and NOTHING WROTE IT. `PullRequestRecord` is the record the
+//    writer needs, and the idempotence key that stops a retried CI step opening
+//    a second PR.
+//  · A recording became a test with no record of having been one, so "where did
+//    this test come from?" had no answer and a double promotion made two.
+//
+// THE RULE THE WHOLE SECTION IS BUILT AROUND: a suppression is COUNTED, OWNED,
+// EXPIRING and REVERSIBLE, and AN EXPIRED SUPPRESSION DOES NOT SUPPRESS. The
+// vocabulary and the single `isInForce` check live in
+// packages/shared/src/suppression.ts; these columns are its storage, and every
+// one of them is non-nullable where that file's type is non-nullable.
+
+/// The five ways this product makes a red thing stop being red.
+///
+/// Mirrors `SUPPRESSION_KINDS` in packages/shared/src/suppression.ts. A Prisma
+/// enum rather than TEXT because it is GROUPED ON: "47 failures suppressed by 3
+/// known issues" is a group-by over this column, and that sentence is the one
+/// that keeps the whole feature honest.
+enum SuppressionKind {
+  QUARANTINE
+  MUTE
+  ENV_ISSUE
+  COVERAGE_WAIVER
+  RETIREMENT
+}
+
+/// HOW an owner was decided — the field that makes a human's decision
+/// distinguishable from a glob's guess.
+///
+/// Mirrors `OWNER_PROVENANCES` in packages/shared/src/ownership.ts. Grouped on:
+/// "how many of this project's owners were actually set by a person?" is the
+/// question that says whether an ownership table is real or whether one
+/// catch-all pattern is routing everything. A suppression may only be owned by
+/// an EXPLICIT_ASSIGNMENT — see `applySuppression`.
+enum OwnerProvenance {
+  EXPLICIT_ASSIGNMENT
+  RULE_TEST
+  RULE_SUITE
+  RULE_FEATURE
+  RULE_PATH
+  CODEOWNERS_IMPORT
+  LAST_EDITOR
+  INHERITED
+  NONE
+}
+
+/// Why a test looks obsolete, from a deterministic comparison against the
+/// latest crawl. Mirrors `OBSOLESCENCE_SIGNAL_KINDS`.
+///
+/// Grouped on, which is why it is an enum: "how many of these are route-gone
+/// and how many are merely a locator we could not find" is the difference
+/// between a real cleanup list and a crawl that forgot to log in.
+enum ObsolescenceSignalKind {
+  ROUTE_GONE
+  LOCATOR_GONE
+  ROUTE_UNREACHABLE
+  FEATURE_GONE
+}
+
+/// The life of a retirement proposal. Mirrors `RETIREMENT_STATES`.
+///
+/// REVERTED is a state and not a deletion: the promise of retirement is that it
+/// can be taken back, and a reverted proposal that left no row would make "we
+/// retired this and put it back" unanswerable. EXPIRED exists because a
+/// proposal nobody reviews must stop being pending rather than sit in a queue
+/// pretending to be a decision somebody is about to make.
+enum RetirementState {
+  PROPOSED
+  APPROVED
+  APPLIED
+  REJECTED
+  REVERTED
+  EXPIRED
+}
+
+/// A failure somebody has already triaged, and will not be paged about again
+/// until this row expires.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// `VerdictReviewState.MUTED` was written by two endpoints and read by nothing.
+/// There was no durable record of a mute, so the next run of the same failure
+/// minted a fresh verdict and a fresh strong-model heal: noise and cost,
+/// forever, for a failure a human had already judged.
+///
+/// `FailureSignature.mutedUntil` was the first half of the fix and is keyed
+/// right — on the SIGNATURE, so a change in the cause un-mutes it — but it can
+/// only express ONE mute per cause, carries no owner, no tracker link and no
+/// durable match count, and cannot say that three causes are one known issue.
+/// This table is the row a person actually owns. The signature columns stay as
+/// the hot per-cause read; `KnownIssueMatch` is the audit trail underneath this
+/// row's counter.
+///
+/// ── WHY `signatures` IS AN ARRAY OF EXACT KEYS ──────────────────────────────
+///
+/// EXACT 12-hex cluster keys (`failureClusterKey`, packages/agent/src/triage.ts).
+/// Never patterns, never prefixes. The safety property of a mute is that the key
+/// changes when the cause does, so a mute cannot swallow a failure nobody has
+/// inspected; a pattern would hand that property straight back and turn this
+/// into a quarantine wearing a mute's name. A known issue that genuinely covers
+/// three causes names three keys, and adding a fourth is a decision somebody
+/// makes and the audit log records.
+///
+/// ── WHY `expiresAt` IS NOT NULL ─────────────────────────────────────────────
+///
+/// Because every previous suppression in this schema made it optional and every
+/// one of them then shipped rows without it: `Test.quarantineExpiresAt` is null
+/// on every quarantine written before the column existed, and
+/// `CoverageWaiver.expiresAt` is still nullable today. A mute that silently
+/// outlives its reason is how a team stops trusting the board. There is no
+/// "forever" value and no sentinel far-future date — `MUTE_MAX_DAYS` clamps it
+/// to fourteen days and the renewal is a decision re-made by the people who
+/// still remember making it.
+///
+/// AN EXPIRED ROW DOES NOT SUPPRESS. Not "warns", not "is flagged": `isInForce`
+/// (packages/shared/src/suppression.ts) is the one check every consumer asks,
+/// and it is false the moment `expiresAt` passes.
+model KnownIssue {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  /// What a person would call it, for the roster. Written by a human through
+  /// the API and never composed from failure output: a title assembled from a
+  /// test's error text is a title attacker-influenced text can choose.
+  title  String
+  /// Why this is not being fixed right now. Required — an unexplained silence
+  /// is one somebody else inherits.
+  reason String
+
+  /// Exact cluster keys. See the header. Never a pattern.
+  signatures String[]
+
+  /// ── The owner (§8) ─────────────────────────────────────────────────────
+  ///
+  /// Exactly one of the two, enforced by a CHECK constraint in the migration
+  /// rather than by convention: both null is not a mute, it is a silence with
+  /// nobody's name on it, which is the thing this column exists to prevent.
+  ///
+  /// `ownerProvenance` must be EXPLICIT_ASSIGNMENT. A glob may route a failure
+  /// to a team; it may not decide the failure stops counting. `applySuppression`
+  /// refuses anything weaker, and the column records which answer was accepted
+  /// so a later audit does not have to take that on trust.
+  ownerUserId     String?
+  ownerTeamId     String?
+  ownerProvenance OwnerProvenance
+
+  /// When it stops suppressing. NOT NULL, never "forever". See the header.
+  expiresAt DateTime
+
+  /// The ticket on the customer's board, when one exists. A plain id and not a
+  /// relation for the reason `TrackerIssue` records about `Integration`: the
+  /// ticket outlives the integration that filed it.
+  trackerIssueId String?
+
+  /// ── The count (§ the sentence that keeps this honest) ──────────────────
+  ///
+  /// "This mute has silenced 1,340 failures over six weeks" has to be
+  /// answerable. A suppression that recorded nothing makes "muted and gone" and
+  /// "muted and still firing forty times a day" the same row, and that is the
+  /// fact that decides whether it should be renewed.
+  ///
+  /// The counter is a denormalised SUM of `KnownIssueMatch`, kept because the
+  /// roster shows it for every row and the matches table grows without bound.
+  /// It is incremented in the same transaction as the match row, so the two
+  /// cannot disagree; the matches are the evidence and this is the headline.
+  matchCount     Int       @default(0)
+  firstMatchedAt DateTime?
+  lastMatchedAt  DateTime?
+
+  /// ── Reversible and auditable ───────────────────────────────────────────
+  ///
+  /// A revoked row is kept, never deleted. An EXPIRED mute and a REVOKED one
+  /// are different facts: the first ran out, the second was judged wrong, and
+  /// only the second says anything about the decision. `isInForce` treats both
+  /// as not suppressing, and revocation wins over expiry because a revoked mute
+  /// is dead NOW rather than at its expiry.
+  revokedAt     DateTime?
+  revokedBy     String?
+  revokedReason String?
+
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  matches KnownIssueMatch[]
+
+  /// The roster read, and the expiry sweep's read: "which of this project's
+  /// known issues are about to stop suppressing?" Indexed on `expiresAt`
+  /// rather than on a partial "still live", because the read that matters most
+  /// is the one that wants the EXPIRED ones too.
+  @@index([orgId, projectId, expiresAt])
+  /// "Which known issue covers this cause?" — asked once per failing cluster
+  /// per run, which on a 200-test outage is the read that decides whether a
+  /// model call happens at all. GIN, so `signatures has <key>` is an index
+  /// lookup instead of a scan of every mute the install has ever written.
+  @@index([signatures], type: Gin)
+}
+
+/// One occurrence a known issue silenced, so the counter above is evidence
+/// rather than a claim.
+///
+/// WHY A ROW PER (ISSUE, RUN, CAUSE) AND NOT JUST A COUNTER. Because "1,340
+/// failures over six weeks" needs to be auditable, and because a retried run
+/// finaliser must not double-count. The unique key IS the idempotence: a
+/// redelivered job finds the row and increments nothing.
+///
+/// `occurrences` is the number of failing RESULTS this cause had in that run,
+/// which is the number a reader means by "how many failures did this silence".
+/// It is on the row rather than inferred because the results are subject to
+/// retention and this record is the point.
+model KnownIssueMatch {
+  id           String @id @default(cuid())
+  orgId        String
+  knownIssueId String
+  runId        String
+  /// The cause this match was for — one of the issue's `signatures`, stored so
+  /// the audit says WHICH of a multi-cause mute fired.
+  clusterKey   String
+  occurrences  Int    @default(1)
+
+  matchedAt DateTime @default(now())
+
+  knownIssue KnownIssue @relation(fields: [knownIssueId], references: [id], onDelete: Cascade)
+
+  /// The claim. A retried finaliser must not file a second match for one cause
+  /// in one run.
+  @@unique([knownIssueId, runId, clusterKey])
+  @@index([orgId, matchedAt])
+}
+
+/// ONE ROW PER SUPPRESSION THAT APPLIED, ACROSS ALL FIVE KINDS.
+///
+/// ── WHY THIS TABLE IS THE MOST IMPORTANT ONE IN THIS SECTION ───────────────
+///
+/// "47 failures suppressed by 3 known issues" is the sentence that keeps this
+/// feature honest, and before this table nothing could produce it: quarantine
+/// counted itself on `Run.suppressedFailures`, a mute counted itself on
+/// `FailureSignature.suppressedCount`, a waiver counted itself nowhere at all,
+/// and ENV_ISSUE and retirement counted themselves not at all. Five private
+/// counters mean five chances for a surface to read four of them, and a failure
+/// suppressed without being counted is the one lie this product cannot afford —
+/// it is how a team learns to ignore the board.
+///
+/// So every kind writes HERE, and every surface reads HERE.
+/// `summariseSuppressions` (packages/shared/src/suppression.ts) turns these
+/// rows into the sentence; the kind-specific tables keep their own detail.
+///
+/// ── `inForce` IS WHY AN EXPIRY CAN BE TRUSTED ──────────────────────────────
+///
+/// A suppression that was past its expiry when the run executed writes a row
+/// with `inForce = false` and `suppressed = 0`. That row is the PROOF the expiry
+/// worked — without it, "the mute expired and the failure went red" and "nobody
+/// ever asked" are the same absence. An expired suppression does not suppress,
+/// and this is where that is visible.
+///
+/// ── THE DENOMINATOR, NOT STORED ────────────────────────────────────────────
+///
+/// There is no `denominatorEffect` column. The effect is a FUNCTION of `kind`
+/// (`denominatorEffectOf`), and a stored copy would be two facts in one field —
+/// a row and the disclosure beside it computed from different values, which is
+/// the defect `houseStyle.planned` already shipped once.
+model SuppressionEvent {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  /// The run this applied in. Every kind except COVERAGE_WAIVER applies during
+  /// a run; a waiver applies during a MEASUREMENT, and writes the coverage
+  /// snapshot's run id — or, when a measurement had no run, `<measurement>`,
+  /// which is a value a reader can see rather than a null a reader must guess
+  /// about.
+  runId     String
+
+  kind        SuppressionKind
+  /// Which key space `targetKey` is in — TEST | SIGNATURE | SURFACE_ITEM | RUN,
+  /// `SUPPRESSION_TARGET_SCOPES`. TEXT: it is a function of `kind` for four of
+  /// the five and nothing groups on it, so a Postgres type here would be a
+  /// drift guard with nothing to guard.
+  targetScope String
+  /// A test id, a 12-hex cluster key, a surface item id or a run id.
+  targetKey   String
+  /// The row that did the suppressing, in whichever table owns that kind. A
+  /// plain id across five tables, so no relation: the event must outlive the
+  /// suppression being revoked or deleted, which is the entire point of keeping
+  /// a count.
+  sourceId    String?
+
+  /// Red things this silenced in this run. ZERO when `inForce` is false, which
+  /// is the honest reading and not a missing measurement.
+  suppressed Int     @default(0)
+  /// Was it actually in force? See the header.
+  inForce    Boolean
+
+  /// ── Copied from the suppression, not joined ────────────────────────────
+  ///
+  /// Denormalised deliberately: the point of an audit row is that it still
+  /// reads correctly after the suppression has been revoked, renewed with a new
+  /// reason, or deleted with its project. A join would make this table's
+  /// honesty depend on rows it does not own.
+  reason          String
+  ownerUserId     String?
+  ownerTeamId     String?
+  ownerState      String
+  ownerProvenance OwnerProvenance
+  /// The expiry AS IT WAS when this applied. A renewed mute must not rewrite
+  /// the history of what it silenced under its old terms.
+  expiresAt       DateTime
+
+  createdAt DateTime @default(now())
+
+  /// The claim. A redelivered run finaliser must not double-count a
+  /// suppression, because these rows ARE the count and a doubled count is
+  /// exactly as dishonest as a missing one.
+  @@unique([runId, kind, targetKey])
+  /// The roster: "what has this project been suppressing, and for how long?"
+  @@index([projectId, kind, createdAt])
+  @@index([orgId, createdAt])
+}
+
+/// A test whose routes or locators are GONE from the latest crawl.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// Nothing flagged this and no job compared existing tests' locators against a
+/// new FlowMap. So a removed feature left a test that still counted as
+/// coverage — the denominator said the surface was covered by a test that could
+/// not pass — and every rename cost a failing run plus a strong-model heal that
+/// a set difference would have predicted for free.
+///
+/// ── DETERMINISTIC, AND THAT IS THE WHOLE POINT ──────────────────────────────
+///
+/// Each signal is a set difference against a `FlowMap`: this route is not in the
+/// crawl, this locator is on no page in it. No model, no judgement, no API key.
+/// `confidence` is the kind's own number from `OBSOLESCENCE_SIGNAL_RULES` and
+/// not a model's opinion.
+///
+/// ── WHY CONFIRMATIONS, AND WHY TWO ──────────────────────────────────────────
+///
+/// One crawl that missed a page because the app was mid-deploy looks exactly
+/// like a removed feature. `confirmations` counts CONSECUTIVE crawls that
+/// agreed, and `OBSOLESCENCE_MIN_CONFIRMATIONS` (2) is the floor below which a
+/// signal may not justify a retirement proposal. A reviewer who is shown forty
+/// bogus proposals once will never read the forty-first.
+///
+/// ROUTE_UNREACHABLE and LOCATOR_GONE can never be the SOLE basis for a
+/// retirement (`soleBasisForRetirement: false`): both are also exactly what an
+/// unauthenticated or interrupted crawl produces, and "the one mistake that is
+/// unrecoverable here is retiring a test that was merely unreached".
+model ObsoleteTestSignal {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  testId    String
+
+  kind       ObsolescenceSignalKind
+  /// The route or locator that is gone, verbatim, so a human can check the
+  /// claim. UNTRUSTED TEXT — it came out of the customer's own application —
+  /// and it is stored for display only. Nothing composes a branch name, a PR
+  /// title or an issue target out of it.
+  reference  String
+  /// The kind's own number from `OBSOLESCENCE_SIGNAL_RULES`. Stored so an old
+  /// row still reads correctly after the table is retuned.
+  confidence Float
+
+  /// The crawl that last agreed, and how many consecutive crawls have. Not a
+  /// relation: a FlowMap is prunable and this record must outlive it.
+  lastFlowMapId String
+  confirmations Int    @default(1)
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime
+
+  /// Set when the signal stopped being true. REAPPEARED is the honest and
+  /// common outcome — the route came back, or the crawl reached it this time —
+  /// and a resolved row is kept so "we nearly retired this test twice" is
+  /// answerable. Domain: REAPPEARED | RETIRED | DISMISSED, enforced at the
+  /// producer, TEXT for the reason check-enums.ts records about new enums.
+  resolvedAt      DateTime?
+  resolution      String?
+  /// Who dismissed it, when a human did.
+  dismissedBy     String?
+  dismissedReason String?
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  /// One live signal per (test, kind, reference). A new crawl that still cannot
+  /// find the same route INCREMENTS `confirmations` on this row rather than
+  /// filing a second one — which is what makes "two consecutive crawls agreed"
+  /// a fact rather than a count of rows that happen to exist.
+  @@unique([testId, kind, reference])
+  /// The proposal job's read: "every unresolved signal in this project".
+  @@index([projectId, resolvedAt])
+  @@index([orgId, kind])
+}
+
+/// "This test should stop existing" — with an owner, a review state, an expiry
+/// on the REVIEW, and a denominator consequence spelled out before anybody
+/// clicks.
+///
+/// `HealRisk.RETIRE` has existed on the heal side with nothing on the other end
+/// of it: a retirement could be PROPOSED by the healer and there was no record
+/// of what retiring would cost, who agreed to it, or how to put it back.
+///
+/// ── THE DENOMINATOR RULE, WHICH IS THE WHOLE REASON TO BE CAREFUL ──────────
+///
+/// RETIRING A TEST MAKES ITS SURFACE UNCOVERED AGAIN. The surface does NOT
+/// leave the coverage denominator: the application still has it and now nothing
+/// tests it, so the percentage goes DOWN. A retirement that quietly improved the
+/// coverage number would be the worst defect this round could ship, so the shape
+/// enforces it — `surfacesReturnedToUncovered` is NOT NULL and is written in the
+/// same transaction that applies the retirement, and `retirementDenominatorEffect`
+/// (packages/shared/src/suppression.ts) is what computes it.
+///
+/// A retirement is never a DELETE of the customer's test. It sets
+/// `Test.disabledAt`, exactly as `HealRisk.RETIRE` is documented to, and
+/// `revertedAt` + `disabledVersion` are how it comes back: without the version,
+/// an applied retirement cannot be undone except by guessing which TestVersion
+/// came before it.
+model RetirementProposal {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+  testId    String
+
+  state  RetirementState @default(PROPOSED)
+  /// Why, in a sentence a reviewer can act on. Composed by QAAI from its OWN
+  /// records (the signal kinds and their counts), never from the application
+  /// text in `ObsoleteTestSignal.reference`.
+  reason String
+
+  /// ── The owner ──────────────────────────────────────────────────────────
+  ///
+  /// Who has to decide. Resolved from `OwnershipRule`, with the provenance on
+  /// the row so "the payments team was asked to retire this" can be checked
+  /// against how firmly the payments team owns it. `ownerState` is one of
+  /// OWNERSHIP_STATES; UNOWNED is a real and reportable answer here, not an
+  /// error — a retirement nobody owns is a finding, and proposing it to nobody
+  /// in particular is better than assigning it to whoever is listed first.
+  ownerUserId     String?
+  ownerTeamId     String?
+  ownerState      String
+  ownerProvenance OwnerProvenance
+
+  /// When this PROPOSAL stops being pending. Not a licence to stay retired for
+  /// fourteen days — applying it disables the test and re-opens its surface the
+  /// same minute. A proposal nobody reviews becomes EXPIRED rather than sitting
+  /// in a queue pretending to be a decision somebody is about to make.
+  expiresAt DateTime
+
+  /// The signals this rests on. Plain ids: a signal is resolvable and this
+  /// record must outlive its resolution, which is the point — "we retired it on
+  /// evidence that later REAPPEARED" has to stay readable.
+  signalIds String[]
+
+  /// ── The denominator consequence, measured before it is applied ─────────
+  ///
+  /// `surfacesReturnedToUncovered` are the coverage items this test was the ONLY
+  /// cover for; they go back to uncovered. `surfacesStillCovered` are the ones
+  /// another live test also reaches. Both stored, because the second is what
+  /// makes the first believable.
+  surfacesReturnedToUncovered String[]
+  surfacesStillCovered        String[]
+  /// The sentence shown to the reviewer, written by
+  /// `retirementDenominatorEffect`. Stored rather than re-derived: the coverage
+  /// edges it was computed from will have moved by the time anyone reads the row.
+  denominatorNote             String
+
+  /// Set only when the surfaces were actually re-opened, in the same
+  /// transaction as `Test.disabledAt`. The honesty column: an APPLIED
+  /// retirement with this false is a retirement that improved the coverage
+  /// number, and the close-loop tick reports it as a defect rather than
+  /// repairing it silently.
+  surfacesReopened Boolean @default(false)
+
+  /// The heal proposal this came from, when the healer proposed it. Null for a
+  /// retirement the obsolescence job proposed on its own, which is the common
+  /// case and the one that needs no model.
+  healProposalId String?
+
+  decidedBy       String?
+  decidedAt       DateTime?
+  appliedAt       DateTime?
+  appliedBy       String?
+  /// The TestVersion that disabled the test. The revert path's only way back.
+  disabledVersion Int?
+  revertedAt      DateTime?
+  revertedBy      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  test Test @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  /// The review queue, and the expiry sweep.
+  @@index([projectId, state])
+  @@index([orgId, expiresAt])
+  @@index([testId])
+}
+
+/// A pull request QAAI opened in the customer's repository.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// `HealProposal.prUrl` is documented as "PR opened when the repo is connected"
+/// and NOTHING WROTE IT. `pushRepo` (apps/api/src/lib/git.ts) writes a branch
+/// and stops there, so the loop ended in the database and nothing QAAI produced
+/// ever reached a reviewer by the path reviewers actually use. A pushed suite of
+/// generated tests had no record at all.
+///
+/// ── IDEMPOTENCE IS A CONSTRAINT, NOT A CHECK ────────────────────────────────
+///
+/// `@@unique([orgId, causeKey])` — the same shape `TrackerIssue` uses, and for
+/// the same reason. Opening a PR is an OUTWARD-FACING WRITE into somebody
+/// else's system: a retried CI step, a redelivered webhook or a double-clicked
+/// button must find this row and link to the PR already open, never open a
+/// second one. A customer who gets two PRs for one fix will not forgive a third.
+///
+/// ── THE TARGET IS OURS, THE CONTENT IS THEIRS ───────────────────────────────
+///
+/// `repo`, `branch` and `baseRef` are determined by QAAI's OWN records — the
+/// `Integration` row the customer connected and a branch name composed from
+/// ids — and are INCAPABLE of being influenced by test output, page text,
+/// customer source or a model's own words. That is the rule: a PR's target must
+/// never be composed from attacker-influenced text. The TITLE and BODY are
+/// bounded and fenced by the writer; nothing in them can change where the PR
+/// lands, because where it lands is already decided here.
+///
+/// NO TOKEN ON THIS ROW, and none in any column. The credentials live on the
+/// `Integration` the customer owns, which is the pattern this schema already
+/// uses, and nothing here is ever logged.
+model PullRequestRecord {
+  id        String @id @default(cuid())
+  orgId     String
+  projectId String
+
+  provider      IntegrationKind
+  /// Which integration opened it. Not a relation — the PR outlives the
+  /// connection, exactly as `TrackerIssue.integrationId` does.
+  integrationId String?
+  /// `owner/repo`, from the integration's own configuration.
+  repo          String
+  branch        String
+  baseRef       String
+
+  /// What it is for: HEAL | GENERATED_TESTS | RETIREMENT | CLOSURE_CAMPAIGN.
+  /// TEXT with the domain enforced at the producer (`PR_PURPOSES` in
+  /// packages/shared/src/schemas.ts), for the reason check-enums.ts records: a
+  /// new Prisma enum with no entry in its PAIRS list is an enum with no drift
+  /// guard, and nothing groups rows on this.
+  purpose  String
+  /// The idempotence key: sha256 of (purpose | projectId | the cause identity).
+  /// A cluster key for a heal, a campaign id for a campaign, a test id for a
+  /// retirement.
+  causeKey String
+
+  /// REQUESTED | OPEN | MERGED | CLOSED | FAILED. REQUESTED is the state a row
+  /// is created in BEFORE the host is called, so a crash between the insert and
+  /// the API call leaves a row that says "we were about to" rather than a
+  /// claimed PR nobody can find. FAILED carries `failureNote`.
+  state       String  @default("REQUESTED")
+  /// Null until the host answers. NULL, not an empty string: "we have no url"
+  /// and "the url is empty" must not be the same value.
+  number      Int?
+  url         String?
+  /// Why it could not be opened, in our own prose. NEVER the host's raw
+  /// response: an error body is attacker-influenceable text and may carry
+  /// credentials the request sent.
+  failureNote String?
+
+  /// What was in it, for the audit trail. Counts and paths, never file
+  /// contents.
+  fileCount      Int      @default(0)
+  filePaths      String[]
+  /// Paths QAAI refused to write because a human owns them, carried so the
+  /// reviewer can see what was LEFT ALONE. `pushRepo`'s preserve list.
+  preservedPaths String[]
+
+  openedBy  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// One PR per cause. See the header.
+  @@unique([orgId, causeKey])
+  @@index([projectId, state])
+}
+
+/// A recording promoted into the suite.
+///
+/// `startRecording` (packages/runner/src/record.ts) opens codegen and
+/// `cleanupRecordedSpec` makes the result portable, and then the spec became a
+/// `Test` with no record of having been a recording. Two consequences: "where
+/// did this test come from?" had no answer, so a recorded test was
+/// indistinguishable from a generated one in the coverage evidence; and a
+/// double promotion made two tests from one session.
+///
+/// `recordingKey` is a content hash of the cleaned spec, and
+/// `@@unique([projectId, recordingKey])` is what makes the promotion idempotent
+/// — the same recording promoted twice finds this row and links to the test it
+/// already made.
+model RecordingPromotion {
+  id            String  @id @default(cuid())
+  orgId         String
+  projectId     String
+  /// The environment it was recorded against, so a reader knows which base URL
+  /// the relative paths were made relative TO. Not a relation: an environment is
+  /// deletable and the record of what was recorded where must outlive it, the
+  /// same argument `VisualBaseline.environmentId` carries.
+  environmentId String?
+
+  /// sha256 of the cleaned spec, hex. The idempotence key.
+  recordingKey String
+  /// What the human called it.
+  name         String
+  /// CAPTURED | PROMOTED | REJECTED | SUPERSEDED. TEXT, domain at the producer
+  /// (`RECORDING_PROMOTION_STATES`), for the same reason as
+  /// `PullRequestRecord.purpose`.
+  state        String @default("CAPTURED")
+
+  /// The test this became. Null while CAPTURED, and null forever when REJECTED
+  /// — a rejected recording is a decision worth keeping, not a row to delete.
+  promotedTestId String?
+  rejectedReason String?
+
+  recordedBy String
+  recordedAt DateTime  @default(now())
+  promotedBy String?
+  promotedAt DateTime?
+  updatedAt  DateTime  @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// The claim. See the header.
+  @@unique([projectId, recordingKey])
+  @@index([projectId, state])
 }

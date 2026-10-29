@@ -70,7 +70,14 @@ import {
   TERMINAL_RUN_STATUSES,
   resolveFlakePolicy,
 } from '@qaai/shared';
-import type { FlakePolicy, FlowMap, Priority, RunStatus, TestResultStatus } from '@qaai/shared';
+import type {
+  CrawlAcceptanceState,
+  FlakePolicy,
+  FlowMap,
+  Priority,
+  RunStatus,
+  TestResultStatus,
+} from '@qaai/shared';
 /*
  * The budget, the expiry and what "quarantine in force" means all live in
  * packages/runner/src/gates.ts — the module that already owned the one rule
@@ -2099,6 +2106,8 @@ interface CrawlRow {
   version: number;
   graph: unknown;
   truncatedReason: string | null;
+  acceptance: CrawlAcceptanceState | null;
+  acceptanceReason: string | null;
 }
 
 /**
@@ -2124,6 +2133,8 @@ export async function driftSweep(): Promise<void> {
       version: true,
       graph: true,
       truncatedReason: true,
+      acceptance: true,
+      acceptanceReason: true,
     },
   })) as CrawlRow[];
 
@@ -2316,6 +2327,32 @@ function readFlowMap(crawl: CrawlRow): FlowMap | null {
      */
     version: crawl.version,
     truncatedReason: crawl.truncatedReason,
+    /*
+     * THE ROW, NOT THE BLOB — and this field is the reason that rule exists.
+     *
+     * THE DEFECT THIS FIXES: this reconstruction rebuilt the FlowMap
+     * field-by-field and dropped `acceptance`, so `crawlSurfaceOf` read it as
+     * `null` for every crawl ever written and `retirementBlockedBy` answered
+     * "never adjudicated" for all of them. The retirement path was dead in
+     * production — a CORRECT gate reading a field nobody passed it — while the
+     * only thing that noticed was two red tests in this file.
+     *
+     * Only `state` and `reasons` are reconstructed, because they are the only
+     * two `retirementBlockedBy` asks for and the row stores no more than that.
+     * `degradations` and the two comparison counts live in the blob's own
+     * acceptance object when there is one; inventing zeros for them here would
+     * be reporting an unmeasured count as a measured one.
+     */
+    acceptance:
+      crawl.acceptance === null
+        ? null
+        : {
+            state: crawl.acceptance,
+            reasons: crawl.acceptanceReason === null ? [] : [crawl.acceptanceReason],
+            degradations: [],
+            comparedToVersion: null,
+            previousNodeCount: null,
+          },
   };
 }
 

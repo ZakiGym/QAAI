@@ -65,6 +65,20 @@ import type {
   OwnershipState,
 } from '@qaai/shared';
 
+import {
+  OWNER_PROVENANCES,
+  OWNER_PROVENANCE_STRENGTH,
+  isHumanSetProvenance,
+  mayPage,
+  resolutionIsCoherent,
+} from '../../../../packages/shared/src/ownership.js';
+import type {
+  OwnableSubject,
+  OwnerProvenance,
+  OwnerResolution,
+  OwnerStrength,
+} from '../../../../packages/shared/src/ownership.js';
+
 /** Which of the four things a rule points at. */
 export type OwnershipSubject = 'TEST' | 'SUITE' | 'FEATURE' | 'PATH';
 
@@ -819,6 +833,521 @@ export function ownerLabel(owner: OwnerRef, directory: OwnerDirectory): string {
   return team?.slug ? `@${team.slug}` : 'a deleted team';
 }
 
+
+// ─── Provenance: HOW the owner was decided ───────────────────────────────────
+
+/*
+ * THE DEFECT THIS SECTION CLOSES, verbatim from the round's register: "A
+ * FAILURE IS NEVER ASSIGNED. Ownership resolves for the digest and for the
+ * triage list, and the verdict itself goes to a shared queue nobody owns."
+ *
+ * Everything above answers WHO. Nothing above answers HOW WELL WE KNOW, and the
+ * two halves of this file's job are not the same question: `assignOwner` returns
+ * the same shape for "Dana assigned this test to herself" and "somebody once
+ * wrote `tests/**` and this file is under tests/", so every surface that renders
+ * an owner renders both identically. A digest that pages the payments team on
+ * the strength of a catch-all glob teaches the payments team to filter the
+ * digest.
+ *
+ * The vocabulary is `packages/shared/src/ownership.ts` — OWNER_PROVENANCES,
+ * their strengths, `mayPage`, `isHumanSetProvenance`, `resolutionIsCoherent`.
+ * This file supplies the half that vocabulary cannot: which provenance a MATCH
+ * earns, given what matched and where the rule came from.
+ *
+ * WHY THE IMPORT IS A RELATIVE PATH AND NOT `@qaai/shared`. At this round's
+ * baseline `packages/shared/src/index.ts` does not re-export `./ownership` and
+ * `packages/shared/package.json` does not list it under `exports`, so
+ * `@qaai/shared` publishes no name from it and apps/api cannot reach it by the
+ * package name at all. lib/git.ts reaches `artifact-set.ts` by this same
+ * four-dot path for exactly that reason. THE BARREL LINE IS OWED and is in this
+ * round's needsFromOtherFiles; when it lands, change this import to
+ * `from '@qaai/shared'` — nothing else changes. What is NOT an option is a
+ * second copy of the strength table in this package:
+ * `apps/api/scripts/check-enums.ts` diffs the shared file against
+ * `schema.prisma`, so there is exactly one declaration of `OwnerProvenance` and
+ * it is not this one.
+ */
+
+/**
+ * Which provenance a matching RULE earns, by what the rule points at.
+ *
+ * A `satisfies Record<OwnershipSubject, OwnerProvenance>`, so a fifth subject
+ * cannot be added to this file without somebody deciding how much an answer
+ * from it is worth. The four values are the four `RULE_*` provenances and the
+ * mapping is one-to-one on purpose: the shared file orders its provenances
+ * strongest-first in exactly the order `SUBJECT_RANK` above orders subjects, so
+ * the two tables cannot disagree about which of two matches is better. The
+ * run-time parity test is in ownership.test.ts.
+ */
+export const PROVENANCE_BY_SUBJECT = {
+  TEST: 'RULE_TEST',
+  SUITE: 'RULE_SUITE',
+  FEATURE: 'RULE_FEATURE',
+  PATH: 'RULE_PATH',
+} as const satisfies Record<OwnershipSubject, OwnerProvenance>;
+
+/**
+ * Where a rule came from.
+ *
+ *   QAAI        a person typed it into this product, meaning to route QAAI's
+ *               failures. DECLARED.
+ *   CODEOWNERS  it arrived in bulk from a repository's CODEOWNERS file.
+ *               Identical mechanism, different consent: nobody wrote it with
+ *               QAAI in mind, and an import brings a thousand at once. The
+ *               shared table makes it WEAK for that reason alone.
+ *
+ * There is no `OwnershipRule.source` column, so this cannot be read off a row.
+ * It is supplied by the caller that knows — the import endpoint knows which ids
+ * it just created — and a caller that does NOT know passes nothing and gets
+ * `QAAI`, which is the answer a hand-written rule deserves and the one a
+ * pre-provenance row has always implicitly carried. The column is owed and is in
+ * this round's needsFromOtherFiles; until it exists, a caller that guessed
+ * CODEOWNERS for a hand-written rule would be understating a real assignment,
+ * which is the safe direction of the two.
+ */
+export const RULE_ORIGINS = ['QAAI', 'CODEOWNERS'] as const;
+export type RuleOrigin = (typeof RULE_ORIGINS)[number];
+
+/**
+ * What a surface may SAY about an owner.
+ *
+ *   ASSIGNED   a person decided this, or wrote a rule meaning to cover it.
+ *              Page on it, put a name on the ticket, show it as an assignment.
+ *   SUGGESTED  a bulk-imported glob, a git-blame guess or an inherited owner
+ *              landed on it. Show it as a suggestion. Presenting one of these as
+ *              an assignment is how a team learns to ignore assignments.
+ *   UNOWNED    nobody. A reportable value, not an error — see
+ *              `unownedFinding` in the shared file.
+ */
+export const ASSIGNMENT_KINDS = ['ASSIGNED', 'SUGGESTED', 'UNOWNED'] as const;
+export type AssignmentKind = (typeof ASSIGNMENT_KINDS)[number];
+
+/**
+ * Strength → what a surface may say. Compiler-enforced over every strength, and
+ * DERIVED rather than re-decided: the shared file already answered "may this
+ * page somebody" (`mayPage`), and a second threshold here would be a number
+ * somebody tunes until a catch-all glob pages again.
+ *
+ * `strongerResolution` and this table therefore agree by construction. The
+ * run-time check that they do is in ownership.test.ts.
+ */
+export const KIND_BY_STRENGTH = {
+  HUMAN: 'ASSIGNED',
+  DECLARED: 'ASSIGNED',
+  WEAK: 'SUGGESTED',
+  NONE: 'UNOWNED',
+} as const satisfies Record<OwnerStrength, AssignmentKind>;
+
+/**
+ * An assignment with its provenance, and whether a surface may present it as an
+ * assignment at all.
+ *
+ * TWO FIELDS, NOT ONE, and deliberately so. `provenance` says how the owner was
+ * decided; `kind` says what a reader may be told. They are computed from each
+ * other here, once — but a caller that had to derive "is this showable as an
+ * assignment" from a nine-member enum at every render site would get it right in
+ * the digest and wrong in the ticket, which is the `houseStyle.planned` defect
+ * (one field meaning two things in two places) arriving by the other door.
+ */
+export interface OwnerRouting extends OwnerAssignment {
+  readonly provenance: OwnerProvenance;
+  readonly kind: AssignmentKind;
+  /** True only for EXPLICIT_ASSIGNMENT. The predicate `applySuppression` asks. */
+  readonly humanSet: boolean;
+  /** May this answer wake somebody up? `mayPage` in the shared file. */
+  readonly pageable: boolean;
+}
+
+/** An owner a person set on this exact thing. The only HUMAN provenance. */
+export interface ExplicitAssignment {
+  readonly owner: OwnerRef;
+  /** Who set it, for the note. Never a token, never an email. */
+  readonly byLabel?: string | null;
+}
+
+/**
+ * What the caller knows beyond the rule table.
+ *
+ * Every field is OPTIONAL and the default of each is the weakest honest answer,
+ * so a caller that knows nothing extra gets exactly what `assignOwner` already
+ * returned plus a provenance for it. That is the point: this is not a second
+ * resolver, it is the first one with its strength written down.
+ */
+export interface RoutingContext {
+  /** A person assigned this exact subject. Beats every rule. */
+  readonly explicit?: ExplicitAssignment | null;
+  /** Rule ids that arrived from a repository's CODEOWNERS file. */
+  readonly codeownersRuleIds?: ReadonlySet<string>;
+  /**
+   * The last human to edit the test, from git blame — a HEURISTIC and the
+   * weakest answer this function will give. Used ONLY when no rule matched, and
+   * never to override one: somebody who fixed a typo in a test a year ago does
+   * not own it, and overriding a declared rule with them is how a digest pages
+   * the wrong person.
+   */
+  readonly lastEditor?: { readonly userId: string } | null;
+  /**
+   * An owner inherited from a parent — a suite's owner applied to a test with
+   * none of its own. A convenience, not a decision, so it sits between a rule
+   * and git blame.
+   */
+  readonly inherited?: { readonly owner: OwnerRef; readonly fromLabel: string } | null;
+}
+
+/*
+ * Strongest first — the shared declaration order, aliased rather than copied so
+ * a reordering there cannot leave a stale precedence table here. `indexOf` on a
+ * nine-member array is cheaper than the Map that would avoid it, and this runs
+ * once per ticket rather than once per member.
+ */
+const PROVENANCE_RANK: readonly OwnerProvenance[] = OWNER_PROVENANCES;
+
+/** The provenance a winning match earns, given where its rule came from. */
+export function provenanceOfMatch(
+  match: Pick<OwnershipMatch, 'ruleId' | 'subject'>,
+  codeownersRuleIds?: ReadonlySet<string>,
+): OwnerProvenance {
+  return codeownersRuleIds?.has(match.ruleId)
+    ? 'CODEOWNERS_IMPORT'
+    : PROVENANCE_BY_SUBJECT[match.subject];
+}
+
+function routing(assignment: OwnerAssignment, provenance: OwnerProvenance): OwnerRouting {
+  /*
+   * The coherence check is the shared file's, run on every answer this function
+   * produces rather than at the write site. The two illegal pairs — an owner
+   * with provenance NONE, and no owner with a provenance that is not NONE — are
+   * both easy to produce here by accident, and either one stored on a verdict
+   * reads as a routing decision that was never made. It returns a PATH and
+   * never a message built out of the value, which is why the thrown sentence
+   * below names the field and not its contents.
+   */
+  const coherent = resolutionIsCoherent({
+    state: assignment.state,
+    owner: assignment.owner,
+    provenance,
+  });
+  if (!coherent.coherent) {
+    throw new OwnershipRuleError(
+      `An ownership answer was composed with an incoherent "${coherent.path}". This is a bug in QAAI's routing, not in your rules.`,
+    );
+  }
+  const strength = OWNER_PROVENANCE_STRENGTH[provenance];
+  return {
+    ...assignment,
+    provenance,
+    kind: KIND_BY_STRENGTH[strength],
+    humanSet: isHumanSetProvenance(provenance),
+    pageable: mayPage(provenance),
+  };
+}
+
+/**
+ * Who owns this, which kind of nobody if nobody, and HOW the answer was reached.
+ *
+ * `assignOwner` is left exactly as it was and is called here: the matching is
+ * the part worth testing exhaustively and it does not change. What this adds is
+ * the strength of the answer and the three fallbacks that only make sense once
+ * strength exists — an explicit assignment that must beat every glob, and two
+ * WEAK guesses that may only speak when no rule did.
+ *
+ * ORDER, and why each step is where it is:
+ *
+ *   1. EXPLICIT    a person pointed at this thing. The only HUMAN answer, and
+ *                  the only one a suppression may be hung on.
+ *   2. A RULE      whatever `assignOwner` found, with its provenance taken from
+ *                  the subject it matched and downgraded to CODEOWNERS_IMPORT
+ *                  when the rule was bulk-imported.
+ *   3. INHERITED   a parent's owner. WEAK.
+ *   4. LAST_EDITOR git blame. WEAK, and last.
+ *
+ * A fallback NEVER overrides a rule and never changes `unusable`: a project can
+ * route this test by blame and still have a broken rule that has stopped
+ * routing twenty others, and swallowing that is the failure mode this whole
+ * file is arranged against. Both fallbacks keep `state: 'OWNED'` because an
+ * owner WAS produced — and `kind: 'SUGGESTED'` is what stops a surface
+ * presenting it as an assignment.
+ */
+export function routeOwner(
+  test: OwnableTest,
+  rules: OwnershipRuleInput[],
+  context: RoutingContext = {},
+): OwnerRouting {
+  const matched = assignOwner(test, rules);
+
+  if (context.explicit) {
+    const by = context.explicit.byLabel ? ` by ${context.explicit.byLabel}` : '';
+    return routing(
+      {
+        state: 'OWNED',
+        owner: context.explicit.owner,
+        ruleId: null,
+        note:
+          matched.unusable.length > 0
+            ? `Assigned directly${by}. (${matched.unusable.length} ownership rule(s) could not be evaluated: ${matched.unusable[0]!.reason})`
+            : `Assigned directly${by}.`,
+        unusable: matched.unusable,
+      },
+      'EXPLICIT_ASSIGNMENT',
+    );
+  }
+
+  if (matched.owner !== null) {
+    const winner = resolveOwnership(test, rules).owner;
+    /*
+     * `winner` cannot be null when `matched.owner` is not — they come from the
+     * same resolution — but the compiler does not know that, and a `!` here
+     * would be the kind of assertion that outlives the invariant. Falling back
+     * to RULE_PATH, the weakest of the four rule provenances, is the honest
+     * answer if it ever did: understating a real rule is recoverable, and
+     * overstating one pages a team that did not agree to be paged.
+     */
+    return routing(matched, winner ? provenanceOfMatch(winner, context.codeownersRuleIds) : 'RULE_PATH');
+  }
+
+  if (context.inherited) {
+    return routing(
+      {
+        state: 'OWNED',
+        owner: context.inherited.owner,
+        ruleId: null,
+        note: `No rule covers this; the owner shown is inherited from ${context.inherited.fromLabel}. A suggestion, not an assignment.`,
+        unusable: matched.unusable,
+      },
+      'INHERITED',
+    );
+  }
+
+  if (context.lastEditor) {
+    return routing(
+      {
+        state: 'OWNED',
+        owner: { kind: 'USER', userId: context.lastEditor.userId },
+        ruleId: null,
+        note: `No rule covers this; the owner shown is the last person to edit the test. A suggestion, not an assignment — write an ownership rule to make it one.`,
+        unusable: matched.unusable,
+      },
+      'LAST_EDITOR',
+    );
+  }
+
+  return routing(matched, 'NONE');
+}
+
+/**
+ * The provenance a MANY-SUBJECT answer may claim: the WEAKEST among the members
+ * that have an owner.
+ *
+ * `consensusOwner` above decides whether one owner is true for a whole cause.
+ * This decides how good that answer is, and the weakest-wins rule is the only
+ * defensible one: a ticket for forty tests, thirty-nine of them assigned by
+ * name and one by a bulk-imported glob, is a ticket whose claim to that owner is
+ * only as strong as the glob. Taking the strongest would let one explicit
+ * assignment launder thirty-nine guesses into an assignment nobody made.
+ *
+ * Members with no owner do not weaken it, for the same reason they do not veto
+ * unanimity in `consensusOwner`: "the payments team owns eight of these and
+ * nobody owns the other two" still routes to payments, with the gap stated.
+ * When nothing is owned the answer is NONE / UNOWNED.
+ */
+export function consensusProvenance(routings: readonly OwnerRouting[]): {
+  provenance: OwnerProvenance;
+  kind: AssignmentKind;
+} {
+  const owned = routings.filter((routed) => routed.owner !== null);
+  if (owned.length === 0) return { provenance: 'NONE', kind: 'UNOWNED' };
+  const weakest = owned.reduce(
+    (worst, routed) =>
+      PROVENANCE_RANK.indexOf(routed.provenance) > PROVENANCE_RANK.indexOf(worst) ? routed.provenance : worst,
+    owned[0]!.provenance,
+  );
+  return { provenance: weakest, kind: KIND_BY_STRENGTH[OWNER_PROVENANCE_STRENGTH[weakest]] };
+}
+
+/** `routeOwner` for a list — the shape the digest and the filing path want. */
+export function routeOwnershipFor(
+  tests: OwnableTest[],
+  rules: OwnershipRuleInput[],
+  context: (test: OwnableTest) => RoutingContext = () => ({}),
+): Map<string, OwnerRouting> {
+  const byTest = new Map<string, OwnerRouting>();
+  for (const test of tests) byTest.set(test.id, routeOwner(test, rules, context(test)));
+  return byTest;
+}
+
+/**
+ * The routing as the shared `OwnerResolution` — the shape the web app and the
+ * suppression path read.
+ *
+ * `subject` is an argument because the resolver cannot know it: the same test
+ * row is the subject of a FAILURE when it is red and of a TEST when a
+ * suppression is being hung on it, and a function that guessed would be a
+ * second opinion about what is being owned.
+ */
+export function routingResolution(
+  subject: OwnableSubject,
+  routed: OwnerRouting,
+): OwnerResolution {
+  return {
+    subject,
+    state: routed.state,
+    owner: routed.owner,
+    provenance: routed.provenance,
+    ruleId: routed.ruleId,
+    note: routed.note,
+    unusable: routed.unusable,
+  };
+}
+
+/**
+ * The verdict columns, INCLUDING `ownerProvenance`.
+ *
+ * ─── WHY THIS IS A SECOND FUNCTION AND NOT A CHANGED ONE ────────────────────
+ *
+ * `TriageVerdict.ownerProvenance` says in the schema that it is "written
+ * together or not at all" with `ownerState`, and `verdictOwnerColumns` above
+ * writes `ownerState` and cannot write a provenance — it is handed an
+ * `OwnerAssignment`, which does not carry one. Making its `provenance` argument
+ * required would break `apps/worker/src/processors/notify.ts`, a file this
+ * round's agent does not own; making it optional would write `ownerState`
+ * without `ownerProvenance` and contradict the column's own documentation,
+ * which is one of the lies this product cannot afford.
+ *
+ * So the writer that CAN tell the truth is a new function over `OwnerRouting`,
+ * `verdictOwnerColumns` is left byte-identical for its remaining caller, and
+ * the one-line edit that moves that caller over is in this round's
+ * needsFromOtherFiles. When it lands, `verdictOwnerColumns` has no callers and
+ * can be deleted.
+ */
+export interface VerdictRoutingColumns extends VerdictOwnerColumns {
+  ownerProvenance: OwnerProvenance;
+}
+
+export function verdictRoutingColumns(
+  routed: OwnerRouting,
+  now: Date = new Date(),
+): VerdictRoutingColumns {
+  return {
+    ...verdictOwnerColumns(routed, now),
+    ownerProvenance: routed.provenance,
+  };
+}
+
+// ─── Importing a repository's CODEOWNERS ─────────────────────────────────────
+
+/**
+ * One CODEOWNERS line, parsed.
+ *
+ * `owners` are the raw tokens — `@acme/payments`, `@dana`, `dana@acme.com` —
+ * and are NOT resolved here. Resolution needs the org's users and teams, which
+ * means Prisma, which this module deliberately does not have; and a parser that
+ * silently dropped the tokens it could not resolve would turn "we could not
+ * find this team" into "this directory has no owner", which is the one
+ * confusion the whole ownership vocabulary exists to prevent.
+ */
+export interface CodeownersEntry {
+  /** 1-based line number in the file, so a refusal can be pointed at. */
+  readonly line: number;
+  readonly pathPattern: string;
+  readonly owners: readonly string[];
+}
+
+/** How many lines of a CODEOWNERS file are read. GitHub's own ceiling is 3MB. */
+export const MAX_CODEOWNERS_LINES = 2_000;
+
+/**
+ * Parse a CODEOWNERS file into rule drafts, deterministically and with no model
+ * and no network.
+ *
+ * ─── WHAT IS REFUSED, AND WHY NOTHING IS GUESSED ────────────────────────────
+ *
+ * A line this dialect cannot express is SKIPPED WITH A REASON and counted. The
+ * alternative — reinterpreting it as the nearest pattern this product does
+ * support — routes failures to the wrong team while looking correct, which is
+ * the failure `normalisePattern` already refuses loudly for a hand-typed
+ * pattern. An import is the one place where a thousand of them arrive at once,
+ * so it is the last place to start guessing.
+ *
+ * Sections (`[Section name]`, GitHub's CODEOWNERS-with-sections syntax) are
+ * skipped rather than parsed: a section carries approval-count and optional-ness
+ * semantics that have no meaning here, and silently flattening them would route
+ * an OPTIONAL reviewer's directory to them as an owner.
+ *
+ * THE LINE CAP IS REPORTED. `truncated` carries the number of lines that were
+ * never read and why, because an import that silently stopped at 2,000 lines
+ * would leave a project believing it had routed a directory it had not.
+ */
+export function parseCodeowners(text: string): {
+  entries: CodeownersEntry[];
+  skipped: Array<{ line: number; reason: string }>;
+  truncated: { lines: number; reason: string } | null;
+} {
+  const all = text.split(/\r?\n/);
+  const read = all.slice(0, MAX_CODEOWNERS_LINES);
+  const entries: CodeownersEntry[] = [];
+  const skipped: Array<{ line: number; reason: string }> = [];
+
+  read.forEach((raw, index) => {
+    const line = index + 1;
+    const stripped = raw.replace(/#.*$/, '').trim();
+    if (!stripped) return;
+
+    if (stripped.startsWith('[') || stripped.startsWith('^[')) {
+      skipped.push({
+        line,
+        reason:
+          'Section headers carry approval counts and optional reviewers, which have no meaning for failure routing. Write the patterns inside it as plain rules.',
+      });
+      return;
+    }
+
+    const fields = stripped.split(/\s+/);
+    const pattern = fields[0];
+    const owners = fields.slice(1).filter((field) => field.startsWith('@') || field.includes('@'));
+
+    if (!pattern) return;
+    if (owners.length === 0) {
+      skipped.push({ line, reason: 'This line names a path and no owner, so it routes nowhere.' });
+      return;
+    }
+    if (owners.length !== fields.length - 1) {
+      skipped.push({
+        line,
+        reason:
+          'Some tokens on this line are neither a @handle, a @org/team nor an email address. The line was not imported rather than importing the half of it that parsed.',
+      });
+      return;
+    }
+
+    try {
+      // The SAME validator a hand-typed pattern goes through. An imported
+      // pattern that would be refused in the UI must be refused here too, or
+      // the import becomes a way to store rules the editor cannot show.
+      entries.push({ line, pathPattern: normalisePattern(pattern), owners });
+    } catch (err) {
+      skipped.push({
+        line,
+        reason:
+          err instanceof OwnershipRuleError
+            ? err.message
+            : 'This path pattern could not be evaluated.',
+      });
+    }
+  });
+
+  return {
+    entries,
+    skipped,
+    truncated:
+      all.length > read.length
+        ? {
+            lines: all.length - read.length,
+            reason: `Only the first ${MAX_CODEOWNERS_LINES} lines were read. The rest were NOT imported, so the directories they cover are still unowned.`,
+          }
+        : null,
+  };
+}
+
 // ─── Re-exported vocabulary ──────────────────────────────────────────────────
 
 /*
@@ -836,6 +1365,19 @@ export function ownerLabel(owner: OwnerRef, directory: OwnerDirectory): string {
  * compile. It fails to match a row somebody already wrote.
  */
 export { ISSUE_OWNER_STATES, ISSUE_SUBJECTS, OWNERSHIP_STATES } from '@qaai/shared';
+/*
+ * And the provenance half, from the shared module the barrel does not publish
+ * yet (see the import note in the provenance section). Re-exported for the same
+ * reason the block above exists: a module that routes ownership is where a
+ * caller looks for the words ownership is described in, and routes/issues.ts
+ * would otherwise need the same four-dot relative path.
+ */
+export type {
+  OwnableSubject,
+  OwnerProvenance,
+  OwnerResolution,
+  OwnerStrength,
+} from '../../../../packages/shared/src/ownership.js';
 export type {
   IssueOwnerState,
   IssueSubject,

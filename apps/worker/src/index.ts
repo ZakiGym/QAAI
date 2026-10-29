@@ -27,6 +27,8 @@ import {
   armFlakeTick,
   armPreflightSweep,
   armScheduleTick,
+  armSuppressionSweep,
+  SUPPRESSION_QUEUE,
   closeProducers,
   type AnalyzeSourceJob,
   type DeliveryJob,
@@ -36,7 +38,11 @@ import { processAnalyzeSource } from './processors/analyze-source.js';
 import { processExplore } from './processors/explore.js';
 import { processGenerate } from './processors/generate.js';
 import { failRunFromDeadJob, processRun, sweepStalledShardedRuns } from './processors/run.js';
-import { processTriage } from './processors/triage.js';
+import {
+  processSuppressionSweep,
+  processTriage,
+  type SuppressionSweepJob,
+} from './processors/triage.js';
 import { processCopilot } from './processors/copilot.js';
 import { processEdit } from './processors/edit.js';
 import { processDelivery, processNotify } from './processors/notify.js';
@@ -416,6 +422,29 @@ register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, async (
 // this worker stays cheap even while an investigation is in flight.
 register<FlakeTickJob>(QUEUE_NAMES.flake, 1, processFlakeTick);
 void armFlakeTick().catch((err) => logger.error({ err }, 'could not arm the flake sweep'));
+
+// ── The suppression expiry sweep ───────────────────────────────────────────
+//
+// WITHOUT THESE TWO LINES the expiry feature exists only as a function with a
+// test. `isInForce` already refuses an expired suppression at every read, so
+// nothing stays suppressed — but a `RetirementProposal` nobody reviewed would
+// sit PROPOSED for ever pretending to be a pending decision, and the humans who
+// own the mutes that are about to stop suppressing would never be told. An
+// expiry that arrives as a surprise outage is how a team learns to set the next
+// one for a year.
+//
+// Concurrency 1, like the retention sweep and for the same reason: two ticks
+// expiring the same rows at once would race over them, and there is never a
+// reason to hurry an expiry that has already taken effect at every read.
+register<SuppressionSweepJob>(SUPPRESSION_QUEUE, 1, async (payload) => {
+  // The counts are RETURNED by the processor (its own tests read them) and
+  // logged by it, so they are deliberately dropped here rather than being
+  // handed to BullMQ as a job return value nothing reads.
+  await processSuppressionSweep(payload);
+});
+void armSuppressionSweep().catch((err) =>
+  logger.error({ err }, 'could not arm the suppression expiry sweep'),
+);
 
 // Build bisect. Each tick only reads the database and enqueues the next probe
 // run — the browser work happens on the run queue — so this stays cheap, but it

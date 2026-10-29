@@ -131,15 +131,15 @@ import {
   BOUNDARY_CLASSES,
   BOUNDARY_DESCRIPTORS,
   BOUNDARY_RISK_RANK,
-} from '../../shared/src/boundaries';
+} from '@qaai/shared';
 import type {
   BoundaryApplicability,
   BoundaryClass,
   BoundaryExpectation as KeystoneExpectation,
   BoundaryPrecondition,
   BoundaryRisk,
-} from '../../shared/src/boundaries';
-import { isSafeProbeMethod } from '../../shared/src/principals';
+} from '@qaai/shared';
+import { isSafeProbeMethod } from '@qaai/shared';
 
 // ─── Classes ─────────────────────────────────────────────────────────────────
 

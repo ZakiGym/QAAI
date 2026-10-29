@@ -1392,7 +1392,22 @@ function fakeHealPrisma(scenario: HealScenario) {
      */
     testResult: { findMany: async () => [], findFirst: async () => null },
     testFlakeHistory: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
-    flowMap: { findMany: async () => scenario.crawls ?? [] },
+    /*
+     * HONOURS `select`, because a select-blind fake made deleting a field from
+     * the drift query UNDETECTABLE — and one of those fields is `acceptance`,
+     * whose absence killed every retirement proposal in production while this
+     * file stayed green. Projecting to the named columns makes a dropped
+     * `select` entry read as the `undefined` Prisma would really hand back.
+     */
+    flowMap: {
+      findMany: async (args: Row) => {
+        const rows = scenario.crawls ?? [];
+        const select = args?.select as Record<string, boolean> | undefined;
+        if (!select) return rows;
+        const keys = Object.keys(select).filter((key) => select[key] === true);
+        return rows.map((row) => Object.fromEntries(keys.map((key) => [key, row[key]])));
+      },
+    },
     coverageItem: {
       count: async () =>
         (scenario.coverageItems ?? []).filter((item) => item.origin !== 'CRAWL_ONLY').length,
@@ -1797,6 +1812,8 @@ describe('the drift check and retirement proposals', () => {
     version: 9,
     graph: { baseUrl: 'https://app.test', nodes, exploredAt: '2026-10-24T00:00:00.000Z' },
     truncatedReason,
+    acceptance: 'ACCEPTED',
+    acceptanceReason: null,
   });
 
   const projectTest = (over: Row = {}): Row => ({
@@ -2047,6 +2064,61 @@ describe('the drift check and retirement proposals', () => {
     expect(audit.metadata.testsCompared).toBe(500);
     expect(audit.metadata.testsTruncated).toBe(true);
     expect(audit.metadata.testScanLimit).toBe(500);
+  });
+
+  /*
+   * THE TWO TESTS BELOW ARE THE BLOCKING DIRECTION OF `acceptance`, and they
+   * exist because its absence shipped.
+   *
+   * `retirementBlockedBy` (packages/agent/src/obsolete.ts) refuses to retire
+   * from a crawl that was never adjudicated or was held as degraded. The gate
+   * was correct and `readFlowMap` passed it nothing, so it answered "never
+   * adjudicated" for EVERY crawl and no retirement could ever be proposed. The
+   * two tests above cover the permissive direction and went red; nothing
+   * covered the refusing direction, so once the pass-through exists a revert of
+   * it would read as a tightening rather than as the whole feature dying.
+   */
+  it('withholds the retirement when the crawl was never adjudicated, and says so', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [{ ...crawlRow([ordersNode]), acceptance: null, acceptanceReason: null }],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    // The check still happened and still says what it could not answer.
+    const audit = calls.audits.at(-1)!;
+    expect(audit.action).toBe(HEAL_AUDIT_ACTIONS.driftChecked);
+    expect(String((audit.metadata.caveats as string[]).join(' '))).toMatch(/never adjudicated/);
+  });
+
+  it('withholds the retirement from a crawl held as a CANDIDATE, and quotes why', async () => {
+    // A degraded crawl produces exactly the evidence a deleted page does: the
+    // route is not in the map. Retiring on it destroys coverage because a
+    // login expired.
+    const { prisma, calls } = fakeHealPrisma({
+      crawls: [
+        {
+          ...crawlRow([ordersNode]),
+          acceptance: 'CANDIDATE',
+          acceptanceReason: 'the crawl shrank by 71% against v8',
+        },
+      ],
+      projectTests: [projectTest()],
+      coverageItems: [{ key: 'ROUTE:/orders', origin: 'BOTH', retiredAt: null }],
+    });
+    h.prisma = prisma;
+
+    await driftSweep();
+
+    expect(calls.healCreates).toEqual([]);
+    const caveats = String((calls.audits.at(-1)!.metadata.caveats as string[]).join(' '));
+    expect(caveats).toMatch(/CANDIDATE/);
+    // The adjudicator's own sentence reaches the reader, not just the state.
+    expect(caveats).toMatch(/shrank by 71%/);
   });
 
   it('records both caps as not having bitten on an ordinary project', async () => {

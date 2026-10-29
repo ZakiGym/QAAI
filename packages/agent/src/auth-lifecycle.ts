@@ -137,12 +137,16 @@ import type {
  *
  * Structurally the keystone's `Principal` from packages/shared/src/principals.ts
  * and deliberately not a second vocabulary: the field names, the `kind` union
- * and the `createdByScenario` rule are theirs. It is restated here only because
- * principals.ts is not yet on the shared barrel (`packages/shared/src/index.ts`
- * has no `export * from './principals'` line), so the type cannot be imported
- * through the package's front door — and reaching across the workspace boundary
- * by relative path is the thing nine files did in one round and the thing this
- * repo's own notes tell the next person not to do.
+ * and the `createdByScenario` rule are theirs.
+ *
+ * The barrel reason this restatement originally gave is GONE — index.ts:177
+ * carries `export * from './principals'` — and the sentence is corrected rather
+ * than left to mislead. What remains is the reason in {@link DisposableTarget}
+ * below, which the barrel does not touch: `DisposabilityProof` is branded with
+ * a MODULE-PRIVATE witness symbol that cannot be named from outside
+ * packages/shared, so a structural type is still what a journey builder here
+ * can take. Adopting the branded type is a real item and it is still owed; it
+ * needs a prover in packages/shared, not an import line.
  *
  * NOTE WHAT IS ABSENT, as it is absent on the keystone's type and for the same
  * reason: no password, no TOTP secret, no OTP, no session cookie, no

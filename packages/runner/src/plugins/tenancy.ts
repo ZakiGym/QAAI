@@ -76,17 +76,19 @@ import type {
   TestExecution,
 } from '@qaai/shared';
 /*
- * ── THIS IMPORT CROSSES THE WORKSPACE BOUNDARY AND MUST NOT STAY THAT WAY ───
+ * `principals.ts` IS on the package barrel now, so this is the ordinary import
+ * it should always have been. It was a relative path across the workspace
+ * boundary for one round, under protest and with the one-line fix written down;
+ * the line landed and the protest came with it, because a comment that still
+ * claims a defect somebody closed teaches the next reader the wrong thing about
+ * their own repository.
  *
- * `packages/shared/src/principals.ts` is not on its package barrel — there is
- * no `export * from './principals'` in `packages/shared/src/index.ts` — so
- * `isSafeProbeMethod` and `SafeProbeMethod` are unreachable through
- * `@qaai/shared`. `index.ts` belongs to another change in this round and the
- * one-line fix is in this slice's handover; when it lands this becomes
- * `from '@qaai/shared'` and nothing else changes.
+ * What is worth keeping from that note: `isSafeProbeMethod` is ASKED and never
+ * re-derived here. A second opinion about which verbs are safe is how a probe
+ * that must not mutate customer data ends up mutating it.
  */
-import { isSafeProbeMethod } from '../../../shared/src/principals';
-import type { SafeProbeMethod } from '../../../shared/src/principals';
+import { isSafeProbeMethod } from '@qaai/shared';
+import type { SafeProbeMethod } from '@qaai/shared';
 
 // ─── 1. The verdicts ─────────────────────────────────────────────────────────
 

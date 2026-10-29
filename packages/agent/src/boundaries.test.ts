@@ -508,7 +508,7 @@ import {
   type ApiOperationDeclaration,
   type BoundaryClassCase,
 } from './boundaries';
-import { BOUNDARY_DESCRIPTORS, type BoundaryClass } from '../../shared/src/boundaries';
+import { BOUNDARY_DESCRIPTORS, type BoundaryClass } from '@qaai/shared';
 
 /** Classes whose defining constraint is a declared ATTRIBUTE a crawl may miss. */
 const ATTRIBUTE_CONSTRAINTS = ['maxLength', 'minLength', 'min', 'max', 'step', 'pattern'] as const;

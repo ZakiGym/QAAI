@@ -60,13 +60,14 @@ import type {
 } from './admission.js';
 import { toolchainFor } from './toolchain.js';
 /*
- * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
- * and is recorded as one — `admission.ts`, `generator.ts`, `artifacts.ts`,
- * `page-objects.ts` and `refactor.ts` all carry the same note this round.
- * `packages/shared/src/index.ts` has no `export * from './artifact-set'`, and
- * the one-line fix is TS2308 on it: `artifact-set.ts` and `requirements.ts`
- * both export a type named `ContentDigest`. TYPE-ONLY here, so it is erased at
- * build time and reaches no runtime code across the boundary.
+ * Through the package barrel, which now carries `./artifact-set` (index.ts:236).
+ *
+ * The note that used to sit here described a relative path across the workspace
+ * boundary and a TS2308 collision — `artifact-set.ts` and `requirements.ts`
+ * both exported a type named `ContentDigest` — as the reason the barrel line
+ * could not be written. Both are resolved and the import below already named
+ * `@qaai/shared`, so the note had stopped describing its own file. Corrected
+ * rather than kept, for the reason artifacts.ts records about the same note.
  */
 import type {
   ArtifactSet,

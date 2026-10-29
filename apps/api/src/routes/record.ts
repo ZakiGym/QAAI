@@ -45,13 +45,18 @@
  *    failure here would look exactly like a recording that touched nothing.
  */
 
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { cleanupRecordedSpec, startRecording, type RecordingSession } from '@qaai/runner';
 import { canonicalRoute } from '@qaai/agent';
-import { originFromSources, type SurfaceKind, type SurfaceSource } from '@qaai/shared';
+import {
+  originFromSources,
+  promoteRecordingSchema,
+  type SurfaceKind,
+  type SurfaceSource,
+} from '@qaai/shared';
 import { prisma } from '../lib/prisma.js';
-import { badRequest, notFound } from '../lib/errors.js';
+import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
 import { logger } from '../lib/logger.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
@@ -747,4 +752,236 @@ recordRouter.delete('/projects/:projectId/record/:sessionId', (req, res) => {
   sessions.delete(id);
   logger.info({ sessionId: id }, 'recording cancelled');
   res.json({ ok: true });
+});
+
+// ─── Promotion: the recording becomes a test, exactly once ───────────────────
+
+/**
+ * THE RECORDING KEY IS A CONTENT HASH, AND THIS IS WHERE IT IS CHECKED.
+ *
+ * `promoteRecordingSchema` carries both the cleaned spec and its key, which
+ * means a client could send a key that has nothing to do with the code. Then
+ * `@@unique([projectId, recordingKey])` — the whole idempotence mechanism —
+ * guards nothing: two promotions of the same session look like different
+ * recordings, and two different sessions can be made to look like the same one.
+ *
+ * So the key is RECOMPUTED here and the request is refused when it disagrees.
+ * The hash is over the CLEANED spec, which is what `code` is: cleaning renames
+ * the test and makes the URLs relative, so hashing the raw codegen output would
+ * make the same session key differently on two machines.
+ */
+export function recordingKeyOf(code: string): string {
+  return createHash('sha256').update(code, 'utf8').digest('hex');
+}
+
+/** The stem of the file a promoted recording lands at. */
+const PROMOTED_DIRECTORY = 'recorded';
+
+/**
+ * A FILE PATH IS NOT A PLACE TO PUT CUSTOMER TEXT.
+ *
+ * `name` is `outwardText`, so it is bounded and stripped of control characters,
+ * and it is still a human's sentence. It never reaches the path verbatim: the
+ * path is built from a slug of it, over a closed alphabet, with twelve
+ * characters of the key as the tail so two recordings called the same thing do
+ * not land on the same file. An empty slug (a name that is entirely punctuation
+ * or a non-Latin script) is not an error — it falls back to the key alone.
+ */
+export function promotedFilePath(name: string, key: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/, '');
+  const tail = key.slice(0, 12);
+  return `${PROMOTED_DIRECTORY}/${slug ? `${slug}-${tail}` : tail}.spec.ts`;
+}
+
+/**
+ * Promote a recording into the suite — the write half of record mode.
+ *
+ * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────────────
+ *
+ * The header above says it plainly: "The client then saves it as a test through
+ * the normal create-test path." That path knows nothing about recordings, so
+ * two facts were lost. First, "where did this test come from?" had no answer —
+ * a recorded test and a generated test were the same row, and the coverage
+ * evidence could not tell a human's reach from the crawler's. Second, POST
+ * /tests is not idempotent in the recording's terms: a double-click, a retried
+ * request or a client that lost the response made TWO tests out of one session,
+ * and the second one was indistinguishable from a deliberate copy.
+ *
+ * ── WHAT IS IDEMPOTENT, AND IN WHICH TERMS ──────────────────────────────────
+ *
+ * The `RecordingPromotion` row on `(projectId, recordingKey)` is the claim, and
+ * the key is the hash of the spec. So:
+ *
+ *   · PROMOTED, and the test is still there → that test comes back, nothing is
+ *     written, and `idempotent: true` says so out loud. Not 409: the caller
+ *     asked for this session to be a test and it is.
+ *   · PROMOTED, and the test has since been deleted → the test is written again
+ *     and the SAME row is repointed at it. There is never a second live test
+ *     under a row that claims one, and the audit metadata names the id that was
+ *     gone so the sequence is reconstructable.
+ *   · REJECTED → 409. A rejected recording is a decision somebody made, and
+ *     silently promoting over it would throw that decision away.
+ *   · CAPTURED or SUPERSEDED, or no row at all → promote.
+ *
+ * ── ONE TRANSACTION ─────────────────────────────────────────────────────────
+ *
+ * The suite upsert, the test (with its first version) and the promotion row are
+ * one transaction. A promotion row that claims a test which was never written
+ * is worse than no row: every retry after it would return the id of nothing.
+ */
+recordRouter.post('/projects/:projectId/record/promote', requireRole('MEMBER'), async (req, res) => {
+  const actor = actorOf(req);
+  const input = promoteRecordingSchema.parse(req.body);
+  const projectId = String(req.params.projectId);
+
+  /*
+   * TWO PLACES NAMING THE PROJECT IS TWO FACTS IN ONE REQUEST. Preferring
+   * either one silently would promote into a project the caller did not name.
+   */
+  if (input.projectId !== projectId) {
+    throw badRequest(
+      'the project in the path and the project in the body disagree, and which one was meant is not ours to guess',
+    );
+  }
+
+  const computed = recordingKeyOf(input.code);
+  if (computed !== input.recordingKey) {
+    throw badRequest(
+      'recordingKey must be the sha256 of the cleaned spec it comes with — a key that does not match its own code cannot make a retry idempotent',
+    );
+  }
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { id: true },
+  });
+  if (!project) throw notFound('Project');
+
+  /*
+   * `environmentId` is stored as a plain column and not a relation (an
+   * environment is deletable and the record of what was recorded where must
+   * outlive it), which is exactly why it has to be CHECKED here. Unvalidated,
+   * it would let one org's id be filed against another org's recording.
+   */
+  if (input.environmentId != null) {
+    const environment = await prisma.environment.findUnique({
+      where: { id: input.environmentId },
+      select: { id: true, projectId: true },
+    });
+    if (!environment || environment.projectId !== projectId) throw notFound('Environment');
+  }
+
+  const existing = await prisma.recordingPromotion.findUnique({
+    where: { projectId_recordingKey: { projectId, recordingKey: input.recordingKey } },
+    select: { id: true, state: true, promotedTestId: true, rejectedReason: true },
+  });
+
+  if (existing?.state === 'REJECTED') {
+    throw conflict(
+      'this recording was rejected, and promoting over a rejection would discard a decision somebody made',
+      { recordingKey: input.recordingKey, rejectedReason: existing.rejectedReason },
+    );
+  }
+
+  let replacedTestId: string | null = null;
+  if (existing?.state === 'PROMOTED' && existing.promotedTestId !== null) {
+    const live = await prisma.test.findUnique({
+      where: { id: existing.promotedTestId },
+      select: { id: true, name: true, filePath: true, suiteId: true },
+    });
+    if (live) {
+      res.json({ test: live, idempotent: true, recordingKey: input.recordingKey });
+      return;
+    }
+    replacedTestId = existing.promotedTestId;
+  }
+
+  const filePath = promotedFilePath(input.name, input.recordingKey);
+
+  const test = await prisma.$transaction(async (tx) => {
+    const suite = await tx.suite.upsert({
+      where: { projectId_name: { projectId, name: 'Recorded' } },
+      create: {
+        orgId: actor.orgId,
+        projectId,
+        name: 'Recorded',
+        description: 'Tests promoted from a recording session',
+      },
+      update: {},
+      select: { id: true },
+    });
+
+    const created = await tx.test.create({
+      data: {
+        orgId: actor.orgId,
+        projectId,
+        suiteId: suite.id,
+        name: input.name,
+        type: 'E2E',
+        feature: 'Recorded',
+        code: input.code,
+        filePath,
+        versions: {
+          create: {
+            orgId: actor.orgId,
+            version: 1,
+            code: input.code,
+            source: 'HUMAN',
+            authorId: actor.userId,
+            message: 'Promoted from a recording',
+          },
+        },
+      },
+      select: { id: true, name: true, filePath: true, suiteId: true },
+    });
+
+    await tx.recordingPromotion.upsert({
+      where: { projectId_recordingKey: { projectId, recordingKey: input.recordingKey } },
+      create: {
+        orgId: actor.orgId,
+        projectId,
+        environmentId: input.environmentId ?? null,
+        recordingKey: input.recordingKey,
+        name: input.name,
+        state: 'PROMOTED',
+        promotedTestId: created.id,
+        recordedBy: actor.userId,
+        promotedBy: actor.userId,
+        promotedAt: new Date(),
+      },
+      update: {
+        state: 'PROMOTED',
+        promotedTestId: created.id,
+        promotedBy: actor.userId,
+        promotedAt: new Date(),
+      },
+    });
+
+    return created;
+  });
+
+  await audit({
+    actor,
+    action: 'recording.promote',
+    targetType: 'Test',
+    targetId: test.id,
+    metadata: {
+      recordingKey: input.recordingKey,
+      environmentId: input.environmentId ?? null,
+      /*
+       * Null in the ordinary case. Non-null says the row already claimed a test
+       * and that test was gone, which is the one path that writes a second
+       * `Test` row under one promotion — so it is the one path a reader needs
+       * to be able to find.
+       */
+      replacedTestId,
+    },
+  });
+
+  res.status(201).json({ test, idempotent: false, recordingKey: input.recordingKey });
 });

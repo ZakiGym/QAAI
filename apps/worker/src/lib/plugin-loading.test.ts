@@ -598,6 +598,15 @@ function fakeWorld(rows: Array<EnabledPluginRow & { enabled: boolean }>): {
   };
 
   h.prisma = {
+    /*
+     * The suppression ledger. EMPTY, which is the honest default here —
+     * nothing in this file suppresses anything — and a real delegate rather
+     * than an absent one, because `finalizeRun` folds these rows into the
+     * sentence the CLI prints and the GitHub check shows. A missing delegate is
+     * a TypeError the run-level catch turns into "ERRORED" with the real cause
+     * nowhere in the log.
+     */
+    suppressionEvent: { findMany: async () => [] },
     run: {
       findFirst: async () => ({
         ...run,

@@ -245,6 +245,101 @@ describe('runOutcome', () => {
     expect(outcome.reason).toContain('5 failing test(s) were quarantined');
   });
 
+  /*
+   * ── THE FIVE KINDS, NOT JUST QUARANTINE ──────────────────────────────────
+   *
+   * THE DEFECT: `suppressedFailures` was `counts.quarantinedFailed` alone,
+   * which was right while quarantine was the only thing that could make a red
+   * thing stop being red. A known issue, an ENV_ISSUE and a retirement all do
+   * now, so a run that passed while a mute silenced forty failures reported
+   * ZERO suppressed and said nothing — and a suppression that cannot be seen is
+   * how a team learns to ignore the board.
+   */
+  it('counts and names every kind of suppression, not only quarantine', () => {
+    const outcome = runOutcome({
+      counts: { passed: 4, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 2 },
+      gatePassed: true,
+      suppressions: [
+        { kind: 'MUTE', suppressions: 3, suppressed: 47, expired: 0 },
+        { kind: 'ENV_ISSUE', suppressions: 1, suppressed: 5, expired: 0 },
+      ],
+    });
+    expect(outcome.passed).toBe(true);
+    expect(outcome.suppressedFailures).toBe(54);
+    // The sentence this product says out loud.
+    expect(outcome.reason).toContain('47 failures by 3 known issues');
+    expect(outcome.reason).toContain('5 failures by 1 environment failure');
+    // ...and the quarantine wording four other surfaces already print is kept.
+    expect(outcome.reason).toContain('2 failing test(s) were quarantined');
+    expect(outcome.suppressions.byKind.map((t) => t.kind)).toEqual([
+      'QUARANTINE',
+      'MUTE',
+      'ENV_ISSUE',
+    ]);
+  });
+
+  /*
+   * ZERO IS REPORTED OUT LOUD. A surface that renders nothing when nothing was
+   * suppressed is indistinguishable from one that forgot to ask, and the second
+   * is the state this whole vocabulary exists to make impossible.
+   */
+  it('says "nothing was suppressed" rather than returning an empty summary', () => {
+    const outcome = runOutcome({
+      counts: { passed: 4, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 0 },
+      gatePassed: true,
+    });
+    expect(outcome.suppressions.disclosure).toBe('Nothing was suppressed.');
+    expect(outcome.suppressions.suppressed).toBe(0);
+    // ...and it is not appended to the reason, which has nothing to disclose.
+    expect(outcome.reason).not.toContain('Nothing was suppressed');
+  });
+
+  /*
+   * AN EXPIRED SUPPRESSION SILENCED NOTHING, AND IS STILL REPORTED. The expiry
+   * roster is the early warning that a board is about to go loud; hiding it is
+   * what makes an expiry arrive as a surprise outage and teaches a team to set
+   * the next one for a year.
+   */
+  it('reports an expired suppression even though it suppressed nothing', () => {
+    const outcome = runOutcome({
+      counts: { passed: 4, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 0 },
+      gatePassed: true,
+      suppressions: [{ kind: 'MUTE', suppressions: 0, suppressed: 0, expired: 2 }],
+    });
+    expect(outcome.suppressedFailures).toBe(0);
+    expect(outcome.reason).toContain('2 suppressions have expired and silenced nothing');
+  });
+
+  /*
+   * QUARANTINE IS COUNTED ONCE. It arrives as `counts.quarantinedFailed`, and a
+   * ledger row for the same kind would double the one total a release decision
+   * reads — two facts in one field is a defect even when both values are
+   * correct, and so is one fact counted twice.
+   */
+  it('refuses to double-count quarantine when a ledger row names it too', () => {
+    const outcome = runOutcome({
+      counts: { passed: 1, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 3 },
+      gatePassed: true,
+      suppressions: [{ kind: 'QUARANTINE', suppressions: 3, suppressed: 3, expired: 0 }],
+    });
+    expect(outcome.suppressedFailures).toBe(3);
+  });
+
+  /*
+   * A SUPPRESSION DOES NOT OPEN THE GATE. It explains a quiet board; it is not
+   * a verdict. A run with a real failure stays red however much was muted.
+   */
+  it('never turns a real failure green', () => {
+    const outcome = runOutcome({
+      counts: { passed: 1, failed: 2, flaky: 0, skipped: 0, quarantinedFailed: 0 },
+      gatePassed: true,
+      suppressions: [{ kind: 'MUTE', suppressions: 1, suppressed: 40, expired: 0 }],
+    });
+    expect(outcome).toMatchObject({ status: 'FAILED', passed: false });
+    expect(outcome.reason).toContain('2 test(s) failed');
+    expect(outcome.reason).toContain('40 failures by 1 known issue');
+  });
+
   it('a forced status wins, and is never reported as a pass', () => {
     for (const forcedStatus of ['CANCELLED', 'ERRORED'] as const) {
       const outcome = runOutcome({

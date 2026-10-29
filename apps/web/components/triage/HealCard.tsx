@@ -241,6 +241,29 @@ function Verification({ heal }: { heal: Heal }) {
       {verification.note && (
         <p className="text-ink-dim text-micro mt-1 leading-relaxed">{verification.note}</p>
       )}
+      {/*
+        WHERE THIS LEFT THE PRODUCT. A heal that only exists in QAAI is a fix a
+        reviewer has to come here to discover, which is not how a reviewer works
+        — so when a pull request was opened, the card says so and links to it.
+
+        ABSENT, not "not opened": a heal with no pull request renders nothing at
+        all rather than a line implying somebody should have opened one. Pull
+        requests are an opt-in, per-project setting, and a card nagging about a
+        feature the customer deliberately left off is a card they stop reading.
+      */}
+      {heal.pullRequest && (
+        <p className="text-micro mt-1">
+          <a
+            href={heal.pullRequest.url}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-accent hover:underline"
+            title="The pull request QAAI opened for this fix"
+          >
+            open the pull request →
+          </a>
+        </p>
+      )}
     </div>
   );
 }

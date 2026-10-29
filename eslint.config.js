@@ -72,6 +72,22 @@ const IGNORES = [
   '.artifacts/**',
   'test-results/**',
   '**/next-env.d.ts', // next writes it, and the file itself says not to edit it
+  /*
+   * A COMMITTED ONE-OFF PROBE, OUTSIDE EVERY tsconfig.
+   *
+   * `.perf-probe3.mts` is a tracked script that counts Prisma queries against a
+   * connection string given on argv. It is in no tsconfig's `include`, so the
+   * typed ruleset cannot resolve it and ESLint reports a PARSING ERROR — which
+   * means `npx eslint .` can never come back clean, and a run that always has
+   * at least one error is a run nobody can read a regression out of.
+   *
+   * Ignored rather than deleted. It is somebody's tool, it is committed, and
+   * nothing records that QAAI owns it; the cost of being wrong about that is
+   * destroying work, while the cost of ignoring it is one unlinted probe.
+   * Deleting it, or adding it to a tsconfig and linting it properly, is a
+   * decision for whoever committed it.
+   */
+  '.perf-probe3.mts',
 ];
 
 /**

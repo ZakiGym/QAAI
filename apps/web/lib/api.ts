@@ -324,6 +324,17 @@ export interface Heal {
     checks: string | null;
   };
   verification: HealVerification;
+  /**
+   * The pull request this heal reached a reviewer through, or NULL.
+   *
+   * NULL IS "NO PULL REQUEST", not "not opened yet". `HealProposal.prUrl` was
+   * documented as "the PR opened when the repo is connected" while nothing in
+   * the product wrote it — so the loop ended in the database and nothing QAAI
+   * produced ever reached a reviewer by the path reviewers use. Now that the
+   * column has a writer it needs a reader, or it is another honesty column with
+   * one half.
+   */
+  pullRequest: { url: string; recordId: string | null } | null;
 }
 
 // ─── Insights: coverage gaps (GET/POST /coverage) ────────────────────────────

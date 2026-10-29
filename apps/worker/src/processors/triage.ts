@@ -88,15 +88,26 @@ import {
   deriveClusterVerdict,
   failureClusterKey,
   isAutoApprovable,
+  knownIssueSuppression,
+  matchKnownIssues,
   muteInForce,
+  planHealSupersession,
   postCheckCode,
   proposeHeal,
   shouldProposeHeal,
   summariseCorrections,
+  suppressionEventsFor,
   triageFailure,
   verificationRunTag,
 } from '@qaai/agent';
-import type { CorrectionRow, OpenHeal, TriageClusterContext } from '@qaai/agent';
+import type {
+  CorrectionRow,
+  KnownIssueRow,
+  OpenHeal,
+  SuppressionEventWrite,
+  TriageClusterContext,
+} from '@qaai/agent';
+import { isInForce } from '@qaai/shared';
 import type { FlowMap, StepResult, TestExecution, TestType, TriageJob } from '@qaai/shared';
 /*
  * The clusterer lives in the API workspace and the worker shares it rather than
@@ -171,6 +182,35 @@ export const CORRECTION_HISTORY_SAMPLE = 400;
  * cockpit reads.
  */
 export const RUN_CLUSTER_SCAN_CAP = 1000;
+
+/**
+ * How many of a project's known issues are read to answer one cause.
+ *
+ * A BOUND, not a filter, and the distinction is the whole reason this is a
+ * separate number from the GIN index on `KnownIssue.signatures`. That index
+ * serves the API's roster, which wants the issues naming one key;
+ * `matchKnownIssues` wants the EXPIRED rows too, because reporting "a mute that
+ * would have silenced this is over, and here is who owns it" is the early
+ * warning that stops an expiry arriving as a surprise outage. A read narrowed
+ * by `expiresAt` or by `signatures: { has: … }` could not answer that.
+ *
+ * Past the cap the answer UNDER-counts: a mute beyond it was not consulted, so
+ * a failure somebody already triaged gets a fresh verdict and a fresh
+ * strong-model call. That is a cap biting, so it is reported with its count and
+ * its reason rather than taken silently (rule 12).
+ */
+export const KNOWN_ISSUE_SCAN_CAP = 200;
+
+/**
+ * How many distinct cluster keys the near tier's join reads.
+ *
+ * The near tier needs the LEGIBLE signature behind each muted key, because
+ * `KnownIssue.signatures` holds only 12-hex hashes and "same error class" is
+ * uncomputable from a hash. Past this cap the join is incomplete, and
+ * `matchKnownIssues` is told so by being handed fewer `covered` causes — which
+ * it reports as `NO_JOINED_CAUSES` rather than as a silent NONE.
+ */
+export const KNOWN_ISSUE_JOIN_CAP = 500;
 
 const DAY_MS = 86_400_000;
 
@@ -562,6 +602,229 @@ async function sizeCause(args: {
   };
 }
 
+/**
+ * This project's known issues, in the shape `matchKnownIssues` wants.
+ *
+ * TWO READS AND NOT ONE, because the second is what turns the NEAR tier on
+ * honestly. `KnownIssue.signatures` stores 12-hex hashes alone, so "the same
+ * error class on the same test" cannot be asked of an issue row; the legible
+ * `class=… | call=…` string lives on `FailureSignature` and the tests a cause
+ * has fired on live on the verdicts written for it. Hand `matchKnownIssues` no
+ * `covered` facts and it reports `NO_JOINED_CAUSES` — a stated gap, not a
+ * silent "no match" — which is exactly what this function would produce if
+ * either join were dropped.
+ *
+ * `createdAt: 'asc'` is load-bearing. `matchKnownIssue` takes the FIRST match
+ * in the order given, so a cause two issues both name is attributed to the
+ * older one, stably, on every run. A match count that moves between two rows
+ * with iteration order is a count nobody can audit, and the count is what
+ * decides whether a mute gets renewed.
+ */
+async function knownIssuesFor(args: {
+  orgId: string;
+  projectId: string;
+}): Promise<{ rows: KnownIssueRow[]; capped: number | null }> {
+  const { orgId, projectId } = args;
+  const issues = await prisma.knownIssue.findMany({
+    where: { orgId, projectId },
+    orderBy: { createdAt: 'asc' },
+    // +1 so "exactly at the cap" and "more than the cap" are distinguishable.
+    // A take of `cap` cannot tell a reader whether anything was left out.
+    take: KNOWN_ISSUE_SCAN_CAP + 1,
+    select: {
+      id: true,
+      title: true,
+      reason: true,
+      signatures: true,
+      expiresAt: true,
+      revokedAt: true,
+      ownerUserId: true,
+      ownerTeamId: true,
+      ownerProvenance: true,
+      matchCount: true,
+    },
+  });
+  const capped = issues.length > KNOWN_ISSUE_SCAN_CAP ? issues.length : null;
+  const read = issues.slice(0, KNOWN_ISSUE_SCAN_CAP);
+
+  const keys = [...new Set(read.flatMap((row) => row.signatures))].slice(0, KNOWN_ISSUE_JOIN_CAP);
+  const [signatures, verdicts] = await Promise.all([
+    keys.length === 0
+      ? Promise.resolve([])
+      : prisma.failureSignature.findMany({
+          where: { orgId, projectId, clusterKey: { in: keys } },
+          select: { clusterKey: true, signature: true },
+        }),
+    keys.length === 0
+      ? Promise.resolve([])
+      : prisma.triageVerdict.findMany({
+          where: { orgId, clusterKey: { in: keys } },
+          orderBy: { createdAt: 'desc' },
+          take: KNOWN_ISSUE_JOIN_CAP,
+          select: { clusterKey: true, testResult: { select: { testId: true } } },
+        }),
+  ]);
+
+  const signatureOfKey = new Map(signatures.map((row) => [row.clusterKey, row.signature]));
+  const testsOfKey = new Map<string, Set<string>>();
+  for (const row of verdicts) {
+    if (row.clusterKey === null) continue;
+    const seen = testsOfKey.get(row.clusterKey) ?? new Set<string>();
+    seen.add(row.testResult.testId);
+    testsOfKey.set(row.clusterKey, seen);
+  }
+
+  return {
+    capped,
+    rows: read.map((row): KnownIssueRow => ({
+      id: row.id,
+      title: row.title,
+      reason: row.reason,
+      signatures: row.signatures,
+      expiresAt: row.expiresAt,
+      revokedAt: row.revokedAt,
+      /*
+       * The schema's `KnownIssue_one_owner` CHECK guarantees exactly one of the
+       * two is set, so the TEAM arm's non-null assertion is the constraint being
+       * read rather than an assumption. A row with neither would be a silence
+       * with nobody's name on it, which is the thing the constraint exists to
+       * make unwritable.
+       */
+      owner: row.ownerUserId
+        ? { kind: 'USER', userId: row.ownerUserId }
+        : { kind: 'TEAM', teamId: row.ownerTeamId! },
+      ownerProvenance: row.ownerProvenance,
+      matchCount: row.matchCount,
+      covered: row.signatures.map((key) => ({
+        clusterKey: key,
+        signature: signatureOfKey.get(key) ?? null,
+        testIds: [...(testsOfKey.get(key) ?? [])],
+      })),
+    })),
+  };
+}
+
+/**
+ * Writes the suppression ledger for one cause in one run.
+ *
+ * CALLED WHETHER OR NOT ANYTHING WAS SUPPRESSED, and that is the point. The row
+ * that matters most is the boring one — `inForce: false, suppressed: 0` — which
+ * is the only durable proof that an expiry actually took effect. A failure
+ * silenced without being counted is the one lie this round cannot ship, and a
+ * ledger that only recorded successful suppressions would make an expired mute
+ * and a mute that was never consulted the same absence of a row.
+ *
+ * Idempotent by construction rather than by care: `SuppressionEvent` has
+ * `@@unique([runId, kind, targetKey])` and `KnownIssueMatch`
+ * `@@unique([knownIssueId, runId, clusterKey])`, so a redelivered triage job
+ * updates the row it already wrote. The counter bump rides in the SAME
+ * transaction as the match row because `KnownIssue.matchCount` is a
+ * denormalised SUM of those rows: the headline is what a human reads when
+ * deciding to renew, and a headline that disagrees with its own evidence is
+ * worse than no headline.
+ */
+async function recordSuppressionLedger(args: {
+  orgId: string;
+  runId: string;
+  ledger: ReturnType<typeof suppressionEventsFor>;
+}): Promise<void> {
+  const { orgId, runId, ledger } = args;
+
+  for (const event of ledger.events) {
+    const row = suppressionEventRow(orgId, event);
+    await prisma.suppressionEvent.upsert({
+      where: { runId_kind_targetKey: { runId, kind: event.kind, targetKey: event.targetKey } },
+      create: row,
+      /*
+       * `increment`, not `set`. A second cause under one key in one run is
+       * impossible (the key IS the cause), but a redelivery that already wrote
+       * the row must not double the count either — and `suppressed` is 0 on
+       * every redelivery of a path that suppressed nothing, so the increment is
+       * a no-op where it would otherwise lie.
+       */
+      update: { suppressed: { increment: event.suppressed }, inForce: event.inForce },
+    });
+  }
+
+  const match = ledger.match;
+  if (!match) return;
+  await prisma.$transaction([
+    prisma.knownIssueMatch.upsert({
+      where: {
+        knownIssueId_runId_clusterKey: {
+          knownIssueId: match.knownIssueId,
+          runId,
+          clusterKey: match.clusterKey,
+        },
+      },
+      create: {
+        orgId,
+        knownIssueId: match.knownIssueId,
+        runId,
+        clusterKey: match.clusterKey,
+        occurrences: match.occurrences,
+      },
+      update: { occurrences: { increment: match.occurrences } },
+    }),
+    prisma.knownIssue.update({
+      where: { id: match.knownIssueId },
+      data: {
+        matchCount: { increment: match.matchCountDelta },
+        lastMatchedAt: new Date(),
+        /*
+         * `firstMatchedAt` is set once and never moved. Prisma has no
+         * "coalesce" in an update, so the write is conditional in the WHERE of
+         * a second statement rather than guessed at here — see below.
+         */
+      },
+    }),
+    prisma.knownIssue.updateMany({
+      where: { id: match.knownIssueId, firstMatchedAt: null },
+      data: { firstMatchedAt: new Date() },
+    }),
+  ]);
+}
+
+/** The `SuppressionEvent` row, with the owner split into the two columns. */
+function suppressionEventRow(
+  orgId: string,
+  event: SuppressionEventWrite,
+): {
+  orgId: string;
+  projectId: string;
+  runId: string;
+  kind: SuppressionEventWrite['kind'];
+  targetScope: string;
+  targetKey: string;
+  sourceId: string;
+  suppressed: number;
+  inForce: boolean;
+  reason: string;
+  ownerUserId: string | null;
+  ownerTeamId: string | null;
+  ownerState: string;
+  ownerProvenance: SuppressionEventWrite['ownerProvenance'];
+  expiresAt: Date;
+} {
+  return {
+    orgId,
+    projectId: event.projectId,
+    runId: event.runId,
+    kind: event.kind,
+    targetScope: event.targetScope,
+    targetKey: event.targetKey,
+    sourceId: event.sourceId,
+    suppressed: event.suppressed,
+    inForce: event.inForce,
+    reason: event.reason,
+    ownerUserId: event.owner.kind === 'USER' ? event.owner.userId : null,
+    ownerTeamId: event.owner.kind === 'TEAM' ? event.owner.teamId : null,
+    ownerState: event.ownerState,
+    ownerProvenance: event.ownerProvenance,
+    expiresAt: event.expiresAt,
+  };
+}
+
 export async function processTriage(job: TriageJob): Promise<void> {
   const { orgId, runId, testResultId } = job;
   const now = new Date();
@@ -682,6 +945,146 @@ export async function processTriage(job: TriageJob): Promise<void> {
   });
 
   /*
+   * ── THE DURABLE MUTE, ASKED BEFORE THE STRONG-MODEL CALL ──────────────────
+   *
+   * THE DEFECT THIS CLOSES. `VerdictReviewState.MUTED` was written by two
+   * endpoints and read by nothing, so the next run of a cause somebody had
+   * already triaged minted a fresh verdict and bought a fresh strong-model
+   * heal — noise and cost, every run, for ever. The saving only exists if the
+   * question is asked HERE: wiring it after `triageFailure` would spend the
+   * call and then throw the answer away, which is the shape of saving that
+   * shows up in a changelog and not on a bill.
+   *
+   * ORDER, and all three parts of it are load-bearing:
+   *  · AFTER `claimCause`, so the occurrence is counted. A muted failure is
+   *    still a failure that happened; the mute decides what it costs and what
+   *    it pages, never whether it happened.
+   *  · The LEDGER is written before the branch, so the `inForce: false,
+   *    suppressed: 0` row lands even when nothing was suppressed. That row is
+   *    the only durable proof an expiry worked.
+   *  · BEFORE the signature mute below, which is the older per-signature
+   *    `mutedUntil` on `FailureSignature`. The two coexist on purpose: that one
+   *    is a quarantine-shaped timer with no owner, this one is a `KnownIssue`
+   *    with a named human, an expiry and a count. They take the same branch and
+   *    the log line says which fired.
+   *
+   * A re-triage overrides this exactly as it overrides the signature mute: a
+   * reviewer asking for a fresh look is an audited human act, and a mute from
+   * which no question can be asked is a trap.
+   */
+  const issues = await knownIssuesFor({ orgId, projectId: result.test.projectId });
+  if (issues.capped !== null) {
+    logger.warn(
+      {
+        projectId: result.test.projectId,
+        cap: KNOWN_ISSUE_SCAN_CAP,
+        read: issues.capped,
+        clusterKey: claimed.clusterKey,
+      },
+      'the known-issue read hit its cap, so a mute past it was not consulted for this cause; it will be triaged as if nobody had seen it',
+    );
+  }
+  const identity = {
+    clusterKey: claimed.clusterKey,
+    signature: claimed.signature,
+    testId: result.testId,
+  };
+  const known = matchKnownIssues(issues.rows, identity, now);
+  const suppression = knownIssueSuppression(known, identity);
+
+  await recordSuppressionLedger({
+    orgId,
+    runId,
+    ledger: suppressionEventsFor(known, identity, {
+      projectId: result.test.projectId,
+      runId,
+      // One failure: this job triages one result. The ledger's `suppressed`
+      // therefore sums to the number of failing results a mute silenced in the
+      // run, which is the number "47 failures suppressed by 3 known issues"
+      // reports.
+      failures: 1,
+    }),
+  });
+
+  if (known.expired.length > 0) {
+    logger.warn(
+      {
+        clusterKey: claimed.clusterKey,
+        expired: known.expired.map((entry) => ({
+          id: entry.id,
+          forceState: entry.forceState,
+          wouldHaveMatched: entry.wouldHaveMatched,
+          owner: entry.owner,
+        })),
+      },
+      'a known issue that would have suppressed this cause is over; the failure is red again and nobody had to do anything',
+    );
+  }
+
+  if (!retriage && suppression.suppress) {
+    /*
+     * The same two writes as the signature-mute branch below, for the same
+     * reason: the occurrence is already counted, the claim is marked
+     * suppressed so later members skip the owner wait, and NO verdict row is
+     * minted — which is what makes it stop paging, since /badges, the digest
+     * and the gate all read verdict rows.
+     */
+    await prisma.$transaction([
+      prisma.failureSignature.update({
+        where: { id: claimed.signatureId },
+        data: { suppressedCount: { increment: 1 } },
+      }),
+      prisma.runFailureCluster.update({
+        where: { id: claimed.claimId },
+        data: { suppressed: true },
+      }),
+    ]);
+
+    logger.info(
+      {
+        testResultId,
+        clusterKey: claimed.clusterKey,
+        knownIssueId: suppression.issueId,
+        tier: suppression.tier,
+        modelCallSkipped: suppression.modelCallSkipped,
+        considered: known.considered,
+      },
+      'a known issue names this cause; no verdict and no heal were bought',
+    );
+
+    publishEvent(orgId, {
+      runId,
+      type: 'verdict.suppressed',
+      data: {
+        testResultId: result.id,
+        testName: result.test.name,
+        clusterKey: claimed.clusterKey,
+        label: claimed.label,
+        knownIssueId: suppression.issueId,
+        disclosure: known.disclosure,
+      },
+      at: now.toISOString(),
+    });
+    return;
+  }
+
+  if (suppression.adoption) {
+    /*
+     * A NEAR match never suppresses — "the same error class on the same test"
+     * is also what a genuinely new failure on an already-muted test looks like.
+     * What it does is hand the owner the exact 12-hex key to add, so the next
+     * run is free. Published on the event stream rather than only logged,
+     * because a proposal nobody can see is a proposal nobody adopts.
+     */
+    publishEvent(orgId, {
+      runId,
+      type: 'knownIssue.adoptionProposed',
+      data: { ...suppression.adoption, expired: known.expired.length },
+      at: now.toISOString(),
+    });
+  }
+
+  /*
    * MUTE. Checked after the occurrence is recorded and before anything is
    * minted: a suppressed cause must stay countable, and the whole point of the
    * mute is that no verdict row appears for anything downstream to page on.
@@ -780,6 +1183,7 @@ export async function processTriage(job: TriageJob): Promise<void> {
           orgId,
           result.test,
           attached.verdictId,
+          claimed.clusterKey,
           attached.verdict,
           stepResultsOf(result),
         );
@@ -874,6 +1278,17 @@ export async function processTriage(job: TriageJob): Promise<void> {
           model: verdict.model,
           runId,
           clusterKey: claimed.clusterKey,
+          /*
+           * The known issue that ALMOST covered this cause, carried onto the
+           * verdict so the roster can say "this verdict was bought for a cause
+           * one of your mutes nearly names". Null at tier NONE and at EXACT —
+           * EXACT returns above without minting a verdict at all, so this
+           * column is only ever written for a NEAR match.
+           *
+           * Deliberately NOT a foreign key in the schema: the evidence that a
+           * mute was consulted must survive the mute being deleted.
+           */
+          knownIssueId: suppression.issueId,
         },
       });
 
@@ -978,7 +1393,7 @@ export async function processTriage(job: TriageJob): Promise<void> {
   });
 
   if (verdict.verdict === 'INTENDED_CHANGE') {
-    await proposeHealFor(orgId, result.test, stored.id, verdict, steps);
+    await proposeHealFor(orgId, result.test, stored.id, claimed.clusterKey, verdict, steps);
   }
 }
 
@@ -1302,6 +1717,15 @@ async function proposeHealFor(
     spec: unknown;
   },
   verdictId: string,
+  /**
+   * The cause this heal answers — the cluster key of the verdict above.
+   *
+   * REQUIRED rather than optional, so a new call site cannot quietly opt out of
+   * the cause lane: both existing callers already hold it, and a proposal whose
+   * cause is unknown is exactly the row `planHealSupersession` refuses to
+   * supersede by a cause it cannot be shown to share.
+   */
+  causeKey: string,
   verdict: Awaited<ReturnType<typeof triageFailure>>,
   steps: StepResult[],
 ): Promise<void> {
@@ -1326,15 +1750,64 @@ async function proposeHealFor(
    * shows up in a changelog and not on a bill.
    */
   const openHeals = await openHealsFor(orgId, test.id);
-  const decision = shouldProposeHeal({
-    openHeals,
-    currentCode: test.code,
-    filePath: test.filePath,
+
+  /*
+   * ── THE CAUSE LANE, WHICH `shouldProposeHeal` CANNOT SEE ──────────────────
+   *
+   * `shouldProposeHeal` stays the STALENESS oracle: it runs the applier, which
+   * is the only form of "does this still apply" that needs no clock, and it
+   * must stay the only one so the guard and the applier cannot disagree. What
+   * it has no notion of is WHICH CAUSE a proposal answers — so on a test with
+   * two live causes, the first proposal that still applied answered for both: a
+   * reviewer was handed a selector fix as the answer to an arithmetic bug, and
+   * the second cause never got a proposal at all.
+   *
+   * `planHealSupersession` adds exactly the two things the oracle cannot see —
+   * the cause lane, and the churn bound — and takes `stillApplies` as DATA so
+   * there is still only one implementation of "applies".
+   *
+   * `decidedBy: { not: null }` and NOT `decidedAt`: the supersede write below
+   * stamps `decidedAt` and `supersededById` without `decidedBy`, so only the
+   * former is "a human decided" and the latter would count this path's own
+   * bookkeeping as review.
+   */
+  const [supersededWithoutReview, reviewedEver] = await Promise.all([
+    prisma.healProposal.count({
+      where: { orgId, testId: test.id, state: 'SUPERSEDED', decidedBy: null },
+    }),
+    prisma.healProposal.count({ where: { orgId, testId: test.id, decidedBy: { not: null } } }),
+  ]);
+  const plan = planHealSupersession({
+    testId: test.id,
+    causeKey,
+    open: openHeals.map((heal) => ({
+      id: heal.id,
+      causeKey: heal.causeKey,
+      stillApplies:
+        shouldProposeHeal({ openHeals: [heal], currentCode: test.code, filePath: test.filePath })
+          .reuseId === heal.id,
+      reviewedAt: heal.reviewedAt,
+      createdAt: heal.createdAt,
+    })),
+    supersededWithoutReview,
+    reviewedEver,
   });
-  if (!decision.propose) {
+
+  if (plan.modelCallSkipped) {
     logger.info(
-      { testId: test.id, verdictId, reuseId: decision.reuseId, reason: decision.reason },
-      'skipping a heal proposal; an open one still applies',
+      {
+        testId: test.id,
+        verdictId,
+        action: plan.action,
+        reuseId: plan.reuseId,
+        causeKey,
+        causeUnknown: plan.causeUnknown,
+        supersededWithoutReview: plan.churn?.supersededWithoutReview ?? null,
+        reason: plan.reason,
+      },
+      plan.action === 'PAUSE_FOR_CHURN'
+        ? 'pausing heal proposals for this test: we keep proposing and nobody is reviewing'
+        : 'skipping a heal proposal; an open one for this cause still applies',
     );
     return;
   }
@@ -1506,8 +1979,14 @@ async function proposeHealFor(
           appliedVersion,
         },
       }),
+      /*
+       * `plan.supersedeIds` and nothing wider: the open proposals FOR THIS
+       * CAUSE whose diffs no longer apply. An open proposal that still applies
+       * is not stale, and one for a DIFFERENT cause is not this proposal's to
+       * close — closing it would throw away the only answer that cause has.
+       */
       prisma.healProposal.updateMany({
-        where: { id: { in: decision.staleIds } },
+        where: { id: { in: [...plan.supersedeIds] } },
         data: { state: 'SUPERSEDED', supersededById: healId, decidedAt },
       }),
     ]);
@@ -1565,7 +2044,8 @@ async function proposeHealFor(
         healId,
         risk: proposal.riskLevel,
         autoApplied: state === 'AUTO_APPLIED',
-        superseded: decision.staleIds.length,
+        superseded: plan.supersedeIds.length,
+        supersessionAction: plan.action,
         reason: applyNote ?? auto.reason,
       },
       'heal proposed',
@@ -1576,14 +2056,74 @@ async function proposeHealFor(
   }
 }
 
-/** Open proposals for one test, in the shape the lifecycle rules want. */
-async function openHealsFor(orgId: string, testId: string): Promise<OpenHeal[]> {
-  return await prisma.healProposal.findMany({
+/**
+ * Open proposals for one test, in the shape the lifecycle rules want.
+ *
+ * `OpenHeal` plus the two fields the CAUSE LANE needs. Kept as one read rather
+ * than two because `shouldProposeHeal` (staleness) and `planHealSupersession`
+ * (the cause, the churn bound) must score the same set of rows — two reads is
+ * how a proposal comes to be superseded by a decision that never saw it.
+ */
+type OpenHealRow = OpenHeal & {
+  /** The cause the verdict behind this proposal was published for. */
+  causeKey: string | null;
+  /** When a HUMAN decided. Null for this path's own supersede bookkeeping. */
+  reviewedAt: Date | null;
+};
+
+async function openHealsFor(orgId: string, testId: string): Promise<OpenHealRow[]> {
+  const rows = await prisma.healProposal.findMany({
     where: { orgId, testId, state: { in: ['PROPOSED', 'APPROVED'] } },
     orderBy: { createdAt: 'desc' },
     take: 20,
-    select: { id: true, state: true, riskLevel: true, diff: true, createdAt: true },
+    select: {
+      id: true,
+      state: true,
+      riskLevel: true,
+      diff: true,
+      createdAt: true,
+      decidedBy: true,
+      decidedAt: true,
+      verdictId: true,
+    },
   });
+
+  /*
+   * A SECOND READ, because `HealProposal.verdictId` is a plain id and not a
+   * relation — the proposal outlives the verdict row, which is the same
+   * argument `TrackerIssue.integrationId` carries. One `in` query for the whole
+   * page rather than a read per row: a test with twenty open proposals would
+   * otherwise issue twenty-one queries on the hot path of every triage.
+   */
+  const verdictIds = [...new Set(rows.map((row) => row.verdictId).filter((id) => id !== null))];
+  const causes =
+    verdictIds.length === 0
+      ? []
+      : await prisma.triageVerdict.findMany({
+          where: { orgId, id: { in: verdictIds } },
+          select: { id: true, clusterKey: true },
+        });
+  const causeOfVerdict = new Map(causes.map((row) => [row.id, row.clusterKey]));
+
+  return rows.map((row) => ({
+    id: row.id,
+    state: row.state,
+    riskLevel: row.riskLevel,
+    diff: row.diff,
+    createdAt: row.createdAt,
+    /*
+     * NULL means "we could not tell which cause this answers", never "it
+     * answers none". A row predating the column, or one whose verdict has been
+     * pruned, lands here — and `planHealSupersession` is explicit that such a
+     * row is eligible for REUSE and is NEVER superseded by a cause it cannot be
+     * shown to share.
+     */
+    causeKey: row.verdictId === null ? null : (causeOfVerdict.get(row.verdictId) ?? null),
+    // `decidedAt` alone is not review: the supersede write stamps it without a
+    // `decidedBy`, so reading it as review would let this path's own
+    // bookkeeping clear the churn bound it exists to report.
+    reviewedAt: row.decidedBy ? row.decidedAt : null,
+  }));
 }
 
 /**
@@ -1689,4 +2229,225 @@ async function startHealVerification(args: {
     state: 'PENDING',
     note: `Applied with nobody reviewing it, and now being checked: run ${started.run.id} re-runs this test on its own. Until it lands, nobody has confirmed the fix works — and if it fails, the sweep reverts the patch.`,
   };
+}
+
+// ─── The expiry sweep ────────────────────────────────────────────────────────
+
+/**
+ * How many expired suppressions one sweep tick acts on.
+ *
+ * A BOUND, reported when it bites. The remainder is picked up by the next tick
+ * five minutes later, so nothing is lost — but a tick that silently stopped
+ * halfway would make "every expired proposal has been closed" untrue while
+ * reading as a clean run, which is a pass that means "we did not check".
+ */
+export const SUPPRESSION_SWEEP_BATCH = 500;
+
+/**
+ * How far ahead the sweep looks for suppressions about to stop suppressing.
+ *
+ * The expiry itself needs no warning to WORK — `isInForce` refuses an expired
+ * suppression at every read — but it needs one to be survivable. A board that
+ * goes loud at 3am because a mute nobody remembered ran out is how a team
+ * learns to set the next expiry for a year, which is how "temporary" becomes
+ * permanent.
+ */
+export const SUPPRESSION_EXPIRY_WARNING_MS = 3 * DAY_MS;
+
+export interface SuppressionSweepJob {
+  /** Advisory only; the sweep uses its OWN clock. See `processSuppressionSweep`. */
+  at?: string;
+}
+
+export interface SuppressionSweepResult {
+  /** `RetirementProposal` rows moved out of a pending state. */
+  proposalsExpired: number;
+  /** Known issues whose expiry has passed and which therefore suppress nothing. */
+  mutesExpired: number;
+  /** Known issues inside the warning window — still suppressing, not for long. */
+  mutesExpiringSoon: number;
+  /** TRUE when a batch cap bit, so a reader knows the counts are a floor. */
+  capped: boolean;
+}
+
+/**
+ * Makes an expired suppression stop suppressing — in the places a read-time
+ * check cannot reach.
+ *
+ * ── WHAT THIS DOES *NOT* DO, AND WHY THAT MATTERS ──────────────────────────
+ *
+ * It does not enforce the expiry. `isInForce` does that, at every read, against
+ * the READER's own clock — so a mute that ran out one second ago has already
+ * stopped suppressing and this sweep being late changes nothing about whether a
+ * failure is red. A sweep that were the enforcement point would be a window in
+ * which an expired suppression still worked, and that is the one rule the
+ * keystone marks as impossible-to-get-wrong.
+ *
+ * What it does is the two things that need a clock of their own:
+ *
+ *  · A `RetirementProposal` nobody reviewed becomes EXPIRED instead of sitting
+ *    PROPOSED for ever pretending to be a decision somebody is about to make.
+ *    That is a state transition; nothing derives it at read time.
+ *  · The humans who OWN the expiring suppressions are told. Counted out loud,
+ *    with the owner on every line, because an expiry nobody saw coming is the
+ *    thing that teaches a team to stop setting them.
+ *
+ * ── THE CLOCK ──────────────────────────────────────────────────────────────
+ *
+ * `new Date()` here, not `job.at`. The job payload's timestamp is when the tick
+ * was SCHEDULED, and a repeatable job that sat in the queue for an hour would
+ * then evaluate "has this expired" against an hour-old instant — which is a
+ * cached clock, and a cached clock is how a suppression outlives its expiry.
+ * The payload is carried for the log line and nothing reads it as time.
+ */
+export async function processSuppressionSweep(
+  job: SuppressionSweepJob = {},
+): Promise<SuppressionSweepResult> {
+  const now = new Date();
+
+  /*
+   * PROPOSED and APPROVED only. An APPLIED retirement is not pending — it has
+   * already disabled the test and re-opened its surfaces — and expiring it
+   * would silently un-decide a decision somebody made. REJECTED and REVERTED
+   * are terminal. The filter is a positive list for exactly that reason: a
+   * `notIn` would quietly adopt every state a later round adds.
+   */
+  const pending = await prisma.retirementProposal.findMany({
+    where: { state: { in: ['PROPOSED', 'APPROVED'] }, expiresAt: { lte: now } },
+    orderBy: { expiresAt: 'asc' },
+    take: SUPPRESSION_SWEEP_BATCH + 1,
+    select: { id: true, orgId: true, projectId: true, testId: true, expiresAt: true },
+  });
+  const proposalsCapped = pending.length > SUPPRESSION_SWEEP_BATCH;
+  const expiring = pending.slice(0, SUPPRESSION_SWEEP_BATCH);
+
+  /*
+   * The state filter is repeated in the WHERE of the write. "The write is the
+   * decision" — a reviewer who approved or rejected one of these between the
+   * read and this statement must win, and `updateMany` with the filter is what
+   * makes that true without a transaction spanning the batch.
+   */
+  const expired =
+    expiring.length === 0
+      ? { count: 0 }
+      : await prisma.retirementProposal.updateMany({
+          where: { id: { in: expiring.map((row) => row.id) }, state: { in: ['PROPOSED', 'APPROVED'] } },
+          data: { state: 'EXPIRED' },
+        });
+
+  for (const row of expiring) {
+    /*
+     * One line per proposal rather than a count alone, because the whole point
+     * of expiring it is that the test is STILL THERE, still counted, and still
+     * nobody's decision. A count would say how many we closed; this says which
+     * tests went back to being somebody's problem.
+     */
+    logger.info(
+      {
+        retirementProposalId: row.id,
+        projectId: row.projectId,
+        testId: row.testId,
+        expiresAt: row.expiresAt.toISOString(),
+      },
+      'a retirement proposal expired with nobody reviewing it; the test is not retired and its surface is still covered by it',
+    );
+  }
+
+  /*
+   * ── THE MUTES ────────────────────────────────────────────────────────────
+   *
+   * READ, NOT WRITTEN. There is nothing to write: an expired `KnownIssue` is
+   * already refused by `isInForce` at every read, and flipping a column here
+   * would create a second answer to "is this in force" that could disagree with
+   * the first. The index this read uses — `@@index([orgId, projectId,
+   * expiresAt])` — is deliberately NOT partial on "still live" for exactly this
+   * read: the rows that matter most are the expired ones.
+   *
+   * `revokedAt: null` because a revoked mute is a different fact. It was judged
+   * wrong rather than running out, somebody already knows, and reporting it as
+   * a surprise expiry every five minutes for ever would train a reader to
+   * ignore the whole line.
+   */
+  const horizon = new Date(now.getTime() + SUPPRESSION_EXPIRY_WARNING_MS);
+  const mutes = await prisma.knownIssue.findMany({
+    where: { revokedAt: null, expiresAt: { lte: horizon } },
+    orderBy: { expiresAt: 'asc' },
+    take: SUPPRESSION_SWEEP_BATCH + 1,
+    select: {
+      id: true,
+      orgId: true,
+      projectId: true,
+      expiresAt: true,
+      matchCount: true,
+      ownerUserId: true,
+      ownerTeamId: true,
+      ownerProvenance: true,
+    },
+  });
+  const mutesCapped = mutes.length > SUPPRESSION_SWEEP_BATCH;
+  const seen = mutes.slice(0, SUPPRESSION_SWEEP_BATCH);
+
+  /*
+   * `isInForce` and not `expiresAt <= now` written out again. One comparison,
+   * one place, and the boundary is `>` rather than `>=` — a suppression whose
+   * expiry is exactly now is OVER. A second copy of that comparison here is a
+   * second chance to get the boundary wrong.
+   */
+  const over = seen.filter((row) => !isInForce({ expiresAt: row.expiresAt, revokedAt: null }, now));
+  const soon = seen.filter((row) => isInForce({ expiresAt: row.expiresAt, revokedAt: null }, now));
+
+  for (const row of over) {
+    logger.warn(
+      {
+        knownIssueId: row.id,
+        projectId: row.projectId,
+        expiresAt: row.expiresAt.toISOString(),
+        silenced: row.matchCount,
+        ownerUserId: row.ownerUserId,
+        ownerTeamId: row.ownerTeamId,
+        ownerProvenance: row.ownerProvenance,
+      },
+      'a known issue has expired; it suppresses nothing from now on and the failures it was silencing are red again',
+    );
+  }
+  for (const row of soon) {
+    logger.info(
+      {
+        knownIssueId: row.id,
+        projectId: row.projectId,
+        expiresAt: row.expiresAt.toISOString(),
+        silenced: row.matchCount,
+        ownerUserId: row.ownerUserId,
+        ownerTeamId: row.ownerTeamId,
+        ownerProvenance: row.ownerProvenance,
+      },
+      'a known issue is about to expire; the failures it silences will be red again unless somebody renews or fixes them',
+    );
+  }
+
+  const capped = proposalsCapped || mutesCapped;
+  if (capped) {
+    /*
+     * A cap that bit, reported as a count AND a reason. The next tick picks the
+     * remainder up five minutes later, so nothing is lost — but a reader must
+     * not take these numbers for the whole truth.
+     */
+    logger.warn(
+      {
+        cap: SUPPRESSION_SWEEP_BATCH,
+        proposalsCapped,
+        mutesCapped,
+      },
+      'the suppression sweep hit its batch cap; the counts below are a floor and the next tick continues',
+    );
+  }
+
+  const result: SuppressionSweepResult = {
+    proposalsExpired: expired.count,
+    mutesExpired: over.length,
+    mutesExpiringSoon: soon.length,
+    capped,
+  };
+  logger.info({ ...result, scheduledAt: job.at ?? null }, 'suppression sweep finished');
+  return result;
 }

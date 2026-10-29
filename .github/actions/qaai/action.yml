@@ -1,8 +1,35 @@
 # Reusable GitHub Action (§6).
 #
 # Runs a QAAI suite in the repo's own CI and fails the job when a test fails or
-# a quality gate blocks — the CLI's exit code does the work, this is just the
-# thin wrapper that surfaces JUnit to the Checks tab.
+# a quality gate blocks — the CLI's exit code does the work, and this wrapper's
+# job is to pass every knob through, surface JUnit to the Checks tab, and write
+# what was SELECTED and what was SKIPPED where a reviewer will read it.
+#
+# WHY EVERY FLAG IS HERE NOW
+#
+# The gate lives in the customer's CI, and this file could not drive most of
+# what the API can: impact selection, sharding, caching, fail-fast and the PR
+# number were all fields of `createRunSchema`, and `apps/api/src/lib/impact.ts`
+# documented a three-line `curl | jq` recipe that neither the CLI nor this
+# action implemented. So the one place a pull request is actually gated was the
+# one place the features could not be used. Each input below maps to exactly one
+# CLI flag, and the flag names come from `RUN_REQUEST_FLAGS` in
+# packages/shared/src/schemas.ts — the CLI mirrors that table and
+# packages/cli/src/index.test.ts diffs the two, so the three surfaces cannot
+# drift apart.
+#
+# WHY NOTHING IS INTERPOLATED INTO A `run:` BODY ANY MORE
+#
+# This step used to build its command line out of workflow expressions, with
+# the environment id substituted straight into the `--env` argument. The runner
+# expands an expression ANYWHERE in a run body, before bash sees it. A workflow
+# is free to pass a value that came from a pull-request title, a branch name or
+# an issue body, and an interpolated value carrying a command substitution would
+# EXECUTE during expansion — in a step that has just exported the customer's
+# QAAI_API_KEY into its environment. Every input now reaches the script through
+# the environment instead and is quoted as a single argv element, which is the
+# rule ../qaai-coverage already followed. (The expression syntax is deliberately
+# not written out even in a comment: the runner evaluates it in comments too.)
 #
 # WHY THE PACKAGE NAME IS SCOPED AND PINNED
 #
@@ -28,7 +55,7 @@
 # separate action on purpose, and the reasoning is worth keeping here because
 # the obvious instinct is to add two inputs to this file instead:
 #
-#   - `environment-id` above is `required: true`, which is the one guarantee
+#   - `environment-id` below is `required: true`, which is the one guarantee
 #     this action makes: it cannot be configured into running nothing. A
 #     coverage mode needs no environment, so adding it means making that input
 #     optional and branching on which mode the caller meant.
@@ -61,6 +88,11 @@ inputs:
     description: QAAI API base URL
     required: false
     default: http://localhost:4000
+  project:
+    description: >-
+      The project id. Required by `impact`, which asks POST /impact/analyze
+      before the run.
+    required: false
   suite:
     # Quoted, and it has to be: an unquoted plain scalar cannot contain a
     # colon followed by a space. Without the quotes this line ends the mapping
@@ -69,30 +101,414 @@ inputs:
     # tried to use it, since the runner parses this file before it runs a step.
     description: 'Run only this suite (default: the whole project)'
     required: false
+  tests:
+    description: >-
+      Newline-separated test ids. Overrides `suite`. Selecting by hand is still
+      SELECTION, so the run reports itself as such.
+    required: false
+  pr:
+    description: >-
+      The pull request this run gates, so its check and its PR comment land on
+      the right one. Defaults to the pull request that triggered the workflow.
+    required: false
+    default: ${{ github.event.pull_request.number }}
+  branch:
+    description: >-
+      The branch this run is for. LEAVE EMPTY unless your QAAI accepts it:
+      `Run.branch` has no writer on any create path today, so the CLI sends it,
+      reads it back, finds it missing and exits 2 rather than reporting a branch
+      the run does not carry.
+    required: false
+  shards:
+    description: >-
+      Split the suite across this many parallel workers (1-50). The server may
+      GRANT fewer — never more shards than tests, never more than your plan's
+      worker ceiling — and what it granted is printed.
+    required: false
+  impact:
+    description: >-
+      'true' to compute the changed paths from git, ask the API which tests the
+      diff can reach, and run only those. Needs `project`, and needs a full
+      clone: actions/checkout fetches depth 1 by DEFAULT, which makes the merge
+      base uncomputable, and the run then falls back to the FULL SUITE and says
+      so. Set `fetch-depth: 0` on your checkout step.
+    required: false
+    default: 'false'
+  impact-base:
+    description: >-
+      The ref `impact` diffs against. Defaults to the pull request's base branch
+      when there is one, then to origin/HEAD.
+    required: false
+    default: ${{ github.event.pull_request.base.ref && format('origin/{0}', github.event.pull_request.base.ref) || '' }}
+  changed-paths:
+    description: >-
+      Newline-separated changed paths, for a workflow that already has the diff.
+      Mutually exclusive with `impact`. SEND BOTH SIDES OF A RENAME.
+    required: false
+  cache:
+    description: >-
+      'true' to let an unchanged test reuse its last PASSED result. Inert
+      without `impact` or `changed-paths`.
+    required: false
+    default: 'false'
+  cache-window-hours:
+    description: How old a passing result may be and still be reused (1-336)
+    required: false
+  fail-fast:
+    description: >-
+      'true' to stop at the first REAL failure. A flake, a quarantined test and
+      a skip stop nothing.
+    required: false
+    default: 'false'
+  base-url:
+    description: >-
+      Override the environment base URL for this run only — a preview deploy's
+      address. LEAVE EMPTY unless your QAAI accepts it: `Run.baseUrlOverride`
+      has no writer on any create path today, so the CLI sends it, reads it back,
+      finds it missing and exits 2 rather than claiming a target the run never
+      used.
+    required: false
+  rerun-failures-of:
+    description: >-
+      Re-run only the failures of this run id. Never a suite pass, and the log
+      says so.
+    required: false
+  include-flaky:
+    description: "'true' to also re-run tests that failed and then passed"
+    required: false
+    default: 'false'
+  require-full-suite:
+    description: >-
+      'true' to fail the job when the run executed a SELECTED subset. THE FLAG A
+      MERGE QUEUE OR A RELEASE JOB SETS: it is what stops a gate configured for
+      the whole suite being satisfied by an impact run. Exit 3, which is not a
+      test failure — the suite was not run.
+    required: false
+    default: 'false'
+  suppressions:
+    description: >-
+      'true' to print the suppression ledger: how many failures were silenced,
+      by how many known issues, quarantines and waivers, and how many
+      suppressions had EXPIRED and silenced nothing.
+    required: false
+    default: 'false'
+  timeout:
+    description: Give up waiting after this many seconds
+    required: false
+    default: '600'
   junit-path:
     description: Where to write JUnit XML
     required: false
     default: qaai-results.xml
+  json-path:
+    description: Where to write the run's --json payload
+    required: false
+    default: qaai-run.json
   cli-version:
     description: >-
       Version of @qaai/cli to run. Pinned by default so a workflow that has not
       changed cannot start executing different code; override to upgrade.
     required: false
     default: 0.1.0
+outputs:
+  run-id:
+    description: The id of the run that executed
+    value: ${{ steps.report.outputs.run-id }}
+  exit-code:
+    description: >-
+      The CLI's exit code. 0 pass, 1 a gating test failed or a gate blocked,
+      2 the gate could not be delivered, 3 the run PASSED and was a SELECTED
+      subset while require-full-suite was set.
+    value: ${{ steps.report.outputs.exit-code }}
+  scope:
+    description: FULL_SUITE or SELECTED — what this run's verdict is about
+    value: ${{ steps.report.outputs.scope }}
+  selected:
+    description: >-
+      How many tests ran, when the run was selective and the count is known.
+      EMPTY rather than 0 when it is not: a 0 here would read as "no tests ran".
+    value: ${{ steps.report.outputs.selected }}
+  skipped:
+    description: >-
+      How many tests did NOT run. EMPTY rather than 0 when the server decided
+      the set and did not say.
+    value: ${{ steps.report.outputs.skipped }}
 runs:
   using: composite
   steps:
+    # `required: true` above is documentation, not enforcement — the runner does
+    # not check it for composite actions — so a workflow that forgets
+    # `environment-id` would otherwise get a confusing API error. Cheap, and
+    # before the network call. Mutually exclusive inputs are refused here too,
+    # for the same reason: a second is better than ten minutes.
+    - name: Check the inputs
+      shell: bash
+      env:
+        QAAI_API_KEY: ${{ inputs.api-key }}
+        QAAI_ENVIRONMENT_ID: ${{ inputs.environment-id }}
+        QAAI_PROJECT: ${{ inputs.project }}
+        QAAI_IMPACT: ${{ inputs.impact }}
+        QAAI_CHANGED_PATHS: ${{ inputs.changed-paths }}
+        QAAI_RERUN_OF: ${{ inputs.rerun-failures-of }}
+        QAAI_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        node -e '
+          const fail = (message) => {
+            process.stdout.write(`::error title=QAAI::${message}\n`);
+            process.exit(2);
+          };
+          const on = (value) => value === "true";
+          if (!process.env.QAAI_API_KEY) fail("api-key is empty. Store the key as a repository secret and pass it as `api-key`.");
+          if (!process.env.QAAI_ENVIRONMENT_ID) fail("environment-id is empty. Copy it from the environment in the app.");
+          if (on(process.env.QAAI_IMPACT) && !process.env.QAAI_PROJECT) fail("impact needs `project`: POST /impact/analyze is asked per project.");
+          if (on(process.env.QAAI_IMPACT) && process.env.QAAI_CHANGED_PATHS) fail("impact computes the changed paths from git, so it cannot be combined with `changed-paths`.");
+          if (process.env.QAAI_RERUN_OF && (on(process.env.QAAI_IMPACT) || process.env.QAAI_CHANGED_PATHS)) fail("rerun-failures-of already decides which tests run, so it cannot be combined with impact or changed-paths.");
+          const timeout = Number(process.env.QAAI_TIMEOUT);
+          if (!Number.isInteger(timeout) || timeout < 1) fail("timeout must be a whole number of seconds.");
+        '
+
+    # Runs, and deliberately does NOT decide. The CLI's exit code is data here,
+    # not a crash: the job summary is where the SELECTED/SKIPPED disclosure has
+    # to land, and it has to land on the failing path too, so the verdict is
+    # deferred to the step below and this one always exits 0.
     - name: Run QAAI
       shell: bash
       env:
         QAAI_API_KEY: ${{ inputs.api-key }}
         QAAI_API_URL: ${{ inputs.api-url }}
+        QAAI_ENVIRONMENT_ID: ${{ inputs.environment-id }}
+        QAAI_PROJECT: ${{ inputs.project }}
+        QAAI_SUITE: ${{ inputs.suite }}
+        QAAI_TESTS: ${{ inputs.tests }}
+        QAAI_COMMIT: ${{ github.sha }}
+        QAAI_PR: ${{ inputs.pr }}
+        QAAI_BRANCH: ${{ inputs.branch }}
+        QAAI_SHARDS: ${{ inputs.shards }}
+        QAAI_IMPACT: ${{ inputs.impact }}
+        QAAI_IMPACT_BASE: ${{ inputs.impact-base }}
+        QAAI_CHANGED_PATHS: ${{ inputs.changed-paths }}
+        QAAI_CACHE: ${{ inputs.cache }}
+        QAAI_CACHE_WINDOW_HOURS: ${{ inputs.cache-window-hours }}
+        QAAI_FAIL_FAST: ${{ inputs.fail-fast }}
+        QAAI_BASE_URL: ${{ inputs.base-url }}
+        QAAI_RERUN_OF: ${{ inputs.rerun-failures-of }}
+        QAAI_INCLUDE_FLAKY: ${{ inputs.include-flaky }}
+        QAAI_REQUIRE_FULL_SUITE: ${{ inputs.require-full-suite }}
+        QAAI_SUPPRESSIONS: ${{ inputs.suppressions }}
+        QAAI_TIMEOUT: ${{ inputs.timeout }}
+        QAAI_JUNIT_PATH: ${{ inputs.junit-path }}
+        QAAI_JSON_PATH: ${{ inputs.json-path }}
+        QAAI_CLI_VERSION: ${{ inputs.cli-version }}
       run: |
-        npx --yes "@qaai/cli@${{ inputs.cli-version }}" run \
-          --env "${{ inputs.environment-id }}" \
-          ${{ inputs.suite && format('--suite {0}', inputs.suite) || '' }} \
-          --commit "${{ github.sha }}" \
-          --junit "${{ inputs.junit-path }}"
+        set -uo pipefail
+        # Not `set -e`: a nonzero exit from the gate is the normal failing case.
+        set +e
+
+        # Every value is a single argv element taken from the environment, so a
+        # branch name or a suite id carrying a shell metacharacter is data.
+        args=(run --env "$QAAI_ENVIRONMENT_ID" --commit "$QAAI_COMMIT" \
+                  --junit "$QAAI_JUNIT_PATH" --timeout "$QAAI_TIMEOUT" --json)
+        if [ -n "$QAAI_PROJECT" ]; then args+=(--project "$QAAI_PROJECT"); fi
+        if [ -n "$QAAI_SUITE" ]; then args+=(--suite "$QAAI_SUITE"); fi
+        if [ -n "$QAAI_PR" ]; then args+=(--pr "$QAAI_PR"); fi
+        if [ -n "$QAAI_BRANCH" ]; then args+=(--branch "$QAAI_BRANCH"); fi
+        if [ -n "$QAAI_SHARDS" ]; then args+=(--shards "$QAAI_SHARDS"); fi
+        if [ -n "$QAAI_CACHE_WINDOW_HOURS" ]; then args+=(--cache-window-hours "$QAAI_CACHE_WINDOW_HOURS"); fi
+        if [ -n "$QAAI_BASE_URL" ]; then args+=(--base-url "$QAAI_BASE_URL"); fi
+        if [ -n "$QAAI_RERUN_OF" ]; then args+=(--rerun-failures-of "$QAAI_RERUN_OF"); fi
+        if [ "$QAAI_IMPACT" = "true" ]; then
+          args+=(--impact)
+          if [ -n "$QAAI_IMPACT_BASE" ]; then args+=(--impact-base "$QAAI_IMPACT_BASE"); fi
+        fi
+        if [ "$QAAI_CACHE" = "true" ]; then args+=(--cache); fi
+        if [ "$QAAI_FAIL_FAST" = "true" ]; then args+=(--fail-fast); fi
+        if [ "$QAAI_INCLUDE_FLAKY" = "true" ]; then args+=(--include-flaky); fi
+        if [ "$QAAI_REQUIRE_FULL_SUITE" = "true" ]; then args+=(--require-full-suite); fi
+        if [ "$QAAI_SUPPRESSIONS" = "true" ]; then args+=(--suppressions); fi
+
+        # Repeatable list inputs, one argv pair per non-empty line. `read -r`
+        # so a path containing a backslash is itself.
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=(--test "$line"); fi
+        done <<< "$QAAI_TESTS"
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=(--changed-paths "$line"); fi
+        done <<< "$QAAI_CHANGED_PATHS"
+
+        # --json goes to stdout and the progress and every disclosure to stderr,
+        # so redirecting stdout to a file leaves the log readable and the file
+        # parseable. Both are wanted: the log is where a reviewer sees what was
+        # SELECTED, the file is where the next step gets the numbers.
+        npx --yes "@qaai/cli@${QAAI_CLI_VERSION}" "${args[@]}" > "$QAAI_JSON_PATH"
+        status=$?
+
+        # Handed to the next step in a file rather than $GITHUB_ENV: the exit
+        # code belongs to this run, and putting it in the job's environment
+        # would leak it to every later step in the job.
+        echo "$status" > "${RUNNER_TEMP:-.}/qaai-run.exit"
+        echo "qaai run exited $status; JSON at $QAAI_JSON_PATH"
+        exit 0
+
+    # Writes the summary and sets the verdict. `always()` so a failed run still
+    # explains itself where a reviewer is looking.
+    - name: Report the run
+      id: report
+      if: always()
+      shell: bash
+      env:
+        QAAI_JSON_PATH: ${{ inputs.json-path }}
+        QAAI_REQUIRE_FULL_SUITE: ${{ inputs.require-full-suite }}
+      run: |
+        set -uo pipefail
+        temp="${RUNNER_TEMP:-.}"
+        summary="${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+
+        # No exit-code file means the run step never started — an input check
+        # failed above and has already made the job red with a specific message.
+        # Saying it again, less precisely, helps nobody.
+        if [ ! -f "$temp/qaai-run.exit" ]; then
+          {
+            echo "## QAAI run"
+            echo
+            echo "The run stopped before it started. See the failing step above."
+          } >> "$summary"
+          exit 0
+        fi
+
+        cat > "$temp/qaai-run-summary.mjs" <<'NODE'
+        /**
+         * Render a QAAI run into a GitHub step summary, and decide the job's
+         * verdict.
+         *
+         * WHY THE VERDICT IS DECIDED HERE AS WELL AS IN THE CLI
+         *
+         * Not out of distrust of the CLI, but because of the failure mode that
+         * would discredit this product: a green check on a run that tested a
+         * twelfth of the suite. `require-full-suite` is the input that must not
+         * be satisfiable by a selected run, so this script reaches its own
+         * verdict from `ci.scope` in the JSON and the exit code is the STRICTER
+         * of the two. It can only ever turn a pass into a failure, never the
+         * reverse.
+         *
+         * WHAT IT WILL NOT DO
+         *
+         * Report an unknown number as a known one. `ci.selection.selected` and
+         * `.skipped` are NULL when the server decided the set and did not say
+         * how many it held back, and they stay EMPTY here — an output of 0
+         * would read as "nothing was skipped", which is the opposite of the
+         * truth on exactly the runs these fields exist for.
+         *
+         * WHY THE LABELS ARE NOT IMPORTED
+         *
+         * This runs in the customer's CI with nothing installed but the pinned
+         * CLI, so it cannot import from @qaai/shared. It therefore renders only
+         * what the payload already says in the customer's own words — the
+         * disclosure sentence, the gate details — and invents no vocabulary of
+         * its own that could drift.
+         */
+        import { appendFileSync, readFileSync } from 'node:fs';
+
+        const jsonPath = process.env.QAAI_JSON_PATH || 'qaai-run.json';
+        const requireFullSuite = process.env.QAAI_REQUIRE_FULL_SUITE === 'true';
+        const cliExit = Number(process.env.QAAI_CLI_EXIT ?? '0');
+        const out = [];
+        const outputs = [];
+
+        let payload = null;
+        try {
+          payload = JSON.parse(readFileSync(jsonPath, 'utf8'));
+        } catch {
+          payload = null;
+        }
+
+        out.push('## QAAI run', '');
+
+        if (!payload) {
+          /*
+           * No parseable payload is the ordinary shape of a refused flag or an
+           * unreachable API, and the CLI has already said why on stderr. The one
+           * thing this must not do is read "no JSON" as "no failures", so a
+           * zero exit from the step is turned into a 2 — the gate could not be
+           * delivered — rather than passed through.
+           */
+          out.push(
+            `The run produced no readable result (\`${jsonPath}\`), so nothing here was measured.`,
+            '',
+            'See the step log above for the reason. This job fails on a missing result rather than',
+            'passing a check that never ran.',
+          );
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY || '/dev/stdout', out.join('\n') + '\n');
+          appendFileSync(
+            process.env.GITHUB_OUTPUT || '/dev/null',
+            ['run-id=', `exit-code=${cliExit === 0 ? 2 : cliExit}`, 'scope=', 'selected=', 'skipped=']
+              .join('\n') + '\n',
+          );
+          process.exit(cliExit === 0 ? 2 : cliExit);
+        }
+
+        const ci = payload.ci ?? {};
+        const selection = ci.selection ?? {};
+        const scope = typeof ci.scope === 'string' ? ci.scope : '';
+        const counts = [
+          `${payload.passedCount ?? 0} passed`,
+          `${payload.failedCount ?? 0} failed`,
+          `${payload.flakyCount ?? 0} flaky`,
+          `${payload.skippedCount ?? 0} skipped`,
+        ];
+        out.push(`**${payload.status ?? 'UNKNOWN'}** — ${counts.join(' · ')}`, '');
+
+        if (scope === 'SELECTED') {
+          out.push(`> ${selection.disclosure ?? 'This run executed a SELECTED subset.'}`, '');
+        }
+        for (const notice of ci.notices ?? []) out.push(`- ${notice}`);
+
+        const suppressed = Number(ci.suppressedFailures ?? 0);
+        if (suppressed > 0) {
+          out.push(
+            `${suppressed} failing test(s) are quarantined, so they did not fail this build.`,
+            'They are still failing — quarantine stops the gate, not the failure.',
+            '',
+          );
+        }
+
+        for (const evaluation of payload.gateResult?.evaluations ?? []) {
+          if (evaluation.action === 'BLOCK') out.push(`- **gate BLOCK** — ${evaluation.detail}`);
+          else if (evaluation.action === 'WARN') out.push(`- gate warn — ${evaluation.detail}`);
+          else if (evaluation.action === 'UNMEASURED') out.push(`- gate unmeasured — ${evaluation.detail}`);
+        }
+        for (const kind of ci.gateNotFullSuite ?? []) {
+          out.push(`- \`${kind}\` passed over the tests that RAN, not over the suite.`);
+        }
+        for (const line of ci.disclosures ?? []) out.push(`- ${line}`);
+
+        /*
+         * The stricter of the two verdicts. The CLI already exits 3 for this;
+         * the check is here because the input that must not be satisfiable by a
+         * selected run is THIS action's, and defence in depth costs two lines.
+         */
+        let exitCode = cliExit;
+        if (requireFullSuite && scope === 'SELECTED' && exitCode === 0) {
+          out.push(
+            '',
+            'This job required a full-suite verdict and got a SELECTED one. Exit 3, not 1: your',
+            'tests did not fail, the suite was not run.',
+          );
+          exitCode = 3;
+        }
+
+        appendFileSync(process.env.GITHUB_STEP_SUMMARY || '/dev/stdout', out.join('\n') + '\n');
+        outputs.push(
+          `run-id=${payload.id ?? ''}`,
+          `exit-code=${exitCode}`,
+          `scope=${scope}`,
+          `selected=${selection.selected ?? ''}`,
+          `skipped=${selection.skipped ?? ''}`,
+        );
+        appendFileSync(process.env.GITHUB_OUTPUT || '/dev/null', outputs.join('\n') + '\n');
+        process.exit(exitCode);
+        NODE
+
+        QAAI_CLI_EXIT="$(cat "$temp/qaai-run.exit")" node "$temp/qaai-run-summary.mjs"
 
     # Surfaces per-test results in the Checks tab even when the run passes.
     - name: Publish results

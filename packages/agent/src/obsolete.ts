@@ -81,7 +81,36 @@
  */
 
 import { locatorExpression } from '@qaai/shared';
-import type { FlowMap, Priority } from '@qaai/shared';
+import type { CrawlAcceptanceState, FlowMap, OwnerRef, Priority } from '@qaai/shared';
+/*
+ * The suppression and ownership vocabularies, through the package barrel.
+ *
+ * Copying either of them here would have been the sixth implementation of the
+ * idea those two files exist to end, which is why this module asks for
+ * `retirementAdmissible` and `retirementDenominatorEffect` rather than deciding
+ * for itself whether a test may be retired and what that does to the
+ * denominator. One answer, one place, every caller.
+ */
+import {
+  OBSOLESCENCE_MIN_CONFIRMATIONS,
+  OBSOLESCENCE_SIGNAL_RULES,
+  applySuppression,
+  expiryFor,
+  retirementAdmissible,
+  retirementDenominatorEffect,
+  summariseSuppressions,
+} from '@qaai/shared';
+import type {
+  ObsolescenceSignal,
+  ObsolescenceSignalKind,
+  RetirementDenominatorEffect,
+  RetirementState,
+  Suppression,
+  SuppressionRefusal,
+  SuppressionSummary,
+  SuppressionTally,
+} from '@qaai/shared';
+import type { OwnerProvenance } from '@qaai/shared';
 import { extractBehavior, normalizeLocator, normalizeRoute } from './suite-health.js';
 import type { SuiteHealthTestInput } from './suite-health.js';
 import { routeVisits } from './coverage.js';
@@ -148,6 +177,25 @@ export interface CrawlSurface {
   truncatedReason: string | null;
   /** Affordances seen but not comparable (CSS, unparsed). Reported, never used. */
   uncomparableAffordances: number;
+  /**
+   * The crawl's own adjudication (`adjudicateCrawl`, packages/shared/src/flow-map.ts),
+   * or NULL for a map written before acceptance existed and never adjudicated.
+   *
+   * ONLY `ACCEPTED` MAY SUPPORT A RETIREMENT. A CANDIDATE crawl is one the
+   * enumerate round already decided not to measure against — it was rate
+   * limited, it was not logged in, it SHRANK — and every one of those
+   * degradations produces the same evidence as a deleted page. A REJECTED one
+   * enumerated nothing usable at all.
+   *
+   * `null` blocks a retirement too, and the asymmetry is deliberate: an
+   * un-adjudicated crawl is good enough to WARN from (a drift warning costs
+   * nothing when it is wrong) and not good enough to retire from (a retirement
+   * destroys coverage the customer paid for). Several ways to say "I do not
+   * know" and one way to say "retire it".
+   */
+  acceptance: CrawlAcceptanceState | null;
+  /** The adjudicator's own sentences, so a blocked retirement can quote why. */
+  acceptanceReasons: string[];
 }
 
 /**
@@ -187,7 +235,37 @@ export function crawlSurfaceOf(flowMap: FlowMap | null): CrawlSurface {
     exploredAt: flowMap?.exploredAt ?? null,
     truncatedReason: flowMap?.truncatedReason ?? null,
     uncomparableAffordances: uncomparable,
+    acceptance: flowMap?.acceptance?.state ?? null,
+    acceptanceReasons: [...(flowMap?.acceptance?.reasons ?? [])],
   };
+}
+
+/**
+ * Why this crawl cannot support an obsolescence claim, or null when it can.
+ *
+ * One function, asked by the audit and by {@link proposeRetirement}, so the
+ * verdict screen and the retirement queue cannot disagree about whether the
+ * crawl was good enough — which is the shape the quarantine bug had.
+ */
+export function retirementBlockedBy(crawl: CrawlSurface): string | null {
+  /*
+   * TRUNCATION FIRST, and the order is a choice about which sentence a reader
+   * gets. A crawl can be ACCEPTED and still have stopped early, and "stopped
+   * early at 25 pages — re-crawl with a wider budget" is something the customer
+   * can act on this afternoon. "Never adjudicated" is true of the same map and
+   * tells them nothing to do.
+   */
+  if (crawl.truncatedReason !== null) {
+    return `the crawl stopped early (${crawl.truncatedReason}), so a route it did not reach may simply be past where it stopped`;
+  }
+  if (crawl.acceptance === null) {
+    return 'this crawl was never adjudicated, so nothing has established that it enumerated the application rather than a login wall';
+  }
+  if (crawl.acceptance !== 'ACCEPTED') {
+    const why = crawl.acceptanceReasons[0];
+    return `the crawl was held as ${crawl.acceptance}${why ? ` (${why})` : ''}, and a degraded crawl produces the same evidence as a deleted page`;
+  }
+  return null;
 }
 
 // ─── Per-test verdict ────────────────────────────────────────────────────────
@@ -200,6 +278,53 @@ export type SurfaceVerdict =
   | 'OBSOLETE'
   | 'UNMEASURED';
 
+/**
+ * The reasons a route that is ABSENT FROM THE CRAWL is nevertheless not gone.
+ *
+ * Every one of these looks identical to "deleted" from the crawl's point of
+ * view, which is exactly why each needs a name: an unnamed exclusion is an
+ * exclusion a reader cannot audit, and a missing one is a retirement proposal
+ * for a feature that is simply switched off this week.
+ *
+ * The facts come from the CALLER, not from guesswork here. QAAI has a flag
+ * store, a set of auth profiles and a surface inventory that records
+ * exercisability; this module compares routes. A module that inferred "probably
+ * behind a flag" from a route's shape would be inventing the one fact that
+ * decides whether a customer loses a test.
+ */
+export const OBSOLESCENCE_EXCLUSIONS = [
+  /** A feature flag was off during the crawl. The route exists; it was dark. */
+  'BEHIND_FEATURE_FLAG',
+  /** The route needs a role the crawl held no session for. */
+  'ROLE_NOT_CRAWLED',
+  /**
+   * The surface inventory says QAAI is not PERMITTED to drive this — it ends the
+   * session, it destroys data, it charges money. See `UNEXERCISABLE_REASONS`
+   * (packages/shared/src/surface.ts). Those routes are absent from every crawl
+   * BY DESIGN, so a retirement argued from their absence would retire the tests
+   * covering precisely the surfaces QAAI refuses to touch itself.
+   */
+  'UNEXERCISABLE',
+] as const;
+export type ObsolescenceExclusion = (typeof OBSOLESCENCE_EXCLUSIONS)[number];
+
+export const OBSOLESCENCE_EXCLUSION_LABELS = {
+  BEHIND_FEATURE_FLAG: 'a feature flag was off during the crawl',
+  ROLE_NOT_CRAWLED: 'the crawl held no session for the role it needs',
+  UNEXERCISABLE: 'QAAI is not permitted to drive it here',
+} as const satisfies Record<ObsolescenceExclusion, string>;
+
+/** One route the caller has excluded from the obsolescence argument, and why. */
+export interface RouteExclusion {
+  route: string;
+  exclusion: ObsolescenceExclusion;
+  /**
+   * The caller's own evidence: the flag key, the role name, the
+   * `UnexercisableReason`. Shown to the reviewer verbatim.
+   */
+  detail: string;
+}
+
 export interface RouteCheck {
   route: string;
   /** The crawl got here. */
@@ -208,6 +333,11 @@ export interface RouteCheck {
   declared: boolean;
   /** The extractor used to find this route and no longer does. */
   retired: boolean;
+  /**
+   * Set when the caller excluded this route from the obsolescence argument.
+   * An excluded route is NEVER evidence of deletion, however absent it is.
+   */
+  excluded: RouteExclusion | null;
 }
 
 export interface LocatorCheck {
@@ -233,6 +363,13 @@ export interface TestSurfaceReport {
   name: string;
   filePath: string;
   priority: Priority;
+  /**
+   * The test's declared feature, carried through so FEATURE_GONE — the
+   * strongest signal in the vocabulary — can be derived from the report without
+   * a second read of the suite. Null on a test that declares none, and a null
+   * feature can never produce FEATURE_GONE.
+   */
+  feature: string | null;
   verdict: SurfaceVerdict;
   routes: RouteCheck[];
   locators: LocatorCheck[];
@@ -284,6 +421,25 @@ export interface ObsoleteInput {
    * proposal is still possible but weaker and says so.
    */
   retiredRoutes?: readonly string[];
+  /**
+   * Routes the caller knows are absent from this crawl for a reason that is NOT
+   * deletion — see {@link OBSOLESCENCE_EXCLUSIONS}.
+   *
+   * Matched template-aware, both ways, exactly like `declaredRoutes`: an
+   * exclusion written as `/orders/:id` covers `/orders/7`, because the caller's
+   * flag and role facts are about the route pattern and the test's token may be
+   * either shape.
+   */
+  excludedRoutes?: readonly RouteExclusion[];
+  /**
+   * Feature names the SOURCE still declares, or null when nothing has told us.
+   *
+   * Only consulted for the FEATURE_GONE signal, which is the strongest one in
+   * the vocabulary and therefore the one that must not be argued from a crawl
+   * alone. Null withholds FEATURE_GONE entirely rather than treating "we were
+   * not told" as "the feature is gone".
+   */
+  declaredFeatures?: readonly string[] | null;
 }
 
 export interface ObsoleteReport {
@@ -300,6 +456,28 @@ export interface ObsoleteReport {
   summary: Record<SurfaceVerdict, number>;
   /** Facts a reader must know before trusting any count here. Never empty. */
   caveats: string[];
+  /**
+   * Null when this crawl may support a retirement, otherwise the one sentence
+   * saying why not. Computed once by {@link retirementBlockedBy}.
+   */
+  retirementBlockedBy: string | null;
+  /** Feature names the newest crawl clustered nodes under. */
+  crawlFeatures: string[];
+  /**
+   * Feature names the SOURCE declares, or null when nothing told us. Null
+   * withholds every FEATURE_GONE signal — see {@link ObsoleteInput.declaredFeatures}.
+   */
+  declaredFeatures: string[] | null;
+  /**
+   * Routes excluded from the obsolescence argument, COUNTED BY REASON.
+   *
+   * An exclusion is a suppression of a finding, and rule: every suppression is
+   * counted out loud. "3 routes were not considered: 2 behind a feature flag, 1
+   * unexercisable" is a sentence a reader can check; silently skipping them
+   * would make "no retirement candidates" and "we did not look at nine routes"
+   * the same output.
+   */
+  exclusionCounts: Record<ObsolescenceExclusion, number>;
 }
 
 /**
@@ -340,7 +518,14 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
   const retired = (input.retiredRoutes ?? []).map((route) => normalizeRoute(route));
   const haveCrawl = input.flowMap !== null && crawl.routes.length > 0;
   const completeCrawl = haveCrawl && crawl.truncatedReason === null;
+  const crawlBlocked = haveCrawl ? retirementBlockedBy(crawl) : null;
   const declaredTruncated = input.declaredRoutesTruncatedReason ?? null;
+  const exclusions = input.excludedRoutes ?? [];
+  const exclusionCounts: Record<ObsolescenceExclusion, number> = {
+    BEHIND_FEATURE_FLAG: 0,
+    ROLE_NOT_CRAWLED: 0,
+    UNEXERCISABLE: 0,
+  };
   // The source-side twin of `completeCrawl`. A capped declared list cannot
   // support "the source does not declare this route" any more than a capped
   // crawl can support "nothing reached it".
@@ -355,6 +540,7 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
       name: test.name,
       filePath: test.filePath,
       priority: test.priority,
+      feature: test.feature,
     };
 
     const routes: RouteCheck[] = [...new Set(routesOf(behavior.routes))]
@@ -364,7 +550,12 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
         reached: matchesAny(route, crawl.routes),
         declared: matchesAny(route, declared),
         retired: matchesAny(route, retired),
+        excluded: exclusionFor(route, exclusions),
       }));
+
+    for (const check of routes) {
+      if (check.excluded && !check.reached) exclusionCounts[check.excluded.exclusion] += 1;
+    }
 
     // ─ The reasons there is no verdict at all ─
 
@@ -437,13 +628,52 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
     const drifted = locators.filter((check) => check.comparable && !check.seen);
     const uncomparable = locators.filter((check) => !check.comparable);
 
-    const missingRoutes = routes.filter((route) => !route.reached && !route.declared);
+    const excludedRoutes = routes.filter((route) => !route.reached && route.excluded !== null);
+    const missingRoutes = routes.filter(
+      (route) => !route.reached && !route.declared && route.excluded === null,
+    );
     const unreachedRoutes = routes.filter((route) => !route.reached && route.declared);
+
+    /*
+     * AN EXCLUDED ROUTE ENDS THE ARGUMENT, BEFORE ANY OF THE BRANCHES BELOW.
+     *
+     * A route behind a dark flag, a route needing a role the crawl had no
+     * session for, and a route QAAI is not permitted to drive are all ABSENT
+     * from the crawl and all three mean the page is there. They are handled
+     * here rather than folded into UNREACHED because UNREACHED's own evidence
+     * sentence is "the source still declares it", which says nothing about a
+     * flag — and a reader who is told the wrong reason stops trusting the
+     * right ones.
+     */
+    if (excludedRoutes.length > 0) {
+      tests.push({
+        ...base,
+        verdict: 'UNMEASURED',
+        routes,
+        locators: [],
+        evidence: [
+          `The newest crawl did not reach ${excludedRoutes.map((route) => route.route).join(', ')}, and QAAI already knows why: ` +
+            `${excludedRoutes.map((route) => `${route.route} — ${OBSOLESCENCE_EXCLUSION_LABELS[route.excluded!.exclusion]} (${route.excluded!.detail})`).join('; ')}.`,
+          'That is a fact about this crawl, not about the application, so no obsolescence claim is made from it.',
+        ],
+        caveats: [
+          'This test is NOT a retirement candidate. A route that is dark, role-gated or off-limits to QAAI is absent from every crawl by design.',
+        ],
+        retirement: null,
+      });
+      continue;
+    }
 
     // ─ OBSOLETE, and only under every condition at once ─
 
     const allRoutesGone = missingRoutes.length === routes.length;
-    if (allRoutesGone && sourceAnalysed && completeCrawl && completeSource) {
+    if (
+      allRoutesGone &&
+      sourceAnalysed &&
+      completeCrawl &&
+      completeSource &&
+      crawlBlocked === null
+    ) {
       const retiredEvidence = routes.filter((route) => route.retired);
       const confidence = retiredEvidence.length > 0 ? 0.9 : 0.7;
       const evidence = [
@@ -495,8 +725,8 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
        */
       const why = !sourceAnalysed
         ? 'no source analysis has run for this project, so "the code does not declare this route" is the absence of a detector rather than a fact'
-        : !completeCrawl
-          ? `the crawl stopped early (${crawl.truncatedReason}), so a route it did not reach may simply be past where it stopped`
+        : crawlBlocked !== null
+          ? crawlBlocked
           : `the list of routes your source declares was capped before it got here (${declaredTruncated}), so "the code does not declare this route" may only mean the route is past the end of the page QAAI read`;
       tests.push({
         ...base,
@@ -510,8 +740,8 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
         caveats: [
           !sourceAnalysed
             ? 'Connect the repository so source analysis can run, and this test gets a real verdict instead of a shrug.'
-            : !completeCrawl
-              ? 'Re-crawl with a wider budget and this test gets a real verdict.'
+            : crawlBlocked !== null
+              ? 'A retirement needs a crawl that was ACCEPTED and ran to completion. Re-crawl, or clear the degradation the adjudicator recorded, and this test gets a real verdict.'
               : 'This is a limit in QAAI’s own read of your route inventory, not a finding about your test. It is not a retirement candidate while that list is capped.',
         ],
         retirement: null,
@@ -652,9 +882,10 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
     caveats.push(
       'Nothing has crawled this application, so no test could be compared against anything. Every verdict here is UNMEASURED.',
     );
-  } else if (crawl.truncatedReason) {
+  } else if (crawlBlocked !== null) {
     caveats.push(
-      `The crawl stopped early (${crawl.truncatedReason}), so no retirement can be proposed from it: a route past where a crawl stopped looks exactly like a route that is gone.`,
+      `No retirement can be proposed from this crawl: ${crawlBlocked}. ` +
+        'A route QAAI did not see looks exactly like a route that is gone, and only one of those two is worth acting on.',
     );
   }
   if (!sourceAnalysed) {
@@ -674,6 +905,16 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
   caveats.push(
     'Drift is a lower bound in both directions: the crawl lists what it found, and this comparison only runs for routes it reached.',
   );
+  const excludedTotal = OBSOLESCENCE_EXCLUSIONS.reduce((a, k) => a + exclusionCounts[k], 0);
+  if (excludedTotal > 0) {
+    caveats.push(
+      `${excludedTotal} route-level absence(s) were NOT considered as evidence of deletion: ` +
+        OBSOLESCENCE_EXCLUSIONS.filter((kind) => exclusionCounts[kind] > 0)
+          .map((kind) => `${exclusionCounts[kind]} because ${OBSOLESCENCE_EXCLUSION_LABELS[kind]}`)
+          .join(', ') +
+        '.',
+    );
+  }
 
   return {
     crawl,
@@ -682,7 +923,30 @@ export function auditTestsAgainstCrawl(input: ObsoleteInput): ObsoleteReport {
     tests,
     summary,
     caveats,
+    retirementBlockedBy: crawlBlocked,
+    crawlFeatures: [
+      ...new Set((input.flowMap?.features ?? []).map((f) => f?.name).filter((n): n is string => typeof n === 'string')),
+    ].sort(),
+    declaredFeatures:
+      input.declaredFeatures === undefined || input.declaredFeatures === null
+        ? null
+        : [...new Set(input.declaredFeatures)].sort(),
+    exclusionCounts,
   };
+}
+
+/** The caller's exclusion covering this route, template-aware both ways, or null. */
+function exclusionFor(
+  route: string,
+  exclusions: readonly RouteExclusion[],
+): RouteExclusion | null {
+  for (const candidate of exclusions) {
+    const pattern = normalizeRoute(candidate.route);
+    if (routeVisits(route, pattern) || routeVisits(pattern, route)) {
+      return { ...candidate, route: pattern };
+    }
+  }
+  return null;
 }
 
 /** Newest-first de-duplication by locator, so one element is reported once. */
@@ -773,4 +1037,488 @@ export function driftCheck(report: ObsoleteReport): DriftCheck {
 
 function priorityRank(priority: Priority): number {
   return priority === 'CRITICAL_PATH' ? 0 : priority === 'IMPORTANT' ? 1 : 2;
+}
+
+// ─── Signals, in the one suppression vocabulary ──────────────────────────────
+
+/**
+ * Obsolescence and retirement, rebuilt on `packages/shared/src/suppression.ts`.
+ *
+ * ── WHAT WAS WRONG WITH WHAT IS ABOVE ───────────────────────────────────────
+ *
+ * Everything above this line computes a correct verdict and then hands the
+ * reviewer a `RetirementProposal` with a confidence and some prose. What it
+ * never had is the four properties that make a suppression safe, and a
+ * retirement is a suppression — it is the fifth kind in
+ * `SUPPRESSION_KINDS`, and the one with the largest blast radius:
+ *
+ *   COUNTED      a retirement nobody counted is a test that stopped running and
+ *                a board that went quiet for a reason nobody can name.
+ *   OWNED        by a HUMAN. `isHumanSetProvenance` is the predicate: a glob may
+ *                route a failure to a team, it may not decide that a test stops
+ *                existing.
+ *   EXPIRING     the PROPOSAL expires. A queue of proposals nobody reviewed is
+ *                not a decision somebody is about to make, it is a backlog
+ *                pretending to be one.
+ *   REVERSIBLE   with the evidence kept, so "we retired this and put it back" is
+ *                a question with an answer.
+ *
+ * ── AND THE ONE THAT MATTERS MOST ───────────────────────────────────────────
+ *
+ * RETIRING A TEST MAKES ITS SURFACE UNCOVERED AGAIN. The surface stays in the
+ * denominator; the numerator goes DOWN. A retirement that quietly improved the
+ * coverage percentage would be the worst defect this module could ship, because
+ * it would turn "delete the failing tests" into the fastest way to hit a
+ * coverage target — and the product would then be actively worse than no
+ * product. {@link coverageAfterRetirement} is that rule as arithmetic rather
+ * than as a comment: the denominator is passed through untouched and the
+ * covered count can only fall.
+ *
+ * Nothing here calls a model. Signal derivation is a set difference, admission
+ * is a count against a threshold, and the owner and expiry checks are the
+ * keystone's.
+ */
+
+/** A persisted `ObsoleteTestSignal` row, as the caller reads it back. */
+export interface PriorObsolescenceSignal {
+  testId: string;
+  kind: ObsolescenceSignalKind;
+  /** The route, locator or feature name, verbatim — the row's third unique key. */
+  reference: string;
+  confirmations: number;
+}
+
+export interface TestObsolescenceSignals {
+  testId: string;
+  name: string;
+  filePath: string;
+  signals: ObsolescenceSignal[];
+}
+
+export interface ObsolescenceSignalReport {
+  /**
+   * Null when signals were derived. Otherwise the reason none were, and the
+   * reason is never "there was nothing wrong".
+   *
+   * A CANDIDATE crawl must not contribute a CONFIRMATION, which is why this
+   * gate is here and not only in {@link proposeRetirement}: confirmations
+   * accumulate across crawls, so one degraded crawl that was allowed to add one
+   * would let two degraded crawls retire a test between them.
+   */
+  withheldBecause: string | null;
+  tests: TestObsolescenceSignals[];
+  /** Every kind, always present, so "none of these" and "we did not look" differ. */
+  counts: Record<ObsolescenceSignalKind, number>;
+  /** Signals now at or above {@link OBSOLESCENCE_MIN_CONFIRMATIONS}. */
+  confirmed: number;
+}
+
+const SIGNAL_SEP = '\u0000';
+
+function priorKey(testId: string, kind: ObsolescenceSignalKind, reference: string): string {
+  return `${testId}${SIGNAL_SEP}${kind}${SIGNAL_SEP}${reference}`;
+}
+
+/**
+ * Derive this crawl's obsolescence signals, with confirmations carried forward.
+ *
+ * `prior` is the `ObsoleteTestSignal` rows already stored for these tests. A
+ * signal seen before has its confirmation count INCREMENTED; a signal seen for
+ * the first time starts at 1, which is below the threshold by construction —
+ * so no single crawl can ever produce an admissible retirement, whatever it
+ * saw. That is the same rule the unique key `(testId, kind, reference)` enforces
+ * in the database, implemented here so the two cannot disagree.
+ */
+export function obsolescenceSignalsFor(
+  report: ObsoleteReport,
+  prior: readonly PriorObsolescenceSignal[] = [],
+): ObsolescenceSignalReport {
+  const counts: Record<ObsolescenceSignalKind, number> = {
+    ROUTE_GONE: 0,
+    LOCATOR_GONE: 0,
+    ROUTE_UNREACHABLE: 0,
+    FEATURE_GONE: 0,
+  };
+
+  if (report.retirementBlockedBy !== null) {
+    return {
+      withheldBecause: `No obsolescence signal was recorded from this crawl: ${report.retirementBlockedBy}. A signal from a crawl that cannot support a retirement would still count towards one.`,
+      tests: [],
+      counts,
+      confirmed: 0,
+    };
+  }
+
+  const priorCounts = new Map<string, number>();
+  for (const row of prior) {
+    priorCounts.set(priorKey(row.testId, row.kind, row.reference), row.confirmations);
+  }
+
+  const tests: TestObsolescenceSignals[] = [];
+  let confirmed = 0;
+
+  for (const test of report.tests) {
+    const signals: ObsolescenceSignal[] = [];
+    const add = (kind: ObsolescenceSignalKind, reference: string): void => {
+      const seenBefore = priorCounts.get(priorKey(test.testId, kind, reference)) ?? 0;
+      signals.push({ kind, reference, confirmations: seenBefore + 1 });
+      counts[kind] += 1;
+      if (seenBefore + 1 >= OBSOLESCENCE_MIN_CONFIRMATIONS) confirmed += 1;
+    };
+
+    for (const route of test.routes) {
+      if (route.reached) continue;
+      // An EXCLUDED route produces no signal of any kind. Its absence is
+      // already explained, and a ROUTE_UNREACHABLE row for a dark flag would
+      // accumulate confirmations towards a retirement of a live feature.
+      if (route.excluded !== null) continue;
+      if (route.declared) add('ROUTE_UNREACHABLE', route.route);
+      else add('ROUTE_GONE', route.route);
+    }
+
+    for (const locator of test.locators) {
+      if (locator.comparable && !locator.seen) add('LOCATOR_GONE', locator.locator);
+    }
+
+    /*
+     * FEATURE_GONE needs BOTH negatives and an unexcluded clean sweep.
+     *
+     * `declaredFeatures: null` withholds it entirely rather than reading "we
+     * were not told which features the source declares" as "the feature is
+     * gone" — the exact mistake `declaredRoutes: null` already exists to stop
+     * on the route side.
+     */
+    const everyRouteGone =
+      test.routes.length > 0 &&
+      test.routes.every((route) => !route.reached && !route.declared && route.excluded === null);
+    if (
+      test.feature !== null &&
+      test.feature.length > 0 &&
+      report.declaredFeatures !== null &&
+      everyRouteGone &&
+      !report.crawlFeatures.includes(test.feature) &&
+      !report.declaredFeatures.includes(test.feature)
+    ) {
+      add('FEATURE_GONE', test.feature);
+    }
+
+    if (signals.length > 0) {
+      tests.push({
+        testId: test.testId,
+        name: test.name,
+        filePath: test.filePath,
+        signals: signals.sort(
+          (a, b) =>
+            OBSOLESCENCE_SIGNAL_RULES[b.kind].confidence -
+              OBSOLESCENCE_SIGNAL_RULES[a.kind].confidence ||
+            a.reference.localeCompare(b.reference),
+        ),
+      });
+    }
+  }
+
+  return { withheldBecause: null, tests, counts, confirmed };
+}
+
+// ─── The coverage arithmetic, so the rule cannot be forgotten ────────────────
+
+export interface CoverageAfterRetirement {
+  /** UNCHANGED. The application still has those surfaces. */
+  denominator: number;
+  coveredBefore: number;
+  /** Never above {@link coveredBefore}. */
+  coveredAfter: number;
+  /** Null when the denominator is 0 — a null that became 0 is its own lie. */
+  percentBefore: number | null;
+  percentAfter: number | null;
+  disclosure: string;
+}
+
+/**
+ * The coverage numbers after a set of retirements is applied.
+ *
+ * THE DEFECT THIS IS: every other way of writing this invites the caller to
+ * shrink the denominator, because shrinking the denominator is what makes the
+ * arithmetic come out flattering and nobody notices a number that went the
+ * direction they wanted. Here the denominator is an input that is returned
+ * unmodified and `coveredAfter` is `coveredBefore` minus the surfaces that lost
+ * their only cover, clamped at zero. There is no argument that could make this
+ * function raise a percentage.
+ */
+export function coverageAfterRetirement(args: {
+  denominator: number;
+  covered: number;
+  surfacesReturnedToUncovered: number;
+}): CoverageAfterRetirement {
+  const denominator = Math.max(0, Math.trunc(args.denominator));
+  const coveredBefore = Math.max(0, Math.min(Math.trunc(args.covered), denominator));
+  const coveredAfter = Math.max(0, coveredBefore - Math.max(0, Math.trunc(args.surfacesReturnedToUncovered)));
+  const pct = (n: number): number | null =>
+    denominator === 0 ? null : Math.round((n / denominator) * 1000) / 10;
+  const before = pct(coveredBefore);
+  const after = pct(coveredAfter);
+  return {
+    denominator,
+    coveredBefore,
+    coveredAfter,
+    percentBefore: before,
+    percentAfter: after,
+    disclosure:
+      denominator === 0
+        ? 'No surface is being measured, so retiring a test changes no coverage number. The percentage is UNAVAILABLE rather than 0.'
+        : coveredAfter === coveredBefore
+          ? `Coverage is unchanged at ${after}%: every surface these tests reached is also reached by another test. The denominator stays at ${denominator}.`
+          : `Coverage falls from ${before}% to ${after}%. The denominator stays at ${denominator} — the application still has these surfaces and now nothing tests them.`,
+  };
+}
+
+// ─── Proposing a retirement ──────────────────────────────────────────────────
+
+export const RETIREMENT_REFUSALS = [
+  /** The audit did not call this test obsolete. */
+  'VERDICT_NOT_OBSOLETE',
+  /** The crawl was REJECTED, held as a CANDIDATE, never adjudicated, or truncated. */
+  'CRAWL_DOES_NOT_SUPPORT_RETIREMENT',
+  /** Too few confirmations, or only weak signals. `retirementAdmissible`'s own reason. */
+  'SIGNALS_NOT_ADMISSIBLE',
+  /** The owner or the expiry did not satisfy `applySuppression`. */
+  'SUPPRESSION_REFUSED',
+] as const;
+export type RetirementRefusal = (typeof RETIREMENT_REFUSALS)[number];
+
+export interface RetirementRecord {
+  testId: string;
+  name: string;
+  filePath: string;
+  /** Always PROPOSED from here. Nothing in this module applies anything. */
+  state: RetirementState;
+  /**
+   * The strongest confirmed signal's DECLARED confidence from
+   * `OBSOLESCENCE_SIGNAL_RULES` — a prior from a table, not a measurement, and
+   * never 1: this is an argument from absence however well fenced.
+   */
+  confidence: number;
+  explanation: string;
+  evidence: string[];
+  signals: ObsolescenceSignal[];
+  /** What this does to the coverage number. Carried, not remembered. */
+  denominator: RetirementDenominatorEffect;
+  /** Owner, expiry and count, from the one constructor. */
+  suppression: Suppression;
+  /** How to undo it, in the reviewer's terms. */
+  reversal: string;
+}
+
+export interface RetirementRefused {
+  proposed: false;
+  refusal: RetirementRefusal;
+  /** The PATH of the offending field, never a message built from its value. */
+  path: string;
+  /** One sentence for the reviewer. Never assembled from customer text. */
+  why: string;
+  /** The keystone's own refusal when `refusal` is SUPPRESSION_REFUSED. */
+  suppressionRefusal: SuppressionRefusal | null;
+}
+
+export type RetirementDecision = { proposed: true; proposal: RetirementRecord } | RetirementRefused;
+
+export interface RetirementRequest {
+  report: ObsoleteReport;
+  test: TestSurfaceReport;
+  signals: readonly ObsolescenceSignal[];
+  /** Surface item ids this test covers. */
+  covers: readonly string[];
+  /** Of those, the ones some OTHER live test also covers. */
+  alsoCoveredElsewhere: readonly string[];
+  owner: OwnerRef | null;
+  ownerProvenance: OwnerProvenance;
+  /** Review window in days. Clamped to the kind's ceiling by `expiryFor`. */
+  reviewDays: number;
+}
+
+/**
+ * Propose retiring one test, or refuse and say which condition was missing.
+ *
+ * Four gates, in this order, because the cheapest and most decisive one goes
+ * first: the crawl, then the verdict, then the signals, then the ownership and
+ * expiry rules that every suppression in this product shares. The order is also
+ * the order a reader wants the answer in — "your crawl was degraded" is a more
+ * useful sentence than "this test has only weak signals", and both are true.
+ */
+export function proposeRetirement(request: RetirementRequest, now: Date): RetirementDecision {
+  if (request.report.retirementBlockedBy !== null) {
+    return {
+      proposed: false,
+      refusal: 'CRAWL_DOES_NOT_SUPPORT_RETIREMENT',
+      path: 'report.crawl.acceptance',
+      why: `No retirement can be proposed: ${request.report.retirementBlockedBy}.`,
+      suppressionRefusal: null,
+    };
+  }
+
+  if (request.test.verdict !== 'OBSOLETE') {
+    return {
+      proposed: false,
+      refusal: 'VERDICT_NOT_OBSOLETE',
+      path: 'test.verdict',
+      why: `This test is ${request.test.verdict}, not OBSOLETE. Only a test whose every route is absent from both the crawl and the source is a retirement candidate.`,
+      suppressionRefusal: null,
+    };
+  }
+
+  const admission = retirementAdmissible(request.signals);
+  if (!admission.admissible) {
+    return {
+      proposed: false,
+      refusal: 'SIGNALS_NOT_ADMISSIBLE',
+      path: 'signals',
+      why: admission.reason,
+      suppressionRefusal: null,
+    };
+  }
+
+  const denominator = retirementDenominatorEffect({
+    covers: request.covers,
+    alsoCoveredElsewhere: request.alsoCoveredElsewhere,
+  });
+
+  /*
+   * The reason sentence is composed from QAAI'S OWN RECORDS ONLY — the test id,
+   * the route strings the audit matched, the signal kinds. The test's NAME is
+   * customer text and it is deliberately absent from here: this string ends up
+   * on a `Suppression` row and in an audit entry, and a name is the one field
+   * an attacker controls.
+   */
+  const strong = request.signals
+    .filter(
+      (s) =>
+        s.confirmations >= OBSOLESCENCE_MIN_CONFIRMATIONS &&
+        OBSOLESCENCE_SIGNAL_RULES[s.kind].soleBasisForRetirement,
+    )
+    .sort(
+      (a, b) =>
+        OBSOLESCENCE_SIGNAL_RULES[b.kind].confidence - OBSOLESCENCE_SIGNAL_RULES[a.kind].confidence,
+    );
+
+  const applied = applySuppression(
+    {
+      kind: 'RETIREMENT',
+      target: { scope: 'TEST', key: request.test.testId },
+      reason: `Obsolete: ${strong.map((s) => s.kind).join(', ')} confirmed by at least ${OBSOLESCENCE_MIN_CONFIRMATIONS} accepted crawls.`,
+      owner: request.owner,
+      ownerProvenance: request.ownerProvenance,
+      expiresAt: expiryFor('RETIREMENT', now, request.reviewDays),
+      // Checked against the kind's own rule rather than trusted. A caller that
+      // believed retirement shrinks the denominator is refused here instead of
+      // being quietly corrected and shipping a wrong percentage elsewhere.
+      expectedDenominator: 'RETURNS_TO_UNCOVERED',
+    },
+    now,
+  );
+
+  if (!applied.applied) {
+    return {
+      proposed: false,
+      refusal: 'SUPPRESSION_REFUSED',
+      path: applied.path,
+      why: 'A retirement is a suppression: it needs a named human owner and a review window that expires.',
+      suppressionRefusal: applied.refusal,
+    };
+  }
+
+  const confidence = Math.min(
+    0.95,
+    strong.length > 0 ? OBSOLESCENCE_SIGNAL_RULES[strong[0]!.kind].confidence : 0,
+  );
+
+  return {
+    proposed: true,
+    proposal: {
+      testId: request.test.testId,
+      name: request.test.name,
+      filePath: request.test.filePath,
+      state: 'PROPOSED',
+      confidence,
+      explanation:
+        `Every route this test drives is absent from an ACCEPTED crawl and from the application's source ` +
+        `(${request.test.routes.map((route) => route.route).join(', ')}), confirmed across ` +
+        `${OBSOLESCENCE_MIN_CONFIRMATIONS} or more crawls. Retiring it DISABLES the test — the code stays in your ` +
+        `repository and in its history. ${denominator.disclosure}`,
+      evidence: [...request.test.evidence, admission.reason, denominator.disclosure],
+      signals: [...request.signals],
+      denominator,
+      suppression: applied.suppression,
+      reversal:
+        'Reject or revoke this proposal and the test runs again on the next run. ' +
+        'The surfaces it covered are reopened as UNCOVERED when it is applied and re-close when it is reverted, so the coverage number tracks the decision in both directions.',
+    },
+  };
+}
+
+// ─── Counted, out loud ───────────────────────────────────────────────────────
+
+export interface RetirementSummary {
+  proposed: number;
+  /** Every refusal reason, always present. */
+  refused: Record<RetirementRefusal, number>;
+  /** Surfaces that would go back to UNCOVERED across all proposals. */
+  surfacesReturnedToUncovered: number;
+  /** Surfaces that stay covered because another live test reaches them. */
+  surfacesStillCovered: number;
+  /** Through the one summariser, so retirement is counted like every other kind. */
+  suppressions: SuppressionSummary;
+  disclosure: string;
+}
+
+/**
+ * The sentence a reviewer sees above the queue.
+ *
+ * Reports the refusals as loudly as the proposals. "No retirement candidates"
+ * and "nine candidates, all refused because your crawl was degraded" are
+ * completely different facts about a project, and a surface that showed only
+ * the first would teach a customer that the feature does nothing.
+ */
+export function summariseRetirements(decisions: readonly RetirementDecision[]): RetirementSummary {
+  const refused: Record<RetirementRefusal, number> = {
+    VERDICT_NOT_OBSOLETE: 0,
+    CRAWL_DOES_NOT_SUPPORT_RETIREMENT: 0,
+    SIGNALS_NOT_ADMISSIBLE: 0,
+    SUPPRESSION_REFUSED: 0,
+  };
+  let proposed = 0;
+  let returned = 0;
+  let stillCovered = 0;
+  for (const decision of decisions) {
+    if (decision.proposed) {
+      proposed += 1;
+      returned += decision.proposal.denominator.surfacesReturnedToUncovered.length;
+      stillCovered += decision.proposal.denominator.surfacesStillCovered.length;
+    } else {
+      refused[decision.refusal] += 1;
+    }
+  }
+
+  const tallies: SuppressionTally[] =
+    proposed > 0
+      ? [{ kind: 'RETIREMENT', suppressions: proposed, suppressed: proposed, expired: 0 }]
+      : [];
+  const suppressions = summariseSuppressions(tallies);
+
+  const refusalParts = RETIREMENT_REFUSALS.filter((kind) => refused[kind] > 0).map(
+    (kind) => `${refused[kind]} ${kind}`,
+  );
+
+  return {
+    proposed,
+    refused,
+    surfacesReturnedToUncovered: returned,
+    surfacesStillCovered: stillCovered,
+    suppressions,
+    disclosure:
+      `${proposed} retirement(s) proposed for review` +
+      (proposed > 0
+        ? `, which would return ${returned} surface(s) to UNCOVERED (${stillCovered} stay covered by another test). The coverage percentage goes DOWN, not up.`
+        : '.') +
+      (refusalParts.length > 0 ? ` ${refusalParts.join(', ')} refused.` : ''),
+  };
 }
