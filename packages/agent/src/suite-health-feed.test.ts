@@ -73,14 +73,42 @@ function weak(over: Partial<SuiteHealthReport['weakAssertions'][number]> = {}) {
   };
 }
 
+/**
+ * An EMPTY REAL REPORT, from the shipped producer, as the base every case below
+ * overrides.
+ *
+ * ── WHY NOT A LITERAL, WHICH IS WHAT THIS WAS ──────────────────────────────
+ *
+ * This builder used to return a four-field object literal ending in
+ * `as unknown as SuiteHealthReport`, and that double cast is precisely a
+ * compiler instruction to stop checking the thing that then broke: when
+ * `findSharedSetup` added the required `sharedSetupClusters` — which
+ * `refactorFeed` iterates — every test in this file kept TYPECHECKING and nine
+ * of them failed at run time with `report.sharedSetupClusters is not iterable`.
+ * A hand-maintained literal has to be updated by whoever adds a field to the
+ * interface, which is exactly the person who has no reason to open this file.
+ *
+ * `analyzeSuiteHealth({ tests: [] })` cannot drift that way: a field added to
+ * `SuiteHealthReport` arrives here with the value the REAL producer gives it,
+ * so a test over `refactorFeed` ends at the producer the production path runs
+ * rather than at one test's idea of the shape. There is no cast left.
+ */
+const EMPTY_REPORT: SuiteHealthReport = analyzeSuiteHealth({ tests: [] });
+
 function report(over: Partial<SuiteHealthReport> = {}): SuiteHealthReport {
   return {
-    duplicateClusters: [],
-    weakAssertions: [],
-    unanalyzed: [],
-    limits: { duplicateScanComplete: true, duplicateScanNote: null },
+    ...EMPTY_REPORT,
+    /*
+     * `duplicateScanComplete: true` is PINNED and not inherited. An empty suite
+     * has nothing to compare, so the real producer reports the scan as
+     * incomplete with a note saying why — and `refactorFeed` proposes NOTHING
+     * from an incomplete scan, which would make every case below pass for a
+     * reason that has nothing to do with what it is testing. The incomplete
+     * path has its own describe block, over the real `analyzeSuiteHealth`.
+     */
+    limits: { ...EMPTY_REPORT.limits, duplicateScanComplete: true, duplicateScanNote: null },
     ...over,
-  } as unknown as SuiteHealthReport;
+  };
 }
 
 describe('a duplicate cluster', () => {
@@ -276,11 +304,21 @@ describe('the candidate cap', () => {
 describe('an empty report', () => {
   it('proposes nothing and declines nothing, which are different from each other', () => {
     const feed = refactorFeed(report());
+    /*
+     * EXHAUSTIVE on purpose, and it stays exhaustive. `toEqual` over the whole
+     * feed is what noticed `fixtures` and `omitted.fixtures` arriving with
+     * `extractFixture`'s candidate producer, and a third operation added later
+     * has to be listed here too — an empty list and a missing list are the
+     * same to a caller that does `?? []`, which is how a whole operation ships
+     * reaching nothing. Every one of these is an EMPTY list and a ZERO count,
+     * never an absent key.
+     */
     expect(feed).toEqual({
       merges: [],
+      fixtures: [],
       strengthenings: [],
       declined: [],
-      omitted: { merges: 0, strengthenings: 0 },
+      omitted: { merges: 0, fixtures: 0, strengthenings: 0 },
     });
   });
 });

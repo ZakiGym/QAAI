@@ -110,22 +110,36 @@ import {
  */
 import {
   MAX_CORPUS_ROWS,
+  MAX_REFACTOR_CANDIDATES,
   analyzeSuiteHealth,
   correctionFromVersions,
+  extractFixture,
   mergeNearDuplicates,
   refactorBlocked,
   refactorFeed,
+  strengthenAssertions,
   summariseCorpus,
+  verifyStrengthening,
 } from '@qaai/agent';
-import type { RefactorContext, RefactorFeed, SuiteHealthReport } from '@qaai/agent';
+import type {
+  AssertionTrial,
+  RefactorContext,
+  RefactorFeed,
+  RefactorOutcome,
+  SuiteHealthReport,
+} from '@qaai/agent';
 import type { OpenHeal, PostCheck } from '@qaai/agent';
 /*
- * The one import still reached by path, and a narrower reason than before:
- * `obsolete.js` is in the package barrel now, but `suite-health.js` is not
- * exported from it. This is TYPE-ONLY, so it is erased at build time and
- * reaches no runtime code across the workspace boundary.
+ * THIS IMPORT USED TO BE A RELATIVE PATH, UNDER A COMMENT THAT WAS FALSE.
+ *
+ * The comment said `suite-health.js` is not exported from the package barrel.
+ * It is — packages/agent/src/index.ts:369 is `export * from './suite-health.js'`
+ * — so the loan the comment justified had already been repaid and the sentence
+ * was the kind a reviewer trusts instead of checking. Type-only either way; now
+ * it goes through the package's own entry point, which is what repo.ts's own
+ * note asks for.
  */
-import type { SuiteHealthTestInput } from '../../../../packages/agent/src/suite-health.js';
+import type { SuiteHealthTestInput } from '@qaai/agent';
 import { effectivePlan, startRun } from '../lib/start-run.js';
 import {
   budgetForEnvironment,
@@ -3467,53 +3481,20 @@ agentRouter.post(
     });
     if (!project) throw notFound('Project');
 
-    const where = {
-      projectId,
-      disabledAt: null,
-      filePath: { not: { startsWith: FIXTURE_PREFIX } },
-    } as const;
-    const tests = await prisma.test.findMany({
-      where,
-      // Deterministic, for the reason the suite-health reading gives: two calls
-      // a second apart must propose the same changes or nothing can be traced.
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      take: MAX_PROPOSAL_TESTS,
-      select: PROPOSAL_TEST_SELECT,
-    });
-
-    const report: SuiteHealthReport = analyzeSuiteHealth({ tests });
-    const feed: RefactorFeed = refactorFeed(report);
-
     /*
-     * The ledger, narrowed to what `RefactorContext` reads. It decides whether
-     * a file the proposal rewrites is one QAAI may rewrite at all — and absence
-     * of a row is UNRECORDED, which is not writable, so a merge over a human's
-     * file is refused rather than proposed.
+     * ONE READ, SHARED WITH THE OTHER TWO OPERATIONS' HANDLERS — see
+     * {@link proposalPass}. The ledger is in it, narrowed to what
+     * `RefactorContext` reads: it decides whether a file the proposal rewrites
+     * is one QAAI may rewrite at all, and absence of a row is UNRECORDED, which
+     * is not writable, so a merge over a human's file is refused rather than
+     * proposed.
+     *
+     * `knownPaths: null`, AND NULL IS NOT EMPTY. Nobody listed the customer's
+     * working tree in this request, so a merge may rewrite a path a test row
+     * already points at and nothing here may invent one. A merge creates no
+     * file, so this costs it nothing.
      */
-    const ledger: ArtifactLedgerEntry[] = (
-      await prisma.generatedArtifact.findMany({
-        where: { projectId },
-        select: { path: true, role: true, ownership: true, contentHash: true, imports: true },
-      })
-    ).map((row) => ({
-      path: row.path,
-      role: row.role,
-      ownership: row.ownership,
-      contentHash: row.contentHash,
-      imports: row.imports,
-    }));
-
-    const ctx: RefactorContext = {
-      digest: (input: string) => createHash('sha256').update(input).digest('hex'),
-      ledger,
-      /*
-       * NULL, AND NULL IS NOT EMPTY. Nobody listed the customer's working tree
-       * in this request, so a merge may rewrite a path a test row already points
-       * at and an extraction may not invent one. The operation decides; this
-       * handler does not pretend to know.
-       */
-      knownPaths: null,
-    };
+    const { tests, report, feed, ctx } = await proposalPass(projectId, null);
 
     const byId = new Map(tests.map((test) => [test.id, test]));
     const stored: Array<{ id: string; kind: string; title: string; paths: string[] }> = [];
@@ -3631,24 +3612,672 @@ agentRouter.post(
       /** Findings `refactorFeed` would not even offer, each with its reason. */
       declined: feed.declined,
       /**
-       * Weak assertions that COULD be strengthened and cannot be proposed from
-       * here: the stronger assertion has to be RUN before anyone may call it a
-       * strengthening, and this handler has no runner.
+       * Weak assertions that COULD be strengthened and are not proposed from
+       * THIS endpoint: the stronger assertion has to be RUN before anyone may
+       * call it a strengthening, and this handler has no runner.
+       *
+       * It is no longer a dead end. `POST .../suite-changes/strengthenings`
+       * takes them, stores the computed rewrite BLOCKED with
+       * STRENGTHENING_UNVERIFIED, and turns a reported trial into a proposal
+       * whose title says whether it passes or fails.
        */
       needsVerification: feed.strengthenings.length,
+      strengtheningsEndpoint: `/projects/${projectId}/suite-changes/strengthenings`,
       /**
-       * Fixture extraction is unavailable in this request, not unimplemented.
-       * It invents a path, so it needs a listing of the customer's working tree
-       * to prove nothing is there — and `null` is not empty.
+       * Fixture extraction is not proposed from THIS endpoint, and the reason is
+       * a fact about this request rather than a gap in the engine: an extraction
+       * invents a path, so it needs a listing of the customer's working tree to
+       * prove nothing is there — and `null` is not empty.
+       *
+       * `.../suite-changes/fixtures` takes that listing. The candidate count is
+       * reported here so the number is visible from the page that found it.
        */
+      extractionCandidates: feed.fixtures.length,
+      extractionEndpoint: `/projects/${projectId}/suite-changes/fixtures`,
       extractionUnavailable:
         'Fixture extraction needs a listing of your working tree to prove the helper path is free: ' +
         'reverting a creation DELETES the file, so a false "nothing was here" would delete a ' +
-        'human’s. Nothing was proposed for it.',
+        'human’s. Nothing was proposed for it HERE — post that listing to ' +
+        `/projects/${projectId}/suite-changes/fixtures.`,
       /** Caps that BIT, as counts. */
       omitted: feed.omitted,
       testsRead: tests.length,
       duplicateScanComplete: report.limits.duplicateScanComplete,
+    });
+  },
+);
+
+// ─── The other two operations of the refactor engine ────────────────────────
+
+/**
+ * THE READ EVERY PROPOSAL PASS MAKES, IN ONE PLACE.
+ *
+ * Three handlers now turn suite-health findings into proposals and each needs
+ * the same four things: the bounded test read, the report, the feed and the
+ * ownership ledger. Spelling that out three times is how the merge route and
+ * the extraction route come to disagree about which tests were eligible — and
+ * the feed's FIFTH refusal (an extraction defers to a merge over the same file)
+ * is only meaningful if both handlers computed the same feed from the same
+ * rows.
+ *
+ * `knownPaths` is the one thing that differs, so it is the only parameter.
+ */
+async function proposalPass(
+  projectId: string,
+  knownPaths: readonly string[] | null,
+): Promise<{
+  tests: ProposalTestRow[];
+  report: SuiteHealthReport;
+  feed: RefactorFeed;
+  ctx: RefactorContext;
+}> {
+  const tests = await readProposalTests(projectId);
+  const report: SuiteHealthReport = analyzeSuiteHealth({ tests });
+  const feed: RefactorFeed = refactorFeed(report);
+
+  const ledger: ArtifactLedgerEntry[] = (
+    await prisma.generatedArtifact.findMany({
+      where: { projectId },
+      select: { path: true, role: true, ownership: true, contentHash: true, imports: true },
+    })
+  ).map((row) => ({
+    path: row.path,
+    role: row.role,
+    ownership: row.ownership,
+    contentHash: row.contentHash,
+    imports: row.imports,
+  }));
+
+  return {
+    tests,
+    report,
+    feed,
+    ctx: {
+      digest: (input: string) => createHash('sha256').update(input).digest('hex'),
+      ledger,
+      knownPaths,
+    },
+  };
+}
+
+/**
+ * One row of that read, named so the engine's own input type can be asserted
+ * against it.
+ *
+ * `satisfies SuiteHealthTestInput` is the load-bearing part and the reason this
+ * alias exists rather than a cast at each call site: dropping a column from
+ * `PROPOSAL_TEST_SELECT` becomes a compile error here instead of an `undefined`
+ * that the analysis reads as a test with no code. A cast would have accepted
+ * exactly that.
+ */
+type ProposalTestRow = Awaited<ReturnType<typeof readProposalTests>>[number];
+
+function readProposalTests(projectId: string) {
+  return prisma.test.findMany({
+    where: {
+      projectId,
+      disabledAt: null,
+      filePath: { not: { startsWith: FIXTURE_PREFIX } },
+    },
+    // Deterministic, for the reason the suite-health reading gives: two calls
+    // a second apart must propose the same changes or nothing can be traced.
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    take: MAX_PROPOSAL_TESTS,
+    select: PROPOSAL_TEST_SELECT,
+  });
+}
+
+/**
+ * The compile-time proof that the bounded read above supplies exactly what the
+ * analysis needs. See {@link ProposalTestRow}.
+ */
+const PROPOSAL_ROW_IS_ANALYSABLE = (row: ProposalTestRow): SuiteHealthTestInput => row;
+
+/**
+ * Store one outcome's proposal, through the validator the write path runs.
+ *
+ * Lifted out of the merge handler unchanged in meaning: `suiteChangeProposalSchema`
+ * delegates to `proposalProblems`, which refuses a revert record that misses a
+ * file the proposal changes and one that claims prior bytes for a file it
+ * creates. A refusal here is a bug in the engine and is logged WITH ITS NAME.
+ *
+ * `paths` comes from the REVERT RECORD and not from `after`, because the revert
+ * record is the authority on which paths the proposal touches — deriving the
+ * index from `after` would let a row be findable by a different set of paths
+ * than the one that can be put back.
+ */
+async function storeProposal(args: {
+  readonly orgId: string;
+  readonly projectId: string;
+  readonly testIds: readonly string[];
+  readonly outcome: RefactorOutcome;
+  /**
+   * The state to store. PROPOSED for a proposal a human may decide on, BLOCKED
+   * for one the world refused — `APPLYABLE_STATES` says false for both, so this
+   * chooses what the queue SAYS and never whether a write may happen.
+   */
+  readonly state: 'PROPOSED' | 'BLOCKED';
+  readonly blockedReason: string | null;
+}): Promise<
+  | { stored: { id: string; kind: string; state: string; title: string; paths: string[] } }
+  | { problems: string[] }
+> {
+  const { outcome } = args;
+  if (outcome.proposal === null) {
+    return {
+      problems: outcome.problems.map((problem) => `${problem.kind}: ${problem.why}`),
+    };
+  }
+  const parsed = suiteChangeProposalSchema.safeParse(outcome.proposal);
+  if (!parsed.success) {
+    logger.warn(
+      {
+        projectId: args.projectId,
+        testIds: args.testIds,
+        kind: outcome.kind,
+        issue: parsed.error.issues[0]?.message,
+        /*
+         * THE ZOD PATH, NEVER THE VALUE. The value at a refused path is the
+         * customer's own file content or their file path, and both are
+         * customer-authored text that must not reach a log line.
+         */
+        path: parsed.error.issues[0]?.path,
+        problems: proposalProblems(outcome.proposal).map((problem) => problem.kind),
+      },
+      'a refactor proposal was refused by suiteChangeProposalSchema and not stored',
+    );
+    return {
+      problems: [`SCHEMA_REFUSED: ${parsed.error.issues[0]?.message ?? 'unknown reason'}`],
+    };
+  }
+
+  const row = await prisma.suiteChangeProposal.create({
+    data: {
+      orgId: args.orgId,
+      projectId: args.projectId,
+      kind: parsed.data.kind,
+      state: args.state,
+      title: parsed.data.title,
+      rationale: parsed.data.rationale,
+      before: parsed.data.before,
+      after: parsed.data.after,
+      paths: parsed.data.revert.paths,
+      dependentTestIds: parsed.data.dependentTestIds,
+      dependentPaths: parsed.data.dependentPaths,
+      revert: parsed.data.revert,
+      ...(args.blockedReason === null ? {} : { blockedReason: args.blockedReason }),
+    },
+    select: { id: true, kind: true, state: true, title: true, paths: true },
+  });
+  return { stored: row };
+}
+
+/**
+ * How many paths one request may claim are in the working tree.
+ *
+ * A listing, not a repository: large enough for a real monorepo's test tree and
+ * small enough that the request cannot be used to push a hundred megabytes
+ * through a JSON body. A listing longer than this is REFUSED rather than
+ * truncated, because a truncated listing is a listing that says a path is free
+ * when it is not — which is the one error this input exists to prevent.
+ */
+const MAX_TREE_LISTING_PATHS = 20_000;
+
+/** The longest single path in that listing. Git's own limit is far below this. */
+const MAX_TREE_LISTING_PATH_CHARS = 400;
+
+const treeListingSchema = z.object({
+  /**
+   * EVERY repo-relative path that exists in the caller's working tree.
+   *
+   * ── WHY THE CALLER SUPPLIES THIS AND WHY THAT IS SAFE ─────────────────────
+   *
+   * `extractFixture` is the only operation that CREATES a file, so it is the
+   * only one that records `{ existed: false }` — the claim that licenses a
+   * revert to DELETE. The claim needs a fact, and an HTTP handler materialises
+   * no checkout, so the fact has to arrive with the request. The caller that
+   * has a checkout is the CLI or the GitHub app, and producing this is a
+   * directory listing: no model, no network from here.
+   *
+   * It is customer-authored text and it is treated as such. It NEVER decides
+   * where anything is written — `extractFixture` computes the helper path from
+   * the canonical test's own directory — it can only ADD refusals, and the
+   * handler unions it with the paths QAAI's own rows already prove are
+   * occupied, so under-reporting cannot buy a path our records say is taken.
+   *
+   * The dangerous direction is a listing that is too SMALL, and an empty one is
+   * the limit case. That is why the handler requires the listing to contain the
+   * spec file the cluster lives in: a tree holding the tests we just read
+   * cannot be a tree that does not hold their file, so a listing that omits it
+   * is not a listing of this tree and is refused by name.
+   */
+  treeListing: z
+    .array(z.string().min(1).max(MAX_TREE_LISTING_PATH_CHARS))
+    .max(MAX_TREE_LISTING_PATHS),
+});
+
+/**
+ * EXTRACT A SHARED SETUP BLOCK INTO A FIXTURE.
+ *
+ * ── WHAT WAS WRONG BEFORE THIS HANDLER ────────────────────────────────────
+ *
+ * `extractFixture` had NO production caller and no candidate producer: the
+ * merge route reported it `extractionUnavailable`, and `RefactorFeed` declared
+ * no `fixtures` member, so nothing anywhere in the product could even name a
+ * cluster of tests that share setup. Both halves are fixed — `findSharedSetup`
+ * produces the clusters and this handler runs the operation.
+ *
+ * ── THE ONE PRECONDITION, AND IT IS NOT OPTIONAL ──────────────────────────
+ *
+ * This is the only operation that creates a file. Its revert entry is
+ * `{ existed: false }`, and reverting that DELETES the file — so the claim must
+ * be checked against a listing of the working tree. `null` is not empty: with
+ * no listing the engine refuses with TREE_UNKNOWN, which is what this endpoint
+ * returns when `treeListing` is absent. Nothing is guessed.
+ */
+agentRouter.post(
+  '/projects/:projectId/suite-changes/fixtures',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    /*
+     * An ABSENT listing is a different answer from an empty one, and both are
+     * answered honestly. Absent → `knownPaths: null` → the engine's own
+     * TREE_UNKNOWN refusal, with its own sentence. Present-but-wrong is caught
+     * per candidate below.
+     */
+    const hasListing = req.body !== null && typeof req.body === 'object' && 'treeListing' in req.body;
+    let claimed: readonly string[] | null = null;
+    if (hasListing) {
+      const parsed = treeListingSchema.safeParse(req.body);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        /*
+         * THE PATH, NOT THE VALUE. A rejected entry of this array is a
+         * customer-authored file path; echoing it would put their text into an
+         * error body and from there into whatever logs it.
+         */
+        throw badRequest(
+          `treeListing is not a list of repo-relative paths: ${issue?.message ?? 'invalid'} at ${(issue?.path ?? []).join('.') || 'treeListing'}`,
+        );
+      }
+      claimed = parsed.data.treeListing;
+    }
+
+    const { tests, report, feed, ctx: baseCtx } = await proposalPass(projectId, null);
+
+    /*
+     * THE UNION, AND IT ONLY EVER GROWS THE OCCUPIED SET.
+     *
+     * Every path QAAI's own rows prove is taken is added to whatever the caller
+     * claimed: the ledger's artifacts and the file of every test in this read.
+     * A caller that under-reports its tree therefore still cannot be handed a
+     * path our records say is occupied. It cannot work the other way round — a
+     * bigger set can only cause more refusals — which is why this is a union
+     * and not a cross-check.
+     */
+    const ourOccupied = [
+      ...baseCtx.ledger!.map((entry) => entry.path),
+      ...tests.map((test) => test.filePath),
+    ];
+    const claimedSet = claimed === null ? null : new Set(claimed);
+    const knownPaths = claimedSet === null ? null : [...new Set([...claimedSet, ...ourOccupied])];
+    const pathsAddedFromOurRecords =
+      claimedSet === null || knownPaths === null ? 0 : knownPaths.length - claimedSet.size;
+    const ctx: RefactorContext = { ...baseCtx, knownPaths };
+
+    const byId = new Map(tests.map((test) => [test.id, test]));
+    const stored: Array<{ id: string; kind: string; state: string; title: string; paths: string[] }> = [];
+    const refused: Array<{ testIds: readonly string[]; problems: string[] }> = [];
+
+    for (const candidate of feed.fixtures) {
+      const candidates = candidate.testIds
+        .map((id) => byId.get(id))
+        .filter((test): test is ProposalTestRow => test !== undefined)
+        .map((test) => ({ test: PROPOSAL_ROW_IS_ANALYSABLE(test) }));
+      if (candidates.length !== candidate.testIds.length) {
+        refused.push({
+          testIds: candidate.testIds,
+          problems: [
+            `only ${candidates.length} of ${candidate.testIds.length} cluster members were inside this request's ${MAX_PROPOSAL_TESTS}-test read, and hoisting the setup of a subset leaves the copies behind`,
+          ],
+        });
+        continue;
+      }
+
+      /*
+       * THE LISTING HAS TO BE A LISTING OF **THIS** TREE.
+       *
+       * A tree that holds these tests cannot be a tree that does not hold their
+       * file. So a listing missing it is not under-reported, it is the wrong
+       * listing — an empty array, a listing of a different checkout, a caller
+       * that sent `[]` because it had nothing handy. Proceeding would let the
+       * extraction claim `{ existed: false }` for a helper path nobody checked,
+       * and the revert of that claim deletes whatever is there.
+       */
+      const missing = candidate.filePaths.filter((path) => !claimedSet?.has(path));
+      if (claimedSet !== null && missing.length > 0) {
+        refused.push({
+          testIds: candidate.testIds,
+          problems: [
+            `TREE_LISTING_NOT_OF_THIS_TREE: the listing is missing ${missing.length} of the ` +
+              `${candidate.filePaths.length} file(s) these tests live in, so it is not a listing ` +
+              'of the tree they are in. An extraction records that the helper path was empty, and ' +
+              'reverting that claim DELETES the file — the claim is not made off a listing that ' +
+              'cannot see the specs beside it.',
+          ],
+        });
+        continue;
+      }
+
+      const outcome = extractFixture({ candidates, finding: candidate.finding }, ctx);
+      if (refactorBlocked(outcome) || outcome.proposal === null) {
+        refused.push({
+          testIds: candidate.testIds,
+          problems: outcome.problems.map((problem) => `${problem.kind}: ${problem.why}`),
+        });
+        continue;
+      }
+
+      const result = await storeProposal({
+        orgId: actor.orgId,
+        projectId,
+        testIds: candidate.testIds,
+        outcome,
+        state: 'PROPOSED',
+        blockedReason: null,
+      });
+      if ('stored' in result) stored.push(result.stored);
+      else refused.push({ testIds: candidate.testIds, problems: result.problems });
+    }
+
+    await audit({
+      actor,
+      action: 'suite-changes.extract-fixture',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: {
+        proposed: stored.length,
+        refused: refused.length,
+        candidates: feed.fixtures.length,
+        testsRead: tests.length,
+        /*
+         * The SIZE of the listing, never its contents. The count is what makes
+         * "we were handed a tree" auditable; the paths are the customer's.
+         */
+        treeListingPaths: claimed?.length ?? null,
+      },
+    });
+
+    res.json({
+      projectId,
+      proposed: stored,
+      /** Candidates the engine itself refused, each with its named problems. */
+      refused,
+      /**
+       * Findings `refactorFeed` would not offer at all, with their reasons —
+       * including the clusters that are really near-duplicates and the ones
+       * deferring to a merge over the same file.
+       */
+      declined: feed.declined.filter((entry) => entry.operation === 'EXTRACT_FIXTURE'),
+      /** Shared-setup clusters found, as a count beside what was proposed. */
+      candidates: feed.fixtures.length,
+      setupClustersFound: report.totals.sharedSetupClusters,
+      /** Caps that BIT, as counts. */
+      omitted: {
+        candidates: feed.omitted.fixtures,
+        setupClustersNotListed: report.limits.omittedSetupClusters,
+        candidateCap: MAX_REFACTOR_CANDIDATES,
+      },
+      /**
+       * WHERE THE WORKING-TREE FACT CAME FROM. Null means nobody supplied one
+       * and every extraction was refused TREE_UNKNOWN — which is a measurement
+       * of this request, not a claim about the tree.
+       */
+      treeListing:
+        claimed === null
+          ? null
+          : { pathsClaimed: claimed.length, pathsAddedFromOurRecords },
+      testsRead: tests.length,
+      why:
+        claimed === null
+          ? 'No treeListing was supplied, so nothing was proposed. An extraction CREATES a file and ' +
+            'records that nothing was there, which is what lets a revert delete it — QAAI will not ' +
+            'make that claim off an assumption. Send treeListing: a repo-relative listing of your ' +
+            'working tree.'
+          : 'QAAI did not list your tree itself: the listing is yours, and QAAI added every path its ' +
+            'own rows already prove is occupied. The helper path is computed from the canonical ' +
+            'test’s own directory, never from the listing, so the listing can only cause refusals.',
+    });
+  },
+);
+
+/**
+ * One trial result, as reported by whoever ran it.
+ *
+ * NOT a verdict QAAI measured, and the handler says so in every place a human
+ * reads: a stronger assertion has to be EXECUTED, an HTTP handler executes
+ * nothing, and the runner that does is the caller. `why` is required because
+ * `verifyStrengthening` interpolates it into the rationale a reviewer reads —
+ * a verdict with no evidence beside it is the pass that means "we did not
+ * check" wearing a state name.
+ */
+const strengthenTrialSchema = z.object({
+  testId: z.string().min(1).max(64),
+  state: z.enum(['PASSED', 'FAILED', 'UNAVAILABLE']),
+  why: z.string().min(1).max(1_000),
+  /** The runner's own output. Untrusted text: bounded, quoted, never parsed. */
+  detail: z.array(z.string().max(500)).max(20).default([]),
+});
+
+const strengthenRequestSchema = z.object({
+  trials: z.array(strengthenTrialSchema).max(MAX_REFACTOR_CANDIDATES).default([]),
+});
+
+/**
+ * STRENGTHEN A WEAK ASSERTION.
+ *
+ * ── WHAT WAS WRONG BEFORE THIS HANDLER ────────────────────────────────────
+ *
+ * `strengthenAssertions` and `verifyStrengthening` had no production caller.
+ * The merge route counted the candidates in `needsVerification` and offered no
+ * way to act on any of them, so the engine's third operation was reachable only
+ * from its own test file.
+ *
+ * ── UNVERIFIED IS A RECORD, NOT A PROPOSAL ────────────────────────────────
+ *
+ * With no trial, `strengthenAssertions` returns `proposal: null` and
+ * `STRENGTHENING_UNVERIFIED`, and this handler stores the rewrite it DID
+ * compute at state BLOCKED with that reason. The row exists so a human can see
+ * the work and send it to a runner; `APPLYABLE_STATES.BLOCKED` is false, so it
+ * is not a write that someone can approve by accident.
+ *
+ * ── PASSES AND FAILS ARE DIFFERENT PROPOSALS, AND BOTH ARE STORED ─────────
+ *
+ * PASSED is a tidy-up and its title says it passes. FAILED is a FINDING and its
+ * title says it fails: `STRENGTHENING_FAILED` is the one non-blocking problem
+ * in the engine precisely so the proposal reaches a human, because a weak
+ * assertion that was hiding a real defect is the most valuable thing this
+ * engine produces. Suppressing it would be a failure suppressed without being
+ * counted. UNAVAILABLE blocks, exactly as never having asked does.
+ */
+agentRouter.post(
+  '/projects/:projectId/suite-changes/strengthenings',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const projectId = String(req.params.projectId);
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    const input = strengthenRequestSchema.parse(req.body ?? {});
+    const reported = new Map(input.trials.map((trial) => [trial.testId, trial]));
+
+    /*
+     * `knownPaths: null` and that is not a gap here: a strengthening creates
+     * nothing. It only ever rewrites a path a test row already points at, so
+     * TREE_UNKNOWN cannot fire and a tree listing would be a field nobody reads
+     * — which is its own small lie.
+     */
+    const { tests, feed, ctx } = await proposalPass(projectId, null);
+
+    const byId = new Map(tests.map((test) => [test.id, test]));
+    const stored: Array<{ id: string; kind: string; state: string; title: string; paths: string[] }> = [];
+    const refused: Array<{ testIds: readonly string[]; problems: string[] }> = [];
+    const trialStates: Record<AssertionTrial['state'], number> = {
+      PASSED: 0,
+      FAILED: 0,
+      UNAVAILABLE: 0,
+    };
+    /** Weaknesses the engine SAW and would not guess a fix for. Reported, never silent. */
+    const notStrengthened: Array<{ testId: string; line: number | null; why: string }> = [];
+
+    for (const candidate of feed.strengthenings) {
+      const test = byId.get(candidate.testId);
+      if (test === undefined) {
+        refused.push({
+          testIds: [candidate.testId],
+          problems: [
+            `the test this finding is about was outside this request's ${MAX_PROPOSAL_TESTS}-test read`,
+          ],
+        });
+        continue;
+      }
+      const subject = { test: PROPOSAL_ROW_IS_ANALYSABLE(test) };
+      const trial = reported.get(candidate.testId);
+
+      const outcome =
+        trial === undefined
+          ? strengthenAssertions({ subject, finding: candidate.finding }, ctx)
+          : await verifyStrengthening({ subject, finding: candidate.finding }, ctx, async () => ({
+              state: trial.state,
+              why: trial.why,
+              /*
+               * OUR OWN SENTENCE FIRST. `verifyStrengthening` appends `detail`
+               * to the rationale a reviewer reads, and that rationale must not
+               * present a reported verdict as QAAI's own measurement. The
+               * runner's lines follow it, bounded by the schema and quoted
+               * rather than parsed.
+               */
+              detail: [
+                'VERDICT SOURCE: reported to the QAAI API by whoever ran this assertion. QAAI did ' +
+                  'not execute this trial itself and is repeating the verdict it was given.',
+                ...trial.detail,
+              ],
+            }));
+
+      trialStates[outcome.trial?.state ?? 'UNAVAILABLE'] += 1;
+      for (const item of outcome.notStrengthened) {
+        notStrengthened.push({ testId: candidate.testId, line: item.line, why: item.why });
+      }
+
+      /*
+       * The proposal is withheld when something blocks, and `pending` is the
+       * rewrite that was computed anyway. Storing it BLOCKED is what turns "we
+       * computed a strengthening and nobody ran it" from a number in a response
+       * body into a row a human can act on.
+       */
+      const blocking = outcome.problems.filter((problem) => problem.kind !== 'STRENGTHENING_FAILED');
+      if (outcome.proposal === null) {
+        if (outcome.pending === null) {
+          refused.push({
+            testIds: [candidate.testId],
+            problems: outcome.problems.map((problem) => `${problem.kind}: ${problem.why}`),
+          });
+          continue;
+        }
+        const result = await storeProposal({
+          orgId: actor.orgId,
+          projectId,
+          testIds: [candidate.testId],
+          outcome: { ...outcome, proposal: outcome.pending },
+          state: 'BLOCKED',
+          blockedReason: blocking.map((problem) => `${problem.kind}: ${problem.why}`).join(' | '),
+        });
+        if ('stored' in result) stored.push(result.stored);
+        else refused.push({ testIds: [candidate.testId], problems: result.problems });
+        continue;
+      }
+
+      const result = await storeProposal({
+        orgId: actor.orgId,
+        projectId,
+        testIds: [candidate.testId],
+        outcome,
+        state: 'PROPOSED',
+        /*
+         * A FAILING strengthening is stored as a PROPOSED row — a finding a
+         * human must read — and the non-blocking problem is recorded beside it
+         * so the queue does not have to re-derive it from the title.
+         */
+        blockedReason:
+          outcome.trial?.state === 'FAILED'
+            ? outcome.problems
+                .filter((problem) => problem.kind === 'STRENGTHENING_FAILED')
+                .map((problem) => `${problem.kind}: ${problem.why}`)
+                .join(' | ')
+            : null,
+      });
+      if ('stored' in result) stored.push(result.stored);
+      else refused.push({ testIds: [candidate.testId], problems: result.problems });
+    }
+
+    await audit({
+      actor,
+      action: 'suite-changes.strengthen',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: {
+        proposed: stored.length,
+        refused: refused.length,
+        candidates: feed.strengthenings.length,
+        trialsReported: input.trials.length,
+        trialStates,
+        testsRead: tests.length,
+      },
+    });
+
+    res.json({
+      projectId,
+      proposed: stored,
+      refused,
+      declined: feed.declined.filter((entry) => entry.operation === 'STRENGTHEN_ASSERTION'),
+      candidates: feed.strengthenings.length,
+      /**
+       * How many candidates still have no verdict. The merge route's own
+       * `needsVerification` number, now with somewhere to send it.
+       */
+      needsVerification: trialStates.UNAVAILABLE,
+      /** What the trials said, by state. A reported verdict, counted per state. */
+      trialStates,
+      /**
+       * Weaknesses the engine could SEE and will not guess a fix for — a
+       * transport-only assertion, a volatile expected value. Reported, because
+       * "we can see the weakness and cannot derive the fix" is the honest
+       * answer and silence would read as there being nothing there.
+       */
+      notStrengthened,
+      omitted: { candidates: feed.omitted.strengthenings, candidateCap: MAX_REFACTOR_CANDIDATES },
+      testsRead: tests.length,
+      why:
+        'A strengthening is never applied unverified: with no trial the rewrite is stored BLOCKED ' +
+        'with STRENGTHENING_UNVERIFIED, and APPLYABLE_STATES has exactly one true key, which is ' +
+        'APPROVED. A trial that FAILS is still stored, and its title says it fails — a stronger ' +
+        'assertion going red is frequently a defect QAAI just found, and suppressing it would be a ' +
+        'failure suppressed without being counted. QAAI does not run these trials itself; the ' +
+        'verdict is the one it was reported.',
     });
   },
 );

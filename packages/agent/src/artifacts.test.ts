@@ -176,12 +176,21 @@ const plan = (over: Partial<Parameters<typeof planArtifacts>[0]> = {}) =>
 const kinds = (problems: readonly { kind: string }[]): string[] => problems.map((p) => p.kind);
 
 describe('vocabulary parity: the run-time half', () => {
-  it('PATH_SOURCE_IS_THEIR_CONVENTION decides every source, and only one is ours', () => {
+  it('PATH_SOURCE_IS_THEIR_CONVENTION decides every source, and the ecosystem ones are ours', () => {
     expect(Object.keys(PATH_SOURCE_IS_THEIR_CONVENTION).sort()).toEqual([...PATH_SOURCES].sort());
     const ours = Object.entries(PATH_SOURCE_IS_THEIR_CONVENTION)
       .filter(([, theirs]) => !theirs)
-      .map(([source]) => source);
-    expect(ours).toEqual(['ECOSYSTEM_DEFAULT']);
+      .map(([source]) => source)
+      .sort();
+    /*
+     * TWO sources are ours, not one, and the second is the interesting one:
+     * `ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE` is the directory QAAI chose
+     * after READING their layout and refusing to follow it, so reporting it as
+     * their convention would claim a layout match that was deliberately not
+     * made. Still an exact list: a measured source that turned up here would
+     * mean a guess was about to be reported as a measurement.
+     */
+    expect(ours).toEqual(['ECOSYSTEM_DEFAULT', 'ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE']);
   });
 
   it.each([
@@ -257,6 +266,84 @@ describe('the paths are theirs, not ours', () => {
     expect(fromEcosystem.source).toBe('ECOSYSTEM_DEFAULT');
     // And this one is a guess, which the record says out loud.
     expect(PATH_SOURCE_IS_THEIR_CONVENTION[fromEcosystem.source]).toBe(false);
+  });
+
+  /*
+   * ── A LEARNED OR RECORDED ROOT IS EVIDENCE, NEVER PERMISSION ──────────────
+   *
+   * Both branches above used to be followed unconditionally, and the
+   * consequence was reproduced end to end rather than imagined: `learnStyle`
+   * over four files at `.github/workflows/tests/*` left
+   * `fileLayout.root = ".github/workflows/tests"` at MEDIUM confidence, which
+   * `CONFIDENCE_IS_USABLE` calls usable, and this function returned
+   * `.github/workflows/tests/pages` for a PAGE_OBJECT — a destination the same
+   * `destinationDecision` the admission gate consults REFUSES, asked by nobody
+   * on this path.
+   *
+   * The learner now skips those files, so the profile below is hand-built
+   * deliberately: a `Project.styleProfile` computed before that guard existed
+   * is still in the database, and a profile is not re-derived on read. This is
+   * the second line of the same defence, and it has to hold on its own.
+   */
+  const poisonedProfile = profileWith({
+    fileLayout: observed({
+      value: { root: 'node_modules/@acme/suite', filename: '{name}.spec.ts', colocated: false },
+      filesSeen: 18,
+      filesConsidered: 20,
+    }),
+  });
+
+  it('discards a profile root it may never write into, and does not report it as their convention', () => {
+    const decision = directoryForRole({
+      role: 'PAGE_OBJECT',
+      profile: poisonedProfile,
+      ledger: [],
+      ecosystemId: 'PLAYWRIGHT_TS',
+      item,
+    });
+
+    expect(decision.directory).not.toContain('node_modules');
+    expect(decision.directory).toBe('checkout/pages');
+    /*
+     * AND THE FALL-THROUGH IS DISCLOSED. `ECOSYSTEM_DEFAULT` would say "nobody
+     * measured this repository", which is false and is the sentence a reviewer
+     * would trust: a layout WAS measured and QAAI refused to follow it.
+     */
+    expect(decision.source).toBe('ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE');
+    expect(PATH_SOURCE_IS_THEIR_CONVENTION[decision.source]).toBe(false);
+  });
+
+  /*
+   * THE LEDGER SIBLING IS GUARDED TOO, and that is not belt-and-braces: a
+   * ledger row is a RECORDED fact, which is exactly what rule 11 says ownership
+   * must be — and a recorded row pointing into a cache is still a row QAAI must
+   * not follow. The ledger branch runs FIRST, so an unguarded one would win
+   * over the guarded profile branch below it.
+   */
+  it('discards a ledger sibling it may never write into, even though the ledger is the strongest signal', () => {
+    const decision = directoryForRole({
+      role: 'PAGE_OBJECT',
+      profile: theirLayout,
+      ledger: [ledgerEntry({ path: 'packages/web/.cache/pages/cart.page.ts' })],
+      ecosystemId: 'PLAYWRIGHT_TS',
+      item,
+    });
+
+    expect(decision.directory).not.toContain('.cache');
+    // The profile is clean here, so the refusal falls through to IT and not to
+    // the ecosystem — a refused row must not also discard a usable profile.
+    expect(decision).toEqual({ directory: 'e2e/specs/pages', source: 'STYLE_PROFILE' });
+  });
+
+  it('still follows a clean profile root, so the guard is not a blanket refusal', () => {
+    const decision = directoryForRole({
+      role: 'PAGE_OBJECT',
+      profile: theirLayout,
+      ledger: [],
+      ecosystemId: 'PLAYWRIGHT_TS',
+      item,
+    });
+    expect(decision).toEqual({ directory: 'e2e/specs/pages', source: 'STYLE_PROFILE' });
   });
 
   it('breaks a tie between two ledger directories the same way on every run', () => {

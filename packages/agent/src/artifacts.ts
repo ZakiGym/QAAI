@@ -18,7 +18,11 @@
  * "this was not written here". So the layout is DECIDED, from evidence, in this
  * order: where QAAI's own ledger already puts that role, then what the style
  * profile measured about their layout, then — last — the ecosystem default.
- * {@link PlacedArtifact.pathSource} records which of the three answered, and
+ * Every one of those sources is asked `destinationDecision` before it is
+ * followed, so a learned or recorded root is EVIDENCE and never PERMISSION, and
+ * the ecosystem default taken after a refusal is reported as its own source
+ * rather than as "nothing was measured".
+ * {@link PlacedArtifact.pathSource} records which of the four answered, and
  * {@link PATH_SOURCE_IS_THEIR_CONVENTION} records whether that answer was their
  * convention or ours, because the second is a guess and the first is not.
  *
@@ -100,18 +104,21 @@ import {
 } from '@qaai/shared';
 import {
   CONFIDENCE_IS_USABLE,
+  destinationDecision,
   type NamingConvention,
   type StyleProfile,
 } from '@qaai/shared';
 
 /*
- * The two imports above cross the workspace boundary, which is a defect and is
- * recorded as one — the same one `authz-probe.ts` and `page-objects.ts` carry,
- * for the same reason. `packages/shared/src/index.ts` has no
- * `export * from './artifact-set'` or `'./style-profile'`, so neither
- * vocabulary is reachable through `@qaai/shared`. That file belongs to another
- * change in this round; the exact two lines are in this slice's handover, and
- * when they land these become `@qaai/shared`.
+ * Both imports above resolve through the package barrel, and the note that used
+ * to sit here claiming otherwise was WRONG — it said
+ * `packages/shared/src/index.ts` has no `export * from './artifact-set'` or
+ * `'./style-profile'` and that neither vocabulary was reachable through
+ * `@qaai/shared`. Both lines are there (index.ts:236 and :237) and both of
+ * these imports already named `@qaai/shared`, so the comment contradicted the
+ * code directly above it. The same false note was corrected in admission.ts;
+ * this copy survived. Deleting it rather than editing it, because there is no
+ * longer anything to record: the handover it described has landed.
  */
 
 // ─── Caps, each one disclosed where it bites ────────────────────────────────
@@ -135,7 +142,7 @@ export const MAX_REUSE_SCAN_FILES = 500;
 
 // ─── Where a file goes, and who said so ─────────────────────────────────────
 
-/** Which of the three sources decided a path. */
+/** Which of the four sources decided a path. */
 export const PATH_SOURCES = [
   /** QAAI's own ledger already puts this role in a directory. The strongest signal. */
   'LEDGER_SIBLING',
@@ -143,6 +150,18 @@ export const PATH_SOURCES = [
   'STYLE_PROFILE',
   /** Neither said anything, so the ecosystem's own convention decided. */
   'ECOSYSTEM_DEFAULT',
+  /**
+   * EVIDENCE EXISTED AND QAAI REFUSED TO FOLLOW IT, so the ecosystem default
+   * decided instead. A SEPARATE MEMBER FROM `ECOSYSTEM_DEFAULT` on purpose.
+   *
+   * "Nobody measured this repository" and "this repository's measured layout
+   * points somewhere QAAI must never write" produce the same directory and are
+   * not the same fact: the first is a gap a scan closes, the second is a
+   * refusal a human needs to see, because either the repository really does
+   * keep its tests inside CI configuration or something poisoned the scan.
+   * Collapsing them would be a cap applied without being disclosed.
+   */
+  'ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE',
 ] as const;
 export type PathSource = (typeof PATH_SOURCES)[number];
 
@@ -158,6 +177,13 @@ export const PATH_SOURCE_IS_THEIR_CONVENTION = {
   LEDGER_SIBLING: true,
   STYLE_PROFILE: true,
   ECOSYSTEM_DEFAULT: false,
+  /*
+   * FALSE, and it is the interesting `false`. Their convention was read and
+   * then DISCARDED, so the path QAAI chose is its own guess — reporting it as
+   * their convention would claim a layout match that was deliberately not
+   * made.
+   */
+  ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE: false,
 } as const satisfies Record<PathSource, boolean>;
 
 /**
@@ -264,24 +290,55 @@ export function directoryForRole(args: {
     const directory = dirnameOf(entry.path);
     counts.set(directory, (counts.get(directory) ?? 0) + 1);
   }
+  /*
+   * ── A LEARNED ROOT IS EVIDENCE, NEVER PERMISSION ──────────────────────────
+   *
+   * BOTH branches below are asked `destinationDecision` before they are
+   * followed, and `refusedEvidence` records that it happened so the
+   * fall-through is a disclosed refusal rather than a silent "nothing was
+   * measured".
+   *
+   * THE DEFECT THIS PREVENTS, which was reproduced end to end rather than
+   * imagined: `learnStyle` over four files at `.github/workflows/tests/*` left
+   * `fileLayout.root = ".github/workflows/tests"` at MEDIUM confidence, which
+   * `CONFIDENCE_IS_USABLE` calls usable, and this function then returned
+   * `.github/workflows/tests/pages` for a PAGE_OBJECT — a destination the same
+   * `destinationDecision` refuses, asked by nobody on this path. An existing
+   * test file is attacker-influenced input wherever a pull request can be
+   * opened, so "the repository's own convention" is not a sentence that may
+   * authorise a write location on its own.
+   *
+   * THE LEDGER SIBLING IS GUARDED TOO, and that is not belt-and-braces: a
+   * ledger row is a RECORDED fact and a recorded fact pointing into
+   * `node_modules` is still a row QAAI must not follow. One rule, asked of
+   * every source of evidence.
+   */
+  let refusedEvidence = false;
+
   const sibling = [...counts.entries()].sort(
     (a, b) => b[1] - a[1] || byCodeUnit(a[0], b[0]),
   )[0];
-  if (sibling) return { directory: sibling[0], source: 'LEDGER_SIBLING' };
+  if (sibling) {
+    if (destinationDecision({ path: sibling[0] }).verdict !== 'REFUSED') {
+      return { directory: sibling[0], source: 'LEDGER_SIBLING' };
+    }
+    refusedEvidence = true;
+  }
 
   const layout = profile.fileLayout;
   if (CONFIDENCE_IS_USABLE[layout.confidence] && layout.value) {
-    return {
-      directory: joinPath(layout.value.root, ROLE_SUBDIRECTORY[role]),
-      source: 'STYLE_PROFILE',
-    };
+    const directory = joinPath(layout.value.root, ROLE_SUBDIRECTORY[role]);
+    if (destinationDecision({ path: directory }).verdict !== 'REFUSED') {
+      return { directory, source: 'STYLE_PROFILE' };
+    }
+    refusedEvidence = true;
   }
 
   const ecosystem = ECOSYSTEMS[ecosystemId];
   const conventional = ecosystem.path({ feature: item.feature, title: item.title });
   return {
     directory: joinPath(dirnameOf(conventional), ROLE_SUBDIRECTORY[role]),
-    source: 'ECOSYSTEM_DEFAULT',
+    source: refusedEvidence ? 'ECOSYSTEM_DEFAULT_AFTER_REFUSED_EVIDENCE' : 'ECOSYSTEM_DEFAULT',
   };
 }
 

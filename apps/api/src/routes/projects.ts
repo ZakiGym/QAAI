@@ -2,6 +2,8 @@
  * Projects, environments, and the secrets vault (§2).
  */
 
+import { createHash } from 'node:crypto';
+
 import { Router } from 'express';
 import { parse as parseDotenv } from 'dotenv';
 import { z } from 'zod';
@@ -40,6 +42,7 @@ import type {
   FlowMap,
   GitIntegrationKind,
   Language,
+  OwnershipVerdict,
   TestResultStatus,
   UiFramework,
 } from '@qaai/shared';
@@ -57,6 +60,7 @@ import { open as openSecret, seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
 import { pushRepo, repoHttpsUrl } from '../lib/git.js';
+import type { OwnershipRecord, RepoOwnership } from '../lib/git.js';
 import { signInWithProfile } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { canCreateProject, planFor } from '../lib/plan.js';
@@ -1388,12 +1392,119 @@ projectsRouter.get(
 });
 
 /**
+ * The digest `GeneratedArtifact.contentHash` is written with, in one place.
+ *
+ * It MUST be the same function `ledgerRowsFor` uses
+ * (apps/worker/src/processors/generate.ts) — sha256 hex. `RepoOwnership.digest`
+ * exists precisely so the reader supplies its own, because a comparison against
+ * a digest computed by a different function never matches, and that failure is
+ * closed for the WRONG reason: every file on the branch would come back as one
+ * a human had changed.
+ */
+const ledgerDigest = (input: string): string => createHash('sha256').update(input).digest('hex');
+
+/**
+ * THE RECORDED OWNERSHIP LEDGER FOR ONE PROJECT, KEYED THE WAY `pushRepo` ASKS.
+ *
+ * ── WHY THE PUSH ASKS IN A DIFFERENT SPELLING THAN THE LEDGER RECORDS ───────
+ *
+ * `pushRepo` asks `recordFor` about paths AS THE TREE AND THE BRANCH SPELL
+ * THEM, and the ledger records the path THE GENERATOR chose. For PLAYWRIGHT_TS
+ * and PUPPETEER those differ — `checkout/pay.spec.ts` in the ledger,
+ * `tests/checkout/pay.spec.ts` in the tree — so a reader that looked tree paths
+ * up directly would answer `UNRECORDED` for every file in a Playwright project
+ * and the push would refuse every replacement while the ledger claimed all of
+ * them under another name. {@link RepoBuild.ledgerPaths} is the exporter's own
+ * answer to that question, which is why it is passed in here rather than
+ * recomputed.
+ *
+ * ── THE TWO-STEP LOOKUP, AND WHAT MAKES THE SECOND STEP SAFE ───────────────
+ *
+ * A tree path the exporter mapped is looked up under ITS MAPPED LEDGER PATH AND
+ * NOWHERE ELSE: once the exporter has said which row is the recorded fact about
+ * that file, a second candidate is a second answer to "may QAAI write this",
+ * and the permissive one would win by accident.
+ *
+ * Every other path — and in pass 2 that means every tracked file on the branch
+ * that QAAI's tree does not hold — is looked up VERBATIM. That step is what
+ * lets a stale file QAAI wrote on an earlier push still be recognised, and the
+ * reason it cannot be turned into a permission is `replaceDecision`: the
+ * verdict alone authorises nothing, and the recorded `contentHash` must equal
+ * the digest of the bytes actually on the branch. A human's unrelated file that
+ * happens to sit at a path some row names is refused as BYTES_DIVERGED, because
+ * its bytes are not the bytes QAAI recorded writing.
+ *
+ * Nothing is normalised, which is {@link RepoOwnership}'s own rule: a lookup
+ * that helpfully stripped a `./` would make two spellings of one file resolve to
+ * two verdicts.
+ */
+function repoOwnershipFor(args: {
+  readonly rows: readonly {
+    readonly path: string;
+    readonly ownership: OwnershipVerdict;
+    readonly contentHash: string;
+    readonly imports: readonly string[];
+  }[];
+  /** Tree path → ledger path, from {@link buildRepoTree}. */
+  readonly ledgerPaths: ReadonlyMap<string, string>;
+}): { readonly ownership: RepoOwnership; readonly ledgerPathFor: (path: string) => string } {
+  const byPath = new Map(args.rows.map((row) => [row.path, row] as const));
+  const ledgerPathFor = (path: string): string => args.ledgerPaths.get(path) ?? path;
+
+  /** The answer for a path with no row. Never a default of "ours". */
+  const unrecorded: OwnershipRecord = { verdict: 'UNRECORDED', contentHash: null, imports: [] };
+
+  return {
+    ledgerPathFor,
+    ownership: {
+      digest: ledgerDigest,
+      recordFor: (path: string): OwnershipRecord => {
+        const row = byPath.get(ledgerPathFor(path));
+        if (!row) return unrecorded;
+        return {
+          verdict: row.ownership,
+          contentHash: row.contentHash,
+          imports: row.imports,
+        };
+      },
+    },
+  };
+}
+
+/**
  * Push the repo to a connected git remote.
  *
  * ADMIN-only and gated on `confirm: true` — a write to the customer's own repo is
  * never implicit. The token is decrypted here, handed to the push, and dropped;
  * it is never logged, audited, or returned. Failures are reported with the
  * provider's message only after it has been checked for credential material.
+ *
+ * ── THE OWNERSHIP READER AND THE LEDGER REFRESH ARE ONE CHANGE ─────────────
+ *
+ * They cannot be separated, in either direction, and the comment is here rather
+ * than at one of them because the argument is about the pair.
+ *
+ * WITHOUT THE READER this route is CREATE-ONLY. `pushRepo` resolves every path
+ * on the branch `UNRECORDED`, `UNRECORDED` is not writable, and the second push
+ * of a project therefore writes nothing and refuses every file it holds — which
+ * is the correct, safe behaviour for a caller that cannot say what QAAI owns,
+ * and useless as a product.
+ *
+ * WITHOUT THE REFRESH the reader makes things WORSE than create-only.
+ * `contentHash` is written once, by `ledgerRowsFor`, with `skipDuplicates` — so
+ * it holds the digest of the FIRST version QAAI ever generated for that path and
+ * nothing updates it. The first push matches it and writes; the second push then
+ * compares the bytes QAAI ITSELF pushed against that stale hash, they differ,
+ * and `replaceDecision` refuses with BYTES_DIVERGED — "somebody changed this
+ * file" said about a file nobody touched. That is a correct refusal with a false
+ * reason on it, and a false accusation of a human edit is worse than a feature
+ * that plainly does not work yet.
+ *
+ * So the refresh is written in ONE transaction, after the push has committed.
+ * The order is deliberate and the failure direction is the reason: a push that
+ * succeeded and a refresh that did not leaves a stale hash, which refuses the
+ * next write — and a refresh written before a push that then failed would record
+ * bytes that are not on the branch and PERMIT one.
  */
 projectsRouter.post(
   '/:projectId/git/push',
@@ -1440,7 +1551,36 @@ projectsRouter.post(
     integration.id,
   );
 
-  const { tree } = await buildRepoTree({ projectId });
+  const { tree, ledgerPaths } = await buildRepoTree({ projectId });
+
+  /*
+   * The ledger, read ONCE for the whole push. `select` is the narrow projection
+   * `OwnershipRecord` needs and nothing more — `contentHash` is the authority
+   * here and `imports` is read for exactly one thing, the coherence rule in
+   * `PRESERVE_REASONS`. The query carries no `orgId`: it runs inside the
+   * request's tenant scope and the prisma extension adds it, which is the
+   * convention every other read in this router follows.
+   */
+  const ledgerRows = await prisma.generatedArtifact.findMany({
+    where: { projectId },
+    select: { path: true, ownership: true, contentHash: true, imports: true },
+  });
+  const { ownership, ledgerPathFor } = repoOwnershipFor({
+    /*
+     * NO CAST ON `ownership`, deliberately. Prisma's `ArtifactOwnership` has
+     * three members and `OwnershipVerdict` is those three plus `UNRECORDED`, so
+     * the column is already assignable and an assertion here would only hide the
+     * day the two vocabularies stop agreeing — which is the one thing a reader
+     * of this ledger must not be allowed to get wrong silently.
+     */
+    rows: ledgerRows.map((row) => ({
+      path: row.path,
+      ownership: row.ownership,
+      contentHash: row.contentHash,
+      imports: row.imports,
+    })),
+    ledgerPaths,
+  });
 
   let result;
   try {
@@ -1452,6 +1592,7 @@ projectsRouter.post(
       message: input.message ?? `QAAI: sync ${tree.size} test files`,
       authorName: 'QAAI',
       authorEmail: 'bot@qaai.local',
+      ownership,
     });
   } catch (err) {
     // Never surface raw provider output: it can echo the request, and the token
@@ -1466,6 +1607,55 @@ projectsRouter.post(
       metadata: { integrationId: integration.id, branch, reason: safe.slice(0, 200) },
     });
     throw badRequest(`Push failed: ${safe.slice(0, 300)}`);
+  }
+
+  /*
+   * THE OBLIGATION THE PUSH RETURNED, PAID IN ONE TRANSACTION.
+   *
+   * One `updateMany` per written path rather than one `update`: `updateMany`
+   * takes the `(projectId, path)` pair as a filter and matches nothing when no
+   * row claims that path, where `update` would throw on the first unclaimed one
+   * and abandon the refresh for every path after it. A path with no row is a
+   * fact to COUNT, not an error to fail the whole push on — the push has already
+   * committed and cannot be undone by throwing here.
+   *
+   * `refreshed` and `unclaimed` are both reported because 0 refreshed because
+   * nothing was written and 0 refreshed because no row claimed any of it are
+   * different outcomes, and only the pair distinguishes them. `unclaimed` is the
+   * disclosed count {@link RepoBuild.ledgerPaths} promises: every one of those
+   * paths is a file whose next update will be refused, and a refusal nobody was
+   * told about is a failure suppressed without being counted.
+   */
+  let ledgerRefreshed = 0;
+  let ledgerUnclaimed = 0;
+  if (result.ledgerRefresh.length > 0) {
+    const counts = await prisma.$transaction(
+      result.ledgerRefresh.map((entry) => {
+        /*
+         * `bytes` is updated only when the written content is in hand, and
+         * there is no `?? 0`. Every entry's path IS a key of the tree today —
+         * `ledgerRefresh` is built from the paths `pushRepo` wrote — so the
+         * absent branch is unreachable and is written this way anyway: a 0
+         * length recorded for a file whose length was not known is a null that
+         * became a measurement, and `bytes` is the audit trail for exactly
+         * "how big was what we wrote". Leaving the column at its previous value
+         * is the honest answer, and `contentHash` — the one the gate reads — is
+         * refreshed either way.
+         */
+        const written = tree.get(entry.path);
+        return prisma.generatedArtifact.updateMany({
+          where: { projectId, path: ledgerPathFor(entry.path) },
+          data: {
+            contentHash: entry.contentHash,
+            ...(written === undefined ? {} : { bytes: written.length }),
+          },
+        });
+      }),
+    );
+    for (const count of counts) {
+      if (count.count > 0) ledgerRefreshed += count.count;
+      else ledgerUnclaimed += 1;
+    }
   }
 
   await audit({
@@ -1483,16 +1673,18 @@ projectsRouter.post(
        *
        * `fileCount` is the size of QAAI's tree — what the push MEANT to sync —
        * and `pushRepo`'s own doc comment says so. Since ownership gates every
-       * write, it is no longer the number of files that moved: with no
-       * ownership reader supplied every path already on the branch resolves
-       * UNRECORDED and is REFUSED, so a second push of the same project writes
-       * nothing and this row said `files: 40` about it. An audit row is the
-       * only durable record of the push, and one that reports an intent as
-       * though it were a result is a thing reported as measured that was not.
+       * write it is NOT the number of files that moved, and it never was: a
+       * path the ledger does not claim, or claims against bytes a human has
+       * since changed, is refused. An audit row is the only durable record of
+       * the push, and one that reports an intent as though it were a result is
+       * a thing reported as measured that was not.
        *
        * `ownershipKnown` is here for the same reason: 0 written because nothing
        * was permitted and 0 written because nothing had changed are different
-       * outcomes, and only this flag distinguishes them.
+       * outcomes, and only this flag distinguishes them. It is `true` on every
+       * row this route writes now that the reader above is supplied — which is
+       * exactly why it stays, because a row that stopped carrying it could not
+       * be told apart from the create-only pushes already in the table.
        */
       files: result.fileCount,
       filesWritten: result.filesWritten,
@@ -1501,10 +1693,12 @@ projectsRouter.post(
       refused: result.refusedCount,
       kept: result.keptCount,
       ownershipKnown: result.ownershipKnown,
+      ledgerRefreshed,
+      ledgerUnclaimed,
     },
   });
 
-  res.json({ push: result });
+  res.json({ push: result, ledgerRefreshed, ledgerUnclaimed });
 });
 
 

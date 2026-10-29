@@ -1016,3 +1016,83 @@ describe("the schema's own floors and ceilings", () => {
     expectStorable(learned);
   });
 });
+
+/**
+ * A LEARNED ROOT IS EVIDENCE, NEVER PERMISSION.
+ *
+ * `safeRepoPath` refused `..`, absolute paths, `~`, backslashes, drive letters
+ * and control characters, and had NO notion of a directory QAAI must never
+ * write into. So four files at `.github/workflows/tests/*.spec.ts` were read
+ * and counted with NONE skipped, `fileLayout` came back MEDIUM — which
+ * `CONFIDENCE_IS_USABLE` calls usable — with `root: ".github/workflows/tests"`,
+ * and `directoryForRole` placed a page object at
+ * `.github/workflows/tests/pages/login.page.ts`. An existing test file is
+ * attacker-influenced input anywhere a pull request can be opened, and the
+ * conclusion drawn from its PATH is a write location.
+ *
+ * These run the REAL `learnStyle`, so unwiring the predicate from
+ * `safeRepoPath` turns them red rather than changing a mock's expectations.
+ */
+describe('a directory QAAI never writes into is not a convention it may learn', () => {
+  const POISONED = [
+    '.github/workflows/tests/release.spec.ts',
+    '.github/workflows/tests/deploy.spec.ts',
+    '.github/workflows/tests/smoke.spec.ts',
+    '.github/workflows/tests/rollback.spec.ts',
+  ];
+
+  it('refuses to adopt a CI-configuration directory as the test layout root', async () => {
+    const learned = await learnStyle(
+      source(Object.fromEntries(POISONED.map((path) => [path, playwrightSpec('release')]))),
+    );
+
+    // The root is the thing that decides where a generated file goes.
+    expect(learned.profile.fileLayout.value).toBeNull();
+    expect(learned.profile.fileLayout.confidence).toBe('UNKNOWN');
+    expect(learned.profile.filesRead).toBe(0);
+    expectStorable(learned);
+  });
+
+  /*
+   * THE REASON MUST BE THE ONE THAT BIT. `filesSkipped` is reported and not
+   * subtracted, so folding this into UNSAFE_PATH would make a traversal attempt
+   * and a repository that keeps a smoke test in CI configuration read the same
+   * to the human looking at the hole in the denominator.
+   */
+  it('attributes every skip to FORBIDDEN_DIRECTORY rather than to UNSAFE_PATH', async () => {
+    const learned = await learnStyle(
+      source(Object.fromEntries(POISONED.map((path) => [path, playwrightSpec('release')]))),
+    );
+
+    expect(learned.filesSkipped.map((entry) => entry.reason)).toEqual([
+      'FORBIDDEN_DIRECTORY',
+      'FORBIDDEN_DIRECTORY',
+      'FORBIDDEN_DIRECTORY',
+      'FORBIDDEN_DIRECTORY',
+    ]);
+    expect(SKIP_REASON_WHY.FORBIDDEN_DIRECTORY).toContain('never writes into');
+  });
+
+  it.each([
+    ['a dependency tree', 'node_modules/@acme/suite/tests/cart.spec.ts'],
+    ['build output', 'dist/tests/cart.spec.ts'],
+    ['a hidden directory at depth', 'packages/web/.cache/tests/cart.spec.ts'],
+  ])('refuses %s as a source of conventions', async (_what, path) => {
+    expect(safeRepoPath(path)).toBe(false);
+  });
+
+  /*
+   * AND THE PREDICATE IS ASKED WITH NO LAYOUT, SO IT MUST NOT REQUIRE
+   * `ALLOWED`. Every well-formed path comes back UNDECIDED when nothing has
+   * measured the repository — which is the state the learner always runs in,
+   * because it IS the measurement. A `=== 'ALLOWED'` check here would skip
+   * every file in every repository and the learner would read nothing.
+   */
+  it('still reads an ordinary repository, which UNDECIDED must not block', async () => {
+    const learned = await learnStyle(source(playwrightRepo(4, 'e2e')));
+
+    expect(learned.profile.filesRead).toBe(4);
+    expect(learned.filesSkipped).toEqual([]);
+    expect(learned.profile.fileLayout.value?.root).toBe('e2e');
+  });
+});

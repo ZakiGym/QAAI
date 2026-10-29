@@ -24,6 +24,7 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 
 type Row = Record<string, any>;
 
@@ -115,6 +116,7 @@ vi.mock('../middleware/auth.js', async () => {
 
 const express = (await import('express')).default;
 const { agentRouter, MAX_CORPUS_SYNC_TESTS } = await import('./agent.js');
+const { MAX_REFACTOR_CANDIDATES } = await import('@qaai/agent');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 
 const app = express();
@@ -571,6 +573,682 @@ describe('GET /projects/:projectId/artifacts', () => {
   it('says that an absent row is not a permission', async () => {
     const res = await call('/projects/proj_1/artifacts');
     expect(res.body.why).toMatch(/UNRECORDED, which is NOT a permission/);
+  });
+});
+
+// ─── The other two operations of the refactor engine ────────────────────────
+
+/**
+ * Three specs in one directory that walk the same setup and then check
+ * different things.
+ *
+ * ONE TEST PER FILE, which is how this product's rows actually look and why
+ * `findSharedSetup` groups by DIRECTORY: a row's `code` is its whole file, so
+ * two rows at one path share every site the analysis records, and the unit of
+ * extraction is one block in one file with several of them in a directory.
+ */
+function sharedSetupSpec(title: string, assertion: string): string {
+  return `import { test, expect } from '@playwright/test';
+
+test('${title}', async ({ page }) => {
+  await page.goto('/checkout');
+  await page.fill('#coupon', 'SAVE10');
+  await page.click('#apply');
+  ${assertion}
+});
+`;
+}
+
+const TOTAL_SPEC = sharedSetupSpec(
+  'shows the total',
+  "await expect(page.getByTestId('order-total')).toHaveText('$42.00');",
+);
+const DISCOUNT_SPEC = sharedSetupSpec(
+  'shows the discount line',
+  "await expect(page.getByTestId('discount')).toHaveText('-$4.20');",
+);
+const TAX_SPEC = sharedSetupSpec(
+  'shows the tax line',
+  "await expect(page.getByTestId('tax')).toHaveText('$3.50');",
+);
+
+/** A test whose only assertion is that an element exists. EXISTENCE_ONLY. */
+const WEAK_SPEC = `import { test, expect } from '@playwright/test';
+
+test('the pay button is there', async ({ page }) => {
+  await page.goto('/pay');
+  const btn = page.getByRole('button', { name: 'Pay' });
+  await expect(btn).toBeTruthy();
+  await expect(page.getByTestId('error')).toBeTruthy();
+});
+`;
+
+const SETUP_FILES = [
+  { id: 'test_total', name: 'shows the total', filePath: 'tests/checkout/total.spec.ts', code: TOTAL_SPEC },
+  { id: 'test_discount', name: 'shows the discount line', filePath: 'tests/checkout/discount.spec.ts', code: DISCOUNT_SPEC },
+  { id: 'test_tax', name: 'shows the tax line', filePath: 'tests/checkout/tax.spec.ts', code: TAX_SPEC },
+] as const;
+
+/** The helper `extractFixture` computes for this directory. Asserted, not guessed. */
+const HELPER_PATH = 'tests/checkout/checkout.qaai-setup.ts';
+
+function row(over: Row): Row {
+  return {
+    orgId: 'org_1',
+    projectId: 'proj_1',
+    feature: 'checkout',
+    type: 'E2E',
+    priority: 'IMPORTANT',
+    tags: [],
+    spec: null,
+    flakeRate: 0,
+    quarantined: false,
+    consecutiveFailures: 0,
+    disabledAt: null,
+    createdAt: new Date('2026-10-01T00:00:00Z'),
+    updatedAt: new Date('2026-10-02T00:00:00Z'),
+    ...over,
+  };
+}
+
+/** The ledger row that says QAAI owns a spec. Absent, every rewrite is refused. */
+function owned(filePath: string, code: string): Row {
+  return {
+    path: filePath,
+    projectId: 'proj_1',
+    role: 'SPEC',
+    ownership: 'QAAI_OWNED',
+    contentHash: createHash('sha256').update(code).digest('hex'),
+    bytes: code.length,
+    imports: [],
+    humanEditedAt: null,
+    firstWrittenAt: new Date('2026-10-01T00:00:00Z'),
+    lastWrittenAt: new Date('2026-10-01T00:00:00Z'),
+  };
+}
+
+function useSharedSetupSuite(): void {
+  tests = SETUP_FILES.map((file) => row({ ...file }));
+  artifacts = SETUP_FILES.map((file) => owned(file.filePath, file.code));
+}
+
+function useWeakSuite(): void {
+  tests = [
+    row({
+      id: 'test_weak',
+      name: 'the pay button is there',
+      filePath: 'tests/pay/pay.spec.ts',
+      code: WEAK_SPEC,
+      feature: 'pay',
+      priority: 'CRITICAL',
+    }),
+  ];
+  artifacts = [owned('tests/pay/pay.spec.ts', WEAK_SPEC)];
+}
+
+describe('POST /projects/:projectId/suite-changes/fixtures', () => {
+  beforeEach(() => {
+    useSharedSetupSuite();
+  });
+
+  /*
+   * THE WIRING, AND IT IS THE WHOLE POINT. Before this round `extractFixture`
+   * had no production caller AND `RefactorFeed` had no `fixtures` member, so
+   * there was no cluster to hand it even if something had called it. This test
+   * runs the real producer and the real engine through the real route and
+   * requires a stored row: unwire either half and it goes red.
+   */
+  it('turns a shared setup block into a stored proposal', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: SETUP_FILES.map((file) => file.filePath) }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.candidates).toBe(1);
+    expect(res.body.proposed).toHaveLength(1);
+    const proposed = res.body.proposed[0] as Row;
+    expect(proposed.kind).toBe('EXTRACT_FIXTURE');
+    expect(proposed.state).toBe('PROPOSED');
+    // The helper the engine computed, in the one directory every member shares.
+    expect(proposed.paths).toContain(HELPER_PATH);
+    for (const file of SETUP_FILES) expect(proposed.paths).toContain(file.filePath);
+    expect(h.audits.map((entry) => entry.action)).toContain('suite-changes.extract-fixture');
+  });
+
+  /*
+   * THE PRODUCER AND THE ENGINE AGREE ABOUT WHAT A DIRECTORY IS. `directoryOf`
+   * in suite-health.ts and `dirOf` in refactor.ts are separate private
+   * functions, and a disagreement would mean every cluster is excluded
+   * DIFFERENT_DIRECTORY. The proposal above exists only if they agree, and this
+   * asserts the consequence rather than the comment.
+   */
+  it('proposes nothing when the members are in different directories', async () => {
+    tests = [
+      row({ ...SETUP_FILES[0] }),
+      row({ ...SETUP_FILES[1], filePath: 'tests/basket/discount.spec.ts' }),
+      row({ ...SETUP_FILES[2], filePath: 'tests/tax/tax.spec.ts' }),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: tests.map((test) => test.filePath) }),
+    });
+
+    expect(res.body.candidates).toBe(0);
+    expect(res.body.proposed).toEqual([]);
+  });
+
+  /*
+   * NULL IS NOT EMPTY. With no listing the engine refuses TREE_UNKNOWN, and the
+   * response says so rather than reporting zero candidates — a refusal and a
+   * suite with nothing to extract are different facts.
+   */
+  it('refuses every extraction, by name, when nobody said what is in the tree', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', { method: 'POST' });
+
+    expect(res.body.proposed).toEqual([]);
+    expect(res.body.candidates).toBe(1);
+    expect(res.body.treeListing).toBeNull();
+    expect(JSON.stringify(res.body.refused)).toContain('TREE_UNKNOWN');
+    expect(res.body.why).toMatch(/lets a revert delete it/);
+  });
+
+  /*
+   * AN EMPTY LISTING IS THE DANGEROUS CASE AND IT IS CAUGHT. `[]` would make
+   * every path look free, and the extraction would then record "nothing was
+   * here" for a helper path nobody checked. A tree holding these tests cannot
+   * be a tree that does not hold their files, so the listing is refused as not
+   * being of this tree.
+   */
+  it('refuses a listing that cannot see the specs it is supposed to contain', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: [] }),
+    });
+
+    expect(res.body.proposed).toEqual([]);
+    expect(JSON.stringify(res.body.refused)).toContain('TREE_LISTING_NOT_OF_THIS_TREE');
+    expect(JSON.stringify(res.body.refused)).toContain('missing 3 of the 3 file(s)');
+  });
+
+  /*
+   * A FILE ALREADY AT THE HELPER PATH IS NOT OVERWRITTEN. This is the refusal
+   * the listing exists for, and it comes from the engine rather than this
+   * handler.
+   */
+  it('refuses to write over a file already at the helper path', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({
+        treeListing: [...SETUP_FILES.map((file) => file.filePath), HELPER_PATH],
+      }),
+    });
+
+    expect(res.body.proposed).toEqual([]);
+    expect(JSON.stringify(res.body.refused)).toContain('PATH_OCCUPIED');
+  });
+
+  /*
+   * THE UNION IS DISCLOSED AS A COUNT. QAAI adds every path its own rows prove
+   * is occupied, which can only cause more refusals — and a caller needs to
+   * know its listing was not the whole input.
+   */
+  it('says how many paths it added from its own records', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: SETUP_FILES.map((file) => file.filePath) }),
+    });
+
+    expect(res.body.treeListing.pathsClaimed).toBe(3);
+    /*
+     * ZERO here, and that is a measurement: the ledger and the test rows name
+     * exactly the three files the caller already listed. The field matters when
+     * they do not — see the next test.
+     */
+    expect(res.body.treeListing.pathsAddedFromOurRecords).toBe(0);
+    expect(res.body.why).toMatch(/QAAI did not list your tree itself/);
+  });
+
+  it('adds a path our ledger knows about and the listing did not mention', async () => {
+    artifacts = [...artifacts, owned('tests/checkout/old-helper.ts', 'export const x = 1;')];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: SETUP_FILES.map((file) => file.filePath) }),
+    });
+
+    expect(res.body.treeListing.pathsAddedFromOurRecords).toBe(1);
+  });
+
+  /*
+   * A CLUSTER THAT IS REALLY A DUPLICATE GOES BACK TO THE MERGE. Three specs
+   * with identical setup AND identical assertions are near-duplicates;
+   * extracting their setup would tidy tests that should have been one and leave
+   * the duplication in place.
+   */
+  it('declines a cluster whose members assert the same thing, naming the merge', async () => {
+    const identical = "await expect(page.getByTestId('order-total')).toHaveText('$42.00');";
+    tests = SETUP_FILES.map((file, index) =>
+      row({
+        ...file,
+        name: `shows the total ${index}`,
+        code: sharedSetupSpec(`shows the total ${index}`, identical),
+      }),
+    );
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: tests.map((test) => test.filePath) }),
+    });
+
+    expect(res.body.proposed).toEqual([]);
+    expect(res.body.candidates).toBe(0);
+    expect(JSON.stringify(res.body.declined)).toContain('MERGE_NEAR_DUPLICATES is the operation');
+  });
+
+  /*
+   * NO SETUP IS NOT SHARED SETUP. `setupBlockOf` refuses an empty block as
+   * NO_SETUP_BLOCK, so clustering tests whose first statement IS the assertion
+   * would produce a candidate the engine is guaranteed to exclude — a proposal
+   * pass that reports work it could never do.
+   */
+  it('does not cluster tests that have no setup before their first assertion', async () => {
+    const assertionFirst = (title: string, id: string): string =>
+      `import { test, expect } from '@playwright/test';
+
+test('${title}', async ({ page }) => {
+  await expect(page.getByTestId('${id}')).toHaveText('1');
+  await page.goto('/after');
+});
+`;
+    tests = [
+      row({ id: 'test_a', name: 'a', filePath: 'tests/none/a.spec.ts', code: assertionFirst('a', 'x') }),
+      row({ id: 'test_b', name: 'b', filePath: 'tests/none/b.spec.ts', code: assertionFirst('b', 'y') }),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: tests.map((test) => test.filePath) }),
+    });
+
+    expect(res.body.setupClustersFound).toBe(0);
+    expect(res.body.proposed).toEqual([]);
+  });
+
+  /*
+   * NO ASSERTION MEANS NO BOUNDARY. Where the setup ENDS is not knowable, which
+   * is the exclusion `extractFixture` makes by the name NO_ASSERTION_BOUNDARY.
+   * A test with no assertion is already a HIGH weak-assertion finding; it is
+   * not also a fixture candidate.
+   */
+  it('does not cluster tests that make no assertion at all', async () => {
+    const noAssertion = (title: string): string =>
+      `import { test } from '@playwright/test';
+
+test('${title}', async ({ page }) => {
+  await page.goto('/checkout');
+  await page.click('#apply');
+});
+`;
+    tests = [
+      row({ id: 'test_a', name: 'a', filePath: 'tests/na/a.spec.ts', code: noAssertion('a') }),
+      row({ id: 'test_b', name: 'b', filePath: 'tests/na/b.spec.ts', code: noAssertion('b') }),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: tests.map((test) => test.filePath) }),
+    });
+
+    expect(res.body.setupClustersFound).toBe(0);
+    expect(res.body.proposed).toEqual([]);
+  });
+
+  /*
+   * BOTH CAPS THAT BIT, AS COUNTS, AND EACH ONE THE REASON THAT ACTUALLY BIT.
+   *
+   * 101 directories, each with two specs sharing a setup step. Two different
+   * caps fire and they are reported separately because they have different
+   * fixes: the report's payload slice (`MAX_REPORTED_CLUSTERS`, 100) and the
+   * feed's candidate cap (`MAX_REFACTOR_CANDIDATES`, 20). `setupClustersFound`
+   * is the TRUE count and not the length of the sliced list, which is the
+   * substitution a reader cannot detect.
+   */
+  it('discloses the payload slice and the candidate cap as separate counts', async () => {
+    const spec = (dir: number, title: string, target: string): string =>
+      `import { test, expect } from '@playwright/test';
+
+test('${title}', async ({ page }) => {
+  await page.goto('/d${dir}');
+  await expect(page.getByTestId('${target}')).toHaveText('1');
+});
+`;
+    tests = [];
+    for (let dir = 0; dir < 101; dir += 1) {
+      tests.push(
+        row({ id: `t${dir}a`, name: `d${dir} a`, filePath: `tests/d${dir}/a.spec.ts`, code: spec(dir, `d${dir} a`, 'alpha') }),
+        row({ id: `t${dir}b`, name: `d${dir} b`, filePath: `tests/d${dir}/b.spec.ts`, code: spec(dir, `d${dir} b`, 'beta') }),
+      );
+    }
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: tests.map((test) => test.filePath) }),
+    });
+
+    // The TRUE count, not the 100 the payload carries.
+    expect(res.body.setupClustersFound).toBe(101);
+    expect(res.body.omitted.setupClustersNotListed).toBe(1);
+    // And the candidate cap, with its own number and its own limit beside it.
+    expect(res.body.candidates).toBe(MAX_REFACTOR_CANDIDATES);
+    expect(res.body.omitted.candidates).toBe(80);
+    expect(res.body.omitted.candidateCap).toBe(MAX_REFACTOR_CANDIDATES);
+  });
+
+  /*
+   * THE SAME STEPS IN A DIFFERENT ORDER ARE NOT THE SAME SETUP.
+   *
+   * `extractBehavior` records every navigation before every action regardless
+   * of where they are in the file, so the token list is sorted BY LINE back
+   * into source order before it becomes the grouping key. Without that, these
+   * two specs key identically, get clustered, and the engine then excludes one
+   * as SETUP_NOT_IDENTICAL — which reads to a human as the engine being broken
+   * rather than as the cluster being wrong.
+   */
+  it('does not cluster two tests that run the same steps in a different order', async () => {
+    const couponFirst = `import { test, expect } from '@playwright/test';
+
+test('coupon then page', async ({ page }) => {
+  await page.fill('#coupon', 'SAVE10');
+  await page.goto('/checkout');
+  await expect(page.getByTestId('order-total')).toHaveText('$42.00');
+});
+`;
+    const pageFirst = `import { test, expect } from '@playwright/test';
+
+test('page then coupon', async ({ page }) => {
+  await page.goto('/checkout');
+  await page.fill('#coupon', 'SAVE10');
+  await expect(page.getByTestId('discount')).toHaveText('-$4.20');
+});
+`;
+    tests = [
+      row({ id: 'test_a', name: 'coupon then page', filePath: 'tests/checkout/a.spec.ts', code: couponFirst }),
+      row({ id: 'test_b', name: 'page then coupon', filePath: 'tests/checkout/b.spec.ts', code: pageFirst }),
+    ];
+    artifacts = [
+      owned('tests/checkout/a.spec.ts', couponFirst),
+      owned('tests/checkout/b.spec.ts', pageFirst),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({
+        treeListing: ['tests/checkout/a.spec.ts', 'tests/checkout/b.spec.ts'],
+      }),
+    });
+
+    expect(res.body.candidates).toBe(0);
+    expect(res.body.proposed).toEqual([]);
+    expect(res.body.setupClustersFound).toBe(0);
+  });
+
+  /*
+   * SET EQUALITY, BOTH DIRECTIONS. A member whose assertions are a SUBSET of
+   * the first member's is NOT asserting the same thing, and this is the case a
+   * one-way `every` reports as identical — which would decline the cluster as a
+   * near-duplicate and refuse the extraction that should have been offered.
+   *
+   * The mutant this exists for: drop `length === size` from
+   * `assertionsIdentical` in findSharedSetup. 46 tests stayed green without
+   * this one, which is lesson D of this codebase — a presence record and a
+   * run-time check are not interchangeable, and a comparison needs the case
+   * that distinguishes them.
+   */
+  it('offers an extraction when one member asserts a SUBSET of another’s claims', async () => {
+    const both = sharedSetupSpec(
+      'shows the total and the discount',
+      "await expect(page.getByTestId('order-total')).toHaveText('$42.00');\n" +
+        "  await expect(page.getByTestId('discount')).toHaveText('-$4.20');",
+    );
+    const one = sharedSetupSpec(
+      'shows the total',
+      "await expect(page.getByTestId('order-total')).toHaveText('$42.00');",
+    );
+    tests = [
+      row({
+        id: 'test_both',
+        name: 'shows the total and the discount',
+        filePath: 'tests/checkout/both.spec.ts',
+        code: both,
+      }),
+      row({
+        id: 'test_one',
+        name: 'shows the total',
+        filePath: 'tests/checkout/total.spec.ts',
+        code: one,
+      }),
+    ];
+    artifacts = [
+      owned('tests/checkout/both.spec.ts', both),
+      owned('tests/checkout/total.spec.ts', one),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({
+        treeListing: ['tests/checkout/both.spec.ts', 'tests/checkout/total.spec.ts'],
+      }),
+    });
+
+    expect(res.body.candidates).toBe(1);
+    expect(res.body.proposed).toHaveLength(1);
+    // And it was NOT sent back to the merge, which is what the subset would do.
+    expect(JSON.stringify(res.body.declined)).not.toContain('MERGE_NEAR_DUPLICATES is the operation');
+  });
+
+  /*
+   * A TEST WHOSE SOURCE WAS NOT READ COMPLETELY IS NOT IN THE CLUSTER AT ALL.
+   * Rule FOUR, applied at FORMATION: the setup boundary for an unread file is a
+   * guess, and a cluster keyed on a guess is not evidence. It is already in
+   * `unanalyzed` with a reason, so nothing goes missing.
+   */
+  it('leaves a test whose source could not be read out of the cluster', async () => {
+    tests = [
+      row({ ...SETUP_FILES[0] }),
+      row({ ...SETUP_FILES[1] }),
+      // Ends inside an unterminated string, so the file was not fully parsed.
+      row({ ...SETUP_FILES[2], code: `${TAX_SPEC}\nconst oops = 'unterminated` }),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: SETUP_FILES.map((file) => file.filePath) }),
+    });
+
+    expect(res.body.proposed).toHaveLength(1);
+    // Two members, not three: the unread one was never a candidate.
+    expect(res.body.proposed[0].paths).not.toContain(SETUP_FILES[2].filePath);
+    expect(res.body.proposed[0].paths).toContain(SETUP_FILES[0].filePath);
+    expect(res.body.proposed[0].paths).toContain(SETUP_FILES[1].filePath);
+  });
+
+  /*
+   * TWO ROWS AT ONE PATH ARE SET ASIDE AND NAMED. The setup boundary is the
+   * file's first assertion, so a second block in that file would be described
+   * by the first block's evidence. Declined rather than described wrongly.
+   */
+  it('names the rows it set aside because their file holds more than one test', async () => {
+    tests = [
+      ...SETUP_FILES.map((file) => row({ ...file })),
+      row({
+        id: 'test_second_block',
+        name: 'and the shipping line',
+        filePath: SETUP_FILES[0].filePath,
+        code: TOTAL_SPEC,
+      }),
+    ];
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: SETUP_FILES.map((file) => file.filePath) }),
+    });
+
+    expect(JSON.stringify(res.body.declined)).toContain('more than one');
+    expect(JSON.stringify(res.body.declined)).toContain(SETUP_FILES[0].filePath);
+  });
+
+  /*
+   * A REFUSED LISTING NEVER ECHOES THE PATH IT REFUSED. The entries are
+   * customer-authored text; the error names the zod path and the rule.
+   */
+  it('refuses a malformed listing without quoting the customer’s path back', async () => {
+    const res = await call('/projects/proj_1/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: ['x'.repeat(5_000)] }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).toContain('treeListing');
+    expect(JSON.stringify(res.body)).not.toContain('x'.repeat(100));
+  });
+
+  it('404s for a project that does not exist', async () => {
+    h.db = { ...h.db, project: { findUnique: async () => null } };
+    const res = await call('/projects/nope/suite-changes/fixtures', {
+      method: 'POST',
+      body: JSON.stringify({ treeListing: [] }),
+    });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('POST /projects/:projectId/suite-changes/strengthenings', () => {
+  beforeEach(() => {
+    useWeakSuite();
+  });
+
+  /*
+   * THE WIRING. `strengthenAssertions` had no production caller; the merge
+   * route counted the candidates and offered no way to act on any of them.
+   */
+  it('stores the computed rewrite BLOCKED when nobody has run it', async () => {
+    const res = await call('/projects/proj_1/suite-changes/strengthenings', { method: 'POST' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.candidates).toBe(1);
+    expect(res.body.proposed).toHaveLength(1);
+    const proposed = res.body.proposed[0] as Row;
+    expect(proposed.kind).toBe('STRENGTHEN_ASSERTION');
+    /*
+     * BLOCKED, NOT PROPOSED. An unverified strengthening has an unknown
+     * verdict, and "unknown" stored as a proposal is the pass that means "we
+     * did not check". `APPLYABLE_STATES` says false for BLOCKED.
+     */
+    expect(proposed.state).toBe('BLOCKED');
+    expect(proposed.title).toContain('(unverified)');
+    expect(String(proposals[0]!.blockedReason)).toContain('STRENGTHENING_UNVERIFIED');
+    expect(res.body.needsVerification).toBe(1);
+    expect(res.body.trialStates).toEqual({ PASSED: 0, FAILED: 0, UNAVAILABLE: 1 });
+  });
+
+  /*
+   * PASSES AND FAILS ARE DIFFERENT PROPOSALS. Both are stored and the titles
+   * differ, because suppressing the failing one would be a failure suppressed
+   * without being counted — and a weak assertion that was hiding a real defect
+   * is the most valuable thing this engine produces.
+   */
+  it('stores a PASSING trial as a tidy-up whose title says it passes', async () => {
+    const res = await call('/projects/proj_1/suite-changes/strengthenings', {
+      method: 'POST',
+      body: JSON.stringify({
+        trials: [{ testId: 'test_weak', state: 'PASSED', why: 'ran green on main' }],
+      }),
+    });
+
+    const proposed = res.body.proposed[0] as Row;
+    expect(proposed.state).toBe('PROPOSED');
+    expect(proposed.title).toContain('(verified: passes)');
+    expect(res.body.trialStates).toEqual({ PASSED: 1, FAILED: 0, UNAVAILABLE: 0 });
+    expect(res.body.needsVerification).toBe(0);
+  });
+
+  it('stores a FAILING trial as a finding whose title says it fails', async () => {
+    const res = await call('/projects/proj_1/suite-changes/strengthenings', {
+      method: 'POST',
+      body: JSON.stringify({
+        trials: [{ testId: 'test_weak', state: 'FAILED', why: 'the element was empty' }],
+      }),
+    });
+
+    const proposed = res.body.proposed[0] as Row;
+    // STILL A PROPOSAL — `STRENGTHENING_FAILED` is the engine's one
+    // non-blocking problem precisely so this reaches a human.
+    expect(proposed.state).toBe('PROPOSED');
+    expect(proposed.title).toContain('FAILS');
+    expect(proposed.title).not.toContain('(verified: passes)');
+    expect(String(proposals[0]!.blockedReason)).toContain('STRENGTHENING_FAILED');
+    expect(res.body.trialStates).toEqual({ PASSED: 0, FAILED: 1, UNAVAILABLE: 0 });
+  });
+
+  /*
+   * A TRIAL THAT COULD NOT RUN BLOCKS, exactly as never having asked does.
+   * UNAVAILABLE is not a pass.
+   */
+  it('treats a trial that could not run as no trial at all', async () => {
+    const res = await call('/projects/proj_1/suite-changes/strengthenings', {
+      method: 'POST',
+      body: JSON.stringify({
+        trials: [{ testId: 'test_weak', state: 'UNAVAILABLE', why: 'the runner timed out' }],
+      }),
+    });
+
+    expect((res.body.proposed[0] as Row).state).toBe('BLOCKED');
+    expect(res.body.needsVerification).toBe(1);
+  });
+
+  /*
+   * THE VERDICT IS NOT QAAI'S OWN MEASUREMENT AND THE RATIONALE SAYS SO. A
+   * reviewer reading "this stronger assertion PASSES" has to be able to tell
+   * who ran it, or the sentence is the product claiming a measurement it did
+   * not make.
+   */
+  it('records that the verdict was reported rather than measured here', async () => {
+    await call('/projects/proj_1/suite-changes/strengthenings', {
+      method: 'POST',
+      body: JSON.stringify({
+        trials: [{ testId: 'test_weak', state: 'PASSED', why: 'ran green', detail: ['1 passed'] }],
+      }),
+    });
+
+    expect(String(proposals[0]!.rationale)).toContain('VERDICT SOURCE');
+    expect(String(proposals[0]!.rationale)).toContain('did not execute this trial itself');
+  });
+
+  /*
+   * NOTHING AUTO-APPLIES. `APPLYABLE_STATES` has exactly one `true` key and
+   * this endpoint never writes it, whatever the trial said.
+   */
+  it('never stores a row in the one state that may be applied', async () => {
+    for (const state of ['PASSED', 'FAILED', 'UNAVAILABLE'] as const) {
+      proposals = [];
+      await call('/projects/proj_1/suite-changes/strengthenings', {
+        method: 'POST',
+        body: JSON.stringify({ trials: [{ testId: 'test_weak', state, why: 'ran' }] }),
+      });
+      expect(proposals.map((p) => p.state)).not.toContain('APPROVED');
+      expect(proposals.map((p) => p.appliedAt)).toEqual([undefined]);
+    }
+  });
+
+  /*
+   * A VERDICT WITH NO EVIDENCE IS REFUSED AT THE EDGE. `why` is required
+   * because `verifyStrengthening` interpolates it into the rationale a reviewer
+   * reads, and a bare state is the pass that means "we did not check".
+   */
+  it('refuses a verdict with no reason beside it', async () => {
+    const res = await call('/projects/proj_1/suite-changes/strengthenings', {
+      method: 'POST',
+      body: JSON.stringify({ trials: [{ testId: 'test_weak', state: 'PASSED' }] }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('404s for a project that does not exist', async () => {
+    h.db = { ...h.db, project: { findUnique: async () => null } };
+    const res = await call('/projects/nope/suite-changes/strengthenings', { method: 'POST' });
+    expect(res.status).toBe(404);
   });
 });
 

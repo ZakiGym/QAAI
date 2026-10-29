@@ -9,7 +9,11 @@ import {
   CORRECTION_CLASSIFIER_VERSION,
   CORRECTION_IS_ACTIONABLE,
   CORRECTION_KINDS,
+  DESTINATION_REFUSALS,
+  DESTINATION_REFUSAL_WHY,
+  FORBIDDEN_DIRECTORIES,
   MAX_ARTIFACTS_PER_SET,
+  MAX_ARTIFACT_PATH_CHARS,
   MAX_CORRECTION_ITEMS,
   MAX_CORRECTION_QUOTE_CHARS,
   OWNERSHIP_VERDICTS,
@@ -25,6 +29,8 @@ import {
   corpusWhere,
   dependentsAffected,
   dependentsOf,
+  destinationDecision,
+  destinationRefusalSchema,
   dispositionFor,
   isRecordableCorrection,
   mayWriteDirectly,
@@ -42,6 +48,8 @@ import type {
   GeneratedArtifact,
   SuiteChangeProposal,
 } from './artifact-set';
+import { unknownObservation } from './style-profile';
+import type { FileLayout, StyleConfidence, StyleObservation } from './style-profile';
 import {
   artifactDispositionSchema,
   artifactOwnershipSchema,
@@ -111,6 +119,16 @@ describe('vocabulary parity: the run-time half', () => {
     ['correctionKindSchema', correctionKindSchema.options, CORRECTION_KINDS],
     ['suiteChangeKindSchema', suiteChangeKindSchema.options, SUITE_CHANGE_KINDS],
     ['suiteChangeStateSchema', suiteChangeStateSchema.options, SUITE_CHANGE_STATES],
+    /*
+     * HONESTLY LABELLED: `destinationRefusalSchema` is `z.enum` over the very
+     * array beside it, so `.options` is DERIVED and these two CANNOT disagree
+     * today. It is here as the tripwire for the day somebody hand-writes the
+     * enum — in this file or in schemas.ts — and leaves a member out, which is
+     * how eight GateRule kinds shipped unsaveable. Every other row above is a
+     * live check against a separately written schema; this one is not, and
+     * saying so beats letting the row imply otherwise.
+     */
+    ['destinationRefusalSchema', destinationRefusalSchema.options, DESTINATION_REFUSALS],
   ])('%s carries exactly its vocabulary', (_name, options, list) => {
     expect([...options].sort()).toEqual([...list].sort());
   });
@@ -127,6 +145,7 @@ describe('vocabulary parity: the run-time half', () => {
     expect(Object.keys(CORRECTION_IS_ACTIONABLE).sort()).toEqual([...CORRECTION_KINDS].sort());
     expect(Object.keys(CHANGE_ALTERS_BEHAVIOUR).sort()).toEqual([...SUITE_CHANGE_KINDS].sort());
     expect(Object.keys(APPLYABLE_STATES).sort()).toEqual([...SUITE_CHANGE_STATES].sort());
+    expect(Object.keys(DESTINATION_REFUSAL_WHY).sort()).toEqual([...DESTINATION_REFUSALS].sort());
   });
 
   it('OWNERSHIP_VERDICTS is the recordable states plus exactly one that is not', () => {
@@ -1030,5 +1049,520 @@ describe('suite-change proposals', () => {
   it('marks a merge as behaviour-altering and a rename as not', () => {
     expect(CHANGE_ALTERS_BEHAVIOUR.MERGE_NEAR_DUPLICATES).toBe(true);
     expect(CHANGE_ALTERS_BEHAVIOUR.MOVE_FILE).toBe(false);
+  });
+});
+
+// ─── The destination rule ───────────────────────────────────────────────────
+
+/**
+ * ONE RULE ABOUT WHERE QAAI MAY WRITE, and the three paths that proved there
+ * wasn't one.
+ *
+ * A verifier ran the real `admit` on `src/index.spec.ts`,
+ * `.github/workflows/release.spec.ts` and `node_modules/.bin/payload.spec.ts`.
+ * All three came back PASS with `correctedFilePath: null`, because the only two
+ * guards in the product asked different questions: `PATH_CONVENTION` checked a
+ * SUFFIX and `safeRepoPath` checked for TRAVERSAL, and none of those three is a
+ * traversal or has the wrong suffix. Separately, the style learner was fed four
+ * files under `.github/workflows/tests/` and reported that directory as the
+ * repository's layout root at MEDIUM confidence — which `directoryForRole` then
+ * uses to place every generated artifact.
+ *
+ * So the three acceptance cases below are those paths, and the fourth is the
+ * poisoned layout root. Each must be refused, and the LAST TWO MUST BE REFUSED
+ * FOR DIFFERENT REASONS: "QAAI never writes there" and "this repository keeps
+ * its tests somewhere else" are different facts, and a single reason covering
+ * both would be a rule nobody could act on.
+ */
+
+function layoutOf(
+  over: Partial<FileLayout> = {},
+  confidence: StyleConfidence = 'MEDIUM',
+): StyleObservation<FileLayout> {
+  return {
+    value: { root: 'e2e', filename: '{name}.spec.ts', colocated: false, ...over },
+    confidence,
+    filesSeen: 3,
+    filesConsidered: 4,
+    examples: [],
+    deferredTo: null,
+  };
+}
+
+/** Pushes a path through the validator the write path actually parses. LESSON H. */
+function parsesAtTheWritePath(path: string): boolean {
+  return artifactSetSchema.safeParse(
+    singleFileArtifactSet({ filePath: path, code: "test('x', () => {});\n" }),
+  ).success;
+}
+
+describe('destinationDecision: the two holes, by name', () => {
+  it('refuses a path inside a dependency tree, and names the directory', () => {
+    const decision = destinationDecision({ path: 'node_modules/.bin/payload.spec.ts' });
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('FORBIDDEN_DIRECTORY');
+    expect(decision.subject).toBe('node_modules');
+    expect(decision.why).toContain('node_modules');
+    expect(decision.why).toContain('a dependency tree');
+  });
+
+  it('refuses a path inside CI configuration, and names the directory', () => {
+    const decision = destinationDecision({ path: '.github/workflows/release.spec.ts' });
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('FORBIDDEN_DIRECTORY');
+    expect(decision.subject).toBe('.github');
+  });
+
+  it('refuses a perfectly legal path that is not where THIS repository puts tests', () => {
+    // The subtler half. `src/index.spec.ts` is relative, has no `..`, ends in
+    // `.spec.ts` and would be collected by Playwright. It is still wrong, and
+    // the only thing that knows it is wrong is the measurement.
+    const decision = destinationDecision({ path: 'src/index.spec.ts', layout: layoutOf() });
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('OUTSIDE_LEARNED_LAYOUT');
+    expect(decision.subject).toBe('e2e');
+  });
+
+  it('gives the two kinds of refusal DIFFERENT reasons', () => {
+    // A mutant that collapsed both into one member would leave every test
+    // above green while making the refusal unactionable, so the distinction is
+    // asserted directly rather than inferred from the two tests that use it.
+    const forbidden = destinationDecision({ path: 'node_modules/x.spec.ts', layout: layoutOf() });
+    const outside = destinationDecision({ path: 'src/x.spec.ts', layout: layoutOf() });
+    expect(forbidden.verdict).toBe('REFUSED');
+    expect(outside.verdict).toBe('REFUSED');
+    if (forbidden.verdict !== 'REFUSED' || outside.verdict !== 'REFUSED') {
+      throw new Error('unreachable');
+    }
+    expect(forbidden.reason).not.toBe(outside.reason);
+  });
+
+  it('allows the path the measurement actually points at', () => {
+    // The refusals above are worthless if the rule refuses everything, so the
+    // happy path is pinned beside them.
+    expect(destinationDecision({ path: 'e2e/checkout/pay.spec.ts', layout: layoutOf() })).toEqual({
+      verdict: 'ALLOWED',
+    });
+  });
+
+  it('allows the flagship ecosystem default, which has no test directory in it', () => {
+    /*
+     * WHY THE LIST IS A DENY LIST. `PLAYWRIGHT_TS.path` and
+     * `WEBDRIVERIO.path` — the two most used paths in the product — produce a
+     * bare feature directory: `checkout/pay.spec.ts`, with no `tests/` segment
+     * anywhere. An allow list of conventional test directories would refuse the
+     * flagship ecosystem's own output, which is why this rule enumerates the
+     * places that are never legal instead of the places that are.
+     */
+    expect(destinationDecision({ path: 'checkout/pay.spec.ts' }).verdict).not.toBe('REFUSED');
+  });
+});
+
+describe('a learned layout is evidence, never permission', () => {
+  it('refuses a path under a forbidden root even when the profile is HIGHLY confident of it', () => {
+    /*
+     * The exact state a verifier produced: four files under
+     * `.github/workflows/tests/`, none of them skipped, reported as the layout
+     * root. Confidence is irrelevant to this answer — the deny list is asked
+     * BEFORE the layout is read at all, which is what makes a measurement
+     * unable to widen the rule.
+     */
+    const poisoned = layoutOf({ root: '.github/workflows/tests' }, 'HIGH');
+    const decision = destinationDecision({
+      path: '.github/workflows/tests/login.spec.ts',
+      layout: poisoned,
+    });
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('FORBIDDEN_DIRECTORY');
+    expect(decision.subject).toBe('.github');
+  });
+
+  it('refuses the forbidden root itself, so a caller never adopts it as a layout', () => {
+    // `directoryForRole` and `safeRepoPath` ask about a DIRECTORY rather than a
+    // file. The same rule answers, so neither needs its own opinion.
+    expect(destinationDecision({ path: '.github/workflows/tests' }).verdict).toBe('REFUSED');
+    expect(destinationDecision({ path: 'node_modules/.bin' }).verdict).toBe('REFUSED');
+  });
+
+  it('discards a poisoned root as evidence rather than obeying or inheriting it', () => {
+    /*
+     * A legal path, measured against a root QAAI may never write into. Obeying
+     * the root is the hole; refusing the path would punish the repository for
+     * what the scan read. So the honest answer is that there is no usable
+     * layout here — and it must NOT come back ALLOWED, which would be the
+     * measurement silently granting permission.
+     */
+    const decision = destinationDecision({
+      path: 'e2e/checkout/pay.spec.ts',
+      layout: layoutOf({ root: '.github/workflows/tests' }, 'HIGH'),
+    });
+    expect(decision.verdict).toBe('UNDECIDED');
+    expect(decision.verdict).not.toBe('ALLOWED');
+    if (decision.verdict !== 'UNDECIDED') throw new Error('unreachable');
+    expect(decision.why).toContain('discarded as evidence');
+  });
+
+  it('will not rely on a layout the confidence rule says is not reliable', () => {
+    // `CONFIDENCE_IS_USABLE` is the one opinion about this, and a second
+    // threshold here would agree with it until the day it did not. LOW is a
+    // finding shown to a human, never a rule.
+    for (const confidence of ['LOW', 'UNKNOWN'] as const) {
+      const decision = destinationDecision({
+        path: 'src/index.spec.ts',
+        layout: layoutOf({}, confidence),
+      });
+      expect(decision.verdict).toBe('UNDECIDED');
+    }
+    // MEDIUM is the floor at which it becomes a rule, and it refuses.
+    expect(
+      destinationDecision({ path: 'src/index.spec.ts', layout: layoutOf({}, 'MEDIUM') }).verdict,
+    ).toBe('REFUSED');
+  });
+});
+
+describe('an unmeasured repository is UNDECIDED, which is not "anywhere is fine"', () => {
+  it('does not allow a path just because nothing contradicts it', () => {
+    /*
+     * THE DECISION, AND WHY IT IS NEITHER OF THE TWO OBVIOUS ONES.
+     *
+     * ALLOWED would make "nobody has measured this repository" read as "any
+     * directory is correct", which is the answer this rule exists to stop —
+     * and today NO project has a measured layout, so that reading would cover
+     * every generation the product performs. REFUSED would mean a project
+     * could never receive its first file, the same dead end `ledgerChecked`
+     * was invented to avoid. So there is a third state, every caller must
+     * disclose it, and it is never a permission.
+     */
+    const decision = destinationDecision({ path: 'src/index.spec.ts' });
+    expect(decision.verdict).toBe('UNDECIDED');
+    expect(decision.verdict).not.toBe('ALLOWED');
+  });
+
+  it('says WHICH half it could not ask and which half it did', () => {
+    // A pass that means "we did not check" is one of the lies this product
+    // cannot afford, so the state carries the sentence that distinguishes them.
+    const decision = destinationDecision({ path: 'src/index.spec.ts', layout: null });
+    if (decision.verdict !== 'UNDECIDED') throw new Error('expected UNDECIDED');
+    expect(decision.why).toContain('NOT checked');
+    expect(decision.why).toContain('The directories QAAI never writes into were checked');
+  });
+
+  it('still refuses every forbidden directory with no measurement at all', () => {
+    // The half that needs no evidence runs with nothing supplied, which is why
+    // the two known holes closed at every existing call site without one line
+    // changing there.
+    const unknown = unknownObservation<FileLayout>();
+    for (const path of [
+      'node_modules/x.spec.ts',
+      '.github/workflows/x.spec.ts',
+      'dist/x.spec.ts',
+      'apps/web/node_modules/x.spec.ts',
+      'packages/web/dist/bundle.spec.ts',
+    ]) {
+      expect(destinationDecision({ path }).verdict).toBe('REFUSED');
+      expect(destinationDecision({ path, layout: unknown }).verdict).toBe('REFUSED');
+    }
+  });
+});
+
+describe('the deny list itself', () => {
+  it('covers a dependency tree, build output and a hidden directory at every depth', () => {
+    const nested = [
+      ...Object.keys(FORBIDDEN_DIRECTORIES).map((segment) => `apps/web/${segment}/x.spec.ts`),
+      'apps/web/.turbo/x.spec.ts',
+      'tests/.cache/x.spec.ts',
+    ];
+    for (const path of nested) {
+      expect(destinationDecision({ path }).verdict).toBe('REFUSED');
+    }
+  });
+
+  it('does not refuse the directories real repositories keep tests in', () => {
+    /*
+     * The other half of a deny list's contract: a wrong refusal is a feature
+     * that does not work, so the ecosystem defaults are pinned here. These are
+     * the directory shapes `ECOSYSTEMS[*].path` actually emits.
+     */
+    for (const path of [
+      'tests/checkout/pay.spec.ts',
+      'test/specs/checkout/pay.spec.ts',
+      'e2e/checkout/order_total_test.go',
+      'spec/features/checkout/pay_spec.rb',
+      'cypress/e2e/checkout/pay.cy.ts',
+      'features/checkout/pay.feature',
+      'src/test/java/tests/checkout/PayTest.java',
+      'app/src/androidTest/java/tests/checkout/PayTest.kt',
+      'Tests/Checkout/PayTests.cs',
+      'tests/E2E/Checkout/PayTest.php',
+      '__tests__/checkout/pay.spec.ts',
+    ]) {
+      expect(destinationDecision({ path }).verdict).not.toBe('REFUSED');
+    }
+  });
+
+  it('does not read the deny list off Object.prototype', () => {
+    /*
+     * The key being looked up is a PATH SEGMENT out of a model's answer, and a
+     * plain object literal answers `constructor` with a function and
+     * `__proto__` with `Object.prototype` — both `!== undefined`. Without
+     * `Object.hasOwn` the rule refuses `tests/constructor/x.spec.ts` and puts
+     * `function Object() { [native code] }` into the sentence a human reads.
+     * `noUncheckedIndexedAccess` does not catch it: the value really is there.
+     */
+    for (const segment of ['constructor', 'toString', 'valueOf', 'hasOwnProperty', '__proto__']) {
+      const decision = destinationDecision({ path: `tests/${segment}/x.spec.ts` });
+      // None of these is a directory QAAI must never write into. A test file
+      // under one is odd, not destructive — and a wrong refusal here would come
+      // with `function Object() { [native code] }` as its explanation.
+      expect(decision.verdict).not.toBe('REFUSED');
+      expect(JSON.stringify(decision)).not.toContain('native code');
+      expect(JSON.stringify(decision)).not.toContain('[object Object]');
+    }
+  });
+});
+
+/*
+ * A DENY LIST DEFEATED BY AN ENCODING IS A FILTER AND NOT A GUARD.
+ *
+ * The first version of this rule compared path segments byte for byte, and the
+ * two filesystems QAAI's customers write on do not. Each case below was run
+ * against this machine's own APFS volume before it was written down, and each
+ * one LANDED IN THE FORBIDDEN DIRECTORY: a write to
+ * `NODE_MODULES/.bin/payload.spec.ts` appeared in `node_modules/.bin` beside
+ * the file already there, `ſite-packages/x.spec.ts` appeared in
+ * `site-packages/`, and `pods/payload.spec.ts` appeared in `Pods/`. Through the
+ * live gate all of them returned `PATH_CONVENTION=PASS`, `verdict=ADMIT`,
+ * `correctedFilePath=null` — the exact shape of the hole this rule was built to
+ * close, one case-fold to the side of it.
+ *
+ * Every assertion here ENDS AT `parsesAtTheWritePath`, which is
+ * `artifactSetSchema.safeParse` and therefore the validator the write path
+ * actually runs, and not only at the predicate: lesson H is that a test over a
+ * producer that stops short of the validator proves the spelling and not the
+ * storing.
+ */
+describe('the deny list folds what a filesystem folds', () => {
+  it.each([
+    ['an upper-case dependency tree', 'NODE_MODULES/lodash/tests/x.spec.ts', 'NODE_MODULES'],
+    ['a title-case dependency tree', 'Node_Modules/lodash/x.spec.ts', 'Node_Modules'],
+    ['upper-case build output', 'DIST/x.spec.ts', 'DIST'],
+    ['title-case build output', 'Build/x.spec.ts', 'Build'],
+    ['a title-case vendor tree', 'Vendor/x.spec.ts', 'Vendor'],
+    ['a lower-case spelling of a capitalised entry', 'pods/x.spec.ts', 'pods'],
+    ['the other capitalised entry, lower-cased', 'carthage/x.spec.ts', 'carthage'],
+    ['a case-varied cache', '__PYCACHE__/x.spec.ts', '__PYCACHE__'],
+    // U+017F LATIN SMALL LETTER LONG S upper-cases to `S`, so APFS opens this
+    // as `site-packages`. A plain `toLowerCase()` does NOT fold it, which is
+    // why the rule round-trips through upper case.
+    ['a unicode-folded dependency tree', 'ſite-packages/x.spec.ts', 'ſite-packages'],
+    // Win32 strips trailing dots and spaces from a path component, so both of
+    // these open `node_modules` on a customer's Windows checkout.
+    ['a Win32 trailing dot', 'node_modules./x.spec.ts', 'node_modules.'],
+    ['a Win32 trailing space', 'node_modules /x.spec.ts', 'node_modules '],
+  ])('refuses %s, and the write path refuses it too', (_what, path, segment) => {
+    const decision = destinationDecision({ path });
+
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('FORBIDDEN_DIRECTORY');
+    /*
+     * `subject` is the segment AS WRITTEN and not the folded form, because the
+     * refusal is a statement about the path in hand — naming `node_modules`
+     * for a path that says `NODE_MODULES` would be a sentence about a path
+     * nobody asked about. It is safe to quote for the reason
+     * `destinationDecision` records: it has cleared `malformedDestination`.
+     */
+    expect(decision.subject).toBe(segment);
+    // Ends at the validator, not at the predicate.
+    expect(parsesAtTheWritePath(path)).toBe(false);
+  });
+
+  it('does not refuse a capitalised directory real repositories keep tests in', () => {
+    /*
+     * The cost side of folding, pinned so the next person widens it on purpose.
+     * `Tests/` is the C# and Swift convention and `E2E/` is a real directory
+     * name; neither folds onto anything in the list, and a fold that refused
+     * them would be the wrong-refusal half of the asymmetry
+     * `FORBIDDEN_DIRECTORIES` states.
+     */
+    for (const path of [
+      'Tests/Checkout/PayTests.cs',
+      'tests/E2E/Checkout/PayTest.php',
+      'src/test/java/tests/checkout/PayTest.java',
+      'Spec/Features/pay_spec.rb',
+    ]) {
+      expect(destinationDecision({ path }).verdict).not.toBe('REFUSED');
+      expect(parsesAtTheWritePath(path)).toBe(true);
+    }
+  });
+
+  it('permits `bin`, which is the judgement call in the list', () => {
+    // Stated as a test because it is the one entry a reviewer should push on:
+    // `bin` is .NET build output and is also, in most repositories, a directory
+    // of hand-written scripts. A test file under it is odd, not destructive.
+    expect(destinationDecision({ path: 'bin/x.spec.ts' }).verdict).not.toBe('REFUSED');
+  });
+});
+
+describe('the destination rule ends at the validator the write path runs', () => {
+  it.each([
+    ['a traversal', 'tests/../../etc/passwd'],
+    ['`..` as a SUBSTRING, which `artifactPath` refuses too', 'tests/foo..bar/x.spec.ts'],
+    ['an absolute path', '/etc/cron.d/x.spec.ts'],
+    ['a home-directory prefix', '~/x.spec.ts'],
+    ['a backslash separator', 'tests\\win.spec.ts'],
+    ['a drive letter', 'C:/tests/x.spec.ts'],
+    ['a `.` segment, a second spelling of one path', './tests/x.spec.ts'],
+    ['an empty segment, another second spelling', 'tests//x.spec.ts'],
+    ['a newline, which `artifactPath` permits', 'tests/a\nb.spec.ts'],
+    ['a NUL, which truncates a path in any C library below us', 'tests/a\u0000b.spec.ts'],
+    ['nothing at all', ''],
+  ])('refuses %s as MALFORMED_PATH', (_what, path) => {
+    const decision = destinationDecision({ path });
+    expect(decision.verdict).toBe('REFUSED');
+    if (decision.verdict !== 'REFUSED') throw new Error('unreachable');
+    expect(decision.reason).toBe('MALFORMED_PATH');
+    // It never quotes the path it refused: a malformed path is the one case
+    // whose own bytes could carry a newline into the line that reports it.
+    expect(decision.subject).toBe('');
+    expect(decision.why).toBe(DESTINATION_REFUSAL_WHY.MALFORMED_PATH);
+  });
+
+  it('refuses nothing the validator would accept, at the validator\u2019s own `..` rule', () => {
+    /*
+     * LESSON H, in the direction that bites. The old `pathEscapes` refused `..`
+     * as a SEGMENT while `artifactPath` refuses it as a SUBSTRING, so
+     * `tests/foo..bar/x.spec.ts` was a destination this product called legal
+     * and then could not store. The rule and the validator must agree, and the
+     * only way to prove that is to run both.
+     */
+    const substring = 'tests/foo..bar/x.spec.ts';
+    expect(destinationDecision({ path: substring }).verdict).toBe('REFUSED');
+    expect(parsesAtTheWritePath(substring)).toBe(false);
+  });
+
+  it('accepts a 300-character path full of spaces, and the validator stores it', () => {
+    /*
+     * Derived from the SCHEMA'S OWN CEILING rather than invented:
+     * `artifactPath` is `.max(MAX_ARTIFACT_PATH_CHARS)` and permits spaces, and
+     * a directory with a space in it is a real directory in a real repository.
+     * A rule that refused it would be a wrong refusal at exactly the boundary
+     * the validator was written to allow.
+     */
+    const tail = ' tests/pay.spec.ts';
+    const directory = 'my tests'.padEnd(MAX_ARTIFACT_PATH_CHARS - tail.length, 'x');
+    const path = `${directory}${tail}`;
+    expect(path.length).toBe(MAX_ARTIFACT_PATH_CHARS);
+    expect(destinationDecision({ path }).verdict).not.toBe('REFUSED');
+    expect(parsesAtTheWritePath(path)).toBe(true);
+
+    // And one character past the ceiling is refused by both.
+    const tooLong = `x${path}`;
+    expect(destinationDecision({ path: tooLong }).verdict).toBe('REFUSED');
+    expect(parsesAtTheWritePath(tooLong)).toBe(false);
+  });
+
+  it('refuses a forbidden destination AT the write path, not only at the gate', () => {
+    /*
+     * ITEM 3, as far as it can honestly be taken: `artifactSetSchema` calls
+     * `artifactSetProblems`, which calls this rule, so a set whose spec points
+     * into a dependency tree cannot be PARSED — no call site has to remember to
+     * ask. What that does NOT cover is the single-file `filePath` on
+     * `generatedTestSchema`, which has its own looser refinement; see this
+     * round's handover.
+     */
+    expect(parsesAtTheWritePath('node_modules/.bin/payload.spec.ts')).toBe(false);
+    expect(parsesAtTheWritePath('.github/workflows/release.spec.ts')).toBe(false);
+    expect(parsesAtTheWritePath('tests/checkout/pay.spec.ts')).toBe(true);
+  });
+});
+
+describe('artifactSetProblems asks the destination rule and nothing else', () => {
+  it('names a forbidden destination separately from a path escape', () => {
+    // Two different facts. `node_modules/.bin/payload.spec.ts` escapes nothing:
+    // it is relative, `..`-free and ends in `.spec.ts`.
+    const forbidden = artifactSetProblems(
+      set([artifact({ path: 'node_modules/.bin/payload.spec.ts', ownership: 'QAAI_OWNED' })]),
+    );
+    expect(kinds(forbidden)).toContain('FORBIDDEN_DESTINATION');
+    expect(kinds(forbidden)).not.toContain('PATH_ESCAPE');
+
+    const escape = artifactSetProblems(
+      set([artifact({ path: 'tests/../../etc/passwd', ownership: 'QAAI_OWNED' })]),
+    );
+    expect(kinds(escape)).toContain('PATH_ESCAPE');
+    expect(kinds(escape)).not.toContain('FORBIDDEN_DESTINATION');
+  });
+
+  it('raises the layout refusal only when a layout was supplied', () => {
+    /*
+     * The one place this function fails OPEN, and it is disclosed rather than
+     * hidden: `artifactSetSchema` parses a generated set before anything has
+     * looked at the repository, so a layout refusal at parse time would refuse
+     * every set in a product where nothing has measured a repository yet.
+     * `admitSet` reports `layoutChecked: false` beside the set.
+     */
+    const outside = set([artifact({ path: 'src/index.spec.ts', ownership: 'QAAI_OWNED' })]);
+    expect(kinds(artifactSetProblems(outside))).not.toContain('FORBIDDEN_DESTINATION');
+    expect(kinds(artifactSetProblems(outside, { layout: layoutOf() }))).toContain(
+      'FORBIDDEN_DESTINATION',
+    );
+  });
+
+  it('blocks the whole set on a forbidden destination, like every other problem', () => {
+    expect(PROBLEM_BLOCKS_SET.FORBIDDEN_DESTINATION).toBe(true);
+  });
+});
+
+describe('a colocated repository, and one whose tests are at the top level', () => {
+  it('has no root to be outside of, so the deny list is the whole answer', () => {
+    /*
+     * A colocated repository genuinely does put tests anywhere its source is.
+     * Inventing a narrower rule for it would refuse the convention just
+     * measured — so this is ALLOWED on purpose, and the deny list still bites.
+     *
+     * THE PATH HERE IS OUTSIDE THE MEASURED ROOT ON PURPOSE. The first version
+     * of this test used `root: ''`, which the NEXT branch also allows — so a
+     * mutant that ignored `colocated` entirely left it green. A colocated
+     * profile with a real root and a path outside it is the only shape only
+     * this branch satisfies.
+     */
+    const colocated = layoutOf({ root: 'src', colocated: true });
+    expect(
+      destinationDecision({ path: 'apps/web/cart/total.spec.ts', layout: colocated }).verdict,
+    ).toBe('ALLOWED');
+    expect(
+      destinationDecision({ path: 'apps/web/cart/total.spec.ts', layout: layoutOf({ root: 'src' }) })
+        .verdict,
+    ).toBe('REFUSED');
+    // And the deny list is still asked of a colocated repository.
+    expect(destinationDecision({ path: 'dist/cart/total.spec.ts', layout: colocated }).verdict).toBe(
+      'REFUSED',
+    );
+  });
+
+  it('treats a measured root of "" as the repository root, which everything is under', () => {
+    const topLevel = layoutOf({ root: '' });
+    expect(destinationDecision({ path: 'checkout/pay.spec.ts', layout: topLevel }).verdict).toBe(
+      'ALLOWED',
+    );
+    expect(destinationDecision({ path: '.husky/pay.spec.ts', layout: topLevel }).verdict).toBe(
+      'REFUSED',
+    );
+  });
+
+  it('does not mistake a sibling directory for being under the root', () => {
+    // `e2e-archive/` is not under `e2e/`, and a prefix test without the
+    // separator would have said it was.
+    expect(
+      destinationDecision({ path: 'e2e-archive/pay.spec.ts', layout: layoutOf() }).verdict,
+    ).toBe('REFUSED');
+    expect(destinationDecision({ path: 'e2e/pay.spec.ts', layout: layoutOf() }).verdict).toBe(
+      'ALLOWED',
+    );
   });
 });

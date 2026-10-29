@@ -541,6 +541,26 @@ export interface AssertionSite {
   swallowLine: number | null;
 }
 
+/**
+ * The spelling of a navigation facet token, in ONE place.
+ *
+ * `nav:${route}` was written inline at both of its producers and is now read
+ * back by {@link findSharedSetup}, which has to compose the SAME token from the
+ * same `NavigationSite.route` or its clusters would be keyed on a vocabulary
+ * nothing else in this file uses. The round's own notes name `ASSERTION_KEY`
+ * versus the regex in {@link specAssertions} as what two spellings of one
+ * question cost, so the third producer got a function instead of a template
+ * literal.
+ */
+function navToken(route: string): string {
+  return `nav:${route}`;
+}
+
+/** The spelling of an action facet token. See {@link navToken}. */
+function actToken(verb: string, locator: string): string {
+  return `act:${verb}:${locator}`;
+}
+
 export interface TestBehavior {
   testId: string;
   name: string;
@@ -1096,7 +1116,7 @@ export function extractBehavior(test: SuiteHealthTestInput): TestBehavior {
     }
     if (!path.startsWith('/')) continue;
     const route = normalizeRoute(path);
-    routes.add(`nav:${route}`);
+    routes.add(navToken(route));
     navigationSites.push({ line: lineOf(starts, m.index), route });
   }
 
@@ -1112,7 +1132,7 @@ export function extractBehavior(test: SuiteHealthTestInput): TestBehavior {
 
     const statement = src.slice(statementStart(src, m.index), close + 1);
     const locator = resolveLocator(normalizeLocator(statement), statement);
-    actions.add(`act:${verb}:${locator}`);
+    actions.add(actToken(verb, locator));
     actionSites.push({ line: lineOf(starts, m.index), verb, locator });
 
     if (VALUE_ACTIONS.has(verb)) {
@@ -1206,7 +1226,7 @@ export function extractBehavior(test: SuiteHealthTestInput): TestBehavior {
    * likely to be accidental copies — a bare API check someone imported three
    * times — were exactly the ones the comparison could not see.
    */
-  for (const route of routesFromSpec(test.spec)) routes.add(`nav:${route}`);
+  for (const route of routesFromSpec(test.spec)) routes.add(navToken(route));
   for (const token of specBehaviorTokens(test.spec)) assertions.add(token);
 
   if (incomplete && reasons.length === 0) reasons.push('analysis was truncated');
@@ -1636,6 +1656,237 @@ function clusterDuplicates(pairs: DuplicatePair[], behaviors: TestBehavior[]): D
   }
 
   return clusters.sort((a, b) => b.size - a.size);
+}
+
+// ─── Shared setup: the candidate producer `extractFixture` never had ─────────
+
+/**
+ * Tests IN ONE DIRECTORY whose setup is the same and whose assertions are not.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ *
+ * `extractFixture` in refactor.ts takes a `FixtureExtractionInput.candidates`
+ * list and nothing in this product ever built one. `RefactorFeed` declared
+ * `merges` and `strengthenings` and no third member, so the extraction half of
+ * the refactor engine had no candidate producer anywhere and was reachable only
+ * from its own tests — this codebase's signature defect, in the one function
+ * whose header claims to be "the only sanctioned way to turn THIS module's
+ * findings into ITS inputs".
+ *
+ * ── A DIRECTORY AND NOT A FILE, WHICH IS NOT A STYLE CHOICE ─────────────────
+ *
+ * The first version of this grouped by `filePath` and every cluster it produced
+ * was dead on arrival. `extractFixture` excludes a candidate whose
+ * `dirOf(filePath)` differs from the canonical one — "one import specifier
+ * cannot serve them all" — and otherwise does not care which file a candidate
+ * is in; the helper it writes lands in that one directory. And in this product
+ * a test row's `code` IS ITS WHOLE FILE, so two rows pointing at one file share
+ * every site this module records. The unit of extraction is therefore one test
+ * block in one file, and several of them in one directory.
+ *
+ * ── THE BOUNDARY IS THE ONE `setupBlockOf` USES, NOT A SECOND ONE ───────────
+ *
+ * "Setup" ends at `assertionSites[0].line`, which is exactly where
+ * refactor.ts's `setupBlockOf` ends it, and the tokens are composed by
+ * {@link navToken} and {@link actToken} from the sites this module already
+ * recorded. So the cluster this names and the block the engine hoists answer
+ * one question. A fresh scan here — a second `beforeEach` regex, a second idea
+ * of what a setup line is — is the defect whose cost is written above
+ * `setupBlockOf` and above `ASSERTION_KEY`.
+ *
+ * THAT BOUNDARY IS FILE-WIDE, AND IT IS WHY `ambiguousFiles` EXISTS. For a file
+ * holding two test blocks, the sites before the file's first assertion are the
+ * FIRST block's setup and not the second's — so a second row pointing at that
+ * same file would be described by evidence that is not about it. Those rows are
+ * set aside and NAMED rather than described wrongly.
+ *
+ * ── WHY IDENTICAL ASSERTIONS DISQUALIFY A CLUSTER ──────────────────────────
+ *
+ * Same setup AND same assertions is a NEAR-DUPLICATE, and the operation for it
+ * is `mergeNearDuplicates`. Extracting a fixture from it would tidy the setup
+ * of tests that should have been one, leave the duplication in place, and burn
+ * the merge's base bytes doing it. {@link refactorFeed} declines those by name
+ * rather than this function dropping them, so the fact is reported.
+ *
+ * Model-free, pure, O(tests) — a hash grouping, not a pair scan.
+ */
+export interface SharedSetupCluster {
+  /** The one directory every member lives in. An extraction needs exactly one. */
+  readonly directory: string;
+  readonly testIds: readonly string[];
+  readonly members: readonly DuplicateRef[];
+  /** One per member, in the same order. The files the extraction would rewrite. */
+  readonly filePaths: readonly string[];
+  /**
+   * The behaviour tokens that occur before the first assertion of each member's
+   * file, in this module's own facet vocabulary. The grouping key, and evidence.
+   */
+  readonly setupTokens: readonly string[];
+  /**
+   * Files with more than one test row pointing at them, SET ASIDE from this
+   * cluster.
+   *
+   * The setup boundary is the file's first assertion, so for a second block in
+   * the same file the evidence above is about the first block and not about it.
+   * Named rather than silently dropped: a row left out of a refactor with no
+   * reason recorded reads as a row nobody found.
+   */
+  readonly ambiguousFiles: readonly string[];
+  /**
+   * True when every retained member also asserts exactly the same thing — then
+   * this is a duplicate and not an extraction. Carried rather than filtered, so
+   * the refusal has something to name.
+   */
+  readonly assertionsIdentical: boolean;
+}
+
+/**
+ * The smallest cluster that means anything. TWO.
+ *
+ * NOT a tunable, and deliberately not a copy of refactor.ts's
+ * `MIN_FIXTURE_DEPENDENTS`: "shared" by one test is not a definition anyone
+ * disagrees with, and the engine's own minimum is applied AFTER its exclusions
+ * eat members, which is the only place that judgement can be made correctly. A
+ * second threshold here would silently decide the question that constant exists
+ * to decide.
+ */
+const SETUP_CLUSTER_MEMBERS = 2;
+
+/**
+ * The directory part of a repo-relative path.
+ *
+ * refactor.ts's `dirOf` is private to that module and this must agree with it,
+ * because a disagreement means a cluster this function calls one directory is a
+ * set the engine excludes as DIFFERENT_DIRECTORY. The agreement is not asserted
+ * in a comment: `agent.craft.test.ts` runs the real `extractFixture` over a
+ * cluster this function produced and requires a stored proposal, which is only
+ * possible if the two read a path the same way.
+ */
+function directoryOf(path: string): string {
+  const slash = path.lastIndexOf('/');
+  return slash === -1 ? '' : path.slice(0, slash);
+}
+
+export function findSharedSetup(behaviors: readonly TestBehavior[]): SharedSetupCluster[] {
+  /** `directory\u0000token,token` → the members sharing it. */
+  const groups = new Map<string, Array<{ behavior: TestBehavior; tokens: string[] }>>();
+
+  for (const behavior of behaviors) {
+    /*
+     * Rule FOUR of the feed, applied at FORMATION and not only at selection: a
+     * test we did not read end to end has a setup boundary we guessed, and a
+     * cluster keyed on a guess is not evidence. These are already in
+     * `unanalyzed` with a reason, so nothing goes missing by skipping them.
+     */
+    if (behavior.incomplete) continue;
+
+    const firstAssertion = behavior.assertionSites[0];
+    /*
+     * No assertion means no boundary — where the setup ENDS is not knowable,
+     * which is the same exclusion `extractFixture` makes by the name
+     * NO_ASSERTION_BOUNDARY. A test with no assertion is already a HIGH
+     * weak-assertion finding; it is not also a fixture candidate.
+     */
+    if (firstAssertion === undefined) continue;
+
+    /*
+     * IN SOURCE ORDER, NOT SORTED. Two tests that fill a form in different
+     * orders do not have the same setup block, and a sorted key would say they
+     * do and then hand the engine two blocks whose normalised text differs — a
+     * SETUP_NOT_IDENTICAL exclusion on every candidate, which reads as the
+     * engine being broken rather than as the cluster being wrong.
+     */
+    const tokens = [
+      ...behavior.navigationSites
+        .filter((site) => site.line < firstAssertion.line)
+        .map((site) => ({ line: site.line, token: navToken(site.route) })),
+      ...behavior.actionSites
+        .filter((site) => site.line < firstAssertion.line)
+        .map((site) => ({ line: site.line, token: actToken(site.verb, site.locator) })),
+    ]
+      .sort((a, b) => a.line - b.line)
+      .map((entry) => entry.token);
+
+    /*
+     * An empty prefix is not shared setup, it is no setup — and `setupBlockOf`
+     * refuses it as NO_SETUP_BLOCK, so emitting it would produce a candidate
+     * the engine is guaranteed to exclude.
+     */
+    if (tokens.length === 0) continue;
+
+    const key = `${directoryOf(behavior.filePath)}\u0000${tokens.join(',')}`;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push({ behavior, tokens });
+    else groups.set(key, [{ behavior, tokens }]);
+  }
+
+  const clusters: SharedSetupCluster[] = [];
+  for (const group of groups.values()) {
+    /*
+     * ONE TEST BLOCK PER FILE. See `ambiguousFiles` above: a second row at the
+     * same path is described by the first block's evidence, so it is set aside
+     * and named. Sorted by test id first so which row survives is deterministic
+     * rather than a function of row order.
+     */
+    const byFile = new Map<string, TestBehavior[]>();
+    for (const entry of [...group].sort((a, b) =>
+      a.behavior.testId.localeCompare(b.behavior.testId),
+    )) {
+      const rows = byFile.get(entry.behavior.filePath);
+      if (rows) rows.push(entry.behavior);
+      else byFile.set(entry.behavior.filePath, [entry.behavior]);
+    }
+
+    const members: TestBehavior[] = [];
+    const ambiguousFiles: string[] = [];
+    for (const [filePath, rows] of byFile) {
+      if (rows.length > 1) {
+        ambiguousFiles.push(filePath);
+        continue;
+      }
+      members.push(rows[0]!);
+    }
+
+    if (members.length < SETUP_CLUSTER_MEMBERS) continue;
+
+    const first = members[0]!;
+    const tokens = group.find((entry) => entry.behavior.testId === first.testId)?.tokens ?? [];
+
+    /*
+     * Set equality over the assertion facet, both directions. `length ===
+     * length` plus a one-way `every` is the bug this avoids: two tests each
+     * asserting two things, one shared, would compare equal.
+     */
+    const firstAssertions = new Set(first.assertions);
+    const assertionsIdentical = members.every(
+      (member) =>
+        member.assertions.length === firstAssertions.size &&
+        member.assertions.every((token) => firstAssertions.has(token)),
+    );
+
+    clusters.push({
+      directory: directoryOf(first.filePath),
+      testIds: members.map((member) => member.testId),
+      members: members.map(refOf),
+      filePaths: members.map((member) => member.filePath),
+      setupTokens: tokens,
+      ambiguousFiles: ambiguousFiles.sort(),
+      assertionsIdentical,
+    });
+  }
+
+  /*
+   * Biggest first, then by directory, then by the member list: a deterministic
+   * order, so two calls a second apart propose the same changes.
+   * `MAX_REFACTOR_CANDIDATES` cuts this list, and a cut applied to an unstable
+   * order means a different twenty every time somebody presses the button.
+   */
+  return clusters.sort(
+    (a, b) =>
+      b.testIds.length - a.testIds.length ||
+      a.directory.localeCompare(b.directory) ||
+      a.testIds.join(',').localeCompare(b.testIds.join(',')),
+  );
 }
 
 // ─── Weak assertions ─────────────────────────────────────────────────────────
@@ -2492,6 +2743,15 @@ export interface SuiteHealthReport {
   formula: string;
   duplicates: DuplicatePair[];
   duplicateClusters: DuplicateCluster[];
+  /**
+   * Tests in one file that share a setup block. The candidate source for
+   * `extractFixture`, which had none at all — see {@link findSharedSetup}.
+   *
+   * Sliced to {@link MAX_REPORTED_CLUSTERS} for payload, like the duplicate
+   * list; the TRUE count is `totals.sharedSetupClusters` and the number cut is
+   * `limits.omittedSetupClusters`.
+   */
+  sharedSetupClusters: SharedSetupCluster[];
   weakAssertions: WeakAssertion[];
   criticalPaths: JourneyCoverage[];
   totals: {
@@ -2500,6 +2760,8 @@ export interface SuiteHealthReport {
     unanalyzed: number;
     duplicatePairs: number;
     duplicateClusters: number;
+    /** The true count, even when the list above was sliced for payload. */
+    sharedSetupClusters: number;
     weakAssertions: number;
     weakAssertionsBySeverity: Record<Severity, number>;
   };
@@ -2512,6 +2774,14 @@ export interface SuiteHealthReport {
     omittedPairs: number;
     /** Clusters found beyond the payload cap. They ARE in the score. */
     omittedClusters: number;
+    /**
+     * Shared-setup clusters beyond the payload cap, as a count.
+     *
+     * They are NOT in the score — nothing scores setup duplication — so this is
+     * a disclosure about the LIST a caller is proposing from, which is the only
+     * thing it affects.
+     */
+    omittedSetupClusters: number;
     skippedCommonTokens: string[];
     minSimilarity: number;
     findingsCapped: boolean;
@@ -2568,6 +2838,7 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
   }
 
   const duplicates = findDuplicates(behaviors, options);
+  const sharedSetup = findSharedSetup(behaviors);
   const weakAssertions = findWeakAssertions(input.tests, byId);
   const criticalPaths = coverCriticalPaths(
     behaviors,
@@ -2594,6 +2865,7 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
     duplicates: duplicates.pairs,
     // Sliced for payload only — `scoreSuiteHealth` above already saw them all.
     duplicateClusters: duplicates.clusters.slice(0, MAX_REPORTED_CLUSTERS),
+    sharedSetupClusters: sharedSetup.slice(0, MAX_REPORTED_CLUSTERS),
     weakAssertions,
     criticalPaths: criticalPaths.journeys,
     totals: {
@@ -2603,6 +2875,7 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
       duplicatePairs: duplicates.pairs.length,
       /** The true count, even when the list above was sliced for payload. */
       duplicateClusters: duplicates.clusters.length,
+      sharedSetupClusters: sharedSetup.length,
       weakAssertions: weakAssertions.length,
       weakAssertionsBySeverity: bySeverity,
     },
@@ -2613,6 +2886,7 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
       pairsCompared: duplicates.pairsCompared,
       omittedPairs: duplicates.omittedPairs,
       omittedClusters: Math.max(0, duplicates.clusters.length - MAX_REPORTED_CLUSTERS),
+      omittedSetupClusters: Math.max(0, sharedSetup.length - MAX_REPORTED_CLUSTERS),
       skippedCommonTokens: duplicates.skippedCommonTokens,
       minSimilarity: options.minSimilarity ?? DEFAULT_MIN_SIMILARITY,
       findingsCapped: weakAssertions.length >= MAX_FINDINGS,
@@ -2630,6 +2904,12 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
  * grew. `refactor.ts` is now the engine — `extractFixture`,
  * `mergeNearDuplicates`, `strengthenAssertions` — and this function is the only
  * sanctioned way to turn THIS module's findings into ITS inputs.
+ *
+ * AND IT ONLY BECAME TRUE OF ALL THREE IN THIS ROUND. `RefactorFeed` declared
+ * `merges` and `strengthenings` and no third member, so `extractFixture` had no
+ * candidate producer anywhere in the product: the one operation that creates a
+ * file was reachable only from its own tests. `fixtures` and
+ * {@link findSharedSetup} are that producer.
  *
  * ── WHY IT IS HERE AND NOT IN refactor.ts ──────────────────────────────────
  *
@@ -2662,6 +2942,14 @@ export function analyzeSuiteHealth(input: SuiteHealthInput): SuiteHealthReport {
  * ACTED ON. `unanalyzed` names them, and a refactor computed from a partial
  * reading would rewrite bytes nobody saw.
  *
+ * All four apply to extractions as well as merges, and the Extractions block
+ * adds two of its own: a cluster whose members assert the same thing is sent
+ * back to the merge it really is, and a file with more than one test row in it
+ * is set aside because this reading's setup boundary is the FILE's and not
+ * either block's. A fifth refusal was written here and deleted once it was
+ * proved unreachable — the reasoning is in that block, because it is the thing
+ * a reader will want to add back.
+ *
  * Model-free, pure, and every refusal is RETURNED rather than logged — see
  * {@link RefactorFeed.declined}, because a finding silently not acted on reads
  * as a finding nobody found.
@@ -2674,6 +2962,24 @@ export interface DeclinedFinding {
   /** The tests the declined finding was about. */
   readonly testIds: readonly string[];
   readonly why: string;
+}
+
+/**
+ * One extraction this feed is willing to ask `extractFixture` for.
+ *
+ * `directory` and `filePaths` are carried because this feed's own ordering rule
+ * needs them — see the FIFTH refusal in {@link refactorFeed} — and because a
+ * caller that stores proposals wants the files without re-deriving them from
+ * the test rows.
+ */
+export interface FixtureCandidate {
+  readonly testIds: readonly string[];
+  /** The one directory the helper would be written into. */
+  readonly directory: string;
+  /** The files this extraction would rewrite, one per test id, same order. */
+  readonly filePaths: readonly string[];
+  /** The finding, quoted into the proposal's rationale verbatim. */
+  readonly finding: string;
 }
 
 /** One merge this feed is willing to ask `mergeNearDuplicates` for. */
@@ -2693,6 +2999,15 @@ export interface StrengthenCandidate {
 
 export interface RefactorFeed {
   readonly merges: readonly MergeCandidate[];
+  /**
+   * Extractions, from {@link SuiteHealthReport.sharedSetupClusters}.
+   *
+   * THIS FIELD'S ABSENCE WAS THE DEFECT. `extractFixture` is one of the
+   * engine's three operations and this feed — the only sanctioned producer of
+   * its inputs — declared no member for it, so the operation had no candidate
+   * producer anywhere in the product and was reachable only from its own tests.
+   */
+  readonly fixtures: readonly FixtureCandidate[];
   readonly strengthenings: readonly StrengthenCandidate[];
   /** Every finding that was NOT turned into a candidate, with the reason. */
   readonly declined: readonly DeclinedFinding[];
@@ -2702,7 +3017,11 @@ export interface RefactorFeed {
    * merges must be able to tell "there were ten" from "there were ten of
    * ninety".
    */
-  readonly omitted: { readonly merges: number; readonly strengthenings: number };
+  readonly omitted: {
+    readonly merges: number;
+    readonly fixtures: number;
+    readonly strengthenings: number;
+  };
 }
 
 /**
@@ -2743,9 +3062,11 @@ export const WEAKNESS_IS_STRENGTHENABLE = {
 
 export function refactorFeed(report: SuiteHealthReport): RefactorFeed {
   const merges: MergeCandidate[] = [];
+  const fixtures: FixtureCandidate[] = [];
   const strengthenings: StrengthenCandidate[] = [];
   const declined: DeclinedFinding[] = [];
   let mergesOmitted = 0;
+  let fixturesOmitted = 0;
   let strengtheningsOmitted = 0;
 
   /*
@@ -2823,6 +3144,91 @@ export function refactorFeed(report: SuiteHealthReport): RefactorFeed {
     }
   }
 
+  /*
+   * ── Extractions ──
+   *
+   * ── A REFUSAL I WROTE, PROVED UNREACHABLE, AND DELETED ────────────────────
+   *
+   * There was a fifth refusal here: an extraction deferring to a MERGE over the
+   * same file, because both rewrite a spec whole and both record its current
+   * bytes as `revert.priorContent`, so applying either leaves the other's
+   * revert record describing a tree that no longer exists.
+   *
+   * NOTHING CAN PRODUCE THAT COLLISION, and the chain is worth keeping because
+   * the next person will want to add it back. A merge candidate requires every
+   * member in ONE file (`mergeNearDuplicates`, and the SECOND refusal above
+   * declines the rest), so `merges` only ever names files holding two or more
+   * test rows. A file holding two or more test rows is exactly what
+   * `SharedSetupCluster.ambiguousFiles` sets aside — the setup boundary is the
+   * file's first assertion, so a second block in it cannot be described by this
+   * reading — so no file can be in a merge candidate and in an extraction
+   * candidate at once. The branch was a check that could never fire: correct
+   * code connected to nothing, which is the defect this round exists to end,
+   * written by the agent sent to end it.
+   *
+   * The cross-REQUEST version of the hazard is real and is owned elsewhere: a
+   * merge stored on Monday and an extraction stored on Tuesday over one file
+   * are caught by the apply path re-reading the ledger and by
+   * `revert.priorContent` not matching — see the `decide` endpoint's own note.
+   * Re-adding a check here would not cover it, because this function sees one
+   * pass and not the stored queue.
+   */
+  for (const cluster of report.sharedSetupClusters) {
+    /*
+     * The rows set aside because their file holds more than one test block, and
+     * whose setup boundary is therefore the file's rather than theirs. Declined
+     * BESIDE the cluster that went ahead, because they are a different fact
+     * with a different fix — split the file, or let a human read it.
+     */
+    if (cluster.ambiguousFiles.length > 0) {
+      declined.push({
+        operation: 'EXTRACT_FIXTURE',
+        testIds: cluster.testIds,
+        why:
+          `${cluster.ambiguousFiles.length} file(s) in ${cluster.directory} have more than one ` +
+          `test row pointing at them (${cluster.ambiguousFiles.join(', ')}). The setup boundary ` +
+          'this reading computes is the file’s first assertion, so for a second block in the same ' +
+          'file the evidence would be about the first block and not about it. Those rows were set ' +
+          'aside; the rest of the cluster was not.',
+      });
+    }
+
+    if (cluster.assertionsIdentical) {
+      declined.push({
+        operation: 'EXTRACT_FIXTURE',
+        testIds: cluster.testIds,
+        why:
+          `These ${cluster.testIds.length} tests share their setup AND assert exactly the same ` +
+          'things, which makes them near-duplicates rather than tests with duplicated setup. ' +
+          'Tidying their setup would leave the duplication in place and spend the merge’s base ' +
+          'bytes doing it. MERGE_NEAR_DUPLICATES is the operation for this finding.',
+      });
+      continue;
+    }
+    if (cluster.testIds.some((id) => unread.has(id))) {
+      declined.push({
+        operation: 'EXTRACT_FIXTURE',
+        testIds: cluster.testIds,
+        why: "At least one member's source was not read completely, so an extraction would hoist bytes nobody analysed.",
+      });
+      continue;
+    }
+    if (fixtures.length >= MAX_REFACTOR_CANDIDATES) {
+      fixturesOmitted += 1;
+      continue;
+    }
+    fixtures.push({
+      testIds: cluster.testIds,
+      directory: cluster.directory,
+      filePaths: cluster.filePaths,
+      finding:
+        `${cluster.testIds.length} tests in ${cluster.directory} run the same ` +
+        `${cluster.setupTokens.length} setup step(s) before their first assertion ` +
+        `(${cluster.setupTokens.join(', ')}) and then assert different things. The setup is a ` +
+        'fixture; the assertions are the tests.',
+    });
+  }
+
   // ── Strengthenings ──
   for (const finding of report.weakAssertions) {
     if (!WEAKNESS_IS_STRENGTHENABLE[finding.kind]) {
@@ -2860,9 +3266,14 @@ export function refactorFeed(report: SuiteHealthReport): RefactorFeed {
 
   return {
     merges,
+    fixtures,
     strengthenings,
     declined,
-    omitted: { merges: mergesOmitted, strengthenings: strengtheningsOmitted },
+    omitted: {
+      merges: mergesOmitted,
+      fixtures: fixturesOmitted,
+      strengthenings: strengtheningsOmitted,
+    },
   };
 }
 

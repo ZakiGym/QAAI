@@ -60,7 +60,25 @@
  * only way a table this consequential stays correct.
  */
 
+import { z } from 'zod';
+
 import type { DialectId } from './dialect';
+/*
+ * The LEARNED layout, imported rather than re-spelled as a local shape.
+ *
+ * {@link destinationDecision} takes `profile.fileLayout` ITSELF — a
+ * `StyleObservation<FileLayout>` — and asks `CONFIDENCE_IS_USABLE` the same
+ * question `directoryForRole` asks of the same field. A local
+ * `{ root, colocated, usable }` adaptor would have been tidier to read and is
+ * exactly the `ASSERTION_KEY`-versus-`specAssertions` defect this file's header
+ * names: two spellings of one question, agreeing until the day one of them
+ * decides LOW is usable.
+ *
+ * `style-profile.ts` imports only types from `./dialect` and `./ecosystems`, so
+ * this adds no cycle — the same argument index.ts makes for publishing both.
+ */
+import { CONFIDENCE_IS_USABLE } from './style-profile';
+import type { FileLayout, StyleObservation } from './style-profile';
 
 // ─── Caps, each one disclosed where it bites ────────────────────────────────
 
@@ -497,6 +515,431 @@ export function sharedSurfaceChange(before: string, after: string): SharedSurfac
   };
 }
 
+// ─── Destination: the one opinion about where QAAI may write ───────────────
+
+/**
+ * WHERE A GENERATED FILE MAY LAND, and it is the only opinion in the product
+ * about that question.
+ *
+ * ── The two half-rules this replaces ───────────────────────────────────────
+ *
+ * There were two guards and neither asked this question. `PATH_CONVENTION` in
+ * packages/agent/src/admission.ts checked a SUFFIX against an ecosystem's
+ * `filePattern`, which is a regex anchored at the end of the string and
+ * therefore constrains the DIRECTORY not at all; `safeRepoPath` in
+ * packages/agent/src/style-learner.ts checked for TRAVERSAL. Between them,
+ * every one of these was a legal destination:
+ *
+ *   node_modules/.bin/payload.spec.ts     — a shim on everybody's PATH
+ *   .github/workflows/release.spec.ts     — a workflow that runs on push
+ *   dist/checkout.spec.ts                 — erased by the next build
+ *
+ * None of them is a traversal and all three end in `.spec.ts`. The path they
+ * arrived on is MODEL-CHOSEN, out of a prompt carrying customer source, crawled
+ * page text and toolchain output, and the end of this pipeline writes files
+ * into the customer's repository. So the question "is this a legal destination"
+ * is asked ONCE, here, and answered with a REASON.
+ *
+ * ── Why a DENY list, when an allow list is usually the safer shape ─────────
+ *
+ * An allow list is the right default and it is wrong here, because QAAI cannot
+ * enumerate every legal test directory in every repository on earth. The
+ * ecosystem defaults alone write to `e2e/`, `spec/`, `test/`, `tests/`,
+ * `cypress/e2e/`, `features/`, `src/test/java/`, `app/src/androidTest/java/`,
+ * `Tests/` and — for Playwright TypeScript and WebdriverIO, the two most used
+ * paths in the product — to a bare feature directory with NO test segment at
+ * all (`checkout/pay.spec.ts`). An allow list over that is a list that refuses
+ * the flagship ecosystem's own output.
+ *
+ * The asymmetry decides it: a wrong refusal is a feature that does not work and
+ * says why, and a wrong permission is a file somebody loses. So the list below
+ * is the places that are NEVER legal, it is deliberately short, and the
+ * judgement calls in it are stated rather than implied.
+ */
+export const FORBIDDEN_DIRECTORIES: Readonly<Record<string, string>> = {
+  // Dependency trees. Writing here is writing into somebody else's code, and
+  // `node_modules/.bin` in particular is a directory of executables on the
+  // PATH of every script in the project.
+  node_modules: 'a dependency tree',
+  vendor: 'a dependency tree',
+  bower_components: 'a dependency tree',
+  third_party: 'a dependency tree',
+  'site-packages': 'a dependency tree',
+  Pods: 'a dependency tree',
+  Carthage: 'a dependency tree',
+  // Build output. A file written here survives until the next build and then
+  // silently stops existing, which reads as a test that vanished.
+  dist: 'build output',
+  build: 'build output',
+  out: 'build output',
+  target: 'build output',
+  obj: 'build output',
+  coverage: 'build output',
+  __pycache__: 'build output',
+  venv: 'a dependency tree',
+  /*
+   * `bin` is NOT in this list, on purpose, and it is the one judgement here a
+   * reviewer should push on. It is .NET build output and it is also, in most
+   * repositories, a directory of hand-written scripts — so denying it would
+   * refuse a path in somebody's real project, while permitting it risks
+   * nothing a human loses: a test file under `bin/` is odd, not destructive.
+   * The dot-directory rule below and {@link isDotDirectory} cover the cases
+   * that actually have power.
+   */
+};
+
+/**
+ * Is this segment a hidden directory?
+ *
+ * EVERY DEPTH, not only the repository root. The brief for this rule said "a
+ * dot-directory at the repository root" and this is deliberately wider, for
+ * three reasons stated so the next person can narrow it on purpose rather than
+ * by accident: a hidden directory is a place a human does not browse at any
+ * depth, so a test written there is a test nobody finds; `.git` exists inside a
+ * submodule and inside a linked worktree, not only at the top; and every hidden
+ * directory this product has met — `.github`, `.circleci`, `.husky`, `.vscode`,
+ * `.next`, `.venv`, `.gradle`, `.pytest_cache` — is configuration, a hook that
+ * executes, or a cache.
+ *
+ * `.` and `..` never reach here: {@link malformedDestination} refuses both
+ * first, because they are a SECOND SPELLING of a path rather than a place.
+ */
+function isDotDirectory(segment: string): boolean {
+  return segment.startsWith('.');
+}
+
+/** Any character below U+0020, or DEL. A newline in a path breaks every line-oriented rendering out of its fence. */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+/**
+ * Why a destination was refused. Closed, so every caller handles every reason
+ * and a new one cannot arrive as a silent pass.
+ *
+ * In memory only, like {@link ARTIFACT_DISPOSITIONS} and for the same reason:
+ * a refusal is computed at the moment a path is checked and is never stored, so
+ * there is no column for it to drift from. It is rendered into a gate's
+ * `detail` and into an {@link ArtifactSetProblem}'s `why`, both of which a
+ * human reads and nothing parses.
+ */
+export const DESTINATION_REFUSALS = [
+  /** Not a repo-relative path at all, or a second spelling of one. */
+  'MALFORMED_PATH',
+  /** Under a directory QAAI must never write into. See {@link FORBIDDEN_DIRECTORIES}. */
+  'FORBIDDEN_DIRECTORY',
+  /**
+   * A path that is perfectly legal in the abstract and is not where THIS
+   * repository puts its tests. `src/index.spec.ts` in a repository whose tests
+   * all live under `e2e/` is this refusal, and it is a different fact from the
+   * one above — which is why it is a different member.
+   */
+  'OUTSIDE_LEARNED_LAYOUT',
+] as const;
+export type DestinationRefusalReason = (typeof DESTINATION_REFUSALS)[number];
+
+/**
+ * The sentence a human reads for each refusal, as a compiler-enforced presence
+ * record: a fourth reason cannot be added without one.
+ *
+ * Every sentence here is composed of CONSTANTS THIS FILE OWNS. The refused
+ * PATH is never interpolated into it — see {@link DestinationDecision} for why
+ * — and the only variable part any caller appends is `subject`, which is either
+ * a key of {@link FORBIDDEN_DIRECTORIES} or a learned layout root that has
+ * already cleared {@link malformedDestination}.
+ */
+export const DESTINATION_REFUSAL_WHY = {
+  MALFORMED_PATH:
+    'Not a repo-relative path. A generated path is joined against a working tree and committed to a pull request, and a second spelling of one path resolves to two different ownership records — the permissive one by accident.',
+  FORBIDDEN_DIRECTORY:
+    'QAAI never writes into this directory. A test here is either inside somebody else’s code, inside configuration that executes, or inside output the next build erases.',
+  OUTSIDE_LEARNED_LAYOUT:
+    'This repository keeps its tests somewhere else, as measured from the repository itself. A learned layout may narrow where QAAI writes; it is evidence and never permission, so it cannot widen it.',
+} as const satisfies Record<DestinationRefusalReason, string>;
+
+/**
+ * The run-time half of the same parity, and AN HONEST ACCOUNT OF WHAT IT
+ * GUARDS.
+ *
+ * This is `z.enum` over the very array {@link DESTINATION_REFUSAL_WHY} is keyed
+ * on, so `.options` is DERIVED from it and THE TWO CANNOT DISAGREE. The parity
+ * test in artifact-set.test.ts is therefore not a live refusal today — it is a
+ * tripwire for the day somebody hand-writes `z.enum(['MALFORMED_PATH', ...])`
+ * here or in schemas.ts and leaves a member out, which is how eight GateRule
+ * kinds shipped unsaveable. Saying that plainly, rather than letting the test
+ * imply it is checking something, is the fifth bullet of this round's rule 12.
+ */
+export const destinationRefusalSchema = z.enum(DESTINATION_REFUSALS);
+
+/**
+ * What the rule answers about one path. THREE STATES AND NOT TWO.
+ *
+ * `UNDECIDED` exists because the second half of the rule needs EVIDENCE — a
+ * measurement of where this repository keeps its tests — and absent evidence is
+ * absent. Collapsing it into `ALLOWED` would make "nobody has measured this
+ * repository yet" read as "anywhere is fine", which is the answer this rule
+ * exists to stop; collapsing it into `REFUSED` would mean a project with no
+ * style profile could never receive a file, and today NO project has one.
+ *
+ * UNDECIDED IS NOT A PERMISSION AND IT IS NOT A PASS. Every caller must
+ * disclose it rather than treat it as agreement, and the two callers in this
+ * round do: {@link artifactSetProblems} does not raise it as a problem and
+ * reports `layoutChecked: false` beside the set, and `PATH_CONVENTION` says in
+ * the sentence a human reads that the directory was not compared against the
+ * repository's own layout because nothing had measured it.
+ *
+ * ── THE REFUSED PATH IS NOT IN HERE, AND THAT IS DELIBERATE ────────────────
+ *
+ * A file path is customer-authored — or model-authored — text by the same rule
+ * a locale tag is, and `artifactPath` in schemas.ts permits newlines and spaces
+ * up to 300 characters, which is a path a repository really can contain. A
+ * refusal that echoed the path would put a newline into whatever line-oriented
+ * report rendered it. Every caller already HAS the path it asked about, so
+ * nothing is lost by leaving it out, and `subject` carries only a value this
+ * file owns or one that has cleared the malformed check.
+ */
+export type DestinationDecision =
+  | { readonly verdict: 'ALLOWED' }
+  | { readonly verdict: 'UNDECIDED'; readonly why: string }
+  | {
+      readonly verdict: 'REFUSED';
+      readonly reason: DestinationRefusalReason;
+      /**
+       * WHAT the refusal is about: the forbidden directory segment, or the
+       * learned layout root. `''` for a malformed path, which has no part worth
+       * naming and whose parts must not be quoted.
+       */
+      readonly subject: string;
+      /** {@link DESTINATION_REFUSAL_WHY} for the reason, plus the subject. */
+      readonly why: string;
+    };
+
+/**
+ * Not a repo-relative path, or a second spelling of one.
+ *
+ * ── IT MUST REFUSE EVERYTHING `artifactPath` REFUSES, AND IT DOES ──────────
+ *
+ * `artifactPath` in schemas.ts is the validator the write path actually parses,
+ * and it refuses `..` AS A SUBSTRING — so `foo..bar/x.spec.ts` fails it. A
+ * destination rule that refused `..` only as a SEGMENT would ACCEPT a path the
+ * validator then rejects, which is a destination this function called legal and
+ * the product cannot store. That is not a theoretical ordering problem: it is
+ * the whole of lesson H — a test over a producer must end at the validator the
+ * write path runs. So the substring form is what is checked here.
+ *
+ * It also refuses MORE than `artifactPath`, in three places, each one a thing
+ * `artifactPath` permits and no repository needs:
+ *
+ *   - a control character, including the newline `artifactPath` allows inside
+ *     its 300 characters, which breaks a path out of any fence rendering it;
+ *   - a `~` prefix, which a shell expands to somebody's home directory;
+ *   - a `.` or an EMPTY segment — `./tests/x.ts`, `tests//x.ts` — because
+ *     {@link resolveOwnership} normalises nothing on purpose, so two spellings
+ *     of one file resolve to two different ownership verdicts and the
+ *     permissive one wins by accident.
+ *
+ * A SPACE is permitted, because `artifactPath` permits it and because
+ * `tests/my tests/checkout.spec.ts` is a real directory in real repositories.
+ */
+function malformedDestination(path: string): boolean {
+  if (path.length === 0 || path.length > MAX_ARTIFACT_PATH_CHARS) return true;
+  if (path.startsWith('/') || path.startsWith('\\') || path.startsWith('~')) return true;
+  if (path.includes('\\')) return true;
+  if (/^[A-Za-z]:/.test(path)) return true;
+  if (path.includes('..')) return true;
+  if (hasControlCharacter(path)) return true;
+  return path.split('/').some((segment) => segment.length === 0 || segment === '.');
+}
+
+/**
+ * The form of a path segment that a FILESYSTEM compares, not the form a string
+ * comparison does.
+ *
+ * ── THIS IS THE DIFFERENCE BETWEEN A GUARD AND A FILTER ────────────────────
+ *
+ * A deny list keyed on exact bytes is defeated by every spelling the filesystem
+ * folds together, and the two filesystems QAAI's customers actually use fold
+ * plenty. macOS APFS and Windows NTFS are BOTH case-insensitive by default, so
+ * `NODE_MODULES/lodash/x.spec.ts` and `node_modules/lodash/x.spec.ts` are ONE
+ * directory, and a write through the first spelling lands in the second. That
+ * was verified against this machine's own APFS volume rather than assumed: a
+ * write to `NODE_MODULES/.bin/payload.spec.ts` appeared in `node_modules/.bin`,
+ * beside the file already there.
+ *
+ * So three equivalences are folded out before the lookup, each one a spelling a
+ * real filesystem resolves to a forbidden directory:
+ *
+ *   - CASE, via `toUpperCase().toLowerCase()` rather than `toLowerCase()`
+ *     alone. The upper round-trip is what reaches the single-character folds a
+ *     plain lower-casing misses: `ſ` (U+017F) upper-cases to `S`, so
+ *     `ſite-packages` folds to `site-packages` — and APFS really does open the
+ *     one as the other, which is why the long form is here instead of the short
+ *     one that reads more tidily.
+ *   - UNICODE NORMALISATION, via NFC, because APFS is normalisation-insensitive
+ *     and a decomposed spelling of a forbidden name is the same directory.
+ *     NFC and not NFKC: NFKC also folds compatibility characters, which no
+ *     filesystem here treats as equal, and that would be a wrong refusal rather
+ *     than a closed hole. THIS CALL CHANGES NO OUTCOME TODAY AND NO TEST PINS
+ *     IT — every key in {@link FORBIDDEN_DIRECTORIES} is pure ASCII, and no
+ *     decomposed sequence normalises to an ASCII character, so NFC provably
+ *     cannot move a segment onto one of them. It is here for the first
+ *     non-ASCII entry, and removing it is a mutant that survives the suite.
+ *     Saying so is cheaper than the next reader assuming it is load-bearing.
+ *   - TRAILING DOTS AND SPACES, which Win32 STRIPS from a path component, so
+ *     `node_modules./x.spec.ts` opens `node_modules` on Windows.
+ *
+ * The folded form is used for the LOOKUP ONLY. `subject` keeps the segment as
+ * it was actually written, because the refusal is a statement about the path in
+ * hand and the folded form would be a path nobody asked about. It is safe to
+ * quote for the reason stated on {@link destinationDecision}: it has already
+ * cleared {@link malformedDestination}.
+ */
+function foldSegment(segment: string): string {
+  return segment
+    .normalize('NFC')
+    .toUpperCase()
+    .toLowerCase()
+    .replace(/[. ]+$/, '');
+}
+
+/**
+ * The deny list in the form the lookup needs, keyed on {@link foldSegment}.
+ *
+ * A `Map` and not an object, which also retires the `Object.hasOwn` hazard
+ * structurally rather than by remembering to guard each lookup: a `Map` has no
+ * `constructor` entry to find, so `tests/constructor/x.spec.ts` cannot pick a
+ * function up off a prototype. The behaviour that proves it is still pinned by
+ * `does not read the deny list off Object.prototype`.
+ */
+const FORBIDDEN_FOLDED: ReadonlyMap<string, string> = new Map(
+  Object.entries(FORBIDDEN_DIRECTORIES).map(([segment, kind]) => [foldSegment(segment), kind]),
+);
+
+/** The first segment of `path` that QAAI must never write into, or null. */
+function forbiddenSegmentOf(path: string): { readonly segment: string; readonly kind: string } | null {
+  const segments = path.split('/');
+  for (const segment of segments) {
+    const listed = FORBIDDEN_FOLDED.get(foldSegment(segment));
+    if (listed !== undefined) return { segment, kind: listed };
+    if (isDotDirectory(segment)) {
+      return { segment, kind: 'a hidden directory, which is configuration or a cache by convention' };
+    }
+  }
+  return null;
+}
+
+/**
+ * MAY QAAI WRITE A FILE AT THIS REPO-RELATIVE PATH. The one predicate, and the
+ * only opinion in the product about the question.
+ *
+ * ── THE TWO HALVES ARE INDEPENDENT, AND THE ORDER IS THE SAFETY ARGUMENT ───
+ *
+ * The DENY LIST needs no evidence and runs first and always. The LAYOUT
+ * comparison needs a measurement and runs second, only when there is one. That
+ * order is what makes a learned layout EVIDENCE rather than PERMISSION: a
+ * repository whose profile reports `.github/workflows/tests` as its layout root
+ * — which the style learner really did produce, from four files it never
+ * skipped — cannot thereby make `.github` writable, because `.github` was
+ * refused before the layout was read at all. A layout may NARROW where QAAI
+ * writes and can never widen it.
+ *
+ * The same ordering is what lets `why` name its subject. A learned root is
+ * customer-derived text; it is interpolated into a sentence only AFTER
+ * {@link malformedDestination} has cleared it, so the string that reaches a
+ * report has no control characters in it and is at most
+ * {@link MAX_ARTIFACT_PATH_CHARS} long.
+ *
+ * ── `layout` IS `profile.fileLayout`, HANDED OVER WHOLE ────────────────────
+ *
+ * Callers pass the observation itself, so this function asks
+ * `CONFIDENCE_IS_USABLE` the same question `directoryForRole` asks — one
+ * opinion about whether an observation may be relied on, rather than a second
+ * threshold that agrees until it does not. A LOW or UNKNOWN observation is
+ * evidence of nothing and comes back UNDECIDED, which is `CONFIDENCE_IS_USABLE`
+ * read out loud.
+ */
+export function destinationDecision(args: {
+  readonly path: string;
+  /** `profile.fileLayout`. Omitted or null means nothing has measured this repository. */
+  readonly layout?: StyleObservation<FileLayout> | null;
+}): DestinationDecision {
+  const { path, layout } = args;
+
+  if (malformedDestination(path)) {
+    return {
+      verdict: 'REFUSED',
+      reason: 'MALFORMED_PATH',
+      subject: '',
+      why: DESTINATION_REFUSAL_WHY.MALFORMED_PATH,
+    };
+  }
+
+  const forbidden = forbiddenSegmentOf(path);
+  if (forbidden) {
+    return {
+      verdict: 'REFUSED',
+      reason: 'FORBIDDEN_DIRECTORY',
+      subject: forbidden.segment,
+      why: `${DESTINATION_REFUSAL_WHY.FORBIDDEN_DIRECTORY} "${forbidden.segment}" is ${forbidden.kind}.`,
+    };
+  }
+
+  const observation = layout ?? null;
+  if (!observation || !CONFIDENCE_IS_USABLE[observation.confidence] || !observation.value) {
+    return {
+      verdict: 'UNDECIDED',
+      why:
+        'Whether this is where the repository keeps its tests was NOT checked: no test layout has been measured for it at a confidence worth relying on. The directories QAAI never writes into were checked, and this path is not in one.',
+    };
+  }
+
+  const { root, colocated } = observation.value;
+
+  /*
+   * A learned root that is itself a place QAAI must never write into is
+   * DISCARDED AS EVIDENCE rather than obeyed or refused. Obeying it is the hole
+   * this function exists to close. Refusing every path because the measurement
+   * was poisoned would punish the repository for what the scan read, and the
+   * path in hand may be perfectly ordinary — so the answer is the honest one:
+   * there is no usable layout here, and the deny list was the whole question.
+   */
+  const rootIsUnusable =
+    root !== '' && (malformedDestination(root) || forbiddenSegmentOf(root) !== null);
+  if (rootIsUnusable) {
+    return {
+      verdict: 'UNDECIDED',
+      why:
+        'Whether this is where the repository keeps its tests was NOT checked: the measured layout root is itself a directory QAAI never writes into, so it was discarded as evidence rather than used. The directories QAAI never writes into were checked, and this path is not in one.',
+    };
+  }
+
+  /*
+   * A COLOCATED repository genuinely does put tests anywhere its source is —
+   * `src/cart/total.spec.ts` beside `src/cart/total.ts` — so there is no root
+   * to be outside of and the deny list is the whole answer. Inventing a
+   * narrower rule for this case would refuse the convention we just measured.
+   */
+  if (colocated) return { verdict: 'ALLOWED' };
+
+  /*
+   * `root: ''` is the repository root, which every path is under. That is not
+   * this function giving up: it is what the measurement SAYS — the scan found
+   * this repository's tests at the top level — and the deny list still applies.
+   */
+  if (root === '' || path.startsWith(`${root}/`)) return { verdict: 'ALLOWED' };
+
+  return {
+    verdict: 'REFUSED',
+    reason: 'OUTSIDE_LEARNED_LAYOUT',
+    subject: root,
+    why: `${DESTINATION_REFUSAL_WHY.OUTSIDE_LEARNED_LAYOUT} Its tests are under "${root}".`,
+  };
+}
+
 // ─── Refusal ────────────────────────────────────────────────────────────────
 
 /**
@@ -508,6 +951,17 @@ export const ARTIFACT_SET_PROBLEMS = [
   'DUPLICATE_PATH',
   /** `..`, an absolute path, a backslash, or a Windows drive. A path is not a place to be clever. */
   'PATH_ESCAPE',
+  /**
+   * A well-formed path to a place QAAI must never write: a dependency tree, CI
+   * configuration, a hidden directory, build output — or, when the repository
+   * has been measured, somewhere its tests do not live.
+   *
+   * SEPARATE FROM `PATH_ESCAPE` because it is a separate fact.
+   * `node_modules/.bin/payload.spec.ts` escapes nothing: it is relative, it has
+   * no `..` in it and it ends in `.spec.ts`. The whole reason this member
+   * exists is that both guards the product had answered "yes" to it.
+   */
+  'FORBIDDEN_DESTINATION',
   /** A writable disposition against an ownership verdict that forbids writing. */
   'WRITE_TO_UNOWNED',
   /** UPDATE_OWNED or PROPOSED_EDIT with no `basedOnHash`: a change against unknown bytes. */
@@ -551,6 +1005,7 @@ export interface ArtifactSetProblem {
 export const PROBLEM_BLOCKS_SET = {
   DUPLICATE_PATH: true,
   PATH_ESCAPE: true,
+  FORBIDDEN_DESTINATION: true,
   WRITE_TO_UNOWNED: true,
   MISSING_BASE_HASH: true,
   BASE_HASH_ON_NEW: true,
@@ -563,17 +1018,8 @@ export const PROBLEM_BLOCKS_SET = {
   ARTIFACT_SIZE: true,
 } as const satisfies Record<ArtifactSetProblemKind, boolean>;
 
-/** `..`, absolute, backslash-separated, or a drive letter. */
-function pathEscapes(path: string): boolean {
-  if (path.length === 0 || path.length > MAX_ARTIFACT_PATH_CHARS) return true;
-  if (path.startsWith('/') || path.startsWith('\\')) return true;
-  if (path.includes('\\')) return true;
-  if (/^[A-Za-z]:/.test(path)) return true;
-  return path.split('/').includes('..');
-}
-
 /**
- * The two facts a full refusal decision needs and a schema cannot have.
+ * The facts a full refusal decision needs and a schema cannot have.
  *
  * Both optional and both INJECTED, per rule 8: no filesystem reaches this
  * module. `priorContent` is a reader over the customer's working tree, which is
@@ -588,6 +1034,21 @@ export interface ArtifactSetContext {
    * read. Null is "unavailable" and is treated as a refusal, never as "empty".
    */
   readonly priorContent?: (path: string) => string | null;
+  /**
+   * The repository's own measured test layout — `profile.fileLayout`, handed
+   * over whole.
+   *
+   * OMITTING IT IS NOT FREE AND IS NOT A PASS, and it fails OPEN rather than
+   * closed, which is the one place in this function that does. The reason is
+   * the same one `ledgerChecked` records: `artifactSetSchema` parses a
+   * generated set before anything has looked at the repository, so a layout
+   * refusal raised at parse time would refuse every set in a product where
+   * nothing has measured a repository yet. So with no layout the
+   * `OUTSIDE_LEARNED_LAYOUT` half is NOT ASKED — the deny list still is, and it
+   * needs no evidence — and `admitSet` reports `layoutChecked: false` beside
+   * the set so "we did not ask" is a disclosed fact rather than agreement.
+   */
+  readonly layout?: StyleObservation<FileLayout> | null;
 }
 
 /**
@@ -643,11 +1104,26 @@ export function artifactSetProblems(
     }
     seen.add(path);
 
-    if (pathEscapes(path)) {
+    /*
+     * THE PATH, ASKED OF THE ONE RULE. There is no second opinion here any
+     * more: `pathEscapes` used to live in this file and answered a narrower
+     * question than `artifactPath` in schemas.ts did, so this function accepted
+     * paths the write path's own validator then rejected. Both halves are now
+     * {@link destinationDecision}, which is also what the `PATH_CONVENTION`
+     * gate asks — one implementation of "may this be written", rather than one
+     * per caller.
+     *
+     * UNDECIDED IS NOT RAISED, deliberately and visibly: see
+     * {@link ArtifactSetContext.layout} for why a parse-time layout refusal
+     * would refuse every set in the product, and `layoutChecked` in
+     * admission.ts for where the omission is disclosed.
+     */
+    const destination = destinationDecision({ path, layout: context.layout });
+    if (destination.verdict === 'REFUSED') {
       add(
-        'PATH_ESCAPE',
+        destination.reason === 'MALFORMED_PATH' ? 'PATH_ESCAPE' : 'FORBIDDEN_DESTINATION',
         path,
-        'Not a repo-relative path. A generated path is written to disk and committed to a PR.',
+        destination.why,
       );
     }
 

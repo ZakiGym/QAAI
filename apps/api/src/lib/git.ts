@@ -421,10 +421,20 @@ export interface PushOptions {
    * reports every other one as a refusal. `ownershipKnown: false` comes back on
    * the result so a caller cannot read that outcome as a clean sync.
    *
-   * It is optional rather than required because the one call site
-   * (`POST /projects/:id/git/push` in routes/projects.ts) belongs to another
-   * change; making it required would have broken that file's build from here,
-   * and the exact edit that supplies it is in this round's handover.
+   * THE PRODUCTION CALLER NOW SUPPLIES IT. `POST /projects/:id/git/push` in
+   * routes/projects.ts builds it from `GeneratedArtifact` and writes
+   * {@link PushResult.ledgerRefresh} back, so the create-only behaviour below is
+   * no longer what a customer gets.
+   *
+   * It stays OPTIONAL rather than becoming required, and that is a decision
+   * about what the degraded mode is worth, not an oversight. A caller that
+   * cannot say what QAAI owns — a dry run, a future caller reached before a
+   * ledger exists — must still have one behaviour, and the safe one is this:
+   * create what is absent, refuse everything else, and say `ownershipKnown:
+   * false` so the outcome cannot be read as a clean sync. That path is held by
+   * tests in git.test.ts on purpose. Requiring the field would delete the only
+   * tested answer to "what happens when ownership is unknown" and replace it
+   * with a compile error at the call site that is least likely to think about it.
    */
   ownership?: RepoOwnership;
 }

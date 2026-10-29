@@ -59,19 +59,22 @@
 import { FRAMEWORKS_BY_LANGUAGE } from '@qaai/shared';
 import type { DialectId, Language, PlanItem, Priority, TestType, UiFramework } from '@qaai/shared';
 /*
- * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
- * and is recorded as one — `artifacts.ts`, `page-objects.ts` and `refactor.ts`
- * all carry the same note this round, and `boundaries.ts` set the precedent.
+ * THE CRAFT VOCABULARY, THROUGH THE PACKAGE'S FRONT DOOR.
  *
- * `packages/shared/src/index.ts` has no `export * from './artifact-set'`, and
- * the obvious one-line fix DOES NOT COMPILE: `artifact-set.ts` and
- * `requirements.ts` both export a type named `ContentDigest` and `requirements`
- * is already in that barrel, so a star export is TS2308 on it. The working edit
- * is in this round's handover.
+ * The comment that stood here said `packages/shared/src/index.ts` has no
+ * `export * from './artifact-set'` and that the one-line fix does not compile.
+ * Both halves are now FALSE — the barrel publishes `./artifact-set` and
+ * `./style-profile`, the `ContentDigest` collision was resolved by
+ * re-exporting the declaration in `requirements.ts` rather than spelling it
+ * twice, and this import has been `@qaai/shared` ever since. A doc comment that
+ * contradicts the code under it is the sentence a reviewer trusts instead of
+ * testing, so it is corrected rather than left as history.
  */
 import {
+  CONFIDENCE_IS_USABLE,
   PROBLEM_BLOCKS_SET,
   artifactSetProblems,
+  destinationDecision,
   orderedForApply,
 } from '@qaai/shared';
 import type {
@@ -79,7 +82,9 @@ import type {
   ArtifactSet,
   ArtifactSetContext,
   ArtifactSetProblem,
+  FileLayout,
   GeneratedArtifact,
+  StyleObservation,
 } from '@qaai/shared';
 import {
   assertionExampleFor,
@@ -163,6 +168,13 @@ export interface AdmissionReport {
    *
    * The same string is always `detail[0]` of the PATH_CONVENTION outcome, for
    * a caller coding against the original shape.
+   *
+   * NULL WHEN THE DESTINATION WAS REFUSED, and that is the one case where null
+   * must not be read as "the path was fine". A path `destinationDecision`
+   * refuses is not corrected, silently or otherwise: substituting a legal path
+   * for `node_modules/.bin/payload.spec.ts` would hide that something proposed
+   * writing into the dependency tree, which is the single most interesting fact
+   * in that report. The gate FAILS instead, and `detail` names the reason.
    */
   correctedFilePath: string | null;
 }
@@ -189,6 +201,21 @@ export interface AdmissionInput {
   /** For resolving the assertion dialect. */
   language?: Language | null;
   ecosystemId?: string | null;
+  /**
+   * The repository's own measured test layout — `profile.fileLayout`, handed
+   * over whole — so PATH_CONVENTION can ask whether this is where THIS
+   * repository keeps its tests.
+   *
+   * OMITTING IT DOES NOT SWITCH THE DESTINATION CHECK OFF. The half that needs
+   * no evidence — the directories QAAI must never write into — runs on every
+   * call with nothing supplied, which is why the two holes this field was added
+   * for (`node_modules/.bin/payload.spec.ts` and
+   * `.github/workflows/release.spec.ts`) are closed at every existing call site
+   * without one line changing there. What omitting it does is leave the
+   * `OUTSIDE_LEARNED_LAYOUT` half UNASKED, and the gate says so in the sentence
+   * a human reads rather than passing quietly.
+   */
+  layout?: StyleObservation<FileLayout> | null;
   /** The spec for spec-driven and hybrid test types; the assertions may live here rather than in code. */
   spec?: unknown;
   /** Which attempt this is. 1 = first. A failure that is revisable on attempt 1 is a refusal on attempt 2. */
@@ -1373,8 +1400,33 @@ function noFixedSleepGate(args: { code: string; dialectId: DialectId | null }): 
  * produce an error — they produce a pass over nothing, and a coverage number
  * that counts it.
  *
- * The convention is mechanical, so the computed path wins over the model's and
- * we say so, exactly as `generator.ts` already does.
+ * ── WHAT THIS GATE DECIDES, ACCURATELY ─────────────────────────────────────
+ *
+ * The comment that stood here said "the convention is mechanical, so the
+ * computed path wins over the model's and we say so". THAT WAS FALSE UNDER THE
+ * CODE, and it is the sentence a reviewer would have trusted instead of
+ * testing: the computed path wins ONLY when the model's path fails the
+ * ecosystem's `filePattern`, which is a suffix regex. A model's path that ends
+ * in `.spec.ts` is kept exactly as the model wrote it, wherever it points. A
+ * verifier ran this gate on `src/index.spec.ts`,
+ * `.github/workflows/release.spec.ts` and `node_modules/.bin/payload.spec.ts`
+ * and all three came back PASS with `correctedFilePath: null`.
+ *
+ * So the gate now asks TWO questions, in this order:
+ *
+ *   1. MAY QAAI WRITE THERE AT ALL — `destinationDecision` in
+ *      packages/shared/src/artifact-set.ts, the one rule in the product about
+ *      whether a repo-relative path is a legal destination. A refusal is a
+ *      FAIL: not a warning, and not a silent correction, because substituting
+ *      a tidy path would erase the only interesting fact in the report.
+ *   2. WILL THE RUNNER COLLECT IT — the suffix question this gate was built
+ *      for, unchanged, including the correction that replaces a path the runner
+ *      would skip.
+ *
+ * Question 1 runs FIRST and runs on EVERY call, including the two that used to
+ * return early (a spec-driven type, and an unresolvable runner): a path in
+ * `node_modules` is not made legal by the fact that no language runner collects
+ * it.
  */
 function pathConventionGate(args: {
   filePath: string;
@@ -1382,20 +1434,73 @@ function pathConventionGate(args: {
   language: Language | null;
   ecosystemId: string | null;
   item: PlanItem | null;
+  layout: StyleObservation<FileLayout> | null;
 }): { outcome: GateOutcome; correctedFilePath: string | null } {
-  const { filePath, testType, language, ecosystemId, item } = args;
+  const { filePath, testType, language, ecosystemId, item, layout } = args;
+  const specDriven = generationStrategyFor(testType).mode === 'spec';
 
   /*
-   * A spec-driven type's path belongs to the spec store (`specFilePathFor`
-   * writes `<dir>/<slug>.json`), not to a language runner — no runner ever
-   * collects it. Checking it against an ecosystem's `filePattern` would warn on
-   * every API, visual and accessibility test in the product.
+   * THE DESTINATION, FIRST AND ALWAYS.
+   *
+   * A spec-driven type is handed NO layout on purpose. Its path belongs to
+   * QAAI's own spec store (`specFilePathFor` writes `<dir>/<slug>.json`), not to
+   * the directory the customer keeps their tests in, so comparing it against a
+   * learned test root would refuse every API, visual and accessibility test in
+   * a repository whose own tests live under `e2e/`. The deny list still applies
+   * to it — that half needs no evidence and no convention.
    */
-  if (generationStrategyFor(testType).mode === 'spec') {
+  const destination = destinationDecision({
+    path: filePath,
+    layout: specDriven ? null : layout,
+  });
+  if (destination.verdict === 'REFUSED') {
+    return {
+      outcome: fail(
+        'PATH_CONVENTION',
+        `QAAI will not write a file at this path: ${destination.why}`,
+        [
+          `destination refused: ${destination.reason}`,
+          ...(destination.subject.length > 0 ? [`the directory in question: ${destination.subject}`] : []),
+        ],
+      ),
+      // Not corrected. See `AdmissionReport.correctedFilePath`.
+      correctedFilePath: null,
+    };
+  }
+
+  /*
+   * The honest disclosure for the half that could not be asked. It is appended
+   * to the sentence a human reads rather than raised as a review flag, because
+   * NO project has a measured layout today — a flag here would fire on every
+   * test the product has ever generated, which is the "four lines per artifact
+   * nobody reads" failure this file already names about MUTATION.
+   */
+  const layoutNote =
+    destination.verdict !== 'UNDECIDED'
+      ? ''
+      : specDriven
+        ? /*
+           * ACCURATE FOR THIS CASE RATHER THAN BORROWED FROM THE RULE. Reusing
+           * the predicate's own sentence here would say "no test layout has
+           * been measured" even when one WAS supplied and this gate chose not
+           * to apply it — a sentence contradicting the code above it, which is
+           * the fifth bullet of rule 12 and the one a reviewer trusts instead
+           * of testing.
+           */
+          ' Whether this is where the repository keeps its tests was NOT ASKED, deliberately: this path belongs to QAAI’s own spec store rather than to the directory the repository keeps its tests in. The directories QAAI never writes into were checked, and this path is not in one.'
+        : ` ${destination.why}`;
+
+  /*
+   * A spec-driven type's path belongs to the spec store, not to a language
+   * runner — no runner ever collects it. Checking it against an ecosystem's
+   * `filePattern` would warn on every API, visual and accessibility test in the
+   * product.
+   */
+  if (specDriven) {
     return {
       outcome: pass(
         'PATH_CONVENTION',
-        `A ${testType} test is executed from its spec by its runner plugin, not collected from disk by a language runner, so no file-naming convention applies to it.`,
+        `A ${testType} test is executed from its spec by its runner plugin, not collected from disk by a language runner, so no file-naming convention applies to it.${layoutNote}`,
       ),
       correctedFilePath: null,
     };
@@ -1406,7 +1511,7 @@ function pathConventionGate(args: {
     return {
       outcome: unavailable(
         'PATH_CONVENTION',
-        'Whether this runner can collect this file could not be checked: neither a language nor a known runner was supplied, and every file-naming rule in this repo belongs to a specific runner.',
+        `Whether this runner can collect this file could not be checked: neither a language nor a known runner was supplied, and every file-naming rule in this repo belongs to a specific runner. The destination itself WAS checked and is not in a directory QAAI refuses to write into.${layoutNote}`,
         [`filePath: ${filePath}`],
       ),
       correctedFilePath: null,
@@ -1417,7 +1522,7 @@ function pathConventionGate(args: {
     return {
       outcome: pass(
         'PATH_CONVENTION',
-        `${ecosystem.label} collects "${filePath}" (${ecosystem.pathRule}).`,
+        `${ecosystem.label} collects "${filePath}" (${ecosystem.pathRule}), and it is not in a directory QAAI refuses to write into.${layoutNote}`,
       ),
       correctedFilePath: null,
     };
@@ -1723,12 +1828,24 @@ async function runFormatGate(
  * one question: would re-prompting plausibly fix it, and what does being wrong
  * cost?
  *
- *   HARD — SYNTAX, ASSERTIONS, FIDELITY. A file that does not parse, checks
- *   nothing, or implements a different scenario than the one approved is not a
- *   test. Storing it is the original defect. One retry, then refuse: a model
- *   that has already been told exactly what is missing and produced it again is
- *   not going to produce it on the third try, and a refusal is honest where a
- *   stored empty test is not.
+ *   HARD — SYNTAX, ASSERTIONS, FIDELITY, PATH_CONVENTION. A file that does not
+ *   parse, checks nothing, or implements a different scenario than the one
+ *   approved is not a test. Storing it is the original defect. One retry, then
+ *   refuse: a model that has already been told exactly what is missing and
+ *   produced it again is not going to produce it on the third try, and a
+ *   refusal is honest where a stored empty test is not.
+ *
+ *   PATH_CONVENTION JOINED THIS CLASS, and only its FAIL did: the suffix
+ *   correction this gate was built for is a WARN and is unaffected. A FAIL here
+ *   means `destinationDecision` refused the destination — a dependency tree, CI
+ *   configuration, build output, or a directory this repository does not keep
+ *   tests in. HARD rather than SOFT because ADMIT_WITH_FLAGS on the second
+ *   attempt would store a test whose destination is `node_modules`, and a flag
+ *   is not a substitute for not doing that. HARD rather than TERMINAL because
+ *   the revise prompt for it is the most actionable in the file — "put it
+ *   somewhere legal" — and the existing `case 'PATH_CONVENTION'` in
+ *   {@link revisePromptFor} stays reachable, where TERMINAL would have made it
+ *   dead code on the day it started mattering.
  *
  *   SOFT — TYPECHECK, LINT, LOCATORS, NO_LOCK_IN. Real problems, all
  *   mechanically fixable, none of which make the test about the wrong thing.
@@ -1745,7 +1862,7 @@ async function runFormatGate(
  * flags it. Admitting with a loud flag after one retry is therefore never worse
  * than the behaviour being replaced.
  */
-const HARD_FAIL_GATES = new Set<GateId>(['SYNTAX', 'ASSERTIONS', 'FIDELITY']);
+const HARD_FAIL_GATES = new Set<GateId>(['SYNTAX', 'ASSERTIONS', 'FIDELITY', 'PATH_CONVENTION']);
 const SOFT_FAIL_GATES = new Set<GateId>(['TYPECHECK', 'LINT', 'LOCATORS', 'NO_LOCK_IN']);
 const TERMINAL_FAIL_GATES = new Set<GateId>(['DUPLICATE']);
 
@@ -1872,7 +1989,15 @@ function revisePromptFor(args: {
       case 'NO_FIXED_SLEEP':
         return 'Replace the fixed sleeps below with a wait for the thing you actually care about: an element state, a response, or a computed value.';
       case 'PATH_CONVENTION':
-        return 'Put the file at the path the runner collects, shown below, and make any package, namespace or class declaration inside the file match it.';
+        /*
+         * One instruction for two findings, because the model needs the same
+         * thing from both: a different path. The destination refusal is named
+         * first because it is the one a model will otherwise argue with — and
+         * no legal path is suggested for it ON PURPOSE, since the reason the
+         * gate failed rather than correcting is that the proposed directory is
+         * the finding.
+         */
+        return 'Put this file somewhere QAAI is allowed to write it: never inside a dependency tree (node_modules, vendor), never inside a hidden directory (.github, .circleci, .vscode), never inside build output (dist, build, target, coverage), and inside the directory this repository already keeps its tests in when the report below names one. Then make sure the filename is one the runner collects, and that any package, namespace or class declaration inside the file matches where you put it.';
       default:
         return `Fix the following: ${gate.why}`;
     }
@@ -2017,7 +2142,14 @@ export async function admit(input: AdmissionInput): Promise<AdmissionReport> {
   const fidelity = fidelityGate({ code, spec, item, testType, dialectId });
   const noLockIn = noLockInGate({ code, dialectId });
   const noSleep = noFixedSleepGate({ code, dialectId });
-  const path = pathConventionGate({ filePath, testType, language, ecosystemId, item });
+  const path = pathConventionGate({
+    filePath,
+    testType,
+    language,
+    ecosystemId,
+    item,
+    layout: input.layout ?? null,
+  });
   const duplicate = duplicateGate({
     code,
     filePath,
@@ -2101,6 +2233,22 @@ export async function admit(input: AdmissionInput): Promise<AdmissionReport> {
  *                   collected and run as a test with no tests in it, so
  *                   "correcting" a page object onto one is the defect, not the
  *                   fix.
+ *
+ *                   THIS SETS ASIDE THE COLLECTION QUESTION AND NOT THE
+ *                   DESTINATION ONE, and the distinction matters enough to
+ *                   state: the gate also refuses a path QAAI must never write
+ *                   into, and a page object in `node_modules` is exactly as
+ *                   unacceptable as a spec there. That refusal is NOT left to
+ *                   this record — it is asked STRUCTURALLY, of every artifact
+ *                   of every role, by `artifactSetProblems`' new
+ *                   `FORBIDDEN_DESTINATION`, which is a set problem and
+ *                   therefore a REFUSE that no role exempts. Were it left to
+ *                   the gate alone, setting PATH_CONVENTION aside here would
+ *                   have switched the destination rule off for six of the seven
+ *                   roles — a pass that means "we did not check", on the exact
+ *                   question this round exists to answer. The set-aside entry
+ *                   still appears in `setAside` with its status, so the finding
+ *                   is visible in both places.
  *   DUPLICATE       Asks "do you already have this test". A page object two
  *                   specs share is the GOAL of this round; reporting it as a
  *                   duplicate would refuse exactly the thing being built.
@@ -2190,6 +2338,20 @@ export interface SetAdmissionReport {
    * them with the ledger in hand.
    */
   readonly ledgerChecked: boolean;
+  /**
+   * FALSE when no measured test layout was supplied, in which case the
+   * `OUTSIDE_LEARNED_LAYOUT` half of the destination rule was NOT ASKED of any
+   * artifact in this set.
+   *
+   * It is not a pass, and it is reported separately from `ledgerChecked`
+   * because the two are different omissions with different fixes: a missing
+   * ledger means ownership is undecided and the apply path decides it, while a
+   * missing layout means nothing has measured where this repository keeps its
+   * tests and only a scan can change that. The half that needs no measurement —
+   * the directories QAAI never writes into — WAS asked either way, of every
+   * artifact, and `setProblems` carries it as `FORBIDDEN_DESTINATION`.
+   */
+  readonly layoutChecked: boolean;
   /** Every gate finding kept out of a role's verdict, with its reason. */
   readonly setAside: readonly SetAsideGate[];
   /** Every artifact's flags, each prefixed with the file it is about. */
@@ -2263,6 +2425,15 @@ export interface AdmitSetInput {
 export const PROBLEM_NEEDS_LEDGER = {
   DUPLICATE_PATH: false,
   PATH_ESCAPE: false,
+  /*
+   * `false`, and it is the interesting `false` in this record. The destination
+   * rule needs no ledger and no working tree: the deny-list half is a closed
+   * list of directory names, and the layout half reads a measurement that
+   * arrives on `context.layout` rather than from any row. So it is asked at
+   * parse time, by `artifactSetSchema`, which is the strongest place in the
+   * product this rule can be enforced from.
+   */
+  FORBIDDEN_DESTINATION: false,
   WRITE_TO_UNOWNED: true,
   MISSING_BASE_HASH: false,
   BASE_HASH_ON_NEW: false,
@@ -2336,6 +2507,15 @@ export async function admitSet(input: AdmitSetInput): Promise<SetAdmissionReport
    * every omitted input, which is its property and not this function's.
    */
   const ledgerChecked = input.context?.ledger !== undefined;
+  /*
+   * A SUPPLIED layout is a measurement in hand; `null` is the honest value for
+   * "we looked and nothing is measured", and both are different from the field
+   * being absent. All three are reported as "not checked" unless the
+   * measurement is actually usable, which `destinationDecision` decides through
+   * `CONFIDENCE_IS_USABLE` rather than this line re-deciding it.
+   */
+  const layout = input.context?.layout ?? null;
+  const layoutChecked = layout !== null && CONFIDENCE_IS_USABLE[layout.confidence] && layout.value !== null;
   const setProblems = artifactSetProblems(ordered, input.context ?? {}).filter(
     (problem) =>
       PROBLEM_BLOCKS_SET[problem.kind] && (ledgerChecked || !PROBLEM_NEEDS_LEDGER[problem.kind]),
@@ -2366,6 +2546,15 @@ export async function admitSet(input: AdmitSetInput): Promise<SetAdmissionReport
       item: isSpec ? input.item : null,
       language: input.language ?? null,
       ecosystemId: input.ecosystemId ?? null,
+      /*
+       * The SAME layout the structural half was given, read off the same field,
+       * so the gate and `artifactSetProblems` cannot reach two conclusions
+       * about one path. Handed to every role, not only the SPEC: a page
+       * object's destination is as consequential as a spec's, and
+       * `GATES_NOT_ABOUT_ROLE` sets the gate's COLLECTION finding aside without
+       * stopping the destination finding being computed and listed.
+       */
+      layout,
       /*
        * A spec-driven type keeps its assertions in `spec` and not in `code`,
        * and only the SPEC has one. Giving a fixture the spec would let the
@@ -2479,11 +2668,18 @@ export async function admitSet(input: AdmitSetInput): Promise<SetAdmissionReport
     );
   }
 
+  if (!layoutChecked) {
+    reviewFlags.push(
+      'No usable test layout was measured for this repository, so whether these paths are where it keeps its tests was not checked. The directories QAAI never writes into were checked, on every file in this set.',
+    );
+  }
+
   return {
     verdict,
     artifacts,
     setProblems,
     ledgerChecked,
+    layoutChecked,
     setAside,
     reviewFlags,
     revisePrompt:

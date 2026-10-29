@@ -79,6 +79,7 @@ import {
   findTestBlocks,
   hasAnyAssertion,
   resolveDialect,
+  destinationDecision,
   DIALECT_IDS,
   type DialectId,
   type Ecosystem,
@@ -209,6 +210,7 @@ export const SKIP_REASONS = [
   'EMPTY',
   'TOO_LARGE',
   'UNSAFE_PATH',
+  'FORBIDDEN_DIRECTORY',
   'NOT_A_TEST_FILE',
   'OUTSIDE_SCOPE',
 ] as const;
@@ -221,6 +223,9 @@ export const SKIP_REASON_WHY = {
   EMPTY: 'the file is empty, so it is evidence of nothing',
   TOO_LARGE: `over ${MAX_FILE_CHARS} characters; a file that size is a generated dump`,
   UNSAFE_PATH: 'the path is not a safe repo-relative path, and a path decides where we write',
+  FORBIDDEN_DIRECTORY:
+    'the path is inside a directory QAAI never writes into, so its conventions are not conventions ' +
+    'QAAI may follow',
   NOT_A_TEST_FILE: 'the path does not look like a test file, so its conventions are not test conventions',
   OUTSIDE_SCOPE: 'the path is not under the scope root this profile describes',
 } as const satisfies Record<SkipReason, string>;
@@ -231,44 +236,41 @@ export const SKIP_REASON_WHY = {
  * Is this a path we are willing to read, count, quote and derive a write
  * location from?
  *
- * The traversal guard is REPEATED here rather than imported, for the reason
- * `artifactPath` in schemas.ts already records about itself: the bound differs,
- * the private helper is not exported, and this one refuses MORE. A path that
- * reaches here came out of a `list()` over somebody else's repository, so it
- * also may not contain a control character (a newline in a path breaks every
- * line-oriented rendering below out of its fence), may not start with `~` (a
- * shell would expand it), and may not be absolute in either separator style.
+ * ONE RULE, ASKED HERE. `destinationDecision` in @qaai/shared is the single
+ * predicate about where QAAI may write a generated file, and this function is
+ * now a call to it rather than a second spelling of the same question. The
+ * traversal guard used to be REPEATED here — length, `..`, absolute in either
+ * separator style, `~`, a Windows drive letter, control characters — and
+ * `malformedDestination` inside the predicate refuses every one of those AND
+ * refuses `..` as a SUBSTRING rather than as a segment, which is what
+ * `artifactPath` in schemas.ts refuses. So this is a strict superset of what
+ * was here and it ends at the validator the write path actually runs.
  *
  * `fileLayout.root` and `fileLayout.filename` are derived from paths that
  * passed this, and those two decide where a generated file is written. That is
  * the whole reason this function exists before the one that counts.
+ *
+ * ── `!== 'REFUSED'`, NOT `=== 'ALLOWED'`, AND THE DIFFERENCE IS THE FUNCTION ─
+ *
+ * With no layout supplied every well-formed path comes back UNDECIDED, because
+ * UNDECIDED is the predicate's honest answer for "nothing has measured this
+ * repository" — which is exactly the state the learner runs in, since it is the
+ * thing that performs the measurement. Requiring ALLOWED would skip every file
+ * in every repository and the learner would read nothing.
+ *
+ * ── THE HOLE IT CLOSES, WHICH THE OLD BODY HAD NO NOTION OF ─────────────────
+ *
+ * `.github/workflows/tests/release.spec.ts` passed every check the old body
+ * made. Four files under that directory were therefore read and counted with
+ * none skipped, and `fileLayout` came back MEDIUM — which
+ * `CONFIDENCE_IS_USABLE` calls usable — with `root: ".github/workflows/tests"`.
+ * `directoryForRole` then placed every artifact under it: a page object at
+ * `.github/workflows/tests/pages/login.page.ts`. A path inside a directory
+ * QAAI must never write into is not a convention QAAI may learn FROM, because
+ * the conclusion drawn from it is a write location.
  */
 export function safeRepoPath(path: string): boolean {
-  if (path.length === 0 || path.length > MAX_ARTIFACT_PATH_CHARS) return false;
-  if (path.includes('..')) return false;
-  if (path.startsWith('/') || path.startsWith('\\') || path.startsWith('~')) return false;
-  if (path.includes('\\')) return false;
-  if (/^[A-Za-z]:/.test(path)) return false;
-  // Control characters, including the newline that would break a rendering out
-  // of its fence, and the NUL that truncates a path in any C library below us.
-  return !hasControlCharacter(path);
-}
-
-/**
- * Any character below U+0020, or DEL.
- *
- * Written as a code-point walk rather than `/[\u0000-\u001f\u007f]/`, which
- * `no-control-regex` refuses — correctly, in general: a literal control
- * character inside a pattern is almost always a typo. Here the control
- * characters ARE the subject, so the check moves out of the regex engine rather
- * than the rule being disabled.
- */
-function hasControlCharacter(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code < 0x20 || code === 0x7f) return true;
-  }
-  return false;
+  return destinationDecision({ path }).verdict !== 'REFUSED';
 }
 
 /**
@@ -518,8 +520,15 @@ export async function learnStyle(
 
   const admitted: string[] = [];
   for (const path of candidates) {
-    if (!safeRepoPath(path)) {
-      skip(path, 'UNSAFE_PATH');
+    const destination = destinationDecision({ path });
+    if (destination.verdict === 'REFUSED') {
+      /*
+       * TWO REASONS, NOT ONE. A malformed path and a well-formed path into
+       * `node_modules` are different facts with different fixes, and summing
+       * them into UNSAFE_PATH would make a reader unable to tell a traversal
+       * attempt from a repository that keeps a smoke test in CI configuration.
+       */
+      skip(path, destination.reason === 'FORBIDDEN_DIRECTORY' ? 'FORBIDDEN_DIRECTORY' : 'UNSAFE_PATH');
       continue;
     }
     if (scopeRoot !== '' && !isUnderScope(path, scopeRoot)) {

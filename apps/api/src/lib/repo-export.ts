@@ -1026,6 +1026,59 @@ export interface RepoBuild {
   skipped: Array<{ filePath: string; why: string }>;
   /** The ecosystem this repo was written for, primary first. */
   ecosystems: string[];
+  /**
+   * TREE PATH → LEDGER PATH, and THIS FUNCTION IS THE ONLY PLACE THAT CAN SAY.
+   *
+   * ── The seam, and why a map rather than a convention ──────────────────────
+   *
+   * `GeneratedArtifact.path` is the path the GENERATOR chose, which is what
+   * `ledgerRowsFor` (apps/worker/src/processors/generate.ts) records and what
+   * `Test.filePath` stores. The path this exporter WRITES is that one put
+   * through {@link repoPath} and {@link uniquePath}, and for the two most used
+   * ecosystems in the product those are DIFFERENT STRINGS:
+   *
+   *   PLAYWRIGHT_TS  generator `checkout/pay.spec.ts`  → tree `tests/checkout/pay.spec.ts`
+   *   PUPPETEER      generator `checkout/pay.test.ts`  → tree `tests/checkout/pay.test.ts`
+   *
+   * `EXPORT_PROFILES.PLAYWRIGHT_TS` says so in as many words — "the generator
+   * deliberately emits `<feature>/<title>.spec.ts` and leaves the root to the
+   * exporter". That is a deliberate split and it is not a defect here; the
+   * defect is what it does to the ONE CALLER that needs both spellings at once.
+   * `pushRepo` asks its `ownership` reader about TREE paths, and a reader that
+   * looked those up in the ledger directly would answer `UNRECORDED` for every
+   * file in a Playwright project — so every replacement would be refused with
+   * "nothing in the ownership ledger claims this path" while the ledger claimed
+   * all of them under another name. A refusal with a false reason on it is the
+   * lie this round's rule 12 names, and it would read as the ownership gate
+   * working.
+   *
+   * So the correspondence is RETURNED rather than recomputed. The alternative
+   * was `repoPath`'s rule written out a second time at the push call site,
+   * which is two spellings of one question that agree until one of them is
+   * edited — the defect packages/shared/src/artifact-set.ts's header is about.
+   *
+   * ── WHAT IS DELIBERATELY NOT IN HERE ──────────────────────────────────────
+   *
+   * Only the two `tree.set` calls whose bytes ARE a `Test` row's own and whose
+   * path is that row's `filePath` put through `repoPath`. A runner config, a
+   * manifest, `README.md`, `.gitignore` and `.env.example` are QAAI's
+   * scaffolding and no ledger row claims them. Their absence here resolves
+   * `UNRECORDED`, which is why a push creates a `playwright.config.ts` that is
+   * missing and REFUSES to overwrite the customer's own — the fail-closed
+   * direction, and the one a config file has to have.
+   *
+   * A SPEC-DRIVEN TYPE IS ALSO LEFT OUT, and that is a stated limitation rather
+   * than an oversight. Its `Test` row becomes TWO tree entries — a
+   * `fixtures/<stem>.json` and, for Playwright TS only, a generated loader spec
+   * — and one ledger row cannot be the recorded fact about two paths whose
+   * bytes are both different from the artifact it recorded. Claiming either
+   * would make the ledger's hash a comparison against bytes it never hashed, so
+   * neither is claimed: those files are created when absent and refused when
+   * present. `POST /:projectId/git/push` reports the count under
+   * `ledgerUnclaimed` so the consequence is a disclosed number rather than a
+   * silent create-only corner.
+   */
+  ledgerPaths: ReadonlyMap<string, string>;
 }
 
 export async function buildRepoTree({ projectId }: BuildRepoOptions): Promise<RepoBuild> {
@@ -1065,6 +1118,13 @@ export async function buildRepoTree({ projectId }: BuildRepoOptions): Promise<Re
   const used = new Map<GeneratorEcosystemId, GeneratorEcosystem>();
   const roots = new Set<string>();
   const dataOnly: string[] = [];
+  /*
+   * Recorded at each `tree.set` whose bytes come from a `Test` row, and never
+   * derived afterwards from the finished tree: `uniquePath` can rename a second
+   * test onto `-2`, so the only moment the pair is known for certain is the one
+   * where both strings are in hand. See {@link RepoBuild.ledgerPaths}.
+   */
+  const ledgerPaths = new Map<string, string>();
 
   for (const test of tests) {
     const rel = safeRelPath(test.filePath);
@@ -1079,7 +1139,9 @@ export async function buildRepoTree({ projectId }: BuildRepoOptions): Promise<Re
         test.spec !== null && test.spec !== undefined
           ? `${JSON.stringify(test.spec, null, 2)}\n`
           : test.code;
-      tree.set(uniquePath(tree, rel, extname(rel)), body);
+      const fixturePath = uniquePath(tree, rel, extname(rel));
+      tree.set(fixturePath, body);
+      ledgerPaths.set(fixturePath, rel);
       continue;
     }
 
@@ -1130,6 +1192,7 @@ export async function buildRepoTree({ projectId }: BuildRepoOptions): Promise<Re
 
     const path = uniquePath(tree, repoPath(rel, ecosystem, convention, root), convention.suffix);
     tree.set(path, test.code);
+    ledgerPaths.set(path, rel);
     roots.add(layoutRoot(path, root));
   }
 
@@ -1242,6 +1305,7 @@ export async function buildRepoTree({ projectId }: BuildRepoOptions): Promise<Re
     secretNames,
     skipped,
     ecosystems: runners.map((r) => r.ecosystem.id),
+    ledgerPaths,
   };
 }
 
