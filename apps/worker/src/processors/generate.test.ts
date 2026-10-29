@@ -49,12 +49,23 @@ import type { ExecutableTest, FlowMap, PlanItem, TestType } from '@qaai/shared';
 import { pluginFor } from '@qaai/runner';
 import type { CallContext, StructuredOptions } from '@qaai/agent';
 /*
- * Reached by a relative path across the workspace boundary, which is a defect
- * and is recorded as one in the module under test: `packages/shared/src/index.ts`
- * does not export `./style-profile`, and the one-line fix is TS2308 because
- * `artifact-set.ts` and `requirements.ts` both export `ContentDigest`.
+ * WAS a relative path across the workspace boundary, on a comment claiming
+ * `packages/shared/src/index.ts` does not export `./style-profile`. It has for
+ * two commits (line 237 of that barrel), so the comment had become the kind of
+ * doc comment that contradicts the code under it. The module under test carried
+ * the same stale note and lost it in the same change.
  */
-import { emptyStyleProfile } from '../../../../packages/shared/src/style-profile.js';
+import { emptyStyleProfile } from '@qaai/shared';
+/*
+ * TYPE-ONLY, so the module under test is still loaded by the dynamic `import`
+ * below — after `vi.mock('../context.js')` has replaced Postgres, Redis and the
+ * model, which a top-level value import would defeat.
+ */
+import type { DiskState, TestFileSource } from '@qaai/agent';
+import type { RepoFileView, RepoViewOpener } from './generate.js';
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 /*
  * The worker's context opens Postgres, Redis and the LLM at import time, so it
@@ -95,19 +106,98 @@ vi.mock('../context.js', () => {
         h.prompts.push(opts.prompt);
         const reply = h.llmReplies[Math.min(h.prompts.length - 1, h.llmReplies.length - 1)];
         if (!reply) throw new Error('the fake model was called with no reply configured');
-        return reply;
+        /*
+         * ECHOING THE PATH THE PROMPT SUGGESTED, when a test asks for it.
+         *
+         * A well-behaved model writes the file where it was told, and on the
+         * multi-file path that is load-bearing rather than polite: the plan
+         * computes every page-object import specifier RELATIVE TO the spec path
+         * it chose, so a reply at any other path makes `specPathMoved` true and
+         * the generator correctly DROPS the whole set. A canned absolute path
+         * would therefore exercise the drop branch in every multi-file test
+         * instead of the one that is about it — and a test cannot know the
+         * planned path in advance, because the plan reads it off the ledger and
+         * the profile. The craft suite in packages/agent does this for the same
+         * reason and with the same regex.
+         */
+        const answered = { ...reply };
+        if (answered.filePath === FOLLOW_SUGGESTED_PATH) {
+          const suggested = /filePath\s+"([^"]+)"/.exec(opts.prompt)?.[1];
+          if (suggested === undefined) {
+            throw new Error('the prompt did not name a filePath for the fake model to echo');
+          }
+          answered.filePath = suggested;
+        }
+        if (answered.code === FOLLOW_BRIEFED_IMPORTS) {
+          answered.code = specImporting(opts.prompt);
+        }
+        return answered;
       },
     },
   };
 });
 
+/**
+ * The sentinel a canned reply uses to mean "answer at the path you were given".
+ *
+ * A string nothing could be, so a reply that forgot to replace it fails loudly
+ * in the gate rather than quietly becoming a real path.
+ */
+const FOLLOW_SUGGESTED_PATH = '<<echo the suggested path>>';
+
+/** The sentinel a canned reply uses for "import the files you told me about". */
+const FOLLOW_BRIEFED_IMPORTS = '<<import the briefed files>>';
+
+/**
+ * A spec that actually imports what `artifactBriefing` named.
+ *
+ * WHY A CANNED FILE WILL NOT DO, and this cost a debugging pass worth recording:
+ * the generator no longer takes the plan's word for what the spec imports. It
+ * READS THE BYTES, and a multi-file set whose spec does not mention the fixture
+ * or the page object is DROPPED — correctly, because writing files nothing
+ * imports would record an import edge that is not there, and the push path reads
+ * that edge as the truth about what depends on what. So a fake model that
+ * returned a fixed file would exercise the drop branch in every multi-file test
+ * and the wiring would look unwired.
+ *
+ * The specifiers are read out of the briefing's own two line shapes, so this
+ * follows the prompt rather than guessing at the plan's layout.
+ */
+function specImporting(prompt: string): string {
+  const imports: string[] = [];
+  const fixture = /^- Import test and expect from (\S+) /m.exec(prompt)?.[1];
+  imports.push(
+    fixture === undefined
+      ? "import { test, expect } from '@playwright/test';"
+      : `import { test, expect } from '${fixture}';`,
+  );
+  for (const line of prompt.split('\n')) {
+    const page = /^- (\w+) from (\S+?):/.exec(line);
+    if (page) imports.push(`import { ${page[1]!} } from '${page[2]!}';`);
+  }
+  return `${imports.join('\n')}
+
+test('Checkout shows the order total', async ({ page }) => {
+  await page.goto('/cart');
+  await expect(page.getByTestId('order-total')).toHaveText('$42.00');
+});
+`;
+}
+
 const {
   DUPLICATE_CANDIDATE_CAP,
+  DEFAULT_REPO_VIEW_LIMITS,
   GENERATE_AUDIT_ACTIONS,
+  LAYOUT_OUTCOMES,
+  LAYOUT_SENTENCES,
   SHARED_ARTIFACT_ROLES,
   duplicateCandidates,
   ledgerRowsFor,
+  nodeRepoFileView,
+  occupancyProbe,
+  ownershipClaims,
   processGenerate,
+  readFlowGraph,
 } = await import('./generate.js');
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -446,6 +536,14 @@ function fakeWorld(
     corrections?: Array<Record<string, unknown>>;
     /** Ownership rows already in the ledger, which an insert must not overwrite. */
     artifacts?: Array<Record<string, unknown>>;
+    /**
+     * `FlowMap.graph`, as a Json column holds it — ANYTHING AT ALL.
+     *
+     * `unknown` and not `FlowMap`, because the processor's job at that boundary
+     * is to parse a column a previous writer filled, and a fixture the compiler
+     * had already proved well-formed could not exercise the refusal.
+     */
+    flowMapGraph?: unknown;
   } = {},
 ): {
   tests: FakeTest[];
@@ -489,6 +587,16 @@ function fakeWorld(
                 : options.styleProfile === undefined || options.styleProfile === null
                   ? null
                   : new Date('2026-10-20T00:00:00.000Z'),
+            /*
+             * WHICH REPOSITORY, AND ON WHICH BRANCH. On the row because the
+             * processor `select`s them and {@link selected} honours `select` —
+             * so dropping one from that query makes the opener receive
+             * `undefined` and a test below go red, which is exactly what a
+             * select-blind fake would have hidden.
+             */
+            repoFullName: 'acme/shop',
+            repoInstallationId: 'inst_1',
+            defaultBranch: 'main',
           },
           select,
         ),
@@ -521,8 +629,33 @@ function fakeWorld(
      * row back to QAAI_OWNED.
      */
     generatedArtifact: {
-      findMany: async ({ where, select }: { where: Record<string, unknown>; select?: Record<string, boolean> }) =>
-        ledger.filter((row) => matchesWhere(row, where ?? {})).map((row) => selected(row, select)),
+      /*
+       * `take` AND `orderBy` ARE HONOURED, not only `select`.
+       *
+       * A take-blind fake is the same class of defect as a select-blind one and
+       * it survived a mutation here: `readArtifactLedger` reads `cap + 1` rows
+       * so that "there are more of these" is a FACT rather than an inference
+       * from a full page, and a fake that returned every row regardless made
+       * `cap + 1` indistinguishable from `cap`. Dropping the `+ 1` is caught now.
+       */
+      findMany: async ({
+        where,
+        take,
+        orderBy,
+        select,
+      }: {
+        where: Record<string, unknown>;
+        take?: number;
+        orderBy?: { path?: 'asc' | 'desc' };
+        select?: Record<string, boolean>;
+      }) => {
+        const rows = ledger.filter((row) => matchesWhere(row, where ?? {}));
+        if (orderBy?.path !== undefined) {
+          rows.sort((a, b) => String(a.path).localeCompare(String(b.path)));
+          if (orderBy.path === 'desc') rows.reverse();
+        }
+        return rows.slice(0, take ?? undefined).map((row) => selected(row, select));
+      },
       createMany: async ({
         data,
         skipDuplicates,
@@ -546,7 +679,11 @@ function fakeWorld(
     },
     testPlan: { findFirst: async () => ({ id: 'plan1', flowMapId: 'fm1' }) },
     flowMap: {
-      findUnique: async () => ({ id: 'fm1', environmentId: 'env1', graph: crawledFlowMap }),
+      findUnique: async () => ({
+        id: 'fm1',
+        environmentId: 'env1',
+        graph: 'flowMapGraph' in options ? options.flowMapGraph : crawledFlowMap,
+      }),
     },
     // No environment row, so no secrets are read: the vault is not what these
     // tests are about.
@@ -1359,13 +1496,16 @@ describe('the correction corpus', () => {
 // ─── The ledger rows one set owes ───────────────────────────────────────────
 
 /*
- * TESTED DIRECTLY, AND THE REASON IS WORTH RECORDING: `processGenerate` passes
- * no `repository`, so it never produces a multi-artifact set and the two
- * branches below are unreachable THROUGH it today. Driving them through the
- * processor would mean asserting on a shape production cannot currently
- * produce; `ledgerRowsFor` is a pure exported function and the invariants are
- * about it, so they are pinned where they live. The missing wiring — one
- * materialised checkout per batch — is in this round's handover.
+ * TESTED DIRECTLY, AND THE REASON HAS CHANGED, SO THE COMMENT HAS.
+ *
+ * It used to say `processGenerate` passes no `repository`, so a multi-artifact
+ * set was unreachable through it and these invariants had to be pinned on the
+ * pure function. The processor opens a repository view per batch now and section
+ * 5 below drives a four-file set through it end to end, so these are no longer
+ * the only cover for them — they are the UNIT, kept because the shared-role rule
+ * and the imported-human-file rule are properties of this function and a test
+ * that has to generate a whole batch to assert one of them is a test that fails
+ * for ten reasons.
  */
 describe('ledgerRowsFor', () => {
   const set = {
@@ -1446,5 +1586,919 @@ describe('ledgerRowsFor', () => {
     expect(SHARED_ARTIFACT_ROLES.has('FIXTURE')).toBe(true);
     expect(SHARED_ARTIFACT_ROLES.has('SPEC')).toBe(false);
     expect(SHARED_ARTIFACT_ROLES.has('SNAPSHOT')).toBe(false);
+  });
+});
+
+// ─── 5. THE REPOSITORY THIS BATCH PLANNED AGAINST ────────────────────────────
+
+/**
+ * A crawled cart page WITH A FORM, which is what makes a page object worth
+ * minting.
+ *
+ * A node with no affordances and no forms yields no page object at all — the
+ * plan is then correctly a set of one — so the shared `crawledFlowMap` above
+ * cannot prove multi-file generation and a fixture with real controls on it has
+ * to exist. The route is `/cart` because the plan item's own steps say "Open
+ * the cart page", and tier-3 retrieval is word overlap: a page the item does not
+ * mention is not in the prompt and is therefore not in the plan.
+ */
+const cartWithForm: FlowMap['nodes'][number] = {
+  ...node('/cart'),
+  title: 'Your cart',
+  affordances: [
+    {
+      kind: 'button',
+      label: 'Checkout',
+      selector: { strategy: 'ROLE', value: 'button', name: 'Checkout', confidence: 0.95 },
+    },
+  ],
+  forms: [
+    {
+      id: 'form:promo',
+      name: 'promo',
+      selector: { strategy: 'CSS', value: 'form#promo', confidence: 0.7 },
+      submit: { strategy: 'ROLE', value: 'button', name: 'Apply', confidence: 0.9 },
+      fields: [
+        {
+          name: 'code',
+          label: 'Promo code',
+          inputType: 'text',
+          required: true,
+          semantic: 'freeform',
+          selector: { strategy: 'LABEL', value: 'Promo code', confidence: 0.9 },
+        },
+        {
+          name: 'email',
+          label: 'Email for the receipt',
+          inputType: 'email',
+          required: false,
+          semantic: 'email',
+          selector: { strategy: 'LABEL', value: 'Email for the receipt', confidence: 0.9 },
+        },
+      ],
+    },
+  ],
+};
+
+/** The crawl the multi-file tests generate against. */
+const cartFlowMap: FlowMap = {
+  ...crawledFlowMap,
+  nodes: [node('/'), cartWithForm, node('/checkout')],
+};
+
+/**
+ * A style profile that parses, which is the OTHER half of the gate in
+ * `generateTest`: `args.repository && args.styleProfile`.
+ *
+ * `emptyStyleProfile('')` is the canonical "measured nothing anywhere" value and
+ * `styleProfileSchema` accepts it — every confidence in it is NONE, which is
+ * arithmetically consistent with `filesRead: 0`, and the schema re-derives them.
+ * So this is a profile that is HONEST about knowing nothing rather than a
+ * fabricated one, and the layout the plan then chooses comes from the ecosystem
+ * and the ledger instead.
+ */
+const measuredNothing = emptyStyleProfile('');
+
+/** A view over an in-memory tree. No disk, no network, no checkout. */
+function fakeView(files: Map<string, string>, unreadable: Set<string> = new Set()): RepoFileView {
+  return {
+    diskStateAt: (path): DiskState => {
+      if (unreadable.has(path)) return { state: 'UNREADABLE', why: 'the fake declined it' };
+      const content = files.get(path);
+      return content === undefined ? { state: 'ABSENT' } : { state: 'PRESENT', content };
+    },
+    filesUnder: (directory) =>
+      [...files.keys()].filter((path) => {
+        const slash = path.lastIndexOf('/');
+        return (slash === -1 ? '' : path.slice(0, slash)) === directory;
+      }),
+  };
+}
+
+/** An opener that answers READABLE over `files`, and records that it was asked. */
+function readableOpener(
+  files: Map<string, string> = new Map(),
+  unreadable?: Set<string>,
+  /*
+   * The EXISTING TESTS this checkout holds, which is a different question from
+   * the one `fakeView` answers: a view lists one directory and reports what is
+   * at a path, and a style learner walks the tree and reads whole bodies. Null
+   * by default, which every test that is not about exemplars wants.
+   */
+  houseStyleSource: TestFileSource | null = null,
+): { open: RepoViewOpener; asked: Array<Record<string, unknown>>; cleanups: number } {
+  const asked: Array<Record<string, unknown>> = [];
+  const state = { cleanups: 0 };
+  return {
+    asked,
+    get cleanups() {
+      return state.cleanups;
+    },
+    open: async (args) => {
+      asked.push({ ...args });
+      return {
+        kind: 'READABLE',
+        // Null unless a test asks for exemplars — no real directory is behind
+        // this view, and `houseStyleFlags` reports that as "none was read"
+        // rather than as 0 of 0.
+        houseStyleSource,
+        view: fakeView(files, unreadable),
+        source: 'acme/shop@main',
+        files: files.size,
+        cleanup: async () => {
+          state.cleanups += 1;
+        },
+      };
+    },
+  };
+}
+
+describe('a multi-file set reaches a customer', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  /**
+   * THE ITEM TWO ROUNDS FAILED TO LAND, driven through the real
+   * `processGenerate` over a real `generateTest` with a fake model.
+   *
+   * Nothing here is a mock of the thing being proven: the plan is computed by
+   * the real `planArtifacts`, the page object is rendered by the real
+   * `page-objects.ts`, the set is admitted by the real `admitSet`, and what is
+   * asserted is the row that reaches `prisma.test.create` plus the ownership
+   * rows beside it. The only injected surfaces are the model, Prisma and the
+   * repository view — the three things that would otherwise need a key, a
+   * database and a checkout.
+   */
+  it('writes more than one artifact, a page object among them, and the spec imports it', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      // Echoed from the prompt: the plan's import specifiers are relative to
+      // the path it chose, so a reply anywhere else correctly drops the set.
+      filePath: FOLLOW_SUGGESTED_PATH,
+      // And the file IMPORTS what the briefing named — the generator reads the
+      // bytes rather than trusting the plan, and drops a set that does not.
+      code: FOLLOW_BRIEFED_IMPORTS,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    /*
+     * The repository was asked for, with the three facts the materialiser needs
+     * — and this assertion is only meaningful because the Prisma fake honours
+     * `select`: drop `defaultBranch` from the processor's query and these
+     * arrive `undefined`.
+     */
+    expect(repo.asked).toHaveLength(1);
+    expect(repo.asked[0]).toMatchObject({
+      repoFullName: 'acme/shop',
+      repoInstallationId: 'inst_1',
+      defaultBranch: 'main',
+    });
+
+    /*
+     * FOUR FILES, not one — the measured shape of this crawl: the page object
+     * for the cart, the fixture that constructs it, the dataset the form's
+     * fields are filled from, and the spec.
+     */
+    expect(world.artifactWrites.map((row) => row.role)).toEqual([
+      'DATASET',
+      'FIXTURE',
+      'PAGE_OBJECT',
+      'SPEC',
+    ]);
+    const roleOf = (role: string) => world.artifactWrites.find((row) => row.role === role)!;
+    const pageObject = roleOf('PAGE_OBJECT');
+    const fixture = roleOf('FIXTURE');
+    const spec = roleOf('SPEC');
+
+    /*
+     * AND THE SPEC REACHES THE PAGE OBJECT, which is the point of the whole
+     * exercise: a file in the set that nothing imports is a file nobody loads.
+     * The chain is spec → fixture → page object, and it is asserted as a CHAIN
+     * rather than as "the spec names the page object", because the fixture is
+     * what constructs page objects and a spec that imported the class directly
+     * would be the un-extended `test` with no fixtures. `imports` is the column
+     * `dependentsOf` and the shared-surface rule read, so a wrong value here is
+     * a wrong blast radius on the push path.
+     */
+    expect(spec.imports as string[]).toEqual([fixture.path]);
+    expect(fixture.imports as string[]).toEqual([pageObject.path]);
+    // And the spec's own bytes mention it, which is what the generator checked.
+    expect(world.created[0]!.code as string).toContain('pages.fixture');
+
+    /*
+     * The page object and the fixture belong to NO single test — two specs may
+     * import either — and the spec belongs to this one. Attaching a shared file
+     * to the first spec that needed it would make deleting that test look like
+     * permission to delete the page object.
+     */
+    expect(pageObject.testId).toBeNull();
+    expect(fixture.testId).toBeNull();
+    expect(spec.testId).toBe('test-1');
+    // The workspace was removed on the way out.
+    expect(repo.cleanups).toBe(1);
+  });
+
+  /**
+   * THE NEGATIVE, AND IT IS HALF THE ITEM. "One file because we could not look"
+   * and "one file because the page needed nothing else" are different outcomes,
+   * and before this round the product said the first about both.
+   */
+  it('falls back to one file with the materialiser’s own reason when the view is unavailable', async () => {
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, {
+      openRepoView: async () => ({
+        kind: 'UNAVAILABLE',
+        why: 'This project has no connected repository: install the QAAI GitHub App on the repo.',
+      }),
+    });
+
+    expect(world.artifactWrites).toHaveLength(1);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    // The reason that ACTUALLY BIT, in the materialiser's own words.
+    expect(flags).toMatch(/could not read the repository/);
+    expect(flags).toMatch(/no connected repository/);
+    // And NOT the sentence for a different branch.
+    expect(flags).not.toMatch(/the page needed nothing else|planned against the repository itself/);
+  });
+
+  /**
+   * THE OTHER ONE-FILE OUTCOME, which only exists because the pair does.
+   *
+   * A page with no controls on it needs no page object, so a PLANNED batch can
+   * still produce a set of one — and that must not read as "we could not look".
+   */
+  it('says the repository WAS read when the page simply needed nothing else', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({
+      styleProfile: measuredNothing,
+      // The bare `/cart` node: no affordances, no forms, nothing to extract.
+      flowMapGraph: { ...crawledFlowMap, nodes: [node('/'), node('/cart')] },
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: FOLLOW_SUGGESTED_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    expect(world.artifactWrites).toHaveLength(1);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/planned against the repository itself/);
+    expect(flags).toMatch(/acme\/shop@main/);
+    expect(flags).not.toMatch(/could not read the repository/);
+  });
+
+  /**
+   * NO TARBALL FOR A QUESTION A TARBALL CANNOT ANSWER.
+   *
+   * With no style profile the plan cannot be computed WHATEVER the repository
+   * says, so the download is not paid for — and the reported reason is the one
+   * that actually bit rather than "the repository was unreadable", which would
+   * be a reason for a thing nobody tried.
+   */
+  it('does not open the repository at all when nobody has measured the project', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({ flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    expect(repo.asked).toHaveLength(0);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/the repository was not downloaded at all/);
+    expect(flags).not.toMatch(/could not read the repository/);
+  });
+
+  /**
+   * THE DEFECT THAT BECOMES LIVE THE MOMENT THIS IS WIRED.
+   *
+   * `howToFill` in packages/agent/src/page-objects.ts does
+   * `field.inputType.toLowerCase()` and throws a bare `TypeError` on a form
+   * field that has none. Every current producer sets the field, so it was latent
+   * — and reachable from a stored row the instant a plan is computed over one.
+   * The boundary parse is what keeps it unreachable: the graph is refused, the
+   * plan is withheld, generation still happens single-file, and the reason is on
+   * the test.
+   */
+  it('withholds the plan when the stored crawl does not validate, and still generates', async () => {
+    const fieldWithNoType = {
+      ...cartWithForm,
+      forms: [
+        {
+          ...cartWithForm.forms[0]!,
+          fields: [
+            // `inputType` deleted, which is exactly the row `howToFill` throws on.
+            {
+              name: 'code',
+              label: 'Promo code',
+              required: true,
+              semantic: 'freeform',
+              selector: { strategy: 'LABEL', value: 'Promo code', confidence: 0.9 },
+            },
+          ],
+        },
+      ],
+    };
+    const repo = readableOpener();
+    const world = fakeWorld({
+      styleProfile: measuredNothing,
+      flowMapGraph: { ...cartFlowMap, nodes: [node('/'), fieldWithNoType] },
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    // A test was still stored: an older crawl must not cost a generation.
+    expect(world.created).toHaveLength(1);
+    expect(world.artifactWrites).toHaveLength(1);
+    // The repository was never opened, because the graph was refused first.
+    expect(repo.asked).toHaveLength(0);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/the stored crawl this plan was generated from did not validate/);
+    // The zod PATH, and never the customer-authored value beside it.
+    expect(flags).toMatch(/nodes\.1\.forms\.0\.fields\.0\.inputType/);
+    expect(flags).not.toMatch(/Promo code/);
+  });
+
+  /**
+   * THE FIFTH BRANCH, AND IT IS RULE 12'S MIRROR.
+   *
+   * The repository WAS read and the generator still declined its own plan — here
+   * because the model answered at a path the plan did not choose, which makes
+   * every import specifier in the plan resolve from the wrong directory. Saying
+   * "no repository ledger was available" about that outcome would be reporting
+   * as UNMEASURED a thing that was measured, which is the defect this round was
+   * convened over.
+   *
+   * Found by mutation, not by reasoning: collapsing this branch back into the
+   * batch-level reason left all 92 tests green, so the case had no cover at all.
+   */
+  it('does not blame the repository when the repository was read and the plan was declined', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      // NOT the planned path, which is what drops the set.
+      filePath: 'tests/somewhere-else.spec.ts',
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    expect(repo.asked).toHaveLength(1);
+    expect(world.artifactWrites).toHaveLength(1);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/The repository WAS read for this test/);
+    expect(flags).toMatch(/This is not "we could not look"/);
+    // And never the sentence for a branch that did not happen.
+    expect(flags).not.toMatch(/could not read the repository|was not downloaded at all/);
+  });
+
+  /**
+   * A BATCH WITH NOTHING TO GENERATE DOWNLOADS NOTHING, and the recorded reason
+   * is its own rather than borrowed from the style profile.
+   *
+   * The first version of this reused `NO_STYLE_PROFILE` for this branch, which
+   * put a token saying "nobody measured the conventions" on a batch where
+   * nobody looked at the conventions either — a log line whose token
+   * contradicts its own reason.
+   */
+  it('reads nothing at all for a batch whose items a human has not approved', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({
+      styleProfile: measuredNothing,
+      flowMapGraph: cartFlowMap,
+      items: [{ ...CHECKOUT_ITEM, state: 'PROPOSED' }],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    expect(repo.asked).toHaveLength(0);
+    expect(world.created).toHaveLength(0);
+    const line = h.log.find((entry) => entry.msg.startsWith('the layout this batch'));
+    expect(line).toBeDefined();
+    expect(line!.obj).toMatchObject({
+      layout: 'NOTHING_TO_GENERATE',
+      why: 'this batch named no item it was allowed to generate',
+    });
+  });
+
+  /**
+   * A PARTIAL LEDGER REFUSES THE PLAN RATHER THAN SHORTENING IT.
+   *
+   * A plan computed over part of the recorded artifacts would reuse the page
+   * objects it happened to read and mint second copies of the rest, which the
+   * artifact rules call worse than minting none. So the cap does not truncate
+   * the answer, it withdraws it — and says which cap bit.
+   */
+  it('refuses to plan over a ledger longer than one job reads, and names the cap', async () => {
+    const repo = readableOpener();
+    const world = fakeWorld({
+      styleProfile: measuredNothing,
+      flowMapGraph: cartFlowMap,
+      // One past the cap, which is exactly what `take: cap + 1` exists to see.
+      artifacts: Array.from({ length: 5_001 }, (_row, index) => ({
+        orgId: 'org1',
+        projectId: 'p1',
+        path: `e2e/recorded-${index}.spec.ts`,
+        role: 'SPEC',
+        ownership: 'QAAI_OWNED',
+        contentHash: 'h',
+        imports: [],
+      })),
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    // The download was never paid for, because the ledger question came first.
+    expect(repo.asked).toHaveLength(0);
+    expect(world.artifactWrites).toHaveLength(1);
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/more recorded generated files than one job reads \(more than the 5000/);
+    expect(flags).toMatch(/mint second copies of the rest/);
+  });
+
+  /**
+   * THE WORKSPACE IS REMOVED WHEN THE BATCH THROWS, which is what `finally` is
+   * for: a worker that leaks one extracted repository per failed batch fills its
+   * disk and then fails every job for an unrelated reason.
+   */
+  it('removes the checkout even when the batch produced nothing', async () => {
+    const repo = readableOpener();
+    fakeWorld({
+      styleProfile: measuredNothing,
+      flowMapGraph: cartFlowMap,
+      // A duplicate of the item being generated, which the gate refuses.
+      tests: [existingTest()],
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await expect(processGenerate(job, { openRepoView: repo.open })).rejects.toThrow(
+      'Generation produced no tests',
+    );
+    expect(repo.cleanups).toBe(1);
+  });
+});
+
+describe('the ownership claim a generated set earns', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  /**
+   * ITEM 4, END TO END. `ledgerRowsFor` minted `QAAI_OWNED` for every artifact
+   * path having examined no repository, and the two `*.verify.test.ts` files
+   * beside this one recorded that as the measured behaviour. With the view in
+   * hand it is fixable, and this is the proof through the processor rather than
+   * through the pure function alone.
+   */
+  it('does not claim a path the repository already has a file of theirs at', async () => {
+    const theirs = "test('a person wrote this months ago', () => {});";
+    const repo = readableOpener(new Map([[CHECKOUT_PATH, theirs]]));
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      // Deliberately NOT echoed: the model answers at the path their file is
+      // at, which is the collision this rule exists for.
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    const row = world.artifactWrites.find((entry) => entry.path === CHECKOUT_PATH);
+    expect(row).toBeDefined();
+    expect(row!.ownership).toBe('HUMAN_AUTHORED');
+    // And the human is TOLD, because a file that silently never syncs is the
+    // other half of this defect.
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toMatch(/were NOT claimed by QAAI/);
+    expect(flags).toMatch(/will NOT be pushed to your branch/);
+  });
+
+  /**
+   * THE OTHER DIRECTION, WHICH IS WHY `recorded` IS AN ARGUMENT. A path is
+   * occupied BECAUSE QAAI pushed a file there last sync; ownership is read from
+   * the recorded fact and never inferred from the file at the path.
+   */
+  it('keeps a path QAAI already has a row for, even though a file is there', async () => {
+    const repo = readableOpener(new Map([[CHECKOUT_PATH, CHECKOUT_CODE]]));
+    const world = fakeWorld({
+      styleProfile: measuredNothing,
+      flowMapGraph: cartFlowMap,
+      artifacts: [
+        {
+          orgId: 'org1',
+          projectId: 'p1',
+          path: CHECKOUT_PATH,
+          role: 'SPEC',
+          ownership: 'QAAI_OWNED',
+          contentHash: 'whatever-we-wrote-last-time',
+          imports: [],
+        },
+      ],
+    });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: CHECKOUT_PATH,
+      code: CHECKOUT_CODE,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    const row = world.artifactWrites.find((entry) => entry.path === CHECKOUT_PATH);
+    expect(row!.ownership).toBe('QAAI_OWNED');
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).not.toMatch(/were NOT claimed by QAAI/);
+  });
+
+  /** The rule, at the unit the rule lives in. */
+  it('reads UNREADABLE as UNKNOWN, which claims and COUNTS rather than refusing', () => {
+    const set = {
+      dialect: null,
+      artifacts: [
+        {
+          role: 'SPEC' as const,
+          path: 'e2e/checkout.spec.ts',
+          content: 'ours',
+          disposition: 'NEW' as const,
+          ownership: 'QAAI_OWNED' as const,
+          imports: [],
+          basedOnHash: null,
+          why: 'the spec',
+        },
+      ],
+    };
+    const declined = ownershipClaims({
+      set,
+      occupancy: occupancyProbe(fakeView(new Map(), new Set(['e2e/checkout.spec.ts']))),
+    });
+    expect(declined.verdictFor('e2e/checkout.spec.ts')).toBe('QAAI_OWNED');
+    expect(declined.notOurs).toEqual([]);
+    // The disclosure: a claim nothing looked at is COUNTED, not assumed absent.
+    expect(declined.unexamined).toEqual(['e2e/checkout.spec.ts']);
+
+    // And with no probe at all, which is the old blind behaviour plus the count.
+    const blind = ownershipClaims({ set });
+    expect(blind.verdictFor('e2e/checkout.spec.ts')).toBe('QAAI_OWNED');
+    expect(blind.unexamined).toEqual(['e2e/checkout.spec.ts']);
+
+    // An ABSENT path is FREE and is claimed with nothing counted.
+    const free = ownershipClaims({ set, occupancy: occupancyProbe(fakeView(new Map())) });
+    expect(free.verdictFor('e2e/checkout.spec.ts')).toBe('QAAI_OWNED');
+    expect(free.unexamined).toEqual([]);
+  });
+});
+
+describe('readFlowGraph', () => {
+  it('accepts the crawl shape the Explorer stores, and keeps the optional fields', () => {
+    const read = readFlowGraph({
+      ...cartFlowMap,
+      nodes: [
+        {
+          ...cartWithForm,
+          /*
+           * The honesty fields. `looseObject` is what keeps them: a schema that
+           * listed only the required members would STRIP these, and `status`
+           * absent means "this crawl could not ask" while `status: null` means
+           * "it asked and the page declares nothing" — a distinction FlowMap's
+           * own header calls load-bearing.
+           */
+          status: null,
+          access: [],
+        },
+      ],
+    });
+    expect(read.graph).not.toBeNull();
+    expect(read.refused).toEqual([]);
+    expect(read.refusedCount).toBe(0);
+    const first = read.graph!.nodes[0]!;
+    expect(first.status).toBeNull();
+    expect(first.access).toEqual([]);
+    expect(first.forms[0]!.fields[0]!.inputType).toBe('text');
+  });
+
+  it('refuses a form field with no inputType, reporting the PATH and not the value', () => {
+    const read = readFlowGraph({
+      ...cartFlowMap,
+      nodes: [
+        {
+          ...cartWithForm,
+          forms: [
+            {
+              ...cartWithForm.forms[0]!,
+              fields: [{ ...cartWithForm.forms[0]!.fields[0]!, inputType: undefined }],
+            },
+          ],
+        },
+      ],
+    });
+    expect(read.graph).toBeNull();
+    expect(read.refusedCount).toBeGreaterThan(0);
+    expect(read.refused.join(' ')).toContain('nodes.0.forms.0.fields.0.inputType');
+    // Customer-authored text never travels in the report.
+    expect(read.refused.join(' ')).not.toContain('Promo code');
+  });
+
+  it('refuses a selector the shared schema refuses, rather than keeping a second opinion', () => {
+    const read = readFlowGraph({
+      ...cartFlowMap,
+      nodes: [
+        {
+          ...cartWithForm,
+          affordances: [
+            {
+              kind: 'button',
+              label: 'Checkout',
+              // `selectorSchema` floors `confidence` at 0 and ceilings it at 1.
+              selector: { strategy: 'ROLE', value: 'button', confidence: 1.5 },
+            },
+          ],
+        },
+      ],
+    });
+    expect(read.graph).toBeNull();
+    expect(read.refused.join(' ')).toContain('nodes.0.affordances.0.selector.confidence');
+  });
+
+  it('caps the reported issues and says how many there were in all', () => {
+    const broken = { ...cartFlowMap, nodes: [1, 2, 3, 4, 5, 6, 7, 8] };
+    const read = readFlowGraph(broken);
+    expect(read.graph).toBeNull();
+    // A capped list that cannot read as the whole list.
+    expect(read.refused).toHaveLength(5);
+    expect(read.refusedCount).toBe(8);
+  });
+
+  it('hands back the raw value either way, which is what the single-file path reads', () => {
+    const read = readFlowGraph({ nodes: 'not a list' });
+    expect(read.graph).toBeNull();
+    expect(read.unvalidated).toEqual({ nodes: 'not a list' });
+  });
+});
+
+describe('nodeRepoFileView', () => {
+  /*
+   * THE ONE ADAPTER, against a real temp directory — which is the only way to
+   * test it. Every rule above it is pure and takes a fake; this is the piece
+   * where `lstat` either refuses a link or does not, and a fake reader cannot
+   * answer that. No network, and nothing is written outside `mkdtemp`.
+   */
+  const root = mkdtempSync(join(tmpdir(), 'qaai-generate-view-'));
+  mkdirSync(join(root, 'e2e', 'pages'), { recursive: true });
+  writeFileSync(join(root, 'e2e', 'pages', 'cart.page.ts'), 'export class CartPage {}');
+  writeFileSync(join(root, 'e2e', 'checkout.spec.ts'), 'ours');
+
+  it('lists the files directly under a directory, repo-relative and sorted', () => {
+    const view = nodeRepoFileView(root);
+    expect(view.filesUnder('e2e/pages')).toEqual(['e2e/pages/cart.page.ts']);
+    // Directly under, so the nested directory is not flattened in.
+    expect(view.filesUnder('e2e')).toEqual(['e2e/checkout.spec.ts']);
+    expect(view.filesUnder('nowhere')).toEqual([]);
+  });
+
+  it('answers PRESENT with the bytes, and ABSENT for a path their tree has not got', () => {
+    const view = nodeRepoFileView(root);
+    const present = view.diskStateAt('e2e/pages/cart.page.ts');
+    expect(present).toEqual({ state: 'PRESENT', content: 'export class CartPage {}' });
+    expect(view.diskStateAt('e2e/nope.spec.ts')).toEqual({ state: 'ABSENT' });
+    // A directory is not a file, and it is not an absence either.
+    expect(view.diskStateAt('e2e')).toEqual({
+      state: 'UNREADABLE',
+      why: 'a directory is there, not a file',
+    });
+  });
+
+  /*
+   * THE ESCAPE. `lstat` on a full path inspects only the FINAL component, so one
+   * symlinked DIRECTORY makes `vendor/etc/hosts` a path with no `..` in it,
+   * inside the root by every string check, resolving outside it. This is the
+   * hole apps/worker/src/lib/workspace.ts's own test found in its first version.
+   */
+  it('refuses to follow a symlinked DIRECTORY, which is the cheaper escape', () => {
+    symlinkSync('/', join(root, 'vendor'));
+    const view = nodeRepoFileView(root);
+    const state = view.diskStateAt('vendor/etc/hosts');
+    expect(state.state).toBe('UNREADABLE');
+    expect(state.state === 'UNREADABLE' && state.why).toMatch(/symbolic link/);
+    // And the message names the SEGMENT, never the worker's temp-directory path.
+    expect(state.state === 'UNREADABLE' && state.why).not.toContain(root);
+  });
+
+  it('refuses a path that climbs out, and a NUL byte, through the one path rule', () => {
+    const view = nodeRepoFileView(root);
+    for (const attempt of ['../../etc/passwd', '/etc/passwd', 'e2e/\0.spec.ts']) {
+      const state = view.diskStateAt(attempt);
+      expect(state.state).toBe('UNREADABLE');
+      expect(state.state === 'UNREADABLE' && state.why).toMatch(/inside the checkout/);
+    }
+  });
+
+  /*
+   * A CAP THAT BIT, REPORTED AS THE CAP THAT BIT — and UNREADABLE rather than
+   * ABSENT, because a planner that read "nothing is there" would conclude the
+   * path is free and plan a write over a file QAAI declined to open.
+   */
+  it('reports a file over the byte cap as UNREADABLE with the cap named', () => {
+    writeFileSync(join(root, 'big.spec.ts'), 'x'.repeat(64));
+    const view = nodeRepoFileView(root, { ...DEFAULT_REPO_VIEW_LIMITS, fileBytes: 32 });
+    const state = view.diskStateAt('big.spec.ts');
+    expect(state.state).toBe('UNREADABLE');
+    expect(state.state === 'UNREADABLE' && state.why).toMatch(/reads at most 32 from one file/);
+  });
+
+  it('stops a directory listing at the entry cap', () => {
+    mkdirSync(join(root, 'many'), { recursive: true });
+    for (const n of [1, 2, 3, 4]) writeFileSync(join(root, 'many', `f${n}.ts`), '');
+    const view = nodeRepoFileView(root, { ...DEFAULT_REPO_VIEW_LIMITS, entriesPerDirectory: 2 });
+    expect(view.filesUnder('many')).toHaveLength(2);
+  });
+});
+
+describe('the layout vocabulary', () => {
+  /*
+   * THE COMPILER-ENFORCED HALF OF RULE D, asserted at run time too — because
+   * `LAYOUT_SENTENCES` being a `Record<LayoutOutcome, …>` is checked by tsc and
+   * tsc is not what runs in CI for this file.
+   *
+   * THERE IS NO ZOD PARITY TEST AND NONE IS OWED: this union has no write path.
+   * The token is logged and the SENTENCE is what reaches a human, on
+   * `Test.reviewFlags`, which is a `String[]` and not an enum — so a
+   * `z.enum(LAYOUT_OUTCOMES)` here would guard a validator nothing runs.
+   */
+  it('has a distinct sentence for every outcome, and none of them is a restatement', () => {
+    const rendered = LAYOUT_OUTCOMES.map((outcome) => LAYOUT_SENTENCES[outcome]('BECAUSE'));
+    expect(new Set(rendered).size).toBe(LAYOUT_OUTCOMES.length);
+    for (const sentence of rendered) {
+      expect(sentence.length).toBeGreaterThan(80);
+      // Never the bare token: a human reads prose, not a vocabulary member.
+      expect(sentence).not.toMatch(/GRAPH_UNPARSED|REPOSITORY_UNREADABLE|PLAN_NOT_USABLE/);
+    }
+  });
+
+  it('distinguishes the two one-file outcomes in words, not only in a token', () => {
+    const couldNotLook = LAYOUT_SENTENCES.REPOSITORY_UNREADABLE('no repository is connected.');
+    const nothingNeeded = LAYOUT_SENTENCES.PLANNED('5 file(s) at acme/shop@main');
+    expect(couldNotLook).toMatch(/could not read the repository/);
+    expect(nothingNeeded).toMatch(/read rather than guessed/);
+    expect(couldNotLook).not.toContain(nothingNeeded);
+  });
+});
+
+/**
+ * THE EXEMPLAR HALF OF THE HOUSE STYLE, which had no producer on this path.
+ *
+ * `GenerateTestArgs.learnedStyle` was declared, read by `selectExemplars` and
+ * disclosed by `houseStyleFlags` — and nothing in the product filled it. Every
+ * generated test therefore carried `exemplarsShown: 0, exemplarsConsidered: 0`,
+ * the shape whose own sentence is "none was read, so there was nothing to
+ * quote", about a repository this processor had just downloaded and walked.
+ *
+ * That is lesson A exactly — correct code connected to nothing — and it is why
+ * these assertions are about the FLAG ON THE ROW rather than about a call: a
+ * spy proving `learnStyle` ran would have passed in the round that left the
+ * field empty too.
+ */
+describe('the existing tests in the checkout reach the generator', () => {
+  beforeEach(() => {
+    h.prompts.length = 0;
+    h.llmReplies.length = 0;
+    h.log.length = 0;
+  });
+
+  /** Two real-looking Playwright specs, long enough to survive the excerpt floor. */
+  function houseTests(): TestFileSource {
+    const body = (surface: string) => `import { test, expect } from '@playwright/test';
+
+test.describe('${surface}', () => {
+  test('shows the ${surface} to a signed-in member', async ({ page }) => {
+    await page.goto('/${surface}');
+    await expect(page.getByTestId('${surface}-heading')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Continue' })).toBeEnabled();
+  });
+
+  test('refuses an empty submission', async ({ page }) => {
+    await page.goto('/${surface}');
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await expect(page.getByText('Required')).toBeVisible();
+  });
+});
+`;
+    const files = new Map([
+      ['e2e/cart.spec.ts', body('cart')],
+      ['e2e/checkout.spec.ts', body('checkout')],
+      ['e2e/account.spec.ts', body('account')],
+    ]);
+    return {
+      list: () => Promise.resolve([...files.keys()]),
+      read: (path) => Promise.resolve(files.get(path) ?? null),
+    };
+  }
+
+  it('stops claiming nothing was read once the checkout answers with its tests', async () => {
+    const withTests = readableOpener(new Map(), undefined, houseTests());
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: FOLLOW_SUGGESTED_PATH,
+      code: FOLLOW_BRIEFED_IMPORTS,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: withTests.open });
+
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    /*
+     * THE SENTENCE THAT WAS A LIE ABOUT AN OPENED REPOSITORY. Three test files
+     * were offered and read, so whatever `selectExemplars` decided to quote,
+     * "none was read" is no longer an honest thing to say.
+     */
+    expect(flags).not.toContain('none was read, so there was nothing to quote');
+  });
+
+  it('still says nothing was read when the opener has no tests to offer, which is the honest case', async () => {
+    const noTests = readableOpener();
+    const world = fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: FOLLOW_SUGGESTED_PATH,
+      code: FOLLOW_BRIEFED_IMPORTS,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: noTests.open });
+
+    const flags = (world.created[0]!.reviewFlags as string[]).join('\n');
+    expect(flags).toContain('none was read, so there was nothing to quote');
+  });
+
+  it('asks the learner once for the batch and not once per test', async () => {
+    let listed = 0;
+    const counting: TestFileSource = {
+      list: () => {
+        listed += 1;
+        return Promise.resolve([]);
+      },
+      read: () => Promise.resolve(null),
+    };
+    const repo = readableOpener(new Map(), undefined, counting);
+    fakeWorld({ styleProfile: measuredNothing, flowMapGraph: cartFlowMap });
+    h.llmReplies.push({
+      name: 'Checkout shows the order total',
+      filePath: FOLLOW_SUGGESTED_PATH,
+      code: FOLLOW_BRIEFED_IMPORTS,
+      reviewFlags: [],
+    });
+
+    await processGenerate(job, { openRepoView: repo.open });
+
+    /*
+     * ONE. It reads whole file bodies, so a per-item call would re-read the
+     * suite for every test in the batch — the cost shape `readArtifactLedger`
+     * and the view opener are both batch-scoped to avoid.
+     */
+    expect(listed).toBe(1);
   });
 });

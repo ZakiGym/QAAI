@@ -1629,6 +1629,24 @@ export function artifactBriefing(plan: ArtifactPlan): string {
  * IT IS NOT A PERMISSION TO WRITE. {@link resolveAgainstRepository} is, and a
  * caller that applies this set without re-resolving it is the `pushRepo`
  * defect with extra steps.
+ *
+ * ── `imports` IS THE PLAN'S CLAIM, AND IT IS VERIFIED ELSEWHERE ────────────
+ *
+ * `content` on the SPEC is REPLACED by the model's code while `imports` is kept
+ * from the plan, so this function on its own can declare that the spec imports
+ * a fixture its own bytes never mention. That is not a hole left open — it is
+ * the only honest thing this function can do, because it is handed the plan and
+ * the bytes and has no business deciding which of the two is wrong — but it IS
+ * a field `dependentsOf` and the shared-surface rule read as the truth about
+ * what depends on what, so a wrong value is a wrong blast radius on the push
+ * path.
+ *
+ * `missingSpecImports` in generator.ts is where the two are compared: it reads
+ * the spec's bytes for every specifier the plan declared, and a set whose spec
+ * does not mention them is DROPPED rather than stored with a false edge. The
+ * only production caller of this function is behind that check. A SECOND caller
+ * must do the same, and this sentence is here so it is a decision rather than
+ * an omission.
  */
 export function declaredArtifactSet(args: {
   readonly plan: ArtifactPlan;

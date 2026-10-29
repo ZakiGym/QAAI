@@ -28,14 +28,19 @@
 
 import { describe, expect, it } from 'vitest';
 import type { FlowMap, PlanItem } from '@qaai/shared';
-import { GenerationRefused, generateTest, houseStyleFlags } from './generator.js';
+import {
+  GenerationRefused,
+  generateTest,
+  houseStyleFlags,
+  layoutNotAppliedFlags,
+} from './generator.js';
 import type { CallContext, LlmService, StructuredOptions } from './llm.js';
 import type { ArtifactRepository } from './artifacts.js';
 import type { LearnedStyle } from './style-learner.js';
 import { learnStyle } from './style-learner.js';
 import type { CorrectionSignal } from './corrections.js';
 import { FENCE_CLOSE, FENCE_OPEN } from './untrusted.js';
-import { emptyStyleProfile } from '@qaai/shared';
+import { emptyStyleProfile, generatedTestSchema } from '@qaai/shared';
 import type { StyleProfile } from '@qaai/shared';
 
 const ctx: CallContext = {
@@ -104,6 +109,35 @@ const item: PlanItem = {
 };
 
 const GOOD_CODE = `import { test, expect } from '@playwright/test';
+
+test('Cart shows the order total', async ({ page }) => {
+  await page.goto('/cart');
+  await page.getByRole('button', { name: 'Checkout' }).click();
+  await expect(page.getByTestId('order-total')).toHaveText('$42.00');
+});
+`;
+
+/**
+ * The specifier the briefing names for the planned fixture, under
+ * `emptyStyleProfile('')` — the profile every set test below uses. It is the
+ * plan's own `moduleSpecifier(specPath, fixturePath, profile)`, quoted here so a
+ * change in the layout rule shows up as these tests going red rather than as a
+ * silently single-file set.
+ */
+const FIXTURE_SPECIFIER = './fixtures/setup/pages.fixture';
+
+/**
+ * A SPEC THAT ACTUALLY IMPORTS THE FIXTURE IT WAS HANDED, which is what the
+ * prompt demands and what the multi-file branch now requires.
+ *
+ * {@link GOOD_CODE} imports `@playwright/test` and nothing else, so under the
+ * declared-import evidence rule it drops the set — and every test in this file
+ * that is ABOUT the set used to pass with it, because `SPEC.imports` was
+ * asserted from the plan and never read from the bytes. Four of them went red
+ * the moment the claim needed evidence, which is the measurement that says they
+ * were covering a set whose own import edge was fiction.
+ */
+const SET_CODE = `import { test, expect } from '${FIXTURE_SPECIFIER}';
 
 test('Cart shows the order total', async ({ page }) => {
   await page.goto('/cart');
@@ -192,6 +226,49 @@ function args(over: Record<string, unknown> = {}) {
   } as Parameters<typeof generateTest>[2];
 }
 
+/**
+ * A toolchain whose SYNTAX gate fails the PAGE OBJECT and passes everything
+ * else.
+ *
+ * The one shape that makes "a refused artifact refuses the whole set" testable:
+ * the spec is fine, so a report that admitted it would be admitting a test that
+ * fails its first run on an import error. Shared by the three tests about that
+ * property, which carried byte-identical copies of it.
+ */
+function failSyntaxOnPageObject() {
+  return {
+    syntax: async ({ filePath }: { filePath: string }) => ({
+      gate: 'SYNTAX' as const,
+      status: filePath.includes('page') ? ('FAIL' as const) : ('PASS' as const),
+      why: 'the parser rejected this file',
+      detail: ['1:1 unexpected token'],
+      line: 1,
+    }),
+    typecheck: async () => ({
+      gate: 'TYPECHECK' as const,
+      status: 'PASS' as const,
+      why: 'ok',
+      detail: [],
+      line: null,
+    }),
+    format: async ({ code }: { code: string }) => ({
+      gate: 'FORMAT' as const,
+      status: 'PASS' as const,
+      why: 'ok',
+      detail: [],
+      line: null,
+      code,
+    }),
+    lint: async () => ({
+      gate: 'LINT' as const,
+      status: 'PASS' as const,
+      why: 'ok',
+      detail: [],
+      line: null,
+    }),
+  };
+}
+
 describe('the computed house style reaches the prompt', () => {
   it('states the repository conventions it measured', async () => {
     const learned = await learnedFrom(
@@ -270,6 +347,7 @@ describe('the computed house style reaches the prompt', () => {
       exemplarCharsDropped: 0,
       reviewerSignal: null,
       planned: false,
+      planApplied: false,
     });
     const flags = result.reviewFlags.join('\n');
     expect(flags).toMatch(/nobody has computed this repository's own/);
@@ -420,7 +498,9 @@ describe('the artifact set', () => {
     expect(result.artifacts.artifacts[0]?.role).toBe('SPEC');
     expect(result.artifactPlan).toBeNull();
     expect(result.setAdmission).toBeNull();
+    // No repository was supplied, so no plan was COMPUTED and none was applied.
     expect(result.houseStyle.planned).toBe(false);
+    expect(result.houseStyle.planApplied).toBe(false);
   });
 
   /*
@@ -430,7 +510,7 @@ describe('the artifact set', () => {
    */
   it('carries a page object when the repository is known, and tells the spec about it', async () => {
     const profile: StyleProfile = emptyStyleProfile('');
-    const { llm, prompts } = fakeLlm();
+    const { llm, prompts } = fakeLlm(SET_CODE);
 
     const result = await generateTest(
       llm,
@@ -439,6 +519,7 @@ describe('the artifact set', () => {
     );
 
     expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(true);
     expect(result.artifactPlan).not.toBeNull();
     const roles = result.artifacts.artifacts.map((a) => a.role);
     expect(roles).toContain('PAGE_OBJECT');
@@ -456,7 +537,7 @@ describe('the artifact set', () => {
    * so rather than letting a caller read it as permission to write.
    */
   it('reports that the ownership half of the refusals was not asked', async () => {
-    const { llm } = fakeLlm();
+    const { llm } = fakeLlm(SET_CODE);
     const result = await generateTest(
       llm,
       ctx,
@@ -473,7 +554,7 @@ describe('the artifact set', () => {
      * the page object alone. Admitting the spec by itself would store a test
      * that fails its first run on an import error.
      */
-    const { llm } = fakeLlm();
+    const { llm } = fakeLlm(SET_CODE);
     await expect(
       generateTest(
         llm,
@@ -481,44 +562,14 @@ describe('the artifact set', () => {
         args({
           styleProfile: emptyStyleProfile(''),
           repository: emptyRepository(),
-          toolchain: {
-            syntax: async ({ filePath }: { filePath: string }) => ({
-              gate: 'SYNTAX' as const,
-              status: filePath.includes('page') ? ('FAIL' as const) : ('PASS' as const),
-              why: 'the parser rejected this file',
-              detail: ['1:1 unexpected token'],
-              line: 1,
-            }),
-            typecheck: async () => ({
-              gate: 'TYPECHECK' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-            }),
-            format: async ({ code }: { code: string }) => ({
-              gate: 'FORMAT' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-              code,
-            }),
-            lint: async () => ({
-              gate: 'LINT' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-            }),
-          },
+          toolchain: failSyntaxOnPageObject(),
         }),
       ),
     ).rejects.toThrow(GenerationRefused);
   });
 
   it('names the failing FILE in the refusal, not just "admission"', async () => {
-    const { llm } = fakeLlm();
+    const { llm } = fakeLlm(SET_CODE);
     let caught: GenerationRefused | null = null;
     try {
       await generateTest(
@@ -527,37 +578,7 @@ describe('the artifact set', () => {
         args({
           styleProfile: emptyStyleProfile(''),
           repository: emptyRepository(),
-          toolchain: {
-            syntax: async ({ filePath }: { filePath: string }) => ({
-              gate: 'SYNTAX' as const,
-              status: filePath.includes('page') ? ('FAIL' as const) : ('PASS' as const),
-              why: 'the parser rejected this file',
-              detail: ['1:1 unexpected token'],
-              line: 1,
-            }),
-            typecheck: async () => ({
-              gate: 'TYPECHECK' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-            }),
-            format: async ({ code }: { code: string }) => ({
-              gate: 'FORMAT' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-              code,
-            }),
-            lint: async () => ({
-              gate: 'LINT' as const,
-              status: 'PASS' as const,
-              why: 'ok',
-              detail: [],
-              line: null,
-            }),
-          },
+          toolchain: failSyntaxOnPageObject(),
         }),
       );
     } catch (err) {
@@ -592,7 +613,14 @@ describe('the artifact set', () => {
 
     expect(result.filePath).toBe('tests/cart.spec.ts');
     expect(result.artifacts.artifacts).toHaveLength(1);
-    expect(result.houseStyle.planned).toBe(false);
+    /*
+     * A PLAN WAS COMPUTED AND THEN DROPPED, which is two facts and used to be
+     * one field. `planned` says the repository was read and a multi-file layout
+     * was worked out; `planApplied` says that layout is not what came back.
+     * Asserting only the second would pass for a job that never looked.
+     */
+    expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(false);
     expect(result.artifactPlan).toBeNull();
     const flags = result.reviewFlags.join(' ');
     expect(flags).toMatch(/planned page object\(s\) and fixture were NOT written/);
@@ -632,7 +660,8 @@ describe('the artifact set', () => {
     );
 
     expect(result.filePath).not.toBe('tests/cart.txt');
-    expect(result.houseStyle.planned).toBe(false);
+    expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(false);
     expect(result.reviewFlags.join(' ')).toMatch(/PATH_CONVENTION replaced it/);
   });
 });
@@ -689,7 +718,8 @@ describe('a plan that may not be applied', () => {
     );
 
     expect(result.artifactPlan).toBeNull();
-    expect(result.houseStyle.planned).toBe(false);
+    expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(false);
     expect(result.artifacts.artifacts).toHaveLength(1);
     const flags = result.reviewFlags.join(' ');
     expect(flags).toMatch(/DISK_UNREADABLE/);
@@ -704,7 +734,7 @@ describe('the single-file shape stays authoritative', () => {
    * them in step. This asserts the producer does.
    */
   it('keeps the set SPEC byte-identical to code and filePath', async () => {
-    const { llm } = fakeLlm();
+    const { llm } = fakeLlm(SET_CODE);
     const result = await generateTest(
       llm,
       ctx,
@@ -725,8 +755,8 @@ describe('the single-file shape stays authoritative', () => {
    * invisible.
    */
   it('puts the FORMATTED spec in the set, not the one the model returned', async () => {
-    const formatted = `${GOOD_CODE}// reformatted by the project's own prettier\n`;
-    const { llm } = fakeLlm();
+    const formatted = `${SET_CODE}// reformatted by the project's own prettier\n`;
+    const { llm } = fakeLlm(SET_CODE);
     const result = await generateTest(
       llm,
       ctx,
@@ -833,5 +863,336 @@ describe('the single-file shape stays authoritative', () => {
     expect(result.setAdmission).toBeNull();
     expect(result.artifacts.artifacts[0]?.content).toBe(formatted);
     expect(result.artifacts.artifacts[0]?.content).toBe(result.code);
+  });
+});
+
+/**
+ * THE LAYOUT HALF OF THE DESTINATION RULE, WIRED.
+ *
+ * `admitSet` is the only reader of `ArtifactSetContext.layout` and the only
+ * producer of `layoutChecked`, and generator.ts called it with NO context at
+ * all — so it emitted "No usable test layout was measured for this repository"
+ * while this very function held the profile. A verifier measured exactly that
+ * with a HIGH-confidence layout over 5 of 5 files.
+ *
+ * Both halves are pinned below, because only one of them being right is how the
+ * lie flips rather than closes: a layout that WAS measured must not be reported
+ * as unmeasured, AND a layout that genuinely was not must still say so.
+ */
+describe('the measured layout reaches the set gate', () => {
+  /** Five specs under `e2e/`, which is `fileLayout.root = 'e2e'` at HIGH confidence. */
+  async function e2eLayoutProfile(): Promise<StyleProfile> {
+    const learned = await learnedFrom(
+      new Map(
+        ['cart', 'checkout', 'search', 'login', 'admin'].map((name) => [
+          `e2e/${name}.spec.ts`,
+          EXISTING_TEST,
+        ]),
+      ),
+    );
+    return learned.profile;
+  }
+
+  it('reports layoutChecked true, and drops the "no layout was measured" flag', async () => {
+    const profile = await e2eLayoutProfile();
+    // The precondition this test is only meaningful under: a layout worth
+    // relying on. Asserted rather than assumed, because a LOW-confidence
+    // observation would make `layoutChecked: false` the CORRECT answer and the
+    // test would then be pinning the bug.
+    expect(profile.fileLayout.confidence).toBe('HIGH');
+    expect(profile.fileLayout.value?.root).toBe('e2e');
+
+    const { llm } = fakeLlm(SET_CODE);
+    const result = await generateTest(
+      llm,
+      ctx,
+      args({ styleProfile: profile, repository: emptyRepository() }),
+    );
+
+    expect(result.setAdmission).not.toBeNull();
+    expect(result.setAdmission?.layoutChecked).toBe(true);
+    // The flag that was being emitted over a measurement that had been made.
+    expect(result.reviewFlags.join(' ')).not.toMatch(/No usable test layout was measured/);
+    // And the set still ADMITS: every planned path is under the measured root,
+    // so forwarding the layout asks a question it also answers.
+    expect(result.setAdmission?.verdict).not.toBe('REFUSE');
+    expect(result.filePath.startsWith('e2e/')).toBe(true);
+  });
+
+  it('reports layoutChecked false when nothing measured one, and still says so', async () => {
+    const { llm } = fakeLlm(SET_CODE);
+    const result = await generateTest(
+      llm,
+      ctx,
+      // `emptyStyleProfile` is every field UNKNOWN: a profile exists and has
+      // measured nothing, which is a different fact from no profile at all and
+      // must still report the half it could not ask.
+      args({ styleProfile: emptyStyleProfile(''), repository: emptyRepository() }),
+    );
+
+    expect(result.setAdmission?.layoutChecked).toBe(false);
+    expect(result.reviewFlags.join(' ')).toMatch(/No usable test layout was measured/);
+  });
+
+  /*
+   * THE WITHHELD CASE, WHICH IS THE ONE THAT COULD HAVE BECOME THE SAME LIE
+   * WITH THE SIGN FLIPPED AGAIN.
+   *
+   * With a profile and no repository view there is no plan, so the path handed
+   * to the model is `testFilePath`'s — computed from the ecosystem, which knows
+   * nothing of the profile. Comparing that against the measured root would
+   * FAIL a HARD gate over QAAI's own suggestion, so the layout is not
+   * forwarded; the gate then says "no layout was measured", which is false, and
+   * this flag is what makes the report true.
+   */
+  it('says on the test when a measured layout was NOT applied, and why', async () => {
+    const profile = await e2eLayoutProfile();
+    const { llm } = fakeLlm();
+    const result = await generateTest(llm, ctx, args({ styleProfile: profile }));
+
+    const flags = result.reviewFlags.join('\n');
+    expect(flags).toMatch(/test layout WAS measured \(5 of 5 file\(s\) agreed, at HIGH confidence\)/);
+    expect(flags).toMatch(/read "it was not applied here"/);
+    // The reason that ACTUALLY bit, not a generic one: there was no repository
+    // view, so there was no ledger to place the file from.
+    expect(flags).toMatch(/no repository view was supplied/);
+  });
+
+  /*
+   * THE SAME MEASUREMENT, ON THE GATE THAT RUNS FIRST. `generateCodeTest` calls
+   * `admit` on the single file BEFORE it builds the set, and that call was
+   * layout-blind — so a model that answered with a path outside the measured
+   * root was admitted by the gate and only then compared by `admitSet`, which
+   * is two answers about one path from a function whose own comment says the
+   * second run "cannot disagree with the first".
+   *
+   * `src/cart.spec.ts` IS collected by Playwright's suffix pattern, so nothing
+   * but the destination rule refuses it. PATH_CONVENTION is a HARD_FAIL gate:
+   * one REVISE, then the refusal.
+   */
+  it('refuses a path outside the measured root at the single-file gate too', async () => {
+    const profile = await e2eLayoutProfile();
+    const { llm } = fakeLlm(SET_CODE, 'src/cart.spec.ts');
+
+    let caught: GenerationRefused | null = null;
+    try {
+      await generateTest(
+        llm,
+        ctx,
+        args({ styleProfile: profile, repository: emptyRepository() }),
+      );
+    } catch (err) {
+      caught = err as GenerationRefused;
+    }
+
+    expect(caught).toBeInstanceOf(GenerationRefused);
+    const gate = caught?.report.gates.find((g) => g.gate === 'PATH_CONVENTION');
+    expect(gate?.status).toBe('FAIL');
+    expect(gate?.detail.join(' ')).toMatch(/destination refused: OUTSIDE_LEARNED_LAYOUT/);
+    // It spent the whole budget rather than refusing on sight: the gate offers
+    // one REVISE, which is the shape the rest of this pipeline relies on.
+    expect(caught?.attempts).toBe(2);
+  });
+
+  it('emits nothing when the layout WAS applied, or when there was none to apply', async () => {
+    const profile = await e2eLayoutProfile();
+    expect(
+      layoutNotAppliedFlags({ layout: profile.fileLayout, applied: true }),
+    ).toEqual([]);
+    expect(
+      layoutNotAppliedFlags({ layout: emptyStyleProfile('').fileLayout, applied: false }),
+    ).toEqual([]);
+    expect(layoutNotAppliedFlags({ layout: null, applied: false })).toEqual([]);
+    // And the one case that does speak.
+    expect(
+      layoutNotAppliedFlags({ layout: profile.fileLayout, applied: false }),
+    ).toHaveLength(1);
+  });
+});
+
+describe('the multi-artifact branch', () => {
+  /*
+   * Lesson E, as an assertion: `admitSet` has been green and unreachable for two
+   * rounds because a barrel export plus a colocated test satisfies the ratchet.
+   * This is the production entry point — `generateTest` — reaching it.
+   */
+  it('is entered when the repository and the profile arrive, and judges every file', async () => {
+    const { llm } = fakeLlm(SET_CODE);
+    const result = await generateTest(
+      llm,
+      ctx,
+      args({ styleProfile: emptyStyleProfile(''), repository: emptyRepository() }),
+    );
+
+    expect(result.artifacts.artifacts.length).toBeGreaterThan(1);
+    expect(result.setAdmission).not.toBeNull();
+    // Every artifact in the set has its own report, and the roles are the
+    // planned ones rather than one SPEC wearing a set's clothes.
+    expect(result.setAdmission?.artifacts.map((a) => a.role).sort()).toEqual(
+      [...result.artifacts.artifacts.map((a) => a.role)].sort(),
+    );
+    for (const artifact of result.setAdmission?.artifacts ?? []) {
+      expect(artifact.judged.length).toBeGreaterThan(0);
+    }
+  });
+
+  /*
+   * A spec admitted without the page object it imports does not run. The SPEC's
+   * OWN verdict is asserted to be an admission here, which is what makes this
+   * test about the SET's verdict rather than about a failing spec.
+   */
+  it('refuses the whole set over one artifact, while the SPEC itself admitted', async () => {
+    const { llm } = fakeLlm(SET_CODE);
+    let caught: GenerationRefused | null = null;
+    try {
+      await generateTest(
+        llm,
+        ctx,
+        args({
+          styleProfile: emptyStyleProfile(''),
+          repository: emptyRepository(),
+          toolchain: failSyntaxOnPageObject(),
+        }),
+      );
+    } catch (err) {
+      caught = err as GenerationRefused;
+    }
+
+    expect(caught).toBeInstanceOf(GenerationRefused);
+    const setReport = caught?.setReport ?? null;
+    expect(setReport?.verdict).toBe('REFUSE');
+    const spec = setReport?.artifacts.find((a) => a.role === 'SPEC');
+    expect(spec?.verdict === 'ADMIT' || spec?.verdict === 'ADMIT_WITH_FLAGS').toBe(true);
+    const pageObject = setReport?.artifacts.find((a) => a.role === 'PAGE_OBJECT');
+    expect(pageObject?.verdict).toBe('REFUSE');
+  });
+});
+
+describe('a declared import with no evidence in the bytes', () => {
+  /*
+   * `declaredArtifactSet` replaces the SPEC's `content` with the model's code
+   * and KEEPS `imports` from the plan, so this claim used to be made with no
+   * evidence at all: a measured set declared it imported
+   * `.../pages.fixture.ts` while its own bytes imported only
+   * `@playwright/test`, with `setProblems: []` and not one review flag.
+   */
+  it('drops the set and names the specifier the spec never mentioned', async () => {
+    // GOOD_CODE imports `@playwright/test` and nothing else.
+    const { llm } = fakeLlm(GOOD_CODE);
+    const result = await generateTest(
+      llm,
+      ctx,
+      args({ styleProfile: emptyStyleProfile(''), repository: emptyRepository() }),
+    );
+
+    expect(result.artifacts.artifacts).toHaveLength(1);
+    expect(result.artifacts.artifacts[0]?.role).toBe('SPEC');
+    expect(result.artifacts.artifacts[0]?.imports).toEqual([]);
+    expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(false);
+    expect(result.artifactPlan).toBeNull();
+    const flags = result.reviewFlags.join(' ');
+    expect(flags).toMatch(/planned page object\(s\) and fixture were NOT written/);
+    expect(flags).toContain(FIXTURE_SPECIFIER);
+    expect(flags).toMatch(/record an import edge that is not there/);
+  });
+
+  /*
+   * ONE DROP, ONE REASON, AND IT MUST BE THE REASON THAT BIT. A spec that
+   * landed somewhere else has every specifier in the plan computed relative to
+   * the wrong directory, so the bytes CANNOT evidence them — reporting the
+   * import disagreement there would name the second-order effect as the cause.
+   */
+  it('is not the reason reported when the spec path is what moved', async () => {
+    const { llm } = fakeLlm(GOOD_CODE, 'tests/cart.spec.ts');
+    const result = await generateTest(
+      llm,
+      ctx,
+      args({ styleProfile: emptyStyleProfile(''), repository: emptyRepository() }),
+    );
+
+    const flags = result.reviewFlags.join(' ');
+    expect(flags).toMatch(/answered with a different path than the one it was given/);
+    expect(flags).not.toMatch(/record an import edge that is not there/);
+  });
+
+  /*
+   * The repo-relative spelling counts as evidence, because a project with a
+   * `baseUrl` really does import that way and it is the same file. Pinned so a
+   * tightening to "the specifier verbatim" is a decision somebody makes rather
+   * than a set silently dropped.
+   */
+  it('accepts the repo-relative spelling of the same import', async () => {
+    const { llm } = fakeLlm(
+      `import { test, expect } from 'checkout/fixtures/setup/pages.fixture';\n${GOOD_CODE.split(
+        '\n',
+      )
+        .slice(1)
+        .join('\n')}`,
+    );
+    const result = await generateTest(
+      llm,
+      ctx,
+      args({ styleProfile: emptyStyleProfile(''), repository: emptyRepository() }),
+    );
+
+    expect(result.houseStyle.planned).toBe(true);
+    expect(result.houseStyle.planApplied).toBe(true);
+    expect(result.artifacts.artifacts.length).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * THE PARSER, WHICH IS THE VALIDATOR THE WRITE PATH ACTUALLY RUNS (lesson H).
+ *
+ * `generatedTestSchema.filePath` kept `!p.includes('..') && !p.startsWith('/')`,
+ * so on the single-file path — the only shape generation produces — a
+ * model-chosen destination was stopped by `admit` HAPPENING to be called and not
+ * by the parser. These end at `safeParse` and assert the zod PATH rather than
+ * the value, because a file path is model-authored text.
+ */
+describe('generatedTestSchema is not looser than the gate', () => {
+  const base = { name: 'Cart shows the order total', code: GOOD_CODE, reviewFlags: [] };
+
+  it('refuses every directory QAAI never writes into, naming the field and not the value', () => {
+    for (const filePath of [
+      'node_modules/.bin/payload.spec.ts',
+      '.github/workflows/release.spec.ts',
+      'dist/checkout.spec.ts',
+    ]) {
+      const parsed = generatedTestSchema.safeParse({ ...base, filePath });
+      expect(parsed.success).toBe(false);
+      if (parsed.success) continue;
+      const issue = parsed.error.issues[0];
+      expect(issue?.path).toEqual(['filePath']);
+      expect(issue?.message).toMatch(/FORBIDDEN_DIRECTORY/);
+      // The refused path is customer-/model-authored text and is not echoed.
+      expect(issue?.message).not.toContain(filePath);
+    }
+  });
+
+  it('refuses the spellings the old traversal guard let through', () => {
+    for (const filePath of [
+      './tests/cart.spec.ts',
+      'tests//cart.spec.ts',
+      'pages\\login.spec.ts',
+      '~/cart.spec.ts',
+      'tests/cart\n.spec.ts',
+    ]) {
+      const parsed = generatedTestSchema.safeParse({ ...base, filePath });
+      expect(parsed.success).toBe(false);
+      if (parsed.success) continue;
+      expect(parsed.error.issues[0]?.path).toEqual(['filePath']);
+    }
+  });
+
+  it('still accepts the ordinary paths generation produces', () => {
+    for (const filePath of [
+      'tests/cart.spec.ts',
+      'e2e/checkout/pay-with-card.spec.ts',
+      'tests/my tests/checkout/pay.spec.ts',
+    ]) {
+      expect(generatedTestSchema.safeParse({ ...base, filePath }).success).toBe(true);
+    }
   });
 });

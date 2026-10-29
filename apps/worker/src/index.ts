@@ -75,6 +75,13 @@ import {
   requestRecompute,
   type RecomputeCoverageJob,
 } from './processors/recompute-coverage.js';
+import {
+  STYLE_PROFILE_QUEUE,
+  closeStyleProfileQueue,
+  processStyleProfile,
+  requestStyleProfile,
+  type StyleProfileJob,
+} from './processors/style-profile.js';
 import { BISECT_QUEUE, type BisectJob } from '../../api/src/lib/bisect.js';
 import { CHECKS_QUEUE, type ChecksJob } from '../../api/src/lib/github-app.js';
 
@@ -252,6 +259,35 @@ register<GenerateJob>(QUEUE_NAMES.generate, config.concurrency * 2, async (paylo
       orgId: payload.orgId,
       projectId: payload.projectId,
     });
+    /*
+     * ── THE HOUSE-STYLE PROFILE, ASKED FOR BY THE ONLY THING THAT READS IT ──
+     *
+     * Somebody is writing tests into this repository, which is the whole demand
+     * signal: `processGenerate` SELECTs `styleProfile` and
+     * `styleProfileComputedAt` at the top of every batch, and until this
+     * request existed nothing in apps/ ever wrote either, so every batch read
+     * NULL for the life of the feature.
+     *
+     * AFTER, not before, and the reason is honesty rather than ordering: this
+     * batch has already read the column, so a request made before it could not
+     * have been used by it — and pretending otherwise by awaiting a
+     * computation here would put a repository archive download in front of a
+     * plan somebody is waiting on, which is precisely what
+     * `processGenerate`'s own comment refuses. THE FIRST BATCH OF A PROJECT
+     * THEREFORE GENERATES WITH NO PROFILE, and that is not silent: every test
+     * it writes carries the `houseStyleFlags` sentence saying the ecosystem
+     * defaults were used because nobody had measured the repository. The
+     * source-analysis trigger below usually gets there first.
+     *
+     * `requestStyleProfile` never throws, which is what makes an `await` in a
+     * `finally` safe here — a throw would REPLACE the error the batch actually
+     * failed with, and a Redis blip would be reported as a generation failure.
+     */
+    await requestStyleProfile({
+      reason: 'generate',
+      orgId: payload.orgId,
+      projectId: payload.projectId,
+    });
   }
 });
 register<TriageJob>(QUEUE_NAMES.triage, config.concurrency * 2, processTriage);
@@ -349,6 +385,21 @@ register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, async (
      * processors/recompute-coverage.ts.
      */
     await requestRecompute({
+      reason: 'source-analysis',
+      orgId: payload.orgId,
+      projectId: payload.projectId,
+    });
+    /*
+     * And the house style, for the same reason and with the same caveat: this
+     * job only READS the stored CodebaseSnapshot, so it is not the
+     * repository-landed event — but it is the nearest in-worker signal that
+     * somebody connected a repository and expects QAAI to write tests into it,
+     * and it is the one that normally fires BEFORE any generation. It costs one
+     * coalesced job, and the freshness window makes a second request a single
+     * SELECT. The create itself is in apps/api/src/routes/source.ts, which this
+     * change does not own; it is named in the handover.
+     */
+    await requestStyleProfile({
       reason: 'source-analysis',
       orgId: payload.orgId,
       projectId: payload.projectId,
@@ -451,6 +502,40 @@ register<ActionEventJob>(ACTIONS_QUEUE, config.concurrency, (payload) =>
  */
 register<RecomputeCoverageJob>(RECOMPUTE_COVERAGE_QUEUE, 1, async (payload) => {
   await processRecomputeCoverage(payload);
+});
+
+/*
+ * ── THE HOUSE-STYLE PROFILE ─────────────────────────────────────────────────
+ *
+ * "What are this repository's own test conventions?" `Project.styleProfile` and
+ * `Project.styleProfileComputedAt` have been SELECTed by every generate batch
+ * for three rounds and written by NOTHING, so every batch read NULL, the
+ * briefing rendered "not established", and the product wrote in its own dialect
+ * inside repositories that already had one. processors/style-profile.ts is the
+ * writer; this is the line that lets it run.
+ *
+ * Concurrency 1, and not only for load: each job extracts a customer repository
+ * into a temp directory bounded at MAX_WORKSPACE_BYTES (512MB), so N concurrent
+ * jobs is N times that on a worker that is also holding run workspaces. Nobody
+ * is waiting on this job either, so a single lane costs nothing a user can
+ * feel — and it means one project's two columns can never be written by two
+ * jobs racing, which the coalescing job id makes unlikely and serialising makes
+ * impossible within a worker.
+ *
+ * Without this registration both triggers above enqueue into a queue nobody
+ * drains, the two columns stay NULL for ever, and every generated test keeps
+ * carrying the review flag that says nobody measured the repository. That is
+ * the bisect-queue defect with this round's headline behind it;
+ * `npm run check:wiring` fails if the line is removed.
+ *
+ * Wrapped in an arrow for the same reason as the backup tick: `register`'s
+ * second argument is the BullMQ Job, and that slot in `processStyleProfile` is
+ * `StyleProfileDeps` — the test seam for injecting a filesystem and a clock —
+ * so a Job landing in it would be a silent no-op today and a confusing bug the
+ * day the two types grow a matching field.
+ */
+register<StyleProfileJob>(STYLE_PROFILE_QUEUE, 1, async (payload) => {
+  await processStyleProfile(payload);
 });
 
 /*
@@ -596,14 +681,15 @@ for (const signal of ['SIGINT', 'SIGTERM'] as const) {
 
     await Promise.all(workers.map((w) => w.close()));
     await closeProducers().catch(() => {});
-    // retention.ts, backup.ts, actions.ts and recompute-coverage.ts build their
-    // producers lazily and outside queues.ts, so closeProducers() does not know
-    // about them. Left open, they hold the process past the shutdown that is
-    // supposed to end it.
+    // retention.ts, backup.ts, actions.ts, recompute-coverage.ts and
+    // style-profile.ts build their producers lazily and outside queues.ts, so
+    // closeProducers() does not know about them. Left open, they hold the
+    // process past the shutdown that is supposed to end it.
     await closeRetentionQueue().catch(() => {});
     await closeBackupQueue().catch(() => {});
     await closeActionsQueue().catch(() => {});
     await closeRecomputeCoverageQueue().catch(() => {});
+    await closeStyleProfileQueue().catch(() => {});
     await prisma.$disconnect().catch(() => {});
     connection.disconnect();
     process.exit(0);

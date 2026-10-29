@@ -492,12 +492,54 @@ describe('what reaches the model prompt', () => {
     expect(text).toContain('would run as nobody and pass');
   });
 
-  it('carries no credential into the prompt for a bound gap', () => {
+  /*
+   * The profile NAME moved out of the crawl block and into a span of its own
+   * under `CUSTOMER_CONFIGURATION`, because a cockpit field is not crawl
+   * output and the crawl header was only approximately true of it. So the
+   * assertion is the reference AND the referent, which is what a model needs
+   * to resolve "#1" at all — asserting only that the name appears somewhere
+   * would pass on a report whose numbering had come apart.
+   */
+  it('names a bound gap by reference, resolves it, and carries no credential', () => {
     const text = summariseGapReport([
       { id: 'g2', kind: 'UNREACHED_AUTH_ROUTE', route: '/admin', feature: null, requiresAuth: true, authProfileName: 'Admin' },
     ]);
-    expect(text).toContain('run as "Admin"');
+    expect(text).toContain('run as profile #1');
+    expect(text).toContain('#1 — "Admin"');
     expect(text).not.toMatch(/password|secret|token|cookie/i);
+  });
+
+  /*
+   * ONE NAME, ONCE, however many gaps run as it. The numbering is ours and the
+   * deduplication is what keeps a hundred gaps from quoting the same two
+   * cockpit strings a hundred times into a prompt with a character budget.
+   */
+  it('quotes a repeated profile name once and keeps the two numbers apart', () => {
+    const gap = (id: string, name: string) => ({
+      id,
+      kind: 'UNREACHED_AUTH_ROUTE',
+      route: `/${id}`,
+      feature: null,
+      requiresAuth: true,
+      authProfileName: name,
+    });
+    const text = summariseGapReport([gap('g1', 'Admin'), gap('g2', 'Shopper'), gap('g3', 'Admin')]);
+    expect(text).toContain('/g1 — run as profile #1');
+    expect(text).toContain('/g2 — run as profile #2');
+    expect(text).toContain('/g3 — run as profile #1');
+    expect(text.match(/"Admin"/g)).toHaveLength(1);
+  });
+
+  /*
+   * AND NO SECOND BLOCK WHEN NOTHING NAMES A PROFILE. A span whose header
+   * announces customer configuration and holds none teaches the model to look
+   * for a convention that is not there.
+   */
+  it('emits no configuration block when no shown gap names a profile', () => {
+    const text = summariseGapReport([
+      { id: 'g1', kind: 'UNREACHED_ROUTE', route: '/pricing', feature: null },
+    ]);
+    expect(text).not.toContain('TYPED BY A CUSTOMER');
   });
 });
 

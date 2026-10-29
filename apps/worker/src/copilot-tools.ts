@@ -43,6 +43,9 @@ const RUN_WAIT_MS = 180_000;
 export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
   const listTests = defineTool({
     name: 'list_tests',
+    /** test names, features and flake rates, every one of them a string a human or
+     * a generator put in the customer's own suite. */
+    returns: 'EXISTING_TEST_FILE',
     description:
       'List the tests in this project with their type, feature, priority, flake rate and last result. ' +
       'Call this first whenever the question involves what is or is not covered, or before proposing a new test — ' +
@@ -103,6 +106,9 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
   const readTest = defineTool({
     name: 'read_test',
+    /** one test's SOURCE, in full. The longest and most attacker-influenced span the
+     * copilot reads. */
+    returns: 'EXISTING_TEST_FILE',
     description:
       'Read one test in full: its source code (or its JSON spec for API, accessibility and security tests) ' +
       'plus its recent pass/fail history. Call this before proposing an edit — never rewrite a file you have not read.',
@@ -137,6 +143,8 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
   const getRunResults = defineTool({
     name: 'get_run_results',
+    /** stdout, stderr, error messages and stack traces printed by the run. */
+    returns: 'RUNNER_OUTPUT',
     description:
       'Get the results of a run: per-test status, the step timeline, the failing step with its expected/actual ' +
       'values, findings, and the triage verdict. Call this whenever asked why something failed, or after run_tests. ' +
@@ -199,6 +207,8 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
   const runTests = defineTool({
     name: 'run_tests',
+    /** the same, from a run this call started. */
+    returns: 'RUNNER_OUTPUT',
     description:
       'Execute tests against the app and wait for the result. Pass testIds to run specific tests, or omit to run ' +
       'everything. Call this after a proposal is applied, or when asked to verify something actually works — ' +
@@ -302,6 +312,9 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
   const getFlowMap = defineTool({
     name: 'get_flow_map',
+    /** routes, page titles, form field labels and locators scraped off the
+     * customer's own pages. */
+    returns: 'CRAWLED_PAGE_TEXT',
     description:
       'Get the map of the application the crawler discovered: pages, states, forms, and the locators available on ' +
       'each. Call this before writing any test code so you use locators that actually exist rather than guessing.',
@@ -348,6 +361,10 @@ export function buildCopilotTools(ctx: ToolContext): AgentTool[] {
 
   const proposeTest = defineTool({
     name: 'propose_test',
+    /** QAAI's own proposal row echoed back — ids and a status. The nearest truth
+     * rather than a guess, because there is no provenance for "ours" and a
+     * read that quotes nothing of theirs still costs nothing to fence. */
+    returns: 'CUSTOMER_CONFIGURATION',
     description:
       'Propose creating or editing a test. This does NOT write anything — it records a diff for the person to ' +
       'accept or reject. Use it for every code change you want to make. Read the existing test first when editing, ' +

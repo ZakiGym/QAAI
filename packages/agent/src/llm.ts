@@ -18,6 +18,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import { z } from 'zod';
 import { maskSecrets } from '@qaai/shared';
 import type { AgentCallRecord, TokenUsage } from '@qaai/shared';
+import { MAX_FENCE_CHARS, UNTRUSTED_DATA_RULE, fence, untrusted } from './untrusted.js';
+import type { FenceDisclosure, UntrustedProvenance } from './untrusted.js';
 
 // ─── Model catalogue ─────────────────────────────────────────────────────────
 
@@ -213,6 +215,18 @@ export interface AgentTool<T extends z.ZodType = z.ZodType> {
   /** The model picks tools from this text. Say *when* to use it, not just what it does. */
   description: string;
   input: T;
+  /**
+   * WHAT KIND OF SOMEBODY-ELSE'S-TEXT THIS TOOL HANDS BACK.
+   *
+   * Required, with no default, for the reason {@link CopilotTool.returns} in
+   * `chat.ts` gives at greater length: this loop has to label the span it
+   * quotes, and a default would label it with a guess. There is no `UNKNOWN`
+   * provenance to fall back on, and the compiler refusing a tool that declares
+   * none is the whole point — `copilot-tools.ts` is the only producer of
+   * `AgentTool` in the repository, so "every tool declares one" is checked
+   * rather than hoped for.
+   */
+  returns: UntrustedProvenance;
   execute: (input: z.infer<T>) => Promise<unknown>;
 }
 
@@ -250,7 +264,31 @@ export interface ToolLoopResult {
   text: string;
   calls: ToolCallRecord[];
   stoppedBecause: 'end_turn' | 'max_rounds';
+  /**
+   * One per tool result quoted back to the model, in call order.
+   *
+   * Here for the same reason `CopilotResult.fenceDisclosures` is: a tool result
+   * that was cut, or whose payload tried to close the fence, is a quote with a
+   * missing half, and the only thing worse than the cut is nobody saying so.
+   */
+  fenceDisclosures: readonly FenceDisclosure[];
 }
+
+/**
+ * How much of one tool result the loop quotes back.
+ *
+ * ── IT WAS 24,000 AND IS NOW THE FENCE'S CEILING, WHICH IS LOWER ───────────
+ *
+ * The loop used to cut at 24,000 with a truncation note of its own writing.
+ * That was a SECOND truncation rule for the same question the fence already
+ * answers, and two rules for one question is the shape four of this round's
+ * defects were made of — so the fence's {@link MAX_FENCE_CHARS} is now the
+ * budget. It is 4,000 characters lower, which is a real product change and is
+ * therefore DISCLOSED twice over: the fence writes its own `[TRUNCATED: n
+ * further character(s)…]` line into the span the model reads, and the caller
+ * gets `limitApplied` and `limitReason` on {@link ToolLoopResult.fenceDisclosures}.
+ */
+const TOOL_RESULT_FENCE_CHARS = MAX_FENCE_CHARS;
 
 export class LlmService {
   private readonly client: Anthropic;
@@ -393,6 +431,7 @@ export class LlmService {
     }));
 
     const calls: ToolCallRecord[] = [];
+    const fenceDisclosures: FenceDisclosure[] = [];
     let finalText = '';
 
     for (let round = 0; round < maxRounds; round++) {
@@ -412,8 +451,17 @@ export class LlmService {
         output_config: { effort: opts.effort ?? 'medium' },
         system: [
           {
+            /*
+             * THE STANDING RULE TRAVELS WITH THE SYSTEM PROMPT, not with the
+             * caller. Every tool result below is fenced, and a prompt that
+             * teaches a model the delimiters it will then meet is the half the
+             * fence cannot supply from the other end — so it is prepended HERE,
+             * where the fencing happens, rather than left to each caller to
+             * remember. Cached with the rest of the system block, so it costs
+             * one write and reads thereafter.
+             */
             type: 'text',
-            text: maskSecrets(opts.system, secrets),
+            text: `${UNTRUSTED_DATA_RULE}\n\n${maskSecrets(opts.system, secrets)}`,
             cache_control: { type: 'ephemeral' },
           },
         ],
@@ -450,7 +498,7 @@ export class LlmService {
       );
 
       if (toolUses.length === 0) {
-        return { text: finalText, calls, stoppedBecause: 'end_turn' };
+        return { text: finalText, calls, stoppedBecause: 'end_turn', fenceDisclosures };
       }
 
       conversation.push({ role: 'assistant', content: response.content });
@@ -467,7 +515,13 @@ export class LlmService {
           results.push({
             type: 'tool_result',
             tool_use_id: use.id,
-            content: `No tool named "${use.name}" exists.`,
+            /*
+             * The name is the MODEL'S, so it is bounded before it is echoed.
+             * Unbounded it is an arbitrary-length string of its choosing in our
+             * own sentence, and a sentence of ours that an outside string can
+             * make arbitrarily long is not reliably ours any more.
+             */
+            content: `No tool named "${use.name.slice(0, 64)}" exists.`,
             is_error: true,
           });
           continue;
@@ -491,15 +545,40 @@ export class LlmService {
         calls.push({ id: use.id, name: use.name, input: use.input, output, isError });
         await emit({ type: 'tool_end', id: use.id, name: use.name, output, isError });
 
+        /*
+         * FENCED, AND THE REASON IS AN EXECUTION PROBE RATHER THAN A PRINCIPLE.
+         *
+         * This is the LIVE copilot. `chat.ts` was rewritten to stop a tool
+         * result choosing a tool and its own header says plainly that
+         * `askCopilot` has no production caller — this loop does. A fake model
+         * that obeys the last instruction in its context (the behaviour a fence
+         * exists to defend against) was pointed at this function with a payload
+         * planted in ONE TEST NAME, and it ran `list_tests, run_tests,
+         * run_tests`: the same signature as the defect chat.ts was rewritten
+         * for, on the path that ships. `run_tests` calls `startRun` and
+         * enqueues a job.
+         *
+         * WHAT THIS BUYS AND WHAT IT DOES NOT. A native `tool_result` block
+         * cannot be made OURS by fencing it — the model still chooses the next
+         * tool with this text in its context, and removing the channel the way
+         * `gatheredManifest` does is not available here, because a native tool
+         * loop has exactly one context. So this is mechanisms 2 and 3 of the
+         * three in `untrusted.ts`: the span is labelled and bounded, the
+         * standing rule travels in the system prompt beside it, and the refusal
+         * that actually holds is that every tool in `copilot-tools.ts` is a
+         * READ scoped to one org and one project. Saying otherwise here would
+         * be the sentence a reviewer trusts instead of testing.
+         */
+        const fenced = fence(
+          untrusted({ provenance: tool.returns, text: serialised, origin: tool.name }),
+          { maxChars: TOOL_RESULT_FENCE_CHARS },
+        );
+        fenceDisclosures.push(fenced.disclosure);
+
         results.push({
           type: 'tool_result',
           tool_use_id: use.id,
-          // A huge tool result is mostly wasted context; truncation is visible
-          // to the model so it can narrow its next query rather than assume.
-          content:
-            serialised.length > 24_000
-              ? `${serialised.slice(0, 24_000)}\n…[truncated, ${serialised.length} chars total]`
-              : serialised,
+          content: fenced.block,
           is_error: isError,
         });
       }
@@ -507,7 +586,7 @@ export class LlmService {
       conversation.push({ role: 'user', content: results });
     }
 
-    return { text: finalText, calls, stoppedBecause: 'max_rounds' };
+    return { text: finalText, calls, stoppedBecause: 'max_rounds', fenceDisclosures };
   }
 
   private validate<T extends z.ZodType>(

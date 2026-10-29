@@ -73,6 +73,7 @@ import type { DialectId, Language, PlanItem, Priority, TestType, UiFramework } f
 import {
   CONFIDENCE_IS_USABLE,
   PROBLEM_BLOCKS_SET,
+  PROBLEM_NEEDS_LEDGER,
   artifactSetProblems,
   destinationDecision,
   orderedForApply,
@@ -1532,6 +1533,56 @@ function pathConventionGate(args: {
     ? testFilePath(ecosystem, { feature: item.feature, title: item.title })
     : null;
 
+  /*
+   * ── THE REPLACEMENT FACES THE DENY LIST TOO ────────────────────────────────
+   *
+   * THE DEFECT, MEASURED: `destinationDecision` ran on the path the MODEL
+   * supplied and never on the one this gate SUBSTITUTES for it, so the one
+   * destination in the product that nothing judged was the one QAAI chose
+   * itself. `testFilePath` builds its first segment out of `item.feature`, and
+   * a plan item whose feature is `dist` (or `build`, `out`, `target`, `obj`,
+   * `coverage`, `vendor`) produces `dist/<kebab-title>.spec.ts` — a path this
+   * same function FAILS with `FORBIDDEN_DIRECTORY` when a model asks for it.
+   * Driven through the real `processGenerate`: `Test.filePath` came back
+   * `dist/checkout-shows-the-order-total.spec.ts` with a `GeneratedArtifact`
+   * row at that path marked QAAI_OWNED, which `pushRepo` then refuses — so the
+   * cost was a test counted as coverage that can never reach the branch, and
+   * the gate that exists to say so reported WARN.
+   *
+   * THE DENY LIST ONLY, AND THE OMISSION IS DELIBERATE. That half needs no
+   * evidence and is the half this gate's own header says "runs on EVERY call".
+   * The LAYOUT half is NOT re-asked here: `testFilePath` is computed from the
+   * ecosystem and knows nothing of a measured root, so comparing its output
+   * against one would refuse the generation over QAAI's own suggestion in every
+   * repository that keeps its tests anywhere but the ecosystem default — which
+   * is the exact failure `plannedLayout`'s comment refuses, one layer up. That
+   * a corrected path can still land outside a measured root is a REAL and
+   * SEPARATE gap, and the fix for it is to teach the replacement the layout
+   * rather than to fail here; it is reported rather than silently narrowed.
+   */
+  const replacementDestination = suggested === null ? null : destinationDecision({ path: suggested });
+  if (replacementDestination?.verdict === 'REFUSED') {
+    return {
+      outcome: fail(
+        'PATH_CONVENTION',
+        `${ecosystem.label} does not collect "${filePath}" (${ecosystem.pathRule}), and the conventional replacement for it is a path QAAI will not write to: ${replacementDestination.why}`,
+        [
+          `destination refused: ${replacementDestination.reason}`,
+          ...(replacementDestination.subject.length > 0
+            ? [`the directory in question: ${replacementDestination.subject}`]
+            : []),
+          // The feature name is what chose that directory, and it is the thing a
+          // human has to change. Named as a FIELD, never as the value — the
+          // value is customer-authored text by the same rule a path is.
+          'the replacement directory came from this plan item\'s own feature name',
+        ],
+      ),
+      // Not corrected. See `AdmissionReport.correctedFilePath`: a refused
+      // destination is never silently swapped for a tidy one.
+      correctedFilePath: null,
+    };
+  }
+
   if (!suggested) {
     return {
       outcome: warn(
@@ -2397,54 +2448,22 @@ export interface AdmitSetInput {
   readonly context?: ArtifactSetContext;
 }
 
-/**
- * WHICH REFUSALS NEED A LEDGER TO BE DECIDABLE AT ALL.
+/*
+ * WHICH REFUSALS NEED A LEDGER TO BE DECIDABLE AT ALL — IMPORTED, NOT DECLARED.
  *
- * `artifactSetProblems` fails closed on an omitted ledger, which is right for
- * an APPLY and wrong for a GENERATION: a declared set claims `QAAI_OWNED`/`NEW`
- * on every artifact (see `declaredArtifactSet`), so with no ledger in hand every
- * one of them comes back WRITE_TO_UNOWNED and STALE_BASE — and refusing a
- * freshly generated set on that basis would mean a project could never receive
- * its first test.
+ * This file used to hold a second copy of `PROBLEM_NEEDS_LEDGER`, beside the one
+ * in packages/shared/src/schemas.ts that `artifactSetSchema` parses with. Two
+ * vocabularies for one question is the defect this codebase keeps paying for
+ * (`ASSERTION_KEY` vs `specAssertions`, `SECRET_FORMS` vs `SECRET_SHAPES`,
+ * `ContentDigest` twice): they agreed when they were compared, and nothing made
+ * them. The copy here asked for "schemas.ts to import it and delete its own",
+ * which cannot happen — @qaai/shared must not depend on @qaai/agent — so the
+ * owner is the shared one and this is the deletion that squares the pair.
  *
- * So when no `context` is supplied this function checks the LEDGER-FREE half
- * only and reports `ledgerChecked: false`, which is exactly what
- * `artifactSetSchema` in packages/shared/src/schemas.ts already does for the
- * same reason. That schema holds the same list as a module-private `Set` of
- * string literals, so THERE ARE TWO COPIES OF THIS CLASSIFICATION IN THE
- * REPOSITORY and that is this codebase's `ASSERTION_KEY`-versus-`specAssertions`
- * defect arriving in the ownership layer. This one is a compiler-enforced record
- * rather than a `Set<string>`, so a thirteenth problem kind cannot be added
- * without being classified; the handover asks for schemas.ts to import it and
- * delete its own.
- *
- * `ledgerChecked: false` IS NOT A PASS. It says the five refusals below were
- * not asked, and the apply path asks them with the ledger in hand before a byte
- * is written.
+ * `ledgerChecked: false` IS STILL NOT A PASS. It says the ledger-dependent
+ * refusals were not asked, and the apply path asks them with the ledger in hand
+ * before a byte is written.
  */
-export const PROBLEM_NEEDS_LEDGER = {
-  DUPLICATE_PATH: false,
-  PATH_ESCAPE: false,
-  /*
-   * `false`, and it is the interesting `false` in this record. The destination
-   * rule needs no ledger and no working tree: the deny-list half is a closed
-   * list of directory names, and the layout half reads a measurement that
-   * arrives on `context.layout` rather than from any row. So it is asked at
-   * parse time, by `artifactSetSchema`, which is the strongest place in the
-   * product this rule can be enforced from.
-   */
-  FORBIDDEN_DESTINATION: false,
-  WRITE_TO_UNOWNED: true,
-  MISSING_BASE_HASH: false,
-  BASE_HASH_ON_NEW: false,
-  STALE_BASE: true,
-  UNRESOLVED_IMPORT: true,
-  APPLY_ORDER: false,
-  SHARED_EXPORT_REMOVED: true,
-  SHARED_SURFACE_UNREADABLE: true,
-  SET_SIZE: false,
-  ARTIFACT_SIZE: false,
-} as const satisfies Record<ArtifactSetProblem['kind'], boolean>;
 
 /** Worst-first, so `Math.max` over the ranks is the set's verdict. */
 const VERDICT_SEVERITY: Record<AdmissionVerdict, number> = {

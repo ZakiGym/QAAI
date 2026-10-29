@@ -64,18 +64,22 @@ import type { CorrectionSignal } from './corrections.js';
 import { composePrompt, untrusted } from './untrusted.js';
 import type { FenceDisclosure } from './untrusted.js';
 /*
- * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
- * and is recorded as one. `packages/shared/src/index.ts` has no
- * `export * from './style-profile'` or `'./artifact-set'`, and the obvious
- * one-line fix does NOT compile: `artifact-set.ts` and `requirements.ts` both
- * export a type named `ContentDigest` and `requirements` is already in that
- * barrel, so a star export is TS2308 on it. The working edit is in the
- * handover; `admission.ts`, `artifacts.ts`, `page-objects.ts` and `refactor.ts`
- * all carry the same note.
+ * THE BARREL, AND THIS COMMENT USED TO SAY THE OPPOSITE.
+ *
+ * It claimed these four names were "reached by a RELATIVE PATH ACROSS THE
+ * WORKSPACE BOUNDARY, which is a defect", because `packages/shared/src/index.ts`
+ * had no `export * from './style-profile'` or `'./artifact-set'` and the
+ * one-line fix was TS2308 on a duplicated `ContentDigest`. Both lines are in
+ * that barrel now (artifact-set.ts re-exports `ContentDigest` FROM
+ * requirements.ts rather than declaring a second one, which is what made the
+ * star export legal), the imports below have always been `@qaai/shared`, and
+ * the paragraph outlived its subject. Corrected rather than deleted because it
+ * is exactly the sentence a reviewer trusts instead of checking: it described a
+ * defect in the lines directly under it that was not there.
  */
-import { styleProfileBriefing } from '@qaai/shared';
-import type { StyleProfile } from '@qaai/shared';
-import type { ArtifactSet } from '@qaai/shared';
+import { CONFIDENCE_IS_USABLE, styleProfileBriefing } from '@qaai/shared';
+import type { FileLayout, StyleObservation, StyleProfile } from '@qaai/shared';
+import type { ArtifactSet, ArtifactSetContext } from '@qaai/shared';
 import { singleFileArtifactSet } from '@qaai/shared';
 import { LlmError, NO_KEY_SENTENCE } from './llm.js';
 import type { CallContext, LlmService } from './llm.js';
@@ -170,8 +174,29 @@ export interface HouseStyleDisclosure {
   readonly exemplarCharsDropped: number;
   /** A reviewer signal was supplied, and what it concluded. Null when none was. */
   readonly reviewerSignal: CorrectionSignal['state'] | null;
-  /** A multi-file plan was computed, rather than a set of one. */
+  /** A multi-file plan was COMPUTED, rather than a set of one. */
   readonly planned: boolean;
+  /**
+   * The computed plan was USED — the set that came back holds its files.
+   *
+   * ── WHY THIS IS A SECOND FIELD AND NOT A SHARPER `planned` ────────────────
+   *
+   * It used to be one field with two meanings. `houseStyleFlags` was called
+   * with `planned: plan !== null` and the RETURNED disclosure overwrote it with
+   * `planned: usePlan`, so on a dropped-plan job the flags on the row were
+   * computed from `true` and the disclosure beside them said `false`. A
+   * consumer that recomputed `houseStyleFlags(result.houseStyle)` — which is
+   * the obvious thing to do with an exported pure function — got a different
+   * list than `reviewFlags` holds, and would have reported the generic "no
+   * ledger" sentence over the specific one that names what was dropped and why.
+   *
+   * The two facts are genuinely different and both are worth having: a plan
+   * that was never computed is a repository nobody could read, and a plan
+   * computed and dropped is a defect in the plan or in the path the model
+   * answered with. Every false `planApplied` with a true `planned` already
+   * carries its own named sentence from the three drop branches below.
+   */
+  readonly planApplied: boolean;
 }
 
 /**
@@ -838,7 +863,15 @@ export interface GenerateTestArgs {
  * indistinguishable in the output. The precedent is the DUPLICATE gate's —
  * omitting `existing` reports UNAVAILABLE rather than passing.
  */
-export function houseStyleFlags(disclosure: HouseStyleDisclosure): string[] {
+export function houseStyleFlags(
+  /*
+   * `planApplied` IS DELIBERATELY NOT REQUIRED. This function is called before
+   * the generator knows whether the plan survived, and asking for a field the
+   * caller would have to invent is how the two came to disagree in the first
+   * place. It reads `planned` only.
+   */
+  disclosure: Omit<HouseStyleDisclosure, 'planApplied'>,
+): string[] {
   const flags: string[] = [];
   if (!disclosure.profileUsed) {
     flags.push(
@@ -867,11 +900,120 @@ export function houseStyleFlags(disclosure: HouseStyleDisclosure): string[] {
     );
   }
   if (!disclosure.planned) {
+    /*
+     * THE CONSEQUENCE, AND NOT THE CAUSE — because this function cannot know
+     * the cause and used to name one anyway.
+     *
+     * It said "because no repository ledger was available". That was the only
+     * reason when it was written and is now ONE OF SIX: the worker's
+     * `LAYOUT_OUTCOMES` separates a repository that could not be read from one
+     * nobody has measured a style profile for, a stored crawl that did not
+     * validate, a ledger longer than one job reads, a batch of items a human
+     * has not approved, and a plan that was read and declined. On five of those
+     * a ledger was available or was never the obstacle, so the sentence was a
+     * false attribution sitting next to the caller's true one.
+     *
+     * The caller states the cause: `layoutSentence` in the generate processor
+     * renders exactly one sentence per outcome onto the same `reviewFlags`.
+     */
     flags.push(
-      "This test's setup is inline rather than extracted into a page object and a fixture, because no repository ledger was available to decide where those files belong or whether they already exist. Minting a second page object for a page that already has one is worse than minting none, so none was minted.",
+      "This test's setup is inline rather than extracted into a page object and a fixture, so the selectors and the sign-in steps are repeated in this file rather than shared. Minting a second page object for a page that already has one is worse than minting none, so none was minted. The reason no multi-file plan was computed is stated separately on this test by whoever asked for the generation.",
     );
   }
   return flags;
+}
+
+/**
+ * THE ONE CASE WHERE A MEASURED LAYOUT IS NOT APPLIED, SAID OUT LOUD.
+ *
+ * `PATH_CONVENTION` and `admitSet` both describe an absent layout as "no test
+ * layout has been measured for this repository". That sentence is TRUE when
+ * nothing measured one and FALSE when something did and this function chose not
+ * to hand it over — which is rule 12's mirror, a thing reported as unmeasured
+ * that was measured, and is why the choice is disclosed here instead of being
+ * left to a gate that cannot know the difference.
+ *
+ * The choice itself is forced: the only path the gate would compare is the one
+ * `testFilePath` produced, which is computed from the ecosystem and ignores the
+ * profile entirely, so comparing it against a measured root refuses the
+ * generation over QAAI's own suggestion. See `plannedLayout`.
+ *
+ * Exported and pure for the same reason {@link houseStyleFlags} is: the sentence
+ * is pinned by a test rather than asserted on in prose. Nothing is emitted when
+ * the layout WAS applied, and nothing when there was none to apply — a flag that
+ * is always there is a flag nobody reads.
+ */
+export function layoutNotAppliedFlags(args: {
+  readonly layout: StyleObservation<FileLayout> | null;
+  readonly applied: boolean;
+}): string[] {
+  const { layout, applied } = args;
+  if (applied || layout === null) return [];
+  // `CONFIDENCE_IS_USABLE` and not a threshold of this file's own: one opinion
+  // about whether an observation may be relied on, which is the same question
+  // `destinationDecision` and `directoryForRole` ask.
+  if (!CONFIDENCE_IS_USABLE[layout.confidence] || layout.value === null) return [];
+  return [
+    `This repository's own test layout WAS measured (${layout.filesSeen} of ${layout.filesConsidered} file(s) agreed, at ${layout.confidence} confidence), and this test's destination was NOT compared against it — so where a gate says no layout was measured, read "it was not applied here". It could not be: no repository view was supplied, so there was no ledger to place the file from and the path came from the runner's own naming convention alone, which knows nothing of this layout. Connecting the repository is what makes the two agree.`,
+  ];
+}
+
+/**
+ * THE DECLARED IMPORTS THE SPEC'S OWN BYTES DO NOT EVIDENCE, as the specifiers
+ * the briefing named.
+ *
+ * ── WHY THIS READS THE PLAN'S `specifier` AND NOT THE PLAN'S `path` ────────
+ *
+ * `SPEC.imports` holds REPO-RELATIVE paths, and no spec in any ecosystem
+ * imports by one: `artifactBriefing` tells the model to import from
+ * `artifact.specifier`, which `moduleSpecifier` computed — relative, extension
+ * stripped, or the project's own `importAlias` when one was measured at MEDIUM
+ * or above. So the question "did the model import this file" is asked in the
+ * spelling the model was given, read off the plan rather than recomputed here.
+ * A second implementation of "how does one generated file import another" is
+ * exactly the duplication this codebase keeps paying for.
+ *
+ * TWO SPELLINGS COUNT AS EVIDENCE, and the second is not generosity: a project
+ * with a `baseUrl` or a root-relative resolution really does write
+ * `e2e/fixtures/setup/pages.fixture`, and that is the same file. The extension
+ * is stripped from both sides for the same reason `moduleSpecifier` strips it —
+ * `'./pages.fixture'`, `'./pages.fixture.ts'` and `'./pages.fixture.js'` are one
+ * import in TypeScript.
+ *
+ * ── WHAT IT DOES NOT CLAIM ─────────────────────────────────────────────────
+ *
+ * A substring match over the file's text. It does not parse, so a specifier
+ * inside a comment or a string literal counts, and an import the plan never
+ * declared is not noticed at all. That is a deliberate floor rather than a
+ * limitation worth hiding: it is sound in the direction that matters — a
+ * declared import the bytes never mention CANNOT be a real edge — and the
+ * direction it misses (bytes importing something the plan did not declare)
+ * needs a per-language parser and is recorded in the handover, not implied here.
+ */
+function missingSpecImports(args: {
+  readonly plan: ArtifactPlan;
+  readonly specCode: string;
+}): readonly string[] {
+  const { plan, specCode } = args;
+  const spec = plan.artifacts.find((artifact) => artifact.role === 'SPEC');
+  if (!spec) return [];
+
+  /** Every spelling the briefing could have used, per declared path. */
+  const specifierFor = (path: string): string => {
+    const planned = plan.artifacts.find((artifact) => artifact.path === path);
+    const reused = plan.reused.find((artifact) => artifact.path === path);
+    return planned?.specifier ?? reused?.specifier ?? path;
+  };
+  const stripExtension = (value: string): string => value.replace(/\.[A-Za-z0-9]{1,4}$/, '');
+
+  const missing: string[] = [];
+  for (const path of spec.imports) {
+    const specifier = specifierFor(path);
+    const evidence = [stripExtension(specifier), stripExtension(path)];
+    if (evidence.some((candidate) => candidate.length > 0 && specCode.includes(candidate))) continue;
+    missing.push(specifier);
+  }
+  return missing;
 }
 
 /**
@@ -941,11 +1083,13 @@ async function generateCodeTest(
    * "this was not written here" signal this round exists to remove — so the
    * honest fallback is a set of one, reported by `houseStyle.planned`.
    */
+  const repository = args.repository ?? null;
+  const profile = args.styleProfile ?? null;
   const plan =
-    args.repository && args.styleProfile
+    repository && profile
       ? planArtifacts({
           item,
-          profile: args.styleProfile,
+          profile,
           ecosystemId: ecosystem.id,
           /*
            * Only the pages retrieval chose, in its order. The whole flow map
@@ -958,7 +1102,7 @@ async function generateCodeTest(
           pages: pageSourcesFrom(flowMap).filter((page) =>
             context.nodeIds.some((id) => flowMap.nodes.find((n) => n.id === id)?.route === page.route),
           ),
-          repository: args.repository,
+          repository,
           // Stable per item, so a regeneration is not a diff against itself.
           seed: args.artifactSeed ?? item.id,
         })
@@ -971,6 +1115,74 @@ async function generateCodeTest(
   const suggestedPath = plan ? plan.specPath : testFilePath(ecosystem, { feature: item.feature, title: item.title });
 
   /*
+   * ── THE REPOSITORY FACTS THE GATES ARE BUILT TO READ ───────────────────────
+   *
+   * `ArtifactSetContext` declares three, and this was `undefined` — so
+   * `admitSet` computed `layoutChecked: false` on every call and emitted "No
+   * usable test layout was measured for this repository" WHILE THIS FUNCTION
+   * HELD THE PROFILE. Measured at the previous commit, with a HIGH-confidence
+   * layout over 5 of 5 files: that is rule 12 with the sign flipped — a thing
+   * reported as UNMEASURED that was measured.
+   *
+   * TWO OF THE THREE ARE FORWARDED AND THE LEDGER IS NOT, and the reason is a
+   * measurement rather than caution. `declaredArtifactSet` claims
+   * `QAAI_OWNED`/`NEW` on every artifact, which is what a freshly generated
+   * file IS; supplying the ledger makes `artifactSetProblems` compare that
+   * claim against `resolveOwnership`, which answers `UNRECORDED` because the
+   * rows do not exist until the apply path reserves them. Driving the real
+   * `admitSet` over the real three-artifact plan with `context: { ledger: [] }`
+   * returns REFUSE with STALE_BASE on ALL THREE files ("computed when the
+   * ledger said QAAI_OWNED; it now says UNRECORDED"). So a generation that
+   * forwarded the ledger would refuse every first test of every project, which
+   * is precisely what `PROBLEM_NEEDS_LEDGER` exists to prevent. The ledger half
+   * is the APPLY path's, which holds it at the instant of the write;
+   * `ledgerChecked: false` and its flag stay, and they are true.
+   *
+   * `priorContent` IS forwarded and IS INERT TODAY, said plainly rather than
+   * implied: `artifactSetProblems` reads it only for a non-NEW artifact of a
+   * shared role that has dependents in the ledger, and a declared set has
+   * neither a non-NEW artifact nor a ledger. It is wired because the reader is
+   * the only one of the three this module can answer and the day a generation
+   * produces an UPDATE_OWNED is the day its absence would be a
+   * SHARED_SURFACE_UNREADABLE nobody could act on.
+   *
+   * The three-state `DiskState` collapses into `priorContent`'s two here, in
+   * the fail-closed direction only: PRESENT carries the bytes, and ABSENT and
+   * UNREADABLE both answer null, which that function treats as "unavailable"
+   * and never as "empty". The planner keeps the third state — see `DiskState`
+   * in artifacts.ts — because it is the one that must not read UNREADABLE as a
+   * free path.
+   */
+  const setContext: ArtifactSetContext | null =
+    plan && repository && profile
+      ? {
+          layout: profile.fileLayout,
+          priorContent: (path) => {
+            const disk = repository.diskStateAt(path);
+            return disk.state === 'PRESENT' ? disk.content : null;
+          },
+        }
+      : null;
+  /*
+   * THE LAYOUT, AND THE ONE CONDITION ON FORWARDING IT TO THE GATE.
+   *
+   * `PATH_CONVENTION` is a HARD_FAIL gate and `OUTSIDE_LEARNED_LAYOUT` is a
+   * FAIL, so comparing a path against a layout it was NOT computed from refuses
+   * the generation — and `testFilePath` ignores the profile entirely. A project
+   * with a cached style profile and no repository view (which is every project
+   * whose repository is not connected) would therefore have every generation
+   * refused over the ecosystem default path QAAI itself suggested. So the gate
+   * is handed the layout exactly when the suggested path came FROM it, which is
+   * `plan !== null`, and `setContext` is the single expression that decides it:
+   * one answer about one question, for the single-file `admit` and the set's
+   * alike, which is what keeps "`admit` is pure and cannot disagree with the
+   * first run" true at the set below.
+   *
+   * The withheld case is not silent — see {@link layoutNotAppliedFlags}.
+   */
+  const plannedLayout = setContext?.layout ?? null;
+
+  /*
    * THE THREE LEARNED BRIEFINGS. Every one is deterministic, every one fences
    * its own quotes of customer source, and every one renders an honest line when
    * it has nothing to say — which is what makes this path work with no model
@@ -979,7 +1191,7 @@ async function generateCodeTest(
   const exemplars = args.learnedStyle
     ? selectExemplars({ learned: args.learnedStyle, surface: item.title })
     : null;
-  const houseStyle: HouseStyleDisclosure = {
+  const houseStyle: Omit<HouseStyleDisclosure, 'planApplied'> = {
     profileUsed: args.styleProfile !== null && args.styleProfile !== undefined,
     exemplarsShown: exemplars?.exemplars.length ?? 0,
     exemplarsConsidered: exemplars?.considered ?? 0,
@@ -1156,6 +1368,15 @@ ${ecosystem.rules}`,
        * why ASSERTIONS can count `expect(` in a file whose project is Ruby.
        */
       ecosystemId: ecosystem.id,
+      /*
+       * THE SAME `plannedLayout` THE SET IS GIVEN, off the same expression.
+       * Handing one of the two gates a layout and the other none would make
+       * `admitSet`'s "the SPEC's own gates run a second time here and cannot
+       * disagree with the first run" false — `admit` is pure, so it can only
+       * disagree about its INPUTS, and this is the input that decides whether
+       * `PATH_CONVENTION` asks the destination's layout half at all.
+       */
+      layout: plannedLayout,
       spec: specOf(model),
       attempt,
       existing: args.existing,
@@ -1259,6 +1480,7 @@ ${report.revisePrompt}`);
     ...contextReviewFlags(context),
     ...crawlFenceFlags(composed.disclosures),
     ...houseStyleFlags(houseStyle),
+    ...layoutNotAppliedFlags({ layout: profile?.fileLayout ?? null, applied: plannedLayout !== null }),
   ];
   const code = report.code;
   const filePath = report.correctedFilePath ?? generated.filePath;
@@ -1345,7 +1567,64 @@ ${report.revisePrompt}`);
     );
   }
 
-  const usePlan = plan !== null && plan.plannable && !specPathMoved;
+  /*
+   * ── A DECLARED IMPORT WITH NO EVIDENCE IN THE BYTES ────────────────────────
+   *
+   * `declaredArtifactSet` replaces the SPEC artifact's `content` with the
+   * model's code and KEEPS `imports` from the plan, so the SPEC's declared
+   * imports are ASSERTED FROM THE PLAN AND NEVER READ FROM THE BYTES. A
+   * verifier measured a set whose `SPEC.imports` claimed
+   * `e2e/fixtures/setup/pages.fixture.ts` while the spec's own bytes imported
+   * only `@playwright/test`, with `setProblems: []` and not one review flag.
+   *
+   * WHY THAT IS NOT COSMETIC. `GeneratedArtifact.imports` is documented as
+   * "repo-relative paths this file imports FROM THE PROJECT", and `dependentsOf`
+   * and the shared-surface rule both TRUST it — so a wrong value here is a wrong
+   * blast radius on the push path. And the set itself is wrong in the other
+   * direction: a spec that did not import the fixture it was handed means the
+   * fixture and the page object are dead files about to be written into the
+   * customer's repository, with the spec's setup inlined anyway. Both halves of
+   * the round's headline defect, in one set.
+   *
+   * THE REMEDY IS THE ONE `specPathMoved` ALREADY ESTABLISHED, for the same
+   * class of problem: the set is DROPPED, the single-file shape is returned, and
+   * the flag names the specifier that is missing. It is not a second producer of
+   * `imports` — nothing here recomputes them — and it is not a refusal of the
+   * generation, because the spec itself is fine; only the claim about it is not.
+   *
+   * THE EVIDENCE IS THE SPECIFIER THE BRIEFING NAMED, read off the plan's own
+   * `specifier` field, which is the string `artifactBriefing` interpolated. No
+   * second notion of "how does this file import that one": `moduleSpecifier`
+   * computed it, the prompt quoted it, and this asks whether it came back. The
+   * extension-stripped repo-relative path counts too, because a project with a
+   * `baseUrl` really does import that way and it is the same file either way.
+   *
+   * It is asked of the SPEC ALONE, and that is a fact about which bytes the
+   * planner wrote: every other artifact's `content` is the renderer's own
+   * output, so its imports and its bytes come from the same line of code.
+   *
+   * IT IS ASKED ONLY WHEN THE PATH DID NOT MOVE, so one drop produces one flag. A
+   * moved spec path makes every specifier in the plan wrong by construction —
+   * they were all computed relative to the planned path — so the bytes cannot
+   * evidence them and the cause above is the one that bit. Reporting both would
+   * be two reasons for one decision, and the second would be the wrong one.
+   */
+  const unevidencedSpecImports =
+    plan !== null && plan.plannable && !specPathMoved
+      ? missingSpecImports({ plan, specCode: code })
+      : [];
+  if (unevidencedSpecImports.length > 0 && plan !== null) {
+    flags.push(
+      `The planned page object(s) and fixture were NOT written: this test's setup is inline instead. The plan recorded that "${plan.specPath}" imports ${
+        unevidencedSpecImports.length
+      } file(s) the briefing named — ${unevidencedSpecImports
+        .map((specifier) => `"${specifier}"`)
+        .join(', ')} — and the generated file does not mention them. Writing them anyway would commit files nothing imports and record an import edge that is not there, which the next change would read as the truth about what depends on what.`,
+    );
+  }
+
+  const usePlan =
+    plan !== null && plan.plannable && !specPathMoved && unevidencedSpecImports.length === 0;
   const dialect = resolveDialect({
     filePath,
     ecosystemId: ecosystem.id,
@@ -1360,15 +1639,18 @@ ${report.revisePrompt}`);
    * set of one the single-file `admit` above IS the answer, and a second report
    * over the same bytes would be two verdicts about one artifact.
    *
-   * No `context`, deliberately. This is the GENERATION gate and it answers the
-   * ledger-free half, exactly as `artifactSetSchema` does — `ledgerChecked`
-   * comes back false and says so. The ledger half is asked by the apply path,
-   * which is the only place that holds the ledger at the instant of the write.
+   * `context` CARRIES THE LAYOUT AND THE WORKING-TREE READER AND NOT THE
+   * LEDGER — see `setContext` above for the measurement behind each of those
+   * three decisions. `ledgerChecked` still comes back false and still says so,
+   * which is true: the ledger half is the apply path's, which is the only place
+   * that holds it at the instant of the write. `layoutChecked` now reports what
+   * was actually measured, which was the point.
    *
    * The SPEC's own gates run a second time here and cannot disagree with the
-   * first run: `admit` is pure, and it is handed `report.code` — the formatted
-   * bytes — rather than the model's. That redundancy is the price of leaving the
-   * proven single-file REVISE loop above exactly as it was.
+   * first run: `admit` is pure, it is handed `report.code` — the formatted
+   * bytes — rather than the model's, and it is handed the SAME `plannedLayout`.
+   * That redundancy is the price of leaving the proven single-file REVISE loop
+   * above exactly as it was.
    */
   const setAdmission =
     set.artifacts.length > 1
@@ -1382,6 +1664,7 @@ ${report.revisePrompt}`);
           attempt: FINAL_ATTEMPT,
           existing: args.existing,
           toolchain: args.toolchain,
+          ...(setContext ? { context: setContext } : {}),
           /*
            * UNREVISABLE, and that is the honest value rather than a shortcut.
            * The page objects, the fixture and the dataset were computed
@@ -1425,7 +1708,7 @@ ${report.revisePrompt}`);
     artifacts: setAdmission?.set ?? set,
     setAdmission,
     artifactPlan: usePlan ? plan : null,
-    houseStyle: { ...houseStyle, planned: usePlan },
+    houseStyle: { ...houseStyle, planApplied: usePlan },
   };
 }
 
@@ -1474,6 +1757,12 @@ function SPEC_DRIVEN_SINGLE_FILE(args: { filePath: string; code: string }): Pick
       exemplarCharsDropped: 0,
       reviewerSignal: null,
       planned: false,
+      /*
+       * Both false, and they mean two different things even here: nothing was
+       * computed and so nothing was applied. A spec pointer has no setup to
+       * extract, so this is the type's shape rather than a degradation.
+       */
+      planApplied: false,
     },
   };
 }

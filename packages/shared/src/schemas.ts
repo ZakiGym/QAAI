@@ -114,9 +114,10 @@ import {
   SUITE_CHANGE_KINDS,
   SUITE_CHANGE_STATES,
   artifactSetProblems,
+  destinationDecision,
   proposalProblems,
 } from './artifact-set';
-import type { ArtifactSet } from './artifact-set';
+import type { ArtifactSet, ArtifactSetProblemKind } from './artifact-set';
 import {
   FIXTURE_MECHANISMS,
   IMPORT_STYLES,
@@ -6374,7 +6375,7 @@ export const generatedArtifactSchema = z
  * replacement is refused with `SHARED_SURFACE_UNREADABLE`.
  *
  * THAT IS DELIBERATELY TOO STRICT FOR A FRESH GENERATION, which is why the
- * ledger-dependent half is excluded below by name: a generated set is parsed
+ * ledger-dependent half is excluded below by {@link PROBLEM_NEEDS_LEDGER}: a generated set is parsed
  * BEFORE anything looks at the repository, and a parse that refused every new
  * file would make the shape unusable. The excluded problems are exactly the
  * ones that need a ledger, and the apply path MUST re-run
@@ -6383,13 +6384,56 @@ export const generatedArtifactSchema = z
  * write safe would be one of the lies this product cannot afford, so: IT DOES
  * NOT. It refuses what can be decided from the bytes in hand.
  */
-const LEDGER_DEPENDENT_PROBLEMS = new Set([
-  'WRITE_TO_UNOWNED',
-  'STALE_BASE',
-  'UNRESOLVED_IMPORT',
-  'SHARED_EXPORT_REMOVED',
-  'SHARED_SURFACE_UNREADABLE',
-]);
+/**
+ * WHICH REFUSALS NEED A LEDGER TO BE DECIDABLE AT ALL. THE ONE OWNER.
+ *
+ * This was `LEDGER_DEPENDENT_PROBLEMS`, a module-private `Set<string>` of five
+ * hand-written literals, while `packages/agent/src/admission.ts` held a
+ * compiler-enforced record of the same classification under this name — two
+ * vocabularies for one question, which is the defect this codebase keeps paying
+ * for (`ASSERTION_KEY` vs `specAssertions`, `SECRET_FORMS` vs `SECRET_SHAPES`,
+ * `ContentDigest` twice). They agreed when they were compared; the point is
+ * that nothing made them.
+ *
+ * SO IT LIVES HERE, in the package the other one can import, and the direction
+ * is the whole reason: admission.ts's own doc comment asked for "schemas.ts to
+ * import it and delete its own", which cannot happen — @qaai/shared must not
+ * depend on @qaai/agent, so the dependency only runs one way. That sentence is
+ * corrected by this record existing, and the handover carries the matching
+ * deletion in admission.ts.
+ *
+ * A compiler-enforced record and not a `Set`, so a fourteenth problem kind
+ * cannot be added without someone deciding whether a ledger is needed to
+ * decide it. `false` is the answer that matters: a `false` member is refused at
+ * PARSE time, before anything has looked at the repository, so getting one
+ * wrong here is a generated set refused for a reason nobody can act on.
+ *
+ * `FORBIDDEN_DESTINATION` is the interesting `false`: the destination rule needs
+ * no ledger and no working tree — the deny-list half is a closed list of
+ * directory names and the layout half reads a measurement passed in beside the
+ * set — so it is asked here, which is the strongest place in the product it can
+ * be enforced from.
+ *
+ * NOT ASKING IS NOT A PASS. The apply path MUST re-run `artifactSetProblems`
+ * with the real ledger and the real `priorContent` before writing a byte, and
+ * `admitSet` reports `ledgerChecked: false` beside any set whose caller had no
+ * ledger.
+ */
+export const PROBLEM_NEEDS_LEDGER = {
+  DUPLICATE_PATH: false,
+  PATH_ESCAPE: false,
+  FORBIDDEN_DESTINATION: false,
+  WRITE_TO_UNOWNED: true,
+  MISSING_BASE_HASH: false,
+  BASE_HASH_ON_NEW: false,
+  STALE_BASE: true,
+  UNRESOLVED_IMPORT: true,
+  APPLY_ORDER: false,
+  SHARED_EXPORT_REMOVED: true,
+  SHARED_SURFACE_UNREADABLE: true,
+  SET_SIZE: false,
+  ARTIFACT_SIZE: false,
+} as const satisfies Record<ArtifactSetProblemKind, boolean>;
 
 export const artifactSetSchema = z
   .object({
@@ -6400,7 +6444,7 @@ export const artifactSetSchema = z
   .strict()
   .superRefine((set, ctx) => {
     for (const problem of artifactSetProblems(set)) {
-      if (LEDGER_DEPENDENT_PROBLEMS.has(problem.kind)) continue;
+      if (PROBLEM_NEEDS_LEDGER[problem.kind]) continue;
       ctx.addIssue({
         code: 'custom',
         message: `${problem.kind}: ${problem.why}`,
@@ -6439,12 +6483,49 @@ export const artifactSetSchema = z
 export const generatedTestSchema = z
   .object({
     name: z.string().min(1).max(160),
+    /**
+     * THE DESTINATION, ASKED OF THE ONE RULE — and this field is why that
+     * sentence had to become true here rather than only inside the set.
+     *
+     * It carried `!p.includes('..') && !p.startsWith('/')`, which is a
+     * TRAVERSAL guard and not a destination rule: `node_modules/.bin/payload.spec.ts`,
+     * `.github/workflows/release.spec.ts` and `dist/checkout.spec.ts` all
+     * passed it. `artifacts` below is parsed through `artifactSetSchema`, whose
+     * `superRefine` has consulted {@link destinationDecision} for every
+     * artifact since the last commit — but `artifacts` is OPTIONAL and the
+     * single-file shape is THE ONLY SHAPE GENERATION PRODUCES today, so on the
+     * path that actually runs a model-chosen destination was stopped only by
+     * `admit` happening to be called, and not by the validator the write path
+     * parses with. That is lesson H: a test over a producer must end at the
+     * validator, and this is the validator.
+     *
+     * NO LAYOUT, for the reason {@link ArtifactSetContext.layout} states and
+     * `artifactSetSchema` already obeys: a parse runs before anything has
+     * looked at the repository, so the `OUTSIDE_LEARNED_LAYOUT` half is not
+     * asked and `UNDECIDED` is not refused. The deny list and the malformed
+     * check need no evidence and run on every parse. The layout half is asked
+     * by `PATH_CONVENTION` and by `admitSet`, both of which are handed the
+     * measurement, and both of which disclose its absence.
+     *
+     * THE MESSAGE NAMES NO PATH. A file path is model-authored text, this field
+     * permits 300 characters of it including newlines, and a refusal echoed
+     * into a line-oriented report would break out of whatever rendered it. The
+     * rule's `why` is composed of constants it owns and its `subject` is a
+     * `FORBIDDEN_DIRECTORIES` key, so the sentence below is safe and the zod
+     * issue's PATH is how a caller finds the offending value.
+     */
     filePath: z
       .string()
       .min(1)
       .max(300)
-      // Traversal guard: generated paths are written to disk and committed to PRs.
-      .refine((p) => !p.includes('..') && !p.startsWith('/'), 'must be a relative path without ..'),
+      .superRefine((p, ctx) => {
+        const destination = destinationDecision({ path: p });
+        if (destination.verdict !== 'REFUSED') return;
+        ctx.addIssue({
+          code: 'custom',
+          message: `${destination.reason}: ${destination.why}`,
+        });
+      }),
     code: z.string().min(1),
     /** Selectors the generator was not confident about; surfaced for review. */
     reviewFlags: z.array(z.string()).default([]),

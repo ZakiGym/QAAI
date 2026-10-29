@@ -441,3 +441,143 @@ describe('a QAAI_OWNED row minted for a path nothing examined', () => {
     ]);
   });
 });
+
+/**
+ * THE QUESTION THIS FUNCTION NEVER ASKED: WHERE, not just whether.
+ *
+ * Every other refusal in `pushRepo` answers "may QAAI replace what is at this
+ * path". None of them answered "may QAAI put a file here at all", and a CREATE
+ * skipped the question entirely — `node_modules/.bin/payload.spec.ts` destroys
+ * nothing, so the loop allowed it, staged it and pushed it.
+ *
+ * These cases end at the REAL COMMITTED TREE and not at the return value, for
+ * the reason this file exists: "the file was not written" is a claim about git
+ * objects, and a report that said `refused` while `add` had already staged the
+ * blob would satisfy an assertion over `result` alone.
+ */
+describe('where QAAI may write, asked before any byte is staged', () => {
+  it('refuses a CREATE into a dependency tree and leaves it out of the commit', async () => {
+    reset({ 'src/app.ts': 'export const app = 1;' });
+
+    const result = await pushRepo(
+      new Map([
+        ['node_modules/.bin/payload.spec.ts', 'the payload'],
+        ['e2e/checkout.spec.ts', 'the real test'],
+      ]),
+      { ...OPTS, ownership: ledger({}) },
+    );
+
+    // THE TREE. The ordinary path landed, so this is not passing by refusing
+    // everything, and the forbidden one is absent from the real commit.
+    expect([...captured.after.keys()].sort()).toEqual(['e2e/checkout.spec.ts', 'src/app.ts']);
+    expect(captured.after.has('node_modules/.bin/payload.spec.ts')).toBe(false);
+
+    expect(result.refusedCount).toBe(1);
+    expect(result.filesRefused[0]?.path).toBe('node_modules/.bin/payload.spec.ts');
+    expect(result.filesRefused[0]?.reason).toBe('FORBIDDEN_DESTINATION');
+    /*
+     * THE RULE'S OWN SENTENCE, forwarded rather than rewritten here — it names
+     * the offending directory and what it is. Asserted as the directory plus
+     * the classification rather than the whole string, because the wording
+     * belongs to `destinationDecision` and a copy of it here would be the
+     * second opinion this change exists to remove.
+     */
+    expect(result.filesRefused[0]?.why).toContain('node_modules');
+    expect(result.filesRefused[0]?.why).toContain('a dependency tree');
+    /*
+     * The bytes were NOT read — a refused destination may be a path the
+     * checkout has nothing at — and that is disclosed as a count rather than
+     * reported as an empty file.
+     */
+    expect(result.filesRefused[0]?.remoteContent).toBeNull();
+    expect(result.contentsOmitted).toBe(1);
+  });
+
+  /*
+   * THE ORDERING, WHICH IS THE WHOLE POINT. A ledger row claiming QAAI_OWNED
+   * with a hash that MATCHES the branch is the strongest permission this
+   * function knows, and it still does not buy a write into `.github`. Without
+   * asking the destination first, this case writes the file: QAAI generated the
+   * path, so a row claiming it is exactly what the ledger holds.
+   */
+  it('refuses a QAAI-owned, hash-matching UPDATE inside a hidden directory', async () => {
+    const theirs = 'name: release\non: push\n';
+    reset({ '.github/workflows/release.spec.ts': theirs });
+
+    const result = await pushRepo(
+      new Map([['.github/workflows/release.spec.ts', 'QAAI would have overwritten this']]),
+      {
+        ...OPTS,
+        ownership: ledger(
+          { '.github/workflows/release.spec.ts': 'QAAI_OWNED' },
+          { '.github/workflows/release.spec.ts': sha256(theirs) },
+        ),
+      },
+    );
+
+    // Byte-identical in the pushed tree: their workflow survived.
+    expect(captured.after.get('.github/workflows/release.spec.ts')).toBe(theirs);
+    expect(result.filesRefused[0]?.reason).toBe('FORBIDDEN_DESTINATION');
+    expect(result.filesRefused[0]?.why).toContain('.github');
+    // NOT the ownership verdict's reason — which would have ALLOWED this write.
+    expect(result.filesRefused[0]?.verdict).toBe('QAAI_OWNED');
+    expect(result.filesWritten).toBe(0);
+    /*
+     * And no refresh obligation is recorded for a file that was not written: a
+     * `ledgerRefresh` row for refused bytes would tell the next push that the
+     * branch holds what QAAI never wrote.
+     */
+    expect(result.ledgerRefresh).toEqual([]);
+  });
+
+  /*
+   * AND UNDECIDED IS NOT A REFUSAL EITHER. `pushRepo` passes no measured
+   * layout, so `destinationDecision` answers UNDECIDED for every ordinary
+   * path — the deny list was checked and the layout question was not asked.
+   * Reading UNDECIDED as a refusal here would refuse every file in the product,
+   * which is the mirror of the bug being fixed and the likelier one to ship.
+   */
+  /*
+   * AND A MALFORMED PATH IS STILL AN ABORT, NOT A COUNT. The destination rule
+   * refuses `../../etc/passwd` too, and routing that refusal into the per-file
+   * list — which the first version of this change did — downgrades an abort to
+   * a line in a report and pushes the other files anyway. `safeJoin` owns that
+   * question and throws; this asserts the push produced NO COMMIT at all,
+   * which a `rejects.toThrow` on its own does not say.
+   */
+  it('aborts the whole push for a path that escapes the workspace, committing nothing', async () => {
+    reset({ 'src/app.ts': 'export const app = 1;' });
+
+    await expect(
+      pushRepo(
+        new Map([
+          ['e2e/fine.spec.ts', 'this one is perfectly ordinary'],
+          ['../../etc/passwd', 'root:x:0:0'],
+        ]),
+        { ...OPTS, ownership: ledger({}) },
+      ),
+    ).rejects.toThrow(/outside the repo workspace/);
+
+    expect(captured.pushes).toBe(0);
+    expect(captured.after.size).toBe(0);
+  });
+
+  it('writes an ordinary path, which the rule leaves UNDECIDED rather than allowed', async () => {
+    reset({}, false);
+
+    const result = await pushRepo(
+      new Map([
+        ['e2e/checkout.spec.ts', 'the real test'],
+        ['tests/my tests/pay.spec.ts', 'a space in the directory is not a refusal'],
+      ]),
+      { ...OPTS, ownership: ledger({}) },
+    );
+
+    expect([...captured.after.keys()].sort()).toEqual([
+      'e2e/checkout.spec.ts',
+      'tests/my tests/pay.spec.ts',
+    ]);
+    expect(result.refusedCount).toBe(0);
+    expect(result.filesWritten).toBe(2);
+  });
+});

@@ -61,6 +61,18 @@
  *  - nothing read here may decide a shell command, a git ref, a branch name or
  *    whether a gate passes. The learner returns data; it runs nothing.
  *
+ * ONE EXCEPTION TO "ONLY TEST FILES ARE READ", STATED BECAUSE IT IS AN
+ * EXCEPTION. {@link readRepositoryRunner} reads the bytes of the manifests
+ * `needsContent` names — `package.json`, `pom.xml`, `pyproject.toml`,
+ * `Gemfile` — because `detect.dependencies` and `detect.manifestKeys` live
+ * inside a manifest and nowhere else, and without them 38 of the catalogue's 53
+ * runners are unobservable. Those bytes decide exactly one thing: WHICH OF 53
+ * CLOSED IDS is named. They never reach a path, a command or a gate, and the
+ * evidence sentence detection composes from them is stripped of control
+ * characters, bounded to `MAX_STYLE_EXAMPLE_CHARS`, and rendered to a model
+ * only inside `styleProfileBriefing`'s fence. `formatterFor` still reads
+ * filenames ONLY — a `.prettierrc`'s contents are never opened.
+ *
  * ── Why the filesystem is injected and has no mtime ────────────────────────
  *
  * {@link TestFileSource} is two functions. It exposes no modification time ON
@@ -75,50 +87,35 @@ import {
   ECOSYSTEMS,
   countAssertions,
   blankStringsAndComments,
+  detectProject,
+  ecosystemById,
   findAssertions,
   findTestBlocks,
   hasAnyAssertion,
+  needsContent,
   resolveDialect,
   destinationDecision,
   DIALECT_IDS,
   type DialectId,
   type Ecosystem,
   type EcosystemId,
+  type EvidenceKind,
+  type RepoFile,
 } from '@qaai/shared';
 /*
- * ── IMPORTED BY RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, UNDER PROTEST ──
+ * ── ONE IMPORT, THROUGH THE FRONT DOOR, AND THE PROTEST IS SPENT ────────────
  *
- * `style-profile.ts` is the keystone of this round and it is NOT in
- * `packages/shared/src/index.ts`. The barrel's own comment records this exact
- * failure three times — a module that lands as public vocabulary, is reached by
- * `schemas.ts` through a relative path INSIDE the package, and is therefore read
- * by `check:wiring`'s `package-exports` ratchet as REACHED while the front door
- * is shut. It surfaces as TS2305 in the first sibling package that needs it,
- * which is this one.
+ * This block used to be a long note explaining why `style-profile.ts` and
+ * `artifact-set.ts` were reached by a RELATIVE PATH ACROSS THE WORKSPACE
+ * BOUNDARY, and it named the two-line fix. Both lines landed in
+ * `packages/shared/src/index.ts` — `export * from './artifact-set'` and
+ * `export * from './style-profile'`, published last in that barrel with their
+ * own comment — so every name below now comes in through `@qaai/shared` and the
+ * note described code that no longer existed.
  *
- * `packages/agent/src/boundaries.ts` carries the same block for the same reason
- * and sets the precedent this follows: take the relative path, say so, and put
- * the one-line fix in the handover verbatim. The alternative is worse — a second
- * copy of `confidenceFor` in this file would be a second implementation of the
- * only thing allowed to set a confidence, and two copies of that rule is how one
- * of them comes to report HIGH over one file.
- *
- * THE FIX IS TWO LINES IN A FILE THIS CHANGE DOES NOT OWN:
- *
- *     export * from './style-profile';
- *     export * from './artifact-set';
- *
- * added to `packages/shared/src/index.ts` after `./dialect` and `./ecosystems`
- * (both modules import from those two, and `artifact-set.ts` imports nothing
- * else). The moment they land, these two blocks collapse into the `@qaai/shared`
- * import above and nothing else in this file changes — every name below is
- * already imported under its own identifier.
- *
- * NOTE for whoever lands them: neither module uses a `node:` builtin, so the
- * barrel's standing test holds. `artifact-set.ts` exports `TestCorrection`,
- * which is ALSO the name of a Prisma model type — not a collision in this
- * barrel, but a consumer importing both `@qaai/shared` and the Prisma client
- * will have to alias one.
+ * It is replaced rather than left: a doc comment that contradicts the code
+ * under it is the sentence a reviewer trusts instead of reading the import, and
+ * the previous round shipped seven of them.
  */
 import {
   MAX_STYLE_EXAMPLE_CHARS,
@@ -195,6 +192,43 @@ export const MIN_EXEMPLAR_CHARS = 400;
 
 /** Test titles kept per file, for exemplar similarity. */
 const MAX_TITLES_PER_FILE = 20;
+
+/**
+ * Candidate paths handed to {@link detectProject} when reading the
+ * repository's DECLARED runner.
+ *
+ * A cap, so it is DISCLOSED as {@link RepositoryRunner.pathsOmitted}. It is far
+ * above {@link MAX_SCANNED_FILES} on purpose: this pass is looking for
+ * `pytest.ini`, `pom.xml` and `package.json`, which sort nowhere near the test
+ * files and would be cut off by the scan cap.
+ *
+ * {@link learnStyle} sorts the candidate list before handing it over, so two
+ * scans of one repository hand this pass the same prefix and the profile is
+ * reproducible. A caller invoking {@link readRepositoryRunner} directly owns
+ * that ordering itself.
+ */
+export const MAX_DETECTION_PATHS = 5_000;
+
+/**
+ * Manifests whose BYTES are read for the declared-runner pass.
+ *
+ * `needsContent` names the handful of paths detection cannot read from a
+ * filename — `package.json`, `pom.xml`, `Gemfile`, `pyproject.toml`. A
+ * monorepo has one per workspace, so the cap is generous and still bounded; it
+ * is reported as {@link RepositoryRunner.manifestsOmitted} when it bites.
+ */
+export const MAX_MANIFESTS_READ = 40;
+
+/**
+ * One manifest's ceiling.
+ *
+ * Over this the manifest is NOT READ AND NOT TRUNCATED, and the difference
+ * matters: a `package.json` cut in half is not JSON, so handing detection a
+ * truncated one would turn a large manifest into a PARSE FAILURE attributed to
+ * the customer's file rather than to our cap. It is counted as
+ * {@link RepositoryRunner.manifestsTooLarge} instead.
+ */
+export const MAX_MANIFEST_CHARS = 256_000;
 
 // ─── Why a file was not read ────────────────────────────────────────────────
 
@@ -342,6 +376,295 @@ export interface LearnStyleOptions {
   readonly ecosystemHint?: EcosystemId | null;
 }
 
+// ─── The runner the repository DECLARES ─────────────────────────────────────
+
+/**
+ * WHAT THE REPOSITORY ITSELF SAYS ITS RUNNER IS, measured from the candidate
+ * list rather than from any one test file.
+ *
+ * ── THE DEFECT THIS CLOSES, MEASURED ───────────────────────────────────────
+ *
+ * `runner` was read from `detect.imports` and NOTHING ELSE, and only 15 of the
+ * catalogue's 53 ecosystems declare an import signature at all. So a 12-file
+ * pytest repository where every file begins `import pytest` reported
+ * `runner: UNKNOWN, 0 of 12` — pytest declares no `imports`, so the one line
+ * that names the runner matched nothing — and the same was true of Jest, Mocha,
+ * RSpec, PHPUnit, `go test`, NUnit, Robot Framework and thirty others. An
+ * UNKNOWN runner makes the whole profile read as "we could not understand your
+ * repository", which is the conclusion this feature exists to prevent.
+ *
+ * The catalogue's OTHER evidence — `files`, `dependencies`, `manifestKeys`,
+ * `manifestContains` — answers it, and that evidence is already consumed by ONE
+ * implementation: `detectProject` in @qaai/shared. This calls it rather than
+ * growing a second vocabulary of import patterns beside it, for the reason
+ * `ASSERTION_KEY` and `specAssertions` record — two vocabularies for one
+ * question eventually disagree, and then the style profile and the import
+ * screen describe different runners for one repository. `DETECTABLE_RUNNERS`
+ * covers 35 of the 53, which with the 15 import signatures is 38 observable
+ * where 15 were before. The other 15 are unreachable because detection's rule
+ * table does not cover them, which is detection's to widen and not this file's.
+ *
+ * ── IT IS A REPOSITORY FACT, SO IT IS NOT A FILE COUNT ─────────────────────
+ *
+ * `pytest.ini` is evidence about the repository, not about the file being
+ * scanned, so this never becomes `filesSeen` on its own. It does two things,
+ * both in {@link detectRunner}: it breaks a tie between ecosystems one file's
+ * imports matched equally, and — for a file whose own bytes name no runner — it
+ * promotes, with the promotion counted apart as
+ * {@link LearnedStyle.runnerFromRepository} so that "12 of 12 files" cannot
+ * conceal "and none of the twelve said so itself".
+ */
+export interface RepositoryRunner {
+  /**
+   * The single runner this repository DECLARES, or null.
+   *
+   * Null for three different situations and {@link RepositoryRunner.why} says
+   * which: nothing was declared, more than one thing was declared, or the
+   * candidate list carried no configuration at all.
+   */
+  readonly runner: EcosystemId | null;
+  /**
+   * Every runner whose declaration was found, in detection's own rank order.
+   * More than one is AMBIGUITY and is not resolved here — a repository really
+   * can run Jest and Playwright, and picking one would be a guess.
+   */
+  readonly declared: readonly EcosystemId[];
+  /**
+   * Detection's own evidence sentence for {@link RepositoryRunner.runner}, or
+   * ''.
+   *
+   * UNTRUSTED: detection composes it from the catalogue AND from the
+   * repository — `"test": "jest" in package.json` quotes a script body, and
+   * `3 files match src/test/java/**` quotes paths. Control characters are
+   * stripped here because it is rendered; it reaches a model only inside
+   * `styleProfileBriefing`'s fence, as a `runner` example.
+   */
+  readonly evidence: string;
+  /** Why there is no single declared runner. '' when there is one. */
+  readonly why: string;
+  /**
+   * Paths `destinationDecision` refused, and therefore were NOT handed to
+   * detection.
+   *
+   * MEASURED, NOT PRECAUTIONARY. `detectProject` has an ignore list of its own
+   * and it is NARROWER than `FORBIDDEN_DIRECTORIES`: `node_modules`, `dist`,
+   * `build`, `coverage` and `vendor` are in both, but `.github`, `.circleci`,
+   * `.husky`, `.vscode`, `third_party`, `bower_components` and `Carthage` are
+   * in ours alone. So a `cypress.config.ts` and a `package.json` planted at
+   * `.github/vendor-suite/` made this pass report `declared: ['cypress']`, and
+   * every ordinary test file in the repository was then PROMOTED to cypress at
+   * HIGH confidence — a convention learned from a directory QAAI must never
+   * write into, which is the defect the admission filter below was fixed for,
+   * reopened on a new path. Reproduced before being closed.
+   *
+   * It is OUR check and not detection's deliberately: "the other module's
+   * ignore list would have caught it" is a guarantee about a different module.
+   */
+  readonly pathsRefused: number;
+  /** Paths handed to detection, after the refusals and {@link MAX_DETECTION_PATHS}. */
+  readonly pathsConsidered: number;
+  /** Paths the cap refused to hand over. A cap, counted. */
+  readonly pathsOmitted: number;
+  /** Manifests whose bytes were read. */
+  readonly manifestsRead: number;
+  /** Manifests the source could not read. A hole in our reading, not a fact about the repo. */
+  readonly manifestsUnreadable: number;
+  /** Manifests past {@link MAX_MANIFEST_CHARS}, refused rather than truncated. */
+  readonly manifestsTooLarge: number;
+  /** Manifests past {@link MAX_MANIFESTS_READ}. A cap, counted. */
+  readonly manifestsOmitted: number;
+}
+
+/** Nothing was asked, so nothing is claimed. Used when the pass is skipped. */
+export function unreadRepositoryRunner(why: string): RepositoryRunner {
+  return {
+    runner: null,
+    declared: [],
+    evidence: '',
+    why,
+    pathsRefused: 0,
+    pathsConsidered: 0,
+    pathsOmitted: 0,
+    manifestsRead: 0,
+    manifestsUnreadable: 0,
+    manifestsTooLarge: 0,
+    manifestsOmitted: 0,
+  };
+}
+
+/**
+ * The evidence kinds that mean THE REPOSITORY SAID SO, as opposed to "its
+ * directory layout is consistent with it".
+ *
+ * This filter is not fastidiousness; it was measured. `detectProject` over
+ * three bare files at `src/test/java/*Test.java` — with no `pom.xml`, no
+ * `build.gradle` and `import org.junit.Test;` in every one of them — nominates
+ * **junit5-gradle** at confidence 0.76, on `toolchain` ("src/test/java is the
+ * standard test source root") plus `file-convention` evidence alone. That is a
+ * confident guess at the wrong major version of the wrong build tool, and
+ * promoting a file onto it would state it to the generator as a MEASURED rule.
+ *
+ * `config-file`, `manifest-config`, `script` and `dependency` all require a
+ * file the repository wrote that names the runner. `toolchain` and
+ * `file-convention` are inferences from a directory name, and a directory name
+ * is the one thing a test file's own path already told us.
+ */
+export const DECLARED_RUNNER_EVIDENCE: ReadonlySet<EvidenceKind> = new Set<EvidenceKind>([
+  'config-file',
+  'manifest-config',
+  'script',
+  'dependency',
+]);
+
+/**
+ * Read the repository's declared runner off the candidate list.
+ *
+ * No model, no network, no directory walking: the paths are the ones the caller
+ * offered, and the only bytes read are the manifests `needsContent` names —
+ * which is the one place this module reads a file that is not a test file, and
+ * the reason is that `dependencies` and `manifestKeys` live inside a manifest
+ * and nowhere else. The output is a member of a CLOSED 53-id vocabulary, so
+ * nothing a manifest contains can decide anything except which of those 53 is
+ * named.
+ *
+ * Exported so the pass can be exercised on its own; {@link learnStyle} calls it
+ * once per scan and puts the answer on {@link LearnedStyle.repositoryRunner}.
+ */
+export async function readRepositoryRunner(
+  source: TestFileSource,
+  candidates: readonly string[],
+): Promise<RepositoryRunner> {
+  /*
+   * THE DENY LIST FIRST, BEFORE ANY CAP AND BEFORE DETECTION SEES A PATH. See
+   * {@link RepositoryRunner.pathsRefused} for the measured consequence of not
+   * doing this — a planted config under `.github/` becoming "this repository's
+   * declared runner".
+   */
+  const admissible = candidates.filter(
+    (path) => destinationDecision({ path }).verdict !== 'REFUSED',
+  );
+  const pathsRefused = candidates.length - admissible.length;
+  const considered = admissible.slice(0, MAX_DETECTION_PATHS);
+  const pathsOmitted = admissible.length - considered.length;
+
+  const files: RepoFile[] = [];
+  let manifestsRead = 0;
+  let manifestsUnreadable = 0;
+  let manifestsTooLarge = 0;
+  let manifestsOmitted = 0;
+
+  for (const path of considered) {
+    if (!needsContent(path)) {
+      files.push({ path });
+      continue;
+    }
+    if (manifestsRead >= MAX_MANIFESTS_READ) {
+      manifestsOmitted += 1;
+      // The PATH is still offered. Detection weighs a config file's presence
+      // separately from its contents, so a manifest we did not open is still
+      // worth naming — and dropping it would shrink the denominator silently.
+      files.push({ path });
+      continue;
+    }
+    const text = await source.read(path);
+    if (text === null) {
+      manifestsUnreadable += 1;
+      files.push({ path });
+      continue;
+    }
+    if (text.length > MAX_MANIFEST_CHARS) {
+      manifestsTooLarge += 1;
+      files.push({ path });
+      continue;
+    }
+    manifestsRead += 1;
+    files.push({ path, content: text });
+  }
+
+  const detection = detectProject(files);
+  const declaredCandidates = detection.candidates.filter((candidate) =>
+    candidate.evidence.some((entry) => DECLARED_RUNNER_EVIDENCE.has(entry.kind)),
+  );
+  const declared = declaredCandidates.map((candidate) => candidate.runner);
+
+  const counted = {
+    pathsRefused,
+    pathsConsidered: considered.length,
+    pathsOmitted,
+    manifestsRead,
+    manifestsUnreadable,
+    manifestsTooLarge,
+    manifestsOmitted,
+  };
+
+  const winner = declaredCandidates[0];
+  if (declaredCandidates.length !== 1 || winner === undefined) {
+    return {
+      runner: null,
+      declared,
+      evidence: '',
+      why:
+        declared.length === 0
+          ? 'no file in this repository names a test runner: there is no runner configuration, ' +
+            'no package script and no dependency entry for one among the paths offered.'
+          : `${declared.length} runners are declared here (${declared.join(', ')}), so which one ` +
+            'owns a given test file is not something the repository states.',
+      ...counted,
+    };
+  }
+
+  const strongest = winner.evidence.find((entry) => DECLARED_RUNNER_EVIDENCE.has(entry.kind));
+  return {
+    runner: winner.runner,
+    declared,
+    evidence: stripControlCharacters(
+      strongest
+        ? `${strongest.detail}${strongest.path ? ` (${strongest.path})` : ''}`
+        : winner.label,
+    ).slice(0, MAX_STYLE_EXAMPLE_CHARS),
+    why: '',
+    ...counted,
+  };
+}
+
+/**
+ * Could a file at this path be one this runner collects?
+ *
+ * Asked only on the promotion branch of {@link detectRunner}, and it is the
+ * guard that keeps a declared runner from being written onto a file in another
+ * language. A repository with a `pom.xml` declaring JUnit AND a
+ * `tests/e2e/checkout.spec.ts` with no Playwright import declares exactly one
+ * runner, so without this a TypeScript spec would be reported as junit4-maven
+ * at HIGH confidence across every such file.
+ *
+ * It is answered through `resolveDialect` rather than through a new
+ * extension-to-language table. `dialect.ts` already owns that mapping three
+ * ways over — by filename, by extension and by ecosystem id — and a second copy
+ * here is how `IMPORT_FORMS` came to report every Python repository as
+ * `ESM_DEFAULT`.
+ *
+ * CONSERVATIVE BY CONSTRUCTION, and it misses two cases on purpose rather than
+ * by accident: a `.robot` suite resolves to the ROBOT dialect while
+ * robot-framework's languages resolve to Python, and a `.feature` file
+ * resolves to GHERKIN while `behave`'s resolve to Python. Both therefore stay
+ * UNKNOWN rather than being promoted, which is the right direction — a missed
+ * convention costs the ecosystem default, a wrong one costs every generated
+ * test in the repository.
+ */
+export function runnerCouldOwn(path: string, runner: EcosystemId): boolean {
+  const fileDialect = resolveDialect({ filePath: path });
+  if (fileDialect === null) return false;
+  const entry = ecosystemById(runner);
+  if (!entry) return false;
+  const possible = new Set(
+    [
+      resolveDialect({ ecosystemId: runner }),
+      ...entry.languages.map((language) => resolveDialect({ language })),
+    ].filter((id): id is DialectId => id !== null),
+  );
+  return possible.has(fileDialect);
+}
+
 // ─── What one file said ─────────────────────────────────────────────────────
 
 /** The profile fields whose value is a plain string, so one tally fits them all. */
@@ -370,6 +693,19 @@ interface FileFacts {
    * count that measures something else.
    */
   readonly runnersMatched: number;
+  /**
+   * True when this file's runner vote came from the REPOSITORY'S declared
+   * runner rather than from the file's own bytes.
+   *
+   * Carried rather than derived, because the two are indistinguishable once the
+   * vote is tallied and they are different claims: "this file imports
+   * `@playwright/test`" and "this repository has a `playwright.config.ts` and
+   * this file contradicts nothing" are both evidence and only one of them is
+   * the file's. {@link LearnedStyle.runnerFromRepository} is the count a reader
+   * needs so that `runner: 12 of 12 files` cannot conceal "and not one of the
+   * twelve named it".
+   */
+  readonly runnerPromoted: boolean;
   /** Mean non-blank lines per test block, when the dialect could be read. */
   readonly linesPerTest: number | null;
   /** Declared test titles, for exemplar similarity. UNTRUSTED. */
@@ -462,6 +798,22 @@ export interface LearnedStyle {
    * them is a measurement nobody made.
    */
   readonly runnerAmbiguous: number;
+  /**
+   * What the repository's own configuration says its runner is. See
+   * {@link RepositoryRunner}; every cap and hole in that pass is counted on it.
+   */
+  readonly repositoryRunner: RepositoryRunner;
+  /**
+   * Runner votes that came from {@link RepositoryRunner.runner} rather than
+   * from the voting file's own bytes.
+   *
+   * REPORTED, NEVER SUBTRACTED. `runner: jest, 12 of 12 files` where all twelve
+   * were promoted is a true statement with a missing clause, and this is the
+   * clause: not one of the twelve named Jest itself — `jest.config.js` did.
+   * Equal to `filesRead` means the file bodies contributed nothing to this
+   * field; 0 means every vote was the file's own.
+   */
+  readonly runnerFromRepository: number;
   /** Helper declarations refused because the name is not a plain identifier. */
   readonly helpersRefused: number;
   /** Helpers {@link MAX_HELPERS} refused to keep. A cap, counted. */
@@ -555,6 +907,15 @@ export async function learnStyle(
    */
   const formatter = formatterFor(candidates);
 
+  /*
+   * THE DECLARED RUNNER, read off the same CANDIDATE list and for the same
+   * reason the formatter is: `pytest.ini`, `pom.xml` and `package.json` are not
+   * test files, so none of them survives `looksLikeTestPath` and a version of
+   * this that looked at `facts` could find none of them. Before the admission
+   * loop's results are used, because every file's runner vote may depend on it.
+   */
+  const repositoryRunner = await readRepositoryRunner(source, candidates);
+
   const facts: FileFacts[] = [];
   for (const path of admitted) {
     const text = await source.read(path);
@@ -570,7 +931,7 @@ export async function learnStyle(
       skip(path, 'TOO_LARGE');
       continue;
     }
-    facts.push(readFile(path, text, options.ecosystemHint ?? null));
+    facts.push(readFile(path, text, options.ecosystemHint ?? null, repositoryRunner));
   }
 
   const filesRead = facts.length;
@@ -656,6 +1017,18 @@ export async function learnStyle(
     runnerAmbiguous: facts.filter(
       (file) => file.runnersMatched > 1 && file.votes.runner === undefined,
     ).length,
+    repositoryRunner,
+    /*
+     * Counted off the votes that SURVIVED, not off every promotion attempted:
+     * a promoted vote for a value that lost the tally is not part of the
+     * reported field, and including it would overstate how much of the
+     * reported answer came from the configuration.
+     */
+    runnerFromRepository: facts.filter(
+      (file) =>
+        file.runnerPromoted && file.votes.runner?.value === profile.runner.value &&
+        profile.runner.value !== null,
+    ).length,
     helpersRefused: refused,
     helpersOmitted: omitted,
     files: facts.map((file) => ({
@@ -686,15 +1059,29 @@ function thresholdWhy(filesSeen: number, filesConsidered: number): string {
   );
 }
 
-/** A path on its way into a report. Truncated and stripped, because it is rendered. */
-function sanitisePathForReport(path: string): string {
-  return [...path]
+/**
+ * Every character below U+0020, and DEL, replaced.
+ *
+ * Applied to anything customer-authored that this module puts in a REPORT: a
+ * skipped path, and detection's evidence sentence, which quotes both paths and
+ * a package script's body. A newline or a carriage return breaks a
+ * line-oriented rendering out of whatever framing it was inside; `observed()`
+ * collapses whitespace on its way into `examples` but `\0` is not whitespace to
+ * `\s`, and a NUL truncates a string inside anything that later hands it to a
+ * syscall.
+ */
+function stripControlCharacters(value: string): string {
+  return [...value]
     .map((character) => {
       const code = character.charCodeAt(0);
       return code < 0x20 || code === 0x7f ? '?' : character;
     })
-    .join('')
-    .slice(0, MAX_ARTIFACT_PATH_CHARS);
+    .join('');
+}
+
+/** A path on its way into a report. Truncated and stripped, because it is rendered. */
+function sanitisePathForReport(path: string): string {
+  return stripControlCharacters(path).slice(0, MAX_ARTIFACT_PATH_CHARS);
 }
 
 function isUnderScope(path: string, scopeRoot: string): boolean {
@@ -708,6 +1095,7 @@ function readFile(
   path: string,
   text: string,
   hint: EcosystemId | null,
+  repository: RepositoryRunner,
 ): FileFacts {
   const dialect = resolveFileDialect(path, text, hint);
   /*
@@ -728,7 +1116,7 @@ function readFile(
     votes[field] = { value, evidence: evidence.slice(0, MAX_STYLE_EXAMPLE_CHARS) };
   };
 
-  const runner = detectRunner(code, hint);
+  const runner = detectRunner(path, code, hint, repository);
   vote('runner', runner.id, runner.evidence);
   // The evidence for a dialect is an ASSERTION in that dialect, not the first
   // line of the file: a quote that does not demonstrate the claim is a quote
@@ -806,6 +1194,7 @@ function readFile(
     votes,
     locatorOccurrences: locators,
     runnersMatched: runner.matched,
+    runnerPromoted: runner.promoted,
     linesPerTest: blocks.length > 0 ? Math.round(nonBlank / blocks.length) : null,
     titles: blocks
       .flatMap((block) => (block.name ? [block.name.slice(0, 200)] : []))
@@ -897,22 +1286,47 @@ function hasTestBlock(code: string, dialect: DialectId | null): boolean {
 }
 
 /**
- * Which runner's import signature this file carries.
+ * Which runner this file is written for.
  *
- * Driven off `ECOSYSTEMS[].detect.imports` rather than a second copy of the
- * same strings, for the reason `ASSERTION_KEY` and `specAssertions` record: two
- * vocabularies for one question eventually disagree, and then the style profile
- * and the toolchain describe different runners for one repository.
+ * Driven off `ECOSYSTEMS[].detect.imports` and `detectProject`, never off a
+ * second copy of either, for the reason `ASSERTION_KEY` and `specAssertions`
+ * record: two vocabularies for one question eventually disagree, and then the
+ * style profile and the toolchain describe different runners for one
+ * repository.
  *
- * A file matching several ids is AMBIGUOUS, not assigned. `import
- * org.junit.Test;` is junit4-maven and junit4-gradle and nothing in a test file
- * distinguishes them; the hint breaks that tie if the caller has one and
- * otherwise the file is evidence for nothing and is counted as such.
+ * ── THREE OUTCOMES, IN THIS ORDER, AND THE ORDER IS THE EVIDENCE RANKING ───
+ *
+ * ONE MATCH. The file's own bytes carry exactly one runner's import signature.
+ * The strongest answer there is and the only one that existed before.
+ *
+ * SEVERAL MATCHES — AMBIGUOUS, NOT ASSIGNED. `import org.junit.Test;` is
+ * junit4-maven AND junit4-gradle and nothing inside a test file distinguishes
+ * them. Two things may break that tie and neither may create a match:
+ * {@link LearnStyleOptions.ecosystemHint}, which is the caller's
+ * already-detected runner, and then {@link RepositoryRunner.runner}, which is
+ * this repository's own declaration. The hint is tried first because a caller
+ * that has detected a runner has usually done so against the whole repository
+ * including things this module never sees.
+ *
+ * NO MATCH — THE PROMOTION. 38 of the catalogue's 53 ecosystems declare no
+ * import signature at all, so for most repositories the "several matches"
+ * branch is unreachable and this one is the whole feature. A file whose bytes
+ * name no runner votes for the repository's DECLARED runner when
+ * {@link runnerCouldOwn} says a file at that path could be one it collects.
+ * The vote is marked `promoted` and counted separately for ever after.
+ *
+ * WHAT CANNOT HAPPEN, AND A TEST PINS IT: the HINT cannot promote. A caller
+ * saying "this is a Playwright project" over three files that import nothing is
+ * a claim, and this module reports measurements; the repository's own
+ * `playwright.config.ts` is a measurement, which is the whole difference and
+ * the reason only one of the two reaches this branch.
  */
 function detectRunner(
+  path: string,
   code: string,
   hint: EcosystemId | null,
-): { id: EcosystemId | null; evidence: string; matched: number } {
+  repository: RepositoryRunner,
+): { id: EcosystemId | null; evidence: string; matched: number; promoted: boolean } {
   const matched: { id: EcosystemId; signature: string }[] = [];
   /*
    * Widened to the interface deliberately: `ECOSYSTEMS` is a const tuple, so
@@ -932,21 +1346,44 @@ function detectRunner(
     }
   }
   if (matched.length === 1 && matched[0]) {
-    return { id: matched[0].id, evidence: matched[0].signature, matched: 1 };
+    return { id: matched[0].id, evidence: matched[0].signature, matched: 1, promoted: false };
   }
-  if (matched.length > 1 && hint) {
-    const resolved = matched.find((candidate) => candidate.id === hint);
-    if (resolved) {
-      return {
-        id: resolved.id,
-        evidence:
-          `${resolved.signature} (${matched.length} runners share it; ` +
-          'the already-detected runner broke the tie)',
-        matched: matched.length,
-      };
+  if (matched.length > 1) {
+    for (const [tie, how] of [
+      [hint, 'the already-detected runner broke the tie'],
+      [repository.runner, "this repository's own runner configuration broke the tie"],
+    ] as const) {
+      if (tie === null || tie === undefined) continue;
+      const resolved = matched.find((candidate) => candidate.id === tie);
+      if (resolved) {
+        return {
+          id: resolved.id,
+          evidence: `${resolved.signature} (${matched.length} runners share it; ${how})`,
+          matched: matched.length,
+          promoted: false,
+        };
+      }
     }
+    return { id: null, evidence: '', matched: matched.length, promoted: false };
   }
-  return { id: null, evidence: '', matched: matched.length };
+
+  /*
+   * THE PROMOTION. `matched.length === 0` here, so there is no vote to override
+   * and nothing to contradict — a file whose bytes DO name a runner never
+   * reaches this line, which is what stops a declared runner from overruling a
+   * file that disagrees with it.
+   */
+  if (repository.runner !== null && runnerCouldOwn(path, repository.runner)) {
+    return {
+      id: repository.runner,
+      evidence:
+        `${repository.evidence} — this repository declares one runner and this file carries no ` +
+        'runner import of its own',
+      matched: 0,
+      promoted: true,
+    };
+  }
+  return { id: null, evidence: '', matched: matched.length, promoted: false };
 }
 
 // ─── Field detectors, as data ───────────────────────────────────────────────

@@ -734,7 +734,29 @@ function uniqueNamer(): (candidate: string) => string {
   };
 }
 
-/** How a field's value gets in, from what the page declared. */
+/**
+ * How a field's value gets in, from what the page declared.
+ *
+ * ── `field.inputType` IS DEREFERENCED, AND THE GUARD IS AT THE BOUNDARY ────
+ *
+ * `FormField.inputType` is declared required and non-nullable, so this line is
+ * type-safe and a `?.` here would be a guard against a shape the type forbids.
+ * The reachable defect was never in this function: `FlowMap.graph` is a Json
+ * column, the generate processor used to turn it into a `FlowMap` by double
+ * cast, and a stored crawl written before the field existed therefore arrived
+ * here as `undefined.toLowerCase()` — an untraceable `TypeError` that took the
+ * whole generate item down. That was LATENT while generation produced one file
+ * and became reachable the moment the plan was wired in.
+ *
+ * It is closed by `readFlowGraph` in apps/worker/src/processors/generate.ts,
+ * which PARSES the column: a field with no `inputType` is refused there with
+ * the zod PATH reported and never the value, and the plan is then not computed
+ * at all — so nothing in this file is ever handed a field the schema refused.
+ * A SECOND guard here would be a second opinion about one question, and the
+ * cheaper kind of wrong: it would turn a refused crawl into a page object
+ * silently missing its accessors. If another caller of
+ * {@link synthesisePageObject} ever appears, IT owes the parse.
+ */
 function howToFill(field: FormField): PageObjectField['how'] | null {
   const type = field.inputType.toLowerCase();
   if (type === 'select' || (field.options && field.options.length > 0)) return 'SELECT';

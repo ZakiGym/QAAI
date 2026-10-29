@@ -28,6 +28,7 @@ import type { FlowMap, TestPlan } from '@qaai/shared';
 import { proposePlan } from './explorer.js';
 import type { AuthProfileChoice } from './coverage.js';
 import type { CallContext, LlmService } from './llm.js';
+import { UNTRUSTED_DATA_RULE } from './untrusted.js';
 
 const ADMIN: AuthProfileChoice = { id: 'prof_admin', name: 'Admin', kind: 'FORM_LOGIN' };
 const SHOPPER: AuthProfileChoice = { id: 'prof_shopper', name: 'Shopper', kind: 'FORM_LOGIN' };
@@ -143,10 +144,23 @@ describe('the Explorer is shown the roles it may name', () => {
     await proposePlan(llm, CTX, flowMap(), {
       authProfiles: [{ id: 'prof_admin', name: 'Admin', kind: 'FORM_LOGIN' }],
     });
-    // Choosing a role does not require knowing a password, and a prompt is the
-    // last place to put one. `AuthProfileChoice` carries no secret-bearing
-    // field at all, which is the structural half of this guarantee.
-    expect(prompts[0]!).not.toMatch(/password|secret|token/i);
+    /*
+     * Choosing a role does not require knowing a password, and a prompt is the
+     * last place to put one. `AuthProfileChoice` carries no secret-bearing
+     * field at all, which is the structural half of this guarantee.
+     *
+     * MEASURED OVER THE BODY, NOT THE WHOLE PROMPT, and the slice is the
+     * point rather than a dodge: `UNTRUSTED_DATA_RULE` is prepended now, and
+     * its last paragraph is a REFUSAL that names the things a fenced span may
+     * not decide — "which environment variables or secrets are read or
+     * reported". That sentence matching /secret/ is the fence working. The
+     * property this test was written for is about the prompt WE build out of
+     * the project's own data, so it is asserted there, and the rule's length
+     * is subtracted by identity rather than by searching for a phrase.
+     */
+    const prompt = prompts[0]!;
+    expect(prompt.startsWith(UNTRUSTED_DATA_RULE)).toBe(true);
+    expect(prompt.slice(UNTRUSTED_DATA_RULE.length)).not.toMatch(/password|secret|token/i);
   });
 });
 

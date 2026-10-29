@@ -29,9 +29,16 @@ import type {
   ArtifactSet,
   GeneratedArtifact,
 } from '@qaai/shared';
-import { unknownObservation } from '@qaai/shared';
+/*
+ * `PROBLEM_NEEDS_LEDGER` FROM THE PACKAGE THAT OWNS IT. It used to be imported
+ * from `./admission.js`, which held a second copy of the record beside the one
+ * `artifactSetSchema` parses with — so this parity assertion proved the
+ * vocabulary covered itself in the copy that does NOT gate a parse. One owner,
+ * one import, and this test now stands over the record that refuses a set.
+ */
+import { PROBLEM_NEEDS_LEDGER, unknownObservation } from '@qaai/shared';
 import type { FileLayout, StyleConfidence, StyleObservation } from '@qaai/shared';
-import { FINAL_ATTEMPT, GATES_NOT_ABOUT_ROLE, PROBLEM_NEEDS_LEDGER, admit, admitSet } from './admission.js';
+import { FINAL_ATTEMPT, GATES_NOT_ABOUT_ROLE, admit, admitSet } from './admission.js';
 import type { AdmissionInput, GateId, GateOutcome } from './admission.js';
 
 const ITEM = {

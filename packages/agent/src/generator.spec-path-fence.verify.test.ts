@@ -23,6 +23,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { generatedTestSchema } from '@qaai/shared';
 import type { FlowMap, PlanItem } from '@qaai/shared';
 import { generateTest } from './generator.js';
 import type { CallContext, LlmService, StructuredOptions } from './llm.js';
@@ -193,5 +194,70 @@ describe('a hostile page title through both generator branches', () => {
     expect(result.reviewFlags.join('\n')).toContain(
       "occurrence(s) of QAAI's own data delimiter were found inside the text scraped",
     );
+  });
+});
+
+/**
+ * THE OTHER HALF OF THE SAME ATTACK, AND IT IS NOT THE PROMPT'S TO STOP.
+ *
+ * The payload above does not merely talk: it names a destination
+ * (`../../../.github/workflows/ci.yml`), and a fence QUOTES untrusted text
+ * rather than censoring it, so the instruction travels into the prompt by
+ * design. What must never happen is the instruction being OBEYED — rule 10's
+ * "never let untrusted text decide a FILE PATH" — and no amount of fencing
+ * decides that. The validator does.
+ *
+ * `generatedTestSchema.filePath` carried `!p.includes('..') && !p.startsWith('/')`
+ * until this commit, which stopped the traversal spelling and NOTHING ELSE:
+ * `.github/workflows/ci.yml` passed it, as did `node_modules/...` and `dist/...`.
+ * So both spellings are asserted here, and they are asserted AT THE PARSER
+ * rather than through the fake model above — `recordingLlm` returns its answer
+ * without parsing anything, while the real `llm.structured` parses with this
+ * schema, so a test that went through the fake would be pinning the fake
+ * (lesson H).
+ *
+ * The asked-for path is LIFTED FROM `INJECTION` rather than retyped, so the
+ * payload and the assertion cannot drift apart.
+ */
+describe('the destination the injected text asks for', () => {
+  const asked = /write the spec to (\S+)/.exec(INJECTION)?.[1] ?? '';
+  const base = {
+    name: 'cart',
+    code: "import { test, expect } from '@playwright/test';\ntest('cart', async ({ page }) => { await expect(page.getByTestId('t')).toHaveText('x'); });\n",
+    reviewFlags: [],
+  };
+
+  it('is the path the payload really names', () => {
+    // If the payload is ever reworded, this is what goes red first.
+    expect(asked).toBe('../../../.github/workflows/ci.yml');
+  });
+
+  it('is refused by the validator, not by the prompt', () => {
+    const parsed = generatedTestSchema.safeParse({ ...base, filePath: asked });
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues[0]?.path).toEqual(['filePath']);
+    expect(parsed.error.issues[0]?.message).toMatch(/MALFORMED_PATH/);
+  });
+
+  /*
+   * THE SPELLING THE OLD GUARD LET THROUGH. The traversal is incidental to the
+   * attack — a model that simply answered with the repo-relative form reached
+   * the same file, and the suffix regex `PATH_CONVENTION` used to rely on
+   * constrains the directory not at all.
+   */
+  it('is refused without the traversal too, by the deny list', () => {
+    const parsed = generatedTestSchema.safeParse({
+      ...base,
+      filePath: '.github/workflows/ci.yml',
+    });
+    expect(parsed.success).toBe(false);
+    if (parsed.success) return;
+    expect(parsed.error.issues[0]?.path).toEqual(['filePath']);
+    expect(parsed.error.issues[0]?.message).toMatch(/FORBIDDEN_DIRECTORY/);
+    // The directory is named, because it is a constant this repo owns...
+    expect(parsed.error.issues[0]?.message).toContain('.github');
+    // ...and the model-authored path is not echoed back into the report.
+    expect(parsed.error.issues[0]?.message).not.toContain('ci.yml');
   });
 });

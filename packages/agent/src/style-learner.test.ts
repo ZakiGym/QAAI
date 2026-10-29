@@ -35,18 +35,24 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  DECLARED_RUNNER_EVIDENCE,
   LOCATOR_FORMS_BY_STRATEGY,
   LOCATOR_ORDER,
+  MAX_DETECTION_PATHS,
   MAX_EXEMPLAR_CHARS,
   MAX_EXEMPLAR_TOTAL_CHARS,
   MAX_EXEMPLARS,
   MAX_FILE_CHARS,
   MAX_HELPERS,
+  MAX_MANIFEST_CHARS,
+  MAX_MANIFESTS_READ,
   MAX_SCANNED_FILES,
   MAX_SKIPPED_REPORTED,
   MIN_EXEMPLAR_CHARS,
   SKIP_REASONS,
   importAliasOf,
+  readRepositoryRunner,
+  runnerCouldOwn,
   SKIP_REASON_WHY,
   exemplarBriefing,
   learnStyle,
@@ -55,16 +61,22 @@ import {
   namingConventionOf,
   safeRepoPath,
   selectExemplars,
+  unreadRepositoryRunner,
   type LearnedStyle,
   type TestFileSource,
 } from './style-learner.js';
 import { styleProfileSchema } from '@qaai/shared';
 import {
+  CONFIDENCE_IS_USABLE,
+  DETECTABLE_RUNNERS,
+  ECOSYSTEMS,
   LOCATOR_STRATEGIES,
   MAX_STYLE_EXAMPLE_CHARS,
   MIN_EVIDENCE_FILES,
+  detectProject,
   styleProfileBriefing,
   styleProfileProblems,
+  type Ecosystem,
 } from '@qaai/shared';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -102,6 +114,38 @@ function playwrightRepo(count: number, prefix = 'tests/e2e'): Record<string, str
   const files: Record<string, string> = {};
   for (let index = 0; index < count; index += 1) {
     files[`${prefix}/feature-${index}.spec.ts`] = playwrightSpec(`feature ${index}`);
+  }
+  return files;
+}
+
+/**
+ * A pytest test in the shape a real pytest repository uses: `import pytest` at
+ * the top and nothing else that names a runner.
+ *
+ * The point of the fixture is that `import pytest` is NOT in the catalogue's
+ * `detect.imports` for pytest — pytest declares none — so this file is the
+ * exact one the old `detectRunner` could read nothing from.
+ */
+function pytestSpec(name: string): string {
+  return [
+    'import pytest',
+    '',
+    '@pytest.fixture',
+    'def member(client):',
+    '    return client.login("member")',
+    '',
+    `def test_${name}(member):`,
+    `    response = member.get("/${name}")`,
+    '    assert response.status_code == 200',
+    '',
+  ].join('\n');
+}
+
+/** A pytest repository: `count` test files plus the conftest.py that declares the runner. */
+function pytestRepo(count: number): Record<string, string> {
+  const files: Record<string, string> = { 'conftest.py': 'import pytest\n' };
+  for (let index = 0; index < count; index += 1) {
+    files[`tests/test_feature_${index}.py`] = pytestSpec(`feature_${index}`);
   }
   return files;
 }
@@ -1094,5 +1138,593 @@ describe('a directory QAAI never writes into is not a convention it may learn', 
     expect(learned.profile.filesRead).toBe(4);
     expect(learned.filesSkipped).toEqual([]);
     expect(learned.profile.fileLayout.value?.root).toBe('e2e');
+  });
+});
+
+/**
+ * THE RUNNER WAS UNOBSERVABLE FOR MOST OF THE CATALOGUE.
+ *
+ * `detectRunner` read `ECOSYSTEMS[].detect.imports` and nothing else, and only
+ * 15 of the 53 catalogue entries declare an import signature. A twelve-file
+ * pytest repository whose every file begins `import pytest` therefore reported
+ * `runner: UNKNOWN, 0 of 12` — and so did every Jest, Mocha, RSpec, PHPUnit,
+ * `go test`, NUnit and Robot Framework repository there is.
+ *
+ * These run the REAL `learnStyle` over the REAL catalogue and the REAL
+ * `detectProject`, so unwiring the declared-runner pass turns them red rather
+ * than changing a mock's expectations.
+ */
+describe('the runner the repository declares, where an import signature was the only evidence', () => {
+  /*
+   * THE NUMBERS IN THE DOC COMMENT ON `RepositoryRunner`, PINNED.
+   *
+   * It claims "38 observable where 15 were before" and "35 of the 53". A
+   * comment that states a measured number and is not checked is a comment a
+   * reviewer trusts instead of counting, which is this round's rule 12. If the
+   * catalogue or detection's rule table grows, THIS TEST IS SUPPOSED TO FAIL —
+   * the correct fix is to re-measure and update the comment, not to loosen the
+   * assertion.
+   */
+  it('observes a runner for 38 of the 53 ecosystems, where 15 was the whole reach before', () => {
+    const catalogue: readonly Ecosystem[] = ECOSYSTEMS;
+    expect(catalogue).toHaveLength(53);
+
+    const byImportSignature = catalogue.filter(
+      (entry) => (entry.detect.imports ?? []).length > 0,
+    );
+    expect(byImportSignature).toHaveLength(15);
+    expect(DETECTABLE_RUNNERS).toHaveLength(35);
+
+    const observable = new Set<string>([
+      ...byImportSignature.map((entry) => entry.id),
+      ...DETECTABLE_RUNNERS,
+    ]);
+    expect(observable.size).toBe(38);
+  });
+
+  it('reads pytest from conftest.py for a repository whose files import pytest and say so to nobody', async () => {
+    const learned = await learnStyle(source(pytestRepo(12)));
+
+    expect(learned.profile.runner.value).toBe('pytest');
+    expect(learned.profile.runner.confidence).toBe('HIGH');
+    // Thirteen: the twelve tests and the conftest.py, which is a test path too.
+    expect(learned.profile.runner.filesSeen).toBe(13);
+    expect(learned.profile.runner.filesConsidered).toBe(13);
+    expectStorable(learned);
+
+    // AND THE MISSING CLAUSE, REPORTED. Not one of the thirteen named pytest
+    // itself — pytest declares no import signature — so every vote came from
+    // the configuration and the count says so.
+    expect(learned.runnerFromRepository).toBe(13);
+    expect(learned.repositoryRunner.runner).toBe('pytest');
+    expect(learned.repositoryRunner.evidence).toContain('conftest.py');
+    expect(learned.repositoryRunner.why).toBe('');
+  });
+
+  it('says in the quoted evidence that the repository declared it and the file did not', async () => {
+    const learned = await learnStyle(source(pytestRepo(6)));
+    const [example] = learned.profile.runner.examples;
+
+    expect(example).toContain('conftest.py');
+    expect(example).toContain('carries no runner import of its own');
+    // The quote reaches a model only inside `styleProfileBriefing`'s fence, and
+    // the briefing states the field with its fraction.
+    expect(styleProfileBriefing(learned.profile)).toContain('runner: pytest');
+  });
+
+  it('reads a dependency and a script out of a manifest, which is the only place they live', async () => {
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({
+        devDependencies: { jest: '^29.0.0' },
+        scripts: { test: 'jest' },
+      }),
+    };
+    for (let index = 0; index < 4; index += 1) {
+      files[`tests/unit-${index}.test.ts`] =
+        `describe('u${index}', () => { it('works', () => { expect(1).toBe(1); }); });\n`;
+    }
+
+    const learned = await learnStyle(source(files));
+    expect(learned.profile.runner.value).toBe('jest');
+    expect(learned.repositoryRunner.manifestsRead).toBe(1);
+    expect(learned.runnerFromRepository).toBe(4);
+    expectStorable(learned);
+  });
+
+  /*
+   * THE MANIFEST'S BYTES ARE THE EVIDENCE, AND THIS IS THE MUTATION THAT PROVES
+   * IT. Same repository, same paths, `package.json` unreadable: `jest` is
+   * declared nowhere a filename can see, so the runner goes back to UNKNOWN and
+   * the hole in our reading is counted rather than reported as a fact about the
+   * repository.
+   */
+  it('reports an unreadable manifest as our hole and refuses to guess past it', async () => {
+    const files: Record<string, string | null> = { 'package.json': null };
+    for (let index = 0; index < 4; index += 1) {
+      files[`tests/unit-${index}.test.ts`] = "it('works', () => {});\n";
+    }
+
+    const learned = await learnStyle(source(files));
+    expect(learned.profile.runner.value).toBeNull();
+    expect(learned.profile.runner.confidence).toBe('UNKNOWN');
+    expect(learned.repositoryRunner.manifestsRead).toBe(0);
+    expect(learned.repositoryRunner.manifestsUnreadable).toBe(1);
+    expect(learned.repositoryRunner.why).toContain('no file in this repository names a test runner');
+  });
+
+  /*
+   * THE MEASURED FALSE POSITIVE THE EVIDENCE FILTER EXISTS FOR.
+   *
+   * `detectProject` over three bare `src/test/java/*Test.java` files with no
+   * `pom.xml` and no `build.gradle` nominates a runner at 0.76 confidence on
+   * `toolchain` plus `file-convention` evidence — a guess at the wrong major
+   * version of the wrong build tool, from a directory NAME. Promoting onto that
+   * would state it to the generator as a measured rule.
+   *
+   * The first two assertions prove the guess is really there, so this test
+   * fails if `DECLARED_RUNNER_EVIDENCE` is widened rather than passing because
+   * detection found nothing.
+   */
+  it('refuses a runner detection guessed from a directory name alone', async () => {
+    const jvm = 'import org.junit.Test;\npublic class CheckoutTest {}\n';
+    const files = {
+      'src/test/java/CheckoutTest.java': jvm,
+      'src/test/java/LoginTest.java': jvm,
+      'src/test/java/SearchTest.java': jvm,
+    };
+
+    const detection = detectProject(Object.keys(files).map((path) => ({ path })));
+    expect(detection.candidates.length).toBeGreaterThan(0);
+    expect(
+      detection.candidates.every((candidate) =>
+        candidate.evidence.every((entry) => !DECLARED_RUNNER_EVIDENCE.has(entry.kind)),
+      ),
+    ).toBe(true);
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.runner).toBeNull();
+    expect(learned.repositoryRunner.declared).toEqual([]);
+    // And the file-level ambiguity is untouched: `import org.junit.Test;` is
+    // junit4-maven AND junit4-gradle, and nothing resolved it.
+    expect(learned.runnerAmbiguous).toBe(3);
+    expect(learned.profile.runner.value).toBeNull();
+  });
+
+  /*
+   * A DECLARED RUNNER MAY NOT BE WRITTEN ONTO A FILE IN ANOTHER LANGUAGE.
+   *
+   * One `pom.xml` declaring JUnit is exactly one declared runner, so without
+   * `runnerCouldOwn` every `.spec.ts` in this repository would be reported as
+   * junit4-maven at HIGH confidence — confidently wrong across the whole
+   * repository, which is worse than UNKNOWN because UNKNOWN falls back to the
+   * ecosystem default.
+   */
+  it('does not promote a JVM runner onto a TypeScript spec', async () => {
+    const files = {
+      'pom.xml':
+        '<project><dependencies><dependency><groupId>junit</groupId>' +
+        '<artifactId>junit</artifactId></dependency></dependencies></project>',
+      'tests/e2e/checkout.spec.ts': "test('checkout', async () => {});\n",
+      'tests/e2e/cart.spec.ts': "test('cart', async () => {});\n",
+      'tests/e2e/login.spec.ts': "test('login', async () => {});\n",
+    };
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.declared).toEqual(['junit4-maven']);
+    expect(learned.repositoryRunner.runner).toBe('junit4-maven');
+    expect(learned.profile.runner.value).toBeNull();
+    expect(learned.runnerFromRepository).toBe(0);
+    expectStorable(learned);
+  });
+
+  it('counts two declared runners as ambiguity and names both rather than picking one', async () => {
+    const files: Record<string, string> = {
+      'package.json': JSON.stringify({ devDependencies: { jest: '^29.0.0', cypress: '^13.0.0' } }),
+    };
+    for (let index = 0; index < 3; index += 1) {
+      files[`tests/t-${index}.test.ts`] = "it('a', () => {});\n";
+    }
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.declared).toHaveLength(2);
+    expect(learned.repositoryRunner.declared).toContain('jest');
+    expect(learned.repositoryRunner.declared).toContain('cypress');
+    expect(learned.repositoryRunner.runner).toBeNull();
+    expect(learned.repositoryRunner.why).toContain('2 runners are declared here');
+    expect(learned.profile.runner.value).toBeNull();
+  });
+
+  /*
+   * A CONFIGURATION IS A MEASUREMENT; A CALLER'S HINT IS A CLAIM. The hint
+   * breaks a tie and may never create a vote, which is what
+   * `cannot invent a runner the files never imported, even with a hint` above
+   * pins. This is the other half of that rule: the declared runner is the one
+   * thing that MAY promote, and the difference is where the evidence came from.
+   */
+  it('lets the repository promote where a caller hint may not', async () => {
+    const bare: Record<string, string> = {};
+    for (let index = 0; index < 3; index += 1) {
+      bare[`tests/a-${index}.spec.ts`] = `test('${index}', () => {});\n`;
+    }
+
+    const hinted = await learnStyle(source(bare), { ecosystemHint: 'playwright' });
+    expect(hinted.profile.runner.value).toBeNull();
+    expect(hinted.runnerFromRepository).toBe(0);
+
+    const declared = await learnStyle(source({ ...bare, 'playwright.config.ts': 'export default {};\n' }));
+    expect(declared.repositoryRunner.runner).toBe('playwright');
+    expect(declared.profile.runner.value).toBe('playwright');
+    expect(declared.runnerFromRepository).toBe(3);
+  });
+
+  it('breaks a genuine import tie with the repository configuration, without inventing one', async () => {
+    const jvm = 'import org.junit.Test;\npublic class CheckoutTest {}\n';
+    const files = {
+      // `junit:junit` in a Gradle build file is junit4-gradle's declared
+      // evidence; the IMPORT line is shared with junit4-maven, which is the tie.
+      'build.gradle': "dependencies { testImplementation 'junit:junit:4.13.2' }\n",
+      'src/test/java/CheckoutTest.java': jvm,
+      'src/test/java/LoginTest.java': jvm,
+      'src/test/java/SearchTest.java': jvm,
+    };
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.runner).toBe('junit4-gradle');
+    expect(learned.profile.runner.value).toBe('junit4-gradle');
+    expect(learned.runnerAmbiguous).toBe(0);
+    // The tie-break is NOT a promotion: every one of the three files carried the
+    // import itself, and the two counts have to stay apart.
+    expect(learned.runnerFromRepository).toBe(0);
+    expect(learned.profile.runner.examples[0]).toContain('broke the tie');
+    expectStorable(learned);
+  });
+
+  /*
+   * REFUSED, NOT TRUNCATED, AND THE PAIR IS WHAT PROVES IT.
+   *
+   * `build.gradle` is the manifest detection reads by SUBSTRING
+   * (`manifestContains`), so a truncated copy that still carries `junit:junit`
+   * in its first bytes would detect a runner from a file QAAI only half read —
+   * a measurement made of an arbitrary prefix. The small copy declares
+   * junit4-gradle; the identical-prefixed oversize copy declares NOTHING. A
+   * mutant that slices the content instead of refusing it makes the two agree.
+   */
+  it('refuses a manifest past its ceiling rather than measuring a prefix of one', async () => {
+    const declaration = "dependencies { testImplementation 'junit:junit:4.13.2' }\n";
+    const tests = { 'src/test/java/CartTest.java': 'public class CartTest {}\n' };
+
+    const small = await readRepositoryRunner(
+      source({ 'build.gradle': declaration, ...tests }),
+      ['build.gradle', ...Object.keys(tests)],
+    );
+    expect(small.manifestsRead).toBe(1);
+    expect(small.declared).toContain('junit4-gradle');
+
+    const padded = `${declaration}// ${'pad '.repeat(MAX_MANIFEST_CHARS / 4)}\n`;
+    expect(padded.length).toBeGreaterThan(MAX_MANIFEST_CHARS);
+    const oversize = await readRepositoryRunner(
+      source({ 'build.gradle': padded, ...tests }),
+      ['build.gradle', ...Object.keys(tests)],
+    );
+    expect(oversize.manifestsTooLarge).toBe(1);
+    expect(oversize.manifestsRead).toBe(0);
+    expect(oversize.declared).toEqual([]);
+    expect(oversize.runner).toBeNull();
+  });
+
+  it('counts the manifests the read cap refused, and still offers their paths', async () => {
+    const files: Record<string, string> = {};
+    for (let index = 0; index <= MAX_MANIFESTS_READ; index += 1) {
+      files[`packages/p${index}/package.json`] = JSON.stringify({ name: `p${index}` });
+    }
+    files['tests/a.spec.ts'] = "test('a', () => {});\n";
+
+    const reading = await readRepositoryRunner(source(files), Object.keys(files).sort());
+    expect(reading.manifestsRead).toBe(MAX_MANIFESTS_READ);
+    expect(reading.manifestsOmitted).toBe(1);
+    // Every path was still handed over: detection weighs a manifest's PRESENCE
+    // apart from its contents, so dropping the path would shrink the
+    // denominator without saying so.
+    expect(reading.pathsConsidered).toBe(Object.keys(files).length);
+    expect(reading.pathsOmitted).toBe(0);
+  });
+
+  it('counts the paths the detection cap refused rather than shrinking the denominator', async () => {
+    const paths: string[] = [];
+    for (let index = 0; index <= MAX_DETECTION_PATHS; index += 1) {
+      paths.push(`docs/note-${index}.md`);
+    }
+
+    const reading = await readRepositoryRunner(source({}), paths);
+    expect(reading.pathsConsidered).toBe(MAX_DETECTION_PATHS);
+    expect(reading.pathsOmitted).toBe(1);
+    expect(reading.runner).toBeNull();
+  });
+
+  /*
+   * THE COUNT DESCRIBES THE REPORTED ANSWER, NOT EVERY PROMOTION ATTEMPTED.
+   *
+   * Five files import Vitest and two import nothing, in a repository whose
+   * `playwright.config.ts` declares Playwright. Vitest wins the tally on the
+   * files' own bytes, so the two promoted Playwright votes are not part of the
+   * field that gets reported — and counting them would tell a reader that 2 of
+   * the 5 files behind `runner: vitest` had not said so, which is a statement
+   * about a different field's evidence.
+   */
+  it('attributes nothing to the configuration when the configuration lost the tally', async () => {
+    const files: Record<string, string> = { 'playwright.config.ts': 'export default {};\n' };
+    for (let index = 0; index < 5; index += 1) {
+      files[`tests/unit-${index}.spec.ts`] =
+        "import { test } from 'vitest';\ntest('a', () => {});\n";
+    }
+    for (let index = 0; index < 2; index += 1) {
+      files[`tests/bare-${index}.spec.ts`] = `test('${index}', () => {});\n`;
+    }
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.runner).toBe('playwright');
+    expect(learned.profile.runner.value).toBe('vitest');
+    expect(learned.profile.runner.filesSeen).toBe(5);
+    expect(learned.runnerFromRepository).toBe(0);
+    expectStorable(learned);
+  });
+
+  /*
+   * THE PLAUSIBILITY GUARD'S OWN CLAIMS, PINNED — INCLUDING THE TWO MISSES.
+   *
+   * `runnerCouldOwn`'s doc comment says it is conservative and names the two
+   * ecosystems it refuses on purpose: a `.robot` suite resolves to the ROBOT
+   * dialect while robot-framework's language resolves to Python, and a
+   * `.feature` file resolves to GHERKIN while behave's resolves to Python. A
+   * comment that claims a limitation and is not checked is a comment that
+   * silently becomes false, so both halves are asserted here. If a later round
+   * widens `resolveDialect` so either of those lines up, THIS TEST FAILS and
+   * the comment is what has to change.
+   */
+  it.each([
+    ['a pytest test file', 'tests/test_cart.py', 'pytest', true],
+    ['a unittest test file, through the language', 'tests/test_cart.py', 'unittest', true],
+    ['a Jest spec', 'src/cart.test.ts', 'jest', true],
+    ['a Cypress spec, through the runner', 'cypress/e2e/cart.cy.ts', 'cypress', true],
+    ['a Playwright spec', 'tests/e2e/cart.spec.ts', 'playwright', true],
+    ['a Maven test class', 'src/test/java/CartTest.java', 'junit4-maven', true],
+    ['a Minitest file', 'test/cart_test.rb', 'minitest', true],
+    ['an RSpec file', 'spec/cart_spec.rb', 'rspec', true],
+    ['a Go test', 'pkg/cart_test.go', 'go-test', true],
+    ['a PHPUnit test', 'tests/CartTest.php', 'phpunit', true],
+    ['a Swift test', 'Tests/AppTests/CartTests.swift', 'swift-test', true],
+    ['an NUnit test', 'tests/CartTests.cs', 'nunit', true],
+    // THE REFUSAL THAT MATTERS: a JVM runner onto a TypeScript spec.
+    ['a TypeScript spec under a JVM runner', 'tests/e2e/cart.spec.ts', 'junit4-maven', false],
+    // THE TWO DOCUMENTED MISSES.
+    ['a Robot suite under robot-framework', 'suites/login.robot', 'robot-framework', false],
+    ['a Gherkin feature under behave', 'features/checkout.feature', 'behave', false],
+  ])('decides whether %s belongs to its declared runner', (_what, path, runner, expected) => {
+    expect(runnerCouldOwn(path, runner as never)).toBe(expected);
+  });
+
+  /*
+   * A CONFIGURATION INSIDE A DIRECTORY QAAI NEVER WRITES INTO IS NOT THIS
+   * REPOSITORY'S DECLARATION.
+   *
+   * MEASURED BEFORE IT WAS CLOSED: `detectProject` has an ignore list of its
+   * own and it is NARROWER than `FORBIDDEN_DIRECTORIES` — `.github`,
+   * `.circleci`, `.husky`, `third_party`, `bower_components` and `Carthage` are
+   * in ours and not in theirs. So a `cypress.config.ts` and a `package.json`
+   * under `.github/vendor-suite/` made this pass report `declared: ['cypress']`
+   * and PROMOTED every ordinary spec in the repository to cypress at HIGH
+   * confidence. That is the exact defect the admission filter was fixed for,
+   * arriving by a new route — a convention learned from a directory QAAI must
+   * never write into.
+   *
+   * `node_modules` and `dist` are asserted alongside it even though detection
+   * ignores both, because "the other module's ignore list would have caught it"
+   * is a guarantee about a different module.
+   */
+  it.each([
+    ['CI configuration', '.github/vendor-suite'],
+    ['a dependency tree', 'node_modules/vendored-suite'],
+    ['build output', 'dist/bundled'],
+  ])('refuses a runner declared inside %s', async (_what, directory) => {
+    const files: Record<string, string> = {
+      [`${directory}/cypress.config.ts`]: 'export default {};\n',
+      [`${directory}/package.json`]: JSON.stringify({
+        devDependencies: { cypress: '^13.0.0' },
+        scripts: { test: 'cypress run' },
+      }),
+    };
+    for (let index = 0; index < 3; index += 1) {
+      files[`tests/spec-${index}.spec.ts`] = `test('${index}', () => {});\n`;
+    }
+
+    const learned = await learnStyle(source(files));
+    expect(learned.repositoryRunner.declared).toEqual([]);
+    expect(learned.repositoryRunner.runner).toBeNull();
+    expect(learned.profile.runner.value).toBeNull();
+    expect(learned.runnerFromRepository).toBe(0);
+    // REFUSED AND COUNTED, so the hole in the pass's own denominator is
+    // explained rather than merely smaller.
+    expect(learned.repositoryRunner.pathsRefused).toBe(2);
+    expect(learned.repositoryRunner.pathsConsidered).toBe(3);
+    expectStorable(learned);
+  });
+
+  it('accounts for every candidate path it was offered', async () => {
+    const files: Record<string, string> = {
+      'node_modules/pkg/package.json': '{}\n',
+      'playwright.config.ts': 'export default {};\n',
+    };
+    for (let index = 0; index < 4; index += 1) {
+      files[`tests/spec-${index}.spec.ts`] = playwrightSpec(`s${index}`);
+    }
+
+    const reading = await readRepositoryRunner(source(files), Object.keys(files).sort());
+    // The three buckets reconcile against the list that was offered. A pass
+    // whose buckets do not sum is how a file ends up in no bucket at all.
+    expect(reading.pathsRefused + reading.pathsConsidered + reading.pathsOmitted).toBe(
+      Object.keys(files).length,
+    );
+    expect(reading.pathsRefused).toBe(1);
+  });
+
+  it('claims nothing at all when the pass did not run', () => {
+    const unread = unreadRepositoryRunner('the repository was not materialised for this scan');
+    expect(unread.runner).toBeNull();
+    expect(unread.declared).toEqual([]);
+    expect(unread.pathsConsidered).toBe(0);
+    expect(unread.manifestsRead).toBe(0);
+    expect(unread.why).toContain('not materialised');
+  });
+});
+
+/**
+ * THE HONESTY PROPERTIES, OVER THE PATH THAT RUNS.
+ *
+ * Each of these is a sentence a customer will read, asserted against the real
+ * `learnStyle`, the real `styleProfileSchema` and the real
+ * `styleProfileBriefing` — never against an intermediate value this file
+ * constructed. The three the round named by name are a convention that stays
+ * below the floor at scale, a repository with no tests that says so instead of
+ * reporting conventions, and a profile built from part of a repository that
+ * says which part it could not see.
+ */
+describe('the honesty properties survive being wired', () => {
+  it('keeps a convention seen in 2 files of a 240-file repository out of the stated rules', async () => {
+    const files: Record<string, string> = {};
+    /*
+     * 240 FILES OFFERED, TWO OF THEM KEBAB. The other 238 are single-word
+     * names, which are evidence for NO convention and stay in the denominator —
+     * shrinking it is how "2 of 2" gets reported over a 240-file repository.
+     *
+     * The two kebab files are named to sort INSIDE the scan cap on purpose: the
+     * cap takes the first `MAX_SCANNED_FILES` sorted paths, so the field's own
+     * denominator is 120 and the repository's is 240. Both numbers are asserted
+     * below, because a profile built from 120 of 240 files is a different claim
+     * from one built from a 120-file repository.
+     */
+    files['tests/aa-checkout-flow.spec.ts'] = "import { test } from 'vitest';\ntest('b', () => {});\n";
+    files['tests/ab-cart-flow.spec.ts'] = "import { test } from 'vitest';\ntest('c', () => {});\n";
+    for (let index = 0; index < 238; index += 1) {
+      files[`tests/plain${String(index).padStart(3, '0')}.spec.ts`] =
+        "import { test } from 'vitest';\ntest('a', () => {});\n";
+    }
+
+    const learned = await learnStyle(source(files));
+    const naming = learned.profile.naming;
+
+    // Two agreeing files clears MIN_EVIDENCE_FILES, so the value survives — and
+    // the SHARE is what refuses it. `confidenceFor` needs both halves of the
+    // fraction, every time.
+    expect(naming.filesSeen).toBe(2);
+    expect(naming.confidence).toBe('LOW');
+    expect(CONFIDENCE_IS_USABLE[naming.confidence]).toBe(false);
+    expect(styleProfileBriefing(learned.profile)).not.toContain('naming:');
+
+    const below = learned.belowThreshold.find((entry) => entry.field === 'naming');
+    expect(below?.candidate).toBe('KEBAB');
+    expect(below?.why).toContain('which is LOW confidence');
+
+    // AND THE SCAN CAP THAT BIT ON THE WAY, with its own count and reason.
+    expect(learned.filesOffered).toBe(240);
+    expect(learned.profile.filesRead).toBe(MAX_SCANNED_FILES);
+    expect(learned.filesSkipped.filter((entry) => entry.reason === 'SCAN_CAP')).toHaveLength(
+      240 - MAX_SCANNED_FILES,
+    );
+    expectStorable(learned);
+  });
+
+  it('reports every field UNKNOWN for a repository with no tests, and renders it as not established', async () => {
+    const learned = await learnStyle(
+      source({
+        'src/cart.ts': 'export const total = (n: number) => n;\n',
+        'README.md': '# a repository with no tests\n',
+      }),
+    );
+
+    expect(learned.profile.filesRead).toBe(0);
+    for (const field of [
+      learned.profile.runner,
+      learned.profile.assertionIdiom,
+      learned.profile.fileLayout,
+      learned.profile.naming,
+      learned.profile.fixtureMechanism,
+      learned.profile.setupIdiom,
+      learned.profile.locatorStrategy,
+      learned.profile.testIdAttribute,
+      learned.profile.importStyle,
+      learned.profile.importAlias,
+      learned.profile.quoteStyle,
+      learned.profile.semicolonStyle,
+      learned.profile.parameterisation,
+      learned.profile.testLength,
+    ]) {
+      expect(field.confidence).toBe('UNKNOWN');
+      expect(field.value).toBeNull();
+    }
+    expect(learned.profile.helpers).toEqual([]);
+
+    const briefing = styleProfileBriefing(learned.profile);
+    expect(briefing).toContain('not established');
+    expect(briefing).not.toContain('measured from its existing tests');
+    expectStorable(learned);
+  });
+
+  /*
+   * THE SUBSET THAT MUST NOT READ AS AN ABSENCE.
+   *
+   * A repository whose tests all live in a directory `destinationDecision`
+   * refuses produces `filesRead: 0` — the same number as a repository with no
+   * tests at all — and the two are completely different facts. The STORED
+   * profile is what distinguishes them: `filesSkipped` carries the path and the
+   * reason, so the row a human opens says "we refused to read these" rather
+   * than "you have no tests".
+   */
+  it('says which part of the repository it could not see, rather than reporting an absence', async () => {
+    const hidden = await learnStyle(
+      source({
+        'node_modules/@acme/suite/tests/cart.spec.ts': playwrightSpec('cart'),
+        '.github/workflows/tests/release.spec.ts': playwrightSpec('release'),
+        'dist/tests/checkout.spec.ts': playwrightSpec('checkout'),
+      }),
+    );
+    const none = await learnStyle(source({ 'README.md': '# nothing here\n' }));
+
+    // Indistinguishable on the number alone.
+    expect(hidden.profile.filesRead).toBe(0);
+    expect(none.profile.filesRead).toBe(0);
+
+    // And told apart by the stored profile, which is what gets read later.
+    expect(hidden.profile.filesSkipped).toHaveLength(3);
+    for (const entry of hidden.profile.filesSkipped) {
+      expect(entry.reason).toContain('FORBIDDEN_DIRECTORY');
+      expect(entry.reason).toContain('never writes into');
+    }
+    expect(hidden.profile.filesSkipped.map((entry) => entry.path)).toContain(
+      'node_modules/@acme/suite/tests/cart.spec.ts',
+    );
+    expect(none.profile.filesSkipped.filter((entry) => entry.reason.startsWith('FORBIDDEN'))).toEqual(
+      [],
+    );
+    expectStorable(hidden);
+    expectStorable(none);
+  });
+
+  it('never reports a declared runner it did not read a declaration for', async () => {
+    // `filesRead: 0` and a declared runner is a legal combination — the
+    // configuration is there and the tests are in a refused directory — so the
+    // runner field must still be UNKNOWN, because no FILE voted.
+    const learned = await learnStyle(
+      source({
+        'playwright.config.ts': 'export default {};\n',
+        'node_modules/@acme/suite/tests/cart.spec.ts': playwrightSpec('cart'),
+      }),
+    );
+
+    expect(learned.repositoryRunner.runner).toBe('playwright');
+    expect(learned.profile.filesRead).toBe(0);
+    expect(learned.profile.runner.value).toBeNull();
+    expect(learned.profile.runner.filesConsidered).toBe(0);
+    expect(learned.runnerFromRepository).toBe(0);
+    expectStorable(learned);
   });
 });

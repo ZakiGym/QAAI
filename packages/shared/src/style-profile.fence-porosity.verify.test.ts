@@ -43,25 +43,71 @@ const FENCE_END_TEXT = '<<<END-QAAI-UNTRUSTED-DATA>>>';
 /**
  * Characters with no glyph, one per class the forgery could use.
  *
- * Kept as a separate list from the production `INVISIBLE` class ON PURPOSE: a
- * test that imports the implementation's own character set can only ever agree
- * with it. These are written out independently, so a character dropped from the
- * production class fails a test here rather than silently narrowing the rule.
+ * \u2500\u2500 WHY THIS LIST IS NOW LONGER, AND WHY THE OLD ONE COULD NOT FIND THE GAP \u2500
+ *
+ * The previous version of this file listed eight characters and claimed they
+ * were "written out independently, so a character dropped from the production
+ * class fails a test here". The first half was true and the second half was
+ * only true for a character DROPPED. For a character never added, this file was
+ * blind in a way worth spelling out, because it is the shape to look for in any
+ * sanitiser test: {@link asRendered} \u2014 the premise check that decides whether a
+ * payload is even in scope \u2014 was spelled with the SAME eight characters as the
+ * production class, byte for byte. So a forgery built from a ninth glyph-less
+ * character failed the premise, was `continue`d past, and the file reported
+ * green. An adversarial verifier found six such families and measured each one
+ * reaching a prompt verbatim with `fenceMarkersNeutralised: 0`.
+ *
+ * The fix is to stop both sides enumerating. The production class is now
+ * Unicode's `Default_Ignorable_Code_Point`; the premise below is `\p{Cf}` plus
+ * the controls, which is a DIFFERENT property with a different definition \u2014 so
+ * the two can still disagree, which is the only reason a test like this is
+ * worth running. The list below is the named witnesses, one per family, so a
+ * regression names the family rather than printing a code point.
  */
-const INVISIBLE_CHARS = [
-  '\u00AD', // soft hyphen
-  '\u034F', // combining grapheme joiner
-  '\u200B', // zero width space
-  '\u200C', // zero width non-joiner
-  '\u200D', // zero width joiner
-  '\u200E', // left-to-right mark
-  '\u2060', // word joiner
-  '\uFEFF', // zero width no-break space
+const INVISIBLE_CHARS: readonly { readonly family: string; readonly char: string }[] = [
+  { family: 'soft hyphen', char: '\u00AD' },
+  { family: 'combining grapheme joiner', char: '\u034F' },
+  { family: 'zero width space', char: '\u200B' },
+  { family: 'zero width non-joiner', char: '\u200C' },
+  { family: 'zero width joiner', char: '\u200D' },
+  { family: 'left-to-right mark', char: '\u200E' },
+  { family: 'word joiner', char: '\u2060' },
+  { family: 'zero width no-break space', char: '\uFEFF' },
+  // \u2500\u2500 The six families that walked past the hand-written class \u2500\u2500
+  { family: 'variation selector 1', char: '\uFE00' },
+  { family: 'variation selector 16', char: '\uFE0F' },
+  { family: 'tag character (astral)', char: '\u{E0045}' },
+  { family: 'variation selector supplement', char: '\u{E0100}' },
+  { family: 'Hangul filler', char: '\u3164' },
+  { family: 'halfwidth Hangul filler', char: '\uFFA0' },
+  { family: 'Hangul choseong filler', char: '\u115F' },
+  { family: 'Khmer vowel inherent AQ', char: '\u17B4' },
+  { family: 'Mongolian free variation selector', char: '\u180B' },
+  { family: 'C0 control', char: '\u0001' },
+  { family: 'C1 control', char: '\u009F' },
 ];
 
-/** What a reader's eye sees: the string with every glyph-less character gone. */
+/**
+ * THE PREMISE, AND WHY IT IS NO LONGER A REGEX.
+ *
+ * It used to be one, spelled with the same eight code points as the production
+ * class, and that is the whole defect: a payload built from a ninth glyph-less
+ * character failed the premise, was `continue`d past as "not really a forgery",
+ * and this file reported green on a fence that had let it through verbatim.
+ *
+ * So the premise is now the TABLE above \u2014 a claim this file makes, character by
+ * character, that the thing has no glyph. Every insertion of every entry is in
+ * scope by construction, there is no `continue`, and nothing can be skipped by
+ * agreeing with the implementation. The table spans four Unicode categories
+ * (Cf, Mn, Lo and Cc), which is why no single category expression could have
+ * stood in for it: `\p{Cf}` alone misses every variation selector, and
+ * `\p{Default_Ignorable_Code_Point}` is production's own answer and would make
+ * this a tautology.
+ */
 function asRendered(text: string): string {
-  return text.replace(/(?:\u00AD|\u034F|\u180E|[\u200B-\u200F]|[\u2060-\u2064]|\uFEFF)/g, '');
+  let out = text;
+  for (const { char } of INVISIBLE_CHARS) out = out.split(char).join('');
+  return out;
 }
 
 /** Every one-character insertion of `invisible` into `delimiter`. */
@@ -72,6 +118,36 @@ function everyInsertion(delimiter: string, invisible: string): string[] {
   }
   return out;
 }
+
+describe('the premise this file reasons from', () => {
+  /*
+   * ASSERTED, because the premise being wrong is how the previous version of
+   * this file passed while the fence leaked. If a table entry does NOT render
+   * away, every payload built from it is a forgery a reader would notice and
+   * the central property below would be claiming more than it should.
+   */
+  it('is that every table entry really does vanish from the picture', () => {
+    for (const { family, char } of INVISIBLE_CHARS) {
+      expect(asRendered(`UNTRUST${char}ED`), family).toBe('UNTRUSTED');
+    }
+  });
+
+  /*
+   * THE ONES DELIBERATELY LEFT OUT, named rather than omitted — a reader DOES
+   * see these, so a closer carrying one is distinguishable in review and is a
+   * weaker forgery. Stated here so the gap is a decision on the record instead
+   * of a hole somebody later reports as new.
+   */
+  it('is not claimed for characters a reader can see', () => {
+    for (const [name, char] of [
+      ['combining acute', '́'],
+      ['braille blank', '⠀'],
+      ['newline', '\n'],
+    ] as const) {
+      expect(asRendered(`UNTRUST${char}ED`), name).not.toBe('UNTRUSTED');
+    }
+  });
+});
 
 describe('a forgery that renders as the delimiter cannot survive the sanitiser', () => {
   /*
@@ -87,13 +163,17 @@ describe('a forgery that renders as the delimiter cannot survive the sanitiser',
   ] as const) {
     it(`matches every single-character invisible forgery of ${name}`, () => {
       const survived: string[] = [];
-      for (const invisible of INVISIBLE_CHARS) {
-        for (const payload of everyInsertion(delimiter, invisible)) {
-          // Only payloads that really do render as the delimiter are in scope:
-          // this is the property, so the premise is checked rather than assumed.
-          if (asRendered(payload) !== delimiter) continue;
+      for (const { family, char } of INVISIBLE_CHARS) {
+        for (const payload of everyInsertion(delimiter, char)) {
+          /*
+           * NO `continue`. The premise is the table and it is asserted above,
+           * so every payload here is in scope — which is the whole repair: the
+           * previous version skipped any payload its own `asRendered` did not
+           * recognise, and that skip is what hid six families for a round.
+           */
+          expect(asRendered(payload), family).toBe(delimiter);
           if (!fenceMarkerPattern().test(payload)) {
-            survived.push(JSON.stringify(payload));
+            survived.push(`${family}: ${JSON.stringify(payload)}`);
           }
         }
       }

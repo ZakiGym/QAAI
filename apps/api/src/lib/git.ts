@@ -53,7 +53,14 @@ import { dirname, join, resolve, sep } from 'node:path';
 import fs from 'node:fs';
 import git from 'isomorphic-git';
 import http from 'isomorphic-git/http/node';
-import type { GitIntegrationKind } from '@qaai/shared';
+/*
+ * `destinationDecision` — THE ONE RULE about where QAAI may write a generated
+ * file, consulted here at the last door before bytes are staged. This file used
+ * to ask only "does QAAI own this path"; see `FORBIDDEN_DESTINATION` in
+ * {@link PRESERVE_REASONS} for the hole that left.
+ */
+import { destinationDecision } from '@qaai/shared';
+import type { DestinationRefusalReason, GitIntegrationKind } from '@qaai/shared';
 /*
  * Reached by a RELATIVE PATH ACROSS THE WORKSPACE BOUNDARY, which is a defect
  * and is recorded as one — the same one `routes/agent.ts` carries for
@@ -188,9 +195,9 @@ export interface OwnershipRecord {
 /**
  * WHY QAAI LEFT A PATH ON THE BRANCH ALONE.
  *
- * Five reasons, because they are five different facts about the repository. A
- * single boolean here would report the last four as the first, which is the lie
- * "we do not own this" told about a file we do — and the three that are not
+ * Six reasons, because they are six different facts about the repository. A
+ * single boolean here would report the last five as the first, which is the lie
+ * "we do not own this" told about a file we do — and the four that are not
  * NOT_OURS are the ones a human has to act on.
  */
 export const PRESERVE_REASONS = [
@@ -250,13 +257,41 @@ export const PRESERVE_REASONS = [
    * under a spec that still imports it leaves the same uncompilable suite.
    */
   'DEPENDENT_REMAINS',
+  /**
+   * THE PATH IS SOMEWHERE QAAI MUST NEVER WRITE, whatever the ledger says.
+   *
+   * ── THE HOLE THIS CLOSES, AND WHY OWNERSHIP COULD NOT CLOSE IT ─────────────
+   *
+   * Every other reason here answers "may QAAI replace what is at this path".
+   * None of them answers "may QAAI put a file at this path AT ALL", and the two
+   * are different questions with different answers: a path that is NOT on the
+   * branch is a CREATE, and a CREATE was allowed unconditionally by the loop
+   * below — "there is nothing there to destroy" — so `node_modules/.bin/payload`
+   * and `.github/workflows/release.yml` were writes this function would have
+   * made, staged and pushed without asking anything. The ledger cannot refuse
+   * them either: QAAI generated those paths, so a row claiming them is exactly
+   * what it would hold.
+   *
+   * It delegates to `destinationDecision` in packages/shared/src/artifact-set.ts
+   * — the SAME function `admit`, `artifactSetProblems`, `safeRepoPath` and
+   * `directoryForRole` consult — so there is one answer in this product to
+   * where a generated file may go, and this is the last door it is asked at
+   * rather than a second opinion written at the door.
+   *
+   * WHAT IT IS NOT: a permission. `destinationDecision` is three-state and
+   * UNDECIDED means the layout half was not measured; this push has no measured
+   * layout to hand it and never claims one, so the rule can only ever REFUSE
+   * here. Writing the file remains something the OWNERSHIP reasons above
+   * authorise, and both are asked.
+   */
+  'FORBIDDEN_DESTINATION',
 ] as const;
 export type PreserveReason = (typeof PRESERVE_REASONS)[number];
 
 /**
  * ONE SENTENCE A HUMAN CAN ACT ON, per reason.
  *
- * Compiler-enforced over {@link PRESERVE_REASONS}, so a sixth reason cannot
+ * Compiler-enforced over {@link PRESERVE_REASONS}, so a seventh reason cannot
  * reach a caller as `undefined` — a refusal with no explanation on it reads to
  * whoever is looking at the branch as nothing having happened, which is the
  * shape of a failure suppressed without being counted.
@@ -288,12 +323,41 @@ const WHY_PRESERVED = {
   DEPENDENT_REMAINS: (subject: PreservedSubject): string =>
     `QAAI no longer holds ${subject.path} and may not delete it: a file that imports it is ` +
     'staying on the branch, and removing it would leave that file importing nothing.',
+  /*
+   * THE RULE'S OWN SENTENCE, FORWARDED RATHER THAN REWRITTEN. `destinationDecision`
+   * already names the directory and says what it is ("node_modules" is
+   * dependencies installed by a package manager), and composing a second
+   * sentence here would be this file's own opinion about a question it does not
+   * own — the shape of every duplicated vocabulary in this codebase.
+   *
+   * The null branch is not reachable from the one place that sets this reason,
+   * which records the refusal and the sentence together. It says so rather than
+   * inventing a reason, because a refusal whose cause is "unknown" is still
+   * more honest than a refusal carrying the wrong cause.
+   */
+  FORBIDDEN_DESTINATION: (subject: PreservedSubject): string =>
+    subject.destinationRefusal ??
+    'QAAI may not write a file at this path, and the rule that refused it did not reach this ' +
+      'report. Treat it as refused and raise it: a destination refusal with no reason on it is a ' +
+      'bug in QAAI, not a fact about your repository.',
 } as const satisfies Record<PreserveReason, (subject: PreservedSubject) => string>;
 
 /** What {@link WHY_PRESERVED} needs about the path it is explaining, and nothing more. */
 interface PreservedSubject {
   readonly path: string;
   readonly record: OwnershipRecord;
+  /**
+   * `destinationDecision`'s own sentence when it REFUSED this path, and null
+   * when it did not refuse it.
+   *
+   * NULL IS NOT "ALLOWED" AND IS NOT A PASS. The rule is three-state and this
+   * push supplies no measured layout, so an ordinary path comes back UNDECIDED —
+   * meaning the deny list was checked and the layout question was not asked at
+   * all. Null here says only "the destination rule is not what refused this
+   * path"; whether the path may be written is answered by the ownership reasons
+   * above.
+   */
+  readonly destinationRefusal: string | null;
 }
 
 /**
@@ -308,6 +372,40 @@ interface PreservedSubject {
 export function mayQaaiReplace(verdict: OwnershipVerdict): boolean {
   return WRITABLE_BY_OWNERSHIP[verdict];
 }
+
+/**
+ * WHICH DESTINATION REFUSALS ABORT THE WHOLE PUSH INSTEAD OF REFUSING ONE FILE.
+ *
+ * ── WHY THIS RECORD EXISTS AT ALL ──────────────────────────────────────────
+ *
+ * `destinationDecision` answers one question — may QAAI write here — and this
+ * file has TWO ways of saying no, which are not interchangeable:
+ *
+ *   `false`  the path is refused, counted on {@link PushResult.filesRefused}
+ *            with the rule's own sentence, and the rest of the push proceeds.
+ *            A test under `node_modules/` is a mistake about ONE file and the
+ *            other forty files in the batch are fine.
+ *   `true`   the path is not a repo-relative path at all. That is NOT a fact
+ *            about one file: `safeJoin` already throws on it and the throw
+ *            aborts the push, and this file's own comment says why that is
+ *            deliberate — "a push that skipped the offending path and reported
+ *            a count would be deciding, on its own, that a repository laid out
+ *            through links is one it may half-sync". Routing it into the
+ *            per-file list would DOWNGRADE an abort to a count, which is a
+ *            failure suppressed without being counted wearing the costume of a
+ *            failure counted.
+ *
+ * So a `true` member is deliberately NOT handled by the loop below; it falls
+ * through to `safeJoin`, which is the stronger refusal and the existing owner
+ * of that question. This record is what stops that from being a hole somebody
+ * has to notice: a fourth `DestinationRefusalReason` cannot be added without
+ * choosing which of the two this file does with it.
+ */
+const DESTINATION_REFUSAL_ABORTS_PUSH = {
+  MALFORMED_PATH: true,
+  FORBIDDEN_DIRECTORY: false,
+  OUTSIDE_LEARNED_LAYOUT: false,
+} as const satisfies Record<DestinationRefusalReason, boolean>;
 
 /**
  * BOTH HALVES OF THE PERMISSION FOR ONE PATH THAT IS ON THE BRANCH, and there
@@ -692,6 +790,8 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
       /** The branch's own bytes, or null when they could not be read. */
       readonly branchBytes: string | null;
       readonly record: OwnershipRecord;
+      /** See {@link PreservedSubject.destinationRefusal}. Null is not a pass. */
+      readonly destinationRefusal: string | null;
       allowed: boolean;
       reason: PreserveReason | null;
     }
@@ -700,6 +800,56 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
     for (const [relPath, content] of tree) {
       const record = records.get(relPath) ?? recordFor(relPath);
       const onBranch = tracked.has(relPath);
+      /*
+       * ── WHERE, BEFORE WHETHER ──────────────────────────────────────────────
+       *
+       * Asked FIRST and asked of every path, because it is the only question in
+       * this loop that a CREATE cannot skip. The branch below used to allow
+       * every untracked path unconditionally — "there is nothing there to
+       * destroy" — which is true and is not the whole question: a first write
+       * to `node_modules/.bin/payload.spec.ts` destroys nothing and is still a
+       * write QAAI must never make.
+       *
+       * NO LAYOUT IS PASSED, and that is not an omission. This function holds a
+       * git checkout and a ledger; it has not measured the repository's test
+       * conventions and must not guess at them. So the deny list is the whole
+       * question asked here, `destinationDecision` answers UNDECIDED for every
+       * ordinary path, and UNDECIDED is NOT treated as permission — it falls
+       * through to the ownership rule, which is where this function's
+       * permission has always come from. The layout half is enforced upstream,
+       * at `admit`/`artifactSetProblems`, where the measurement exists.
+       *
+       * A MALFORMED PATH IS NOT HANDLED HERE, BY DECISION AND NOT BY OMISSION:
+       * see {@link DESTINATION_REFUSAL_ABORTS_PUSH}. It reaches `safeJoin`,
+       * which throws and aborts the whole push — the stronger of this file's
+       * two refusals, and the one its own comment argues for.
+       */
+      const destination = destinationDecision({ path: relPath });
+      const destinationRefusal =
+        destination.verdict === 'REFUSED' &&
+        !DESTINATION_REFUSAL_ABORTS_PUSH[destination.reason]
+          ? destination.why
+          : null;
+      if (destinationRefusal !== null) {
+        decisions.push({
+          path: relPath,
+          content,
+          onBranch,
+          /*
+           * Not read, and not readable in the general case: a refused
+           * destination may be a path the checkout has nothing at. The refusal
+           * carries the RULE's sentence rather than the branch's bytes, and
+           * `contentsOmitted` counts it below like any other refusal whose
+           * bytes did not come back.
+           */
+          branchBytes: null,
+          record,
+          destinationRefusal,
+          allowed: false,
+          reason: 'FORBIDDEN_DESTINATION',
+        });
+        continue;
+      }
       if (!onBranch) {
         decisions.push({
           path: relPath,
@@ -707,6 +857,7 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
           onBranch,
           branchBytes: null,
           record,
+          destinationRefusal,
           allowed: true,
           reason: null,
         });
@@ -737,6 +888,7 @@ export async function pushRepo(tree: RepoTree, opts: PushOptions): Promise<PushR
         onBranch,
         branchBytes,
         record,
+        destinationRefusal,
         allowed: outcome.allowed,
         reason: outcome.reason,
       });
