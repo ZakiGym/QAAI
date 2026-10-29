@@ -415,6 +415,59 @@ export const ROLE_RANK: Record<OrgRole, number> = {
   OWNER: 3,
 };
 
+/**
+ * WHAT CHOSE THE TESTS IN A RUN. Stored by `Run.selectionSource` as TEXT.
+ *
+ * ── WHY A GATE NEEDS THIS, AND WHAT GOES WRONG WITHOUT IT ───────────────────
+ *
+ * A MIN_PASS_RATE gate over an impact-selected run of 11 tests computes 100%.
+ * The web app's run page and the GitHub check both rendered that as a pass — a
+ * suite-wide claim made from a sliver of the suite, on the one surface where a
+ * pull request is actually gated. The CLI and the Action withhold it today
+ * because they know what they asked for; the server could not, because the
+ * selection chose the tests and was then discarded.
+ *
+ * NULL IS NOT `FULL_SUITE`. A run written before the column existed was not
+ * necessarily a full-suite run, so a reader must render null as "selection
+ * unknown" and must not let a gate claim a suite-wide pass from it.
+ *
+ * TEXT and not a Prisma enum, the decision `PullRequestRecord.purpose` records:
+ * a sixth selection mode should be a feature, not a migration plus a deploy.
+ * This list is the domain, and the zod schema that writes the column is built
+ * from it — so the two cannot disagree.
+ */
+export const RUN_SELECTION_SOURCES = [
+  /** Everything in the project (or in the named suite's full membership). */
+  'FULL_SUITE',
+  /** Chosen by impact analysis from a diff. A gate over this is not suite-wide. */
+  'IMPACT',
+  /** Only the failures of an earlier run. Says nothing about the rest. */
+  'RERUN_FAILURES',
+  /** One suite of several. Suite-wide, not project-wide. */
+  'SUITE',
+  /** A list of test ids the caller named. */
+  'EXPLICIT',
+] as const;
+export type RunSelectionSource = (typeof RUN_SELECTION_SOURCES)[number];
+
+/** Whether a selection can carry a claim about the WHOLE suite. */
+export const SUITE_WIDE_SELECTIONS: readonly RunSelectionSource[] = ['FULL_SUITE'];
+
+/**
+ * WHERE AN OWNERSHIP RULE CAME FROM. Stored by `OwnershipRule.source` as TEXT.
+ *
+ * `OwnerProvenance.CODEOWNERS_IMPORT` is deliberately WEAKER than `RULE_PATH`,
+ * because an imported catch-all glob should not page anybody at 3am. Without
+ * this column that distinction could never be reported and every imported rule
+ * claimed the strength of a deliberate human assignment.
+ *
+ * Null means MANUAL for rules written before the column existed, which is true
+ * — there was no importer — and is still not back-filled, because a back-fill
+ * would assert MANUAL about rows nobody can check.
+ */
+export const OWNERSHIP_RULE_SOURCES = ['MANUAL', 'CODEOWNERS'] as const;
+export type OwnershipRuleSource = (typeof OWNERSHIP_RULE_SOURCES)[number];
+
 export const ENVIRONMENT_KINDS = ['LOCAL', 'PREVIEW', 'STAGING', 'PRODUCTION'] as const;
 export type EnvironmentKind = (typeof ENVIRONMENT_KINDS)[number];
 

@@ -1,0 +1,74 @@
+-- Three facts that were computed, used once and thrown away -- and each one is
+-- the reason a downstream surface could not tell the truth.
+--
+-- WHY THIS EXISTS
+--
+--   1. "Run"."selectionSource". A MIN_PASS_RATE gate over an impact-selected
+--      run of 11 tests computes 100% and the web app's run page and the GitHub
+--      check both render it AS A PASS -- a suite-wide claim made from a sliver
+--      of the suite. The CLI and the Action withhold that pass today, because
+--      they know what they asked for. The SERVER could not: the request named
+--      its selection, the selection chose the tests, and then it was discarded.
+--      So the one place a pull request is actually gated was the one place the
+--      claim could not be qualified.
+--   2. "Run"."preflightChecks". `environmentPreflight` produces
+--      `PreflightCheck[]` in the run processor and nothing kept it. By the time
+--      triage asks "was this a broken environment rather than a broken app?",
+--      the evidence is gone. A 400-failure run caused by one unreachable base
+--      URL is then indistinguishable from 400 real regressions, and every one
+--      of them costs a strong-model triage -- the exact bill `ENV_ISSUE` exists
+--      to stop.
+--   3. "OwnershipRule"."source". `OwnerProvenance.CODEOWNERS_IMPORT` is
+--      deliberately WEAKER than `RULE_PATH`, because an imported catch-all glob
+--      should not page anybody at 3am. With no column saying where a rule came
+--      from, that distinction can never be reported and every imported rule
+--      claims the strength of a deliberate human assignment. The provenance
+--      landed one migration ago with no feeder; this is the feeder.
+--
+-- NO NEW ENUM, ON PURPOSE. All three are TEXT with their domain at the producer
+-- (`RUN_SELECTION_SOURCES` and `OWNERSHIP_RULE_SOURCES` in
+-- packages/shared/src/constants.ts), the same decision
+-- "PullRequestRecord"."purpose" records: a sixth selection mode should be a
+-- feature, not a migration plus a deploy. The drift guard that matters for a
+-- TEXT column is the producer's own union plus the zod schema that writes it,
+-- and both are in that file.
+--
+-- EVERY COLUMN IS NULLABLE AND NOTHING IS BACK-FILLED, and the reason is the
+-- same for all three: NULL MEANS "WE DO NOT KNOW", WHICH IS NOT THE SAME FACT
+-- AS THE DEFAULT. A run written before this migration was not necessarily a
+-- full-suite run -- impact selection has existed for several rounds -- so
+-- defaulting "selectionSource" to 'FULL_SUITE' would invent a suite-wide claim
+-- for every historical run and make the gate MORE confident about the past than
+-- about the present. Reading surfaces must render null as "selection unknown".
+-- "OwnershipRule"."source" is the one case where null is genuinely equivalent to
+-- a value ('MANUAL'), because there was no importer, and it is still left null:
+-- a back-fill would assert MANUAL about rows nobody can check, and the reader
+-- already has to handle null for the other two.
+
+-- ─── 1. What chose the tests ────────────────────────────────────────────────
+ALTER TABLE "Run" ADD COLUMN "selectionSource" TEXT;
+
+-- ─── 2. The preflight's own answers ─────────────────────────────────────────
+ALTER TABLE "Run" ADD COLUMN "preflightChecks" JSONB;
+
+-- ─── 3. Where an ownership rule came from ───────────────────────────────────
+ALTER TABLE "OwnershipRule" ADD COLUMN "source" TEXT;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REVERT
+--
+--   ALTER TABLE "OwnershipRule" DROP COLUMN "source";
+--   ALTER TABLE "Run" DROP COLUMN "preflightChecks";
+--   ALTER TABLE "Run" DROP COLUMN "selectionSource";
+--
+-- WHAT A REVERT COSTS, stated rather than discovered. Dropping
+-- "selectionSource" does not merely hide a label: it returns the server-side
+-- gate to claiming a suite-wide pass from a selective run, which is a FALSE
+-- GREEN on a pull request and the most expensive single lie in this product.
+-- A revert must therefore be paired with disarming the server-side gate's
+-- MIN_PASS_RATE and BLOCK_ON_VERDICT rules, not only with this SQL.
+--
+-- Dropping "preflightChecks" costs money rather than truth: `classifyEnvironment`
+-- loses its evidence and a run broken by its environment goes back to being
+-- triaged failure by failure at strong-model prices.
+-- ─────────────────────────────────────────────────────────────────────────────

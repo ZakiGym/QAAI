@@ -1814,6 +1814,37 @@ model Run {
   /// Preview-deploy runs override the environment's base URL (§6).
   baseUrlOverride String?
 
+  /// WHAT CHOSE THE TESTS IN THIS RUN, and the reason a gate can be trusted.
+  ///
+  /// FULL_SUITE | IMPACT | RERUN_FAILURES | SUITE | EXPLICIT. TEXT, with the
+  /// domain at the producer (`RUN_SELECTION_SOURCES`), for the same reason as
+  /// `PullRequestRecord.purpose`: a new selection mode is a feature, not a
+  /// migration.
+  ///
+  /// Nothing recorded this, and that is a defect with a number attached. A
+  /// MIN_PASS_RATE gate over an impact-selected run of 11 tests computes 100%
+  /// and the web app's run page and the GitHub check both render it as a pass —
+  /// a suite-wide claim made from a sliver of the suite. The CLI and the Action
+  /// withhold that pass today because they KNOW what they asked for; the server
+  /// could not, because the request's selection was thrown away after it was
+  /// used. Null means a run written before this column existed: unknown, which
+  /// is not the same fact as FULL_SUITE and must never be rendered as one.
+  selectionSource String?
+
+  /// THE PREFLIGHT'S OWN ANSWERS, kept rather than computed and discarded.
+  ///
+  /// `environmentPreflight` produces `PreflightCheck[]` in the run processor and
+  /// nothing kept it, so by the time triage asks "was this a broken environment
+  /// rather than a broken app?" the evidence is gone and `classifyEnvironment`
+  /// has nothing to classify. A 400-failure run caused by an unreachable base
+  /// URL then looks exactly like 400 real regressions, and every one of them
+  /// costs a strong-model triage.
+  ///
+  /// Json and not a table: the shape belongs to the preflight, the rows are read
+  /// only together with their run, and nothing queries across them. It is
+  /// evidence, not a dimension.
+  preflightChecks Json?
+
   queuedAt   DateTime  @default(now())
   startedAt  DateTime?
   finishedAt DateTime?
@@ -3615,6 +3646,19 @@ model OwnershipRule {
   suiteId     String?
   /// Test.feature, matched case-insensitively.
   feature     String?
+
+  /// WHERE THIS RULE CAME FROM — the fact `provenanceOfMatch` needs and could
+  /// not get.
+  ///
+  /// MANUAL | CODEOWNERS. TEXT, domain at the producer
+  /// (`OWNERSHIP_RULE_SOURCES`). Without it, a rule imported wholesale from a
+  /// customer's CODEOWNERS file is indistinguishable from one a human typed
+  /// here, so `OwnerProvenance.CODEOWNERS_IMPORT` — deliberately WEAKER than
+  /// `RULE_PATH`, because an imported catch-all glob should not page anybody at
+  /// 3am — can never be reported, and every imported rule claims the strength of
+  /// a deliberate assignment. Null is MANUAL for every rule written before this
+  /// column existed, which is true: there was no importer.
+  source String?
 
   /// Exactly one owner. Both null is not a rule, it is a routing hole that looks
   /// like a rule — which is worse than no row at all.
