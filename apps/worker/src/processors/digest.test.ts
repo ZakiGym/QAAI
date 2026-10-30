@@ -100,6 +100,13 @@ const digestOf = (newFailures: DigestItem[]): Digest => ({
   silentSchedules: [],
   unowned: newFailures.filter((item) => !item.owner).length,
   truncated: false,
+  /*
+   * Null means the ledger read was NOT capped — which is a different fact from
+   * `truncated: false` above, and the two are separate fields for that reason:
+   * one says the digest saw every RESULT, the other that it saw everything that
+   * was SILENCED.
+   */
+  ledgerTruncated: null,
 });
 
 /**
@@ -200,6 +207,13 @@ const rule = (over: Record<string, unknown> = {}) => ({
   feature: null,
   ownerUserId: null,
   ownerTeamId: null,
+  /*
+   * WHERE THE RULE CAME FROM, defaulted to NULL — what a rule somebody typed
+   * into QAAI stores. It decides whether the digest NAMES a team or merely
+   * SUGGESTS one, so the default has to be a value this fixture states rather
+   * than a missing key.
+   */
+  source: null,
   ...over,
 });
 
@@ -269,6 +283,116 @@ describe('collectDigest resolves ownership through the shared helpers', () => {
 
     expect(digest!.newFailures[0]).toMatchObject({ owner: '@payments', ownerState: 'OWNED' });
     expect(digest!.unowned).toBe(0);
+  });
+
+  /*
+   * ── THE IMPORTED GLOB, AND WHY THE PAIR IS THE TEST ───────────────────────
+   *
+   * `OwnershipRule.source` decides whether a match is an ASSIGNMENT or a
+   * SUGGESTION: CODEOWNERS_IMPORT is deliberately WEAKER than RULE_PATH and
+   * `mayPage` is false for it. Until the digest read it, a glob pasted out of a
+   * customer's CODEOWNERS file named a team outright in the morning message —
+   * and the second time a team is paged for something it never agreed to own,
+   * it filters the digest, after which the feature is worse than not having it.
+   *
+   * THE TWO CASES DIFFER IN ONE FIELD ON ONE FIXTURE. Same rule, same path,
+   * same team, opposite claim about what the match is worth — so neither can
+   * pass by accident, and the third case pins the `select` that feeds them,
+   * because this stub returns whole rule rows regardless of what was asked for.
+   */
+  it('names the team outright for a rule somebody typed', async () => {
+    db({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.newFailures[0]).toMatchObject({
+      owner: '@payments',
+      ownerState: 'OWNED',
+      ownerProvenance: 'RULE_PATH',
+    });
+    const text = renderDigest(digest!, 'https://app.qaai.test');
+    expect(text).toContain('• checkout applies a promo code — @payments');
+    expect(text).not.toContain('suggested');
+  });
+
+  it('calls an imported glob a suggestion, and declines to page on it', async () => {
+    db({
+      rules: [
+        rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments', source: 'CODEOWNERS' }),
+      ],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.newFailures[0]).toMatchObject({
+      owner: '@payments',
+      ownerState: 'OWNED',
+      ownerProvenance: 'CODEOWNERS_IMPORT',
+    });
+    // STILL OWNED: the owner is right. What changed is what the match is worth,
+    // and conflating those two is how a suggestion comes to page.
+    expect(digest!.unowned).toBe(0);
+    const text = renderDigest(digest!, 'https://app.qaai.test');
+    expect(text).toContain('• checkout applies a promo code — @payments (suggested, not paged)');
+  });
+
+  it('discloses the suppression-ledger cap when it bites, as a count AND a reason', async () => {
+    /*
+     * IT WAS A SILENT `take`. The ledger read was capped at MAX_RESULTS and the
+     * message said nothing, so a window with more suppressions than the cap
+     * under-reported what had been silenced with no sign it had happened. On
+     * the one surface whose job is to be believed, that is a cap applied
+     * without being disclosed AND a failure suppressed without being counted.
+     *
+     * The `+ 1` is what makes the disclosure possible: with a plain `take` the
+     * read cannot tell a window of exactly the cap from one over it.
+     */
+    const over = Array.from({ length: 5_001 }, (_unused, index) => ({
+      kind: 'MUTE' as const,
+      sourceId: `ki_${index}`,
+      suppressed: 1,
+      inForce: true,
+    }));
+    db({ ledger: over });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.ledgerTruncated).toMatchObject({ limit: 5_000, rowsRead: 5_000 });
+    expect(digest!.ledgerTruncated!.reason).toMatch(/FLOOR/);
+    // And a reader of the morning message is told, not just a reader of the
+    // object.
+    expect(renderDigest(digest!, 'https://app.qaai.test')).toContain('are a FLOOR');
+    // The fold stopped at the cap rather than walking the extra row.
+    expect(digest!.suppressions.suppressed).toBe(5_000);
+  });
+
+  it('reports NO ledger truncation for a window of exactly the cap', async () => {
+    // The mirror of the silent cap: `>= MAX_RESULTS` called an untruncated
+    // window truncated, which is a thing reported as unmeasured that WAS
+    // measured.
+    const exact = Array.from({ length: 5_000 }, (_unused, index) => ({
+      kind: 'MUTE' as const,
+      sourceId: `ki_${index}`,
+      suppressed: 1,
+      inForce: true,
+    }));
+    db({ ledger: exact });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(digest!.ledgerTruncated).toBeNull();
+    expect(digest!.suppressions.suppressed).toBe(5_000);
+  });
+
+  it('asks for `source` at all — without it every imported glob pages again', async () => {
+    const observed = db({ rules: [] });
+    await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    expect(observed.ruleQuery[0]!.select).toMatchObject({ source: true });
   });
 
   it('prefers the LAST matching path rule', async () => {
@@ -403,6 +527,44 @@ describe('collectDigest resolves ownership through the shared helpers', () => {
     expect(digest!.suppressions.disclosure).toContain('47 failures by 2 known issues');
     expect(digest!.suppressions.disclosure).toContain('2 failures by 1 quarantined test');
     expect(renderDigest(digest!, 'https://app.test')).toContain('Suppressed in this window');
+  });
+
+  it('counts one ENV_ISSUE suppression per run, because the run IS the source', async () => {
+    /*
+     * ── "THE BOARD WAS QUIET BECAUSE THE ENVIRONMENT WAS DOWN NINE TIMES" ─────
+     *
+     * ENV_ISSUE is the kind most likely to go uncounted: there is no roster page
+     * for it, nobody renews it, and it disappears with the run. It is counted
+     * here by the GENERIC fold and needs no kind-specific constructor, and that
+     * is a choice made at the writer rather than a coincidence —
+     * `envIssueEventRow` sets `sourceId` to the RUN id precisely because
+     * ENV_ISSUE has no owning row to point at, so "distinct live sourceIds" and
+     * "runs the environment was down for" are the same number.
+     *
+     * `packages/agent/src/env-issue.ts` held an `envIssueTally` that built this
+     * tally from `{runs, suppressed}` and had no caller anywhere; it was deleted
+     * and this test is where the fact it encoded now lives, on the path that
+     * actually produces the sentence.
+     */
+    db({
+      ledger: Array.from({ length: 9 }, (_, index) => ({
+        kind: 'ENV_ISSUE' as const,
+        // One row per run, and the run is the source.
+        sourceId: `run_${index}`,
+        suppressed: 12,
+        inForce: true,
+      })),
+    });
+
+    const digest = await collectDigest({ orgId: ORG, projectId: PROJECT }, SINCE, UNTIL);
+
+    const env = digest!.suppressions.byKind.find((tally) => tally.kind === 'ENV_ISSUE')!;
+    expect(env.suppressions).toBe(9);
+    expect(env.suppressed).toBe(108);
+    // A run-scoped suppression is either in force during its run or gone with
+    // it, so there is no expired-ENV population to report. An honest zero.
+    expect(env.expired).toBe(0);
+    expect(digest!.suppressions.disclosure).toContain('108 failures by 9');
   });
 
   /*

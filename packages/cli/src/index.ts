@@ -36,6 +36,8 @@ import {
   TRANSPORT_FLAGS,
   changedPathsFromGit,
   checkApiUrl,
+  declaredSelectionSource,
+  deployCheckArgs,
   echoRefusals,
   fallbackLine,
   parseRunCommand,
@@ -194,11 +196,31 @@ interface RunView {
   /** What the server GRANTED, which is not always what `--shards` asked for. */
   shardCount?: number;
   /**
-   * Read back so the CLI can refuse to report a target it was not given. See
-   * `echoRefusals` — neither field has a writer on any create path today.
+   * Read back so the CLI can refuse to report a target it was not given.
+   *
+   * Both fields have a writer now (`createRunSchema` gained `baseUrlOverride`
+   * and `branch`), so on a current server they come back as sent. The read-back
+   * stays because a customer's CI points an updated CLI at whatever QAAI they
+   * run, and an older one accepts both and drops them. See `echoRefusals`.
    */
   baseUrlOverride?: string | null;
   branch?: string | null;
+  /**
+   * WHAT THE SERVER RECORDED ABOUT WHO CHOSE THE TESTS, and whether that can be
+   * read as a statement about the suite.
+   *
+   * Not used by this file's own decisions — `selection.scope` above is the
+   * CLI's answer, from what it ASKED for, and the exit code stays that. These
+   * are declared because `--json` passes the whole run through and
+   * .github/actions/qaai/action.yml's summary step reads both out of the
+   * payload: the server's record is the one that survives in a job summary a
+   * reviewer reads weeks later.
+   *
+   * `selectionSource: null` is UNKNOWN — a run written before the column
+   * existed — and `selectionSuiteWide` is then null too, never false.
+   */
+  selectionSource?: string | null;
+  selectionSuiteWide?: boolean | null;
   /** The cross-kind suppression ledger. Absent on a server that has none yet. */
   suppressions?: {
     failuresSuppressed: number;
@@ -206,6 +228,10 @@ interface RunView {
     quarantines: number;
     waivers: number;
     expiredAndSilencedNothing: number;
+    /** Every kind that silenced something — including the two the five fields above cannot name. */
+    byKind?: Array<{ kind: string; suppressions: number; suppressed: number; expired: number }>;
+    /** The cap on the server's ledger read, if it BIT. */
+    truncated?: { limit: number; rowsRead: number; reason: string } | null;
   } | null;
   gateResult: {
     passed: boolean;
@@ -330,6 +356,13 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
       if (analysis.strategy === 'SELECTIVE') {
         body.testIds = analysis.testIds;
         body.changedPaths = diff.paths;
+        /*
+         * The one declaration this CLI makes, and the only one it is entitled
+         * to. `DECLARED_SELECTION_SOURCE` holds the decision for every
+         * selection source the CLI has, with the reason the other four declare
+         * nothing — a fifth is a compile error there until somebody chooses.
+         */
+        body.selectionSource = declaredSelectionSource('impact');
         selection = selectionOutcome({
           how: 'impact',
           selected: analysis.totals.run,
@@ -583,39 +616,26 @@ async function cmdRun(opts: GlobalOptions, args: string[]): Promise<number> {
 // ─── qaai deploy-check ───────────────────────────────────────────────────────
 
 /**
- * Post-deploy smoke (§6). Identical to `run` but pins the trigger and the suite
- * to the smoke set, so a deploy pipeline reads as intent rather than a pile of
- * flags. A nonzero exit is what a rollback step keys off.
+ * Post-deploy smoke (§6). Identical to `run` but pins the suite to the smoke
+ * set, so a deploy pipeline reads as intent rather than a pile of flags. A
+ * nonzero exit is what a rollback step keys off.
+ *
+ * The argv rewrite lives in `./run-request.js` like every other decision this
+ * file makes, because this module is the published `bin` and self-invokes on
+ * import — nothing can import it to test it. It used to rebuild the command
+ * line from six flags here and drop every other one, which is how
+ * `deploy-check --shards 4` came to run on one worker.
  */
 async function cmdDeployCheck(opts: GlobalOptions, args: string[]): Promise<number> {
-  const flags = parseFlags(args);
-  /*
-   * The reporter flags are forwarded from raw argv rather than through
-   * `flags`, because they are repeatable and order-sensitive — a
-   * `--reporter-out` belongs to the `--reporter` before it — and `parseFlags`
-   * keeps only the last value of a repeated flag.
-   */
-  const reporterArgs: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (arg !== '--reporter' && arg !== '--reporter-out' && arg !== '--testrail-run') continue;
-    reporterArgs.push(arg);
-    const next = args[i + 1];
-    if (next !== undefined && !next.startsWith('--')) {
-      reporterArgs.push(next);
-      i++;
-    }
+  const forwarded = deployCheckArgs(args);
+  if (!forwarded.ok) {
+    throw new CliError(
+      `Cannot deploy-check:\n${refusalLines(forwarded.refusals)
+        .map((line) => `  ${line}`)
+        .join('\n')}`,
+    );
   }
-
-  return cmdRun(opts, [
-    ...reporterArgs,
-    ...(flags.env ? ['--env', String(flags.env)] : []),
-    ...(flags.junit ? ['--junit', String(flags.junit)] : []),
-    ...(flags.commit ? ['--commit', String(flags.commit)] : []),
-    '--suite',
-    String(flags.suite ?? 'smoke'),
-    '--wait',
-  ]);
+  return cmdRun(opts, forwarded.args);
 }
 
 // ─── qaai status ─────────────────────────────────────────────────────────────

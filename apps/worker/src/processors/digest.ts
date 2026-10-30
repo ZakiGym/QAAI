@@ -63,6 +63,7 @@ import {
   UNATTRIBUTED_FEATURE,
   UNOWNED_TEAM,
   deltaIsMeaningful,
+  mayPage,
 } from '@qaai/shared';
 import type { SnapshotComparability } from '@qaai/shared';
 /*
@@ -89,8 +90,15 @@ import { isRealFailure } from '../../../api/src/lib/run-selection.js';
  * label spelled differently here than in the ticket reads as two owners to the
  * person skimming both.
  */
-import { OWNERSHIP_RULE_SELECT, assignOwner, ownerLabel } from '../../../api/src/lib/ownership.js';
+import {
+  OWNERSHIP_RULE_SELECT,
+  codeownersRuleIdsOf,
+  ownerClaimLabel,
+  ownerLabel,
+  routeOwner,
+} from '../../../api/src/lib/ownership.js';
 import type {
+  OwnerProvenance,
   OwnershipRuleInput,
   OwnershipState,
 } from '../../../api/src/lib/ownership.js';
@@ -152,6 +160,34 @@ export interface DigestItem {
    * went green is work nobody reads. It is not the same as NO_RULES.
    */
   ownerState: OwnershipState | null;
+  /**
+   * HOW the owner was decided, when ownership was resolved for this item.
+   *
+   * ── WHY THE LINE NEEDS IT ───────────────────────────────────────────────
+   *
+   * `owner` and `ownerState` together still cannot tell "Dana owns this
+   * because Dana said so" from "the payments team owns this because somebody
+   * pasted a catch-all glob out of a CODEOWNERS file" — both are
+   * `OWNED`/`@payments`, the same pixel. `mayPage` has existed for a round to
+   * answer exactly that and nothing asked it — and the reason no team has been
+   * paged by a glob yet is only that `OwnershipRule.source` had no writer until
+   * this round, so no rule could be imported in the first place. The CODEOWNERS
+   * import lands in the same round, which is what makes this urgent rather than
+   * tidy: a team that was never asked learns to filter the digest, and then the
+   * RULES_UNUSABLE line is filtered with it.
+   *
+   * NULL means ownership was NOT RESOLVED for this item, the same thing
+   * `ownerState`'s null means — `fixed` items are in that state deliberately.
+   * The two are written together by `collectDigest` or not at all.
+   *
+   * OPTIONAL because this interface is also a fixture shape, and that is
+   * stated rather than implied: `collectDigest` sets it on EVERY item it
+   * builds, so no production digest reaches `ownerSuffix` without it, and a
+   * hand-built `DigestItem` that omits it gets the bare label — which is what
+   * the renderer has always printed, not a fresh claim about a strength
+   * nothing measured.
+   */
+  ownerProvenance?: OwnerProvenance | null;
   /** Flakes only: how many times it needed a retry inside the window. */
   retries?: number;
 }
@@ -172,6 +208,21 @@ export interface Digest {
   /** How many of the new failures reached nobody. */
   unowned: number;
   truncated: boolean;
+  /**
+   * The SUPPRESSION LEDGER's own cap, when it bit.
+   *
+   * A SEPARATE FIELD from `truncated`, not folded into it, because they are two
+   * different facts about two different reads: `truncated` means the digest saw
+   * only part of the window's RESULTS, and this means it saw only part of what
+   * was SILENCED. A reader of "47 failures suppressed by 3 known issues" needs
+   * to know which of those numbers is a floor, and a single boolean cannot say.
+   *
+   * It was a silent `take`: the ledger read was capped and the message said
+   * nothing, so a window with more suppressions than the cap under-reported
+   * what had been silenced with no sign it had happened — a cap applied without
+   * being disclosed, on the one surface whose whole job is to be believed.
+   */
+  ledgerTruncated: { limit: number; rowsRead: number; reason: string } | null;
   /**
    * THE COVERAGE LINE. Null means NOT MEASURED, and never 0%.
    *
@@ -336,9 +387,26 @@ export async function collectDigest(
       ? []
       : await prisma.suppressionEvent.findMany({
           where: { orgId, runId: { in: runs.map((run) => run.id) } },
-          take: MAX_RESULTS,
+          /*
+           * `+ 1`, so the cap can be REPORTED rather than guessed at. `take:
+           * MAX_RESULTS` cannot tell a window of exactly the cap from one over
+           * it, and the difference is whether the suppression headline is a
+           * total or a floor.
+           */
+          take: MAX_RESULTS + 1,
           select: { kind: true, sourceId: true, suppressed: true, inForce: true },
         });
+  const ledgerTruncated: Digest['ledgerTruncated'] =
+    ledger.length > MAX_RESULTS
+      ? {
+          limit: MAX_RESULTS,
+          rowsRead: MAX_RESULTS,
+          reason:
+            `This window holds more than ${MAX_RESULTS} suppression-ledger rows, which is the cap ` +
+            'on this read. The suppression numbers below are a FLOOR: more was silenced than they ' +
+            'say, and the number of distinct suppressed causes is itself the finding.',
+        }
+      : null;
   /*
    * Keyed by the UNION and not by `string`, so no cast is needed below.
    * `SuppressionEvent.kind` is a Postgres enum and Prisma types it as the
@@ -350,7 +418,7 @@ export async function collectDigest(
     SuppressionKind,
     { suppressed: number; live: Set<string>; dead: Set<string> }
   >();
-  for (const row of ledger) {
+  for (const row of ledger.slice(0, MAX_RESULTS)) {
     const tally = byKind.get(row.kind) ?? { suppressed: 0, live: new Set(), dead: new Set() };
     tally.suppressed += row.suppressed;
     // `sourceId` is nullable; a row with none still counts as ONE suppression
@@ -370,7 +438,11 @@ export async function collectDigest(
   const results = (await prisma.testResult.findMany({
     where: { orgId, runId: { in: runs.map((run) => run.id) } },
     orderBy: { createdAt: 'asc' },
-    take: MAX_RESULTS,
+    // `+ 1` for the same reason as the ledger above: `>= MAX_RESULTS` reported
+    // a window of EXACTLY the cap as truncated, which is a truncation that did
+    // not happen — the mirror of the silent one, and a lie in the other
+    // direction.
+    take: MAX_RESULTS + 1,
     select: {
       runId: true,
       testId: true,
@@ -390,6 +462,9 @@ export async function collectDigest(
       verdict: { select: { verdict: true, overriddenTo: true } },
     },
   })) as ResultRow[];
+
+  const resultsTruncated = results.length > MAX_RESULTS;
+  if (resultsTruncated) results.length = MAX_RESULTS;
 
   // The last thing each test did in the window. Ordered ascending above, so the
   // last write wins — which is what "how did it end up" means.
@@ -447,6 +522,13 @@ export async function collectDigest(
       // Absent from the map means ownership was not resolved for this item at
       // all — see `DigestItem.ownerState`. Not NO_RULES, which is a finding.
       ownerState: resolution?.state ?? null,
+      /*
+       * WRITTEN WITH `ownerState`, NEVER WITHOUT IT. Both are null for an item
+       * nothing resolved, and both carry a value for one that was resolved —
+       * including `NONE` for an item that resolved to nobody, which is a
+       * measurement and not an absence.
+       */
+      ownerProvenance: resolution?.provenance ?? null,
     };
   };
 
@@ -467,7 +549,8 @@ export async function collectDigest(
     stillFailing,
     silentSchedules: await silentSchedules(orgId, projectId, runs.length, until),
     unowned: newFailures.filter((row) => !owners.get(row.testId)?.label).length,
-    truncated: results.length >= MAX_RESULTS,
+    truncated: resultsTruncated,
+    ledgerTruncated,
     coverage: await digestCoverage(projectId),
   };
 }
@@ -680,10 +763,23 @@ async function silentSchedules(
     .map((schedule) => schedule.name);
 }
 
-/** What ownership resolved to for one test: the label, and which kind of nobody. */
+/**
+ * What ownership resolved to for one test: the label, which kind of nobody, and
+ * HOW WELL WE KNOW.
+ *
+ * `label` is the BARE name and stays bare. The "(suggested, not paged)"
+ * qualifier is composed by the renderer out of `provenance`, because a label
+ * that sometimes carries a strength and sometimes does not is one field meaning
+ * two things — and the next caller that wants the plain name would have to
+ * strip a suffix off it.
+ */
 export interface DigestOwner {
   label: string | null;
   state: OwnershipState;
+  /** `NONE` when there is no owner, which is the coherent partner of a null label. */
+  provenance: OwnerProvenance;
+  /** `mayPage(provenance)`, computed once rather than re-decided per surface. */
+  pageable: boolean;
 }
 
 /**
@@ -695,10 +791,16 @@ export interface DigestOwner {
  * the morning digest is the one surface where telling them apart changes what
  * somebody does next.
  *
- * `assignOwner` rather than `resolveOwnership` directly: it is the function
- * that refuses to return a bare null, and it is the same one the notify
- * processor and the filing endpoint route through, so the digest's answer and
- * the ticket's answer come from one place.
+ * `routeOwner` rather than `resolveOwnership` directly: it is the function that
+ * refuses to return a bare null, and it is the same one the notify processor
+ * and the filing endpoint route through, so the digest's answer and the
+ * ticket's answer come from one place.
+ *
+ * IT WAS `assignOwner`, which is `routeOwner` minus the strength of its answer.
+ * The owner BUCKETS were selected without `source` and resolved without
+ * `codeownersRuleIds`, so every imported glob reached this morning's message
+ * with the strength of a rule somebody typed. Same matching, same precedence,
+ * one more fact.
  */
 async function ownersFor(
   orgId: string,
@@ -716,7 +818,19 @@ async function ownersFor(
     select: OWNERSHIP_RULE_SELECT,
   })) as OwnershipRuleInput[];
 
-  const assignments = tests.map((test) => ({ test, assignment: assignOwner(test, rules) }));
+  /*
+   * WHICH RULES WERE BULK-IMPORTED, off `OwnershipRule.source` — in
+   * `OWNERSHIP_RULE_SELECT`, so the digest and the notify processor cannot
+   * disagree about whether they asked. A rule QAAI has no record of importing
+   * is treated as one somebody typed, which is true for every row written
+   * before the importer existed.
+   */
+  const codeownersRuleIds = codeownersRuleIdsOf(rules);
+
+  const assignments = tests.map((test) => ({
+    test,
+    assignment: routeOwner(test, rules, { codeownersRuleIds }),
+  }));
 
   const userIds: string[] = [];
   const teamIds: string[] = [];
@@ -753,6 +867,8 @@ async function ownersFor(
       // the state still said OWNED — an owned failure rendering as unowned.
       label: assignment.owner ? ownerLabel(assignment.owner, directory) : null,
       state: assignment.state,
+      provenance: assignment.provenance,
+      pageable: assignment.pageable,
     });
   }
 
@@ -799,9 +915,27 @@ const UNOWNED_PHRASE: Record<OwnershipState, string | null> = {
   RULES_UNUSABLE: 'unowned — an ownership rule could not be evaluated, so routing may have stopped',
 };
 
-/** The owner clause on a digest line: a name, a named kind of nobody, or nothing. */
+/**
+ * The owner clause on a digest line: a name, a named kind of nobody, or nothing.
+ *
+ * `mayPage` IS ASKED HERE, through `ownerClaimLabel` — which the 3am chat alert
+ * calls too, so one fact gets one phrasing. A name printed bare is this message
+ * saying that person or team is on the hook; a WEAK answer (a bulk-imported
+ * glob, an inherited owner, git blame) is shown as a suggestion instead. The
+ * name is still printed, because it is the best lead there is.
+ *
+ * NO PROVENANCE AT ALL leaves the label bare, and that is not a claim that it
+ * is pageable — it is the line this renderer has always printed. `collectDigest`
+ * sets `ownerProvenance` on every item it builds, so the bare branch is reached
+ * only by a hand-built fixture.
+ */
 function ownerSuffix(item: DigestItem): string {
-  if (item.owner) return ` — ${item.owner}`;
+  if (item.owner) {
+    const claim = item.ownerProvenance
+      ? ownerClaimLabel(item.owner, mayPage(item.ownerProvenance))
+      : item.owner;
+    return ` — ${claim}`;
+  }
   const phrase = item.ownerState ? UNOWNED_PHRASE[item.ownerState] : null;
   return phrase ? ` — ${phrase}` : '';
 }
@@ -922,6 +1056,14 @@ export function renderDigest(digest: Digest, webUrl: string): string {
     footnotes.push(
       `This window held more than ${MAX_RESULTS} results, so the digest read only the first ${MAX_RESULTS}.`,
     );
+  }
+  /*
+   * ITS OWN FOOTNOTE, beside the results one and not merged with it. The reader
+   * is being told which number is a floor, and "something was truncated" does
+   * not answer that.
+   */
+  if (digest.ledgerTruncated !== null) {
+    footnotes.push(digest.ledgerTruncated.reason);
   }
   if (footnotes.length > 0) lines.push('', ...footnotes);
 

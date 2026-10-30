@@ -88,7 +88,6 @@ import { applySuppression, SUPPRESSION_KIND_RULES } from '@qaai/shared';
 import type {
   DenominatorEffect,
   SuppressionDecision,
-  SuppressionTally,
 } from '@qaai/shared';
 import { mayPage } from '@qaai/shared';
 import type { OwnerProvenance } from '@qaai/shared';
@@ -864,22 +863,30 @@ export function coverageForEnvIssueRun(evidence: EnvironmentEvidence): EnvIssueC
   };
 }
 
-// ─── The count ───────────────────────────────────────────────────────────────
+// ─── The count, and why it is not computed here ──────────────────────────────
 
-/**
- * The ENV_ISSUE tally for the keystone's `summariseSuppressions`.
+/*
+ * ── THERE WAS AN `envIssueTally` HERE, AND IT IS GONE ─────────────────────────
  *
- * ENV_ISSUE is the kind most likely to go uncounted, because it is the only one
- * nobody clicks: there is no roster page for it, nobody renews it, and it
- * disappears with the run. A tally is how "the board was quiet because the
- * environment was down nine times this week" becomes a sentence instead of an
- * impression.
+ * It built the ENV_ISSUE `SuppressionTally` for `summariseSuppressions` from
+ * `{ runs, suppressed }`, so that "the board was quiet because the environment
+ * was down nine times this week" could be a sentence rather than an
+ * impression. That sentence is still produced — and it was never produced by
+ * this function, which had no caller anywhere in the product. Its only
+ * reference was its own test.
  *
- * `expired` is always 0 and it is not dropped: a run-scoped suppression is
- * either in force during its run or gone with it, so there is no expired-ENV
- * population to report — and the field is in the keystone's `SuppressionTally`,
- * where omitting it would be a different shape rather than an honest zero.
+ * The reason it was redundant is a deliberate choice made at the WRITER rather
+ * than a coincidence: `envIssueEventRow` (apps/worker/src/processors/triage.ts)
+ * sets `sourceId` to the RUN id, precisely because ENV_ISSUE has no owning row
+ * to point at. So the generic ledger fold — which counts distinct live
+ * `sourceId`s per kind, in apps/worker/src/processors/digest.ts and
+ * apps/api/src/routes/runs.ts — already answers "nine runs" for nine
+ * down-environment runs, with no kind-specific constructor at all.
+ *
+ * Deleted rather than wired, because the alternative was a SECOND place that
+ * decides what an ENV_ISSUE count is, and two constructors for one number is
+ * the duplication this vocabulary exists to remove. The fact it encoded is
+ * pinned where the number is actually produced:
+ * 'counts one ENV_ISSUE suppression per run, because the run IS the source'
+ * in apps/worker/src/processors/digest.test.ts.
  */
-export function envIssueTally(args: { runs: number; suppressed: number }): SuppressionTally {
-  return { kind: 'ENV_ISSUE', suppressions: args.runs, suppressed: args.suppressed, expired: 0 };
-}

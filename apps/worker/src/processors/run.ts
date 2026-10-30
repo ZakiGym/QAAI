@@ -92,6 +92,7 @@ import {
    * apps/api/src/routes/runners.ts, which is built from the same validator and
    * which silently dropped the field while this file read around it.
    */
+  SUPPRESSION_LEDGER_SCAN_CAP,
   testResultVariantSchema,
   variantKeyOf,
 } from '@qaai/shared';
@@ -1065,6 +1066,57 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
      * every run is noise, and noise is how a signal gets filtered out.
      */
     const decision = preflight;
+
+    /*
+     * ── THE PREFLIGHT'S OWN ANSWERS, KEPT ────────────────────────────────────
+     *
+     * They were computed here and thrown away, so by the time triage asked "was
+     * this a broken environment rather than a broken app?" the evidence was
+     * gone. `readPreflightChecks` -> `classifyEnvironment` in
+     * apps/worker/src/processors/triage.ts is the reader; without this write
+     * that whole path answers UNKNOWN on every run in the product and the
+     * ENV_ISSUE branch is a no-op. The column existed with no writer and no
+     * reader, which is the defect this round is about.
+     *
+     * The reader validates `name` against `ENV_CHECK_NAMES` and `outcome`
+     * against `ENV_CHECK_OUTCOMES` and drops what it cannot read, so
+     * `PreflightDecision.checks` (`{ name, kind, outcome, detail }`) is stored
+     * as-is, and NO CAST: it is an array of plain objects, which Prisma's
+     * `Json` input already accepts. `finalizeRun` needs one for `gateResult`
+     * because a typed interface has no index signature; this does not, and an
+     * assertion that changes nothing only hides the day the shapes diverge.
+     *
+     * ── ONE SHARD WRITES, AND WHICH ONE IS A DECIDED FACT ───────────────────
+     *
+     * Every shard runs its own preflight against its own image, and the column
+     * holds ONE of them. Writing from all of them is last-writer-wins: the row
+     * would describe an arbitrary shard and nobody could say which, which is a
+     * thing reported as measured that was not the thing measured. So shard 0
+     * writes and the others do not, and `preflightChecks` means "the
+     * environment as shard 0 found it" — a fact with a name. The cost is
+     * recorded rather than hidden: a tooling gap present only on shard 3 does
+     * not reach triage through this column.
+     */
+    if (shard === null || shard.index === 0) {
+      await prisma.run
+        .update({
+          where: { id: run.id },
+          data: { preflightChecks: decision.checks },
+        })
+        .catch((err: unknown) => {
+          /*
+           * A failed write costs triage its environment evidence and must not
+           * cost the customer the run. `classifyEnvironment` then answers
+           * UNKNOWN, which withholds rather than invents — the honest
+           * degradation. The log line is what a reader has.
+           */
+          logger.error(
+            { err, runId: run.id, shard: shard?.index ?? null },
+            'could not record the environment preflight; triage will not be able to tell a broken environment from a broken application on this run',
+          );
+        });
+    }
+
     const troubles = decision.checks.filter((check) => check.outcome === 'UNAVAILABLE');
     if (troubles.length > 0) {
       publishEvent(orgId, {
@@ -1785,6 +1837,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
         trigger: run.trigger,
         prNumber: run.prNumber,
         gateRules: run.project.gateRules,
+        selectionSource: run.selectionSource,
         quarantineBudgetPercent: run.project.quarantineBudgetPercent,
       },
       shardIndex: shard.index,
@@ -1800,6 +1853,7 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       trigger: run.trigger,
       prNumber: run.prNumber,
       gateRules: run.project.gateRules,
+      selectionSource: run.selectionSource,
       quarantineBudgetPercent: run.project.quarantineBudgetPercent,
     },
     /*
@@ -1901,16 +1955,17 @@ async function stampNotRun(
   }
 }
 
-/**
- * How many suppression-ledger rows one run's summary is folded from.
+/*
+ * `SUPPRESSION_LEDGER_SCAN_CAP` IS IMPORTED FROM @qaai/shared NOW, not declared
+ * here. It was a literal in this file and another at the same value in
+ * apps/api/src/routes/runs.ts, and the two surfaces report the same total for
+ * one run — so the day one of them moved, a release decision would have been
+ * made from two different numbers for the same ledger. The comment that
+ * explains the bound lives with the constant.
  *
- * A BOUND that is reported when it bites, never a silent take. One row per
- * (cause, kind) per run, so a 200-test outage under three mutes writes three —
- * past this cap a run had thousands of distinct suppressed causes, which is
- * itself the finding, and the summary under-counts rather than lying about
- * having seen everything.
+ * Re-exported because this file's own tests and processors/checks.ts name it.
  */
-export const SUPPRESSION_LEDGER_SCAN_CAP = 2_000;
+export { SUPPRESSION_LEDGER_SCAN_CAP };
 
 /**
  * This run's suppressions, tallied by kind, for `runOutcome`.
@@ -1928,7 +1983,7 @@ export const SUPPRESSION_LEDGER_SCAN_CAP = 2_000;
  * only writer of; letting a ledger row through as well would double the one
  * total a release decision reads.
  */
-async function suppressionTalliesFor(
+export async function suppressionTalliesFor(
   orgId: string,
   runId: string,
 ): Promise<{ tallies: SuppressionTally[]; capped: number | null }> {
@@ -2308,6 +2363,10 @@ export async function failRunFromDeadJob(args: {
       projectId: true,
       trigger: true,
       prNumber: true,
+      // Read because the gate needs it: a rescued run is still a run with a
+      // selection, and a gate scored without it publishes a suite-wide pass
+      // over whatever sliver the dead job was carrying.
+      selectionSource: true,
       project: { select: { gateRules: true, quarantineBudgetPercent: true } },
     },
   });
@@ -2331,6 +2390,7 @@ export async function failRunFromDeadJob(args: {
       trigger: run.trigger,
       prNumber: run.prNumber,
       gateRules: run.project.gateRules,
+      selectionSource: run.selectionSource,
       quarantineBudgetPercent: run.project.quarantineBudgetPercent,
     },
     counts,
@@ -2353,6 +2413,13 @@ async function finalizeRun(args: {
     trigger: string;
     prNumber: number | null;
     gateRules: unknown;
+    /**
+     * `Run.selectionSource`. REQUIRED and NULLABLE — null is UNKNOWN, which is
+     * NOT `FULL_SUITE`. Threaded through to `evaluateRunGates` so a gate rule
+     * can refuse a suite-wide claim over a selective run; see
+     * packages/runner/src/gates.ts.
+     */
+    selectionSource: string | null;
     /** Null means "never configured"; the gate falls back to the documented default. */
     quarantineBudgetPercent?: number | null;
   };
@@ -2449,6 +2516,7 @@ async function finalizeRun(args: {
     rows,
     run.projectId,
     run.gateRules,
+    run.selectionSource,
     run.quarantineBudgetPercent,
   );
 
@@ -2874,6 +2942,13 @@ async function completeShardedRun(args: {
     trigger: string;
     prNumber: number | null;
     gateRules: unknown;
+    /**
+     * `Run.selectionSource`. REQUIRED and NULLABLE — null is UNKNOWN, which is
+     * NOT `FULL_SUITE`. Threaded through to `evaluateRunGates` so a gate rule
+     * can refuse a suite-wide claim over a selective run; see
+     * packages/runner/src/gates.ts.
+     */
+    selectionSource: string | null;
     quarantineBudgetPercent?: number | null;
   };
   /** The shard that finished, or null when the scheduler sweep is asking. */
@@ -3099,6 +3174,9 @@ export async function sweepStalledShardedRuns(): Promise<number> {
       projectId: true,
       trigger: true,
       prNumber: true,
+      // See the dead-job read above: the sweep finalises for real, so it needs
+      // the same selection the inline path has.
+      selectionSource: true,
       project: { select: { gateRules: true, quarantineBudgetPercent: true } },
     },
     // Oldest first. With the cap below, a pool holding more than 100 live
@@ -3126,6 +3204,7 @@ export async function sweepStalledShardedRuns(): Promise<number> {
           trigger: run.trigger,
           prNumber: run.prNumber,
           gateRules: run.project.gateRules,
+          selectionSource: run.selectionSource,
           quarantineBudgetPercent: run.project.quarantineBudgetPercent,
         },
         shardIndex: null,
@@ -4026,6 +4105,21 @@ async function evaluateRunGates(
   results: readonly RunResultRow[],
   projectId: string,
   rawRules: unknown,
+  /**
+   * `Run.selectionSource`, RAW — null included.
+   *
+   * REQUIRED, with no default, and that is the point. `GateInput.selection`
+   * treats ABSENT as "keep today's answer and say nobody looked", so a
+   * parameter with a default would let a caller silently publish a suite-wide
+   * pass over a sliver and nothing would flag it. Passing it is now a compile
+   * error to forget.
+   *
+   * NULL STAYS NULL. A null is a run written before the column existed, which
+   * is UNKNOWN, and `suiteWide` in packages/runner/src/gates.ts withholds the
+   * suite-wide claim on it. Coercing it to FULL_SUITE here is the null that
+   * became a fact.
+   */
+  selectionSource: string | null,
   budgetPercent?: number | null,
 ) {
   const rules =
@@ -4049,6 +4143,14 @@ async function evaluateRunGates(
           : (r.verdict?.verdict ?? null),
       durationMs: r.durationMs,
     })),
+    /*
+     * WHAT CHOSE THE TESTS, carried into the rules. Without this the finaliser
+     * scored `MIN_PASS_RATE` over an eleven-test impact selection and published
+     * 100% as a statement about the suite — the column had a writer in
+     * apps/api/src/routes/runs.ts and no reader anywhere, which is half of the
+     * defect it was minted to fix.
+     */
+    selection: { source: selectionSource },
     ...(await quarantineHealthFor(orgId, projectId, budgetPercent, now)),
   });
 }

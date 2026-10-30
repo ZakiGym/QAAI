@@ -1505,7 +1505,7 @@ export async function computeCoverage(options: ComputeOptions): Promise<Computed
       dimensions,
       rollups: rollups.rows,
       crawlFingerprint: inventory.fingerprint,
-      denominatorDefinition: denominatorDefinitionOf(inventory, result.totals.denominator),
+      denominatorDefinition: denominatorDefinitionOf(inventory, result.totals.denominator, waivers),
       /*
        * THE GATE ON THE SWEEP. Retirement means "every item this computation
        * did not see is gone", and that is only true when the union saw
@@ -2338,16 +2338,43 @@ function rollupItemFor(
  * than hand-written per call site — a sentence that varies by caller would make
  * every snapshot uncomparable with every other.
  */
-function denominatorDefinitionOf(inventory: SurfaceInventory, denominator: number): string {
+function denominatorDefinitionOf(
+  inventory: SurfaceInventory,
+  denominator: number,
+  waivers: Readonly<Record<string, SurfaceWaiver>>,
+): string {
   const axes = [...new Set(inventory.items.map((item) => item.kind))].sort();
   const heldOut = inventory.heldOut;
+  /*
+   * ── THE WAIVER CLAUSE IS MEASURED, NOT ASSERTED ───────────────────────────
+   *
+   * This sentence read "waived items leave the denominator with an owner and
+   * an expiry" unconditionally, which was a claim the write path did not
+   * enforce: the waiver door accepted a null expiry, and line 2299 of this
+   * same file prints ", with NO expiry" for exactly those items. This string is
+   * stored on every CoverageSnapshot, compared VERBATIM by `snapshotDelta` to
+   * decide comparability, and refused-if-empty by `attest` — so it is the
+   * sentence a customer signs, and a cap disclosed as bounded when it is not is
+   * the one lie this product cannot afford.
+   *
+   * The door now requires an expiry (`applySuppression`, routes/surface.ts), so
+   * on a project with no legacy rows the clause reads exactly as it always did.
+   * Where unbounded rows remain, it names how many.
+   */
+  const unbounded = Object.values(waivers).filter((w) => w.expiresAtIso === null).length;
+  const waiverClause =
+    unbounded === 0
+      ? 'waived items leave the denominator with an owner and an expiry.'
+      : `waived items leave the denominator with an owner, and ${unbounded} of ` +
+        `${Object.keys(waivers).length} of them have NO expiry — those were written before an ` +
+        'expiry was required and nothing will lapse them.';
   return (
     `${denominator} CoverageItem(s) across ${axes.length} axis/axes (${axes.join(', ')}), ` +
     `declared by ${inventory.participation.filter((p) => p.participation === 'LOADED').length} of ` +
     `${inventory.participation.length} declarer(s); union ` +
     `${inventory.complete === null ? 'completeness UNKNOWN' : inventory.complete ? 'complete' : 'PARTIAL'}; ` +
     `${heldOut.unexercisable} unexercisable and ${heldOut.refused} refused item(s) held out of the ` +
-    'division with a reason; waived items leave the denominator with an owner and an expiry.'
+    `division with a reason; ${waiverClause}`
   );
 }
 

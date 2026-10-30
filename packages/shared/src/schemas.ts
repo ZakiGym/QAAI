@@ -72,6 +72,7 @@ import {
   ORG_ROLES,
   PRIORITIES,
   RUN_FINISHED_PREFS,
+  RUN_SELECTION_SOURCES,
   TEST_RESULT_STATUSES,
   TEST_TYPES,
   UI_FRAMEWORKS,
@@ -288,6 +289,30 @@ const httpUrl = z
   .string()
   .url()
   .refine((u) => ['http:', 'https:'].includes(new URL(u).protocol), 'must be http or https');
+
+/**
+ * A git branch name — no spaces, no leading dash, no `..`, no path tricks.
+ *
+ * Declared up here with the other primitives rather than beside `gitRepo` in
+ * the git section, because `createRunSchema` (§5) uses it and a `const` cannot
+ * be read before the line that declares it has run.
+ *
+ * It is a SECURITY validator and not tidiness. A branch name arrives from a
+ * request, is stored on `Run.branch`, and is read back out by the PR check, by
+ * the Jira issue body (apps/api/src/lib/issues.ts) and by every reporter — so
+ * the characters git itself uses to mean "a different ref" (`~`, `^`, `:`, `?`,
+ * `*`, `[`, a backslash) are refused at the only door, and `..` and a leading
+ * `-` or `/` with them: `--upload-pack=…` is an argument, not a branch.
+ */
+const gitBranch = z
+  .string()
+  .min(1)
+  .max(120)
+  .regex(/^[^\s~^:?*[\\]+$/, 'invalid branch name')
+  .refine(
+    (b) => !b.includes('..') && !b.startsWith('-') && !b.startsWith('/'),
+    'invalid branch name',
+  );
 
 // ─── Auth (§1) ───────────────────────────────────────────────────────────────
 
@@ -3014,6 +3039,94 @@ export const createRunSchema = z.object({
    * stop nothing — a fail-fast that trips on noise is one people turn off.
    */
   failFast: z.boolean().nullish(),
+
+  /**
+   * WHERE THIS RUN'S BROWSER GOES, overriding the environment's base URL for
+   * this run only — a preview deploy's address, which is the whole reason a
+   * per-run override exists.
+   *
+   * ── WHY THIS FIELD WAS MISSING, AND WHAT THAT COST ────────────────────────
+   *
+   * `Run.baseUrlOverride` has had a column, readers in
+   * apps/api/src/lib/runners.ts, lib/bisect.ts and lib/run-selection.ts, and a
+   * `--base-url` flag on the CLI and the Action — and no acceptor here. A zod
+   * object ignores unknown keys, so every `--base-url` ever sent was accepted
+   * and dropped, and the CLI had to read the field back off the created run and
+   * EXIT 2 rather than report a target the run never used. The flag worked on
+   * no server that exists.
+   *
+   * ── WHY IT IS THE MOST DANGEROUS FIELD IN THIS SCHEMA ─────────────────────
+   *
+   * It decides which host a browser inside QAAI's network opens, on a
+   * caller's say-so, which is the shape of every SSRF. Two checks, in two
+   * places, and the division is deliberate:
+   *
+   *   HERE: the SYNTAX. http(s) only (so it can never become `file:` or
+   *   `javascript:`) and NO USERINFO — a URL carrying `user:pass@` is stored,
+   *   logged by the worker, printed in a report and handed to the runner, which
+   *   is the one place a credential is guaranteed to be written down.
+   *
+   *   NOT HERE: the RESOLVER. `resolvesPublicly` needs DNS, and a name resolved
+   *   in this process is not the name the browser will resolve — so the check
+   *   that matters runs where the connection is opened, in
+   *   `guardProbeHost`/`environmentPreflight` (packages/runner/src/preflight.ts),
+   *   which refuses a private, loopback or ambiguous host and BLOCKS the tests
+   *   that depend on it. This schema must not be described as having done that
+   *   check. The route additionally applies `classifyHost` — the synchronous
+   *   half, no DNS — before the row is written, so an obviously-internal host
+   *   is refused in a second rather than at preflight.
+   */
+  baseUrlOverride: httpUrl
+    .max(2048)
+    .refine((u) => {
+      const parsed = new URL(u);
+      return parsed.username === '' && parsed.password === '';
+    }, 'must not carry a username or password')
+    .nullish(),
+
+  /**
+   * The branch this run is for, so a re-run and a PR check can find it.
+   *
+   * Same story as `baseUrlOverride`: `Run.branch` has a column, the
+   * rerun-failures endpoint copies it, reports carry it, the Jira issue body
+   * prints it — and no create path wrote it, so every run in every install
+   * carried null and a PR check looking a run up by branch found nothing.
+   *
+   * `gitBranch` and not `z.string()`. The value is stored and read back out
+   * next to git refs, so the characters git reads as "a different ref" are
+   * refused at the door; see that validator's own comment.
+   */
+  branch: gitBranch.nullish(),
+
+  /**
+   * WHAT CHOSE THE TESTS, as the CALLER knows it — a claim this endpoint
+   * checks, never one it simply stores.
+   *
+   * ── WHY A CALLER MAY DECLARE THIS AT ALL ──────────────────────────────────
+   *
+   * The server computes its own answer from the request (an id list, a suite, a
+   * diff it analysed, or everything) and that answer is the default. But a CLI
+   * that ran the impact analysis ITSELF and sent the resulting ids arrives
+   * looking exactly like a caller who typed them: the server sees `testIds` and
+   * can only honestly say EXPLICIT, while the truth is IMPACT. The caller is
+   * the only one who knows that, so it may say so.
+   *
+   * ── THE RULE THAT MAKES THAT SAFE, WHICH IS NOT IN THIS SCHEMA ────────────
+   *
+   * A declaration may only ever NARROW the claim. `POST /runs` REFUSES a
+   * declared source that is suite-wide (`SUITE_WIDE_SELECTIONS`) when its own
+   * reasoning says the run is not — because the one thing this field must never
+   * do is let a run of 11 tests be labelled FULL_SUITE and have a MIN_PASS_RATE
+   * gate report 100% as a suite pass. That check needs both answers, so it
+   * lives at the route and not here; this field's job is to bound the
+   * vocabulary.
+   *
+   * `z.enum(RUN_SELECTION_SOURCES)` — the stored domain and the accepted domain
+   * are the same array, so they cannot disagree. NULL IS NOT `FULL_SUITE`: an
+   * absent declaration means "I am not telling you", and the server's own
+   * answer is used.
+   */
+  selectionSource: z.enum(RUN_SELECTION_SOURCES).nullish(),
 });
 
 // ─── Chat (§3.5) ─────────────────────────────────────────────────────────────
@@ -3036,16 +3149,15 @@ const gitRepo = z
     'use owner/repo or an https:// URL',
   );
 
-/** A git branch name — no spaces, no leading dash, no `..`, no path tricks. */
-const gitBranch = z
-  .string()
-  .min(1)
-  .max(120)
-  .regex(/^[^\s~^:?*[\\]+$/, 'invalid branch name')
-  .refine(
-    (b) => !b.includes('..') && !b.startsWith('-') && !b.startsWith('/'),
-    'invalid branch name',
-  );
+/*
+ * `gitBranch` used to be declared here, beside `gitRepo`. It moved up to the
+ * primitives at the top of this file the day `createRunSchema` gained a
+ * `branch` field: a `const` is in its temporal dead zone until the line that
+ * declares it runs, and `createRunSchema` is evaluated hundreds of lines above
+ * this one, so referencing it from there threw on import rather than failing to
+ * compile. The validator itself is unchanged; both integration schemas below
+ * still use it.
+ */
 
 export const createIntegrationSchema = z.object({
   kind: z.enum(GIT_INTEGRATION_KINDS),
@@ -3118,12 +3230,11 @@ export const updateChatIntegrationSchema = z
  * be the literal `true`: a network write to the customer's own repo is never
  * implicit, and a stray/replayed request without it is rejected.
  */
-export const gitPushSchema = z.object({
-  integrationId: z.string().min(1),
-  branch: gitBranch.optional(),
-  message: z.string().min(1).max(500).optional(),
-  confirm: z.literal(true),
-});
+/*
+ * `gitPushSchema` IS DEFINED LOWER DOWN, beside `prPurposeSchema`, which it
+ * now depends on: the pull-request half of a push used to be validated by a
+ * route-local schema and is part of this one. See the PR section.
+ */
 
 // ─── Pagination ──────────────────────────────────────────────────────────────
 
@@ -7681,6 +7792,83 @@ export type PrPurpose = (typeof PR_PURPOSES)[number];
 export const prPurposeSchema = z.enum(PR_PURPOSES);
 
 /**
+ * How many characters of `causeIdentity` are read.
+ *
+ * NOT the safety property — `prCauseKey` hashes the value, so what leaves the
+ * route is 64 hex characters and `branchNameFor` takes 12 of them. The bound
+ * exists so a caller gets a zod PATH back rather than an untraceable cause key,
+ * and so a megabyte of text cannot be hashed.
+ */
+export const PR_CAUSE_IDENTITY_MAX = 200;
+
+/**
+ * Push the repo to a connected git remote, and — when asked — open the pull
+ * request for it.
+ *
+ * ── ONE SCHEMA, BECAUSE THE FIELDS CONSTRAIN EACH OTHER ────────────────────
+ *
+ * The three pull-request fields were validated by a second, route-local schema
+ * in apps/api/src/routes/projects.ts, which meant `gitPushSchema` accepted a
+ * body carrying `openPr` and knew nothing about it: the dependency between
+ * `openPr` and its two companions could not be expressed, because neither
+ * schema could see both halves. Lifted here, `openPr` without a purpose is one
+ * refusal with one path.
+ *
+ * ── AND THE TARGET IS NOT NEGOTIABLE ───────────────────────────────────────
+ *
+ * `branch` is REFUSED beside `openPr` rather than overridden. The repository and
+ * the base branch come off the `Integration` row and the head branch is composed
+ * from the hash of the cause, so a caller that could name the branch could
+ * choose where QAAI's commits land. The refusal names the PATH and does not
+ * echo the value.
+ */
+export const gitPushSchema = z
+  .object({
+    integrationId: z.string().min(1),
+    branch: gitBranch.optional(),
+    message: z.string().min(1).max(500).optional(),
+    confirm: z.literal(true),
+    /**
+     * The literal `true`, matching `confirm`. A write into a customer's
+     * repository is never implicit and neither is a review request in it —
+     * `false` is refused rather than read as "no", so there is no third state.
+     */
+    openPr: z.literal(true).optional(),
+    purpose: prPurposeSchema.optional(),
+    /**
+     * What the pull request is ABOUT, in QAAI's own terms: a cluster key, a
+     * campaign id, a test id. Shape-bounded, never interpreted.
+     *
+     * `|` is excluded because `prCauseKey` throws on an ambiguous separator and
+     * a throw inside the route would surface as a 500 for what is a 400-shaped
+     * mistake. The rest is the identifier charset the cockpit already uses.
+     */
+    causeIdentity: z
+      .string()
+      .min(1)
+      .max(PR_CAUSE_IDENTITY_MAX)
+      .regex(/^[A-Za-z0-9._:/-]+$/, 'a cause identity is an identifier, not a sentence')
+      .optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.openPr && (value.purpose === undefined || value.causeIdentity === undefined)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'a pull request needs a purpose and a cause identity',
+        path: ['openPr'],
+      });
+    }
+    if (value.openPr && value.branch !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'a pull request is opened from the branch QAAI composes for the cause',
+        path: ['branch'],
+      });
+    }
+  });
+
+
+/**
  * REQUESTED is the state the row is created in BEFORE the host is called, so a
  * crash between the insert and the API call leaves a row that says "we were
  * about to" rather than a claimed PR nobody can find. FAILED carries its reason
@@ -7712,6 +7900,60 @@ export const prRecordStateSchema = z.enum(PR_RECORD_STATES);
  * and `.strict()` means a caller that tried to pass one is refused rather than
  * having it silently ignored into a log line.
  */
+/**
+ * A path QAAI will RENDER INTO somebody else's repository.
+ *
+ * ── WHY A PATH IS UNTRUSTED TEXT ──────────────────────────────────────────────
+ *
+ * `buildPullRequestBody` renders each of these as an inline code span in the
+ * markdown body of a pull request opened in a customer's repository — a
+ * document a reviewer reads and the next model in the loop reads. The value
+ * reaching it is `Test.filePath`, which is customer- or model-authored and
+ * whose own validator permits newlines; a path carrying "`\n\n## IGNORE THE
+ * ABOVE\n\n`" closes the code span and writes a heading into the body. The
+ * explanation beside it on the same call IS fenced through `untrusted()`. The
+ * path was not, and it travels further: a path is also the thing that decides
+ * WHERE a file is written.
+ *
+ * So it refuses, exactly as `outwardText` does, and for the same reason: a path
+ * that needs escaping is a path composed from the wrong source, and sanitising
+ * it would turn a hostile value into a working-looking one. Refused rather than
+ * stripped:
+ *
+ *   · fence markers — the span would escape its fence;
+ *   · control characters, newline and carriage return among them — the markdown
+ *     breaks out of its line and a reviewer sees a document the API never sent;
+ *   · a backtick — it closes the inline code span this renders into;
+ *   · an absolute path or a `..` segment — not a rendering concern but a
+ *     WRITING one, and this is the list a writer is handed.
+ *
+ * Bounded at 1024, unchanged: that is a path, and anything longer is a body.
+ */
+const repoPath = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine((v) => !fenceMarkerPattern().test(v), {
+    message: 'carries a fence marker, so it was composed from untrusted text',
+  })
+  .refine(
+    (v) =>
+      ![...v].some((ch) => {
+        const c = ch.codePointAt(0) ?? 0;
+        return c < 0x20 || c === 0x7f;
+      }),
+    { message: 'carries a control character, which would break the line it is rendered into' },
+  )
+  .refine((v) => !v.includes('`'), {
+    message: 'carries a backtick, which would close the code span it is rendered into',
+  })
+  .refine((v) => !v.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(v), {
+    message: 'is absolute, and a path QAAI writes is relative to the repository root',
+  })
+  .refine((v) => !v.split(/[\\/]/).includes('..'), {
+    message: 'climbs out of the repository with a .. segment',
+  });
+
 export const openPullRequestSchema = z
   .object({
     projectId: z.string().min(1),
@@ -7725,14 +7967,14 @@ export const openPullRequestSchema = z
     title: outwardText(200),
     /** Bounded. A PR body is the one place a long explanation belongs, and it is still fenced. */
     body: z.string().min(1).max(60_000),
-    filePaths: z.array(z.string().min(1).max(1024)).max(2000),
+    filePaths: z.array(repoPath).max(2000),
     /**
      * Paths QAAI refused to write because a human owns them. Carried so the
      * reviewer sees what was LEFT ALONE — `pushRepo` used to infer ownership
      * from absence and `git rm` every tracked file not in its tree, which
      * erased human edits in the same branch.
      */
-    preservedPaths: z.array(z.string().min(1).max(1024)).max(2000),
+    preservedPaths: z.array(repoPath).max(2000),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -7884,22 +8126,46 @@ export const RUN_REQUEST_FLAGS = {
     shape: 'boolean',
     help: 'Stop at the first REAL failure. A flake, a quarantined test and a skip stop nothing.',
   },
+  baseUrlOverride: {
+    flag: 'base-url',
+    shape: 'string',
+    help: 'Override the environment base URL for this run only — a preview deploy’s address. An http(s) URL with no credentials in it; the host is classified where the browser opens it, and a private, loopback or unparseable host BLOCKS the tests that need it rather than being attempted.',
+  },
+  branch: {
+    flag: 'branch',
+    shape: 'string',
+    help: 'The branch this run is for, so a re-run and a PR check can find it',
+  },
+  /*
+   * Set by the server from the request, and by the CLI from what it ASKED for —
+   * never typed by a human, which is why there is no flag.
+   *
+   * A flag would be the one input in this table that can make a run claim more
+   * than it did: `--selection-source FULL_SUITE` on an impact run of 11 tests
+   * is how a MIN_PASS_RATE gate comes to report 100% as a suite pass. `POST
+   * /runs` refuses a declaration that widens its own answer, so even a
+   * hand-written request cannot do it — but the surface a customer types into
+   * should not offer the attempt in the first place.
+   */
+  selectionSource: null,
 } as const satisfies Record<RunRequestKey, RunFlagSpec | null>;
 
 /**
  * Flags the CLI and the Action expose that are NOT fields of `createRunSchema`.
  *
  * Kept separate on purpose, so the record above stays a statement about the run
- * contract and nothing else. `base-url` is here and not there because it
- * overrides the ENVIRONMENT's url for one run — it is answered by
- * `environmentUpdateSchema`'s territory, not by the run body — and because a
- * caller pointing a gate at an arbitrary host is a decision that needs a
- * host-classification check (`classifyHost`, packages/shared/src/private-address.ts)
- * before anything connects, which a run field would not get.
+ * contract and nothing else.
+ *
+ * `base-url` USED TO BE HERE, and the reason given was that a caller pointing a
+ * gate at an arbitrary host needs a host-classification check "which a run
+ * field would not get". That was a true worry and the wrong conclusion: being
+ * absent from the run contract did not give the field a check, it gave it no
+ * writer at all — the flag was accepted by both surfaces, dropped by the
+ * server, and worked nowhere. It is now `baseUrlOverride` above, with the
+ * syntax refused in the schema and the host classified at the route and again
+ * where the browser opens it.
  */
 export const EXTRA_RUN_FLAGS = {
-  'base-url':
-    'Override the environment base URL for this run only. Classified before use; a private or unresolvable host is refused, not attempted.',
   'impact-only':
     'Ask POST /impact/analyze and print the selected test ids without running them — the three-line curl recipe impact.ts documented, as a flag.',
   suppressions:
@@ -7914,6 +8180,30 @@ export const EXTRA_RUN_FLAGS = {
  * stored it under the key it was written with, so every `--no-wait` run polled
  * to completion anyway and the documentation had been wrong since it was
  * written.
+ *
+ * ── IT HAS TO KNOW EVERY FLAG, NOT EVERY RUN FIELD ──────────────────────────
+ *
+ * `.strict()` plus an incomplete key list is not a strict validator, it is a
+ * validator that refuses working invocations. This object knew the eleven run
+ * fields and three of the CLI's own flags, and did not know `--impact`,
+ * `--impact-base`, `--rerun-failures-of`, `--include-flaky`,
+ * `--require-full-suite`, `--project`, `--junit`, `--timeout`, `--wait`,
+ * `--no-wait` or the three reporter flags — so `qaai run --impact` validated
+ * against this schema is REFUSED, while the CLI's own parser accepts it. One of
+ * the two was going to be used to check a config file, and whichever it was
+ * would have been wrong.
+ *
+ * So the key set is now the CLI's WHOLE grammar, which is
+ * `RUN_REQUEST_FLAGS` ∪ `EXTRA_RUN_FLAGS` ∪ the transport flags, and
+ * packages/cli/src/index.test.ts diffs these keys against the parser's own
+ * `KNOWN_FLAGS` so the two cannot drift again.
+ *
+ * The SHAPES follow the CLI's parser: a switch is a boolean, a repeatable flag
+ * is an array, and `z.coerce.number()` is used wherever argv hands over a
+ * string. `--reporter` and `--reporter-out` are order-sensitive pairs that
+ * `report.ts` consumes from raw argv, so they are arrays here: this schema can
+ * say they are PRESENT and legal, and deliberately does not claim to validate
+ * their pairing.
  */
 export const cliRunOptionsSchema = z
   .object({
@@ -7932,25 +8222,81 @@ export const cliRunOptionsSchema = z
       .max(24 * 14)
       .nullish(),
     'fail-fast': z.boolean().nullish(),
-    'base-url': z.string().url().nullish(),
+    /*
+     * The same validator the run body runs, so a URL this accepts is a URL the
+     * server can store: a flag check that passed and a 400 two seconds later is
+     * the arrangement this schema exists to prevent. It was `z.string().url()`,
+     * which accepts `file:///etc/passwd` and `https://user:pass@host`.
+     */
+    'base-url': createRunSchema.shape.baseUrlOverride,
+    branch: createRunSchema.shape.branch,
     'impact-only': z.boolean().nullish(),
     suppressions: z.boolean().nullish(),
+
+    // ── The CLI's own flags: the two selection SOURCES, and transport ───────
+    project: z.string().min(1).nullish(),
+    impact: z.boolean().nullish(),
+    'impact-base': z.string().min(1).max(200).nullish(),
+    'rerun-failures-of': z.string().min(1).nullish(),
+    'include-flaky': z.boolean().nullish(),
+    'require-full-suite': z.boolean().nullish(),
+    junit: z.string().min(1).nullish(),
+    'no-wait': z.boolean().nullish(),
+    wait: z.boolean().nullish(),
+    timeout: z.coerce.number().int().min(1).max(86_400).nullish(),
+    reporter: z.array(z.string().min(1)).max(10).nullish(),
+    'reporter-out': z.array(z.string().min(1)).max(10).nullish(),
+    'testrail-run': z.string().min(1).nullish(),
   })
   .strict()
   .superRefine((value, ctx) => {
-    if (value.cache === true && (value['changed-paths'] ?? []).length === 0) {
+    /*
+     * `--impact` COMPUTES the diff from git, so it satisfies the two rules
+     * below that need one. Without this the schema refuses
+     * `qaai run --impact --cache`, which the CLI's parser accepts and which is
+     * the documented way to use caching in CI.
+     */
+    const hasDiff = (value['changed-paths'] ?? []).length > 0 || value.impact === true;
+
+    if (value.cache === true && !hasDiff) {
       ctx.addIssue({
         code: 'custom',
         message:
-          '--cache does nothing without --changed-paths: reuse needs both "this test has not changed" and "nothing in the diff can reach it"',
+          '--cache does nothing without --changed-paths or --impact: reuse needs both "this test has not changed" and "nothing in the diff can reach it"',
         path: ['cache'],
       });
     }
-    if (value['impact-only'] === true && value['changed-paths'] === undefined) {
+    if (value['impact-only'] === true && !hasDiff) {
       ctx.addIssue({
         code: 'custom',
-        message: '--impact-only has nothing to analyse without --changed-paths',
+        message: '--impact-only has nothing to analyse without --changed-paths or --impact',
         path: ['impact-only'],
+      });
+    }
+    if (value.impact === true && (value['changed-paths'] ?? []).length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          '--impact computes --changed-paths from git, so it cannot be combined with --changed-paths given by hand',
+        path: ['impact'],
+      });
+    }
+    if (value.impact === true && !value.project) {
+      ctx.addIssue({
+        code: 'custom',
+        message: '--impact needs --project: POST /impact/analyze is asked per project',
+        path: ['impact'],
+      });
+    }
+    if (
+      value['rerun-failures-of'] != null &&
+      ((value.test ?? []).length > 0 || hasDiff)
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        message:
+          '--rerun-failures-of already decides which tests run, so it cannot be combined with --test, --changed-paths or --impact',
+        path: ['rerun-failures-of'],
       });
     }
   });

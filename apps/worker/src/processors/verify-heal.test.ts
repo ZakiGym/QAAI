@@ -9,7 +9,6 @@
 
 import { describe, expect, it } from 'vitest';
 import { HEAL_VERIFY_STATES, verificationRunTag } from '@qaai/agent';
-import type { HealVerifyState } from '@qaai/agent';
 import {
   admitRetriage,
   healClaim,
@@ -364,6 +363,40 @@ describe('an applied heal with no verification state is a hole, not a resting pl
       refusal: 'NO_APPLY_TIME',
     });
   });
+
+  it('does NOT apply the grace period to the apply path own start', () => {
+    /*
+     * THE DEFECT: the grace period exists to stop a SWEEP racing the apply
+     * path's own start. An `APPLY` job IS that start — it is what replaced the
+     * three module-local copies of `startHealVerification` — so applying a
+     * grace period to it refuses the only start this heal is ever going to get
+     * and leaves `verifyState` NULL until the hole sweep notices minutes later.
+     * A verification delayed by exactly the window meant to protect it.
+     */
+    const justApplied = new Date(NOW.getTime() - 1_000);
+    expect(needsVerificationStart({ ...applied, decidedAt: justApplied }, NOW, false)).toEqual({
+      start: true,
+    });
+    // And it still refuses for every reason that is not about timing: a heal
+    // nobody applied, and one that already has a state, are not holes.
+    expect(needsVerificationStart({ ...applied, state: 'PROPOSED' }, NOW, false)).toEqual({
+      start: false,
+      refusal: 'NOT_APPLIED',
+    });
+    expect(
+      needsVerificationStart({ ...applied, verifyState: 'UNVERIFIABLE' }, NOW, false),
+    ).toEqual({ start: false, refusal: 'ALREADY_HAS_STATE' });
+  });
+
+  it('starts a heal with no apply time when the caller IS the apply path', () => {
+    // `NO_APPLY_TIME` only exists because the grace period needs a clock to
+    // measure. With no grace period to measure there is nothing to refuse, and
+    // refusing here would mean a heal whose `decidedAt` write lost a race is
+    // never verified at all.
+    expect(needsVerificationStart({ ...applied, decidedAt: null }, NOW, false)).toEqual({
+      start: true,
+    });
+  });
 });
 
 // ─── 5. Re-triage, bounded ──────────────────────────────────────────────────
@@ -466,17 +499,26 @@ describe('a re-triage is bounded, rate-limited and deterministic', () => {
 
 // ─── 6. The processor ───────────────────────────────────────────────────────
 
+type Recorded = Awaited<ReturnType<VerificationRecorder['record']>>;
+
 function processFakes(
   heal: Awaited<ReturnType<VerifyHealStore['loadHeal']>>,
-  recorded: { state: HealVerifyState; reverted: boolean } = { state: 'VERIFIED', reverted: false },
+  recorded: Recorded = { wrote: true, state: 'VERIFIED', reverted: false, revertedToVersion: null },
 ) {
   const f = startFakes({ heal });
-  const recorder: VerificationRecorder & { calls: number; lastHealState: string | null } = {
+  const recorder: VerificationRecorder & {
+    calls: number;
+    lastHealState: string | null;
+    /** The deadline inputs, so dropping one from the call is visible. */
+    lastClock: { decidedAt: Date | null; createdAt: Date; now: Date } | null;
+  } = {
     calls: 0,
     lastHealState: null,
+    lastClock: null,
     async record(args) {
       recorder.calls += 1;
       recorder.lastHealState = args.healState;
+      recorder.lastClock = { decidedAt: args.decidedAt, createdAt: args.createdAt, now: args.now };
       return recorded;
     },
   };
@@ -493,6 +535,8 @@ const APPLIED_HEAL = {
   verifyRunId: 'run_1' as string | null,
   appliedVersion: 4 as number | null,
   decidedAt: LONG_AGO as Date | null,
+  /** The deadline's fallback when `decidedAt` is missing. Never null. */
+  createdAt: new Date(LONG_AGO.getTime() - 60_000),
 };
 
 const JOB = { orgId: 'org_1', healId: 'heal_1', reason: 'SWEEP_FOUND_NO_START' as const };
@@ -530,7 +574,12 @@ describe('the processor re-measures one heal', () => {
      * suppression-shaped act, and a suppression nobody can see is how a team
      * learns to ignore the board.
      */
-    const f = processFakes(APPLIED_HEAL, { state: 'STILL_FAILING', reverted: true });
+    const f = processFakes(APPLIED_HEAL, {
+      wrote: true,
+      state: 'STILL_FAILING',
+      reverted: true,
+      revertedToVersion: 3,
+    });
     const out = await processVerifyHeal(
       { store: f.store, runs: f.runs, queue: f.queue, recorder: f.recorder, log: silentLog() },
       JOB,
@@ -540,16 +589,28 @@ describe('the processor re-measures one heal', () => {
     expect(out.outcome).toBe('RECORDED');
     expect(out.verifyState).toBe('STILL_FAILING');
     expect(out.reverted).toBe(true);
-    expect(out.note).toContain('reverted');
+    // WHICH version. `reverted: true` cannot answer "to what", and that is the
+    // first question asked when somebody notices their test changed.
+    expect(out.revertedToVersion).toBe(3);
+    expect(out.note).toContain('reverted to version 3');
     expect(out.note).toContain('appended');
     expect(f.recorder.lastHealState).toBe('AUTO_APPLIED');
+    // Both deadline inputs reached the recorder. The deadline is
+    // `decidedAt ?? createdAt`, so a processor that forwarded only one of them
+    // would ask the implementation a different question about a heal with no
+    // apply time.
+    expect(f.recorder.lastClock).toEqual({
+      decidedAt: APPLIED_HEAL.decidedAt,
+      createdAt: APPLIED_HEAL.createdAt,
+      now: NOW,
+    });
   });
 
   it('leaves a heal a person approved in place, and says it is still red', async () => {
-    const f = processFakes({ ...APPLIED_HEAL, state: 'APPLIED' }, {
-      state: 'STILL_FAILING',
-      reverted: false,
-    });
+    const f = processFakes(
+      { ...APPLIED_HEAL, state: 'APPLIED' },
+      { wrote: true, state: 'STILL_FAILING', reverted: false, revertedToVersion: null },
+    );
     const out = await processVerifyHeal(
       { store: f.store, runs: f.runs, queue: f.queue, recorder: f.recorder, log: silentLog() },
       JOB,
@@ -584,6 +645,84 @@ describe('the processor re-measures one heal', () => {
     expect(out.startRefusal).toBe('ALREADY_HAS_STATE');
     expect(f.recorder.calls).toBe(0);
     expect(out.note).toContain('NOT been shown to pass');
+  });
+
+  it('reports a run that has NOT finished as still in flight, not as recorded', async () => {
+    /*
+     * THE LIE THIS PINS: a thing reported as measured that was not measured.
+     * The recorder returns `wrote: false` when the verifying run has no
+     * terminal status and is still inside its deadline — nothing was written,
+     * the row was already PENDING and stays PENDING. Reporting RECORDED here
+     * would say a verification concluded while its run was still executing.
+     */
+    const f = processFakes(APPLIED_HEAL, {
+      wrote: false,
+      state: 'PENDING',
+      reverted: false,
+      revertedToVersion: null,
+    });
+    const out = await processVerifyHeal(
+      { store: f.store, runs: f.runs, queue: f.queue, recorder: f.recorder, log: silentLog() },
+      JOB,
+      NOW,
+    );
+
+    expect(out.outcome).toBe('STILL_IN_FLIGHT');
+    expect(out.verifyState).toBe('PENDING');
+    expect(out.reverted).toBe(false);
+    expect(out.revertedToVersion).toBeNull();
+    // The AWAITING sentence, which says out loud that nobody has confirmed it.
+    expect(out.note).toBe(VERIFICATION_REPORT.PENDING.sentence);
+    expect(out.note).toContain('Nobody has confirmed');
+    // And it is NOT one of the two outcomes a reader would act on.
+    expect(out.outcome).not.toBe('RECORDED');
+    expect(out.outcome).not.toBe('NOTHING_TO_DO');
+  });
+
+  it('starts the verification for an APPLY job that arrives inside the grace period', async () => {
+    /*
+     * THE DEFECT: the apply path now ENQUEUES its verification instead of
+     * carrying its own copy of `startHealVerification`, so the job arrives
+     * seconds after the apply — inside `VERIFY_START_GRACE_MINUTES`. With the
+     * grace period applied unconditionally the only start this heal is ever
+     * going to get is refused WITHIN_GRACE, and the row sits NULL until the
+     * hole sweep finds it minutes later. A verification delayed by exactly the
+     * window meant to protect it.
+     */
+    const justApplied = new Date(NOW.getTime() - 2_000);
+    const f = processFakes({
+      ...APPLIED_HEAL,
+      verifyState: null,
+      verifyRunId: null,
+      decidedAt: justApplied,
+    });
+    const out = await processVerifyHeal(
+      { store: f.store, runs: f.runs, queue: f.queue, recorder: f.recorder, log: silentLog() },
+      { ...JOB, reason: 'APPLY' },
+      NOW,
+    );
+
+    expect(out.outcome).toBe('STARTED');
+    expect(out.verifyState).toBe('PENDING');
+    expect(f.runs.started).toBe(1);
+    expect(f.runs.lastTriggeredBy).toBe(verificationRunTag('heal_1'));
+
+    // The SAME heal, the SAME clock, asked for by the SWEEP instead: refused,
+    // because that caller really could be racing the apply path's own start.
+    const g = processFakes({
+      ...APPLIED_HEAL,
+      verifyState: null,
+      verifyRunId: null,
+      decidedAt: justApplied,
+    });
+    const swept = await processVerifyHeal(
+      { store: g.store, runs: g.runs, queue: g.queue, recorder: g.recorder, log: silentLog() },
+      { ...JOB, reason: 'SWEEP_FOUND_NO_START' },
+      NOW,
+    );
+    expect(swept.outcome).toBe('NOTHING_TO_DO');
+    expect(swept.startRefusal).toBe('WITHIN_GRACE');
+    expect(g.runs.started).toBe(0);
   });
 });
 

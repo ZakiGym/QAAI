@@ -16,6 +16,33 @@ export interface TriageVerdict {
   explanation: string;
   evidence: Array<{ kind: string; ref: string; detail: string }>;
   reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED';
+  /**
+   * WHETHER THE REVIEW STATE ACTUALLY SILENCES ANYTHING, and what is behind it.
+   *
+   * `reviewState: 'MUTED'` is NOT a suppression and never was: it silences only
+   * while a `KnownIssue` that is IN FORCE backs it. Every surface here rendered
+   * `reviewState.toLowerCase()` — "reviewed · muted" — which reads as HANDLED,
+   * and was identical for a mute with a live issue, a mute whose issue expired
+   * and a mute with no issue at all (which is what the old door wrote, every
+   * time, for as long as it existed).
+   *
+   * `suppresses` IS THE ONLY FIELD A SURFACE MAY RENDER AS "handled".
+   * `forceState` says which of the three a dead one is, and `note` is QAAI's
+   * own sentence about it.
+   *
+   * OPTIONAL, because a server older than the field does not send it — and
+   * `undefined` means "this client was not told", which is not the same fact as
+   * `suppresses: false`. A surface that conflated them would report an
+   * unmeasured answer as a measured one.
+   */
+  suppression?: {
+    /** Null means a state THIS CLIENT does not know — not "unreviewed". */
+    reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED' | null;
+    knownIssueId: string | null;
+    forceState: 'IN_FORCE' | 'EXPIRED' | 'REVOKED' | null;
+    suppresses: boolean;
+    note: string | null;
+  };
   model: string;
   createdAt: string;
   testResult: {

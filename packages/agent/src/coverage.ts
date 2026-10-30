@@ -121,6 +121,17 @@ import type {
   TypeObligationPolicy,
 } from '@qaai/shared';
 import { expandBoundaries, type BoundaryCase, type BoundaryExpansion, type BoundaryField } from './boundaries.js';
+/*
+ * THE DENOMINATOR RULE FOR A RETIREMENT, asked rather than remembered.
+ *
+ * `retirementSurfaceEffect` at the bottom of this file turns a test id and its
+ * coverage edges into the pair this function takes, and then asks IT what
+ * happens to the measurement. Deciding that here would be the sixth
+ * implementation of the one rule the suppression keystone exists to hold: a
+ * retired test's surface stays in the denominator and goes back to UNCOVERED.
+ */
+import { retirementDenominatorEffect } from '@qaai/shared';
+import type { DenominatorEffect } from '@qaai/shared';
 
 // ─── Vocabulary ──────────────────────────────────────────────────────────────
 
@@ -5914,4 +5925,111 @@ export function typesCovering(kind: SurfaceKind): string[] {
     const declaration = declarationFor(type);
     return declaration !== null && declaration.coversSurfaceKinds.includes(kind);
   }).sort();
+}
+
+// ─── What retiring a test does to the denominator ────────────────────────────
+
+/**
+ * One live `TestCoverageEdge`, as the retirement path reads it.
+ *
+ * `testDisabled` is the whole reason this takes edges rather than a set of item
+ * keys. "Another test also covers this surface" is only true of a test that
+ * still RUNS: counting a disabled one would let two retirements each point at
+ * the other as the surface's remaining cover, and the surface would stay
+ * COVERED with nothing covering it. That is the quarantine arithmetic's
+ * mistake (`coveredOnlyByQuarantined`) in a shape the customer could not see.
+ */
+export interface RetirementCoverageEdge {
+  /** `CoverageItem.id`. */
+  itemId: string;
+  testId: string;
+  /** `Test.disabledAt !== null` — the caller's read, not an inference here. */
+  testDisabled: boolean;
+}
+
+/**
+ * Which surfaces a retirement re-opens, and the one thing it may never do.
+ *
+ * `denominatorDelta` is typed as the literal `0`, which is not decoration: the
+ * surface a retired test covered DOES NOT LEAVE THE MEASUREMENT. The
+ * application still has it and now nothing tests it, so the numerator falls and
+ * the percentage goes DOWN. A retirement that shrank the denominator would make
+ * "delete the failing tests" the fastest way to hit a coverage target, and the
+ * product would then be actively worse than no product. A caller that tries to
+ * assign anything else here is a type error rather than a flattering number.
+ */
+export interface RetirementSurfaceEffect {
+  /** From `retirementDenominatorEffect`. Can never be LEAVES_DENOMINATOR. */
+  effect: DenominatorEffect;
+  /** `CoverageItem.id`s that lose their only live cover. Sorted. */
+  surfacesReturnedToUncovered: string[];
+  /** `CoverageItem.id`s another live test still reaches. Sorted. */
+  surfacesStillCovered: string[];
+  /** ALWAYS zero. See the note above. */
+  denominatorDelta: 0;
+  /** The sentence the keystone wrote. Stored, never re-phrased. */
+  disclosure: string;
+}
+
+/**
+ * The surfaces one test's retirement returns to UNCOVERED.
+ *
+ * ── WHY THIS IS HERE AND NOT IN THE THREE CALLERS ──────────────────────────
+ *
+ * Three places need the answer and they must not each compute it: the proposal
+ * writer (processors/close-loop.ts) stores it before anybody decides, the apply
+ * path (routes/tests.ts) re-opens exactly those items in the same transaction
+ * that disables the test, and the recompute (processors/recompute-coverage.ts)
+ * discloses it beside the percentage. Three implementations of "which surfaces
+ * go dark" is three answers, and the one on the proposal is the one the customer
+ * agreed to.
+ *
+ * The arithmetic itself is NOT done here either. `retirementDenominatorEffect`
+ * (packages/shared/src/suppression.ts) is the one function allowed to say what
+ * a retirement does to the denominator, and it is asked rather than remembered
+ * — which is what stops a caller from deciding that this particular retirement
+ * is the one where the surface may leave. What this function contributes is the
+ * COVERAGE MODEL half: turning a test id and a set of live edges into the
+ * `covers` / `alsoCoveredElsewhere` pair that function takes.
+ *
+ * Pure, order-stable, and it never reads a database. A retired edge is the
+ * caller's filter (`TestCoverageEdge.retiredAt`), because "this edge is gone"
+ * and "this test is gone" are different facts and only the second one is being
+ * decided here.
+ */
+export function retirementSurfaceEffect(args: {
+  /** The test being retired. */
+  testId: string;
+  /** Live edges on every item THIS test covers — its own and other tests'. */
+  edges: readonly RetirementCoverageEdge[];
+}): RetirementSurfaceEffect {
+  const covers = new Set<string>();
+  for (const edge of args.edges) {
+    if (edge.testId === args.testId) covers.add(edge.itemId);
+  }
+
+  const elsewhere = new Set<string>();
+  for (const edge of args.edges) {
+    /*
+     * A DISABLED test is not a cover. It is also not an error to find one here:
+     * a project with three retirements applied has three disabled tests whose
+     * edges are still live, and reading any of them as "somebody else has this
+     * covered" is how a surface stays green with nothing behind it.
+     */
+    if (edge.testId === args.testId || edge.testDisabled) continue;
+    if (covers.has(edge.itemId)) elsewhere.add(edge.itemId);
+  }
+
+  const effect = retirementDenominatorEffect({
+    covers: [...covers].sort(),
+    alsoCoveredElsewhere: [...elsewhere].sort(),
+  });
+
+  return {
+    effect: effect.effect,
+    surfacesReturnedToUncovered: [...effect.surfacesReturnedToUncovered],
+    surfacesStillCovered: [...effect.surfacesStillCovered],
+    denominatorDelta: 0,
+    disclosure: effect.disclosure,
+  };
 }

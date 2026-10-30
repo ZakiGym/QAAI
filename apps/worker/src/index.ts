@@ -23,7 +23,9 @@ import { config, connection, logger, prisma } from './context.js';
 import {
   ANALYZE_SOURCE_QUEUE,
   DELIVERY_JOB,
+  MUTANT_CLOSURE_QUEUE,
   PREFLIGHT_QUEUE,
+  VERIFY_HEAL_QUEUE,
   armFlakeTick,
   armPreflightSweep,
   armScheduleTick,
@@ -32,6 +34,7 @@ import {
   closeProducers,
   type AnalyzeSourceJob,
   type DeliveryJob,
+  type MutantClosureJob,
   type PreflightJob,
 } from './queues.js';
 import { processAnalyzeSource } from './processors/analyze-source.js';
@@ -48,7 +51,13 @@ import { processEdit } from './processors/edit.js';
 import { processDelivery, processNotify } from './processors/notify.js';
 import { processScheduleTick } from './processors/schedule.js';
 import { processImport } from './processors/import.js';
-import { processFlakeTick, type FlakeTickJob } from './processors/flake.js';
+import {
+  healVerificationPorts,
+  processFlakeTick,
+  type FlakeTickJob,
+} from './processors/flake.js';
+import { processVerifyHeal, type VerifyHealJob } from './processors/verify-heal.js';
+import { processMutantClosure, requestMutantClosure } from './processors/mutant-closure.js';
 import { processBisect } from './processors/bisect.js';
 import { armCheckSweep, processChecks } from './processors/checks.js';
 import { processDigestTick } from './processors/digest.js';
@@ -236,6 +245,34 @@ register<RunJob>(QUEUE_NAMES.run, config.concurrency, async (payload) => {
     // commit the snapshot should record) from the Run row. A 20-shard run fires
     // this twenty times and all twenty collapse onto one job.
     await requestRecompute({ reason: 'run', orgId: payload.orgId, runId: payload.runId });
+    /*
+     * ── AND THE MUTATION REPORT, WHICH NOTHING READ ────────────────────────
+     *
+     * The run processor writes `MutationSurvivor` rows naming each missing
+     * assertion and nothing in apps/ ever read them, so
+     * packages/agent/src/mutant-closure.ts had no production caller at all.
+     * This is the request.
+     *
+     * AFTER, not before, and in a `finally` rather than on the success path,
+     * for the two reasons the recompute above gives: the survivor rows are
+     * committed before `processRun` returns, so a report asked for here can
+     * never group the previous run's report — and a run that recorded 300
+     * results before its 301st test blew up still produced a mutation report
+     * worth closing. A 20-shard run fires this twenty times and all twenty
+     * collapse onto `mutant-closure:<runId>`.
+     *
+     * `requestMutantClosure` never throws, which is what makes an `await`
+     * here safe: a throw in this `finally` would REPLACE the error the run
+     * actually failed with, and a Redis blip would be reported as a run
+     * failure. The processor itself reports honestly when the run had no
+     * mutation result rather than enqueueing being gated on a join nothing
+     * has an index for.
+     */
+    await requestMutantClosure({
+      reason: 'RUN_FINISHED',
+      orgId: payload.orgId,
+      runId: payload.runId,
+    });
   }
 });
 register<ExploreJob>(
@@ -422,6 +459,61 @@ register<AnalyzeSourceJob>(ANALYZE_SOURCE_QUEUE, config.concurrency * 2, async (
 // this worker stays cheap even while an investigation is in flight.
 register<FlakeTickJob>(QUEUE_NAMES.flake, 1, processFlakeTick);
 void armFlakeTick().catch((err) => logger.error({ err }, 'could not arm the flake sweep'));
+
+/*
+ * ── RE-MEASURING A HEAL, ON A QUEUE ────────────────────────────────────────
+ *
+ * WITHOUT THIS REGISTRATION processors/verify-heal.ts is 870 lines with no
+ * importer, no queue and no request behind it — correct code connected to
+ * nothing, which is this build's signature defect. Three producers reach it:
+ * each apply path (`reason: 'APPLY'`, the one start replacing the three copies
+ * of `startHealVerification` this product carried), the hole sweep in
+ * processors/flake.ts (`SWEEP_FOUND_NO_START`, the applied heal whose
+ * verification start died and which `verifyAppliedHeals` is structurally unable
+ * to see), and an operator.
+ *
+ * Concurrency 1, and not for load: two jobs for the same heal would race over
+ * the same four columns, and the loser would write a terminal state over the
+ * winner's. The per-heal job id makes that unlikely; serialising the lane makes
+ * it impossible within a worker. The expensive half — the verifying run itself
+ * — happens on the run queue, so this lane stays cheap however deep it gets.
+ *
+ * The ports come from processors/flake.ts, which already imports `prisma`,
+ * `startRun` and `enqueueRun`; `recorder` is that file's `advanceVerification`,
+ * so this path and the PENDING sweep share ONE implementation of what a
+ * verification means and what it does to the customer's code.
+ *
+ * The counts are RETURNED by the processor (its own tests read them) and logged
+ * by it, so they are deliberately dropped here rather than handed to BullMQ as
+ * a job return value nothing reads. Same as the suppression sweep above.
+ */
+register<VerifyHealJob>(VERIFY_HEAL_QUEUE, 1, async (payload) => {
+  await processVerifyHeal(healVerificationPorts(), payload);
+});
+
+/*
+ * ── SURVIVING MUTANTS → THE THING TO ASSERT ────────────────────────────────
+ *
+ * packages/agent/src/mutant-closure.ts turns `MutationSurvivor` rows into
+ * ranked, de-duplicated, fenced work, and its only importer was the agent
+ * barrel plus its own test — a surface `check-wiring`'s ratchet accepts and no
+ * request reaches. So the mutation plugin kept naming each missing assertion
+ * and the instruction stopped in a table.
+ *
+ * Concurrency 1: nobody is waiting on it, each job writes one audit row keyed
+ * on its run, and two jobs for one run would write two reports about the same
+ * measurement. The coalescing job id makes that unlikely; a single lane makes
+ * it impossible within a worker.
+ *
+ * Wrapped in an arrow for the same reason as the backup tick: `register`'s
+ * second argument is the BullMQ Job, and that slot in `processMutantClosure` is
+ * its deps — the test seam for injecting the store — so a Job landing in it
+ * would be a silent no-op today and a confusing bug the day the two types grow
+ * a matching field.
+ */
+register<MutantClosureJob>(MUTANT_CLOSURE_QUEUE, 1, async (payload) => {
+  await processMutantClosure(payload);
+});
 
 // ── The suppression expiry sweep ───────────────────────────────────────────
 //

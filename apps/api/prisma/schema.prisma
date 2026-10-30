@@ -8098,22 +8098,53 @@ model KnownIssueMatch {
   @@index([orgId, matchedAt])
 }
 
-/// ONE ROW PER SUPPRESSION THAT APPLIED, ACROSS ALL FIVE KINDS.
+/// ONE ROW PER SUPPRESSION THAT SILENCED A FAILURE IN A RUN.
 ///
 /// ── WHY THIS TABLE IS THE MOST IMPORTANT ONE IN THIS SECTION ───────────────
 ///
 /// "47 failures suppressed by 3 known issues" is the sentence that keeps this
 /// feature honest, and before this table nothing could produce it: quarantine
 /// counted itself on `Run.suppressedFailures`, a mute counted itself on
-/// `FailureSignature.suppressedCount`, a waiver counted itself nowhere at all,
-/// and ENV_ISSUE and retirement counted themselves not at all. Five private
-/// counters mean five chances for a surface to read four of them, and a failure
-/// suppressed without being counted is the one lie this product cannot afford —
-/// it is how a team learns to ignore the board.
+/// `FailureSignature.suppressedCount`, and ENV_ISSUE counted itself not at all.
+/// Private counters mean as many chances for a surface to read all but one of
+/// them, and a failure suppressed without being counted is the one lie this
+/// product cannot afford — it is how a team learns to ignore the board.
 ///
-/// So every kind writes HERE, and every surface reads HERE.
 /// `summariseSuppressions` (packages/shared/src/suppression.ts) turns these
 /// rows into the sentence; the kind-specific tables keep their own detail.
+///
+/// ── WHICH KINDS WRITE HERE, MEASURED RATHER THAN ASSERTED ──────────────────
+///
+/// This header said "every kind writes HERE, and every surface reads HERE",
+/// which was a claim about the code rather than a description of it. THREE of
+/// the five write a row today, and the two that do not are not an oversight:
+///
+///   · MUTE and ENV_ISSUE are written by apps/worker/src/processors/triage.ts,
+///     which is the only writer of this table.
+///   · QUARANTINE is SYNTHESISED on read from `Run.suppressedFailures` rather
+///     than stored — see the note at the ledger read in apps/api/src/routes/
+///     runs.ts, and the `kind: { not: 'QUARANTINE' }` filter that keeps the two
+///     sources from double-counting one suppression.
+///   · COVERAGE_WAIVER writes NOTHING here, and should not. Its denominator
+///     effect is LEAVES_DENOMINATOR: it silences no failure, it removes a
+///     SURFACE from a measurement. Its disclosure therefore belongs to the
+///     measurement — `CoverageSnapshot.denominatorDefinition` names the waived
+///     items and how many of them are unbounded, and `totals.waived` counts
+///     them — and a row here claiming `suppressed: 0` against a run id a
+///     waiver does not have would be a second place to read a number that is
+///     already readable in one.
+///   · RETIREMENT writes NOTHING here either, for the same reason in the other
+///     direction: its effect is RETURNS_TO_UNCOVERED. A retirement DELETES a
+///     test and the percentage goes DOWN, which is why it is the safe
+///     suppression — and a ledger that counted it as a silenced failure would
+///     report a suppression where the number moved against us. Its record is
+///     `RetirementProposal` and the obsolescence surface.
+///
+/// So: this table is the ledger of SILENCED FAILURES, which is three kinds, and
+/// it says which three. The two it leaves out are disclosed where their effect
+/// actually lands. `suppression-ledger-kinds.test.ts` pins that list against
+/// the writers, so a fourth kind that starts writing — or MUTE quietly
+/// stopping — is a failing test rather than a stale paragraph.
 ///
 /// ── `inForce` IS WHY AN EXPIRY CAN BE TRUSTED ──────────────────────────────
 ///

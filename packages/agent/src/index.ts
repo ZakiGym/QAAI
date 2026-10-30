@@ -398,14 +398,27 @@ export * from './gap-closure.js';
 /*
  * ── THE FOUR CLOSURE MODULES THIS ROUND LANDED ──────────────────────────────
  *
- * Every one of them is imported by a PROCESSOR in apps/worker, which is a
- * workspace that cannot see this package's source: `known-issues.js` and
- * `env-issue.js` by processors/triage.ts, `drift.js` by processors/explore.ts,
- * and `mutant-closure.js` by processors/close-loop.ts. Until these lines
- * existed `check:wiring` reported all four `package-exports` disconnected —
- * "nothing but a test file imports it" — which is this codebase's signature
- * defect stated by the ratchet itself, and the deflake/obsolete comment far
- * above records the same four-way mistake being made one round earlier.
+ * Every one of them is imported by something that is NOT a test and NOT this
+ * barrel, which is the only thing that makes these four lines worth anything.
+ * Where each one is actually consumed, VERIFIED rather than planned:
+ *
+ *   · `known-issues.js` and `env-issue.js` — apps/worker/src/processors/
+ *     triage.ts (`matchKnownIssue`, `classifyEnvironment`,
+ *     `envIssueSuppression`).
+ *   · `mutant-closure.js` — apps/worker/src/processors/mutant-closure.ts,
+ *     registered on `MUTANT_CLOSURE_QUEUE` in apps/worker/src/index.ts.
+ *   · `drift.js` — apps/api/src/routes/suite-health.ts, as
+ *     `GET /suite-health/:projectId/drift`. NOT processors/explore.ts, which is
+ *     what this comment said for a round while nothing imported the module at
+ *     all: a request is a stronger door than a crawl tick, because a human can
+ *     ask the question.
+ *
+ * Until these lines existed `check:wiring` reported all four `package-exports`
+ * disconnected — "nothing but a test file imports it" — which is this
+ * codebase's signature defect stated by the ratchet itself. The lines alone are
+ * NOT the fix: a barrel export plus a colocated test satisfies that ratchet and
+ * reaches no request, which is how `drift.js` sat here for a round with 765
+ * lines and no caller.
  *
  * ORDER: `known-issues.js` imports from `./triage.js` (the cluster vocabulary)
  * and `env-issue.js` from `./untrusted.js`, both published above, so no line

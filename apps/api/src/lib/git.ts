@@ -101,6 +101,7 @@ import type {
 } from './pull-request.js';
 import { PR_RECORD_STATES } from '@qaai/shared';
 import type { PrRecordState } from '@qaai/shared';
+import { parseGitConfig } from './integrations.js';
 
 /**
  * The username each provider expects alongside a personal access token. The
@@ -1211,13 +1212,15 @@ function narrowPrRecord(row: StoredPrRecord): PullRequestRecordRow {
   return { ...row, state };
 }
 
-/** The `Integration.config` keys this reads. Anything else is ignored. */
-interface GitIntegrationConfig {
-  repo?: unknown;
-  defaultBranch?: unknown;
-  baseBranch?: unknown;
-  pullRequests?: unknown;
-}
+/*
+ * THE `Integration.config` READER IS `parseGitConfig` IN lib/integrations.ts,
+ * which now knows about `baseBranch` and `pullRequests` too.
+ *
+ * This file carried its own all-`unknown` copy of the shape and read the JSON
+ * by hand, so there were two readers of one row and the one named "parse the
+ * git config" was the incomplete one. One reader, on the path that decides
+ * which repository a pull request is opened in.
+ */
 
 /** Prisma's unique-constraint code, detected structurally. */
 function isUniqueConflict(err: unknown): boolean {
@@ -1279,8 +1282,8 @@ export function pullRequestStore(
       if (!row || !row.enabled) return null;
       if (row.kind !== 'GITHUB' && row.kind !== 'GITLAB' && row.kind !== 'BITBUCKET') return null;
 
-      const config = (row.config ?? {}) as GitIntegrationConfig;
-      const repo = typeof config.repo === 'string' ? config.repo : null;
+      const config = parseGitConfig(row.config);
+      const repo = config.repo === '' ? null : config.repo;
       if (!repo) return null;
       /*
        * `baseBranch`, NOT `defaultBranch`. `parseGitConfig` in lib/integrations.ts
@@ -1290,7 +1293,7 @@ export function pullRequestStore(
        * the test-sync branch instead of the trunk. `main` is the fallback and it
        * is a guess the record carries, so a reader can see what was assumed.
        */
-      const baseRef = typeof config.baseBranch === 'string' ? config.baseBranch : 'main';
+      const baseRef = config.baseBranch ?? 'main';
 
       return {
         integrationId: row.id,

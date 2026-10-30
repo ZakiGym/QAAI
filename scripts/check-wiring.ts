@@ -2158,6 +2158,288 @@ function checkUnmeasuredAxes(): void {
   );
 }
 
+// ─── 11. The GitHub Action declares every knob the run contract has ──────────
+
+const ACTION_FILE = '.github/actions/qaai/action.yml';
+const RUN_REQUEST_MODULE = 'packages/cli/src/run-request.ts';
+
+/**
+ * Inputs the Action names differently from the CLI flag it drives, and why.
+ *
+ * Each one is a DELIBERATE rename, and the reason is that a workflow author is
+ * reading YAML rather than a CLI: `environment-id` says what to paste there and
+ * `env` reads like an environment variable. `tests` is plural because the input
+ * is a newline-separated list, and `junit-path` pairs with `json-path` beside
+ * it.
+ *
+ * A rename not listed here is drift — the thing this check exists to catch —
+ * because the Action's whole promise is that each input maps to exactly one CLI
+ * flag.
+ */
+const ACTION_INPUT_ALIASES: Record<string, string> = {
+  env: 'environment-id',
+  test: 'tests',
+  junit: 'junit-path',
+};
+
+/**
+ * Run-contract flags the Action deliberately does NOT expose, with the reason.
+ *
+ * This is the escape hatch that keeps the check a statement rather than a
+ * formality — and it is the part that must stay short. Two entries:
+ */
+const ACTION_OMITTED_FLAGS: Record<string, string> = {
+  commit:
+    'The Action passes `github.sha` itself. An input would let a workflow label a run with a commit it did not build.',
+  'impact-only':
+    'It queues NOTHING and prints an analysis. The Action’s report step reads a missing result as a failure, which is correct for a gate and wrong for a dry run, so the flag belongs to `qaai run` and not to a job that gates.',
+};
+
+/**
+ * Inputs that belong to the Action itself rather than to any run flag.
+ *
+ * The reverse direction needs this list: an input that maps to no CLI flag and
+ * is not one of these is either an input nothing forwards or a flag table
+ * nobody updated, and both are the defect this file is about.
+ */
+const ACTION_OWN_INPUTS: Record<string, string> = {
+  'api-key': 'The credential, from a repository secret. Never a CLI flag: argv shows up in the log.',
+  'api-url': 'Sets QAAI_API_URL for the step.',
+  'json-path': 'Where the step writes the run’s --json payload for the report step to read.',
+  'cli-version': 'The pinned @qaai/cli version. A security property, not a preference.',
+};
+
+/** Hard stop on the scanner below. The file is ~520 lines; this is slack. */
+const ACTION_SCAN_LINES = 4_000;
+
+type ActionInputs = { ok: true; keys: string[] } | { ok: false; why: string; fix: string };
+
+/**
+ * The `inputs:` keys of a composite action, read with a bounded line scanner.
+ *
+ * ── WHY A SCANNER AND NOT A PARSER ─────────────────────────────────────────
+ *
+ * THERE IS NO YAML PARSER IN node_modules — neither `js-yaml` nor `yaml` — and
+ * a check that needs a new production dependency is a check that does not get
+ * added. So this reads the one shape the file actually has.
+ *
+ * ── WHAT IT CANNOT READ, STATED BECAUSE A GUARD THAT OVER-CLAIMS IS WORSE ──
+ *
+ * It understands exactly this: a top-level `inputs:` on its own line, followed
+ * by keys indented by TWO SPACES, until the next line that starts in column
+ * zero. Which means:
+ *
+ *   · a FLOW mapping (`inputs: {api-key: {...}}`) is not read — detected, and
+ *     reported as unreadable rather than as "no inputs";
+ *   · a YAML ANCHOR or MERGE KEY (`<<: *defaults`) is not resolved — detected
+ *     the same way, because the keys it would contribute are invisible here;
+ *   · a key indented by anything other than two spaces is not seen, so the
+ *     scanner reports a key count and the check refuses to run on an
+ *     implausible one rather than passing an empty diff;
+ *   · a QUOTED key is read (`'suite':` and `"suite":` both), because the file
+ *     already has one — `description: 'Run only this suite (default: …)'` had
+ *     to be quoted and the next person may quote a key the same way.
+ *
+ * It does NOT need to worry about a key appearing inside a block scalar: a
+ * block scalar's content must be indented deeper than its own key, which is
+ * already four spaces here, so nothing at two spaces can be scalar text.
+ *
+ * AND IT DOES NOT CHECK FORWARDING. An input that is declared and never put in
+ * the `args` array would pass this check. That is a second, real gap, and
+ * naming it here is better than implying this closes it.
+ */
+function actionInputs(text: string): ActionInputs {
+  const lines = text.split('\n');
+  if (lines.length > ACTION_SCAN_LINES) {
+    return {
+      ok: false,
+      why: `${ACTION_FILE} is ${lines.length} lines, past this scanner's ${ACTION_SCAN_LINES}-line bound.`,
+      fix: `Raise ACTION_SCAN_LINES in ${SELF} once you have read why it was bounded at all.`,
+    };
+  }
+
+  const start = lines.findIndex((line) => /^inputs:\s*(#.*)?$/.test(line));
+  if (start === -1) {
+    const flow = lines.findIndex((line) => /^inputs:\s*\S/.test(line));
+    if (flow !== -1) {
+      return {
+        ok: false,
+        why: `${ACTION_FILE} declares its inputs as a FLOW mapping on one line, which this scanner does not read.`,
+        fix: `Write the inputs as an indented block mapping, or teach ${SELF} to read the flow form.`,
+      };
+    }
+    return {
+      ok: false,
+      why: `No top-level \`inputs:\` line in ${ACTION_FILE}.`,
+      fix: `If the Action moved, update ACTION_FILE in ${SELF}; if it lost its inputs, that is the finding.`,
+    };
+  }
+
+  const keys: string[] = [];
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line.trim() === '' || /^\s*#/.test(line)) continue;
+    // Column zero and not blank: the next top-level key (`outputs:`, `runs:`).
+    if (/^\S/.test(line)) break;
+    if (/^\s{2}<<:/.test(line)) {
+      return {
+        ok: false,
+        why: `${ACTION_FILE} uses a YAML merge key inside \`inputs:\`, so the real key set is not in the text.`,
+        fix: `Write the inputs out, or teach ${SELF} to resolve anchors.`,
+      };
+    }
+    const key = /^ {2}(?:'([^']+)'|"([^"]+)"|([A-Za-z0-9][\w-]*)):/.exec(line);
+    if (key) keys.push(key[1] ?? key[2] ?? key[3]!);
+  }
+
+  /*
+   * An implausible count is a scanner that stopped reading, not an Action with
+   * no inputs — and "no inputs declared" would otherwise come out as a clean
+   * diff against nothing, which is the shape of a check that passes by failing.
+   */
+  if (keys.length < 5) {
+    return {
+      ok: false,
+      why: `Only ${keys.length} input key(s) were read from ${ACTION_FILE}, which is too few to be the real set.`,
+      fix: `The indentation under \`inputs:\` is probably not two spaces. Fix the file, or teach ${SELF} to read it.`,
+    };
+  }
+  return { ok: true, keys };
+}
+
+/**
+ * THE ACTION AND THE RUN CONTRACT CANNOT DRIFT.
+ *
+ * The gate lives in the customer's CI, and this file is the gate: a knob that
+ * `createRunSchema` accepts and the Action does not declare is a feature the
+ * one surface that gates a pull request cannot use. That is this repo's
+ * signature defect — correct code connected to nothing — in the place where it
+ * costs the most, and it has happened: impact selection, sharding, caching,
+ * fail-fast and the PR number were all run fields that neither the CLI nor the
+ * Action implemented, and the Action declared `branch` and `base-url` for a
+ * schema that had no field for either.
+ *
+ * BOTH DIRECTIONS, because each is a different mistake:
+ *
+ *   A flag with no input — the Action cannot drive what the API accepts.
+ *   An input with no flag — the Action collects a value and forwards it
+ *   nowhere, which is a knob wired to nothing wearing a description.
+ */
+async function checkActionInputs(): Promise<void> {
+  const CHECK = 'action-inputs';
+  const path = join(ROOT, ACTION_FILE);
+
+  if (!existsSync(path)) {
+    add({
+      check: CHECK,
+      severity: 'skip',
+      what: 'the QAAI action',
+      detail: `${ACTION_FILE} not found.`,
+      fix: `Run this from the repo root; if the action moved, update ACTION_FILE in ${SELF}.`,
+    });
+    return;
+  }
+
+  let runFlags: string[];
+  let extraFlags: string[];
+  let transportFlags: string[];
+  try {
+    const shared = (await import('@qaai/shared')) as unknown as {
+      RUN_REQUEST_FLAGS: Record<string, { flag: string } | null>;
+      EXTRA_RUN_FLAGS: Record<string, string>;
+    };
+    /*
+     * The CLI's own flags, imported rather than restated. `run-request.ts`
+     * `import type`s from @qaai/shared and nothing else, so this costs nothing
+     * and runs no CLI code.
+     */
+    const cli = (await import('../packages/cli/src/run-request.js')) as unknown as {
+      TRANSPORT_FLAGS: Record<string, string>;
+    };
+    runFlags = Object.values(shared.RUN_REQUEST_FLAGS)
+      .filter((spec): spec is { flag: string } => spec !== null)
+      .map((spec) => spec.flag);
+    extraFlags = Object.keys(shared.EXTRA_RUN_FLAGS);
+    transportFlags = Object.keys(cli.TRANSPORT_FLAGS);
+  } catch (err) {
+    add({
+      check: CHECK,
+      severity: 'skip',
+      what: 'the run flag tables',
+      detail: `Could not load @qaai/shared and ${RUN_REQUEST_MODULE}: ${err instanceof Error ? err.message : String(err)}`,
+      fix: 'Run `npm install` at the repo root so the workspace packages resolve.',
+    });
+    return;
+  }
+
+  const parsedInputs = actionInputs(read(path));
+  if (!parsedInputs.ok) {
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: ACTION_FILE,
+      detail: `${parsedInputs.why} A diff this check cannot read is a drift guard that would pass on anything.`,
+      fix: parsedInputs.fix,
+    });
+    return;
+  }
+  const inputs = new Set(parsedInputs.keys);
+
+  // ── A run-contract flag the Action cannot drive ────────────────────────────
+  for (const flag of [...runFlags, ...extraFlags]) {
+    const expected = ACTION_INPUT_ALIASES[flag] ?? flag;
+    if (inputs.has(expected)) continue;
+    const omitted = ACTION_OMITTED_FLAGS[flag];
+    if (omitted !== undefined) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: `--${flag}`,
+      detail: `\`${flag}\` is a knob of the run contract (RUN_REQUEST_FLAGS / EXTRA_RUN_FLAGS) and ${ACTION_FILE} declares no \`${expected}\` input, so the one surface that gates a pull request cannot use it.`,
+      fix: `Add an \`${expected}\` input to ${ACTION_FILE} and forward it to the CLI, or record the omission with its reason in ACTION_OMITTED_FLAGS in ${SELF}.`,
+    });
+  }
+
+  // ── An input that forwards nowhere ────────────────────────────────────────
+  const known = new Set<string>([
+    ...runFlags.map((flag) => ACTION_INPUT_ALIASES[flag] ?? flag),
+    ...extraFlags.map((flag) => ACTION_INPUT_ALIASES[flag] ?? flag),
+    ...transportFlags.map((flag) => ACTION_INPUT_ALIASES[flag] ?? flag),
+    ...Object.keys(ACTION_OWN_INPUTS),
+  ]);
+  for (const input of parsedInputs.keys) {
+    if (known.has(input)) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: `inputs.${input}`,
+      detail: `${ACTION_FILE} declares \`${input}\` and no CLI flag or run field answers to it, so a workflow that sets it is setting nothing.`,
+      fix: `Point it at a flag, delete it, or — if it is the Action's own wiring rather than a run knob — record it with its reason in ACTION_OWN_INPUTS in ${SELF}.`,
+    });
+  }
+
+  // ── A recorded omission that is no longer one ─────────────────────────────
+  // The same ratchet rule KNOWN_GAPS follows: a reason kept alive after it
+  // stops being true is how an allowlist starts.
+  for (const [flag, why] of Object.entries(ACTION_OMITTED_FLAGS)) {
+    const expected = ACTION_INPUT_ALIASES[flag] ?? flag;
+    if (!inputs.has(expected)) continue;
+    add({
+      check: CHECK,
+      severity: 'fail',
+      what: `ACTION_OMITTED_FLAGS.${flag}`,
+      detail: `${SELF} records that the Action deliberately does not expose \`${flag}\` ("${why}") and ${ACTION_FILE} now declares \`${expected}\`.`,
+      fix: `Delete the entry from ACTION_OMITTED_FLAGS in ${SELF}.`,
+    });
+  }
+
+  okIfClean(
+    CHECK,
+    `${parsedInputs.keys.length} inputs · ${runFlags.length + extraFlags.length} run flags`,
+    `Every run-contract flag has an input in ${ACTION_FILE} (or a recorded reason), and every input answers to a flag. Declaration only — this does not check that the step FORWARDS it.`,
+  );
+}
+
 // ─── Ratchet + reporting ─────────────────────────────────────────────────────
 
 function applyKnownGaps(): { suppressed: KnownGap[]; stale: KnownGap[] } {
@@ -2304,6 +2586,7 @@ async function main(): Promise<void> {
   checkSurfaceVocabulary();
   checkUnmeasuredAxes();
   checkCoverageArithmeticLevers();
+  await checkActionInputs();
 
   const { suppressed, stale } = applyKnownGaps();
   const code = report(suppressed, stale);

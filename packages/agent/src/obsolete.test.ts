@@ -809,6 +809,83 @@ describe('a dark, role-gated or off-limits route is not a deleted route', () => 
     expect(obsolescenceSignalsFor(report).tests).toEqual([]);
   });
 
+  it('withholds LOCATOR_GONE too, and the exclusion branch is what does it', () => {
+    /*
+     * THE BACK DOOR, AND WHERE IT IS ACTUALLY CLOSED. Locators are compared
+     * against the WHOLE crawl's locator set, so a control living only on a dark
+     * route would read as gone — and LOCATOR_GONE, while it can never retire a
+     * test on its own, RAISES the confidence of a proposal built on a confirmed
+     * ROUTE_GONE.
+     *
+     * A guard on the signal loop was proposed for this and is NOT THERE,
+     * because this is where it is handled: the `excludedRoutes` branch in
+     * `auditTestsAgainstCrawl` answers UNMEASURED with `locators: []`, so the
+     * signal deriver has nothing to iterate. This test is the measurement that
+     * says so, which is the only thing standing between that branch and a
+     * future edit that moves the locator computation above it.
+     *
+     * The test drives `/orders`, which the crawl REACHED, and `/checkout`,
+     * which is excluded — so `reachedSomething` is true and it is the exclusion,
+     * not the absence of a crawl, doing the work.
+     */
+    const twoRoutes = test_({
+      code: [
+        "import { test, expect } from '@playwright/test';",
+        "test('orders then checkout', async ({ page }) => {",
+        "  await page.goto('/orders');",
+        "  await page.goto('/checkout');",
+        "  await page.getByRole('button', { name: 'Pay' }).click();",
+        '});',
+      ].join('\n'),
+    });
+    const report = auditTestsAgainstCrawl({
+      tests: [twoRoutes],
+      flowMap: darkCrawl,
+      declaredRoutes: ['/orders', '/checkout'],
+      excludedRoutes: [
+        { route: '/checkout', exclusion: 'BEHIND_FEATURE_FLAG', detail: 'checkout-v2 off' },
+      ],
+    });
+
+    // The crawl DID reach one of them, so this is not the no-crawl path.
+    expect(report.tests[0]!.routes.some((route) => route.reached)).toBe(true);
+    expect(report.tests[0]!.verdict).toBe('UNMEASURED');
+    // THE PROPERTY: nothing for the locator loop to see.
+    expect(report.tests[0]!.locators).toEqual([]);
+
+    const signals = obsolescenceSignalsFor(report);
+    expect(signals.counts.LOCATOR_GONE).toBe(0);
+    expect(signals.tests).toEqual([]);
+  });
+
+  it('still derives LOCATOR_GONE when the same two routes carry NO exclusion', () => {
+    /*
+     * The other half of the pair, so the test above cannot pass because the
+     * locator comparison is broken for two-route tests generally.
+     */
+    const twoRoutes = test_({
+      code: [
+        "import { test, expect } from '@playwright/test';",
+        "test('orders then checkout', async ({ page }) => {",
+        "  await page.goto('/orders');",
+        "  await page.goto('/checkout');",
+        "  await page.getByRole('button', { name: 'Pay' }).click();",
+        '});',
+      ].join('\n'),
+    });
+    const report = auditTestsAgainstCrawl({
+      tests: [twoRoutes],
+      flowMap: darkCrawl,
+      declaredRoutes: ['/orders', '/checkout'],
+    });
+
+    expect(report.tests[0]!.verdict).toBe('DRIFTED');
+    expect(report.tests[0]!.locators).toEqual([
+      { locator: 'role=button[pay]', line: 5, comparable: true, seen: false },
+    ]);
+    expect(obsolescenceSignalsFor(report).counts.LOCATOR_GONE).toBe(1);
+  });
+
   it('an exclusion the test does not drive changes nothing', () => {
     const report = auditTestsAgainstCrawl({
       tests: [test_()],

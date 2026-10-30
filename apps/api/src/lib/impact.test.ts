@@ -322,6 +322,100 @@ describe('patch coverage refuses to answer rather than divide by a surface it di
   });
 });
 
+describe('a lapsed waiver does not shrink the denominator', () => {
+  const NOW = new Date('2026-10-29T12:00:00.000Z');
+  const waived = (identity: string, waiverExpiresAt: Date | null | undefined): PatchCoverageRow => ({
+    key: `ROUTE:${identity}`,
+    status: 'WAIVED',
+    label: identity,
+    waiverExpiresAt,
+  });
+
+  /*
+   * WHY THIS IS THE PERCENTAGE THAT MATTERS. `CoverageItem.status` is
+   * materialised — the waiver door writes WAIVED eagerly — and nothing
+   * recomputes the inventory on a clock, so a lapsed exclusion stays in effect
+   * for an unbounded time on a quiet project. WAIVED is the only state that
+   * LEAVES the denominator, so the number this gate prints on a pull request
+   * was higher than the truth, by exactly the lapsed items.
+   */
+  it('counts a route whose waiver has expired as a GAP, not as excluded', () => {
+    const result = join(
+      ['app/admin/legacy/page.tsx', 'app/promo/page.tsx'],
+      [
+        waived('/admin/legacy', new Date(NOW.getTime() - 1_000)),
+        route('/promo', 'UNCOVERED'),
+      ],
+      { now: NOW },
+    );
+
+    expect(result.denominator).toBe(2);
+    expect(result.waived).toBe(0);
+    expect(result.uncovered).toBe(2);
+    expect(result.percent).toBe(0);
+    expect(result.caveats.join(' ')).toContain('waiver has lapsed');
+  });
+
+  it('keeps excluding a route whose waiver is still in force', () => {
+    const result = join(
+      ['app/admin/legacy/page.tsx', 'app/promo/page.tsx'],
+      [
+        waived('/admin/legacy', new Date(NOW.getTime() + 30 * 86_400_000)),
+        route('/promo', 'UNCOVERED'),
+      ],
+      { now: NOW },
+    );
+
+    expect(result.denominator).toBe(1);
+    expect(result.waived).toBe(1);
+    expect(result.caveats.join(' ')).not.toContain('waiver has lapsed');
+  });
+
+  it('counts a WAIVED row with NO waiver behind it as a gap', () => {
+    // `null` is "we read the waiver and there is none" — a status with nothing
+    // behind it. It is not the same fact as `undefined`, which is "not read".
+    const result = join(['app/admin/legacy/page.tsx'], [waived('/admin/legacy', null)], {
+      now: NOW,
+    });
+
+    expect(result.denominator).toBe(1);
+    expect(result.waived).toBe(0);
+    expect(result.uncovered).toBe(1);
+  });
+
+  it('takes a WAIVED row at face value when the caller did not read the waiver', () => {
+    /*
+     * NULL IS NOT ZERO, and absent is not null. A caller that cannot join the
+     * waiver must not be silently given a different denominator from the one
+     * it had before the join existed — it gets the old answer, and the caveat
+     * that would have disclosed a lapse is absent because nothing was measured.
+     */
+    const result = join(['app/admin/legacy/page.tsx'], [waived('/admin/legacy', undefined)], {
+      now: NOW,
+    });
+
+    expect(result.denominator).toBe(0);
+    expect(result.waived).toBe(1);
+    expect(result.percent).toBeNull();
+  });
+
+  it('measures the expiry against the injected clock, not the real one', () => {
+    // The same row, read at two times. A gate that could not be asked what it
+    // would have decided yesterday is a gate nobody can audit.
+    const expiry = new Date(NOW.getTime() + 86_400_000);
+    const before = join(['app/admin/legacy/page.tsx'], [waived('/admin/legacy', expiry)], {
+      now: NOW,
+    });
+    const after = join(['app/admin/legacy/page.tsx'], [waived('/admin/legacy', expiry)], {
+      now: new Date(expiry.getTime() + 1_000),
+    });
+
+    expect(before.waived).toBe(1);
+    expect(after.waived).toBe(0);
+    expect(after.uncovered).toBe(1);
+  });
+});
+
 describe('patch coverage says what it cannot distinguish', () => {
   it('cannot tell a renamed route from a new one, and refuses to guess', () => {
     // `app/cart/page.tsx` → `app/basket/page.tsx`, with a test that already

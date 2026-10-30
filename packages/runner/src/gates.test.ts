@@ -143,7 +143,20 @@ describe('tallyResult', () => {
   it('counts a quarantined failure in quarantinedFailed, never in failed', () => {
     const counts = emptyRunCounts();
     tallyResult(counts, { status: 'FAILED', quarantineInForce: true });
-    expect(counts).toEqual({ passed: 0, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 1 });
+    /*
+     * `failedThenSuppressed: 0` is asserted, not omitted. `tallyResult` is the
+     * only writer of `quarantinedFailed` and must never touch the after-the-run
+     * subtraction: a quarantined failure never entered `failed`, so counting it
+     * there as well would take the same failure off the gate twice.
+     */
+    expect(counts).toEqual({
+      passed: 0,
+      failed: 0,
+      flaky: 0,
+      skipped: 0,
+      quarantinedFailed: 1,
+      failedThenSuppressed: 0,
+    });
   });
 
   it('does NOT fold a suppressed failure into skipped', () => {
@@ -175,6 +188,7 @@ describe('tallyResult', () => {
         flaky: 1,
         skipped: 1,
         quarantinedFailed: 0,
+        failedThenSuppressed: 0,
       });
     }
   });
@@ -1953,5 +1967,337 @@ describe('quarantineHealthFrom', () => {
       now: NOW,
     });
     expect(health.unbounded).toEqual([]);
+  });
+});
+
+// ─── The suppression that has to reach the verdict ───────────────────────────
+
+/*
+ * THE DEFECT, AND IT WAS THE WORST OF BOTH. Triage decides a known issue or an
+ * ENV_ISSUE after the run's counters are written, so those failures are still in
+ * `Run.failedCount` when `runOutcome` is asked whether the run passed. Before
+ * this, the ledger recorded "4 failures suppressed" and the build stayed red:
+ * the customer was blocked AND the ledger said a failure had been silenced.
+ * That is the original quarantine defect — signal off, gate on — in a second
+ * table.
+ */
+describe('a counted suppression takes the failure off the gate', () => {
+  const envTally = (suppressed: number) => [
+    { kind: 'ENV_ISSUE' as const, suppressions: 1, suppressed, expired: 0 },
+  ];
+
+  it('PASSES a run whose every failure a counted ENV_ISSUE silenced', () => {
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 4,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 4,
+      },
+      gatePassed: true,
+      suppressions: envTally(4),
+    });
+    expect(outcome.status).toBe('PASSED');
+    expect(outcome.passed).toBe(true);
+    // Named by KIND, so the sentence says which suppression silenced what.
+    expect(outcome.reason).toContain('4 failures by 1 environment failure');
+    expect(outcome.reason).toContain('4 of 4 counted failure(s) did not gate');
+    expect(outcome.reason).toContain('still failures that happened');
+    expect(outcome.suppressedFailures).toBe(4);
+  });
+
+  it('leaves the failures the suppression did not cover gating, with the count', () => {
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 4,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 3,
+      },
+      gatePassed: true,
+      suppressions: envTally(3),
+    });
+    expect(outcome.status).toBe('FAILED');
+    // ONE, not four: the subtraction is reported rather than being invisible.
+    expect(outcome.reason).toContain('1 test(s) failed');
+    expect(outcome.reason).toContain('3 of 4 counted failure(s) did not gate');
+  });
+
+  /*
+   * A FAILURE ONLY STOPS GATING AS FAR AS A COUNTED SUPPRESSION CLAIMS IT. A
+   * counter that can outrun its own ledger is how "a failure suppressed without
+   * being counted" would arrive: the gate comes off and no row says why.
+   */
+  it('refuses to take a failure off the gate that no ledger row accounts for', () => {
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 4,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 4,
+      },
+      gatePassed: true,
+      // The ledger accounts for ONE. The counter claims four.
+      suppressions: envTally(1),
+    });
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.reason).toContain('3 test(s) failed');
+    expect(outcome.reason).toContain(
+      '3 failure(s) were reported as suppressed and no suppression in the ledger accounts for them',
+    );
+    expect(outcome.reason).toContain('they still gate');
+  });
+
+  it('withholds the subtraction entirely when the caller passes no ledger', () => {
+    // Absent `suppressions` means "this caller has no ledger to read", which is
+    // not "nothing was suppressed" — so it may not buy a pass either.
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 4,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 4,
+      },
+      gatePassed: true,
+    });
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.reason).toContain('4 test(s) failed');
+    expect(outcome.reason).toContain('no suppression in the ledger accounts for them');
+  });
+
+  /*
+   * A CAP THAT BIT, DISCLOSED AS A COUNT AND THE REASON THAT ACTUALLY BIT. A
+   * ledger claiming more silenced failures than the run had is a defect in
+   * whatever wrote it, and clamping it silently would hide the defect behind a
+   * green build.
+   */
+  it('clamps a ledger that claims more silenced failures than the run had, and says so', () => {
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 2,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 9,
+      },
+      gatePassed: true,
+      suppressions: envTally(9),
+    });
+    expect(outcome.status).toBe('PASSED');
+    expect(outcome.reason).toContain('the subtraction was clamped to the failures that existed');
+    expect(outcome.reason).toContain('2 of 2 counted failure(s) did not gate');
+  });
+
+  /*
+   * QUARANTINE MAY NOT BE SUBTRACTED. A quarantined failure never entered
+   * `failed` (`tallyResult` is its only writer), so letting its tally account
+   * for `failedThenSuppressed` would take the same failure off the gate twice —
+   * and the run would pass with a real, unsuppressed failure in it.
+   */
+  it('does not let a quarantine tally account for a failure that still gates', () => {
+    const outcome = runOutcome({
+      counts: {
+        passed: 6,
+        failed: 1,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 5,
+        failedThenSuppressed: 1,
+      },
+      gatePassed: true,
+      // No non-quarantine ledger row at all; the 5 arrive as the counter.
+      suppressions: [],
+    });
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.reason).toContain('1 test(s) failed');
+    expect(outcome.reason).toContain('5 failing test(s) were quarantined');
+  });
+
+  it('is unchanged for a caller that passes no counter at all', () => {
+    // Every production caller today. Absent must mean today's answer, or this
+    // change would relabel runs it has no information about.
+    const outcome = runOutcome({
+      counts: { passed: 6, failed: 4, flaky: 0, skipped: 0, quarantinedFailed: 0 },
+      gatePassed: true,
+      suppressions: envTally(4),
+    });
+    expect(outcome.status).toBe('FAILED');
+    expect(outcome.reason).toContain('4 test(s) failed');
+    expect(outcome.reason).not.toContain('did not gate because a suppression');
+  });
+
+  it('says the silenced failures out loud on a cancelled run too', () => {
+    // A run cancelled while a mute was silencing failures still silenced them.
+    const outcome = runOutcome({
+      counts: {
+        passed: 0,
+        failed: 3,
+        flaky: 0,
+        skipped: 0,
+        quarantinedFailed: 0,
+        failedThenSuppressed: 3,
+      },
+      gatePassed: true,
+      forcedStatus: 'CANCELLED',
+      suppressions: [{ kind: 'MUTE', suppressions: 2, suppressed: 3, expired: 0 }],
+    });
+    expect(outcome.status).toBe('CANCELLED');
+    expect(outcome.reason).toContain('3 failures by 2 known issues');
+    expect(outcome.reason).toContain('3 of 3 counted failure(s) did not gate');
+  });
+});
+
+// ─── The selective-run gate ──────────────────────────────────────────────────
+
+/*
+ * THE DEFECT WITH A NUMBER ATTACHED. A `MIN_PASS_RATE` gate over an
+ * impact-selected run of 11 tests computes 100% and the run page and the GitHub
+ * check both render it as a pass — a suite-wide claim made from a sliver of the
+ * suite. The CLI has withheld that claim for a while because it knows what it
+ * asked for; the server could not, because `Run.selectionSource` did not exist.
+ * It does now, and nothing read it.
+ */
+describe('a gate over a selective run may not claim a suite-wide pass', () => {
+  const minPassRate: GateRule[] = [{ kind: 'MIN_PASS_RATE', ratePercent: 90, action: 'BLOCK' }];
+  const blockRealBugs: GateRule[] = [
+    { kind: 'BLOCK_ON_VERDICT', verdict: 'REAL_BUG', onlyPriorities: [] },
+  ];
+  const elevenPassing = () =>
+    Array.from({ length: 11 }, (_, i) => result({ testId: `t${i}`, status: 'PASSED' }));
+
+  const rateLine = (gate: GateResult) =>
+    gate.evaluations.find((e) => e.rule.kind === 'MIN_PASS_RATE')!;
+
+  it('WITHHOLDS the pass on an impact-selected run and names the selection', () => {
+    const gate = evaluateGates(minPassRate, {
+      results: elevenPassing(),
+      selection: { source: 'IMPACT' },
+    });
+    const line = rateLine(gate);
+    expect(line.action).toBe('UNMEASURED');
+    expect(line.passed).toBe(null);
+    expect(line.detail).toContain('100.0% passed (11/11)');
+    expect(line.detail).toContain('selected by IMPACT');
+    expect(line.detail).toContain('NOT a suite-wide result');
+    // Withheld, not blocked: a rule with no answer reaches neither column.
+    expect(gate.passed).toBe(true);
+    expect(gate.unmeasured).toBe(1);
+  });
+
+  /*
+   * NULL IS UNKNOWN, NOT FULL_SUITE. `Run.selectionSource` is nullable and not
+   * back-filled, so a run written before the column existed records no
+   * selection — and reading that absence as "the whole suite" would be a null
+   * that became a fact, on the one surface a merge decision is made from.
+   */
+  it('withholds on a NULL selection source and calls it unknown, not FULL_SUITE', () => {
+    const line = rateLine(
+      evaluateGates(minPassRate, { results: elevenPassing(), selection: { source: null } }),
+    );
+    expect(line.action).toBe('UNMEASURED');
+    expect(line.detail).toContain('selection unknown');
+    expect(line.detail).toContain('not the same fact as FULL_SUITE');
+  });
+
+  /*
+   * A SELECTION MODE THIS BUILD CANNOT NAME IS UNKNOWN. The column is TEXT with
+   * the domain at the producer, so a newer build's value can arrive here — and
+   * the one answer that must never happen is a value we cannot name being read
+   * as suite-wide.
+   */
+  it('reads a selection source it cannot name as unknown, and does not quote it', () => {
+    const line = rateLine(
+      evaluateGates(minPassRate, {
+        results: elevenPassing(),
+        selection: { source: 'SOMETHING_A_LATER_ROUND_ADDED' },
+      }),
+    );
+    expect(line.action).toBe('UNMEASURED');
+    expect(line.detail).toContain('selection unrecognised');
+    // The VALUE is never echoed. A detail assembled out of a stored value is how
+    // a hand-edited row came to print itself to a customer.
+    expect(line.detail).not.toContain('SOMETHING_A_LATER_ROUND_ADDED');
+  });
+
+  it('publishes the pass on a FULL_SUITE run with no withholding clause', () => {
+    const line = rateLine(
+      evaluateGates(minPassRate, { results: elevenPassing(), selection: { source: 'FULL_SUITE' } }),
+    );
+    expect(line.action).toBe('PASS');
+    expect(line.detail).toContain('100.0% passed (11/11)');
+    expect(line.detail).not.toContain('NOT a suite-wide result');
+    expect(line.detail).not.toContain('unrecorded');
+  });
+
+  /*
+   * ONLY THE PASS IS WITHHELD. A rate below the floor over a sliver is still a
+   * real failure, and turning it into "not measured" would be a block this
+   * product threw away.
+   */
+  it('still FAILS a selective run whose rate is below the floor', () => {
+    const gate = evaluateGates(minPassRate, {
+      results: [
+        ...Array.from({ length: 5 }, (_, i) => result({ testId: `p${i}`, status: 'PASSED' })),
+        ...Array.from({ length: 5 }, (_, i) => result({ testId: `f${i}`, status: 'FAILED' })),
+      ],
+      selection: { source: 'RERUN_FAILURES' },
+    });
+    const line = rateLine(gate);
+    expect(line.action).toBe('BLOCK');
+    expect(line.passed).toBe(false);
+    expect(line.detail).toContain('50.0% passed (5/10)');
+    expect(gate.passed).toBe(false);
+  });
+
+  it('says out loud that nobody read the selection when the caller passes none', () => {
+    /*
+     * ABSENT IS DELIBERATELY NOT WITHHELD — see `GateInput.selection`. No
+     * production caller passes it yet, so withholding here would turn every
+     * full-suite pass in the product into "not measured". It still SAYS the gap
+     * rather than implying the claim was checked.
+     */
+    const line = rateLine(evaluateGates(minPassRate, { results: elevenPassing() }));
+    expect(line.action).toBe('PASS');
+    expect(line.detail).toContain('nothing that scored this gate read the run’s selection');
+    expect(line.detail).toContain('NOT a verified suite-wide pass');
+  });
+
+  /*
+   * THE VERDICT RULE SCOPES ITS PASS RATHER THAN WITHHOLDING IT, and that is a
+   * decision with a reason: `gateAwaitsTriage` reads "UNMEASURED and
+   * BLOCK_ON_VERDICT" as "triage has not finished", so an UNMEASURED produced
+   * for a SELECTION reason would make the post-triage sweep re-score this run
+   * for ever and the run page render PROVISIONAL for ever.
+   */
+  it('scopes the verdict rule’s pass to the selection without making it look untriaged', () => {
+    const gate = evaluateGates(blockRealBugs, {
+      results: elevenPassing(),
+      selection: { source: 'EXPLICIT' },
+    });
+    const line = gate.evaluations.find((e) => e.rule.kind === 'BLOCK_ON_VERDICT')!;
+    expect(line.action).toBe('PASS');
+    expect(line.detail).toContain('No REAL_BUG verdicts over the 11 result(s) that gate');
+    expect(line.detail).toContain('selected by EXPLICIT');
+    expect(line.detail).toContain('NOT a suite-wide result');
+    // The load-bearing half: this must not read as "waiting on triage".
+    expect(gateAwaitsTriage(gate)).toBe(false);
+  });
+
+  it('still BLOCKS a selective run that found the verdict it refuses', () => {
+    const gate = evaluateGates(blockRealBugs, {
+      results: [result({ status: 'FAILED', verdict: 'REAL_BUG' })],
+      selection: { source: 'IMPACT' },
+    });
+    expect(gate.passed).toBe(false);
+    expect(gate.evaluations[0]!.action).toBe('BLOCK');
   });
 });

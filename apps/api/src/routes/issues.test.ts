@@ -395,6 +395,15 @@ function makeDb(store: Store): Row {
         return found ? projectRow(name, found, sel, store) : null;
       },
       findMany: async ({ where, orderBy, select: sel, take }: Row = {}) => {
+        /*
+         * The ownership-rule `select`, RECORDED. `OwnershipRule.source` decides
+         * whether a match is an ASSIGNMENT or a SUGGESTION, and a route that
+         * stopped asking for it would silently route every imported glob as
+         * RULE_PATH again — a regression the pair of provenance tests above
+         * cannot see, because they set the field on a fixture rather than
+         * proving the query reads it.
+         */
+        if (name === 'ownershipRule') observed.ruleQueries.push(sel);
         const rows = sortRows(select(where), orderBy);
         const page = typeof take === 'number' ? rows.slice(0, take) : rows;
         return page.map((row) => projectRow(name, row, sel, store));
@@ -596,6 +605,14 @@ const ownershipRule = (over: Row = {}): Row => ({
   feature: null,
   ownerUserId: null,
   ownerTeamId: null,
+  /*
+   * WHERE THE RULE CAME FROM, defaulted to NULL because that is what a rule
+   * somebody typed into QAAI stores. A fixture that omitted the key entirely
+   * would still read as null through `projectRow`, but it would not say that
+   * `source` is a field this row HAS — and the test that distinguishes an
+   * imported glob from a hand-written rule has to be able to set it.
+   */
+  source: null,
   createdAt: nextDate(),
   ...over,
 });
@@ -712,6 +729,9 @@ function coverageFixture(): Row {
 
 let store: Store;
 
+/** What the fake was asked, so a dropped `select` field is detectable. */
+const observed: { ruleQueries: Array<Record<string, unknown> | undefined> } = { ruleQueries: [] };
+
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
@@ -760,6 +780,7 @@ beforeEach(() => {
   h.coverage = coverageFixture();
   store = seed();
   h.prisma = makeDb(store);
+  observed.ruleQueries.length = 0;
 });
 
 // ─── One ticket per cause ────────────────────────────────────────────────────
@@ -1648,6 +1669,51 @@ describe('a failure is routed WITH its strength, not just to somebody', () => {
     expect(body.owner).toMatchObject({ provenance: 'RULE_PATH', kind: 'ASSIGNED' });
     expect(h.filed[0]!.body).toContain('**Owner:**');
     expect(h.filed[0]!.body).not.toContain('Suggested owner');
+  });
+
+  /*
+   * ── THE IMPORTED GLOB, WHICH USED TO PAGE ────────────────────────────────
+   *
+   * `OwnershipRule.source` had no reader on this path, so a glob pasted out of
+   * a customer's CODEOWNERS file was routed as RULE_PATH — an ASSIGNMENT — and
+   * the ticket said "**Owner:**" about a team that never agreed to own
+   * anything. CODEOWNERS_IMPORT is deliberately WEAKER than RULE_PATH and
+   * `mayPage` is false for it.
+   *
+   * THE PAIR IS THE TEST. The two cases below differ in ONE field on ONE
+   * fixture, so neither can pass by accident: the same rule, the same path, the
+   * same owner, and the opposite claim about what the match is worth.
+   */
+  it('writes CODEOWNERS_IMPORT for an imported glob, and the ticket calls it a suggestion', async () => {
+    store.ownershipRule.push(
+      ownershipRule({
+        pathPattern: 'tests/**',
+        ownerTeamId: 'team_payments',
+        source: 'CODEOWNERS',
+      }),
+    );
+
+    const { body } = await post('/issues', { resultId: 'res_a' });
+
+    for (const member of THE_CAUSE) {
+      expect(verdictOf(member.id).ownerProvenance).toBe('CODEOWNERS_IMPORT');
+      // STILL OWNED. The owner is right; what changed is what the match is
+      // worth, and conflating those two is how a suggestion comes to page.
+      expect(verdictOf(member.id).ownerState).toBe('OWNED');
+    }
+    expect(body.owner).toMatchObject({ provenance: 'CODEOWNERS_IMPORT', kind: 'SUGGESTED' });
+    expect(h.filed[0]!.body).toContain('Suggested owner');
+  });
+
+  it('reads `source` off the rule, so dropping it from the select is detectable', async () => {
+    store.ownershipRule.push(
+      ownershipRule({ pathPattern: 'tests/**', ownerTeamId: 'team_payments' }),
+    );
+
+    await post('/issues', { resultId: 'res_a' });
+
+    const read = observed.ruleQueries.at(-1);
+    expect(read).toMatchObject({ source: true });
   });
 
   it('falls back to the last human editor as a SUGGESTION, and the ticket says so', async () => {

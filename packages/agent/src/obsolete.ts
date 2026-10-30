@@ -1176,6 +1176,23 @@ export function obsolescenceSignalsFor(
       else add('ROUTE_GONE', route.route);
     }
 
+    /*
+     * ── WHY THERE IS NO "WAS ANY ROUTE EXCLUDED?" GUARD ON THIS LOOP ─────────
+     *
+     * It was proposed, on the grounds that the crawl's locator set is GLOBAL —
+     * so a control living only on a dark route would read as gone and would
+     * raise the confidence of a proposal built on a confirmed ROUTE_GONE. The
+     * reasoning is right and the guard is NOT NEEDED, which was MEASURED rather
+     * than argued: `auditTestsAgainstCrawl` takes the `excludedRoutes.length >
+     * 0` branch above, which answers UNMEASURED with `locators: []`, so a test
+     * with an excluded-and-unreached route arrives here with NOTHING for this
+     * loop to iterate.
+     *
+     * AND `route.excluded !== null` WOULD BE THE WRONG PREDICATE ANYWAY. That
+     * is true of a route the crawl REACHED despite the exclusion, where the
+     * exclusion is moot and the comparison is perfectly good — so the guard
+     * would withhold a real signal for the one shape it could still see.
+     */
     for (const locator of test.locators) {
       if (locator.comparable && !locator.seen) add('LOCATOR_GONE', locator.locator);
     }

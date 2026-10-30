@@ -192,6 +192,13 @@ interface RunOver {
   /** `Project.repoFullName`. Null is a project with no repository connected. */
   repoFullName?: string | null;
   failures?: number;
+  /**
+   * `Run.selectionSource`. DEFAULTED TO NULL, which is UNKNOWN — a run written
+   * before the column existed — and is NOT `FULL_SUITE`. The gate withholds a
+   * suite-wide claim on it, so a fixture that left the key absent would test
+   * the absent-selection arm for ever and never the column.
+   */
+  selectionSource?: string | null;
   /** Per failing test, index-aligned with the generated failures. */
   quarantine?: QuarantineColumns[];
 }
@@ -210,6 +217,7 @@ function runRow(over: RunOver = {}) {
     skippedCount: 0,
     totalCount: 10,
     errorMessage: null,
+    selectionSource: over.selectionSource ?? null,
     gateResult: over.gateResult ?? null,
     startedAt: new Date('2026-01-01T00:00:00Z'),
     finishedAt: new Date('2026-01-01T00:05:00Z'),
@@ -237,8 +245,19 @@ function runRow(over: RunOver = {}) {
   };
 }
 
-/** Records what the processor asked the database for, so scoping is assertable. */
-const runFindFirstArgs: Array<{ where: { id: string; orgId: string } }> = [];
+/**
+ * Records what the processor asked the database for, so scoping is assertable.
+ *
+ * `select` is in the type because the fake already records it and a test needs
+ * it: `Run.selectionSource` decides whether `MIN_PASS_RATE` may publish a
+ * suite-wide pass, and a read that stopped asking for the column would quietly
+ * go back to claiming one. A recorder that drops the field it was handed makes
+ * that regression invisible.
+ */
+const runFindFirstArgs: Array<{
+  where: { id: string; orgId: string };
+  select?: Select;
+}> = [];
 
 /**
  * Project a fixture row through the `select` the processor actually asked for,
@@ -323,11 +342,41 @@ interface World {
     createdAt: Date;
     commitSha: string | null;
   } | null;
-  items?: Array<{ key: string; status: string; label: string }>;
+  /**
+   * Coverage inventory rows, as the gate's own read selects them.
+   *
+   * `waiver` is part of the row and not an extra: `CoverageItem.status` is a
+   * MATERIALISED answer and the `CoverageWaiver` row is the authority, so a
+   * fixture that could not carry the waiver could not express a lapsed
+   * exclusion — which is the case that used to inflate the percentage printed
+   * on a pull request.
+   */
+  items?: Array<{
+    key: string;
+    status: string;
+    label: string;
+    waiver?: { expiresAt: Date | null } | null;
+  }>;
   /** Tests the impact analysis attributes the diff against. */
   tests?: Array<{ id: string; name: string; filePath: string; code: string | null }>;
+  /**
+   * `SuppressionEvent` rows for this run.
+   *
+   * The POST-TRIAGE re-score is the first moment both halves exist — triage
+   * writes these AFTER the finaliser ran — which is why the subtraction from
+   * `failedCount` happens here and not there. Defaulted to EMPTY and not
+   * absent: empty is "triage silenced nothing", which is the ordinary case.
+   */
+  ledger?: Array<{
+    kind: string;
+    sourceId: string | null;
+    suppressed: number;
+    inForce: boolean;
+  }>;
   /** Make one read fail, to prove the re-score fails toward the stored gate. */
   failResultsRead?: boolean;
+  /** Make the LEDGER read fail. A read that failed is not "nothing was suppressed". */
+  failLedgerRead?: boolean;
 }
 
 const result = (over: Partial<ResultRow> = {}): ResultRow => ({
@@ -355,6 +404,9 @@ const runUpdates: Array<{ where: Record<string, unknown>; data: Record<string, u
  */
 const resultReads = { count: 0, wheres: [] as Array<Record<string, unknown>> };
 
+/** Every argument the ledger read was given, so its scoping is assertable. */
+const ledgerReads: Array<{ where?: Record<string, unknown>; select?: Select; take?: number }> = [];
+
 function useWorld(world: World): void {
   const { row } = world;
   const results = world.results ?? [];
@@ -376,6 +428,35 @@ function useWorld(world: World): void {
       },
     },
     healProposal: { findMany: async () => [] },
+    /**
+     * The suppression ledger, which the re-score reads through
+     * `suppressionTalliesFor` (processors/run.ts — ONE definition, because a
+     * `groupBy` here would count rows where that function counts distinct
+     * `sourceId`s and two surfaces would report different numbers for one run).
+     *
+     * The ARGS are recorded as well as answered: this read is what takes a
+     * silenced failure off the gate, so the `inForce`/`kind` scoping is the
+     * property worth holding — a fake that shrugged at them would let the
+     * subtraction count an EXPIRED mute and relabel a run PASSED on a
+     * suppression that had run out.
+     */
+    suppressionEvent: {
+      findMany: async (
+        args: { where?: Record<string, unknown>; select?: Select; take?: number } = {},
+      ) => {
+        ledgerReads.push(args);
+        if (world.failLedgerRead) throw new Error('the ledger table went away');
+        const rows = (world.ledger ?? []).filter((row) => {
+          // `args.where` is already `Record<string, unknown>`; the cast that
+          // used to be here changed nothing.
+          const kind = (args.where ?? {}).kind as { not?: string } | undefined;
+          if (kind?.not !== undefined && row.kind === kind.not) return false;
+          return true;
+        });
+        const page = typeof args.take === 'number' ? rows.slice(0, args.take) : rows;
+        return page.map((row) => applySelect(row, args.select));
+      },
+    },
     testResult: {
       findMany: async (
         args: { where?: Record<string, unknown>; select?: Select } = {},
@@ -450,7 +531,20 @@ function useWorld(world: World): void {
     coverageSnapshot: { findFirst: async () => world.coverage ?? null },
     coverageItem: { findMany: async () => world.items ?? [] },
     test: {
-      count: async () => results.length,
+      /**
+       * `count` HONOURS `quarantined: true`, and that is not tidiness.
+       *
+       * It used to return `results.length` for every call, so
+       * `quarantineHealth` read 10 of 10 tests quarantined on EVERY fixture in
+       * this file and appended a BLOCK — which meant `GateResult.passed` was
+       * false in every test here and no test could assert a passing gate at
+       * all. A where-blind fake does not just hide a dropped filter; it makes a
+       * whole column of assertions unavailable.
+       */
+      count: async ({ where }: { where?: Record<string, unknown> } = {}) =>
+        where?.quarantined === true
+          ? results.filter((r) => r.quarantined === true).length
+          : results.length,
       findMany: async ({ select }: { select?: Select } = {}) =>
         // Two callers: the quarantine row sample, and the suite the impact
         // analysis attributes a diff against. They ask for different columns.
@@ -495,6 +589,7 @@ beforeEach(() => {
   runUpdates.length = 0;
   resultReads.count = 0;
   resultReads.wheres.length = 0;
+  ledgerReads.length = 0;
   runFindFirstArgs.length = 0;
   _resetTokenCache();
   _resetCommentRefusals();
@@ -689,6 +784,214 @@ describe('org isolation', () => {
     expect(runFindFirstArgs[0]!.where.orgId).toBe('org_someone_else');
     // No token minted, no check, no comment: another org's run id is not a run.
     expect(gh.calls).toHaveLength(0);
+  });
+});
+
+// ─── What chose the tests, and what triage silenced ──────────────────────────
+
+/*
+ * THE TWO THINGS THE POST-TRIAGE RE-SCORE NOW READS, and neither had a
+ * production caller before this round.
+ *
+ *   · `Run.selectionSource` — the column had a WRITER (POST /runs) and no
+ *     reader, so `MIN_PASS_RATE` scored 100% over an eleven-test impact
+ *     selection and every surface rendered it as a statement about the suite.
+ *   · `SuppressionEvent` — triage writes these AFTER the finaliser has already
+ *     written the counters, so this re-score is the FIRST moment both halves
+ *     exist. Without the subtraction the product shipped the worst of both: the
+ *     ledger said N failures were silenced and `Run.status` stayed FAILED, so
+ *     the customer was blocked AND told the failure had been handled.
+ */
+describe('the re-score reads what chose the tests', () => {
+  const minPassRate = [{ kind: 'MIN_PASS_RATE', ratePercent: 90, action: 'BLOCK' }];
+  const tenPassing = () =>
+    Array.from({ length: 10 }, (_, i) =>
+      result({ testId: `p${i}`, name: `test ${i}`, status: 'PASSED' }),
+    );
+  const passing = (selectionSource?: string | null) =>
+    runRow({
+      status: 'PASSED',
+      failures: 0,
+      failedCount: 0,
+      passedCount: 10,
+      gateRules: minPassRate,
+      ...(selectionSource === undefined ? {} : { selectionSource }),
+    });
+
+  const passRate = () =>
+    writtenGate()!.evaluations.find((e) => e.detail.startsWith('Pass rate'))!;
+
+  it('publishes the suite-wide pass for a FULL_SUITE run', async () => {
+    useWorld({ row: passing('FULL_SUITE'), results: tenPassing() });
+    await complete();
+
+    expect(passRate().action).toBe('PASS');
+    // No caveat clause: this one IS a verified suite-wide pass.
+    expect(passRate().detail).not.toContain('NOT a suite-wide result');
+  });
+
+  it('WITHHOLDS the suite-wide pass over an IMPACT selection, and names the mode', async () => {
+    useWorld({ row: passing('IMPACT'), results: tenPassing() });
+    await complete();
+
+    // 100% of ten impact-selected tests says nothing about the rest of the
+    // suite. The pass is withheld; it is NOT converted into a block.
+    expect(passRate().action).toBe('UNMEASURED');
+    expect(passRate().detail).toContain('selected by IMPACT');
+    // WITHHELD, NOT BLOCKED. A rate below the floor would still have failed
+    // this rule; converting a sliver's pass into a block would be a block this
+    // product invented.
+    expect(writtenGate()!.passed).toBe(true);
+  });
+
+  it('withholds it on a NULL selection too, because a null is UNKNOWN and not FULL_SUITE', async () => {
+    useWorld({ row: passing(null), results: tenPassing() });
+    await complete();
+
+    expect(passRate().action).toBe('UNMEASURED');
+    expect(passRate().detail).toContain('the run records no selection source');
+    /*
+     * The sentence NAMES no selection mode, because there is none to name. It
+     * does mention FULL_SUITE — "which is not the same fact as FULL_SUITE" —
+     * and that clause is the point rather than a leak, so what is asserted is
+     * the absence of a CLAIM ("selected by X") and not the absence of the word.
+     */
+    expect(passRate().detail).not.toContain('selected by');
+    expect(passRate().detail).toContain('not the same fact as FULL_SUITE');
+  });
+
+  it('reads the column rather than inferring it, so dropping it from the select is detectable', async () => {
+    useWorld({ row: passing('FULL_SUITE'), results: tenPassing() });
+    await complete();
+
+    const read = runFindFirstArgs.find((args) => args.select && 'gateResult' in args.select)!;
+    expect(read.select).toMatchObject({ selectionSource: true });
+  });
+
+  it('takes a silenced failure off the gate, instead of blocking AND saying it was handled', async () => {
+    /*
+     * One failure, a known issue silencing it, a gate the failure does not
+     * block. Before the ledger reached `runOutcome` here, this run's status
+     * stayed FAILED while the ledger recorded the suppression — the exact
+     * "worst of both" the subtraction exists to end.
+     */
+    useWorld({
+      row: runRow({
+        status: 'FAILED',
+        failures: 1,
+        failedCount: 1,
+        passedCount: 9,
+        /*
+         * AN EXPLICIT RULE LIST, not `[]`. An empty list means
+         * `DEFAULT_GATE_RULES`, which include `BLOCK_ON_VERDICT` — so the gate
+         * would block on the REAL_BUG verdict below and `gatePassed: false`
+         * would decide the status whatever the ledger said. This run's one
+         * failure does not trip a 50% floor, which is what leaves the
+         * subtraction as the only thing deciding PASSED or FAILED.
+         */
+        gateRules: [{ kind: 'MIN_PASS_RATE', ratePercent: 50, action: 'BLOCK' }],
+        selectionSource: 'FULL_SUITE',
+      }),
+      results: [
+        ...Array.from({ length: 9 }, (_, i) =>
+          result({ testId: `p${i}`, name: `test ${i}`, status: 'PASSED' }),
+        ),
+        result({ testId: 'f0', name: 'Checkout completes 0', verdict: 'REAL_BUG' }),
+      ],
+      ledger: [{ kind: 'MUTE', sourceId: 'ki_1', suppressed: 1, inForce: true }],
+    });
+    await complete();
+
+    expect(writtenGate()!.passed).toBe(true);
+    expect(runUpdates[runUpdates.length - 1]!.data.status).toBe('PASSED');
+  });
+
+  it('leaves the same run FAILED when the ledger is empty, so the subtraction is what moved it', async () => {
+    /*
+     * The other half of the pair. Identical fixture with NO ledger row: the
+     * failure still gates, so the test above cannot be passing because the
+     * rules happened to clear it.
+     */
+    useWorld({
+      row: runRow({
+        status: 'FAILED',
+        failures: 1,
+        failedCount: 1,
+        passedCount: 9,
+        gateRules: [{ kind: 'MIN_PASS_RATE', ratePercent: 50, action: 'BLOCK' }],
+        selectionSource: 'FULL_SUITE',
+      }),
+      results: [
+        ...Array.from({ length: 9 }, (_, i) =>
+          result({ testId: `p${i}`, name: `test ${i}`, status: 'PASSED' }),
+        ),
+        result({ testId: 'f0', name: 'Checkout completes 0', verdict: 'REAL_BUG' }),
+      ],
+      ledger: [],
+    });
+    await complete();
+
+    expect(runUpdates[runUpdates.length - 1]!.data.status).toBe('FAILED');
+  });
+
+  it('scopes the ledger read to this run, excludes QUARANTINE, and bounds it', async () => {
+    useWorld({
+      row: passing('FULL_SUITE'),
+      results: tenPassing(),
+      ledger: [],
+    });
+    await complete();
+
+    expect(ledgerReads).toHaveLength(1);
+    /*
+     * QUARANTINE IS EXCLUDED IN THE QUERY. It arrives as
+     * `counts.quarantinedFailed` instead, and counting it twice — once from the
+     * counter and once from a ledger row — would take the same failure off the
+     * gate twice.
+     */
+    expect(ledgerReads[0]!.where).toMatchObject({
+      runId: RUN,
+      orgId: ORG,
+      kind: { not: 'QUARANTINE' },
+    });
+    expect(ledgerReads[0]!.take).toBeGreaterThan(0);
+  });
+
+  it('leaves the failure RED when the ledger read fails, rather than reading it as "nothing"', async () => {
+    /*
+     * A READ THAT FAILED IS NOT "NOTHING WAS SUPPRESSED", and the behaviour
+     * here was MEASURED rather than assumed. `suppressionTalliesFor` catches
+     * its own error and returns an empty tally, so the re-score SURVIVES and
+     * still writes a gate — it does not fail toward the stored answer the way
+     * a failed RESULTS read does.
+     *
+     * What that means for the customer is the safe direction: with no tallies
+     * there is nothing to subtract, so the failure keeps gating. The unsafe
+     * alternative would be a run relabelled PASSED on the strength of a ledger
+     * nobody could read. The log line is what a reader has.
+     */
+    useWorld({
+      row: runRow({
+        status: 'FAILED',
+        failures: 1,
+        failedCount: 1,
+        passedCount: 9,
+        gateRules: [{ kind: 'MIN_PASS_RATE', ratePercent: 50, action: 'BLOCK' }],
+        selectionSource: 'FULL_SUITE',
+      }),
+      results: [
+        ...Array.from({ length: 9 }, (_, i) =>
+          result({ testId: `p${i}`, name: `test ${i}`, status: 'PASSED' }),
+        ),
+        result({ testId: 'f0', name: 'Checkout completes 0', verdict: 'REAL_BUG' }),
+      ],
+      failLedgerRead: true,
+    });
+    await complete();
+
+    // A gate IS written, and the failure is still a failure.
+    expect(writtenGate()).not.toBeNull();
+    expect(runUpdates[runUpdates.length - 1]!.data.status).toBe('FAILED');
   });
 });
 
@@ -1169,6 +1472,18 @@ describe('a test nobody could attempt is out of the pass rate', () => {
    */
   const minPassRate = [{ kind: 'MIN_PASS_RATE', ratePercent: 90, action: 'BLOCK' }];
 
+  /*
+   * `selectionSource: 'FULL_SUITE'` IS DECLARED, and it has to be.
+   *
+   * These tests are about the DENOMINATOR — which rows the pass rate divides
+   * by — and `MIN_PASS_RATE` now also asks what chose the tests. A run whose
+   * selection is UNRECORDED (null) cannot publish a suite-wide 100%, so with
+   * the default fixture these would report UNMEASURED and stop testing the
+   * denominator at all. The runs below execute the whole suite, so saying so is
+   * what makes the subject of the test the subject of the test.
+   *
+   * The null arm is pinned separately, under "what chose the tests".
+   */
   const run = () =>
     runRow({
       status: 'PASSED',
@@ -1176,6 +1491,7 @@ describe('a test nobody could attempt is out of the pass rate', () => {
       failedCount: 0,
       passedCount: 8,
       gateRules: minPassRate,
+      selectionSource: 'FULL_SUITE',
     });
 
   const eightPassing = () =>
@@ -1499,6 +1815,99 @@ describe('patch coverage reaches the merge box', () => {
     const rule = gate.evaluations.find((e) => e.detail.startsWith('Coverage of the changed'))!;
     expect(rule.action).toBe('UNMEASURED');
     expect(gate.passed).toBe(true);
+  });
+
+  it('counts a lapsed waiver as a GAP on the merge box, not as excluded', async () => {
+    /*
+     * ── AN EXPIRED SUPPRESSION MUST NOT SUPPRESS ──────────────────────────────
+     *
+     * `CoverageItem.status` is materialised: the waiver door writes WAIVED
+     * eagerly so the inventory is not stale until the next recomputation. But
+     * nothing recomputes on a clock — recompute is enqueued from run, explore,
+     * generate, import and analyze-source — so on a quiet project a lapsed
+     * exclusion stayed in force for an unbounded time, and WAIVED is the only
+     * state that LEAVES the denominator. The percentage this gate printed on a
+     * pull request was therefore higher than the truth.
+     *
+     * This read used to select `{key, status, label}` with no join. It now
+     * carries the waiver, and `patchCoverage` demotes a lapsed one.
+     */
+    useWorld({
+      row: runRow({
+        status: 'PASSED',
+        failures: 0,
+        failedCount: 0,
+        gateRules: [{ kind: 'MIN_PATCH_COVERAGE', percent: 80, action: 'BLOCK' }],
+      }),
+      results: [result({ status: 'PASSED', verdict: null })],
+      items: [
+        {
+          key: 'ROUTE:/admin/legacy',
+          status: 'WAIVED',
+          label: '/admin/legacy',
+          // Lapsed an hour ago. Nothing has recomputed since.
+          waiver: { expiresAt: new Date(Date.now() - 3_600_000) },
+        },
+      ],
+      // `analyzeImpact` needs at least one test to have any vocabulary to
+      // attribute a changed path with; this one names a different route.
+      tests: [
+        {
+          id: 'test_0',
+          name: 'Checkout completes',
+          filePath: 'tests/checkout.spec.ts',
+          code: "await page.goto('/checkout');",
+        },
+      ],
+    });
+    gh.prFiles = [{ filename: 'app/admin/legacy/page.tsx' }];
+    await complete();
+
+    const rule = writtenGate()!.evaluations.find((e) =>
+      e.detail.startsWith('Coverage of the changed'),
+    )!;
+    // In the denominator, and a gap: 0% of one route, which BLOCKS at 80%.
+    expect(rule.detail).toContain('1 changed route(s)');
+    expect(rule.action).toBe('BLOCK');
+  });
+
+  it('keeps excluding a route whose waiver is still in force', async () => {
+    // The other half of the same rule. A live waiver still leaves the
+    // denominator, so there is nothing left to divide by and the gate reports
+    // UNMEASURED rather than 0% — which would read as a failure caused by a
+    // decision somebody made on purpose.
+    useWorld({
+      row: runRow({
+        status: 'PASSED',
+        failures: 0,
+        failedCount: 0,
+        gateRules: [{ kind: 'MIN_PATCH_COVERAGE', percent: 80, action: 'BLOCK' }],
+      }),
+      results: [result({ status: 'PASSED', verdict: null })],
+      items: [
+        {
+          key: 'ROUTE:/admin/legacy',
+          status: 'WAIVED',
+          label: '/admin/legacy',
+          waiver: { expiresAt: new Date(Date.now() + 30 * 86_400_000) },
+        },
+      ],
+      tests: [
+        {
+          id: 'test_0',
+          name: 'Checkout completes',
+          filePath: 'tests/checkout.spec.ts',
+          code: "await page.goto('/checkout');",
+        },
+      ],
+    });
+    gh.prFiles = [{ filename: 'app/admin/legacy/page.tsx' }];
+    await complete();
+
+    const rule = writtenGate()!.evaluations.find((e) =>
+      e.detail.startsWith('Coverage of the changed'),
+    )!;
+    expect(rule.action).toBe('UNMEASURED');
   });
 
   it('collects a rename as both filenames', async () => {

@@ -9,10 +9,10 @@ import { Button } from '../ui/Button';
 import { DiffRows } from './DiffRows';
 import {
   appliesImmediately,
+  claimLine,
+  healClaim,
   isRetirement,
   riskOf,
-  verifyMeta,
-  verifyTone,
   type Tone,
 } from './heal-risk';
 
@@ -192,27 +192,38 @@ export function HealCard({ heal, focused, busy, frozen, onApply, onReject }: Hea
 /**
  * "We applied this heal and then proved the test passes."
  *
- * The single most load-bearing sentence this feature produces, and the API has
- * been computing it for every row — `verification: { state, claimsFixed, note,
- * runId, at }` — while nothing read it.
+ * The single most load-bearing sentence this feature produces, and it is THREE
+ * FACTS, not one.
  *
- * Three rules it follows, all three of them the difference between this block
+ * ── WHAT IT USED TO BE DRIVEN OFF, AND WHY THAT WAS A LIE ───────────────────
+ *
+ * One boolean, `verification.claimsFixed`. With it false, three different
+ * things rendered as the same pixel: APPLIED-AND-STILL-RED,
+ * APPLIED-AND-NOBODY-COULD-LOOK and APPLIED-AND-NOTHING-HAS-RUN-YET. A
+ * reviewer reading this card could not tell a fix that failed from a fix
+ * nobody checked, and the second is the one that leaves a red test on the
+ * board looking handled.
+ *
+ * `healClaim` is the vocabulary now, over the server's own
+ * `healVerificationDisplay`: `measured`, `fixed` and `unverified`, one fact per
+ * field. Three rules this block follows, all three the difference between it
  * and a lie:
  *
  *  · A NULL state renders NOTHING (unless the server attached a note). Null
  *    means nobody applied this proposal, so nothing was verified — it is not a
  *    failed verification and must not be coloured like one.
- *  · the PASS colour needs the server's own `claimsFixed`, which it sets for
- *    exactly one case: a run executed the test after the patch was written and
- *    it passed. See `verifyTone`.
+ *  · the PASS colour needs BOTH `fixed` and the server's own `claimsFixed`.
+ *    See `verifyTone`.
  *  · A state this build does not recognise says so (see `verifyMeta`) rather
  *    than being read as "not verified".
  */
 function Verification({ heal }: { heal: Heal }) {
   const { verification } = heal;
-  const meta = verifyMeta(verification.state);
+  const claim = healClaim(heal);
+  const meta = claim.meta;
   if (!meta && !verification.note) return null;
-  const tone = verifyTone(verification.claimsFixed, meta);
+  const tone = claim.tone;
+  const line = claimLine(claim);
 
   return (
     <div className="border-line mt-3 border-t pt-2.5">
@@ -222,6 +233,13 @@ function Verification({ heal }: { heal: Heal }) {
               reads as a check that ran and came back negative. */}
           {meta ? meta.word : 'No verification recorded'}
         </span>
+        {/*
+          THE THREE FACTS, SAID OUT LOUD BESIDE THE LABEL — and composed in
+          heal-risk.ts rather than here, because this repository has no React
+          render tooling and a sentence built inside the JSX is the one thing
+          nothing can assert about. `claimLine` is tested; this is a projection.
+        */}
+        {line && <span className="text-ink-faint"> · {line}</span>}
         {verification.at && (
           <span className="text-ink-faint"> · {relativeTime(verification.at)}</span>
         )}

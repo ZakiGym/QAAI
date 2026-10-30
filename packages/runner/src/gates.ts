@@ -39,9 +39,11 @@ import {
   BLOCKING_VERDICTS,
   FINDING_KINDS,
   FINDING_SEVERITIES,
+  RUN_SELECTION_SOURCES,
+  SUITE_WIDE_SELECTIONS,
   summariseSuppressions,
 } from '@qaai/shared';
-import type { SuppressionSummary, SuppressionTally } from '@qaai/shared';
+import type { RunSelectionSource, SuppressionSummary, SuppressionTally } from '@qaai/shared';
 import type {
   FindingKind,
   FindingSeverity,
@@ -124,6 +126,136 @@ export interface GateInput {
   findings?: FindingsGateInput;
   mutation?: MutationGateInput;
   vitals?: VitalsGateInput;
+  /**
+   * WHAT CHOSE THE TESTS IN THIS RUN, when the caller read `Run.selectionSource`.
+   *
+   * ── The defect ────────────────────────────────────────────────────────────
+   *
+   * A `MIN_PASS_RATE` gate over an impact-selected run of 11 tests computes
+   * 100% and every surface renders it as a pass — a suite-wide claim made from
+   * a sliver of the suite. The CLI already withholds that claim because it
+   * knows what it asked for (`scopedGateReport` in
+   * packages/cli/src/run-request.ts); the server could not, because the
+   * selection was used to build the run and then thrown away. It is a column
+   * now, and this is the field that carries it into the rules.
+   *
+   * ── ABSENT IS NOT WITHHELD, AND THAT IS A DECISION ────────────────────────
+   *
+   * Every other optional field on this input treats absent as "not measured".
+   * This one does not, and the reason is blast radius rather than principle:
+   * withholding on absent would turn a `MIN_PASS_RATE` pass into "not
+   * measured" for any caller that had not been taught to pass it — including on
+   * a full-suite run, where the claim is perfectly good. Absent therefore keeps
+   * today's answer and SAYS SO in the detail, so the gap is visible on the
+   * surface rather than only in this comment.
+   *
+   * ── WHAT THAT PARAGRAPH USED TO CLAIM, AND WHY IT IS GONE ─────────────────
+   *
+   * It read "no production caller passes it yet (the finaliser, the post-triage
+   * re-score, the API's run response and the on-prem finaliser all build
+   * `GateInput` without it)". That was true when written and is now false:
+   * every production call site passes it — apps/api/src/lib/runners.ts,
+   * apps/worker/src/processors/checks.ts and apps/worker/src/processors/run.ts
+   * — and run.ts makes its own parameter required, so omitting it there cannot
+   * compile. A reviewer trusting the old sentence would have concluded this
+   * plumbing was inert and either deleted it or widened the absent branch on a
+   * premise that no longer held, and the next selective run would publish
+   * 100%-of-eleven-tests as a suite pass on a pull request — the precise lie
+   * `Run.selectionSource` was minted to stop.
+   *
+   * So the absent branch is now reachable only from a caller that has not been
+   * written yet, and `evaluateGates passes the run's selection from every
+   * production call site` in gates.selection.test.ts is the ratchet that keeps
+   * that true: a new call site that forgets this field fails that test rather
+   * than quietly publishing an unqualified pass.
+   */
+  selection?: RunSelectionInput;
+}
+
+/**
+ * The run's selection, as a gate rule needs it.
+ *
+ * `source` is `string | null` and not `RunSelectionSource | null` on purpose.
+ * `Run.selectionSource` is TEXT with the domain at the producer, so a row
+ * written by a newer build — or edited by hand — can hold a value this build
+ * has never heard of. The rules below treat an unrecognised value exactly like
+ * a null: UNKNOWN, which withholds, because the one thing that must never
+ * happen is a value we cannot name being read as suite-wide.
+ */
+export interface RunSelectionInput {
+  /**
+   * `Run.selectionSource`. NULL IS UNKNOWN — a run written before the column
+   * existed — and it is NOT `FULL_SUITE`. A gate must not claim a suite-wide
+   * pass from a null: that is a null that became a fact.
+   */
+  source: string | null;
+}
+
+/**
+ * Whether this run's selection can carry a claim about the WHOLE suite, and
+ * what to say when it cannot.
+ *
+ * Three answers, and the middle one is the one that gets lost: UNKNOWN is not a
+ * soft FULL_SUITE. `SUITE_WIDE_SELECTIONS` in packages/shared/src/constants.ts
+ * is the single list that decides, so a sixth selection mode is a decision made
+ * there once rather than in each rule.
+ */
+/**
+ * The clause appended when NOTHING read the run's selection.
+ *
+ * Exported so the ratchet in gates.selection.test.ts can pin it: the absent
+ * branch is allowed to keep today's answer precisely BECAUSE it says out loud
+ * that nobody looked, and a sentence that quietly stopped saying so would turn
+ * a disclosed gap into an unqualified pass.
+ */
+export const MIN_PASS_RATE_SELECTION_ABSENT_DETAIL =
+  '; nothing that scored this gate read the run’s selection, so whether this covers the ' +
+  'whole suite is unrecorded — it is NOT a verified suite-wide pass';
+
+function suiteWide(selection: RunSelectionInput | undefined): {
+  /**
+   * May this rule publish a PASS as an answer about the suite?
+   *
+   * TRUE for a recognised suite-wide source and, deliberately, for an ABSENT
+   * selection — see `GateInput.selection`, where that decision and its reason
+   * live. FALSE for every other selection mode, for a null, and for a value
+   * this build cannot name.
+   */
+  claimable: boolean;
+  /**
+   * The clause a rule appends when its answer is less than a VERIFIED
+   * suite-wide one. Empty ONLY when the run records a recognised suite-wide
+   * selection — so an absent selection is `claimable` and still says out loud
+   * that nobody checked, because a pass that quietly means "we did not look" is
+   * the one thing this file exists to stop.
+   */
+  why: string;
+} {
+  if (!selection) {
+    return { claimable: true, why: MIN_PASS_RATE_SELECTION_ABSENT_DETAIL };
+  }
+  const source = selection.source;
+  if (source !== null && (SUITE_WIDE_SELECTIONS as readonly string[]).includes(source)) {
+    return { claimable: true, why: '' };
+  }
+  /*
+   * The SOURCE is echoed only when it is a member of the closed vocabulary.
+   * `Run.selectionSource` is TEXT, and a detail string assembled out of a
+   * stored value is how a row with one hand-edited field came to print that
+   * value to a customer — the rule is a PATH, never a value. "FULL_SUITE" and
+   * its four siblings are our own words, so naming one of them is naming our
+   * vocabulary and not quoting the row.
+   */
+  const named =
+    source !== null && (RUN_SELECTION_SOURCES as readonly string[]).includes(source)
+      ? `selected by ${source as RunSelectionSource}`
+      : source === null
+        ? 'selection unknown — the run records no selection source, which is not the same fact as FULL_SUITE'
+        : 'selection unrecognised — the run records a selection source this build cannot name, so it is read as unknown';
+  return {
+    claimable: false,
+    why: `; ${named}, so this is NOT a suite-wide result`,
+  };
 }
 
 /**
@@ -909,11 +1041,30 @@ function scoreRule(rule: GateRule, gating: GateInput['results'], input: GateInpu
             `triage finishes.`,
         );
       }
+      /*
+       * ── THE SELECTION, AND WHY THIS ARM SCOPES RATHER THAN WITHHOLDS ───────
+       *
+       * A BLOCK on a subset is still a BLOCK — a REAL_BUG found in 12 tests is
+       * a real bug — so only the PASS is at issue, exactly as
+       * `scopedGateReport` decides it for the CLI.
+       *
+       * And the PASS is SCOPED IN THE DETAIL rather than turned into
+       * UNMEASURED, which is the one thing this arm must not do:
+       * `gateAwaitsTriage` (below, and its deliberate copy in
+       * apps/web/lib/gate.ts) reads "UNMEASURED and BLOCK_ON_VERDICT" as "triage
+       * has not finished", so an UNMEASURED produced for a SELECTION reason
+       * would make the post-triage sweep re-score this run for ever and the run
+       * page render PROVISIONAL for ever. Two reasons under one state is the
+       * same "two facts in one field" defect that cost `healVerificationDisplay`
+       * its name, and it is cheaper to say the scope in the sentence than to
+       * mint a state two files would have to learn.
+       */
+      const scope = suiteWide(input.selection);
       return {
         passed: offenders.length === 0,
         detail:
           offenders.length === 0
-            ? `No ${rule.verdict} verdicts`
+            ? `No ${rule.verdict} verdicts over the ${gating.length} result(s) that gate${scope.why}`
             : `${offenders.length} ${rule.verdict} verdict(s): ${few(offenders.map((o) => o.testName))}`,
       };
     }
@@ -971,12 +1122,36 @@ function scoreRule(rule: GateRule, gating: GateInput['results'], input: GateInpu
       }
       const passedCount = ran.filter((r) => r.status === 'PASSED').length;
       const rate = (passedCount / ran.length) * 100;
-      return {
-        passed: rate >= rule.ratePercent,
-        detail:
-          `${rate.toFixed(1)}% passed (${passedCount}/${ran.length})` +
-          denominatorNote(gating, ran),
-      };
+      const measured =
+        `${rate.toFixed(1)}% passed (${passedCount}/${ran.length})` + denominatorNote(gating, ran);
+      /*
+       * ── THE SELECTIVE-RUN PASS, WITHHELD ─────────────────────────────────
+       *
+       * A rate over the tests that RAN is not a rate over the suite. 100% of
+       * eleven impact-selected tests is the number this rule used to hand the
+       * run page and the GitHub check as a pass, and nothing in it says the
+       * 4,989 tests that did not run would have passed.
+       *
+       * Only the PASS is withheld. A rate BELOW the floor still FAILS: a
+       * failure found in a sliver is a real failure, and converting it into
+       * "not measured" would be a block this product threw away. That
+       * asymmetry is the same one `scopedGateReport` applies for the CLI.
+       *
+       * UNMEASURED and not a BLOCK: this rule has no answer about the suite,
+       * and a rule with no answer must reach neither column. `MIN_PASS_RATE` is
+       * not read by `gateAwaitsTriage`, so UNMEASURED here is safe in a way it
+       * is not in the `BLOCK_ON_VERDICT` arm — see the comment there.
+       */
+      const scope = suiteWide(input.selection);
+      if (!scope.claimable && rate >= rule.ratePercent) {
+        return unmeasured(
+          `${measured}, and that is the rate over the tests this run selected rather than over ` +
+            `the suite${scope.why}. The pass is withheld rather than published: nothing here says ` +
+            'the tests that did not run would have passed. A rate below the floor would still ' +
+            'have failed this rule.',
+        );
+      }
+      return { passed: rate >= rule.ratePercent, detail: measured + scope.why };
     }
 
     case 'MAX_QUARANTINE_PERCENT': {
@@ -1837,6 +2012,38 @@ export interface RunCountsWithQuarantine {
   skipped: number;
   /** Failures a quarantine in force suppressed. Reported, never gating. */
   quarantinedFailed: number;
+  /**
+   * Failures that WERE counted in `failed` and that a counted suppression has
+   * since silenced. A SUBSET of `failed`, which is what makes it different in
+   * kind from `quarantinedFailed`.
+   *
+   * ── WHY A FIFTH NUMBER AND NOT A FIFTH CATEGORY ───────────────────────────
+   *
+   * `quarantinedFailed` is decided DURING the run — `tallyResult` is its only
+   * writer and a quarantined failure never enters `failed` — so the five
+   * columns add up to the number of results. The suppressions that arrive
+   * AFTER the run cannot work that way: a known issue and an ENV_ISSUE are
+   * decided by triage, which runs once the counters are already written and
+   * `Run.failedCount` already holds those failures. So this is a SUBTRACTION
+   * from `failed` rather than a column beside it, and the total still adds up.
+   *
+   * Folding the two into one field is the mistake this comment exists to
+   * prevent: they have opposite relationships to `failed`, so a reader who adds
+   * them both to `passed + failed + …` double-counts, and a reader who
+   * subtracts them both takes quarantine off twice. Two facts in one field is a
+   * defect even when both values are correct.
+   *
+   * ── AND IT ONLY COUNTS AS FAR AS THE LEDGER DOES ──────────────────────────
+   *
+   * OPTIONAL, and absent means "this caller has no ledger to read" — the same
+   * meaning `runOutcome`'s `suppressions` carries. A number here that the
+   * `suppressions` tallies do not account for does NOT take a failure off the
+   * gate: see `runOutcome`, which reports the shortfall and keeps those
+   * failures red. A failure silenced without being counted is the one lie this
+   * file refuses, and a counter that can outrun its own evidence is how it would
+   * arrive.
+   */
+  failedThenSuppressed?: number;
 }
 
 export type RunTerminalStatus = 'PASSED' | 'FAILED' | 'CANCELLED' | 'ERRORED';
@@ -1942,6 +2149,77 @@ export function runOutcome(args: {
   const suppressed = suppressions.suppressed;
 
   /*
+   * ── THE SUPPRESSION THAT HAS TO REACH THE VERDICT ────────────────────────
+   *
+   * THE DEFECT. A known issue or an ENV_ISSUE is decided by triage, after the
+   * counters are written, so those failures are still in `counts.failed` when
+   * this function is asked whether the run passed. Counting them in the ledger
+   * and leaving them in `failed` is the WORST of both: the customer is blocked
+   * AND the ledger says a failure was silenced. That is exactly the shape of
+   * the original quarantine defect — the signal suppressed and the gate left in
+   * place — in a second table.
+   *
+   * So the ledger subtracts. And it subtracts ONLY AS FAR AS IT CAN ACCOUNT
+   * FOR, which is the rule that keeps this honest: a failure stops gating to
+   * the extent a COUNTED suppression claims it, never on the strength of a
+   * counter alone. `claimed` is what the caller's counter says; `accounted` is
+   * what the by-kind tallies actually add up to; the smaller wins, and a
+   * shortfall is reported rather than resolved in the customer's favour.
+   *
+   * QUARANTINE IS EXCLUDED from `accounted` for the reason the tally
+   * synthesis above gives: a quarantined failure never entered `failed`, so
+   * subtracting its tally would take the same failure off twice.
+   */
+  const claimed = Math.max(0, counts.failedThenSuppressed ?? 0);
+  const accounted = suppressions.byKind
+    .filter((tally) => tally.kind !== 'QUARANTINE')
+    .reduce((total, tally) => total + tally.suppressed, 0);
+  const silenced = Math.min(claimed, accounted, Math.max(0, counts.failed));
+  const gatingFailed = Math.max(0, counts.failed - silenced);
+
+  /*
+   * EVERY CAP THAT BIT, AS A COUNT AND THE REASON THAT ACTUALLY BIT. Three
+   * different things can shrink the subtraction and they are three different
+   * facts about who has a bug:
+   *
+   *  · the ledger does not account for the counter — a suppression nobody
+   *    counted, which is the lie, so those failures stay red;
+   *  · the counter is larger than the failures there were — a counter that has
+   *    outrun its own run, which is a defect in whatever wrote it;
+   *  · nothing was claimed at all — no note, because that is the ordinary case.
+   */
+  const shortfalls: string[] = [];
+  if (claimed > accounted) {
+    shortfalls.push(
+      `${claimed - accounted} failure(s) were reported as suppressed and no suppression in the ` +
+        'ledger accounts for them, so they still gate — a failure that is silenced without being ' +
+        'counted is the one thing this number may not hide',
+    );
+  }
+  const accountedClaim = Math.min(claimed, accounted);
+  if (accountedClaim > Math.max(0, counts.failed)) {
+    shortfalls.push(
+      `the suppression ledger accounts for ${accountedClaim} silenced failure(s) and this run ` +
+        `counted ${Math.max(0, counts.failed)} gating failure(s), so the subtraction was clamped ` +
+        'to the failures that existed',
+    );
+  }
+  /*
+   * The by-kind sentence is NOT repeated here. `suppressedNote` below already
+   * appends `suppressions.disclosure` — "4 failure(s) by 1 environment failure"
+   * — whenever a non-quarantine suppression applied, which is every case in
+   * which `silenced` can be above zero. This sentence adds the one fact that
+   * disclosure cannot carry: how many of the run's own counted failures came
+   * off the gate because of it.
+   */
+  const silencedNote =
+    silenced > 0
+      ? ` ${silenced} of ${counts.failed} counted failure(s) did not gate because a suppression ` +
+        'silenced them — they are still failures that happened.'
+      : '';
+  const shortfallNote = shortfalls.length === 0 ? '' : ` NOTE: ${shortfalls.join('; ')}.`;
+
+  /*
    * The quarantine sentence is KEPT VERBATIM, because four other surfaces print
    * it and a reader who has learned what it means should not have to learn
    * again. The suppression disclosure is appended beside it rather than
@@ -1955,9 +2233,17 @@ export function runOutcome(args: {
       : '';
   const otherSuppressed = suppressed - quarantined;
   const suppressedNote =
-    otherSuppressed > 0 || suppressions.expired > 0
+    (otherSuppressed > 0 || suppressions.expired > 0
       ? `${quarantineNote} ${suppressions.disclosure}`
-      : quarantineNote;
+      : quarantineNote) +
+    /*
+     * Appended to EVERY return below, including the cancelled and errored arms.
+     * A run that was cancelled while a mute was silencing forty failures still
+     * silenced forty failures, and a note that only appeared on the arms we
+     * remembered would be a disclosure with a hole in it.
+     */
+    silencedNote +
+    shortfallNote;
 
   if (forced === 'CANCELLED') {
     return {
@@ -1981,13 +2267,18 @@ export function runOutcome(args: {
     };
   }
 
-  if (counts.failed > 0) {
+  /*
+   * `gatingFailed` and not `counts.failed`. This is the line the suppression
+   * had to reach: without it a counted ENV_ISSUE left the run FAILED, so the
+   * ledger recorded a silenced failure and the build stayed red anyway.
+   */
+  if (gatingFailed > 0) {
     return {
       status: 'FAILED',
       passed: false,
       suppressedFailures: suppressed,
       suppressions,
-      reason: `${counts.failed} test(s) failed.${suppressedNote}`,
+      reason: `${gatingFailed} test(s) failed.${suppressedNote}`,
     };
   }
 
@@ -2041,7 +2332,14 @@ export function tallyResult(
   }
 }
 
-/** A zeroed tally. */
+/**
+ * A zeroed tally.
+ *
+ * `failedThenSuppressed` is 0 and not left undefined. Zero is the honest value
+ * for a fresh tally — nothing has been suppressed yet — and the field being
+ * present is what makes `tallyResult`'s caller able to add to it without first
+ * deciding whether absent means zero.
+ */
 export function emptyRunCounts(): RunCountsWithQuarantine {
-  return { passed: 0, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 0 };
+  return { passed: 0, failed: 0, flaky: 0, skipped: 0, quarantinedFailed: 0, failedThenSuppressed: 0 };
 }

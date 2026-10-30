@@ -18,6 +18,12 @@ import { BOUNDARY_DESCRIPTORS } from '@qaai/shared';
  * states what the test will NOT prove before anybody runs it.
  */
 import { ANY_TEST_TYPES, declarationFor, isTestType, mintTestTypeSteps } from '@qaai/shared';
+/*
+ * The crawl's own refusal vocabulary. `routeExclusionsFromCrawl` quotes these
+ * LABELS and never `ExcludedPath.rule`, which carries the customer's own glob
+ * text — see the comment there.
+ */
+import { EXCLUSION_KIND_LABELS } from '@qaai/shared';
 import type {
   AnyTestType,
   BoundaryClass,
@@ -68,6 +74,16 @@ import type { TargetedPlanItem } from './generator.js';
  * suppression section below.
  */
 import { extractBehavior, normalizeRoute, similarity } from './suite-health.js';
+/*
+ * THE OBSOLESCENCE EXCLUSION VOCABULARY, imported rather than restated.
+ *
+ * `routeExclusionsFromCrawl` at the bottom of this file produces the
+ * `RouteExclusion[]` that `auditTestsAgainstCrawl` has always taken and that no
+ * production caller has ever supplied. A second spelling of the three reasons
+ * would be a second answer to "is this route's absence evidence of deletion",
+ * which is the one question a retirement turns on.
+ */
+import type { ObsolescenceExclusion, RouteExclusion } from './obsolete.js';
 /*
  * ── THE FENCE, AND THE LEVEL IT IS APPLIED AT ──────────────────────────────
  *
@@ -3239,4 +3255,221 @@ ${
               feature that is not there.`
       : '              Do NOT use any other type.'
   }`;
+}
+
+// ─── What a crawl's absence does NOT prove ───────────────────────────────────
+
+/**
+ * The routes this crawl is KNOWN to have not reached, and why — the guard
+ * against retiring a test whose page is perfectly fine.
+ *
+ * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────────────
+ *
+ * `auditTestsAgainstCrawl` has taken `excludedRoutes` since obsolescence was
+ * written and NO PRODUCTION CALLER HAS EVER SUPPLIED IT. So a route QAAI itself
+ * refuses to visit — `/logout`, `/delete-account`, anything the customer put in
+ * `excludeGlobs` — arrives at the audit as `reached: false`, and with the
+ * source side agreeing (an excluded route is often also absent from a route
+ * table) that is the two independent negatives OBSOLETE needs. It would be
+ * filed as ROUTE_GONE, the strongest signal in the vocabulary, on EVERY crawl —
+ * so two crawls would confirm each other and a test covering a page we simply
+ * declined to open would be proposed for retirement. The customer's most
+ * dangerous surfaces are exactly the ones in that exclude list.
+ *
+ * A route in this list is NOT obsolete. It is UNVERIFIED, which is a different
+ * fact and the opposite decision.
+ *
+ * ── WHY THIS MODULE ─────────────────────────────────────────────────────────
+ *
+ * This is the only module that reads a `FlowMap`'s own accounting — the
+ * exclusion ledger, the off-origin boundary, the auth walls — without a
+ * database. The worker's processor adds the two facts that live in QAAI's
+ * STORED records instead (the surface inventory's exercisability, and the flag
+ * dimension's availability); neither of those is in a flow map and neither is
+ * guessable from one. Both halves are needed and neither is sufficient.
+ *
+ * NOTHING IS INFERRED FROM A ROUTE'S SHAPE. A module that decided `/admin/*`
+ * is "probably behind a role" would be inventing the single fact that decides
+ * whether a customer loses a test. Every entry below comes from something the
+ * crawl RECORDED.
+ */
+export interface CrawlRouteExclusions {
+  /** Hand straight to `ObsoleteInput.excludedRoutes`. Sorted, deduplicated. */
+  exclusions: RouteExclusion[];
+  /**
+   * Counted by reason, always all three keys present, so "no route was
+   * excluded" and "we did not look" are different outputs. An exclusion
+   * suppresses a finding and every suppression in this product is counted out
+   * loud.
+   */
+  counts: Record<ObsolescenceExclusion, number>;
+  /**
+   * The reasons a FLOW MAP cannot supply, named rather than silently zero.
+   *
+   * A zero in `counts` for one of these would read as "no route is behind a
+   * dark flag", which is a claim about the customer's application. The truth is
+   * that a crawl has no flag store in it, and the caller has to supply the fact
+   * from `SurfaceDimension`. Naming it here is what lets a caller that forgot
+   * be caught by a test instead of by a wrong retirement.
+   */
+  notSuppliableFromCrawl: ObsolescenceExclusion[];
+  /** Every sentence a reader needs before trusting the list's completeness. */
+  caveats: string[];
+}
+
+/**
+ * The budget case, stated rather than half-implemented.
+ *
+ * A route the crawl had queued and never visited is a route whose absence
+ * proves nothing — and it is NOT in the list this function returns, on purpose.
+ * `Frontier.sample` is explicitly a BOUNDED sample with `sampleTruncated`
+ * beside it, so an exclusion list built from it would be a PARTIAL list
+ * presented as complete: the named routes would be protected and the unnamed
+ * ones, which are the majority on any crawl that hit a budget, would not.
+ *
+ * It needs no per-route entry, because a crawl that left a frontier behind sets
+ * `truncatedReason`, and `retirementBlockedBy` withholds EVERY retirement from
+ * a truncated crawl — a strictly stronger guard than naming some of the routes.
+ * This constant is the sentence that says so, and it is returned in `caveats`
+ * so the reasoning is on the report rather than only in this comment.
+ */
+export const CRAWL_BUDGET_EXCLUSION_RULE =
+  'Routes the crawl had queued and never visited are NOT listed individually: a frontier sample is ' +
+  'bounded and a partial list would protect the routes it happens to name and no others. A crawl ' +
+  'that left a frontier is truncated, and a truncated crawl can support no retirement at all — ' +
+  'which covers every such route rather than some of them.';
+
+function pushExclusion(
+  into: Map<string, RouteExclusion>,
+  route: string | null | undefined,
+  exclusion: ObsolescenceExclusion,
+  detail: string,
+): void {
+  if (typeof route !== 'string' || route.length === 0) return;
+  const key = normalizeRoute(route);
+  /*
+   * FIRST WRITER WINS, and the order the caller adds in is therefore the
+   * precedence. One route with two reasons is still one withheld signal, and
+   * two entries would double every count in a report whose whole job is to be
+   * countable.
+   */
+  if (into.has(key)) return;
+  into.set(key, { route: key, exclusion, detail });
+}
+
+export function routeExclusionsFromCrawl(flowMap: FlowMap | null): CrawlRouteExclusions {
+  const found = new Map<string, RouteExclusion>();
+  const caveats: string[] = [CRAWL_BUDGET_EXCLUSION_RULE];
+
+  if (flowMap === null) {
+    return {
+      exclusions: [],
+      counts: { BEHIND_FEATURE_FLAG: 0, ROLE_NOT_CRAWLED: 0, UNEXERCISABLE: 0 },
+      notSuppliableFromCrawl: ['BEHIND_FEATURE_FLAG'],
+      caveats: [
+        'There is no crawl to read, so no route exclusion could be derived from one. That is not the same as "no route is excluded".',
+        ...caveats,
+      ],
+    };
+  }
+
+  /*
+   * ── 1. THE EXCLUSION LEDGER: ROUTES QAAI REFUSED TO OPEN ──────────────────
+   *
+   * The detail is the exclusion KIND and nothing else. `ExcludedPath.rule` is
+   * the matching line out of the environment's policy and therefore contains
+   * customer-authored glob text; this string is stored on a proposal and read
+   * by a reviewer, so it carries only QAAI's own closed vocabulary. The rule
+   * is already on the stored flow map for anyone who wants to look it up.
+   */
+  for (const entry of flowMap.excluded ?? []) {
+    if (!entry) continue;
+    pushExclusion(
+      found,
+      entry.route,
+      'UNEXERCISABLE',
+      `the crawl refused this URL: ${EXCLUSION_KIND_LABELS[entry.kind] ?? entry.kind}`,
+    );
+  }
+
+  /*
+   * ── 2. THE OFF-ORIGIN BOUNDARY: SOMEBODY ELSE'S APPLICATION ───────────────
+   *
+   * `fromRoute` is the IN-APP route that reaches the external origin, which is
+   * the route a test would name. The origin itself is never a route of this
+   * application and QAAI is not permitted to drive it, so a test that walks out
+   * to an identity provider is not a test of a deleted page.
+   */
+  for (const external of flowMap.externals ?? []) {
+    if (!external) continue;
+    pushExclusion(
+      found,
+      external.fromRoute,
+      'UNEXERCISABLE',
+      `this route leaves the application for a ${external.kind} boundary, which QAAI does not drive`,
+    );
+  }
+
+  /*
+   * ── 3. THE AUTH WALL: A NODE WE SAW AND COULD NOT GET INTO ────────────────
+   *
+   * `behindAuth` is positive evidence — the crawler recorded being bounced —
+   * and the test is "no role got ALLOWED here", not "the route looks private".
+   * A node where some role WAS allowed was genuinely crawled and is not
+   * excluded: a 403 for anonymous beside a 200 for admin is the correct
+   * behaviour of a surface that exists, and excluding it would withhold a
+   * signal QAAI is entitled to.
+   *
+   * The DESTINATION is excluded as well as the route. A bounce names where the
+   * application sent us, and that destination is reached only as the sign-in
+   * page — so a test that drives it holds a session this crawl did not.
+   */
+  for (const node of flowMap.nodes ?? []) {
+    if (node?.behindAuth !== true) continue;
+    const allowed = (node.access ?? []).some((cell) => cell?.outcome === 'ALLOWED');
+    if (allowed) continue;
+    pushExclusion(
+      found,
+      node.route,
+      'ROLE_NOT_CRAWLED',
+      'the crawl was bounced by an auth wall here and no role it held was served the route',
+    );
+    for (const cell of node.access ?? []) {
+      if (cell?.outcome !== 'REDIRECTED') continue;
+      pushExclusion(
+        found,
+        cell.destinationRoute,
+        'ROLE_NOT_CRAWLED',
+        'the application sent the crawl here instead of to the route it asked for',
+      );
+    }
+  }
+
+  const exclusions = [...found.values()].sort((a, b) => a.route.localeCompare(b.route));
+  const counts: Record<ObsolescenceExclusion, number> = {
+    BEHIND_FEATURE_FLAG: 0,
+    ROLE_NOT_CRAWLED: 0,
+    UNEXERCISABLE: 0,
+  };
+  for (const entry of exclusions) counts[entry.exclusion] += 1;
+
+  if (flowMap.excluded === undefined) {
+    caveats.push(
+      'This crawl recorded no exclusion ledger at all — it predates the ledger — so the routes it refused are not knowable from it and are not in this list.',
+    );
+  }
+
+  return {
+    exclusions,
+    counts,
+    /*
+     * A CRAWL HAS NO FLAG STORE IN IT. The application's flags are
+     * `SurfaceDimension` rows with `kind: 'FLAG'` and an `available` column,
+     * read out of the customer's own flag provider — so BEHIND_FEATURE_FLAG can
+     * only ever come from a caller with a database. Named here so a caller that
+     * supplies nothing is a visible gap rather than an implied zero.
+     */
+    notSuppliableFromCrawl: ['BEHIND_FEATURE_FLAG'],
+    caveats,
+  };
 }

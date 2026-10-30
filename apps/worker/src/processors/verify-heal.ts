@@ -31,12 +31,16 @@
  *     three questions, and `houseStyle.planned` is what happens when two of
  *     them share a column.
  *
- *  3. ONE START, NOT TWO. `startHealVerification` exists twice: a module-local
- *     copy in apps/api/src/routes/agent.ts and a near-copy in
+ *  3. ONE START, NOT THREE. `startHealVerification` existed three times: here,
+ *     a module-local copy in apps/api/src/routes/agent.ts and a near-copy in
  *     processors/triage.ts, whose own doc comment asks for this promotion by
  *     name. {@link startHealVerification} below is the one implementation, over
- *     interfaces narrow enough that both callers can satisfy them and a test
- *     needs no database and no network.
+ *     interfaces narrow enough that every caller can satisfy them and a test
+ *     needs no database and no network. The production ports are
+ *     `healVerificationPorts` in processors/flake.ts — that file already
+ *     imports `prisma`, `startRun` and `enqueueRun`, which is what keeps this
+ *     module free of all three. The two deletions are named in this round's
+ *     handover, with the exact replacement for each.
  *
  *  4. THE HEAL NOTHING WILL EVER CHECK. `verifyAppliedHeals` in flake.ts scans
  *     `where: { verifyState: 'PENDING' }`. A heal whose apply committed and
@@ -63,51 +67,35 @@ import { HEAL_VERIFY_STATES, verificationRunTag } from '@qaai/agent';
 import type { HealVerifyState } from '@qaai/agent';
 
 /*
- * THE QUEUE NAME IS NOT DECLARED HERE, DELIBERATELY.
+ * THE QUEUE NAME IS NOT DECLARED HERE, DELIBERATELY — AND IT NOW EXISTS.
  *
- * `ANALYZE_SOURCE_QUEUE` and `PREFLIGHT_QUEUE` both live in ../queues.ts beside
- * their producers, and so must this one — a queue constant in a processor is a
- * name with no producer, and `scripts/check-wiring.ts` reports exactly that: a
- * declared queue nothing publishes to and nothing consumes. Declaring it here
- * would have added a disconnected entry to the ratchet in exchange for nothing,
- * because the only thing that would reference it is this file's own test, and
- * a surface reached only by its own test is the signature defect of this build.
+ * `VERIFY_HEAL_QUEUE`, its producer (`enqueueVerifyHeal`) and the Queue handle
+ * live in ../queues.ts beside `ANALYZE_SOURCE_QUEUE` and `PREFLIGHT_QUEUE`, and
+ * the consumer is registered in ../index.ts. A queue constant in a processor is
+ * a name with no producer, and `scripts/check-wiring.ts` reports exactly that:
+ * a declared queue nothing publishes to and nothing consumes.
  *
- * The exact edit that adds `VERIFY_HEAL_QUEUE`, its producer and its consumer
- * registration is in this round's handover.
+ * What changed since this comment was first written is that the registration
+ * landed. Three producers reach this module now — the apply paths, the hole
+ * sweep in processors/flake.ts, and an operator — so nothing here is reached
+ * only by its own test any more.
  */
 
-/**
- * One "re-measure this heal" job.
+/*
+ * THE PAYLOAD AND THE JOB OPTIONS MOVED TO packages/shared/src/jobs.ts, and
+ * they are RE-EXPORTED here so this module's importers and its tests keep one
+ * name for them.
  *
- * Ids only, like every other payload (see the header of
- * packages/shared/src/jobs.ts). Nothing is carried: the heal row is the
- * authority and a job holding a copy of its state would be deciding against a
- * snapshot that the apply path may already have moved on from.
+ * They were declared in this file, which apps/api cannot import, so the API's
+ * apply path could not produce to this queue and kept a third copy of the
+ * verification start instead. The same reasoning
+ * `analyzeSourceJobOptions` records: two producers of one queue that cannot
+ * share a definition each end up with half of one bug — here, a missing
+ * `removeOnFail` on whichever side forgot it.
  */
-export interface VerifyHealJob {
-  orgId: string;
-  healId: string;
-  /** Why this was asked for, for the log line and the audit metadata. */
-  reason: 'APPLY' | 'SWEEP_FOUND_NO_START' | 'OPERATOR';
-}
-
-/**
- * BullMQ options for one heal.
- *
- * A PER-ENTITY JOB ID IS A REDIS KEY, so it needs BOTH `removeOnComplete` and
- * `removeOnFail`: with only the first, a job that failed keeps its id in the
- * failed set and the SECOND attempt for that heal is silently dropped for ever
- * — which here would mean a heal that nothing ever re-measures, the exact
- * defect this module exists to close.
- */
-export function verifyHealJobOptions(healId: string): {
-  jobId: string;
-  removeOnComplete: boolean;
-  removeOnFail: boolean;
-} {
-  return { jobId: `verify-heal-${healId}`, removeOnComplete: true, removeOnFail: true };
-}
+import type { VerifyHealJob } from '@qaai/shared';
+export type { VerifyHealJob };
+export { verifyHealJobOptions } from '@qaai/shared';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. The report: three outcomes, and the one column that says "measured".
@@ -531,11 +519,31 @@ export type StartRefusal = (typeof START_REFUSALS)[number];
 export function needsVerificationStart(
   heal: { state: string; verifyState: string | null; decidedAt: Date | null },
   now: Date,
+  /**
+   * FALSE when the caller IS the apply path's own start, so there is nothing to
+   * race.
+   *
+   * ── THE DEFECT THIS PARAMETER EXISTS TO FIX ──────────────────────────────
+   *
+   * The grace period exists to stop a SWEEP starting a second verification
+   * while the apply path's own start is still in flight. An `APPLY` job IS
+   * that start — it is enqueued by the apply path, after the code transaction,
+   * instead of the three module-local copies this module replaced — so a grace
+   * period applied to it refuses the only start the heal is ever going to get
+   * and leaves the row NULL until the hole sweep notices five minutes later.
+   * That was a verification delayed by exactly the window meant to protect it.
+   *
+   * Defaults to TRUE: a caller that does not say which it is gets the cautious
+   * answer, because starting a duplicate run is a cost and refusing one is a
+   * delay the hole sweep recovers from.
+   */
+  graceApplies = true,
 ): { start: true } | { start: false; refusal: StartRefusal } {
   if (heal.state !== 'APPLIED' && heal.state !== 'AUTO_APPLIED') {
     return { start: false, refusal: 'NOT_APPLIED' };
   }
   if (heal.verifyState !== null) return { start: false, refusal: 'ALREADY_HAS_STATE' };
+  if (!graceApplies) return { start: true };
   if (heal.decidedAt === null) return { start: false, refusal: 'NO_APPLY_TIME' };
   const age = now.getTime() - heal.decidedAt.getTime();
   if (age < VERIFY_START_GRACE_MINUTES * 60_000) {
@@ -711,8 +719,36 @@ export interface VerificationRecorder {
     healState: string;
     verifyRunId: string | null;
     appliedVersion: number | null;
+    /**
+     * Both timestamps, because the DEADLINE is `decidedAt ?? createdAt` and the
+     * implementation must compute it from the same two fields the sweep does.
+     * A recorder handed only one of them would answer a different question
+     * about a heal whose apply time is missing.
+     */
+    decidedAt: Date | null;
+    createdAt: Date;
     now: Date;
-  }): Promise<{ state: HealVerifyState; reverted: boolean }>;
+  }): Promise<{
+    /**
+     * FALSE when NOTHING WAS WRITTEN.
+     *
+     * The verifying run has not reached a terminal status and is still inside
+     * its deadline, so there is no outcome yet. It is NOT an UNVERIFIABLE and
+     * NOT a PENDING that was just recorded — the row was already PENDING and
+     * stays that way. Without this field a caller logs a verification as
+     * re-measured when nothing was measured, which is the first lie on the
+     * list this product cannot afford.
+     */
+    wrote: boolean;
+    state: HealVerifyState;
+    reverted: boolean;
+    /**
+     * The version whose code was put back. NULL and never 0 when nothing was
+     * restored: version 0 does not exist, and a zero would name a version to a
+     * reader with confidence.
+     */
+    revertedToVersion: number | null;
+  }>;
 }
 
 export interface VerifyHealStore extends VerificationStore {
@@ -727,6 +763,8 @@ export interface VerifyHealStore extends VerificationStore {
     verifyRunId: string | null;
     appliedVersion: number | null;
     decidedAt: Date | null;
+    /** The fallback the verification deadline is measured from. Never null. */
+    createdAt: Date;
   } | null>;
 }
 
@@ -735,6 +773,15 @@ export const VERIFY_JOB_OUTCOMES = [
   'STARTED',
   /** A terminal state was recorded. */
   'RECORDED',
+  /**
+   * The verifying run was read and HAS NOT FINISHED, so nothing was written.
+   *
+   * Its own member rather than folding into RECORDED or NOTHING_TO_DO. RECORDED
+   * would report a measurement that did not happen; NOTHING_TO_DO would read as
+   * "this heal needs nothing", when in fact it is still owed an answer and the
+   * next tick will come back for it.
+   */
+  'STILL_IN_FLIGHT',
   /** Nothing to do, and {@link StartRefusal} says why. */
   'NOTHING_TO_DO',
   /** The heal is gone. Not an error: a project can be deleted mid-flight. */
@@ -756,6 +803,13 @@ export interface VerifyHealResult {
    * `TestVersion` rather than deleting the heal's.
    */
   readonly reverted: boolean;
+  /**
+   * WHICH version was put back. Null when nothing was.
+   *
+   * `reverted: true` cannot answer "to what", which is the first question
+   * asked when somebody notices their test changed.
+   */
+  readonly revertedToVersion: number | null;
   readonly note: string;
 }
 
@@ -785,11 +839,18 @@ export async function processVerifyHeal(
       startRefusal: null,
       verifyState: null,
       reverted: false,
+      revertedToVersion: null,
       note: 'That heal proposal no longer exists, so there was nothing to re-measure.',
     };
   }
 
-  const need = needsVerificationStart(heal, now);
+  /*
+   * An `APPLY` job IS the apply path's own start, so there is nothing for the
+   * grace period to protect against — see `needsVerificationStart`. Every other
+   * reason is a second opinion about a heal the apply path may still be working
+   * on, and those wait.
+   */
+  const need = needsVerificationStart(heal, now, job.reason !== 'APPLY');
   if (need.start) {
     const started = await startHealVerification(
       { store: deps.store, runs: deps.runs, queue: deps.queue, log: deps.log },
@@ -811,6 +872,7 @@ export async function processVerifyHeal(
       // so here is what keeps "started" from reading as "being checked".
       verifyState: started.state === 'PENDING' ? 'PENDING' : 'UNVERIFIABLE',
       reverted: false,
+      revertedToVersion: null,
       note: started.note,
     };
   }
@@ -826,6 +888,7 @@ export async function processVerifyHeal(
       startRefusal: need.refusal,
       verifyState: read?.known === true ? (heal.verifyState as HealVerifyState) : null,
       reverted: false,
+      revertedToVersion: null,
       note:
         read === null
           ? 'Nothing is claimed about this heal, and it is not in a state that needs re-measuring.'
@@ -842,6 +905,8 @@ export async function processVerifyHeal(
     healState: heal.state,
     verifyRunId: heal.verifyRunId,
     appliedVersion: heal.appliedVersion,
+    decidedAt: heal.decidedAt,
+    createdAt: heal.createdAt,
     now,
   });
 
@@ -850,21 +915,45 @@ export async function processVerifyHeal(
     {
       healId: heal.id,
       testId: heal.testId,
+      /*
+       * `wrote` FIRST, because every field after it is meaningless without it:
+       * a reader who saw `verifyState: 'PENDING'` with no `wrote: false` beside
+       * it would read a row that was left alone as a row that was just written.
+       */
+      wrote: recorded.wrote,
       verifyState: recorded.state,
       reported: report.reported,
       measured: report.measured,
       reverted: recorded.reverted,
+      revertedToVersion: recorded.revertedToVersion,
     },
-    'heal verification re-measured',
+    recorded.wrote ? 'heal verification re-measured' : 'heal verification is still in flight',
   );
+
+  /*
+   * NOTHING WAS WRITTEN. The verifying run has not finished and is inside its
+   * deadline, so this job did not re-measure anything — and saying RECORDED
+   * here would be a thing reported as measured that was not measured.
+   */
+  if (!recorded.wrote) {
+    return {
+      outcome: 'STILL_IN_FLIGHT',
+      startRefusal: null,
+      verifyState: recorded.state,
+      reverted: false,
+      revertedToVersion: null,
+      note: report.sentence,
+    };
+  }
 
   return {
     outcome: 'RECORDED',
     startRefusal: null,
     verifyState: recorded.state,
     reverted: recorded.reverted,
+    revertedToVersion: recorded.revertedToVersion,
     note: recorded.reverted
-      ? `${report.sentence} It was applied with nobody reviewing it, so the patch was reverted — the previous version was appended, not restored in place, so the history of what QAAI wrote to this test is intact.`
+      ? `${report.sentence} It was applied with nobody reviewing it, so the patch was reverted to version ${recorded.revertedToVersion ?? 'unknown'} — the previous version was appended, not restored in place, so the history of what QAAI wrote to this test is intact.`
       : report.sentence,
   };
 }

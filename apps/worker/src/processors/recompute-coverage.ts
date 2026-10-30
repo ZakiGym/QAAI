@@ -120,6 +120,17 @@
 
 import { Queue } from 'bullmq';
 import type { SurfaceKind, SurfaceSnapshot } from '@qaai/shared';
+/*
+ * THE RETIREMENT DENOMINATOR RULE, asked of the one function allowed to answer.
+ *
+ * A retired test's surface STAYS in the denominator and goes back to UNCOVERED,
+ * so the percentage falls. This file reports the percentage, so it is the file
+ * most able to publish the flattering version of that arithmetic by accident —
+ * which is why the rule is imported rather than restated. See
+ * `describeAppliedRetirements`.
+ */
+import { retirementDenominatorEffect } from '@qaai/shared';
+import type { DenominatorEffect } from '@qaai/shared';
 import { connection, logger, prisma } from '../context.js';
 /*
  * TYPE-ONLY, and load-bearing. `verbatimModuleSyntax` erases an `import type`
@@ -446,6 +457,133 @@ export function coverageDelta(previous: number | null, current: number | null): 
   };
 }
 
+// ─── Applied retirements, beside the percentage they lowered ─────────────────
+
+/**
+ * How many APPLIED retirements one recompute reads.
+ *
+ * A disclosure and not a gate: past it the counts are a floor and `capped`
+ * says so. Unlike the exclusion list in processors/explore.ts, a truncated read
+ * here cannot cause a wrong decision — nothing branches on it — it can only
+ * under-report how much coverage a set of retirements removed, which is why it
+ * is reported rather than refused.
+ */
+export const APPLIED_RETIREMENT_SCAN_CAP = 500;
+
+/** One APPLIED `RetirementProposal`, as the recompute reads it. */
+export interface AppliedRetirementRow {
+  id: string;
+  testId: string;
+  surfacesReturnedToUncovered: readonly string[];
+  surfacesStillCovered: readonly string[];
+  /** The honesty column. FALSE on an APPLIED row is a defect, not a state. */
+  surfacesReopened: boolean;
+}
+
+/**
+ * What the retirements applied to this project did to the number beside them.
+ *
+ * ── THE LIE THIS EXISTS TO MAKE IMPOSSIBLE ──────────────────────────────────
+ *
+ * A retirement that quietly RAISED the coverage percentage. The surface a
+ * retired test covered does NOT leave the denominator: the application still
+ * has it and now nothing tests it, so the numerator falls and the number goes
+ * DOWN. Every other arrangement of this arithmetic invites a caller to shrink
+ * the denominator instead, because shrinking it is what makes the figure come
+ * out flattering and nobody questions a number that moved the way they wanted
+ * — and that would make "delete the failing tests" the fastest way to hit a
+ * coverage target.
+ *
+ * `denominatorDelta` is the literal `0` and `effect` is ASKED of
+ * `retirementDenominatorEffect` rather than written here, so the rule cannot be
+ * restated differently by this file than by the proposal writer or the apply
+ * endpoint.
+ */
+export interface AppliedRetirementDisclosure {
+  /** APPLIED proposals read. 0 means we looked; it is not "not measured". */
+  applied: number;
+  /** Surfaces that lost their only live cover, across every applied retirement. */
+  surfacesReturnedToUncovered: number;
+  /** Surfaces another live test still reaches. What makes the first believable. */
+  surfacesStillCovered: number;
+  /**
+   * APPLIED retirements whose surfaces were never re-opened.
+   *
+   * A DEFECT AND NOT A STATE, which is why it is counted separately and named
+   * in the disclosure rather than folded into the total: each one is a test
+   * that stopped running while its surface stayed COVERED, which is a coverage
+   * percentage flattered by exactly that many items. Reported rather than
+   * repaired here — repairing it silently would destroy the evidence that the
+   * apply path has a hole in it, and the apply path is the only thing entitled
+   * to write that column.
+   */
+  surfacesNotReopened: number;
+  /** From the keystone. Can never be LEAVES_DENOMINATOR. */
+  effect: DenominatorEffect;
+  /** ALWAYS zero. A retired test's surface stays in the measurement. */
+  denominatorDelta: 0;
+  /** TRUE when the scan cap bit, so every count above is a floor. */
+  capped: boolean;
+  /** The sentence an operator reads. Never only a count. */
+  disclosure: string;
+}
+
+/**
+ * Describe the applied retirements. Pure, so the arithmetic is testable without
+ * a database — which matters because the one thing it must never do is produce
+ * a positive `denominatorDelta`.
+ */
+export function describeAppliedRetirements(
+  rows: readonly AppliedRetirementRow[],
+  capped = false,
+): AppliedRetirementDisclosure {
+  /*
+   * ASKED, not assumed. `retirementDenominatorEffect` is handed the union of
+   * every applied retirement's surfaces so that the `effect` on this report is
+   * the same value the proposal and the apply path carry — one rule, one
+   * answer, in all three places. A hardcoded `'RETURNS_TO_UNCOVERED'` here
+   * would be a fourth copy of the rule and the one a reader would trust.
+   */
+  const covers = new Set<string>();
+  const elsewhere = new Set<string>();
+  for (const row of rows) {
+    for (const itemId of row.surfacesReturnedToUncovered) covers.add(itemId);
+    for (const itemId of row.surfacesStillCovered) {
+      covers.add(itemId);
+      elsewhere.add(itemId);
+    }
+  }
+  const effect = retirementDenominatorEffect({
+    covers: [...covers].sort(),
+    alsoCoveredElsewhere: [...elsewhere].sort(),
+  });
+
+  const notReopened = rows.filter((row) => !row.surfacesReopened).length;
+  const returned = effect.surfacesReturnedToUncovered.length;
+  const stillCovered = effect.surfacesStillCovered.length;
+
+  return {
+    applied: rows.length,
+    surfacesReturnedToUncovered: returned,
+    surfacesStillCovered: stillCovered,
+    surfacesNotReopened: notReopened,
+    effect: effect.effect,
+    denominatorDelta: 0,
+    capped,
+    disclosure:
+      rows.length === 0
+        ? 'No retirement has been applied to this project, so no surface has been returned to UNCOVERED by one.'
+        : `${rows.length} applied retirement(s) returned ${returned} surface(s) to UNCOVERED (${stillCovered} stay covered by another live test). ` +
+          'The denominator is UNCHANGED — the application still has those surfaces and now nothing tests them, so the percentage went DOWN, not up.' +
+          (notReopened > 0
+            ? ` ${notReopened} of them never re-opened their surfaces, which means the percentage above is flattered by that much: a DEFECT in the apply path, reported here rather than repaired.`
+            : '') +
+          (capped
+            ? ` More than ${APPLIED_RETIREMENT_SCAN_CAP} applied retirements exist, so every count here is a floor.`
+            : ''),
+  };
+}
+
 // ─── Reporting the result honestly ───────────────────────────────────────────
 
 /** The part of a snapshot a log line (and a test) cares about. */
@@ -481,6 +619,17 @@ export interface RecomputeOutcome {
   previousPercent: number | null;
   deltaPoints: number | null;
   deltaWhy: string;
+  /**
+   * What the retirements applied to this project did to this number.
+   *
+   * Reported on every recompute, including as `applied: 0` — "we looked and
+   * none" is a measurement and a missing field would not be. This is the READ
+   * PATH for `RetirementProposal.surfacesReturnedToUncovered` and
+   * `surfacesReopened`: columns the apply endpoint writes, and until now
+   * nothing read, which means nothing could have noticed a retirement whose
+   * surfaces stayed COVERED.
+   */
+  retirements: AppliedRetirementDisclosure;
   headline: string;
 }
 
@@ -651,6 +800,37 @@ export async function processRecomputeCoverage(
     persist: true,
   });
 
+  /*
+   * ── THE RETIREMENTS, READ BESIDE THE NUMBER THEY LOWERED ──────────────────
+   *
+   * THE PRODUCTION READ PATH for the three columns the apply endpoint writes.
+   * Without it, `surfacesReopened` was written by one endpoint and consulted by
+   * nothing — so an APPLIED retirement whose surfaces stayed COVERED would have
+   * flattered this percentage with nothing in the product able to say so.
+   *
+   * APPLIED only. A PROPOSED retirement has disabled nothing and re-opened
+   * nothing, and counting one here would report a decision nobody has made as
+   * coverage already lost. A positive state list rather than a `notIn`, for the
+   * reason triage.ts gives about the same table: a `notIn` quietly adopts every
+   * state a later round adds.
+   */
+  const appliedRows = await prisma.retirementProposal.findMany({
+    where: { projectId: job.projectId, state: 'APPLIED' },
+    orderBy: [{ appliedAt: 'desc' }, { id: 'desc' }],
+    take: APPLIED_RETIREMENT_SCAN_CAP + 1,
+    select: {
+      id: true,
+      testId: true,
+      surfacesReturnedToUncovered: true,
+      surfacesStillCovered: true,
+      surfacesReopened: true,
+    },
+  });
+  const retirements = describeAppliedRetirements(
+    appliedRows.slice(0, APPLIED_RETIREMENT_SCAN_CAP),
+    appliedRows.length > APPLIED_RETIREMENT_SCAN_CAP,
+  );
+
   const { snapshot, unmeasuredKinds } = computed;
   const delta = coverageDelta(previous?.percent ?? null, snapshot.totals.percent);
   const outcome: RecomputeOutcome = {
@@ -669,8 +849,27 @@ export async function processRecomputeCoverage(
     previousPercent: previous?.percent ?? null,
     deltaPoints: delta.points,
     deltaWhy: delta.why,
+    retirements,
     headline: describeSnapshot(snapshot, unmeasuredKinds),
   };
+
+  /*
+   * The retirement defect is logged at ERROR and on its own line, not folded
+   * into the info above. An APPLIED retirement with `surfacesReopened: false`
+   * is a test that stopped running while its surface stayed COVERED — this
+   * percentage is flattered by that much, and an operator reading a dispute
+   * about the number has to be able to find the sentence.
+   */
+  if (retirements.surfacesNotReopened > 0) {
+    logger.error(
+      {
+        projectId: job.projectId,
+        surfacesNotReopened: retirements.surfacesNotReopened,
+        applied: retirements.applied,
+      },
+      'applied retirement(s) never re-opened their surfaces; this coverage percentage is flattered by that many items',
+    );
+  }
 
   logger.info(outcome, 'coverage recomputed');
   return outcome;

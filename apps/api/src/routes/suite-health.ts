@@ -8,6 +8,7 @@
  *
  *   GET  /suite-health/:projectId                    the reading, computed now
  *   GET  /suite-health/:projectId/tests/:testId      why one test was flagged
+ *   GET  /suite-health/:projectId/drift              which locators moved, and to what
  *   POST /suite-health/:projectId/snapshots          store the reading
  *   GET  /suite-health/:projectId/history            the trend
  *
@@ -53,7 +54,14 @@ import { Router } from 'express';
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { FIXTURE_PREFIX, suiteHealthSnapshotSchema } from '@qaai/shared';
-import type { SuiteHealthSnapshot, SuiteHealthSnapshotData } from '@qaai/shared';
+import type { FlowMap, SuiteHealthSnapshot, SuiteHealthSnapshotData } from '@qaai/shared';
+/*
+ * `driftReport` COMES FROM THE BARREL, unlike `analyzeSuiteHealth` below.
+ * packages/agent/src/index.ts publishes `drift.js` (`export * from
+ * './drift.js'`), so this is a package import and not another relative
+ * cross-workspace path. See the header for why the suite-health import is not.
+ */
+import { DRIFT_MAX_WARNINGS, driftReport } from '@qaai/agent';
 import { Prisma } from '../generated/prisma/client.js';
 import { prisma } from '../lib/prisma.js';
 import { audit } from '../lib/audit.js';
@@ -200,6 +208,15 @@ interface ComputedHealth {
   /** Runnable tests matching the scope, counted WITHOUT the cap applied. */
   testsMatching: number;
   flowMapVersion: number | null;
+  /**
+   * The newest crawl itself, kept so `GET /:projectId/drift` compares against
+   * the SAME crawl and the SAME candidate set the score was computed from.
+   *
+   * Two reads of "the newest flow map" would answer differently the moment a
+   * crawl landed between them, and a reader comparing a 62 against a list of
+   * drifted locators would be comparing two different afternoons.
+   */
+  flowMap: FlowMap | null;
   options: HealthQuery;
 }
 
@@ -275,6 +292,14 @@ async function computeSuiteHealth(
     tests,
     testsMatching,
     flowMapVersion: flowMap?.version ?? null,
+    /*
+     * The double cast every reader of this column uses (see
+     * apps/worker/src/processors/generate.ts, which records why): `graph` is
+     * Prisma `Json`, written by our own crawler, and `crawlIndex` in
+     * packages/agent/src/drift.ts reads it defensively — a malformed graph
+     * costs the comparison, not the request.
+     */
+    flowMap: (flowMap?.graph as unknown as FlowMap | undefined) ?? null,
     options,
   };
 }
@@ -912,6 +937,98 @@ const historyQuerySchema = z.object({
  * entire value of a stored reading is that "we did not measure it" survived
  * being written down.
  */
+// ─── GET /suite-health/:projectId/drift ──────────────────────────────────────
+
+/**
+ * Which of this suite's locators the newest crawl can no longer find, what
+ * happened to each one, and — where there is exactly one candidate — the
+ * replacement expression.
+ *
+ * ── WHY THIS ENDPOINT EXISTS ────────────────────────────────────────────────
+ *
+ * `packages/agent/src/drift.ts` is 765 lines and its only importer was the
+ * package barrel plus its own test file. That satisfies `check-wiring`'s
+ * ratchet and reaches NO REQUEST — the exact defect this round is about: a
+ * module that answers the cheapest question in the product (somebody relabelled
+ * a button this afternoon; thirty tests fail tonight) with nobody able to ask
+ * it.
+ *
+ * `GET /:projectId` next door reports `driftCheck`'s answer, which is "this
+ * locator is MISSING". Missing is not the useful fact. The useful facts are
+ * WHICH of four things happened — still there, moved to another page, name
+ * changed, role changed — and, when exactly one candidate survives every
+ * filter, the expression to paste. That is what this returns.
+ *
+ * ── IT COMPUTES, IT DOES NOT WRITE ──────────────────────────────────────────
+ *
+ * No row is written, no test is edited, no heal is proposed. A rewrite is a
+ * PROPOSAL a human applies, and `driftReport` emits one only when exactly one
+ * candidate survives, because A CONFIDENT WRONG REWRITE IS WORSE THAN A FAILING
+ * RUN: a failing run costs a CI cycle and tells the truth, while a locator
+ * pointed at the wrong element produces a test that passes while asserting
+ * nothing about the thing it was written for.
+ *
+ * ── THE SAME CRAWL AND THE SAME ROWS AS THE SCORE ───────────────────────────
+ *
+ * Both come from `computeSuiteHealth`, so this answer and the dashboard's are
+ * about one afternoon. The test cap is `MAX_TESTS` and it is DISCLOSED —
+ * `limits.partial` and `limits.note`, exactly as the score's is — because a
+ * drift report over an unstated subset of the suite reads as "nothing else
+ * drifted", which is a pass that means "we did not check".
+ */
+suiteHealthRouter.get('/:projectId/drift', requireScope('tests:read'), async (req, res) => {
+  const parsed = querySchema.safeParse(req.query);
+  if (!parsed.success) {
+    /*
+     * A PATH, never a zod message: a zod message quotes the value it rejected,
+     * and a query string is customer-authored text.
+     */
+    throw badRequest('That is not a query this endpoint can read.', {
+      paths: parsed.error.issues.map((issue) => issue.path.join('.') || '(root)'),
+    });
+  }
+
+  const project = await projectOr404(String(req.params.projectId));
+  const computed = await computeSuiteHealth(project.id, parsed.data);
+  const partial = computed.testsMatching > computed.tests.length;
+
+  const report = driftReport({ tests: computed.tests, flowMap: computed.flowMap });
+
+  res.json({
+    projectId: project.id,
+    /*
+     * NULL MEANS NOT MEASURED. No crawl has ever run for this project, so
+     * nothing here is a statement about the suite — `driftReport` answers with
+     * every count at zero and a caveat, and a reader who took those zeroes for
+     * "nothing drifted" would be reading an unmeasured answer as a clean one.
+     */
+    crawlVersion: report.crawlVersion,
+    crawlAcceptance: report.crawlAcceptance,
+    headline: report.headline,
+    testsThatWillFail: report.testsThatWillFail,
+    locatorsToUpdate: report.locatorsToUpdate,
+    deterministicallyRepairable: report.deterministicallyRepairable,
+    /** Every state and every refusal, always present, so "none" and "not checked" differ. */
+    counts: report.counts,
+    refusals: report.refusals,
+    tests: report.tests,
+    caveats: report.caveats,
+    limits: {
+      /** `DRIFT_MAX_WARNINGS`, when it bit, with the total it bit at. */
+      warningsCappedAt: report.cappedAt,
+      warningLimit: DRIFT_MAX_WARNINGS,
+      partial,
+      testsCompared: computed.tests.length,
+      testsMatching: computed.testsMatching,
+      testScanLimit: MAX_TESTS,
+      scope: SCOPE,
+      note: partial
+        ? `This project has ${computed.testsMatching} runnable tests and QAAI compared the first ${computed.tests.length}. The counts below are a FLOOR: tests outside that page were not compared at all, so "nothing else drifted" is NOT what this says.`
+        : null,
+    },
+  });
+});
+
 suiteHealthRouter.get('/:projectId/history', requireScope('tests:read'), async (req, res) => {
   const parsed = historyQuerySchema.safeParse(req.query);
   if (!parsed.success) {

@@ -24,11 +24,55 @@
  * customer's own agents (lib/runners.ts) and NOTHING is enqueued on our queue;
  * null means the queue, exactly as before. `Run.runnerPool` records which, and
  * it is what stops a run being executed twice, once in each place.
+ *
+ * ── THREE COLUMNS THAT HAD READERS AND NO WRITER ───────────────────────────
+ *
+ * `POST /runs` now writes `Run.branch`, `Run.baseUrlOverride` and
+ * `Run.selectionSource`. All three had columns, all three had readers, and no
+ * create path wrote any of them — so `--branch` and `--base-url` worked on NO
+ * SERVER THAT EXISTS (a zod object ignores unknown keys, so both were accepted
+ * and dropped, and the CLI read them back off the created run and exited 2
+ * rather than report a target the run never used), and a gate had nothing to
+ * consult when it was asked whether a 100% pass rate was a claim about the
+ * suite or about eleven tests.
+ *
+ * `baseUrlOverride` decides which host a browser inside QAAI's network opens,
+ * so it is classified before it is stored (`checkBaseUrlOverride`), and
+ * `selectionSource` may be DECLARED by a caller but only ever NARROWER than
+ * what this route works out for itself (`resolveSelectionSource`).
+ *
+ * ── AND THE LEDGER THE READER COULD NOT SEE ────────────────────────────────
+ *
+ * `GET /runs/:runId` reports the cross-kind suppression ledger —
+ * "47 failures silenced by 3 known issues" — which the CLI's `--suppressions`
+ * has been ready to print for a release and had no source for. It is folded
+ * from `SuppressionEvent`, the cap is disclosed when it bites, and quarantine
+ * is synthesised from the run's own counter rather than counted twice.
  */
 
 import { Router } from 'express';
 import { z } from 'zod';
-import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
+import {
+  FIXTURE_PREFIX,
+  QUEUE_NAMES,
+  RUN_SELECTION_SOURCES,
+  SUITE_WIDE_SELECTIONS,
+  SUPPRESSION_LEDGER_SCAN_CAP,
+  createRunSchema,
+  summariseSuppressions,
+} from '@qaai/shared';
+/*
+ * The SYNCHRONOUS half of the host guard, imported through the package SUBPATH
+ * and never the barrel: private-address.ts reaches for `node:dns` and the
+ * barrel is what the web app's bundler consumes.
+ *
+ * `resolvesPublicly` is deliberately NOT imported. It needs DNS, and a name
+ * this process resolves is not the name the browser will resolve — so the
+ * resolving check belongs where the connection is opened
+ * (`guardProbeHost`/`environmentPreflight`, packages/runner/src/preflight.ts),
+ * and this route must not be described as having done it.
+ */
+import { classifyHost } from '@qaai/shared/private-address';
 /*
  * The one definition of "did this run pass" (packages/runner/src/gates.ts).
  * This route is the CLI's only source for it: the CLI ships zero dependencies
@@ -36,7 +80,15 @@ import { FIXTURE_PREFIX, QUEUE_NAMES, createRunSchema } from '@qaai/shared';
  * response instead of computing a copy of it. See `runVerdict` below.
  */
 import { quarantineSuppresses, runOutcome } from '@qaai/runner';
-import type { ShardAssignment, ShardPlan, ShardedRunJob, TestType } from '@qaai/shared';
+import type {
+  RunSelectionSource,
+  ShardAssignment,
+  ShardPlan,
+  ShardedRunJob,
+  SuppressionKind,
+  SuppressionTally,
+  TestType,
+} from '@qaai/shared';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { badRequest, conflict, notFound, planLimit, unprocessable } from '../lib/errors.js';
 import { canStartRun, planFor } from '../lib/plan.js';
@@ -600,9 +652,186 @@ async function dispatchOnPrem(args: {
   };
 }
 
+// ─── The two fields a caller hands over that decide what a run MEANS ─────────
+
+/**
+ * The base URL a caller named, checked before anything is written.
+ *
+ * ── WHY THIS IS THE HIGHEST-VALUE FIELD IN THE REQUEST ─────────────────────
+ *
+ * It decides which host a browser inside QAAI's network opens, which is the
+ * shape of every SSRF. `createRunSchema` has already refused anything that is
+ * not an http(s) URL and anything carrying userinfo; this is the host check,
+ * and it is the SYNCHRONOUS one — `classifyHost` reads the host string and
+ * answers from the string alone.
+ *
+ * WHAT IT CATCHES: a loopback, link-local, private or CGNAT literal; an IPv6
+ * literal of the same classes; a name QAAI declines to read at all (`0177.0.0.1`,
+ * `0x7f.0.0.1`, `2130706433` — every one of them 127.0.0.1 to something in the
+ * stack, and a hostname to something else); and a name that resolves inside a
+ * private network by construction (`localhost`, a single label, `*.internal`,
+ * `*.svc`, `*.cluster.local`).
+ *
+ * WHAT IT DOES NOT CATCH, and must not be described as catching: a PUBLIC name
+ * whose records answer `169.254.169.254`. That needs a resolver, a resolver
+ * needs DNS, and a name resolved in this process is not the name the browser
+ * will resolve — so the resolving check runs where the connection is opened, in
+ * `guardProbeHost` (packages/runner/src/preflight.ts), which refuses the host
+ * and BLOCKS the tests that depend on it rather than attempting them. This
+ * function makes that refusal arrive in a second instead of after a queue hop,
+ * which is the whole of what it is for.
+ *
+ * THE REFUSAL NAMES THE FIELD AND THE CLASS, NEVER THE HOST. The host is
+ * customer-authored text, and this message is read by a CI log, a PR comment
+ * and a model's context — the same reason the CLI's refusals carry a path and a
+ * code. (routes/api-surface.ts echoes the hostname in its own refusal; that is
+ * the older convention and not one to copy.)
+ */
+function checkBaseUrlOverride(url: string): void {
+  // `createRunSchema` parsed it, so this cannot throw — but a bare `new URL`
+  // in a route with a `throw` after it is worth being explicit about.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw badRequest('baseUrlOverride is not a URL this server can open.');
+  }
+
+  const host = classifyHost(parsed.hostname);
+  if (host.kind === 'ambiguous') {
+    throw badRequest(
+      'baseUrlOverride names a host QAAI will not read: it is an address written in a form two ' +
+        'parsers would disagree about, and the disagreement is the bypass. Use a hostname, or a ' +
+        'plain dotted-quad.',
+    );
+  }
+  /*
+   * `ambiguous` is handled above and treated exactly as loopback, which is the
+   * contract `classifyHost` states. Only `public` is ever a yes.
+   */
+  if (host.kind === 'address' && host.class !== 'public') {
+    throw badRequest(
+      `baseUrlOverride points at a ${host.class} address. A run's browser executes inside QAAI's ` +
+        'network, so it may only be aimed at a public address. A private address belongs on the ' +
+        "Environment, which the customer's own runners read.",
+    );
+  }
+  if (host.kind === 'name' && host.internal) {
+    throw badRequest(
+      'baseUrlOverride names a host that resolves inside a private network. A run’s browser ' +
+        'executes inside QAAI’s network, so it may only be aimed at a public host. A private ' +
+        "host belongs on the Environment, which the customer's own runners read.",
+    );
+  }
+}
+
+/**
+ * WHAT CHOSE THE TESTS IN THIS RUN — the server's own answer, from the request.
+ *
+ * ── THE DEFECT THIS CLOSES, WITH THE NUMBER ON IT ──────────────────────────
+ *
+ * A MIN_PASS_RATE gate over an impact-selected run of 11 tests computes 100%,
+ * and the web app's run page and the GitHub check both render that as a pass —
+ * a suite-wide claim made from a sliver of the suite, on the one surface where
+ * a pull request is actually gated. The CLI and the Action withhold that pass
+ * today because they KNOW what they asked for. The server could not: the
+ * selection chose the tests and was then discarded.
+ *
+ * ── THE ORDER IS THE CONTENT ───────────────────────────────────────────────
+ *
+ * IMPACT first, and only when the analysis was APPLIED — `selectionReport.applied`
+ * is "the analysis stood AND it actually ruled something out". An analysis that
+ * answered RUN_EVERYTHING, or whose answer was overridden for safety, chose
+ * nothing, and labelling that run IMPACT would be the mirror of the lie this
+ * column exists to stop: a run reported as narrower than it was, whose gate is
+ * then withheld although the whole suite ran.
+ *
+ * Then EXPLICIT, then SUITE, then FULL_SUITE. A request that carries both an id
+ * list and a diff is both, and the narrower label is the honest one — what
+ * matters downstream is that neither is suite-wide.
+ *
+ * `useCache` is deliberately not a source. Reuse does not change which tests
+ * the run is ABOUT; it changes how one of them gets its answer, and that is
+ * reported in `cache` beside it.
+ */
+function selectionSourceFor(args: {
+  impactApplied: boolean;
+  explicitTestIds: boolean;
+  suiteId: string | null;
+}): RunSelectionSource {
+  if (args.impactApplied) return 'IMPACT';
+  if (args.explicitTestIds) return 'EXPLICIT';
+  if (args.suiteId !== null) return 'SUITE';
+  return 'FULL_SUITE';
+}
+
+/** What was stored, what the server worked out, and what the caller claimed. */
+interface SelectionSourceDecision {
+  stored: RunSelectionSource;
+  computed: RunSelectionSource;
+  declared: RunSelectionSource | null;
+  /** Whether `stored` can carry a claim about the WHOLE suite. */
+  suiteWide: boolean;
+}
+
+/**
+ * Reconcile the caller's declaration with the server's own answer.
+ *
+ * A DECLARATION MAY ONLY NARROW. That is the entire rule, and it is what makes
+ * the field safe to accept at all:
+ *
+ *   · no declaration — the server's answer stands.
+ *   · the two agree — nothing to decide.
+ *   · the declaration is NOT suite-wide and the server's answer is — the
+ *     declaration wins, because the caller knows something this server cannot
+ *     see. A CLI that ran the impact analysis itself and sent the resulting ids
+ *     arrives looking exactly like a caller who typed them.
+ *   · the declaration IS suite-wide and the server's answer is not — REFUSED,
+ *     out loud. This is the one case that matters: it is a request to label a
+ *     run of 11 tests FULL_SUITE so that a gate scored over its own results can
+ *     report a suite pass. A field that accepted it would be worse than no
+ *     field at all.
+ *
+ * `SUITE_WIDE_SELECTIONS` is the test, not a literal comparison against
+ * `FULL_SUITE`: when a sixth selection mode arrives that IS suite-wide, this
+ * reads it from the vocabulary rather than needing to be remembered.
+ *
+ * Both values are from a closed vocabulary QAAI owns, so the refusal may name
+ * them — unlike a host or a path, naming them echoes nothing a caller authored.
+ */
+function resolveSelectionSource(
+  computed: RunSelectionSource,
+  declared: RunSelectionSource | null | undefined,
+): SelectionSourceDecision {
+  const suiteWide = (source: RunSelectionSource): boolean =>
+    SUITE_WIDE_SELECTIONS.includes(source);
+
+  const claim = declared ?? null;
+  if (claim === null || claim === computed) {
+    return { stored: computed, computed, declared: claim, suiteWide: suiteWide(computed) };
+  }
+  if (suiteWide(claim) && !suiteWide(computed)) {
+    throw badRequest(
+      `selectionSource was declared ${claim}, which is a claim about the whole suite, and this ` +
+        `request selects ${computed}. A selection may only be declared NARROWER than the one the ` +
+        'server works out, never wider: a gate scored over the tests that ran must not be able to ' +
+        'report a suite pass because the request said so.',
+      { declared: claim, computed },
+    );
+  }
+  return { stored: claim, computed, declared: claim, suiteWide: suiteWide(claim) };
+}
+
 runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (req, res) => {
   const actor = actorOf(req);
   const input = createRunSchema.parse(req.body);
+
+  /*
+   * Before the first query, let alone the first write: this is the field that
+   * decides which host a browser opens, and a guard after the row exists is a
+   * guard a redelivered dispatch walks straight past.
+   */
+  if (input.baseUrlOverride != null) checkBaseUrlOverride(input.baseUrlOverride);
 
   const environment = await prisma.environment.findUnique({
     where: { id: input.environmentId },
@@ -745,6 +974,24 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
   const failFast = planFailFast(input.failFast === true);
 
   /*
+   * WHAT CHOSE THE TESTS, decided here because this is the first line at which
+   * all four inputs are known: whether the impact analysis was applied, whether
+   * the caller named ids, whether it named a suite, and what it declared.
+   *
+   * Computed before `startRun` so the value is written in the same statement
+   * that creates the run. A column filled in afterwards is a column that is
+   * null for every run whose second write failed.
+   */
+  const selectionSource = resolveSelectionSource(
+    selectionSourceFor({
+      impactApplied: selectionReport?.applied === true,
+      explicitTestIds: (input.testIds ?? []).length > 0,
+      suiteId: input.suiteId ?? null,
+    }),
+    input.selectionSource,
+  );
+
+  /*
    * The split, decided before anything is written so the run row, the result
    * rows and the queue jobs all agree about it from the moment they exist.
    *
@@ -804,6 +1051,29 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       triggeredBy: actor.userId || null,
       commitSha: input.commitSha ?? null,
       prNumber: input.prNumber ?? null,
+      /*
+       * THE BRANCH, WRITTEN. `Run.branch` had a column, a copier in the
+       * rerun-failures endpoint, a reader in every reporter and in the Jira
+       * issue body, and no create path that wrote it — so every run in every
+       * install carried null and a PR check looking a run up by branch found
+       * nothing. `createRunSchema` now accepts it through the `gitBranch`
+       * validator.
+       */
+      branch: input.branch ?? null,
+      /*
+       * THE BASE URL, WRITTEN — and the reason `echoRefusals` in the CLI exists
+       * to notice when it is not. Classified above; a private, loopback or
+       * unreadable host never reaches this line.
+       */
+      baseUrlOverride: input.baseUrlOverride ?? null,
+      /*
+       * WHAT CHOSE THE TESTS. Null meant "unknown" and every run ever created
+       * stored null, so a gate had nothing to consult and the run page rendered
+       * a sliver's 100% as a suite pass. `selectionSource.stored` and not the
+       * raw input: one place decides what this means, and it is the function
+       * that also refuses a widened claim.
+       */
+      selectionSource: selectionSource.stored,
       totalCount: testIds.length,
       shardCount: grantedShards,
       /*
@@ -964,11 +1234,46 @@ runsRouter.post('/', requireRole('MEMBER'), requireScope('runs:write'), async (r
       ...(failFast.requested
         ? { failFast: { recorded: true, enforced: failFast.enforced } }
         : {}),
+      /*
+       * Always, not only when it is interesting. "What was this run's verdict
+       * about?" is asked months later, by somebody holding a green check and a
+       * regression that shipped, and FULL_SUITE recorded on every ordinary run
+       * is what makes the answer readable — an absent field would be
+       * indistinguishable from the runs created before the column existed.
+       *
+       * `declaredByCaller` only when it differed, because that is the event: a
+       * caller told us the selection was narrower than we could see. Named
+       * `selectedBy` and not `selection`, which this row already uses for the
+       * impact analysis's own strategy and counts.
+       */
+      selectedBy: {
+        stored: selectionSource.stored,
+        computed: selectionSource.computed,
+        ...(selectionSource.declared !== null && selectionSource.declared !== selectionSource.computed
+          ? { declaredByCaller: selectionSource.declared }
+          : {}),
+      },
     },
   });
 
   res.status(202).json({
     run,
+    /*
+     * WHAT THIS RUN'S VERDICT WILL BE ABOUT, reported with the 202 rather than
+     * left for the caller to re-derive from the fields it sent.
+     *
+     * `suiteWide` is the one a gate needs and the one nobody can compute from
+     * `stored` without knowing `SUITE_WIDE_SELECTIONS`, so it travels with it.
+     * `computed` is kept beside `stored` because they differ exactly when the
+     * caller told us something we could not see, and a caller comparing the two
+     * is how a mislabelled CI integration gets found.
+     */
+    selectionSource: {
+      stored: selectionSource.stored,
+      computed: selectionSource.computed,
+      declared: selectionSource.declared,
+      suiteWide: selectionSource.suiteWide,
+    },
     // `jobId` stays a string for every existing caller; sharded runs add the
     // full list rather than replacing it. An on-prem run has neither: nothing
     // was enqueued on our queue, and reporting an id that names no job would be
@@ -1313,6 +1618,19 @@ runsRouter.post(
         // The same application, not merely the same environment row. See the
         // header: a preview-deploy run's failures belong to the preview URL.
         baseUrlOverride: previous.baseUrlOverride,
+        /*
+         * NOT COPIED from the previous run, and that is the point: whatever
+         * chose the tests THERE, what chose them HERE is "the failures of that
+         * run". Copying `selectionSource` would let a re-run of 6 failures
+         * inherit the parent's FULL_SUITE and hand a MIN_PASS_RATE gate a
+         * suite-wide claim over six tests — the exact lie the column exists to
+         * stop, arriving by the one door that looks like bookkeeping.
+         *
+         * RERUN_FAILURES is not in `SUITE_WIDE_SELECTIONS`, so it says what
+         * this endpoint's own response and the CLI both already say out loud: a
+         * re-run of the failures is never a suite pass.
+         */
+        selectionSource: 'RERUN_FAILURES' satisfies RunSelectionSource,
         totalCount: rerunIds.length,
         failFast: failFast.requested,
         // Never sharded. The point of this endpoint is that the set is small;
@@ -1516,6 +1834,238 @@ runsRouter.post(
   },
 );
 
+// ─── The suppression ledger, reaching the reader ─────────────────────────────
+
+/**
+ * How many ledger rows one run's reported ledger is folded from.
+ *
+ * A BOUND THAT IS REPORTED WHEN IT BITES, never a silent `take`. One row per
+ * (kind, cause) per run, so a 200-test outage under three mutes writes three;
+ * past this cap a run had thousands of distinct suppressed causes, which is
+ * itself the finding, and the answer under-counts out loud rather than claiming
+ * to have seen everything.
+ *
+ * ONE DEFINITION NOW, in packages/shared/src/constants.ts. It was a separate
+ * literal here and in apps/worker/src/processors/run.ts — "deliberately the
+ * same" — because an app cannot import another app's processor; shared is where
+ * both can read it, and `runs.test.ts` pins this surface's total against the
+ * finaliser's on every terminal run, so the day one literal moved that test
+ * would have been the only thing that knew.
+ *
+ * The name is kept so this file's own readers do not all have to change.
+ */
+export const RUN_SUPPRESSION_LEDGER_CAP = SUPPRESSION_LEDGER_SCAN_CAP;
+
+/**
+ * Whether a stored `selectionSource` can carry a claim about the WHOLE suite.
+ *
+ * THREE STATES, because there are three:
+ *
+ *   true   — the selection is in `SUITE_WIDE_SELECTIONS`.
+ *   false  — it is a selection, and it is narrower than the suite.
+ *   null   — WE DO NOT KNOW. The column is null on every run written before it
+ *            existed, and such a run was not necessarily a full-suite run.
+ *            Rendering that as `false` would be a claim nobody measured, and
+ *            rendering it as `true` is the exact lie the column was added to
+ *            stop: a MIN_PASS_RATE gate over eleven tests reporting 100% as a
+ *            suite pass.
+ *
+ * Null is also the answer for a value OUTSIDE the vocabulary. The column is
+ * TEXT with the domain at the producer — deliberately, so a sixth selection
+ * mode is a feature rather than a migration — which means a row written by a
+ * newer QAAI can hold a name this code has never heard of. "Not one of the
+ * suite-wide names I know" is not the same fact as "not suite-wide", and
+ * answering `false` there would turn an unreadable row into a measurement.
+ *
+ * The CAST IS ON THE LIST AND NOT ON THE VALUE: asking whether a string is one
+ * of these names is honest, while `value as RunSelectionSource` would assert
+ * that whatever is in the column is a member of the domain, which is the one
+ * thing this function is here to doubt.
+ */
+function suiteWideClaim(selectionSource: string | null): boolean | null {
+  if (selectionSource === null) return null;
+  if (!(RUN_SELECTION_SOURCES as readonly string[]).includes(selectionSource)) return null;
+  return (SUITE_WIDE_SELECTIONS as readonly string[]).includes(selectionSource);
+}
+
+/** A cap that actually bit, with the count and the reason it bit. */
+interface LedgerTruncation {
+  limit: number;
+  rowsRead: number;
+  reason: string;
+}
+
+/**
+ * This run's suppressions, folded by kind, for `runOutcome`.
+ *
+ * ── WHY THE FOLD IS IN TYPESCRIPT AND NOT A `groupBy` ──────────────────────
+ *
+ * The number that matters is DISTINCT SUPPRESSING ROWS, not ledger rows. A
+ * `groupBy(['kind'])` with `_count` reports three known issues as three when
+ * they silenced one cause each and as ONE when one mute silenced three causes —
+ * and the headline sentence is "47 failures suppressed by 3 known issues", so
+ * the second number has to be distinct `sourceId`s. Prisma cannot count
+ * distinct values inside a group-by. This is the same fold the run finaliser
+ * and the digest each do, for the same reason.
+ *
+ * ── QUARANTINE IS EXCLUDED AT THE SOURCE ───────────────────────────────────
+ *
+ * `runOutcome` synthesises the quarantine tally from `counts.quarantinedFailed`,
+ * which `tallyResult` is the only writer of. Letting a QUARANTINE ledger row
+ * through as well would double the one total a release decision reads — one
+ * fact in two fields, which is the same defect as two facts in one.
+ *
+ * ── NO `catch` HERE, DELIBERATELY ──────────────────────────────────────────
+ *
+ * The finaliser catches, because it must not lose a run's writes over a
+ * summary. This is a GET with nothing to lose: a ledger read that fails here
+ * fails for the same reason the run read two lines above it would, and
+ * inventing a third state ("the ledger exists but could not be read") would
+ * give every caller a case to handle that is indistinguishable in the numbers
+ * from the two that already exist.
+ */
+async function suppressionLedgerFor(
+  runId: string,
+): Promise<{ tallies: SuppressionTally[]; rowsRead: number; truncated: LedgerTruncation | null }> {
+  /*
+   * `orgId` is absent from the `where` on purpose: the tenant extension adds
+   * it, the way it does for every other read in this file. One row over the cap
+   * is read so the cap can be REPORTED rather than guessed at.
+   */
+  const rows = await prisma.suppressionEvent.findMany({
+    where: { runId, kind: { not: 'QUARANTINE' } },
+    take: RUN_SUPPRESSION_LEDGER_CAP + 1,
+    select: { kind: true, sourceId: true, suppressed: true, inForce: true },
+  });
+
+  const truncated: LedgerTruncation | null =
+    rows.length > RUN_SUPPRESSION_LEDGER_CAP
+      ? {
+          limit: RUN_SUPPRESSION_LEDGER_CAP,
+          rowsRead: RUN_SUPPRESSION_LEDGER_CAP,
+          reason:
+            `This run has more than ${RUN_SUPPRESSION_LEDGER_CAP} distinct suppressed causes, ` +
+            'which is the cap on this read. The counts below are a FLOOR: more was suppressed ' +
+            'than they say, and the number of distinct causes is itself the finding.',
+        }
+      : null;
+
+  const byKind = new Map<
+    SuppressionKind,
+    { suppressed: number; live: Set<string>; dead: Set<string> }
+  >();
+  for (const row of rows.slice(0, RUN_SUPPRESSION_LEDGER_CAP)) {
+    /*
+     * NO CAST. `SuppressionEvent.kind` is a Postgres enum, so Prisma already
+     * types it as the union; an assertion here would hide the day the two
+     * vocabularies stop agreeing, which is what a drift guard is for.
+     */
+    const kind: SuppressionKind = row.kind;
+    const tally = byKind.get(kind) ?? { suppressed: 0, live: new Set(), dead: new Set() };
+    tally.suppressed += row.suppressed;
+    // `sourceId` is nullable. A row with none is still ONE suppression,
+    // identified by nothing, rather than a row dropped from the count.
+    (row.inForce ? tally.live : tally.dead).add(row.sourceId ?? `<unidentified:${kind}>`);
+    byKind.set(kind, tally);
+  }
+
+  return {
+    rowsRead: Math.min(rows.length, RUN_SUPPRESSION_LEDGER_CAP),
+    truncated,
+    tallies: [...byKind.entries()].map(([kind, tally]) => ({
+      kind,
+      suppressions: tally.live.size,
+      suppressed: tally.suppressed,
+      expired: tally.dead.size,
+    })),
+  };
+}
+
+/**
+ * The ledger as a reader sees it: five numbers, a complete breakdown, and the
+ * cap if it bit.
+ *
+ * ── THE SENTENCE THIS EXISTS TO MAKE POSSIBLE ──────────────────────────────
+ *
+ * "47 failures silenced by 3 known issues". The CLI has been able to print it
+ * for a release and had no source for it: `--suppressions` read
+ * `run.suppressions` off this endpoint and this endpoint did not report one, so
+ * the flag printed "UNAVAILABLE" on every server that exists.
+ *
+ * ── QUARANTINE IS SYNTHESISED FROM THE COUNTER, NOT READ FROM THE LEDGER ───
+ *
+ * The same rule `runOutcome` states and enforces: `quarantinedFailedCount` is
+ * the only writer of that number, and counting it again from a ledger row would
+ * double the one total a release decision reads. Each quarantined failure is
+ * one quarantined test, so the count of quarantines equals the count of
+ * failures they silenced — honest, and the only thing a run's counters can say.
+ *
+ * `tallies` ARRIVES QUARANTINE-FREE: `suppressionLedgerFor` excludes the kind
+ * in its `where`, which is the one place that exclusion is made. There is
+ * deliberately no second filter here. A belt-and-braces `.filter(kind !==
+ * 'QUARANTINE')` on this line was removed because it could not be killed by a
+ * mutation — with the query filter in place it never excludes anything, so it
+ * is code connected to nothing, and it HID the query filter from the tests that
+ * were supposed to pin it.
+ *
+ * This is the SECOND place the synthesis itself is written (`runOutcome` has
+ * the other, and filters any QUARANTINE tally a caller passes so the two cannot
+ * both apply). `runs.test.ts` pins `verdict.suppressedFailures` against
+ * `suppressions.failuresSuppressed` for exactly that reason: the two must agree
+ * on every terminal run, and a test is the only thing that keeps them agreeing.
+ *
+ * ── THE FIVE FIELDS ARE THREE OF FIVE KINDS, SO `byKind` IS NOT OPTIONAL ───
+ *
+ * `knownIssues`, `quarantines` and `waivers` name three of the five suppression
+ * kinds. ENV_ISSUE and RETIREMENT can silence a failure too, and a reader
+ * handed "12 failures suppressed by 0 known issues, 0 quarantines and 0
+ * waivers" would be reading a failure suppressed without being counted. So the
+ * complete per-kind breakdown travels with the five, and it names every kind
+ * that did anything.
+ */
+function reportedLedger(
+  run: { quarantinedFailedCount: number },
+  ledger: { tallies: readonly SuppressionTally[]; rowsRead: number; truncated: LedgerTruncation | null },
+): {
+  failuresSuppressed: number;
+  knownIssues: number;
+  quarantines: number;
+  waivers: number;
+  expiredAndSilencedNothing: number;
+  byKind: SuppressionTally[];
+  rowsRead: number;
+  truncated: LedgerTruncation | null;
+} {
+  const quarantined = Math.max(0, run.quarantinedFailedCount);
+  const summary = summariseSuppressions([
+    ...(quarantined > 0
+      ? [
+          {
+            kind: 'QUARANTINE' as const,
+            suppressions: quarantined,
+            suppressed: quarantined,
+            expired: 0,
+          },
+        ]
+      : []),
+    ...ledger.tallies,
+  ]);
+
+  const of = (kind: SuppressionKind): number =>
+    summary.byKind.find((tally) => tally.kind === kind)?.suppressions ?? 0;
+
+  return {
+    failuresSuppressed: summary.suppressed,
+    knownIssues: of('MUTE'),
+    quarantines: of('QUARANTINE'),
+    waivers: of('COVERAGE_WAIVER'),
+    expiredAndSilencedNothing: summary.expired,
+    byKind: summary.byKind,
+    rowsRead: ledger.rowsRead,
+    truncated: ledger.truncated,
+  };
+}
+
 /**
  * The run's verdict, computed server-side and returned WITH the run.
  *
@@ -1537,15 +2087,34 @@ runsRouter.post(
  * once. `verdict` rather than a bare boolean because the REASON travels with
  * it: a run that passed with suppressed failures has to be able to say so.
  */
-function runVerdict(run: {
+function runVerdict(
+  run: {
+    status: string;
+    passedCount: number;
+    failedCount: number;
+    flakyCount: number;
+    skippedCount: number;
+    quarantinedFailedCount: number;
+    gateResult: unknown;
+  },
+  /**
+   * The non-quarantine suppressions this run recorded.
+   *
+   * Handed in rather than read here, because this function is also called for a
+   * run that has not finished — and because `runOutcome` documents an ABSENT
+   * list as "this caller has no ledger to read" rather than "nothing was
+   * suppressed". This route used to be exactly that caller: it called
+   * `runOutcome` with no suppressions at all, so a run that passed because a
+   * known issue silenced forty failures reported "Nothing was suppressed." to
+   * the CLI, the check and the run page.
+   */
+  tallies: readonly SuppressionTally[] = [],
+): {
+  passed: boolean;
   status: string;
-  passedCount: number;
-  failedCount: number;
-  flakyCount: number;
-  skippedCount: number;
-  quarantinedFailedCount: number;
-  gateResult: unknown;
-}): { passed: boolean; status: string; suppressedFailures: number; reason: string } {
+  suppressedFailures: number;
+  reason: string;
+} {
   const gate = run.gateResult as { passed?: boolean } | null | undefined;
   /*
    * A run still in flight has no verdict and must not be given one. `null`
@@ -1575,7 +2144,30 @@ function runVerdict(run: {
       flaky: run.flakyCount,
       skipped: run.skippedCount,
       quarantinedFailed: run.quarantinedFailedCount,
+      /*
+       * ── WHY THIS SURFACE SUBTRACTS TOO ────────────────────────────────────
+       *
+       * The post-triage re-score (apps/worker/src/processors/checks.ts) now
+       * hands `runOutcome` the same number and writes the result to
+       * `Run.status`. If this function did not, the API would recompute a
+       * verdict from the same row and reach the OPPOSITE answer — the stored
+       * status PASSED and this endpoint's `verdict.status` FAILED — which is
+       * two surfaces disagreeing about one run, the defect `runOutcome` exists
+       * to end.
+       *
+       * `tallies` arrives quarantine-free (see `suppressionLedgerFor`), so this
+       * total is the non-quarantine ledger and nothing else. As in the worker,
+       * the claim and the accounting come from ONE read, so `runOutcome`'s
+       * `claimed > accounted` shortfall cannot fire here; what bounds the
+       * subtraction is `counts.failed`.
+       *
+       * A pending re-score is NOT a disagreement: the subtraction can only
+       * flip a status whose stored `gateResult.passed` is already true, so a
+       * run the gate blocked stays blocked until the gate itself is re-scored.
+       */
+      failedThenSuppressed: tallies.reduce((total, tally) => total + tally.suppressed, 0),
     },
+    suppressions: tallies,
     // A terminal run with no gate result was finalised by something that did
     // not evaluate one. Treated as "nothing blocked", which is what the stored
     // status already reflects.
@@ -1623,7 +2215,46 @@ runsRouter.get('/:runId', async (req, res) => {
     },
   });
   if (!run) throw notFound('Run');
-  res.json({ run: { ...run, verdict: runVerdict(run) } });
+
+  /*
+   * THE LEDGER, FETCHED FOR THE READER. One indexed read on `runId`, and the
+   * reason it is worth a second query on the endpoint the CLI polls: the only
+   * other way for a release to learn that 47 of its failures were muted is for
+   * somebody to go and look, which is the behaviour this whole vocabulary
+   * exists to replace.
+   *
+   * Reported for a run that has not finished too, and that is not a measurement
+   * claim: these rows are written by the run finaliser, so an unfinished run
+   * reports what has been recorded SO FAR. The quarantine half is live from the
+   * run's own counter.
+   */
+  const ledger = await suppressionLedgerFor(run.id);
+
+  res.json({
+    run: {
+      ...run,
+      verdict: runVerdict(run, ledger.tallies),
+      /*
+       * WHETHER THIS RUN'S VERDICT CAN BE READ AS A STATEMENT ABOUT THE SUITE.
+       *
+       * Derived from `selectionSource` so a reader does not need the
+       * vocabulary: the GitHub Action's summary script runs in the customer's
+       * CI with nothing installed but the pinned CLI, and cannot import
+       * `SUITE_WIDE_SELECTIONS` to work it out.
+       *
+       * THREE STATES, because there are three. See `suiteWideClaim`.
+       */
+      selectionSuiteWide: suiteWideClaim(run.selectionSource),
+      /*
+       * The five numbers `suppressionLines` in the CLI reads, plus the complete
+       * per-kind breakdown and the cap if it bit. Present whenever the run is —
+       * a field that appears only when something was suppressed is a field a
+       * reader cannot tell from a server that does not have one, which is the
+       * difference between "nothing was suppressed" and "we did not look".
+       */
+      suppressions: reportedLedger(run, ledger),
+    },
+  });
 });
 
 /** Live run events for the cockpit's right pane (§8). */

@@ -14,6 +14,15 @@
  *  - The payload names a repository, and the repository decides which org's
  *    tests run. That lookup is deliberately exact-match against a connected
  *    integration; an unknown repo is ignored rather than guessed at.
+ *
+ * ── AND NOW IT IS ALSO WHERE A QAAI PULL REQUEST ENDS ──────────────────────
+ *
+ * `recordPullRequestMerged` (../lib/pull-request.ts) had no caller anywhere in
+ * this repository, and nothing at all handled `action: 'closed'`. A record
+ * written by the open path therefore stayed at OPEN for ever, whichever way the
+ * review went. `closed` arrives for BOTH endings and `merged` is the only thing
+ * that separates them, so both arms are handled here, in one place, from one
+ * verified event.
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
@@ -26,6 +35,24 @@ import { badRequest, unauthorized } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { env } from '../env.js';
 import { registerStripeWebhook } from './billing.js';
+/*
+ * ── THE ONE SEAM, REUSED ───────────────────────────────────────────────────
+ *
+ * `pullRequestStore`/`pullRequestAudit` are the SAME Prisma halves
+ * `POST /agent/heals/:healId/pull-request` drives, and `recordPullRequestMerged`
+ * is the same policy. Nothing about a pull-request record is re-implemented
+ * here: a second idea of what a record is would be a second idea of which cause
+ * a merge belongs to.
+ */
+import { pullRequestAudit, pullRequestStore } from '../lib/git.js';
+import { recordPullRequestMerged } from '../lib/pull-request.js';
+import type { Remeasure } from '../lib/pull-request.js';
+import {
+  findRecordByBranch,
+  qaaiBranchShape,
+  recordPullRequestClosed,
+} from '../lib/pull-request-store.js';
+import { computeCoverage } from '../lib/coverage-store.js';
 
 export const webhooksRouter: Router = Router();
 
@@ -53,12 +80,157 @@ interface PullRequestPayload {
     base?: { ref?: string };
     draft?: boolean;
     title?: string;
+    /**
+     * The ONLY field that separates a merge from a decline, because GitHub
+     * sends `action: 'closed'` for both.
+     *
+     * Read as `=== true` and never as "not false": a payload that omitted it —
+     * a replay, a trimmed delivery, a provider change — must fall into the
+     * close arm, which records a weaker fact, rather than into the merge arm,
+     * which recomputes a customer's coverage number.
+     */
+    merged?: boolean;
   };
   repository?: { full_name?: string };
 }
 
 /** PR actions worth a run. Everything else (labels, comments, assignees) is noise. */
 const RUNNABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'ready_for_review']);
+
+/** The one action that ends a pull request. Both endings arrive under it. */
+const CLOSED_ACTION = 'closed';
+
+/**
+ * The coverage re-measurement a merge owes, over the API's own computation.
+ *
+ * ── WHY IT IS SYNCHRONOUS, AND WHAT THAT COSTS ─────────────────────────────
+ *
+ * `requestRecompute` (apps/worker's recompute-coverage processor) is the queued
+ * path and the API cannot reach it: `RECOMPUTE_COVERAGE_QUEUE` is not a member
+ * of `JobPayloads`, so `enqueue` has no overload for it. The alternative to
+ * computing here is a merge whose coverage is never re-measured, which is the
+ * stale number the `remeasured` field exists to make visible — so this runs
+ * `computeCoverage` on the request thread, exactly as `routes/coverage.ts`
+ * already does for a cockpit read.
+ *
+ * The cost is disclosed rather than hidden: a recompute takes seconds, a merge
+ * event is rare (one per merged pull request), and if GitHub times the delivery
+ * out and retries, `recordPullRequestMerged` answers ALREADY_MERGED and nothing
+ * is computed twice. The queue entry that would make this a background job is in
+ * this round's handover.
+ */
+function coverageRemeasure(): Remeasure {
+  return {
+    async recompute({ orgId, projectId }) {
+      await computeCoverage({ orgId, projectId, persist: true });
+    },
+  };
+}
+
+/** What the close/merge arm answers, so the route body stays one shape. */
+interface ReconcileReport {
+  readonly outcome: string;
+  readonly remeasured: boolean;
+  readonly note: string;
+}
+
+/**
+ * Reconcile a QAAI pull-request record against a VERIFIED `closed` event.
+ *
+ * ── THE ROW IS CHOSEN BY A VALUE QAAI WROTE ────────────────────────────────
+ *
+ * The head branch, and nothing else. NOT `pull_request.number` — that is the
+ * host's identifier, it is a plain integer an attacker can pick, and selecting a
+ * record by it would let a delivery for one repository move another's row.
+ * `qaaiBranchShape` refuses any ref `branchNameFor` could not have produced
+ * before a query runs, and the surviving string is only ever compared for
+ * equality against the `branch` column QAAI composed and stored.
+ *
+ * `orgId` comes from the integration row this request already resolved, never
+ * from the payload, so the search is confined to the tenant that connected the
+ * repository.
+ */
+async function reconcileClosedPullRequest(args: {
+  orgId: string;
+  headRef: unknown;
+  merged: boolean;
+}): Promise<ReconcileReport> {
+  const branch = qaaiBranchShape(args.headRef);
+  if (!branch) {
+    /*
+     * Not a branch QAAI composed, so there is nothing of ours to reconcile.
+     * The ref is NOT logged: it is customer-authored text of unbounded length
+     * and a log line is the one place an injected sentence gets read by a human
+     * out of context. The shape verdict is the fact worth keeping.
+     */
+    return {
+      outcome: 'NOT_A_QAAI_BRANCH',
+      remeasured: false,
+      note: 'The head branch is not one QAAI composed, so no QAAI pull-request record is involved.',
+    };
+  }
+
+  const lookup = await findRecordByBranch(prisma, { orgId: args.orgId, branch });
+  if (lookup.kind === 'NONE') {
+    return {
+      outcome: 'NOT_OURS',
+      remeasured: false,
+      note: 'No QAAI pull-request record claims that branch, so nothing was changed.',
+    };
+  }
+  if (lookup.kind === 'AMBIGUOUS') {
+    /*
+     * NOTHING IS WRITTEN. The branch carries only a prefix of the cause key, so
+     * two causes can collide on it; recording a merge against whichever row the
+     * planner returned first would attribute a customer's merged change to the
+     * wrong cause and re-measure the wrong project. Loud and unresolved beats
+     * quiet and wrong.
+     */
+    logger.warn(
+      { orgId: args.orgId, branch, matched: lookup.matched },
+      'two pull-request records claim one branch; neither was reconciled',
+    );
+    return {
+      outcome: 'AMBIGUOUS',
+      remeasured: false,
+      note: `${lookup.matched} pull-request records claim that branch, so QAAI changed none of them.`,
+    };
+  }
+
+  const store = pullRequestStore(prisma, {
+    /*
+     * The row's OWN branch, which is a value QAAI wrote. `pushedBranch` is only
+     * read by `loadTarget`, which neither arm below calls — but handing a store
+     * a branch taken from the payload would put attacker-influenced text one
+     * refactor away from being the branch a pull request is opened against.
+     */
+    pushedBranch: lookup.row.branch,
+  });
+  /*
+   * `userId: null` — nobody asked. The actor on this path is GitHub, and
+   * `pull_request.merged_by.login` is a GitHub login, not a QAAI user id: it is
+   * deliberately NOT carried, because a column whose siblings hold QAAI user
+   * ids would then hold two different kinds of identity and no reader could tell
+   * which one it had.
+   */
+  const audit = pullRequestAudit(prisma, { orgId: args.orgId, userId: null });
+
+  if (args.merged) {
+    const merge = await recordPullRequestMerged(
+      { store, audit, remeasure: coverageRemeasure() },
+      { orgId: args.orgId, causeKey: lookup.row.causeKey, mergedBy: null },
+    );
+    // Two facts, two fields, carried through rather than folded: the state was
+    // recorded and the number may or may not have been re-measured.
+    return { outcome: merge.outcome, remeasured: merge.remeasured, note: merge.note };
+  }
+
+  const closed = await recordPullRequestClosed(
+    { store, audit },
+    { orgId: args.orgId, causeKey: lookup.row.causeKey, closedBy: null },
+  );
+  return { outcome: closed.outcome, remeasured: false, note: closed.note };
+}
 
 webhooksRouter.post('/github', async (req, res) => {
   const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
@@ -94,12 +266,18 @@ webhooksRouter.post('/github', async (req, res) => {
   const pr = payload.pull_request;
   const repoFullName = payload.repository?.full_name;
 
-  if (!RUNNABLE_ACTIONS.has(action) || !pr || !repoFullName) {
+  if (!pr || !repoFullName) {
     res.json({ ok: true, ignored: `action ${action}` });
     return;
   }
-  if (pr.draft) {
-    res.json({ ok: true, ignored: 'draft pull request' });
+  /*
+   * `closed` joins the runnable actions as a reason to keep reading — it starts
+   * no run, and the DRAFT check below therefore moved into the run arm. A draft
+   * pull request closed without merging still has a record to reconcile, and
+   * skipping it here is how the row stayed at OPEN for ever.
+   */
+  if (!RUNNABLE_ACTIONS.has(action) && action !== CLOSED_ACTION) {
+    res.json({ ok: true, ignored: `action ${action}` });
     return;
   }
 
@@ -127,6 +305,52 @@ webhooksRouter.post('/github', async (req, res) => {
     // Not ours, or not connected. Answer 200 so GitHub does not retry forever.
     logger.info({ repoFullName, action }, 'webhook for an unconnected repository');
     res.json({ ok: true, ignored: 'repository is not connected to a project' });
+    return;
+  }
+
+  /*
+   * ── THE PULL REQUEST ENDED ────────────────────────────────────────────────
+   *
+   * Handled before the run arm because a `closed` event starts nothing: there
+   * is no environment to pick and no quota to check, only a record of ours to
+   * bring in line with what the reviewer decided. Everything runs inside the
+   * resolved org's tenant scope, so a repository can only ever reach its own
+   * rows.
+   */
+  if (action === CLOSED_ACTION) {
+    const report = await withTenant(integration.orgId, () =>
+      reconcileClosedPullRequest({
+        orgId: integration.orgId,
+        headRef: pr.head?.ref,
+        merged: pr.merged === true,
+      }),
+    );
+    logger.info(
+      {
+        repoFullName,
+        pr: pr.number,
+        orgId: integration.orgId,
+        merged: pr.merged === true,
+        outcome: report.outcome,
+        remeasured: report.remeasured,
+      },
+      'reconciled a closed pull request',
+    );
+    res.json({
+      ok: true,
+      pullRequest: {
+        outcome: report.outcome,
+        // Said out loud on every answer. A merge recorded while the coverage
+        // recompute failed must not be indistinguishable from one that ran.
+        remeasured: report.remeasured,
+        note: report.note,
+      },
+    });
+    return;
+  }
+
+  if (pr.draft) {
+    res.json({ ok: true, ignored: 'draft pull request' });
     return;
   }
 

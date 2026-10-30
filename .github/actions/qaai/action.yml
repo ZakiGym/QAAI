@@ -114,10 +114,16 @@ inputs:
     default: ${{ github.event.pull_request.number }}
   branch:
     description: >-
-      The branch this run is for. LEAVE EMPTY unless your QAAI accepts it:
-      `Run.branch` has no writer on any create path today, so the CLI sends it,
-      reads it back, finds it missing and exits 2 rather than reporting a branch
-      the run does not carry.
+      The branch this run is for, so a re-run and a PR check can find it.
+      Refused if it is a name git would read as a different ref. A QAAI older
+      than `Run.branch`'s acceptor drops it silently, so the CLI reads it back
+      off the run and exits 2 rather than reporting a branch the run does not
+      carry.
+
+      NOT DEFAULTED to the workflow's own branch on purpose: sending it to a
+      QAAI older than the acceptor makes the CLI exit 2, so a default here would
+      turn every unchanged workflow red the moment this action was updated. Set
+      it explicitly once your QAAI records it.
     required: false
   shards:
     description: >-
@@ -163,9 +169,11 @@ inputs:
   base-url:
     description: >-
       Override the environment base URL for this run only — a preview deploy's
-      address. LEAVE EMPTY unless your QAAI accepts it: `Run.baseUrlOverride`
-      has no writer on any create path today, so the CLI sends it, reads it back,
-      finds it missing and exits 2 rather than claiming a target the run never
+      address. An http(s) URL with no credentials in it; a loopback, private or
+      unreadable host is REFUSED rather than attempted, and the host is
+      classified again where the browser opens it. A QAAI older than
+      `Run.baseUrlOverride`'s acceptor drops it silently, so the CLI reads it
+      back off the run and exits 2 rather than claiming a target the run never
       used.
     required: false
   rerun-failures-of:
@@ -461,6 +469,39 @@ runs:
           out.push(`> ${selection.disclosure ?? 'This run executed a SELECTED subset.'}`, '');
         }
         for (const notice of ci.notices ?? []) out.push(`- ${notice}`);
+
+        /*
+         * WHAT THE SERVER RECORDED ABOUT WHO CHOSE THE TESTS.
+         *
+         * `ci.scope` above is the CLI's own answer, from what it ASKED for.
+         * This is `Run.selectionSource`, which the server writes from what it
+         * actually DID, and the two are worth having side by side: they
+         * disagree exactly when a CI integration is mislabelling its runs.
+         *
+         * The token is printed RAW. This script runs in the customer's CI with
+         * nothing installed but the pinned CLI, so it cannot import the
+         * vocabulary — and a prettier label written here would be a second
+         * vocabulary that can drift from the server's. `selectionSuiteWide` is
+         * the server's own derivation for the same reason.
+         *
+         * NULL IS UNKNOWN AND SAYS SO. A run written before the column existed
+         * was not necessarily a full-suite run, and printing nothing would read
+         * as "nothing to report".
+         */
+        if ('selectionSource' in payload) {
+          const source = payload.selectionSource;
+          const suiteWide = payload.selectionSuiteWide;
+          out.push(
+            source === null || source === undefined
+              ? '- the server did not record what chose these tests, so nothing here says whether this verdict is about the whole suite.'
+              : `- selection recorded by the server: \`${String(source)}\`` +
+                  (suiteWide === true
+                    ? ' — a verdict about the whole suite.'
+                    : suiteWide === false
+                      ? ' — NOT a verdict about the whole suite.'
+                      : ' — whether that is a suite-wide verdict is not something this QAAI reported.'),
+          );
+        }
 
         const suppressed = Number(ci.suppressedFailures ?? 0);
         if (suppressed > 0) {

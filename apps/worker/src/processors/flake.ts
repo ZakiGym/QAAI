@@ -108,7 +108,7 @@ import {
   proposeDeflake,
   shouldProposeHeal,
 } from '@qaai/agent';
-import type { OpenHeal, TestSurfaceReport } from '@qaai/agent';
+import type { HealVerifyState, OpenHeal, TestSurfaceReport } from '@qaai/agent';
 /*
  * One remaining relative import, and a narrower reason than the three this file
  * used to carry.
@@ -125,7 +125,27 @@ import type { SuiteHealthTestInput } from '../../../../packages/agent/src/suite-
 // argument so this file can call the same implementation POST /runs does.
 import { startRun } from '../../../api/src/lib/start-run.js';
 import { logger, prisma } from '../context.js';
-import { enqueueRun } from '../queues.js';
+import { enqueueRun, enqueueVerifyHeal } from '../queues.js';
+/*
+ * The queue-driven half of heal verification, and the reason this import exists
+ * rather than a second copy of the plumbing.
+ *
+ * `processors/verify-heal.ts` owns the START (one implementation, replacing the
+ * module-local copies this file's own sweep could not reach), the report
+ * vocabulary and `needsVerificationStart` — the predicate that finds the heal
+ * `verifyAppliedHeals` below is structurally unable to see. This file owns the
+ * WRITE. Types only from the port interfaces, plus the one predicate; nothing
+ * in verify-heal.ts imports this file back, so there is no cycle.
+ */
+import { needsVerificationStart } from './verify-heal.js';
+import type {
+  RunEnqueuer,
+  RunStarter,
+  StartRefusal,
+  VerificationRecorder,
+  VerifyHealStore,
+  VerifyLog,
+} from './verify-heal.js';
 
 /** Empty — the tick sweeps for suspects and in-flight investigations itself. */
 export interface FlakeTickJob {
@@ -671,17 +691,42 @@ export async function processFlakeTick(_job: FlakeTickJob): Promise<void> {
    * is suppressed and the next tick retries.
    *
    * WHY THEY LIVE IN THIS FILE. All three are periodic comparisons over test
-   * health that need no new queue and no new table — which is the shape this
-   * file already is (see "Where the state lives" above), and registering a new
-   * queue means editing packages/shared's QUEUE_NAMES and the worker's
-   * registry, neither of which this change owns. `driftSweep` in particular
-   * should ideally be called by processors/explore.ts the moment a crawl
-   * finishes rather than noticed afterwards; it keys off the FlowMap id so it
-   * runs exactly once per crawl either way, and moving the call there later
-   * changes nothing about the function. See the report accompanying this change.
+   * health that need no new table — which is the shape this file already is
+   * (see "Where the state lives" above). `driftSweep` in particular should
+   * ideally be called by processors/explore.ts the moment a crawl finishes
+   * rather than noticed afterwards; it keys off the FlowMap id so it runs
+   * exactly once per crawl either way, and moving the call there later changes
+   * nothing about the function.
+   *
+   * This paragraph used to end "and registering a new queue means editing
+   * packages/shared's QUEUE_NAMES and the worker's registry, neither of which
+   * this change owns". That is no longer true of the file it sits in:
+   * `startVerificationHoles` below PRODUCES to `VERIFY_HEAL_QUEUE`, declared in
+   * ../queues.ts and consumed in ../index.ts, the same way `ANALYZE_SOURCE_QUEUE`
+   * and `PREFLIGHT_QUEUE` are. Corrected rather than left, because a doc comment
+   * that contradicts the code under it is a sentence a reviewer trusts instead
+   * of testing.
    */
   await verifyAppliedHeals(now).catch((err) =>
     logger.error({ err }, 'could not advance heal verification; it will be retried next tick'),
+  );
+  /*
+   * ── AND THE HEAL THE SWEEP ABOVE IS STRUCTURALLY UNABLE TO SEE ────────────
+   *
+   * `verifyAppliedHeals` chases `verifyState: 'PENDING'`. A heal whose apply
+   * committed and whose verification start then failed — the process died
+   * between the transaction and the update, which both apply paths document as
+   * leaving the column NULL — is APPLIED in the customer's test with
+   * `verifyState: null` FOR EVER, and no query above can find it. This is the
+   * one that does. Separately `.catch()`ed, because the two sweeps answer
+   * different questions and a Redis blip in the enqueue must not cost the
+   * reader above its retry.
+   */
+  await startVerificationHoles(now).catch((err) =>
+    logger.error(
+      { err },
+      'could not sweep for applied heals with no verification; it will be retried next tick',
+    ),
   );
   await deflakeSweep(now).catch((err) =>
     logger.error({ err }, 'could not propose deflakes; it will be retried next tick'),
@@ -1641,7 +1686,20 @@ export async function verifyAppliedHeals(now: Date): Promise<void> {
   }
 }
 
-async function advanceVerification(heal: PendingVerification, now: Date): Promise<void> {
+/**
+ * Read the verifying run back and write the verdict, for ONE pending heal.
+ *
+ * NULL means NOTHING WAS WRITTEN: the run has not reached a terminal status and
+ * is still inside its deadline, which is not an outcome. It is distinct from
+ * every `VerificationWrite` — including the UNVERIFIABLE ones — because "still
+ * running" and "we could not look" are different facts about the same heal, and
+ * a caller that collapsed them would report a verification as concluded while
+ * its run was still executing.
+ */
+async function advanceVerification(
+  heal: PendingVerification,
+  now: Date,
+): Promise<VerificationWrite | null> {
   const startedAt = heal.decidedAt ?? heal.createdAt;
 
   const run = heal.verifyRunId
@@ -1665,7 +1723,7 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
    * which is the answer this feature exists to be able to give.
    */
   if (!run) {
-    await recordVerification(heal, now, {
+    return await recordVerification(heal, now, {
       state: 'UNVERIFIABLE',
       revert: false,
       passedOnRetry: false,
@@ -1673,12 +1731,12 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
         ? `The heal was applied and nobody has confirmed it works: the run that was checking it (${heal.verifyRunId}) is gone. The test has NOT been shown to pass — re-run it.`
         : 'The heal was applied and no verifying run was ever started, so nobody has confirmed it works. The test has NOT been shown to pass — re-run it.',
     });
-    return;
   }
 
   if (!TERMINAL.includes(run.status)) {
     const deadline = new Date(startedAt.getTime() + HEAL_VERIFY_DEADLINE_MINUTES * 60_000);
-    if (now <= deadline) return;
+    // Nothing written, and that is the honest answer: the run is still going.
+    if (now <= deadline) return null;
 
     // Stop the queued work too: a verification nobody is waiting on any more
     // must not execute hours later against a verdict already written.
@@ -1689,7 +1747,7 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
       })
       .catch(() => {});
 
-    await recordVerification(heal, now, {
+    return await recordVerification(heal, now, {
       state: 'UNVERIFIABLE',
       revert: false,
       passedOnRetry: false,
@@ -1698,7 +1756,6 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
         `within ${HEAL_VERIFY_DEADLINE_MINUTES} minutes and was cancelled. The test has NOT been ` +
         `shown to pass — re-run it.`,
     });
-    return;
   }
 
   const result = run.results[0] ?? null;
@@ -1710,7 +1767,52 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
     appliedVersion: heal.appliedVersion,
   });
 
-  await recordVerification(heal, now, outcome);
+  return await recordVerification(heal, now, outcome);
+}
+
+/**
+ * What {@link recordVerification} ACTUALLY DID, returned rather than only
+ * logged.
+ *
+ * ── WHY THIS IS A RETURN VALUE AND NOT A LOG LINE ──────────────────────────
+ *
+ * `reverted` was a local variable. The only assertion anywhere that a revert
+ * had happened was `processVerifyHeal`'s, against a FAKE recorder that was told
+ * what to say — so the one write in this product that CHANGES A CUSTOMER'S TEST
+ * BEHIND THEIR BACK was pinned nowhere against the code that performs it. A
+ * rollback nobody has watched is a rollback.
+ *
+ * THREE FIELDS AND NOT ONE, because `reverted: false` has three distinct
+ * causes and a caller that needed to tell them apart had to re-derive the rules:
+ *
+ *   · the decision never asked for a revert (a human approved this heal);
+ *   · it asked and the history could not support it (`revertRefusal`);
+ *   · it asked and it happened (`revertedToVersion` names the version restored,
+ *     and `appendedVersion` the NEW version row the restore was appended as —
+ *     append, never rewind).
+ *
+ * `revertedToVersion` is NULL and never 0 when nothing was restored: version 0
+ * does not exist, and a zero here would name a version to a reader with
+ * confidence.
+ */
+export interface VerificationWrite {
+  readonly state: HealVerifyState;
+  /** TRUE only when a new TestVersion carrying the previous code was written. */
+  readonly reverted: boolean;
+  /** The version whose code was restored. Null when nothing was restored. */
+  readonly revertedToVersion: number | null;
+  /** The version number the restore was APPENDED as. Null when nothing was. */
+  readonly appendedVersion: number | null;
+  /**
+   * Why a revert the decision asked for did not happen. Null when none was
+   * asked for, and null when one happened.
+   *
+   * A revert that was wanted and refused is a cap that bit: the patch is still
+   * in the customer's test, and the reason has to travel with the count.
+   */
+  readonly revertRefusal: 'NO_PREDECESSOR_VERSION' | null;
+  /** The sentence written to `verifyNote`, after any refusal was appended. */
+  readonly note: string;
 }
 
 /**
@@ -1720,15 +1822,22 @@ async function advanceVerification(heal: PendingVerification, now: Date): Promis
  * that nobody can explain; a proposal whose state flipped without the code
  * moving is a lie in the other direction. One transaction, like the quarantine
  * flip above.
+ *
+ * EXPORTED, because this is the ONE implementation of "what does a verification
+ * do to the customer's code" and `processors/verify-heal.ts` now reaches it
+ * through {@link healVerificationPorts} rather than carrying a second copy. Two
+ * implementations of that question is how a product comes to tell a customer
+ * two different answers about the same heal.
  */
-async function recordVerification(
+export async function recordVerification(
   heal: PendingVerification,
   now: Date,
   outcome: ReturnType<typeof decideVerification>,
-): Promise<void> {
+): Promise<VerificationWrite> {
   let note = outcome.note;
   let reverting = outcome.revert;
   let restored: { code: string; version: number } | null = null;
+  let revertRefusal: VerificationWrite['revertRefusal'] = null;
 
   if (reverting && heal.appliedVersion !== null) {
     const previous = await prisma.testVersion.findFirst({
@@ -1744,6 +1853,7 @@ async function recordVerification(
        * stays and the note says so, loudly, instead.
        */
       reverting = false;
+      revertRefusal = 'NO_PREDECESSOR_VERSION';
       note = `${note} In the event it could NOT be reverted: version ${heal.appliedVersion - 1} is not in this test's history. Revert it by hand.`;
     }
   }
@@ -1792,12 +1902,14 @@ async function recordVerification(
     }),
   ];
 
+  let appendedVersion: number | null = null;
   if (reverting && restored) {
     const latest = await prisma.testVersion.findFirst({
       where: { testId: heal.testId },
       orderBy: { version: 'desc' },
       select: { version: true },
     });
+    appendedVersion = (latest?.version ?? restored.version) + 1;
     writes.push(
       prisma.test.update({
         where: { id: heal.testId },
@@ -1813,7 +1925,7 @@ async function recordVerification(
           versions: {
             create: {
               orgId: heal.orgId,
-              version: (latest?.version ?? restored.version) + 1,
+              version: appendedVersion,
               code: restored.code,
               source: 'HEALER',
               message: `Reverted an auto-applied heal that failed verification, back to version ${restored.version}. ${note}`.slice(
@@ -1835,9 +1947,294 @@ async function recordVerification(
       testId: heal.testId,
       verifyState: outcome.state,
       reverted: reverting,
+      /*
+       * The two numbers, as FIELDS. "Reverted" alone cannot answer "to what",
+       * which is the first question asked when somebody notices their test
+       * changed — and `appendedVersion` is the proof that the restore was
+       * APPENDED rather than rewinding the history.
+       */
+      revertedToVersion: restored?.version ?? null,
+      appendedVersion,
+      revertRefusal,
     },
     'heal verification recorded',
   );
+
+  return {
+    state: outcome.state,
+    reverted: reverting,
+    revertedToVersion: restored?.version ?? null,
+    appendedVersion,
+    revertRefusal,
+    note,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The heal nothing would ever have checked, and the ports the queue reaches
+// this file's write through.
+//
+// `verifyAppliedHeals` above scans `where: { verifyState: 'PENDING' }`. Both
+// apply paths document that a crash between the code transaction and the
+// verification start leaves the column NULL — honest about what happened, and
+// it means the patch is in the customer's test with NOTHING that will ever
+// re-measure it, INVISIBLE to the one sweep that looks. `needsVerificationStart`
+// (processors/verify-heal.ts) is the predicate that finds those rows;
+// `startVerificationHoles` is the query, and the job it enqueues is what starts
+// the run.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How far back the hole sweep looks for an applied heal with no verification
+ * state.
+ *
+ * A BOUND, and it is disclosed. There is no index on `HealProposal.decidedAt`,
+ * so this is a window over the `verifyState` index's NULL section rather than a
+ * seek — which is survivable at this cadence and is stated in the sweep's own
+ * log line rather than left for somebody to discover. A heal applied longer ago
+ * than this and never verified stays unverified: that is a gap, not a pass, and
+ * the count below says so.
+ */
+export const HEAL_VERIFY_START_LOOKBACK_DAYS = 7;
+
+/** Ceiling on one hole sweep, so one install cannot hold the tick open. */
+const HEAL_VERIFY_HOLE_SCAN_LIMIT = 50;
+
+export interface VerificationHoleSweep {
+  /** Rows the query returned inside the window. */
+  readonly scanned: number;
+  /** Jobs enqueued — one per heal, de-duplicated by the per-heal job id. */
+  readonly enqueued: number;
+  /**
+   * TRUE when {@link HEAL_VERIFY_HOLE_SCAN_LIMIT} bit, so `scanned` is a FLOOR.
+   *
+   * A cap applied without being disclosed is one of the lies this product
+   * cannot afford, and the reason reported is the one that actually bit.
+   */
+  readonly capped: boolean;
+  /** Why each row the query returned was not enqueued, counted by reason. */
+  readonly refusals: Partial<Record<StartRefusal, number>>;
+  /** Enqueues that threw. The row stays NULL and the next tick retries it. */
+  readonly failed: number;
+}
+
+/**
+ * Find the applied heals nothing is going to check, and ask for one each.
+ *
+ * It ENQUEUES rather than starting the run inline, for the reason the apply
+ * paths give for starting outside their own transaction: a start is a plan toll,
+ * a Run row and a queue write, and a tick that did fifty of those inline would
+ * hold the one lane every org's flake measurement shares. The job id is per
+ * heal, so a hole still open on the next tick collapses onto the one job
+ * instead of starting a second run for the same patch.
+ */
+export async function startVerificationHoles(now: Date): Promise<VerificationHoleSweep> {
+  const since = new Date(now.getTime() - HEAL_VERIFY_START_LOOKBACK_DAYS * 24 * 60 * 60_000);
+  const rows = await prisma.healProposal.findMany({
+    where: {
+      verifyState: null,
+      state: { in: ['APPLIED', 'AUTO_APPLIED'] },
+      decidedAt: { gte: since },
+    },
+    orderBy: { decidedAt: 'asc' },
+    take: HEAL_VERIFY_HOLE_SCAN_LIMIT + 1,
+    select: { id: true, orgId: true, state: true, verifyState: true, decidedAt: true },
+  });
+
+  const capped = rows.length > HEAL_VERIFY_HOLE_SCAN_LIMIT;
+  const scanned = capped ? HEAL_VERIFY_HOLE_SCAN_LIMIT : rows.length;
+  const refusals: Partial<Record<StartRefusal, number>> = {};
+  let enqueued = 0;
+  let failed = 0;
+
+  for (const heal of rows.slice(0, scanned)) {
+    /*
+     * The predicate and not an inline condition, so this sweep and the processor
+     * agree about what a hole IS — including the grace period, without which
+     * every heal would get a second verification started the moment it was
+     * applied, racing the apply path's own.
+     */
+    const need = needsVerificationStart(heal, now);
+    if (!need.start) {
+      refusals[need.refusal] = (refusals[need.refusal] ?? 0) + 1;
+      continue;
+    }
+    try {
+      await enqueueVerifyHeal({ orgId: heal.orgId, healId: heal.id, reason: 'SWEEP_FOUND_NO_START' });
+      enqueued += 1;
+    } catch (err) {
+      // Nothing was written, so the row stays NULL and the next tick retries.
+      // One org's Redis blip must not stop the sweep for every other org.
+      failed += 1;
+      logger.error({ err, healId: heal.id }, 'could not queue a heal verification start');
+    }
+  }
+
+  logger.info(
+    {
+      scanned,
+      enqueued,
+      capped,
+      failed,
+      refusals,
+      lookbackDays: HEAL_VERIFY_START_LOOKBACK_DAYS,
+      /*
+       * The cap AND the reason, in the same line. `scanned` is a floor when
+       * `capped` is true, and a reader who saw only the number would read a
+       * truncated sweep as a complete one.
+       */
+      cappedAt: capped ? HEAL_VERIFY_HOLE_SCAN_LIMIT : null,
+    },
+    capped
+      ? `${enqueued} applied heal(s) had no verification started; the sweep stopped at ${HEAL_VERIFY_HOLE_SCAN_LIMIT} and the rest are picked up next tick`
+      : `${enqueued} applied heal(s) had no verification started`,
+  );
+
+  return { scanned, enqueued, capped, refusals, failed };
+}
+
+/**
+ * The production ports `processVerifyHeal` runs over.
+ *
+ * ── WHY THIS LIVES HERE AND NOT IN verify-heal.ts ──────────────────────────
+ *
+ * Everything it needs is already imported by THIS file — `prisma`, `logger`,
+ * `enqueueRun`, and `startRun` from the API's lib, which is the one toll every
+ * path that creates a Run goes through. verify-heal.ts deliberately imports
+ * none of them: that is what lets its tests run with no database, no queue and
+ * no network, and adding them there would also have meant a new relative
+ * cross-workspace import.
+ *
+ * `recorder` is the load-bearing one. It is `advanceVerification` above —
+ * decide, write the state, write the audit row, append the revert, in one
+ * transaction — so the queue path and this file's own sweep share ONE
+ * implementation of "what does a verification mean and what does it do to the
+ * customer's code". Two implementations of that is how a product tells a
+ * customer two different answers about the same heal.
+ */
+export function healVerificationPorts(): {
+  store: VerifyHealStore;
+  runs: RunStarter;
+  queue: RunEnqueuer;
+  recorder: VerificationRecorder;
+  log: VerifyLog;
+} {
+  const store: VerifyHealStore = {
+    async loadHeal({ orgId, healId }) {
+      return await prisma.healProposal.findFirst({
+        where: { id: healId, orgId },
+        select: {
+          id: true,
+          orgId: true,
+          testId: true,
+          state: true,
+          verifyState: true,
+          verifyRunId: true,
+          appliedVersion: true,
+          decidedAt: true,
+          createdAt: true,
+          // The project is on the TEST, not the proposal: a verification run is
+          // a Run, and a Run needs a project. Two reads would be two chances for
+          // the test to have been deleted in between.
+          test: { select: { projectId: true } },
+        },
+      }).then((row) =>
+        row === null ? null : { ...row, projectId: row.test.projectId },
+      );
+    },
+    async lastEnvironmentFor({ orgId, testId }) {
+      // The environment the test last ran in — the one a re-run must reproduce.
+      // Same rule as the flake radar's confirmation runs above.
+      const last = await prisma.testResult.findFirst({
+        where: { testId, orgId },
+        orderBy: { createdAt: 'desc' },
+        select: { run: { select: { environmentId: true } } },
+      });
+      return last === null ? null : { environmentId: last.run.environmentId };
+    },
+    async abandonRun({ runId, reason }) {
+      await prisma.run.update({
+        where: { id: runId },
+        data: { status: 'ERRORED', finishedAt: new Date(), errorMessage: reason },
+      });
+    },
+    async recordStart({ healId, verifyRunId, verifyState, verifyNote, verifiedAt }) {
+      await prisma.healProposal.update({
+        where: { id: healId },
+        data: { verifyRunId, verifyState, verifyNote, verifiedAt },
+      });
+    },
+  };
+
+  const runs: RunStarter = {
+    async start({ orgId, projectId, environmentId, testId, triggeredBy }) {
+      /*
+       * `advisory`, because this is a background path: throwing on a plan limit
+       * would fail the job over a run we are willing to record as unchecked,
+       * and "applied, nobody checked, here is why" is a true sentence while "we
+       * could not apply your fix because of your plan" is a worse product.
+       */
+      const started = await startRun({
+        db: prisma,
+        orgId,
+        mode: 'advisory',
+        data: {
+          orgId,
+          projectId,
+          environmentId,
+          trigger: 'MANUAL',
+          triggeredBy,
+          totalCount: 1,
+          // One placeholder result: the run processor executes exactly the tests
+          // its result rows name, which is how a single-test run is expressed.
+          results: { create: [{ orgId, testId, status: 'SKIPPED' as const }] },
+        },
+      });
+      return started.created
+        ? { created: true, runId: started.run.id }
+        : { created: false, reason: started.quota.reason ?? null };
+    },
+  };
+
+  const queue: RunEnqueuer = {
+    async enqueue({ orgId, runId }) {
+      await enqueueRun({ orgId, runId }, { background: true });
+    },
+  };
+
+  const recorder: VerificationRecorder = {
+    async record(args) {
+      const write = await advanceVerification(
+        {
+          id: args.healId,
+          orgId: args.orgId,
+          testId: args.testId,
+          state: args.healState,
+          verifyRunId: args.verifyRunId,
+          appliedVersion: args.appliedVersion,
+          decidedAt: args.decidedAt,
+          createdAt: args.createdAt,
+        },
+        args.now,
+      );
+      /*
+       * NULL IS "NOTHING WAS WRITTEN", and it is reported as such rather than
+       * as a PENDING outcome: the run has not finished and is still inside its
+       * deadline. `wrote: false` is what keeps the caller from logging a
+       * verification as re-measured when nothing was measured.
+       */
+      return write === null
+        ? { wrote: false, state: 'PENDING', reverted: false, revertedToVersion: null }
+        : {
+            wrote: true,
+            state: write.state,
+            reverted: write.reverted,
+            revertedToVersion: write.revertedToVersion,
+          };
+    },
+  };
+
+  return { store, runs, queue, recorder, log: logger };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

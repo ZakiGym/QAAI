@@ -151,6 +151,51 @@ export function analyzeSourceJobOptions(projectId: string): {
   };
 }
 
+/**
+ * One "re-measure this heal" job.
+ *
+ * Ids only, like every other payload (see this file's header). Nothing else is
+ * carried: the `HealProposal` row is the authority, and a job holding a copy of
+ * its state would decide against a snapshot the apply path may already have
+ * moved on from.
+ *
+ * ── WHY IT LIVES IN SHARED AND NOT IN THE WORKER ───────────────────────────
+ *
+ * It was declared in apps/worker/src/processors/verify-heal.ts, which apps/api
+ * cannot import — so the API's apply path (`POST /agent/heals/:healId/apply`)
+ * could not reach the queue at all and kept its own third copy of the start
+ * instead. Exactly the `analyzeSourceJobOptions` story above: TWO PRODUCERS OF
+ * ONE QUEUE that cannot share a definition each end up with half of one bug.
+ */
+export interface VerifyHealJob {
+  orgId: string;
+  healId: string;
+  /** Why this was asked for, for the log line and the audit metadata. */
+  reason: 'APPLY' | 'SWEEP_FOUND_NO_START' | 'OPERATOR';
+}
+
+/**
+ * BullMQ options for one heal.
+ *
+ * A PER-ENTITY JOB ID IS A REDIS KEY, so it needs BOTH `removeOnComplete` and
+ * `removeOnFail`. MEASURED, not reasoned about: with only the first, a FAILED
+ * first verification keeps the id in Redis and every later verification of that
+ * heal is silently dropped for ever while `add()` still returns the id — which
+ * here means a patch sitting in a customer's test that nothing will ever
+ * re-measure, the exact defect the queue exists to close.
+ *
+ * Here rather than in the worker for the reason `analyzeSourceJobOptions` gives:
+ * both producers must agree about de-duplication, and the one that cannot see
+ * the definition is the one that forgets a flag.
+ */
+export function verifyHealJobOptions(healId: string): {
+  jobId: string;
+  removeOnComplete: true;
+  removeOnFail: true;
+} {
+  return { jobId: `verify-heal-${healId}`, removeOnComplete: true, removeOnFail: true };
+}
+
 export interface JobPayloads {
   'qaai.explore': ExploreJob;
   'qaai.generate': GenerateJob;
@@ -162,6 +207,13 @@ export interface JobPayloads {
   'qaai.import': ImportJob;
   'qaai.schedule': ScheduleTickJob;
   'qaai.analyze-source': AnalyzeSourceJob;
+  /*
+   * Consumed by apps/worker (`VERIFY_HEAL_QUEUE` in apps/worker/src/queues.ts,
+   * registered in apps/worker/src/index.ts). Listed here so the API can produce
+   * to it — `enqueue` in apps/api/src/lib/queues.ts is keyed on this interface
+   * — which is what replaced the API's own copy of the verification start.
+   */
+  'qaai.verify-heal': VerifyHealJob;
 }
 
 export interface CreateRunRequest {

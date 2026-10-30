@@ -61,9 +61,42 @@ export function openChatCredentials(
  * Non-secret settings we keep on Integration.config. The token lives in
  * configEnc; `keyVersion` rides alongside so the master key can rotate.
  */
+/**
+ * Every `Integration.config` key the git integrations store.
+ *
+ * ── WHY ALL FOUR ARE HERE AND NOT JUST THE TWO THE PUSH NEEDS ──────────────
+ *
+ * `baseBranch` and `pullRequests` were read straight off the JSON by
+ * `pullRequestStore.loadTarget` (apps/api/src/lib/git.ts) while this function —
+ * the one named "parse the git config" — did not know they existed. Two readers
+ * of one row, and the one a developer finds by its name was the incomplete one.
+ * The failure that waits at the end of that is a key added to one reader and
+ * not the other, on the path that decides WHICH REPOSITORY a pull request is
+ * opened in.
+ */
 export interface GitIntegrationConfig {
   repo: string;
+  /**
+   * The branch QAAI PUSHES TO. Defaulted, because a push with nowhere to go is
+   * not a useful refusal.
+   */
   defaultBranch: string;
+  /**
+   * The branch a pull request is opened AGAINST — the trunk, not QAAI's own
+   * branch. NOT DEFAULTED, deliberately: `defaultBranch` falls back to
+   * `qaai/tests`, and a `baseBranch` that inherited that fallback would propose
+   * merging a heal into the test-sync branch instead of the trunk, or open a
+   * pull request from QAAI's branch into QAAI's branch. `undefined` means
+   * "nobody configured one", and the caller decides what to assume and says so.
+   */
+  baseBranch?: string;
+  /**
+   * Whether this integration may open pull requests. An EXPLICIT `true`, never
+   * "not false": a missing key is an org that configured a git integration
+   * before pull requests existed, and inheriting an outward-facing write into
+   * their repository from a default is consent this product may not assume.
+   */
+  pullRequests?: boolean;
   keyVersion?: number;
 }
 
@@ -72,6 +105,8 @@ export function parseGitConfig(config: unknown): GitIntegrationConfig {
   return {
     repo: typeof c.repo === 'string' ? c.repo : '',
     defaultBranch: typeof c.defaultBranch === 'string' ? c.defaultBranch : 'qaai/tests',
+    ...(typeof c.baseBranch === 'string' ? { baseBranch: c.baseBranch } : {}),
+    pullRequests: c.pullRequests === true,
     ...(typeof c.keyVersion === 'number' ? { keyVersion: c.keyVersion } : {}),
   };
 }

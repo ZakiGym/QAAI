@@ -147,6 +147,12 @@ import type {
   PerformanceMetric,
 } from '@qaai/shared';
 import { connection, logger, prisma } from '../context.js';
+/*
+ * The finaliser's ledger read, shared rather than copied. processors/run.ts
+ * does not import this file, so there is no cycle; see the call site for why
+ * one definition matters more than a tidier home for it.
+ */
+import { suppressionTalliesFor } from './run.js';
 import { open as openSecret } from '../vault.js';
 
 // ─── Producers ───────────────────────────────────────────────────────────────
@@ -314,6 +320,14 @@ async function loadRun(orgId: string, runId: string) {
        */
       skippedCount: true,
       totalCount: true,
+      /*
+       * WHAT CHOSE THE TESTS. Without it the re-score builds a `GateInput` with
+       * no `selection` and silently reverts to the suite-wide reading the
+       * finaliser withheld — the gate would block, be re-scored, and come back
+       * claiming a suite-wide pass over an eleven-test impact selection. NULL
+       * IS UNKNOWN and is passed through as null; see gates.ts `suiteWide`.
+       */
+      selectionSource: true,
       errorMessage: true,
       gateResult: true,
       startedAt: true,
@@ -1595,7 +1609,16 @@ async function patchCoverageFor(args: {
     prisma.coverageItem.findMany({
       where: { projectId: args.projectId, retiredAt: null },
       take: RESCORE_COVERAGE_ITEMS_SCANNED + 1,
-      select: { key: true, status: true, label: true },
+      /*
+       * The waiver comes with the status, and it has to. `status` is a
+       * materialised answer the waiver door writes eagerly; the waiver row is
+       * the authority, and WAIVED is the only state that LEAVES the gate's
+       * denominator. Reading the status alone let a lapsed exclusion keep
+       * shrinking the denominator until something happened to recompute the
+       * inventory — which nothing does on a clock. `patchCoverage` demotes a
+       * lapsed one to UNCOVERED and says so in its caveats.
+       */
+      select: { key: true, status: true, label: true, waiver: { select: { expiresAt: true } } },
     }),
   ]);
 
@@ -1604,7 +1627,16 @@ async function patchCoverageFor(args: {
    * `analyzeImpact` that decides which tests to run decides which routes this
    * diff touches, so a gate and a selection can never disagree about one diff.
    */
-  const routeRows = items.slice(0, RESCORE_COVERAGE_ITEMS_SCANNED) as PatchCoverageRow[];
+  const routeRows: PatchCoverageRow[] = items
+    .slice(0, RESCORE_COVERAGE_ITEMS_SCANNED)
+    .map((row) => ({
+      key: row.key,
+      status: row.status,
+      label: row.label,
+      // `null` when there is no waiver row at all, which is a WAIVED status
+      // with nothing behind it. Distinct from undefined, which means "not read".
+      waiverExpiresAt: row.waiver?.expiresAt ?? null,
+    }));
   const analysis = analyzeImpact({
     /*
      * The inventory's routes, so a changed page NOTHING tests can still be
@@ -1696,7 +1728,15 @@ async function rescoreRunGate(args: {
       );
       return { gate: null, status: null };
     }
-    const input: GateInput = { results: results.map((r) => r.gate) };
+    const input: GateInput = {
+      results: results.map((r) => r.gate),
+      /*
+       * `Run.selectionSource`, raw. NULL IS UNKNOWN, not FULL_SUITE: gates.ts
+       * withholds the suite-wide claim on both a null and a value this build
+       * cannot name, so nothing here needs to interpret it.
+       */
+      selection: { source: run.selectionSource },
+    };
 
     input.quarantine = await quarantineHealth(
       orgId,
@@ -1775,6 +1815,34 @@ async function rescoreRunGate(args: {
      * while the gate says BLOCK would be a sixth place deciding red or green —
      * the exact defect packages/runner/src/gates.ts was written to end.
      */
+    /*
+     * ── THE LEDGER, READ HERE BECAUSE THIS IS WHERE IT EXISTS ────────────────
+     *
+     * Triage writes `SuppressionEvent` AFTER the run finalises, so the
+     * finaliser's own read (`suppressionTalliesFor`, called from
+     * processors/run.ts) runs against an empty table on every run whose
+     * failures a known issue or an ENV_ISSUE later silences. This re-score is
+     * the first moment both halves exist, which makes it the only place the
+     * subtraction can honestly happen.
+     *
+     * Without it the product shipped the WORST OF BOTH: the ledger said N
+     * failures were silenced and `Run.status` stayed FAILED, so the customer
+     * was blocked AND told the failure had been handled.
+     *
+     * ONE DEFINITION. `suppressionTalliesFor` is imported rather than
+     * re-implemented as a `groupBy`, because a `groupBy` counts ROWS where that
+     * function counts DISTINCT `sourceId`s — two surfaces would then report a
+     * different number of suppressions for one run. It also discloses its own
+     * cap, which a groupBy here would not.
+     */
+    const ledger = await suppressionTalliesFor(orgId, run.id);
+    if (ledger.capped !== null) {
+      logger.warn(
+        { runId: run.id, read: ledger.capped },
+        'the suppression ledger read hit its cap during the re-score, so this run’s subtraction is a floor and some silenced failures still gate',
+      );
+    }
+
     const outcome = runOutcome({
       counts: {
         passed: run.passedCount,
@@ -1782,9 +1850,23 @@ async function rescoreRunGate(args: {
         flaky: run.flakyCount,
         skipped: run.skippedCount,
         quarantinedFailed: run.quarantinedFailedCount,
+        /*
+         * THE CLAIM AND THE ACCOUNTING COME FROM THE SAME READ, and saying so
+         * is the point. `runOutcome` takes the smaller of this number and what
+         * the by-kind tallies add up to, so that its `claimed > accounted`
+         * shortfall can catch a caller whose counter came from somewhere else.
+         * THIS caller has no such counter — the ledger is its only evidence —
+         * so that shortfall can never fire here and this is NOT a second,
+         * independent confirmation. What still bounds it is `counts.failed`:
+         * the subtraction is clamped to the failures the run actually counted.
+         */
+        failedThenSuppressed: ledger.tallies
+          .filter((tally) => tally.kind !== 'QUARANTINE')
+          .reduce((total, tally) => total + tally.suppressed, 0),
       },
       gatePassed: decision.gate.passed,
       forcedStatus: null,
+      suppressions: ledger.tallies,
     });
 
     /*

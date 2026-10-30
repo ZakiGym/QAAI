@@ -109,6 +109,35 @@ import type { ClosureApprovalPolicy, ClosureCampaignState } from '@qaai/shared';
  */
 export { CLOSURE_APPROVAL_POLICIES, CLOSURE_CAMPAIGN_STATES } from '@qaai/shared';
 export type { ClosureApprovalPolicy, ClosureCampaignState } from '@qaai/shared';
+/*
+ * THE RETIREMENT VOCABULARY, through the package barrels.
+ *
+ * `retirementAdmissible` is the ONE admission test (a confirmed signal that may
+ * be the sole basis for a retirement), `retirementSurfaceEffect` is the ONE
+ * place that turns coverage edges into the denominator consequence, and
+ * `expiryFor` is the ONE place a review window is clamped. Re-deciding any of
+ * the three here would be a second answer to a question a customer loses a test
+ * over.
+ */
+import { retirementSurfaceEffect } from '@qaai/agent';
+import type { RetirementCoverageEdge, RetirementRefusal } from '@qaai/agent';
+import {
+  OBSOLESCENCE_MIN_CONFIRMATIONS,
+  expiryFor,
+  retirementAdmissible,
+} from '@qaai/shared';
+import type { ObsolescenceSignal, RetirementState } from '@qaai/shared';
+/*
+ * The ownership resolver, imported the way notify.ts and digest.ts import it —
+ * same function, same precedence. Three answers to "who has to decide whether
+ * this test stops existing" would be three answers, and the one on the proposal
+ * is the one somebody is held to.
+ */
+import {
+  OWNERSHIP_RULE_SELECT,
+  routeOwner,
+} from '../../../api/src/lib/ownership.js';
+import type { OwnershipRuleInput } from '../../../api/src/lib/ownership.js';
 import { config, logger, prisma } from '../context.js';
 import { enqueueExplore, enqueueGenerate } from '../queues.js';
 import { apiEnvGap, processRecomputeCoverage } from './recompute-coverage.js';
@@ -685,6 +714,15 @@ export interface TickOutcome {
   testsLinked: number;
   recrawlQueued: boolean;
   generationQueued: boolean;
+  /**
+   * `RetirementProposal` rows this tick filed, and the sweep that filed them.
+   *
+   * NULL — not a zero-filled sweep — when the sweep could not run. A zero in
+   * `created` means "we looked and proposed nothing", which is a claim about
+   * the project; a null means the question was not asked, which is a claim
+   * about us. See the catch at the call site.
+   */
+  retirements: RetirementProposalSweep | null;
   again: boolean;
   reason: string;
 }
@@ -770,7 +808,45 @@ export async function processCloseLoopTick(
     enqueue: deps.enqueueExplore ?? enqueueExplore,
   });
 
-  // ── 8. Record everything, including why it stopped ────────────────────────
+  /*
+   * ── 8. Propose retiring the tests whose pages are gone ────────────────────
+   *
+   * THE PRODUCTION CALL SITE for the retirement proposal writer, and the reason
+   * it is on this tick rather than in a sweep of its own: the loop has just
+   * re-measured coverage, and a test whose route is gone is inflating exactly
+   * the numerator it measured. Proposing its retirement here is what keeps the
+   * percentage and the suite from disagreeing.
+   *
+   * IT MUST NOT BE ABLE TO FAIL THE TICK. The measurement and the ledger
+   * reconciliation above are the valuable part — a campaign that lost them
+   * because a proposal could not be filed would stop advancing — so the error
+   * is logged and the tick continues with `retirements: null`, which is NOT the
+   * same as a sweep that proposed nothing.
+   *
+   * Before the campaign update, and wrapped. A throw here must leave the
+   * campaign advanced anyway: an un-advanced campaign is RETRIED, and a retried
+   * tick re-does every step above this one — a second recompute, a second
+   * ledger reconciliation, a second spend of the item budget.
+   *
+   * The retry does NOT duplicate proposals, and the reason is the idempotence
+   * check inside the sweep rather than anything here: a test that already has a
+   * PROPOSED, APPROVED or APPLIED proposal is skipped and counted as
+   * `alreadyProposed`. That check is a READ and not a constraint —
+   * `RetirementProposal` has no unique key on the test — so two ticks running
+   * concurrently on one project could still race. The sweep runs one campaign
+   * at a time and campaigns are armed once per project per day, which makes the
+   * window narrow rather than closed; the real fix is a partial unique index,
+   * and it is in the handover.
+   */
+  const retirements = await proposeRetirements(campaign, now).catch((err: unknown) => {
+    logger.error(
+      { err, campaignId: campaign.id, projectId: campaign.projectId },
+      'could not propose retirements this tick; no proposal was filed and no obsolescence signal was resolved',
+    );
+    return null;
+  });
+
+  // ── 9. Record everything, including why it stopped ────────────────────────
   const terminal = !decision.again;
   await prisma.closureCampaign.update({
     where: { id: campaign.id },
@@ -830,6 +906,7 @@ export async function processCloseLoopTick(
     testsLinked,
     recrawlQueued,
     generationQueued,
+    retirements,
     again: decision.again,
     reason: decision.reason,
   };
@@ -1285,6 +1362,492 @@ async function maybeRecrawl(args: {
     );
     return false;
   }
+}
+
+
+// ─── Step 9: turn confirmed obsolescence into a reviewable proposal ──────────
+
+/**
+ * How many retirement proposals one tick may file.
+ *
+ * Low on purpose, and it is a product decision rather than a query cost. "A
+ * reviewer who sees forty bogus proposals once will never read the forty-first"
+ * is the rule `OBSOLESCENCE_MIN_CONFIRMATIONS` was chosen under, and a queue of
+ * forty CORRECT proposals is just as unreadable. A project with more obsolete
+ * tests than this works through them a tick at a time, and the cap is reported
+ * as a count and a reason whenever it bites.
+ */
+export const RETIREMENT_PROPOSALS_PER_TICK = 10;
+
+/**
+ * How many unresolved signal rows one tick reads.
+ *
+ * A DISCLOSURE and not a gate, which is the opposite of the exclusion cap in
+ * processors/explore.ts, and the asymmetry is deliberate: a truncated signal
+ * list can only make a test look WEAKER than it is, so the cap biting produces
+ * a refusal rather than a proposal. Truncating a guard list is dangerous;
+ * truncating an evidence list is merely incomplete, and incomplete in the
+ * direction that keeps a test running.
+ */
+export const RETIREMENT_SIGNAL_SCAN_CAP = 1_000;
+
+/** The review window stamped on a proposal, clamped by `expiryFor` to 14 days. */
+export const RETIREMENT_REVIEW_DAYS = 7;
+
+/** The states in which a proposal already exists and a second one must not be filed. */
+export const RETIREMENT_LIVE_STATES: readonly RetirementState[] = [
+  'PROPOSED',
+  'APPROVED',
+  'APPLIED',
+];
+
+/**
+ * The refusals THIS sweep decides, as opposed to the ones it reports a zero for.
+ *
+ * Exported because it is the only thing that stops a zero in
+ * `RetirementProposalSweep.refused` meaning two different things — "evaluated,
+ * and none" versus "not evaluated here at all". Two facts in one field is a
+ * defect even when both values are correct.
+ *
+ * SUPPRESSION_REFUSED is in the list and the other two are not: this sweep DOES
+ * stamp the review window, so it can refuse on the expiry (`expiryFor` returns
+ * null rather than substituting a default). What it does not do is construct
+ * the suppression itself — that needs a human owner and happens at apply.
+ */
+export const RETIREMENT_REFUSALS_EVALUATED_IN_THE_LOOP: readonly RetirementRefusal[] = [
+  'SIGNALS_NOT_ADMISSIBLE',
+  'SUPPRESSION_REFUSED',
+];
+
+export interface RetirementProposalSweep {
+  /** Tests that arrived here with at least one CONFIRMED unresolved signal. */
+  considered: number;
+  /** `RetirementProposal` rows written. */
+  created: number;
+  /** Tests that already had a live proposal. Idempotent: nothing was written. */
+  alreadyProposed: number;
+  /** Tests already disabled — retired, or disabled by a human. Left alone. */
+  alreadyDisabled: number;
+  /**
+   * Refusals by reason, every key always present.
+   *
+   * `evaluatedHere` is what stops a zero in this record being two facts in one
+   * field. Only the reasons it names are decided by THIS sweep; the others are
+   * enforced somewhere else and a zero against them is a statement about where
+   * the gate lives, not a measurement made here:
+   *
+   *   CRAWL_DOES_NOT_SUPPORT_RETIREMENT  enforced in processors/explore.ts,
+   *     which writes NO signal from a truncated, un-adjudicated or degraded
+   *     crawl — so a test whose evidence came from one has nothing to arrive
+   *     here with.
+   *   VERDICT_NOT_OBSOLETE  same place: `obsolescenceSignalsFor` files
+   *     ROUTE_GONE only for a route absent from BOTH the crawl and the source.
+   *   SUPPRESSION_REFUSED  enforced at APPLY, in apps/api/src/routes/tests.ts,
+   *     because that is where a retirement starts suppressing anything and
+   *     where a named human is present to own it. See the note below.
+   */
+  refused: Record<RetirementRefusal, number>;
+  /** The refusals this sweep itself decides. See `refused`. */
+  evaluatedHere: readonly RetirementRefusal[];
+  /** Across every proposal written: surfaces that would go back to UNCOVERED. */
+  surfacesReturnedToUncovered: number;
+  /** Surfaces that would stay covered because another live test reaches them. */
+  surfacesStillCovered: number;
+  /** TRUE when a cap bit, so every count is a floor. */
+  capped: boolean;
+  /** The sentence an operator reads. Never only a count. */
+  disclosure: string;
+}
+
+/**
+ * File a `RetirementProposal` for every test whose obsolescence is confirmed.
+ *
+ * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────────────
+ *
+ * `RetirementProposal` HAD NO CREATOR. processors/explore.ts writes
+ * `ObsoleteTestSignal` rows on every crawl and processors/triage.ts has a sweep
+ * that EXPIRES proposals — reading a table nothing ever inserted into. So
+ * `OBSOLESCENCE_MIN_CONFIRMATIONS` guarded a threshold nothing crossed,
+ * `retirementAdmissible` was asked by nobody, and the whole feature was one
+ * writer away from existing. This is that writer.
+ *
+ * ── WHY HERE ────────────────────────────────────────────────────────────────
+ *
+ * The closure loop is the one thing in this system that already asks, on a
+ * schedule, "what is the honest state of this project's coverage?" — it
+ * re-measures, reconciles its ledger and re-crawls. A test whose page is gone
+ * is a coverage fact of exactly that kind: it inflates the numerator with cover
+ * that cannot be checked. Proposing its retirement on the same tick that
+ * measures the number is what keeps the two from disagreeing.
+ *
+ * ── WHAT THIS SWEEP MAY NOT DO ──────────────────────────────────────────────
+ *
+ * IT DOES NOT DISABLE ANYTHING. A proposal is a question put to a human with an
+ * expiry on it; `Test.disabledAt` is written only by the apply endpoint, by an
+ * ADMIN, in one transaction with the version that makes the revert exact. That
+ * separation is rule 11 in its sharpest form — a retirement disables a human's
+ * test — and it is why `applySuppression` is NOT called here: a RETIREMENT
+ * suppression needs a HUMAN-SET owner (`requiresHumanOwner`), and at propose
+ * time there is no human. Calling it here would force this sweep either to
+ * refuse every proposal on a project with no explicit assignments, or to lie
+ * about the provenance of an owner a glob picked. The constructor is invoked at
+ * APPLY, where the actor is a named person and EXPLICIT_ASSIGNMENT is true.
+ *
+ * `ownerState: UNOWNED` is therefore a real and reportable answer on a
+ * proposal, exactly as the schema says: "a retirement nobody owns is a finding,
+ * and proposing it to nobody in particular is better than assigning it to
+ * whoever is listed first".
+ *
+ * NO MODEL. The admission is a count against a threshold, the denominator
+ * effect is set arithmetic, and the reason sentence is composed from QAAI's own
+ * records — the signal KINDS and their counts, never the test's name or the
+ * route text the application supplied.
+ */
+export async function proposeRetirements(
+  campaign: Pick<CampaignRow, 'id' | 'orgId' | 'projectId'>,
+  now: Date,
+): Promise<RetirementProposalSweep> {
+  const refused: Record<RetirementRefusal, number> = {
+    VERDICT_NOT_OBSOLETE: 0,
+    CRAWL_DOES_NOT_SUPPORT_RETIREMENT: 0,
+    SIGNALS_NOT_ADMISSIBLE: 0,
+    SUPPRESSION_REFUSED: 0,
+  };
+  const empty = (disclosure: string, capped = false): RetirementProposalSweep => ({
+    considered: 0,
+    created: 0,
+    alreadyProposed: 0,
+    alreadyDisabled: 0,
+    refused,
+    evaluatedHere: RETIREMENT_REFUSALS_EVALUATED_IN_THE_LOOP,
+    surfacesReturnedToUncovered: 0,
+    surfacesStillCovered: 0,
+    capped,
+    disclosure,
+  });
+
+  const { orgId, projectId } = campaign;
+
+  /*
+   * Every UNRESOLVED signal, not only the confirmed ones.
+   *
+   * `retirementAdmissible` does its own filtering and its REASON differs
+   * between "nothing is confirmed yet" and "only weak signals are confirmed" —
+   * two findings a user will ask about, and pre-filtering here would collapse
+   * them into one. Ordered by test so a test's signals stay together across the
+   * cap; see the partial-group drop below, which is what makes that ordering
+   * load-bearing rather than cosmetic.
+   */
+  const rows = await prisma.obsoleteTestSignal.findMany({
+    where: { orgId, projectId, resolvedAt: null },
+    orderBy: [{ testId: 'asc' }, { kind: 'asc' }, { reference: 'asc' }],
+    take: RETIREMENT_SIGNAL_SCAN_CAP + 1,
+    select: { id: true, testId: true, kind: true, reference: true, confirmations: true },
+  });
+  const signalsCapped = rows.length > RETIREMENT_SIGNAL_SCAN_CAP;
+  let scanned = rows.slice(0, RETIREMENT_SIGNAL_SCAN_CAP);
+  if (signalsCapped) {
+    /*
+     * DROP THE LAST TEST'S PARTIAL GROUP. Past the cap a test's signal list is
+     * a PAGE of its evidence, and a page is exactly how a test with a confirmed
+     * ROUTE_GONE comes to look like a test with only a LOCATOR_GONE. The
+     * refusal would be in the safe direction, but it would be a refusal with a
+     * wrong reason attached — and "only weak signals" is a sentence a customer
+     * would act on.
+     */
+    const lastTestId = scanned[scanned.length - 1]?.testId;
+    scanned = scanned.filter((row) => row.testId !== lastTestId);
+  }
+
+  const byTest = new Map<string, typeof scanned>();
+  for (const row of scanned) {
+    const list = byTest.get(row.testId) ?? [];
+    list.push(row);
+    byTest.set(row.testId, list);
+  }
+  if (byTest.size === 0) {
+    return empty(
+      'No unresolved obsolescence signal exists for this project, so no retirement was proposed. That is not a claim that every test is current — it is what the crawls have recorded.',
+      signalsCapped,
+    );
+  }
+
+  const testIds = [...byTest.keys()].sort();
+  const [tests, live, rules] = await Promise.all([
+    prisma.test.findMany({
+      where: { orgId, projectId, id: { in: testIds } },
+      select: {
+        id: true,
+        name: true,
+        filePath: true,
+        suiteId: true,
+        feature: true,
+        disabledAt: true,
+      },
+    }),
+    /*
+     * The idempotence check. NOT a constraint, and that is stated rather than
+     * implied: `RetirementProposal` has no unique key on the test, so two ticks
+     * racing on one project could file two proposals for one test. The sweep is
+     * armed once per project per day and runs one campaign at a time, so the
+     * race is narrow — but the right fix is a partial unique index on
+     * `(testId)` restricted to the pending states, which is a migration this
+     * round does not own. It is in the handover.
+     */
+    prisma.retirementProposal.findMany({
+      where: { orgId, projectId, testId: { in: testIds }, state: { in: [...RETIREMENT_LIVE_STATES] } },
+      select: { testId: true },
+    }),
+    prisma.ownershipRule.findMany({
+      where: { orgId, projectId },
+      orderBy: [{ position: 'asc' }, { createdAt: 'asc' }],
+      take: 500,
+      select: OWNERSHIP_RULE_SELECT,
+    }) as Promise<OwnershipRuleInput[]>,
+  ]);
+
+  const testById = new Map(tests.map((test) => [test.id, test]));
+  const hasLiveProposal = new Set(live.map((row) => row.testId));
+
+  /*
+   * EVERY LIVE EDGE ON EVERY ITEM THESE TESTS TOUCH, in two reads, because the
+   * question is not "what does this test cover" but "what would be left
+   * covering it". The first read finds the items; the second finds every other
+   * test on those items, with `Test.disabledAt` so a disabled test cannot be
+   * counted as somebody else's cover — see `retirementSurfaceEffect`.
+   */
+  const ownEdges = await prisma.testCoverageEdge.findMany({
+    where: { orgId, projectId, testId: { in: testIds }, retiredAt: null },
+    take: RETIREMENT_SIGNAL_SCAN_CAP + 1,
+    select: { itemId: true, testId: true },
+  });
+  const edgesCapped = ownEdges.length > RETIREMENT_SIGNAL_SCAN_CAP;
+  const own = ownEdges.slice(0, RETIREMENT_SIGNAL_SCAN_CAP);
+  const itemIds = [...new Set(own.map((edge) => edge.itemId))].sort();
+  const siblingEdges =
+    itemIds.length === 0
+      ? []
+      : await prisma.testCoverageEdge.findMany({
+          where: { orgId, projectId, itemId: { in: itemIds }, retiredAt: null },
+          take: RETIREMENT_SIGNAL_SCAN_CAP + 1,
+          select: { itemId: true, testId: true, test: { select: { disabledAt: true } } },
+        });
+  const siblingsCapped = siblingEdges.length > RETIREMENT_SIGNAL_SCAN_CAP;
+  const edges: RetirementCoverageEdge[] = siblingEdges
+    .slice(0, RETIREMENT_SIGNAL_SCAN_CAP)
+    .map((edge) => ({
+      itemId: edge.itemId,
+      testId: edge.testId,
+      testDisabled: edge.test?.disabledAt != null,
+    }));
+
+  /*
+   * ── THE EDGE CAP IS A GATE, NOT A DISCLOSURE ──────────────────────────────
+   *
+   * The opposite of the signal cap above, and the asymmetry is the direction of
+   * the error. A truncated SIGNAL list can only make a test look weaker, so the
+   * cap produces a refusal and the test keeps running. A truncated EDGE list
+   * makes `covers` SMALLER, so `surfacesReturnedToUncovered` understates how
+   * much coverage the retirement removes — and that number is STORED on the
+   * proposal, with `denominatorNote` composed from it, so the row would tell a
+   * reviewer "this returns 1 surface to UNCOVERED" about a retirement that
+   * returns forty. A coverage cost reported lower than it is, is the flattering
+   * lie this whole feature is arranged against, and a `capped: true` beside it
+   * does not fix it: the sentence on the row is what somebody approves.
+   *
+   * So nothing is proposed, and the reason is the one that actually bit.
+   */
+  if (edgesCapped || siblingsCapped) {
+    return empty(
+      `No retirement was proposed: more than ${RETIREMENT_SIGNAL_SCAN_CAP} live coverage edges touch ` +
+        'the candidate tests, so the number of surfaces a retirement would return to UNCOVERED ' +
+        'could not be computed in full. That number is stored on the proposal and is what a ' +
+        'reviewer approves, and one computed from a page of the edges would understate the ' +
+        'coverage it costs.',
+      true,
+    );
+  }
+
+  let considered = 0;
+  let created = 0;
+  let alreadyProposed = 0;
+  let alreadyDisabled = 0;
+  let returned = 0;
+  let stillCovered = 0;
+  let proposalCapped = false;
+
+  for (const testId of testIds) {
+    const test = testById.get(testId);
+    // A signal whose test has been deleted under us. Nothing to propose, and
+    // the row will go when the cascade catches up.
+    if (!test) continue;
+    if (test.disabledAt !== null) {
+      alreadyDisabled += 1;
+      continue;
+    }
+    if (hasLiveProposal.has(testId)) {
+      alreadyProposed += 1;
+      continue;
+    }
+
+    const signals: ObsolescenceSignal[] = (byTest.get(testId) ?? []).map((row) => ({
+      kind: row.kind,
+      reference: row.reference,
+      confirmations: row.confirmations,
+    }));
+    considered += 1;
+
+    /*
+     * THE ONE ADMISSION TEST, asked and not re-implemented.
+     *
+     * It returns a REASON and not a boolean, and the reason is the product:
+     * LOCATOR_GONE and ROUTE_UNREACHABLE are `soleBasisForRetirement: false`
+     * because both are also exactly what an unauthenticated or interrupted
+     * crawl produces, so a test with nothing but those is a FINDING ("this test
+     * may be stale") and never a proposal. Collapsing the two is how a test
+     * that was merely unreached gets retired, which is the one mistake here
+     * that re-crawling cannot undo.
+     */
+    const admission = retirementAdmissible(signals);
+    if (!admission.admissible) {
+      refused.SIGNALS_NOT_ADMISSIBLE += 1;
+      continue;
+    }
+
+    if (created >= RETIREMENT_PROPOSALS_PER_TICK) {
+      proposalCapped = true;
+      break;
+    }
+
+    /*
+     * THE DENOMINATOR CONSEQUENCE, COMPUTED BY THE ONE FUNCTION ALLOWED TO.
+     *
+     * `retirementSurfaceEffect` (@qaai/agent) turns the edges into the
+     * `covers` / `alsoCoveredElsewhere` pair and asks
+     * `retirementDenominatorEffect` what that does to the measurement. It is
+     * not re-derived here, and the DISCLOSURE SENTENCE it returns is stored
+     * verbatim rather than re-phrased: the coverage edges it was computed from
+     * will have moved by the time a reviewer reads the row, and a sentence
+     * rewritten at read time is a sentence that can disagree with the numbers
+     * beside it.
+     */
+    const effect = retirementSurfaceEffect({ testId, edges });
+
+    const routing = routeOwner(
+      {
+        id: test.id,
+        filePath: test.filePath,
+        suiteId: test.suiteId,
+        feature: test.feature,
+      },
+      rules,
+    );
+
+    const expiresAt = expiryFor('RETIREMENT', now, RETIREMENT_REVIEW_DAYS);
+    if (expiresAt === null) {
+      /*
+       * Unreachable with a positive constant, and checked anyway: `expiryFor`
+       * REFUSES rather than substituting a default, and a proposal with no
+       * expiry is a proposal that sits in the queue for ever pretending to be a
+       * decision somebody is about to make. Counted as a suppression refusal
+       * because that is what it is.
+       */
+      refused.SUPPRESSION_REFUSED += 1;
+      continue;
+    }
+
+    /*
+     * The reason is composed from QAAI'S OWN RECORDS ONLY — the signal kinds
+     * and the confirmation threshold. The test's NAME and the route strings in
+     * `ObsoleteTestSignal.reference` are the customer's own application text
+     * and are deliberately absent: this string lands on a row a reviewer reads
+     * and an audit entry, and it must not be composable into an instruction.
+     * The same rule `proposeRetirement` states for its own reason sentence.
+     */
+    const kinds = [...new Set(signals.filter((s) => s.confirmations >= OBSOLESCENCE_MIN_CONFIRMATIONS).map((s) => s.kind))].sort();
+    const reason =
+      `Obsolete: ${kinds.join(', ')} confirmed by at least ${OBSOLESCENCE_MIN_CONFIRMATIONS} accepted crawls. ` +
+      `Retiring this test DISABLES it — the code stays in your repository and in its history. ` +
+      effect.disclosure;
+
+    await prisma.retirementProposal.create({
+      data: {
+        orgId,
+        projectId,
+        testId,
+        state: 'PROPOSED',
+        reason,
+        ownerUserId: routing.owner?.kind === 'USER' ? routing.owner.userId : null,
+        ownerTeamId: routing.owner?.kind === 'TEAM' ? routing.owner.teamId : null,
+        ownerState: routing.state,
+        ownerProvenance: routing.provenance,
+        expiresAt,
+        signalIds: (byTest.get(testId) ?? []).map((row) => row.id).sort(),
+        surfacesReturnedToUncovered: effect.surfacesReturnedToUncovered,
+        surfacesStillCovered: effect.surfacesStillCovered,
+        denominatorNote: effect.disclosure,
+        /*
+         * FALSE until the apply transaction re-opens them. This is the honesty
+         * column: an APPLIED retirement with `surfacesReopened: false` is a
+         * retirement that improved the coverage number, and writing `true` here
+         * — before anything has been re-opened — is the one value that would
+         * make that undetectable.
+         */
+        surfacesReopened: false,
+        healProposalId: null,
+      },
+    });
+
+    created += 1;
+    returned += effect.surfacesReturnedToUncovered.length;
+    stillCovered += effect.surfacesStillCovered.length;
+  }
+
+  /*
+   * The edge cap cannot reach here — it returned above — so only two remain,
+   * and the reason reported is the one that ACTUALLY bit rather than the first
+   * one in the list: the proposal cap is checked first because it is the one
+   * that changes what a reader should do next (come back on the next tick).
+   */
+  const capped = signalsCapped || proposalCapped;
+  const cappedWhy = proposalCapped
+    ? `the per-tick proposal cap of ${RETIREMENT_PROPOSALS_PER_TICK} bit`
+    : signalsCapped
+      ? `more than ${RETIREMENT_SIGNAL_SCAN_CAP} unresolved signals exist in this project`
+      : null;
+
+  const sweep: RetirementProposalSweep = {
+    considered,
+    created,
+    alreadyProposed,
+    alreadyDisabled,
+    refused,
+    evaluatedHere: RETIREMENT_REFUSALS_EVALUATED_IN_THE_LOOP,
+    surfacesReturnedToUncovered: returned,
+    surfacesStillCovered: stillCovered,
+    capped,
+    /*
+     * The refusals as loudly as the proposals. "No retirement candidates" and
+     * "nine candidates, all refused because only a locator was missing" are
+     * completely different facts about a project, and a surface that showed
+     * only the first would teach a customer that the feature does nothing.
+     */
+    disclosure:
+      `${created} retirement(s) proposed for review out of ${considered} test(s) with confirmed ` +
+      `obsolescence signals` +
+      (created > 0
+        ? `, which would return ${returned} surface(s) to UNCOVERED (${stillCovered} stay covered by another live test). The coverage percentage goes DOWN, not up.`
+        : '.') +
+      (refused.SIGNALS_NOT_ADMISSIBLE > 0
+        ? ` ${refused.SIGNALS_NOT_ADMISSIBLE} refused as SIGNALS_NOT_ADMISSIBLE — a missing locator or an unreachable route is also what an unauthenticated crawl produces.`
+        : '') +
+      (alreadyProposed > 0 ? ` ${alreadyProposed} already have a live proposal.` : '') +
+      (alreadyDisabled > 0 ? ` ${alreadyDisabled} are already disabled.` : '') +
+      (cappedWhy === null ? '' : ` A cap bit (${cappedWhy}), so every count here is a floor.`),
+  };
+
+  logger.info({ campaignId: campaign.id, projectId, ...sweep }, 'retirement proposals swept');
+  return sweep;
 }
 
 // ─── The sweep: arm what is due, advance what is running ─────────────────────

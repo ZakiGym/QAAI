@@ -84,8 +84,15 @@
 import { randomUUID } from 'node:crypto';
 import {
   applyHealDiff,
+  classifyEnvironment,
   CORRECTION_HISTORY_DAYS,
+  coverageForEnvIssueRun,
   deriveClusterVerdict,
+  ENV_CHECK_NAMES,
+  ENV_CHECK_OUTCOMES,
+  ENV_RETRY_MAX_ATTEMPTS,
+  envIssueSuppression,
+  envRetryDecision,
   failureClusterKey,
   isAutoApprovable,
   knownIssueSuppression,
@@ -98,16 +105,20 @@ import {
   summariseCorrections,
   suppressionEventsFor,
   triageFailure,
-  verificationRunTag,
 } from '@qaai/agent';
 import type {
   CorrectionRow,
+  EnvCheck,
+  EnvCheckName,
+  EnvCheckOutcome,
+  EnvironmentClassification,
   KnownIssueRow,
   OpenHeal,
   SuppressionEventWrite,
   TriageClusterContext,
 } from '@qaai/agent';
-import { isInForce } from '@qaai/shared';
+import type { OwnerProvenance, OwnerRef } from '@qaai/shared';
+import { SUPPRESSION_EXPIRY_WARNING_DAYS, isInForce } from '@qaai/shared';
 import type { FlowMap, StepResult, TestExecution, TestType, TriageJob } from '@qaai/shared';
 /*
  * The clusterer lives in the API workspace and the worker shares it rather than
@@ -136,9 +147,9 @@ import {
  * (apps/api/src/lib/start-run.ts) rather than inserting a row behind the plan's
  * back. processors/flake.ts reaches for it exactly this way.
  */
-import { startRun } from '../../../api/src/lib/start-run.js';
 import { llm, logger, prisma, publishEvent } from '../context.js';
-import { enqueueRun } from '../queues.js';
+import { healVerificationPorts } from './flake.js';
+import { startHealVerification } from './verify-heal.js';
 
 /**
  * How long a waiter will wait for the cause's owner to publish its verdict.
@@ -211,6 +222,17 @@ export const KNOWN_ISSUE_SCAN_CAP = 200;
  * it reports as `NO_JOINED_CAUSES` rather than as a silent NONE.
  */
 export const KNOWN_ISSUE_JOIN_CAP = 500;
+
+/**
+ * How many entries of `Run.preflightChecks` are read.
+ *
+ * The preflight writes one per check name plus one per required identity, so a
+ * project with many auth profiles can produce dozens. A BOUND, reported when it
+ * bites — a truncated check list that silently dropped the UNAVAILABLE one
+ * would turn a broken environment into a healthy-looking one, which is the one
+ * direction this read must never fail in.
+ */
+export const PREFLIGHT_CHECK_SCAN_CAP = 50;
 
 const DAY_MS = 86_400_000;
 
@@ -714,14 +736,32 @@ async function knownIssuesFor(args: {
  * ledger that only recorded successful suppressions would make an expired mute
  * and a mute that was never consulted the same absence of a row.
  *
- * Idempotent by construction rather than by care: `SuppressionEvent` has
+ * ONE ROW PER (run, kind, target) by construction: `SuppressionEvent` has
  * `@@unique([runId, kind, targetKey])` and `KnownIssueMatch`
  * `@@unique([knownIssueId, runId, clusterKey])`, so a redelivered triage job
- * updates the row it already wrote. The counter bump rides in the SAME
- * transaction as the match row because `KnownIssue.matchCount` is a
- * denormalised SUM of those rows: the headline is what a human reads when
- * deciding to renew, and a headline that disagrees with its own evidence is
- * worse than no headline.
+ * UPDATES the row it already wrote rather than inserting a second one. The
+ * counter bump rides in the SAME transaction as the match row because
+ * `KnownIssue.matchCount` is a denormalised SUM of those rows: the headline is
+ * what a human reads when deciding to renew, and a headline that disagrees with
+ * its own evidence is worse than no headline.
+ *
+ * ── WHAT THIS IS *NOT*, AND IT WAS CLAIMED TO BE ───────────────────────────
+ *
+ * It is NOT idempotent in the COUNTS. This comment used to say a redelivery's
+ * increment "is a no-op where it would otherwise lie", and that is only true of
+ * a path that suppressed nothing. Driving one suppressed result through
+ * `processTriage` TWICE was measured and gives `SuppressionEvent.suppressed: 2`,
+ * `KnownIssue.matchCount: 2`, `RunFailureCluster.members: 2` and
+ * `FailureSignature.suppressedCount: 2` for ONE failure.
+ *
+ * The cause is not here: it is that a suppressed path mints no `TriageVerdict`,
+ * and that row is the only per-result marker the processor's idempotence check
+ * reads. Every no-verdict branch — both mutes and the ENV_ISSUE branch — shares
+ * it. Fixing it needs a durable per-result fact (a `TestResult.suppressedAt`
+ * column, consulted beside the verdict in that skip); it cannot be fixed by
+ * making this function more careful, and a doubled count is exactly as
+ * dishonest as a missing one. Recorded here rather than left as a sentence that
+ * reads true.
  */
 async function recordSuppressionLedger(args: {
   orgId: string;
@@ -736,11 +776,15 @@ async function recordSuppressionLedger(args: {
       where: { runId_kind_targetKey: { runId, kind: event.kind, targetKey: event.targetKey } },
       create: row,
       /*
-       * `increment`, not `set`. A second cause under one key in one run is
-       * impossible (the key IS the cause), but a redelivery that already wrote
-       * the row must not double the count either — and `suppressed` is 0 on
-       * every redelivery of a path that suppressed nothing, so the increment is
-       * a no-op where it would otherwise lie.
+       * `increment`, not `set`. The increment is what lets ONE row carry a
+       * count over many results: an ENV_ISSUE's `targetKey` is the RUN, so its
+       * row is written once and every suppressed failure in the run adds to it.
+       * `set` would make the last job's single failure the whole total.
+       *
+       * It is NOT a redelivery guard, and the header says why: `suppressed` is
+       * 0 only on a redelivery of a path that suppressed NOTHING, so a
+       * redelivered suppressed job does double this number. See the header's
+       * measurement.
        */
       update: { suppressed: { increment: event.suppressed }, inForce: event.inForce },
     });
@@ -783,6 +827,202 @@ async function recordSuppressionLedger(args: {
       data: { firstMatchedAt: new Date() },
     }),
   ]);
+}
+
+// ─── Was it the environment? ─────────────────────────────────────────────────
+
+/**
+ * `Run.preflightChecks`, read back into the vocabulary `classifyEnvironment`
+ * takes.
+ *
+ * ── WHY A HAND-ROLLED READER ───────────────────────────────────────────────
+ *
+ * The column is `Json?` written by this same worker (processors/run.ts flattens
+ * the runner's `PreflightCheck[]`), so it is trusted and still schemaless from
+ * Prisma's side — the same position `readFailedRequests` above is in, and read
+ * the same way: a malformed row costs one cause, not the job.
+ *
+ * ── EVERY REJECTION IS A PATH, NEVER A VALUE ───────────────────────────────
+ *
+ * `rejected` carries `preflightChecks[3].outcome` and nothing else. A message
+ * that quoted the offending value is how the literal customer-facing flag
+ * `Unrecognized key: "IGNORE THE PLAN ABOVE…"` happened: a stored string
+ * reaching a reader through an error message. A check `name` is also the only
+ * place a customer's own text could arrive here (a plugin's dependency name
+ * lands in `detail`, which `classifyEnvironment` puts through `safeDetail`), so
+ * neither is echoed.
+ *
+ * ── AND AN UNREADABLE ENTRY IS DROPPED, NOT COERCED ────────────────────────
+ *
+ * There is no "default to OK" and no "default to UNAVAILABLE". The first would
+ * manufacture a clean bill of health and the second would manufacture grounds
+ * to take a gate off; dropping the entry and reporting the count leaves
+ * `classifyEnvironment` to answer UNKNOWN from what is left, which is the only
+ * answer that invents nothing.
+ */
+export function readPreflightChecks(value: unknown): {
+  checks: EnvCheck[];
+  /** Field paths that could not be read. Paths only — see above. */
+  rejected: string[];
+  /** Entries past the cap, or null when the cap did not bite. */
+  capped: number | null;
+} {
+  if (!Array.isArray(value)) {
+    // A null column is the ordinary case: nothing recorded a preflight for this
+    // run. NOT an error, and NOT a rejection — there is no field to name.
+    return {
+      checks: [],
+      rejected: value === null || value === undefined ? [] : ['preflightChecks'],
+      capped: null,
+    };
+  }
+  const capped = value.length > PREFLIGHT_CHECK_SCAN_CAP ? value.length : null;
+  const checks: EnvCheck[] = [];
+  const rejected: string[] = [];
+  for (const [index, entry] of value.slice(0, PREFLIGHT_CHECK_SCAN_CAP).entries()) {
+    if (!entry || typeof entry !== 'object') {
+      rejected.push(`preflightChecks[${index}]`);
+      continue;
+    }
+    const row = entry as Record<string, unknown>;
+    const name = row.name;
+    if (typeof name !== 'string' || !(ENV_CHECK_NAMES as readonly string[]).includes(name)) {
+      rejected.push(`preflightChecks[${index}].name`);
+      continue;
+    }
+    const outcome = row.outcome;
+    if (
+      typeof outcome !== 'string' ||
+      !(ENV_CHECK_OUTCOMES as readonly string[]).includes(outcome)
+    ) {
+      rejected.push(`preflightChecks[${index}].outcome`);
+      continue;
+    }
+    checks.push({
+      name: name as EnvCheckName,
+      outcome: outcome as EnvCheckOutcome,
+      /*
+       * A missing detail becomes our own sentence rather than an empty string.
+       * `safeDetail` will see whatever is here, so this is not the guard — it is
+       * the difference between a reader seeing "the preflight recorded no
+       * detail" and a reader seeing a blank where a reason should be.
+       */
+      detail:
+        typeof row.detail === 'string' && row.detail.length > 0
+          ? row.detail
+          : 'the preflight recorded no detail for this check',
+    });
+  }
+  return { checks, rejected, capped };
+}
+
+/**
+ * The environment's verdict for this run, and the owner an ENV_ISSUE can name.
+ *
+ * ── THE OWNER, AND WHY IT IS THIS ONE ──────────────────────────────────────
+ *
+ * `Run.triggeredBy`, and only when it names a row in `User`. That column also
+ * holds TAGS — `github-app:rerun`, the heal-verification tag — so writing it
+ * into `SuppressionEvent.ownerUserId` unchecked would put a fabricated user id
+ * in an audit column. The lookup is what makes the owner a RECORDED FACT rather
+ * than an inference from a string's shape.
+ *
+ * Provenance is `INHERITED`, which is WEAK: nobody assigned this person the
+ * environment, it is the person this run belongs to. `mayPage` is therefore
+ * false and `environmentAlert` reports the alert as delivered rather than
+ * paging — which is the designed behaviour for an owner nobody signed, not a
+ * silent downgrade.
+ *
+ * ENV_ISSUE is the one kind whose rule says it needs no human owner
+ * (`SUPPRESSION_KIND_RULES.ENV_ISSUE.requiresHumanOwner` is false), so a null
+ * here SHOULD still suppress — and today it does not, because
+ * `applySuppression` refuses `owner === null` before it consults the kind's
+ * rule. That refusal is carried through honestly rather than worked around: see
+ * the ENV_ISSUE branch in `processTriage`, which leaves such a failure RED. A
+ * failure silenced on a path whose suppression was refused would be a failure
+ * suppressed without being counted.
+ */
+async function environmentFor(args: { orgId: string; runId: string }): Promise<{
+  classification: EnvironmentClassification;
+  owner: OwnerRef | null;
+  ownerProvenance: OwnerProvenance;
+  rejected: string[];
+  capped: number | null;
+  /** True when the run recorded no preflight at all. */
+  unrecorded: boolean;
+}> {
+  const run = await prisma.run.findFirst({
+    where: { id: args.runId, orgId: args.orgId },
+    select: { preflightChecks: true, triggeredBy: true },
+  });
+
+  const read = readPreflightChecks(run?.preflightChecks);
+  const classification = classifyEnvironment(read.checks);
+
+  const triggeredBy = run?.triggeredBy ?? null;
+  const user =
+    triggeredBy === null
+      ? null
+      : await prisma.user.findUnique({ where: { id: triggeredBy }, select: { id: true } });
+
+  return {
+    classification,
+    owner: user ? { kind: 'USER', userId: user.id } : null,
+    ownerProvenance: user ? 'INHERITED' : 'NONE',
+    rejected: read.rejected,
+    capped: read.capped,
+    unrecorded: read.checks.length === 0 && read.rejected.length === 0,
+  };
+}
+
+/**
+ * The `SuppressionEvent` row an applied ENV_ISSUE suppression owes the ledger.
+ *
+ * COUNTED LIKE EVERY OTHER KIND, through the same `recordSuppressionLedger`
+ * upsert and the same `@@unique([runId, kind, targetKey])` claim — never a
+ * private counter. `targetKey` is the RUN, which is what makes this idempotent
+ * in its ROW COUNT across the run's other members: the row is written once and
+ * `suppressed` increments by one per failure the environment took off the gate,
+ * so the ledger's total is the number "N failures by 1 environment failure"
+ * reports.
+ *
+ * `owner` is NON-NULLABLE on this type and on `Suppression`, which is the
+ * constraint rather than a hope: `applySuppression` refuses a null owner before
+ * it builds one, so a decision that came back applied has an owner and the
+ * compiler already knows it. No assertion is needed at the call site, and one
+ * would have been a reviewer's cue to check something the type system had
+ * already settled.
+ */
+function envIssueEventRow(args: {
+  projectId: string;
+  runId: string;
+  reason: string;
+  owner: OwnerRef;
+  ownerProvenance: OwnerProvenance;
+  expiresAt: Date;
+  failures: number;
+}): SuppressionEventWrite {
+  return {
+    projectId: args.projectId,
+    runId: args.runId,
+    kind: 'ENV_ISSUE',
+    targetScope: 'RUN',
+    targetKey: args.runId,
+    /*
+     * The RUN is also the source. The other four kinds point at a row in the
+     * table that owns them; ENV_ISSUE has no such row by design — it expires
+     * with the run rather than being a thing somebody created — so the run id
+     * is the honest answer and not a null a reader has to guess about.
+     */
+    sourceId: args.runId,
+    suppressed: args.failures,
+    inForce: true,
+    reason: args.reason,
+    owner: args.owner,
+    ownerState: 'OWNED',
+    ownerProvenance: args.ownerProvenance,
+    expiresAt: args.expiresAt,
+  };
 }
 
 /** The `SuppressionEvent` row, with the owner split into the two columns. */
@@ -1129,6 +1369,260 @@ export async function processTriage(job: TriageJob): Promise<void> {
       at: now.toISOString(),
     });
     return;
+  }
+
+  /*
+   * ── WAS IT THE ENVIRONMENT? ───────────────────────────────────────────────
+   *
+   * THE DEFECT. Triage classified a failure into four kinds and three of them
+   * went somewhere; ENV_ISSUE went nowhere. So a board red because a credential
+   * expired at 02:00 looked EXACTLY like a board red because checkout broke —
+   * same colour, same gate, same page — and a 400-failure run behind a dead base
+   * URL cost 400 strong-model triages to be told 400 times that the dependency
+   * stopped answering. `packages/agent/src/env-issue.ts` has answered all of
+   * this for a while; nothing called it, and the evidence it needs was computed
+   * by the run processor and thrown away. `Run.preflightChecks` keeps it now.
+   *
+   * ORDER, and every part of it is load-bearing:
+   *  · AFTER `claimCause`, so the occurrence is counted. A failure during a
+   *    broken environment is still a failure that happened.
+   *  · AFTER both mute branches, so a failure is never silenced TWICE. Both of
+   *    those return, so a cause a known issue already names does not also take
+   *    an ENV_ISSUE row — and "N failures suppressed" can therefore never
+   *    exceed the failures there were.
+   *  · BEFORE the attach wait and before `triageFailure`. That is where the
+   *    whole saving is: asking after the model call would spend the call and
+   *    throw the answer away.
+   *
+   * WHAT THE MODEL IS NOT ASKED. A run that never reached the application
+   * observed nothing about it, so "is this a real bug?" has no evidence behind
+   * it — the answer would be the model guessing from an error string. The
+   * deterministic path is a fold over the preflight's own checks
+   * (`classifyEnvironment`), which is why this works with no key at all.
+   *
+   * AND THE SECURITY PROPERTY IS IN THE SIGNATURE. `envIssueSuppression` takes
+   * an `EnvironmentEvidence`, which carries a private witness symbol and which
+   * only `classifyEnvironment` can mint, and only for a BROKEN verdict. There is
+   * no argument list this call site could assemble that suppresses a healthy
+   * environment's failures — not because this code declines to, but because the
+   * value it would need does not exist.
+   */
+  const environment = await environmentFor({ orgId, runId });
+  if (environment.capped !== null) {
+    logger.warn(
+      {
+        runId,
+        cap: PREFLIGHT_CHECK_SCAN_CAP,
+        recorded: environment.capped,
+        clusterKey: claimed.clusterKey,
+      },
+      'the preflight-check read hit its cap, so a check past it was not consulted; a dropped UNAVAILABLE check reads as a healthier environment than the run had',
+    );
+  }
+  if (environment.rejected.length > 0) {
+    logger.warn(
+      // PATHS, never the values. See `readPreflightChecks`.
+      { runId, rejected: environment.rejected, clusterKey: claimed.clusterKey },
+      'some preflight-check entries could not be read and were dropped rather than coerced; the environment verdict is computed from the rest',
+    );
+  }
+
+  const evidence = environment.classification.evidence;
+  if (!retriage && evidence !== null) {
+    /*
+     * `envRetryDecision` answers "could a retry have fixed this?", and triage
+     * reports it as ADVICE rather than acting on it. Two facts kept apart: the
+     * run is over by the time a failure reaches here, so the only caller that
+     * can act on a retry is the run processor. `attempt: 1` is the question
+     * being asked ("would the FIRST retry have been worth it"), and the budget
+     * and what is left of it are disclosed beside it — a retry budget that is
+     * reported without its count looks exactly like a decision not to retry.
+     */
+    const retry = envRetryDecision(environment.classification, 1);
+    const decision = envIssueSuppression({
+      evidence,
+      classification: environment.classification,
+      runId,
+      // ONE failure: this job triages one result, exactly as the known-issue
+      // ledger above counts one. The ledger's `suppressed` therefore sums to the
+      // number of failing results the environment silenced in this run.
+      failures: 1,
+      owner: environment.owner,
+      ownerProvenance: environment.ownerProvenance,
+      now,
+    });
+
+    /*
+     * `EnvIssueSuppressed.decision` is typed as the whole `SuppressionDecision`
+     * union, so the applied arm has to be narrowed here rather than asserted.
+     * Narrowed and not cast: if the two ever disagree — `suppressed: true` with
+     * a refusal inside it — this falls through to the refusal path below and
+     * silences nothing, which is the safe direction. A cast would have silenced
+     * a failure with no ledger row behind it.
+     */
+    const applied =
+      decision.suppressed && decision.decision.applied ? decision.decision.suppression : null;
+    if (decision.suppressed && applied) {
+      /*
+       * The coverage number for a run that measured NOTHING. NULL, never 0 — a
+       * 0% would be a cliff a team would go looking for deleted tests over, and
+       * it would be a measurement nobody took. Published rather than only
+       * logged, because the surface that writes a coverage snapshot is the one
+       * that has to not write a zero.
+       */
+      const coverage = coverageForEnvIssueRun(evidence);
+
+      /*
+       * The SAME two writes as both mute branches, and the SAME ledger upsert as
+       * the known-issue path. The occurrence is already counted, the claim is
+       * marked suppressed so later members skip the bounded owner wait, and NO
+       * verdict row is minted — which is what makes it stop paging, since
+       * /badges, the digest and the gate all read verdict rows.
+       */
+      await recordSuppressionLedger({
+        orgId,
+        runId,
+        ledger: {
+          match: null,
+          events: [
+            envIssueEventRow({
+              projectId: result.test.projectId,
+              runId,
+              reason: applied.reason,
+              owner: applied.owner,
+              ownerProvenance: applied.ownerProvenance,
+              expiresAt: applied.expiresAt,
+              failures: decision.failures,
+            }),
+          ],
+        },
+      });
+
+      await prisma.$transaction([
+        prisma.failureSignature.update({
+          where: { id: claimed.signatureId },
+          data: { suppressedCount: { increment: 1 } },
+        }),
+        prisma.runFailureCluster.update({
+          where: { id: claimed.claimId },
+          data: { suppressed: true },
+        }),
+      ]);
+
+      logger.warn(
+        {
+          testResultId,
+          clusterKey: claimed.clusterKey,
+          failedChecks: decision.alert.failedChecks,
+          mayPage: decision.alert.mayPage,
+          denominator: decision.denominator,
+          coveragePercent: coverage.percent,
+          retryWouldHelp: retry.retry,
+          retryAttemptsRemaining: retry.attemptsRemaining,
+          retryBudget: ENV_RETRY_MAX_ATTEMPTS,
+        },
+        'the environment failed, so this run observed nothing about the application; no verdict and no heal were bought and the failure does not gate',
+      );
+
+      publishEvent(orgId, {
+        runId,
+        type: 'verdict.suppressed',
+        data: {
+          testResultId: result.id,
+          testName: result.test.name,
+          clusterKey: claimed.clusterKey,
+          label: claimed.label,
+          kind: 'ENV_ISSUE',
+          /*
+           * `subject`, `failedChecks` and `evidence` are composed from QAAI's
+           * own records: the run id and check names from a closed vocabulary,
+           * and details `safeDetail` has already refused if they named a
+           * location or a credential.
+           */
+          alert: {
+            subject: decision.alert.subject,
+            failedChecks: decision.alert.failedChecks,
+            evidence: decision.alert.evidence,
+            mayPage: decision.alert.mayPage,
+            body: decision.alert.body,
+          },
+          disclosure: `${decision.disclosure} ${environment.classification.disclosure}`,
+          /*
+           * UNAVAILABLE, not 0. The field is `null` and the reason says why, so
+           * a consumer cannot read the absence as a drop.
+           */
+          coveragePercent: coverage.percent,
+          coverageReason: coverage.reason,
+          denominator: decision.denominator,
+          /*
+           * The retry decision, with the cap disclosed and `actedOn` saying
+           * plainly that nothing here retried. A `wouldHelp: true` printed
+           * without it would read as "a retry is happening".
+           */
+          retry: {
+            wouldHelp: retry.retry,
+            actedOn: false,
+            attemptsRemaining: retry.attemptsRemaining,
+            budget: ENV_RETRY_MAX_ATTEMPTS,
+            reason: retry.reason,
+          },
+        },
+        at: now.toISOString(),
+      });
+      return;
+    }
+
+    /*
+     * REFUSED, AND THE FAILURE STAYS RED. The common refusal today is
+     * `SUPPRESSION_REFUSED` at path `owner`: `applySuppression` rejects a null
+     * owner before it consults `SUPPRESSION_KIND_RULES.ENV_ISSUE`, whose
+     * `requiresHumanOwner: false` says this kind needs none. So a CI run with no
+     * user behind it gets no suppression even though the environment was
+     * measured broken.
+     *
+     * Nothing is silenced on this path and nothing is skipped — the failure is
+     * triaged exactly as it was before this branch existed. That is deliberate:
+     * suppressing a failure whose suppression was refused would be a failure
+     * silenced without a counted row behind it, which is the one lie this file
+     * is full of comments about. The PATH is logged and never the value.
+     */
+    logger.warn(
+      {
+        testResultId,
+        runId,
+        clusterKey: claimed.clusterKey,
+        /*
+         * The closed refusal vocabulary and the PATH of the offending field.
+         * Never a message: a zod message quotes the value it refused, and a
+         * refusal that quoted a stored string is how one came to be printed to
+         * a customer. The `CONTRADICTORY_DECISION` arm is the impossible one
+         * named rather than left as an undefined: `suppressed: true` with a
+         * refusal inside it is a defect in the module, and a log line that said
+         * nothing would make it look like an ordinary refusal.
+         */
+        refusal: decision.suppressed ? 'CONTRADICTORY_DECISION' : decision.refusal,
+        path: decision.suppressed ? 'decision.applied' : decision.path,
+        ownerProvenance: environment.ownerProvenance,
+      },
+      'the environment was measured broken and the suppression was refused, so this failure still gates and is triaged normally',
+    );
+  } else if (!retriage && !environment.unrecorded) {
+    /*
+     * HEALTHY or UNKNOWN. Logged at debug because it is the ordinary case, and
+     * logged at all because "the environment was checked and was fine" and "the
+     * environment was never checked" are different facts — the second is the
+     * `unrecorded` arm, which says nothing rather than implying a clean bill of
+     * health.
+     */
+    logger.debug(
+      {
+        testResultId,
+        runId,
+        verdict: environment.classification.verdict,
+        disclosure: environment.classification.disclosure,
+      },
+      'the environment is not the reason this failed',
+    );
   }
 
   /*
@@ -2010,21 +2504,23 @@ async function proposeHealFor(
      * exist.
      */
     if (state === 'AUTO_APPLIED') {
-      const verification = await startHealVerification({
+      /*
+       * ONE IMPLEMENTATION. This was a module-local near-copy of the one in
+       * apps/api/src/routes/agent.ts, and processors/verify-heal.ts is now the
+       * only one — reached from here, from the hole sweep in
+       * processors/flake.ts, and from the queue registered in
+       * apps/worker/src/index.ts.
+       *
+       * It WRITES `verifyState`, `verifyRunId`, `verifyNote` and `verifiedAt`
+       * itself, which is why the `healProposal.update` that used to follow this
+       * call is gone: two writers of those four columns is how `verifiedAt`
+       * came to be stamped on one path and not the other.
+       */
+      const verification = await startHealVerification(healVerificationPorts(), {
         orgId,
         healId,
         testId: test.id,
         projectId: test.projectId,
-      });
-      await prisma.healProposal.update({
-        where: { id: healId },
-        data: {
-          verifyState: verification.state,
-          verifyRunId: verification.runId,
-          verifyNote: verification.note,
-          // Only an outcome stamps this. PENDING is not an outcome.
-          verifiedAt: verification.state === 'UNVERIFIABLE' ? new Date() : null,
-        },
       });
       logger.info(
         {
@@ -2126,111 +2622,6 @@ async function openHealsFor(orgId: string, testId: string): Promise<OpenHealRow[
   }));
 }
 
-/**
- * Start the run that checks an unattended heal, and say honestly when none
- * could be started.
- *
- * A near-copy of `startHealVerification` in apps/api/src/routes/agent.ts, which
- * is a module-local function in a route file this workspace must not import —
- * see `needsFromOtherFiles` for the promotion that would collapse the two. The
- * RULES it depends on are already shared (`verificationRunTag`,
- * `decideVerification` in packages/agent/src/healer.ts), so the two copies
- * cannot come to different conclusions about what a verification MEANS; what is
- * duplicated is the plumbing.
- *
- * Every arm that cannot run the test returns UNVERIFIABLE, never PENDING: the
- * sweep chases PENDING rows forever, so a row that nothing is going to check
- * must not claim to be waiting. And never VERIFIED — "we could not look" and
- * "it works" are the two facts this whole path exists to keep apart.
- */
-async function startHealVerification(args: {
-  orgId: string;
-  healId: string;
-  testId: string;
-  projectId: string;
-}): Promise<{ runId: string | null; state: 'PENDING' | 'UNVERIFIABLE'; note: string }> {
-  // The environment the test last ran in — the one a re-run must reproduce.
-  // Same rule as the flake radar's confirmation runs (`lastEnvironmentFor`).
-  const last = await prisma.testResult.findFirst({
-    where: { testId: args.testId, orgId: args.orgId },
-    orderBy: { createdAt: 'desc' },
-    select: { run: { select: { environmentId: true } } },
-  });
-  const environmentId = last?.run.environmentId;
-  if (!environmentId) {
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: 'The heal was applied and nobody has checked it: this test has never run, so there is no environment to re-run it in. Run it yourself to find out whether the fix works.',
-    };
-  }
-
-  /*
-   * `advisory`, because this is a background path: throwing on a plan limit
-   * would fail the triage job — and with it the verdict, which is the valuable
-   * part — over a run we are willing to record as unchecked.
-   */
-  const started = await startRun({
-    db: prisma,
-    orgId: args.orgId,
-    mode: 'advisory',
-    data: {
-      orgId: args.orgId,
-      projectId: args.projectId,
-      environmentId,
-      trigger: 'MANUAL',
-      triggeredBy: verificationRunTag(args.healId),
-      totalCount: 1,
-      // One placeholder result: the run processor executes exactly the tests its
-      // result rows name, which is how a single-test run is expressed here.
-      results: { create: [{ orgId: args.orgId, testId: args.testId, status: 'SKIPPED' as const }] },
-    },
-  });
-
-  if (!started.created) {
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: `The heal was applied and nobody has checked it: the verifying run could not be started. ${started.quota.reason ?? 'This org is at its monthly run limit.'}`,
-    };
-  }
-
-  try {
-    await enqueueRun({ orgId: args.orgId, runId: started.run.id }, { background: true });
-  } catch (err) {
-    /*
-     * A run row with no job would sit PENDING until the sweep's deadline and
-     * then report itself unverifiable for the wrong reason. Mark it dead now and
-     * say the true one.
-     */
-    await prisma.run
-      .update({
-        where: { id: started.run.id },
-        data: {
-          status: 'ERRORED',
-          finishedAt: new Date(),
-          errorMessage: 'The heal verification run could not be queued.',
-        },
-      })
-      .catch(() => {});
-    logger.error(
-      { err, healId: args.healId, runId: started.run.id },
-      'could not queue a heal verification run',
-    );
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: 'The heal was applied and nobody has checked it: the verifying run could not be queued. Run the test yourself to find out whether the fix works.',
-    };
-  }
-
-  return {
-    runId: started.run.id,
-    state: 'PENDING',
-    note: `Applied with nobody reviewing it, and now being checked: run ${started.run.id} re-runs this test on its own. Until it lands, nobody has confirmed the fix works — and if it fails, the sweep reverts the patch.`,
-  };
-}
-
 // ─── The expiry sweep ────────────────────────────────────────────────────────
 
 /**
@@ -2251,8 +2642,15 @@ export const SUPPRESSION_SWEEP_BATCH = 500;
  * goes loud at 3am because a mute nobody remembered ran out is how a team
  * learns to set the next expiry for a year, which is how "temporary" becomes
  * permanent.
+ *
+ * THE NUMBER LIVES IN packages/shared/src/suppression.ts, as
+ * `SUPPRESSION_EXPIRY_WARNING_DAYS`, beside the comment that says why it is NOT
+ * the same window as `EXPIRING_WINDOW_DEFAULT_DAYS` in
+ * apps/api/src/routes/triage.ts. Two windows over one subject in two workspaces
+ * looked like a copy of each other; they answer different questions, and the
+ * shared constant is where that is written down rather than inferred.
  */
-export const SUPPRESSION_EXPIRY_WARNING_MS = 3 * DAY_MS;
+export const SUPPRESSION_EXPIRY_WARNING_MS = SUPPRESSION_EXPIRY_WARNING_DAYS * DAY_MS;
 
 export interface SuppressionSweepJob {
   /** Advisory only; the sweep uses its OWN clock. See `processSuppressionSweep`. */
@@ -2407,7 +2805,7 @@ export async function processSuppressionSweep(
         ownerTeamId: row.ownerTeamId,
         ownerProvenance: row.ownerProvenance,
       },
-      'a known issue has expired; it suppresses nothing from now on and the failures it was silencing are red again',
+      'a known issue has expired; it suppresses nothing from now on and the failures it was silencing are red again (the same rows, for a human, at GET /triage/known-issues/expiring)',
     );
   }
   for (const row of soon) {
@@ -2421,7 +2819,7 @@ export async function processSuppressionSweep(
         ownerTeamId: row.ownerTeamId,
         ownerProvenance: row.ownerProvenance,
       },
-      'a known issue is about to expire; the failures it silences will be red again unless somebody renews or fixes them',
+      'a known issue is about to expire; the failures it silences will be red again unless somebody renews or fixes them (the same rows, for a human, at GET /triage/known-issues/expiring)',
     );
   }
 

@@ -1397,6 +1397,14 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
       id: true,
       trigger: true,
       prNumber: true,
+      /*
+       * WHAT CHOSE THE TESTS. An enterprise's own runners finalise HERE rather
+       * than in the worker, so a fix that stopped at the worker would leave
+       * every self-hosted-pool customer as the one path where a sliver still
+       * publishes a suite-wide pass — the same reasoning the `runOutcome`
+       * comment below gives for quarantine.
+       */
+      selectionSource: true,
       project: { select: { gateRules: true } },
     },
   });
@@ -1452,6 +1460,12 @@ export async function finalizeIfComplete(orgId: string, runId: string): Promise<
           : (r.verdict?.verdict ?? null),
       durationMs: r.durationMs,
     })),
+    /*
+     * `Run.selectionSource`, raw and nullable. NULL IS UNKNOWN, not
+     * FULL_SUITE: gates.ts withholds the suite-wide claim on it rather than
+     * reading a missing column as a promise about the whole suite.
+     */
+    selection: { source: run.selectionSource },
   });
 
   /*

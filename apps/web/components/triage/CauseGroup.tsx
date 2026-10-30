@@ -312,8 +312,25 @@ function MemberRow({
         </span>
 
         {reviewed ? (
-          <span className="text-ink-faint shrink-0 font-mono text-[10.5px]">
+          /*
+           * THE STATE IS NOT THE ANSWER. `MUTED` silences nothing unless a
+           * `KnownIssue` that is IN FORCE is behind it, and this line rendered
+           * a live mute, an expired one and one with no issue at all
+           * identically — so a failure that is red again read as handled. The
+           * server sends `suppression.suppresses`, which is the only field that
+           * may be rendered as handled; `title` carries QAAI's own sentence.
+           *
+           * An ABSENT `suppression` is a server that was not asked, so the bare
+           * state is still shown rather than a claim this client cannot make.
+           */
+          <span
+            className="text-ink-faint shrink-0 font-mono text-[10.5px]"
+            title={verdict.suppression?.note ?? undefined}
+          >
             {verdict.reviewState.toLowerCase()}
+            {verdict.suppression && verdict.reviewState === 'MUTED' && !verdict.suppression.suppresses
+              ? ' · not silencing'
+              : ''}
           </span>
         ) : (
           <span className="relative flex shrink-0 items-center gap-1.5 font-mono text-[10.5px]">

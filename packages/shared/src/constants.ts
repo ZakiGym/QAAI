@@ -1166,5 +1166,24 @@ export type QueueName = (typeof QUEUE_NAMES)[keyof typeof QUEUE_NAMES];
 /** Redacted stand-in written wherever a secret would otherwise be serialised (§1). */
 export const SECRET_MASK = '••••••••';
 
+/**
+ * How many `SuppressionEvent` rows one ledger read scans.
+ *
+ * ── ONE DEFINITION, BECAUSE TWO SURFACES REPORT THE SAME TOTAL ─────────────
+ *
+ * The run finaliser (apps/worker/src/processors/run.ts) and the run read
+ * (apps/api/src/routes/runs.ts) each had their own literal at this value, and
+ * `runs.test.ts` pins the two against each other on every terminal run — so
+ * the day one of them moved, one surface would report a different number of
+ * silenced failures for one run and the test would be the only thing that knew.
+ *
+ * It is a DISCLOSURE, not a gate: both readers take `cap + 1`, report the
+ * truncation as a count AND a reason, and say the totals are a FLOOR. A cap
+ * that bit without being disclosed is one of the lies this product cannot
+ * ship — and on this surface it would be a failure suppressed without being
+ * counted.
+ */
+export const SUPPRESSION_LEDGER_SCAN_CAP = 2_000;
+
 /** Prefix on every API key so leak-scanners can pattern-match it. */
 export const API_KEY_PREFIX = 'qaai_';

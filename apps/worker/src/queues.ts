@@ -9,6 +9,7 @@ import type {
   CopilotJob,
   ExploreJob,
   GenerateJob,
+  JobPayloads,
   NotifyJob,
   ShardedRunJob,
   TriageJob,
@@ -18,6 +19,18 @@ import type {
 // duplicated instead precisely because they are not.
 import { BISECT_QUEUE, MAX_BISECT_TICKS, type BisectJob } from '../../api/src/lib/bisect.js';
 import { connection } from './context.js';
+/*
+ * The per-heal job options and the payload type, from the module that owns the
+ * decision they encode.
+ *
+ * `verifyHealJobOptions` is in processors/verify-heal.ts because the ARGUMENT
+ * for both removal flags is about that processor's entity — a heal nothing ever
+ * re-measures — and because its own test pins the exact options object. The
+ * queue NAME stays here beside its producer; the OPTIONS stay beside the
+ * reasoning. verify-heal.ts imports nothing from this file, so there is no
+ * cycle.
+ */
+import { verifyHealJobOptions, type VerifyHealJob } from './processors/verify-heal.js';
 
 /**
  * "Learn my codebase": read the stored source analysis and propose a plan.
@@ -103,6 +116,59 @@ export const PREFLIGHT_QUEUE = 'qaai.preflight';
 export const SUPPRESSION_QUEUE = 'qaai.suppression';
 
 /**
+ * "Re-measure this heal."
+ *
+ * ── WHY IT IS A QUEUE AT ALL ────────────────────────────────────────────────
+ *
+ * Because `startHealVerification` existed THREE TIMES — in
+ * apps/api/src/routes/agent.ts, in processors/triage.ts, and as the one
+ * implementation in processors/verify-heal.ts that nothing imported. Two of
+ * those copies each wrote the same four columns inline afterwards, which is how
+ * `verifiedAt` came to be stamped on one path and not the other. One queue, one
+ * consumer, one writer.
+ *
+ * And because of the heal nothing would ever have checked: both apply paths
+ * document that a crash between their code transaction and their verification
+ * start leaves `verifyState` NULL, which is honest and means the patch sits in
+ * a customer's test with nothing that will re-measure it — invisible to
+ * `verifyAppliedHeals`, whose query is `where: { verifyState: 'PENDING' }`. A
+ * job survives a worker restart; an inline call does not.
+ *
+ * NOT in `QUEUE_NAMES`, for the same reason as `ANALYZE_SOURCE_QUEUE` above and
+ * `RETENTION_QUEUE`. What the API's apply path needed was not that list but a
+ * `JobPayloads` entry — `enqueue` in apps/api/src/lib/queues.ts is keyed on
+ * that interface — and `'qaai.verify-heal': VerifyHealJob` is now in
+ * packages/shared/src/jobs.ts beside the payload and the job options. So the
+ * API produces to this queue and its third copy of the start is gone.
+ *
+ * `satisfies` is what keeps the two strings one fact: renaming the queue here
+ * without renaming the payload key, or the reverse, is a compile error rather
+ * than a producer publishing into a queue nothing drains.
+ */
+export const VERIFY_HEAL_QUEUE = 'qaai.verify-heal' satisfies keyof JobPayloads;
+
+/**
+ * "This run's mutation report named missing assertions — turn them into work."
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * The mutation plugin NAMES EACH MISSING ASSERTION: it flips `>` to `>=` on
+ * line 84 of src/cart.ts, the suite still passes, and a `MutationSurvivor` row
+ * records exactly that. `packages/agent/src/mutant-closure.ts` turns those rows
+ * into ranked, de-duplicated, fenced work — and had NO PRODUCTION CALLER, so
+ * the most precise instruction this product ever generates went into a table,
+ * scored a percentage, and stopped.
+ *
+ * Per RUN and not per result: a mutation report is per test result, but the
+ * thing a developer fixes is "nothing asserts the boundary in cart.ts", which
+ * spans results. One job per run also means the grouping sees the whole report
+ * rather than a slice of it, which is what makes the de-duplication honest.
+ *
+ * NOT in `QUEUE_NAMES`, for the same reason as `VERIFY_HEAL_QUEUE` above.
+ */
+export const MUTANT_CLOSURE_QUEUE = 'qaai.mutant-closure';
+
+/**
  * One capability probe.
  *
  * `deploymentKey` carries the sentinel `<self>` for this image and
@@ -127,6 +193,8 @@ export interface PreflightJob {
 const generateQueue = new Queue(QUEUE_NAMES.generate, { connection });
 const preflightQueue = new Queue(PREFLIGHT_QUEUE, { connection });
 const suppressionQueue = new Queue(SUPPRESSION_QUEUE, { connection });
+const verifyHealQueue = new Queue(VERIFY_HEAL_QUEUE, { connection });
+const mutantClosureQueue = new Queue(MUTANT_CLOSURE_QUEUE, { connection });
 const exploreQueue = new Queue(QUEUE_NAMES.explore, { connection });
 const analyzeSourceQueue = new Queue(ANALYZE_SOURCE_QUEUE, { connection });
 const runQueue = new Queue(QUEUE_NAMES.run, { connection });
@@ -333,6 +401,89 @@ export async function enqueueCopilot(job: CopilotJob): Promise<void> {
 }
 
 /**
+ * Ask for one heal to be re-measured.
+ *
+ * ── THE JOB ID IS A REDIS KEY, AND BOTH FLAGS ARE LOAD-BEARING ──────────────
+ *
+ * The options come from `verifyHealJobOptions`, which carries `removeOnComplete`
+ * AND `removeOnFail` together. With only the first, a job that FAILED keeps its
+ * id in the failed set and every later enqueue for that heal is silently
+ * dropped for as long as the key lives in Redis — `add()` still returns a Job
+ * and the caller cannot tell. Here that means A HEAL NOTHING EVER RE-MEASURES,
+ * which is the exact defect this queue exists to close: the first verification
+ * of a heal fails on a transient error, and the heal is then unverifiable for
+ * ever with no record of why.
+ *
+ * `attempts: 1`, deliberately. The processor decides from the ROW, not the
+ * payload, and everything it needs is read fresh — so the next deliberate
+ * enqueue (the hole sweep's, five minutes later) is always a better answer than
+ * a retry of this one, and a retry storm here means a verification Run per
+ * attempt against the customer's own plan toll.
+ */
+export async function enqueueVerifyHeal(job: VerifyHealJob): Promise<void> {
+  await verifyHealQueue.add(VERIFY_HEAL_QUEUE, job, {
+    ...verifyHealJobOptions(job.healId),
+    attempts: 1,
+  });
+}
+
+/**
+ * One "turn this run's surviving mutants into work" job.
+ *
+ * Ids only, like every other payload (see the header of
+ * packages/shared/src/jobs.ts). The survivor rows are read fresh: a job
+ * carrying a copy would be grouping a snapshot the run processor's own
+ * delete-then-create may already have replaced.
+ */
+export interface MutantClosureJob {
+  orgId: string;
+  runId: string;
+  /** Why this was asked for, for the log line. */
+  reason: 'RUN_FINISHED' | 'OPERATOR';
+}
+
+/**
+ * Ask for a run's mutation report to be turned into closure items.
+ *
+ * ONE JOB PER RUN, with BOTH removal flags, and the second flag is the one that
+ * matters: a per-run id with only `removeOnComplete` keeps a FAILED job's id in
+ * Redis, so a re-requested closure for that run — after the operator fixes
+ * whatever broke — is silently dropped for ever. The report would then never
+ * exist for that run and nothing would say so.
+ *
+ * MEASURED, against this repo's own BullMQ, with the first job driven to each
+ * terminal state by a real Worker:
+ *
+ *   both flags, first job completed  → second add LANDS (waiting: 1)
+ *   both flags, first job FAILED     → second add LANDS (waiting: 1)
+ *   removeOnComplete only, failed    → second add is SILENTLY DROPPED
+ *                                      (failed: 1, waiting: 0) and `add()`
+ *                                      still returns the id
+ *   neither flag, first completed    → second add is SILENTLY DROPPED
+ *
+ * ── A DASH AND NOT A COLON, AND IT IS NOT COSMETIC ──────────────────────────
+ *
+ * This id was written `mutant-closure:${runId}` and BullMQ REFUSES it:
+ * `Error: Custom Id cannot contain :` (bullmq Job.validateOptions). The throw
+ * happens inside `add`, so every closure request would have failed — which is
+ * the loud direction, but it is still a feature that cannot be asked for. Every
+ * other id in this file is dash-separated for the same reason: `run-<id>`,
+ * `triage-<resultId>`, `bisect-<id>-<step>`, `deliver-<id>`.
+ *
+ * `attempts: 1`: the processor writes one audit row per run, keyed on the run,
+ * and everything it reads is read fresh, so the next deliberate request beats a
+ * retry of this one.
+ */
+export async function enqueueMutantClosure(job: MutantClosureJob): Promise<void> {
+  await mutantClosureQueue.add(MUTANT_CLOSURE_QUEUE, job, {
+    jobId: `mutant-closure-${job.runId}`,
+    attempts: 1,
+    removeOnComplete: true,
+    removeOnFail: true,
+  });
+}
+
+/**
  * Outbound notification. Fire-and-forget by design: a PR comment that fails to
  * post must never fail the run that produced it.
  */
@@ -398,10 +549,27 @@ export async function enqueueDelivery(job: DeliveryJob): Promise<void> {
  * `attempts: 1`: the probe is idempotent and cheap, so the next scheduled sweep
  * is always a better answer than a retry of this one — and a retry storm here
  * means nineteen `--version` subprocesses per attempt.
+ *
+ * ── THE COLON, AND WHY THE KEY IS REWRITTEN ────────────────────────────────
+ *
+ * `deploymentKey` carries `pool:<name>` for a customer's own runner pool, and
+ * BullMQ REFUSES that id: `Job.validateOptions` throws `Custom Id cannot
+ * contain :` for any id containing a colon whose `split(':')` is not exactly
+ * three segments (node_modules/bullmq/dist/cjs/classes/job.js — the three-part
+ * case is a compatibility carve-out for repeatable jobs, not a licence).
+ * `preflight-pool:acme` is two segments, so EVERY runner-pool probe threw and
+ * no pool's capabilities were ever recorded.
+ *
+ * So the colon is replaced rather than the key being renamed. It is a Redis
+ * key, not a datum: the only property it needs is that two deployment keys
+ * cannot collide, and `-` for `:` preserves that because `:` is the only
+ * character this sentinel vocabulary uses it for. Rewriting the KEY would
+ * change the de-duplication identity of in-flight `<self>` probes, which is a
+ * decision about the preflight feature rather than about this producer.
  */
 export async function enqueuePreflight(job: PreflightJob = {}): Promise<void> {
   await preflightQueue.add(PREFLIGHT_QUEUE, job, {
-    jobId: `preflight-${job.deploymentKey ?? '<self>'}`,
+    jobId: `preflight-${(job.deploymentKey ?? '<self>').replace(/:/g, '-')}`,
     attempts: 1,
     removeOnComplete: true,
     removeOnFail: true,
@@ -510,5 +678,7 @@ export async function closeProducers(): Promise<void> {
     exploreQueue.close(),
     preflightQueue.close(),
     suppressionQueue.close(),
+    verifyHealQueue.close(),
+    mutantClosureQueue.close(),
   ]);
 }

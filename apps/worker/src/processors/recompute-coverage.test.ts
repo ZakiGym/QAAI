@@ -26,6 +26,13 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SurfaceKind, SurfaceSnapshot, SurfaceSnapshotTotals } from '@qaai/shared';
 // Type-only, so this test never loads the API module the processor defers.
 import type { ComputeOptions } from '../../../api/src/lib/coverage-store.js';
+/*
+ * Type-only as well, and it is the reason the fixture below is TYPED rather
+ * than a bag: `AppliedRetirementRow` is the shape the recompute reads, so a
+ * column added to the read without a fixture to match it is a compile error
+ * here instead of a silently-undefined value in an assertion.
+ */
+import type { AppliedRetirementRow } from './recompute-coverage.js';
 
 // The worker's context opens Postgres, Redis and the LLM at import time, so it
 // is replaced wholesale; `h.prisma` and `h.log` are read per test.
@@ -75,8 +82,10 @@ vi.mock('bullmq', () => ({
 }));
 
 const {
+  APPLIED_RETIREMENT_SCAN_CAP,
   RECOMPUTE_ATTEMPTS,
   apiEnvGap,
+  describeAppliedRetirements,
   RECOMPUTE_COVERAGE_QUEUE,
   RECOMPUTE_WINDOW_MS,
   _resetComputeCache,
@@ -151,7 +160,37 @@ function stubCompute(result?: {
  * business knowing that the processor reads a snapshot at all.
  */
 function noPreviousSnapshot(): Record<string, unknown> {
-  return { coverageSnapshot: { findFirst: async () => null } };
+  return { ...noAppliedRetirements(), coverageSnapshot: { findFirst: async () => null } };
+}
+
+/**
+ * The second read the processor makes, and the reason it is a stub rather than
+ * an omission.
+ *
+ * `RecomputeOutcome.retirements` is a MEASUREMENT on every recompute — "we
+ * looked and none are applied" — so the query is unconditional, and a test that
+ * left it out would fail with a TypeError about this stub rather than about
+ * what it was asserting. `select`, `take` and `orderBy` are honoured because
+ * the cap is read off `rows.length > CAP`.
+ */
+function noAppliedRetirements(
+  rows: Array<AppliedRetirementRow & { state?: string }> = [],
+): Record<string, unknown> {
+  return {
+    retirementProposal: {
+      findMany: async ({ where = {}, take, select }: Record<string, any> = {}) => {
+        const found = rows.filter((row) => !where.state || row.state === where.state);
+        return found.slice(0, take ?? found.length).map((row) => {
+          if (!select) return { ...row };
+          const out: Record<string, unknown> = {};
+          for (const [key, value] of Object.entries(select)) {
+            if (value === true) out[key] = (row as unknown as Record<string, unknown>)[key];
+          }
+          return out;
+        });
+      },
+    },
+  };
 }
 
 beforeEach(() => {
@@ -623,6 +662,7 @@ describe('processRecomputeCoverage reports the delta against the STORED trend', 
   it('reads the previous snapshot BEFORE writing the new one', async () => {
     const order: string[] = [];
     h.prisma = {
+      ...noAppliedRetirements(),
       coverageSnapshot: {
         findFirst: async () => {
           order.push('read');
@@ -660,7 +700,7 @@ describe('processRecomputeCoverage reports the delta against the STORED trend', 
   });
 
   it('carries a null delta for a project with nothing to measure', async () => {
-    h.prisma = { coverageSnapshot: { findFirst: async () => null } };
+    h.prisma = { ...noAppliedRetirements(), coverageSnapshot: { findFirst: async () => null } };
     const { compute } = stubCompute({
       snapshot: snapshot({ totals: totals({ percent: null, denominator: 0, covered: 0 }) }),
     });
@@ -677,7 +717,7 @@ describe('processRecomputeCoverage reports the delta against the STORED trend', 
   });
 
   it('accepts close-loop as a reason and logs it, so the trend says who measured', async () => {
-    h.prisma = { coverageSnapshot: { findFirst: async () => ({ percent: 10 }) } };
+    h.prisma = { ...noAppliedRetirements(), coverageSnapshot: { findFirst: async () => ({ percent: 10 }) } };
     const { compute } = stubCompute();
 
     const outcome = await processRecomputeCoverage(
@@ -688,5 +728,214 @@ describe('processRecomputeCoverage reports the delta against the STORED trend', 
     expect(outcome.reason).toBe('close-loop');
     const line = h.log.find((entry) => entry.msg === 'coverage recomputed');
     expect(line?.obj).toMatchObject({ reason: 'close-loop', deltaPoints: 40 });
+  });
+});
+
+// ─── Applied retirements, and the flattering lie they could tell ─────────────
+
+/*
+ * THE WORST DEFECT THIS FEATURE COULD SHIP is a retirement that RAISED the
+ * coverage percentage, because it would make "delete the failing tests" the
+ * fastest way to hit a coverage target and the product would then be actively
+ * worse than no product. The surface a retired test covered does NOT leave the
+ * denominator: the application still has it and now nothing tests it.
+ *
+ * These tests are the arithmetic half of that rule. The row half — the surfaces
+ * actually being flipped to UNCOVERED in the same transaction as
+ * `Test.disabledAt` — is in apps/api/src/routes/tests.test.ts.
+ */
+const appliedRow = (
+  over: Partial<AppliedRetirementRow> & { state?: string; appliedAt?: Date } = {},
+): AppliedRetirementRow & { state: string; appliedAt: Date } => ({
+  id: 'ret_1',
+  testId: 'test_1',
+  state: 'APPLIED',
+  surfacesReturnedToUncovered: ['item_a'],
+  surfacesStillCovered: [],
+  surfacesReopened: true,
+  appliedAt: new Date('2026-10-28T00:00:00.000Z'),
+  ...over,
+});
+
+describe('describeAppliedRetirements never lets a retirement raise the number', () => {
+  it('leaves the denominator ALONE and says so', () => {
+    const got = describeAppliedRetirements([
+      appliedRow(),
+      appliedRow({ id: 'ret_2', testId: 'test_2', surfacesReturnedToUncovered: ['item_b'] }),
+    ]);
+
+    expect(got.applied).toBe(2);
+    expect(got.surfacesReturnedToUncovered).toBe(2);
+    /*
+     * THE ASSERTION THE WHOLE FEATURE TURNS ON. A type literal `0` makes the
+     * flattering version a compile error; this makes it a test failure too, so
+     * a later widening of the type cannot quietly reopen the hole.
+     */
+    expect(got.denominatorDelta).toBe(0);
+    expect(got.disclosure).toContain('denominator is UNCHANGED');
+    expect(got.disclosure).toContain('went DOWN, not up');
+  });
+
+  it('can never report LEAVES_DENOMINATOR, which is the only effect that raises a percentage', () => {
+    for (const rows of [
+      [],
+      [appliedRow()],
+      [appliedRow({ surfacesReturnedToUncovered: [], surfacesStillCovered: ['item_a'] })],
+      [appliedRow({ surfacesReturnedToUncovered: [], surfacesStillCovered: [] })],
+    ]) {
+      const got = describeAppliedRetirements(rows);
+      /*
+       * LEAVES_DENOMINATOR is reserved for a human COVERAGE_WAIVER — "the ONLY
+       * kind that can make the coverage number go up, which is why it needs a
+       * named human and a yearly re-decision". A retirement reaching it would
+       * mean a background job had acquired a waiver's authority.
+       */
+      expect(got.effect).toBe('RETURNS_TO_UNCOVERED');
+      expect(got.effect).not.toBe('LEAVES_DENOMINATOR');
+      expect(got.denominatorDelta).toBe(0);
+    }
+  });
+
+  it('does not count a surface twice when two retirements both reached it', () => {
+    const got = describeAppliedRetirements([
+      appliedRow({ surfacesReturnedToUncovered: ['item_a', 'item_b'] }),
+      appliedRow({ id: 'ret_2', testId: 'test_2', surfacesReturnedToUncovered: ['item_b'] }),
+    ]);
+
+    // Two retirements, three claims, two surfaces. Summing the arrays would
+    // report more coverage lost than the project has items.
+    expect(got.surfacesReturnedToUncovered).toBe(2);
+  });
+
+  it('counts a surface another live test reaches as STILL COVERED, not as lost', () => {
+    const got = describeAppliedRetirements([
+      appliedRow({ surfacesReturnedToUncovered: ['item_a'], surfacesStillCovered: ['item_b'] }),
+    ]);
+
+    expect(got.surfacesReturnedToUncovered).toBe(1);
+    // What makes the first number believable.
+    expect(got.surfacesStillCovered).toBe(1);
+  });
+
+  it('reports an APPLIED retirement whose surfaces were never re-opened as a DEFECT', () => {
+    const got = describeAppliedRetirements([appliedRow({ surfacesReopened: false })]);
+
+    /*
+     * Each one is a test that stopped running while its surface stayed COVERED,
+     * so the percentage beside it is flattered by exactly that many items.
+     * Counted on its own and NAMED in the disclosure rather than folded into
+     * the total — and reported rather than repaired, because repairing it here
+     * would destroy the evidence that the apply path has a hole in it.
+     */
+    expect(got.surfacesNotReopened).toBe(1);
+    expect(got.disclosure).toContain('DEFECT');
+    expect(got.disclosure).toContain('flattered');
+  });
+
+  it('says "none applied" rather than going quiet', () => {
+    const got = describeAppliedRetirements([]);
+    expect(got.applied).toBe(0);
+    expect(got.surfacesNotReopened).toBe(0);
+    expect(got.disclosure).toContain('No retirement has been applied');
+  });
+
+  it('discloses the scan cap as a floor', () => {
+    const got = describeAppliedRetirements([appliedRow()], true);
+    expect(got.capped).toBe(true);
+    expect(got.disclosure).toContain('floor');
+    expect(got.disclosure).toContain(String(APPLIED_RETIREMENT_SCAN_CAP));
+  });
+});
+
+describe('the recompute reads the retirement columns the apply endpoint writes', () => {
+  it('reports the applied retirements beside the percentage they lowered', async () => {
+    h.prisma = {
+      ...noAppliedRetirements([
+        appliedRow(),
+        appliedRow({ id: 'ret_2', testId: 'test_2', surfacesReturnedToUncovered: ['item_b'] }),
+      ]),
+      coverageSnapshot: { findFirst: async () => ({ percent: 60 }) },
+    };
+    const { compute } = stubCompute();
+
+    const outcome = await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'close-loop' },
+      { compute },
+    );
+
+    /*
+     * THE READ PATH. `RetirementProposal.surfacesReturnedToUncovered` and
+     * `surfacesReopened` were written by one endpoint and consulted by nothing
+     * — so nothing in the product could have noticed a retirement whose
+     * surfaces stayed COVERED. This is the request that notices.
+     */
+    expect(outcome.retirements.applied).toBe(2);
+    expect(outcome.retirements.surfacesReturnedToUncovered).toBe(2);
+    expect(outcome.retirements.denominatorDelta).toBe(0);
+  });
+
+  it('reads APPLIED only — a PROPOSED retirement has lost nobody any coverage yet', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    h.prisma = {
+      retirementProposal: {
+        findMany: async (args: Record<string, any>) => {
+          seen.push(args.where as Record<string, unknown>);
+          return [];
+        },
+      },
+      coverageSnapshot: { findFirst: async () => null },
+    };
+    const { compute } = stubCompute();
+
+    await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'crawl' },
+      { compute },
+    );
+
+    /*
+     * A positive state rather than a `notIn`, for the reason triage.ts gives
+     * about the same table: a `notIn` quietly adopts every state a later round
+     * adds. Counting a PROPOSED retirement here would report a decision nobody
+     * has made as coverage already lost.
+     */
+    expect(seen[0]).toMatchObject({ projectId: 'proj_1', state: 'APPLIED' });
+  });
+
+  it('logs the un-reopened defect at ERROR, on its own line', async () => {
+    h.prisma = {
+      ...noAppliedRetirements([appliedRow({ surfacesReopened: false })]),
+      coverageSnapshot: { findFirst: async () => null },
+    };
+    const { compute } = stubCompute();
+
+    await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'run' },
+      { compute },
+    );
+
+    /*
+     * Not folded into the info line. An operator reading a dispute about the
+     * number has to be able to find the sentence that says it is flattered.
+     */
+    const line = h.log.find(
+      (entry) => entry.level === 'error' && entry.msg.includes('never re-opened their surfaces'),
+    );
+    expect(line).toBeDefined();
+    expect(line?.obj).toMatchObject({ surfacesNotReopened: 1 });
+  });
+
+  it('does not log the defect when every applied retirement re-opened its surfaces', async () => {
+    h.prisma = {
+      ...noAppliedRetirements([appliedRow()]),
+      coverageSnapshot: { findFirst: async () => null },
+    };
+    const { compute } = stubCompute();
+
+    await processRecomputeCoverage(
+      { orgId: 'org_1', projectId: 'proj_1', reason: 'run' },
+      { compute },
+    );
+
+    expect(h.log.some((entry) => entry.level === 'error')).toBe(false);
   });
 });

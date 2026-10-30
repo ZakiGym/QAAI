@@ -23,8 +23,14 @@ import {
   withResumePoint,
 } from '@qaai/agent';
 import { signalsFromFlowMap } from '@qaai/agent';
-import { auditTestsAgainstCrawl, obsolescenceSignalsFor } from '@qaai/agent';
+import {
+  auditTestsAgainstCrawl,
+  normalizeRoute,
+  obsolescenceSignalsFor,
+  routeExclusionsFromCrawl,
+} from '@qaai/agent';
 import type { PriorObsolescenceSignal, SuiteHealthTestInput } from '@qaai/agent';
+import type { ObsolescenceExclusion, RouteExclusion } from '@qaai/agent';
 import type { AuthProfileChoice, CrawlOutcome, TypeSignals, TypeVerdict } from '@qaai/agent';
 import { signInWithProfile } from '@qaai/runner';
 import type { LoginFailure, LoginResult } from '@qaai/runner';
@@ -1897,6 +1903,18 @@ export async function processExplore(job: ExploreJob): Promise<void> {
     projectId,
     flowMapId: stored.id,
     flowMap,
+    environmentId,
+    /*
+     * CONTRIBUTING passes only, which is the entire point of passing this.
+     *
+     * A pass that was demoted to LOGIN_FAILED contributed no nodes, so every
+     * route only that role can reach is absent from this crawl for a reason
+     * that is not deletion — and `obsolescenceExclusionsFor` reads exactly this
+     * set against the stored access matrix to withhold those routes. Passing
+     * every CONFIGURED role instead would claim a session we never held, which
+     * is how "we could not sign in" becomes "the page is gone".
+     */
+    rolesCrawled: passes.filter((pass) => pass.contributed).map((pass) => roleKey(pass.role)),
   }).catch((err: unknown) => {
     logger.error(
       { err, projectId, flowMapId: stored.id },
@@ -2424,6 +2442,294 @@ export async function processExplore(job: ExploreJob): Promise<void> {
   }
 }
 
+
+/**
+ * Add one route exclusion, FIRST WRITER WINS.
+ *
+ * The dedupe is why this is a function and not two lines inline: a route with
+ * two reasons is still ONE withheld signal, and a second entry would double
+ * every number in `ObsolescenceExclusionReport.counts` — a report whose only
+ * job is to make a suppression countable. The route is normalised on the way in
+ * so `/orders/7` and `/orders/:id` cannot both occupy the map.
+ */
+function addExclusion(
+  into: Map<string, RouteExclusion>,
+  route: string | null | undefined,
+  exclusion: ObsolescenceExclusion,
+  detail: string,
+): void {
+  if (typeof route !== 'string' || route.trim().length === 0) return;
+  const key = normalizeRoute(route);
+  if (into.has(key)) return;
+  into.set(key, { route: key, exclusion, detail });
+}
+
+/**
+ * The FLAG coordinate keys on one stored `CoverageItem.coordinates` blob.
+ *
+ * Defensive about shape for the same reason `crawlSurfaceOf` is: this is JSON
+ * written by an older version of the inventory, and a coordinates array of the
+ * wrong shape must narrow the exclusion list rather than throw inside a sweep
+ * whose failure would lose the crawl. An unreadable blob yields no flag key,
+ * which withholds a BEHIND_FEATURE_FLAG exclusion rather than inventing one.
+ */
+function flagCoordinatesOf(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const keys: string[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const coordinate = entry as { dimension?: unknown; value?: unknown };
+    if (coordinate.dimension !== 'FLAG') continue;
+    if (typeof coordinate.value !== 'string' || coordinate.value.length === 0) continue;
+    keys.push(coordinate.value);
+  }
+  return keys;
+}
+
+// ─── The exclusions: why a missing route is not a deleted route ──────────────
+
+/**
+ * How many stored rows one exclusion sweep reads, per source.
+ *
+ * A HARD GATE AND NOT A DISCLOSURE, which is the opposite of every other cap in
+ * this file. An exclusion list is a GUARD: a route that is in it keeps its test
+ * and a route that is missing from it does not. So a truncated guard list does
+ * not make the obsolescence sweep slightly less accurate — it makes it
+ * dangerous in exactly the direction that costs a customer a working test, and
+ * which routes lost their protection would depend on a `take`. `capped` here
+ * therefore WITHHOLDS the whole sweep rather than annotating it.
+ */
+export const OBSOLESCENCE_EXCLUSION_SCAN_CAP = 2_000;
+
+/** The three reasons, plus the accounting that makes a withheld signal visible. */
+export interface ObsolescenceExclusionReport {
+  /** Ready for `ObsoleteInput.excludedRoutes`. Sorted, one entry per route. */
+  exclusions: RouteExclusion[];
+  /** Always all three keys. "None" and "we did not look" are different outputs. */
+  counts: Record<ObsolescenceExclusion, number>;
+  /**
+   * TRUE when any source's cap bit — which means the guard list is a FLOOR.
+   * The caller must withhold rather than proceed; see the constant's comment.
+   */
+  capped: boolean;
+  /** Which source capped, by name, so the remedy is actionable. */
+  cappedBy: string | null;
+  /** Everything a reader needs before trusting the list's completeness. */
+  caveats: string[];
+}
+
+/**
+ * Every recorded reason a route is absent from this crawl WITHOUT being gone.
+ *
+ * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────────────
+ *
+ * `auditTestsAgainstCrawl` has taken `excludedRoutes` since obsolescence was
+ * written and nothing ever passed one, so the guard against retiring a GOOD
+ * test has been a parameter with no argument. Three facts are needed and they
+ * live in three places: the crawl's own ledger (`routeExclusionsFromCrawl`, in
+ * @qaai/agent), the route × role access matrix, and the surface inventory's
+ * exercisability and flag availability. None of the three is derivable from
+ * either of the others.
+ *
+ * ── EVERY ENTRY IS A RECORDED FACT ──────────────────────────────────────────
+ *
+ * Nothing here looks at a route's SHAPE. `/admin/orders` is not excluded
+ * because it starts with `/admin`; it is excluded when a `RouteAccessCell` says
+ * the only role ever served it is a role this crawl could not be. That
+ * distinction is rule 11 — "QAAI owns it" must be a recorded fact, never an
+ * inference from a path — applied to the opposite direction: whether QAAI is
+ * entitled to argue a page is gone.
+ *
+ * ── PRECEDENCE ──────────────────────────────────────────────────────────────
+ *
+ * First writer wins per route (`pushExclusion` in @qaai/agent dedupes), and the
+ * order below is therefore the precedence: the crawl's own refusal, then the
+ * role it could not hold, then the inventory's standing refusal, then the dark
+ * flag. One route with two reasons is one withheld signal, and the reviewer is
+ * shown the most specific reason QAAI has.
+ */
+export async function obsolescenceExclusionsFor(args: {
+  orgId: string;
+  projectId: string;
+  /** The environment this crawl ran against. Null disables the access-matrix half. */
+  environmentId: string | null;
+  flowMap: FlowMap | null;
+  /**
+   * The roles that CONTRIBUTED to this crawl, as `roleKey` spells them.
+   *
+   * Not the roles configured, and not the roles attempted: a pass that hit a
+   * login failure contributed nothing, and treating its role as crawled is
+   * precisely how "we could not sign in" becomes "the page is gone".
+   */
+  rolesCrawled: readonly string[];
+}): Promise<ObsolescenceExclusionReport> {
+  const { orgId, projectId, environmentId, flowMap } = args;
+  const fromCrawl = routeExclusionsFromCrawl(flowMap);
+  const found = new Map<string, RouteExclusion>();
+  for (const entry of fromCrawl.exclusions) found.set(entry.route, entry);
+
+  const caveats = [...fromCrawl.caveats];
+  let cappedBy: string | null = null;
+
+  /*
+   * ── THE ROLE WE COULD NOT BE ──────────────────────────────────────────────
+   *
+   * `RouteAccessCell` is the stored (route, role) → outcome matrix. A route is
+   * excluded when SOME role was recorded as ALLOWED and EVERY such role is
+   * absent from this crawl's contributing set: the route demonstrably exists
+   * and demonstrably needs a session we did not have this time.
+   *
+   * A route with an ALLOWED cell for a role we DID hold is NOT excluded, and
+   * that asymmetry is the whole value of reading the matrix rather than the
+   * role list: a route a member can reach, absent from a crawl that ran as a
+   * member, is a route QAAI is entitled to ask about. Excluding it would
+   * withhold a true signal, which is the mirror lie — reporting as unmeasured
+   * something that WAS measured.
+   *
+   * A route with no ALLOWED cell at all is left alone here. It is either
+   * genuinely gone (the signal is correct) or it was never probed, and
+   * NOT_PROBED is already what `basis`/`outcome` say; manufacturing an
+   * exclusion from "nobody asked" would turn an unprobed cell into a licence.
+   */
+  const crawled = new Set(args.rolesCrawled.map((role) => roleKey(role)));
+  if (environmentId !== null) {
+    const cells = await prisma.routeAccessCell.findMany({
+      where: { orgId, projectId, environmentId },
+      orderBy: [{ routeTemplate: 'asc' }, { role: 'asc' }],
+      take: OBSOLESCENCE_EXCLUSION_SCAN_CAP + 1,
+      select: { routeTemplate: true, role: true, outcome: true },
+    });
+    if (cells.length > OBSOLESCENCE_EXCLUSION_SCAN_CAP) {
+      cappedBy = `the route × role access matrix has more than ${OBSOLESCENCE_EXCLUSION_SCAN_CAP} cells in this environment`;
+    }
+    const allowedRoles = new Map<string, Set<string>>();
+    for (const cell of cells.slice(0, OBSOLESCENCE_EXCLUSION_SCAN_CAP)) {
+      if (cell.outcome !== 'ALLOWED') continue;
+      const roles = allowedRoles.get(cell.routeTemplate) ?? new Set<string>();
+      roles.add(roleKey(cell.role));
+      allowedRoles.set(cell.routeTemplate, roles);
+    }
+    for (const [routeTemplate, roles] of allowedRoles) {
+      if ([...roles].some((role) => crawled.has(role))) continue;
+      addExclusion(
+        found,
+        routeTemplate,
+        'ROLE_NOT_CRAWLED',
+        /*
+         * The role COUNT and not the role NAMES. `SurfaceDimension.key` is "the
+         * role in the APPLICATION's own spelling" — customer-authored text —
+         * and this sentence lands on a `RetirementProposal.reason` a reviewer
+         * reads. The count is QAAI's own and says the same useful thing.
+         */
+        `the only ${roles.size === 1 ? 'role' : `${roles.size} roles`} ever served this route held no session in this crawl`,
+      );
+    }
+  } else {
+    caveats.push(
+      'This crawl is not tied to an environment, so the route × role access matrix was not consulted and a route behind a role QAAI could not be is not in this list.',
+    );
+  }
+
+  /*
+   * ── THE INVENTORY'S STANDING REFUSAL, AND THE DARK FLAG ───────────────────
+   *
+   * One query for both, because both are columns on the same ROUTE items.
+   *
+   *   `exercisability` UNEXERCISABLE or REFUSED  QAAI is not permitted to drive
+   *     this here — it ends the session, it destroys data, it charges money, or
+   *     the crawl policy refused it. Those routes are absent from EVERY crawl
+   *     by design, so a retirement argued from their absence would retire
+   *     exactly the tests covering the surfaces QAAI refuses to touch itself.
+   *   a FLAG coordinate on an unavailable dimension  the route exists and was
+   *     dark. The flag facts are `SurfaceDimension` rows read out of the
+   *     customer's own provider, which is why no crawl can supply this one —
+   *     see `CrawlRouteExclusions.notSuppliableFromCrawl`.
+   */
+  const routeItems = await prisma.coverageItem.findMany({
+    where: { orgId, projectId, kind: 'ROUTE' },
+    orderBy: { key: 'asc' },
+    take: OBSOLESCENCE_EXCLUSION_SCAN_CAP + 1,
+    select: {
+      key: true,
+      exercisability: true,
+      unexercisableReason: true,
+      refusedByRule: true,
+      coordinates: true,
+    },
+  });
+  if (routeItems.length > OBSOLESCENCE_EXCLUSION_SCAN_CAP) {
+    cappedBy ??= `this project has more than ${OBSOLESCENCE_EXCLUSION_SCAN_CAP} route items in the surface inventory`;
+  }
+  const items = routeItems.slice(0, OBSOLESCENCE_EXCLUSION_SCAN_CAP);
+
+  const flagKeys = new Set<string>();
+  for (const item of items) {
+    for (const coordinate of flagCoordinatesOf(item.coordinates)) flagKeys.add(coordinate);
+  }
+  /*
+   * `available: false` is the ONLY thing that excludes. A flag dimension this
+   * install CAN produce is one the crawl could have turned on, so a route
+   * behind it is a route QAAI is entitled to ask about — and reading every
+   * flagged route as excluded would withhold the signal on every feature the
+   * customer ships behind a flag, which is most of them.
+   */
+  const darkFlags = new Set<string>();
+  if (flagKeys.size > 0) {
+    const dimensions = await prisma.surfaceDimension.findMany({
+      where: {
+        orgId,
+        projectId,
+        kind: 'FLAG',
+        key: { in: [...flagKeys].sort() },
+        available: false,
+        retiredAt: null,
+      },
+      select: { key: true },
+    });
+    for (const row of dimensions) darkFlags.add(row.key);
+  }
+
+  for (const item of items) {
+    const route = item.key.replace(/^ROUTE:/, '');
+    if (item.exercisability === 'UNEXERCISABLE' || item.exercisability === 'REFUSED') {
+      addExclusion(
+        found,
+        route,
+        'UNEXERCISABLE',
+        /*
+         * The RECORDED reason token, which is a closed vocabulary
+         * (`UNEXERCISABLE_REASONS`), and never `refusedByRule` — that column
+         * holds the customer's own policy glob. A reviewer who wants the glob
+         * can read the inventory row; a proposal sentence may not carry it.
+         */
+        item.exercisability === 'REFUSED'
+          ? 'the surface inventory records this route as refused by the crawl policy and never attempted'
+          : `the surface inventory records this route as unexercisable here (${item.unexercisableReason ?? 'reason not recorded'})`,
+      );
+      continue;
+    }
+    const dark = flagCoordinatesOf(item.coordinates).filter((key) => darkFlags.has(key));
+    if (dark.length > 0) {
+      addExclusion(
+        found,
+        route,
+        'BEHIND_FEATURE_FLAG',
+        `${dark.length === 1 ? 'a feature flag' : `${dark.length} feature flags`} this environment cannot produce ${dark.length === 1 ? 'was' : 'were'} off during the crawl`,
+      );
+    }
+  }
+
+  const exclusions = [...found.values()].sort((a, b) => a.route.localeCompare(b.route));
+  const counts: Record<ObsolescenceExclusion, number> = {
+    BEHIND_FEATURE_FLAG: 0,
+    ROLE_NOT_CRAWLED: 0,
+    UNEXERCISABLE: 0,
+  };
+  for (const entry of exclusions) counts[entry.exclusion] += 1;
+
+  return { exclusions, counts, capped: cappedBy !== null, cappedBy, caveats };
+}
+
 // ─── Obsolescence: what this crawl says about the tests we already have ──────
 
 /**
@@ -2455,6 +2761,16 @@ export interface ObsolescenceSweepResult {
   admissible: number;
   /** TRUE when a cap bit, so every count above is a floor. */
   capped: boolean;
+  /**
+   * Routes WITHHELD from the obsolescence argument, counted by reason.
+   *
+   * An exclusion is a suppression of a finding and every suppression in this
+   * product is counted out loud: "no test looks obsolete" and "we did not
+   * consider nine routes" are completely different facts about a project, and a
+   * sweep that reported only the first would teach a reader that the feature
+   * does nothing. Always all three keys.
+   */
+  exclusions: Record<ObsolescenceExclusion, number>;
 }
 
 /**
@@ -2493,6 +2809,18 @@ export async function recordObsolescenceSignals(args: {
   projectId: string;
   flowMapId: string;
   flowMap: FlowMap;
+  /** The environment this crawl ran against. Feeds the access-matrix exclusions. */
+  environmentId?: string | null;
+  /**
+   * The roles that CONTRIBUTED to this crawl, as `roleKey` spells them.
+   *
+   * Defaulted to the anonymous role rather than to the empty array, because an
+   * empty set would read as "no role was crawled" and exclude every route the
+   * access matrix has ever served — withholding every true signal as well as
+   * every false one. The anonymous pass always drives a crawl (`runRolePasses`
+   * states it as an invariant), so it is the honest floor.
+   */
+  rolesCrawled?: readonly string[];
 }): Promise<ObsolescenceSweepResult> {
   const { orgId, projectId, flowMapId, flowMap } = args;
   const now = new Date();
@@ -2540,12 +2868,59 @@ export async function recordObsolescenceSignals(args: {
   const routeItems = routeItemRows.slice(0, OBSOLESCENCE_ROUTE_ITEM_SCAN_CAP);
   const routeOf = (key: string): string => key.replace(/^ROUTE:/, '');
 
+  /*
+   * ── THE GUARD LIST, SUPPLIED AT LAST ──────────────────────────────────────
+   *
+   * `excludedRoutes` is the parameter that stops a GOOD test being retired, and
+   * until now nothing passed one. Computed BEFORE the audit because the audit
+   * is where it is applied, and withheld on as hard a gate as a truncated
+   * crawl: an incomplete guard list does not make the sweep slightly less
+   * accurate, it silently removes protection from whichever routes fell past a
+   * `take`. See `OBSOLESCENCE_EXCLUSION_SCAN_CAP`.
+   */
+  const excluded = await obsolescenceExclusionsFor({
+    orgId,
+    projectId,
+    environmentId: args.environmentId ?? null,
+    flowMap,
+    rolesCrawled: args.rolesCrawled ?? [ANONYMOUS_ROLE],
+  });
+
+  if (excluded.capped) {
+    const why =
+      'No obsolescence signal was recorded from this crawl: the list of routes that are absent for ' +
+      `a reason other than deletion could not be read in full (${excluded.cappedBy}). That list is ` +
+      'the guard against retiring a test whose page is fine, and a truncated guard protects the ' +
+      'routes it happens to name and no others.';
+    logger.info(
+      { projectId, flowMapId, withheldBecause: why, cappedBy: excluded.cappedBy },
+      'no obsolescence signal was recorded from this crawl, and none was resolved either',
+    );
+    return {
+      withheldBecause: why,
+      opened: 0,
+      confirmed: 0,
+      reappeared: 0,
+      admissible: 0,
+      capped: true,
+      exclusions: excluded.counts,
+    };
+  }
+
   const report = auditTestsAgainstCrawl({
     // Fixtures are test data, not tests.
     tests: tests
       .filter((test) => !test.filePath.startsWith(FIXTURE_PREFIX))
       .map((test) => test as unknown as SuiteHealthTestInput),
     flowMap,
+    /*
+     * A test whose route is in here is NOT obsolete — it is UNVERIFIED, which
+     * is a different fact and the opposite decision. `obsolescenceSignalsFor`
+     * files no signal of any kind for an excluded route, so a dark flag or a
+     * role we could not hold stops accumulating confirmations towards the
+     * retirement of a live feature.
+     */
+    excludedRoutes: excluded.exclusions,
     declaredRoutes:
       sourceItems > 0
         ? routeItems.filter((item) => item.origin !== 'CRAWL_ONLY').map((item) => routeOf(item.key))
@@ -2625,6 +3000,7 @@ export async function recordObsolescenceSignals(args: {
       reappeared: 0,
       admissible: 0,
       capped,
+      exclusions: excluded.counts,
     };
   }
 
@@ -2646,6 +3022,7 @@ export async function recordObsolescenceSignals(args: {
       reappeared: 0,
       admissible: 0,
       capped,
+      exclusions: excluded.counts,
     };
   }
 
@@ -2755,6 +3132,7 @@ export async function recordObsolescenceSignals(args: {
     reappeared,
     admissible: signals.confirmed,
     capped: capped || writeCapped,
+    exclusions: excluded.counts,
   };
   logger.info(
     {
@@ -2767,6 +3145,9 @@ export async function recordObsolescenceSignals(args: {
       testsCapped,
       routeItemsCapped,
       writeCapped,
+      // In full, next to the counts. A withheld route that is not named in the
+      // log is a suppression nobody can retrieve.
+      exclusionCaveats: excluded.caveats,
     },
     result.capped
       ? 'obsolescence signals recorded, and a cap bit — every count is a floor'

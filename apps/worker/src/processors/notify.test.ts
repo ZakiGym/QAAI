@@ -910,14 +910,24 @@ function routingDb(opts: {
   manyUpdates: unknown[];
   /** The args the failure read was issued with — the cap and its ordering. */
   resultQuery: Array<Record<string, unknown>>;
+  /**
+   * The args the RULE read was issued with.
+   *
+   * Captured because `source` is the field that decides whether an imported
+   * glob pages somebody, and a select that stopped asking for it would make
+   * every rule read as hand-typed — a silent change with no visible output.
+   */
+  ruleQuery: Array<Record<string, unknown>>;
 } {
   const updates: Array<{ id: string; data: Record<string, unknown> }> = [];
   const manyUpdates: unknown[] = [];
   const resultQuery: Array<Record<string, unknown>> = [];
+  const ruleQuery: Array<Record<string, unknown>> = [];
   const db = h.prisma as Record<string, unknown>;
 
   db.ownershipRule = {
-    findMany: async () => {
+    findMany: async (args: Record<string, unknown> = {}) => {
+      ruleQuery.push(args);
       if (opts.throws) throw new Error('connection terminated');
       return opts.rules ?? [];
     },
@@ -946,7 +956,7 @@ function routingDb(opts: {
     },
   };
 
-  return { updates, manyUpdates, resultQuery };
+  return { updates, manyUpdates, resultQuery, ruleQuery };
 }
 
 const rule = (over: Record<string, unknown> = {}) => ({
@@ -958,6 +968,12 @@ const rule = (over: Record<string, unknown> = {}) => ({
   feature: null,
   ownerUserId: null,
   ownerTeamId: null,
+  /*
+   * NULL by default, which is what a row written before the column existed
+   * holds — and the shape `codeownersRuleIdsOf` must read as "not imported".
+   * A default of 'MANUAL' here would hide the null path entirely.
+   */
+  source: null,
   ...over,
 });
 
@@ -1360,5 +1376,164 @@ describe('processNotify routes a finished run to its owners', () => {
     // And a real zero is a real zero, not conflated with the above.
     (h.prisma as Record<string, unknown>).runFailureCluster = { count: async () => 0 };
     await expect(suppressedCauseCount('org1', 'run1')).resolves.toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Routing writes the PROVENANCE, and asks `mayPage` before the page names
+// anybody
+//
+// `TriageVerdict.ownerProvenance` landed one round ago and this processor — the
+// SECOND of the two verdict writers — kept writing the non-provenance columns.
+// Its own schema comment says `ownerProvenance`'s null means "nothing has tried
+// to route this verdict yet, which is the same thing `ownerState`'s null means
+// and is why the two are written together or not at all", and this was the
+// caller that wrote one without the other: a row reading OWNED and
+// "nothing has tried to route this" at the same time.
+//
+// The other half is `mayPage`, which has existed for a round and which nothing
+// asked. An owner that arrived from a glob somebody pasted out of a CODEOWNERS
+// file is WEAK. Printing it at 3am exactly as a human assignment is printed is
+// how a team that was never asked learns to mute the channel.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('processNotify writes how the owner was decided, not only who', () => {
+  const run = {
+    id: 'run1',
+    status: 'FAILED',
+    prNumber: null,
+    passedCount: 7,
+    failedCount: 1,
+    flakyCount: 0,
+    gateResult: null,
+    projectId: 'p1',
+    project: { name: 'Storefront' },
+    environment: { name: 'staging' },
+    results: [
+      {
+        status: 'FAILED',
+        test: { name: 'checkout applies a promo code', filePath: 'specs/checkout.spec.ts' },
+      },
+    ],
+  };
+  const finished = { orgId: 'org1', event: 'run.finished', payload: { runId: 'run1' } };
+  const textOf = (created: Array<Record<string, unknown>>): string =>
+    String((created[0] as { payload: { text: string } }).payload.text);
+
+  it('writes RULE_PATH beside OWNED for a rule nobody imported', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    h.prisma.run = { findFirst: async () => run };
+    const routing = routingDb({
+      // `source: null` — the shape of every rule written before the column
+      // existed, and the one case where null may be read as MANUAL: there was
+      // no importer, so no such row can have been imported.
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments', source: null })],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    expect(routing.updates[0]?.data).toMatchObject({
+      assigneeTeamId: 'team_payments',
+      ownerState: 'OWNED',
+      ownerProvenance: 'RULE_PATH',
+    });
+    // DECLARED, so the page names the team outright.
+    expect(textOf(db.created)).toContain('— @payments');
+    expect(textOf(db.created)).not.toContain('suggested');
+  });
+
+  it('writes CODEOWNERS_IMPORT for an imported rule, and the page calls it a suggestion', async () => {
+    stubFetch();
+    const db = fanOutDb([slack()]);
+    h.prisma.run = { findFirst: async () => run };
+    const routing = routingDb({
+      /*
+       * THE SAME RULE AS THE TEST ABOVE, one field different. That is the whole
+       * claim: identical matching, identical owner, and a different strength —
+       * which nothing in production could report until `source` had a writer.
+       */
+      rules: [
+        rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments', source: 'CODEOWNERS' }),
+      ],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    expect(routing.updates[0]?.data).toMatchObject({
+      assigneeTeamId: 'team_payments',
+      ownerState: 'OWNED',
+      ownerProvenance: 'CODEOWNERS_IMPORT',
+    });
+    /*
+     * The name is still there — it is the best lead there is — and it is
+     * qualified. `ownerClaimLabel` composes this and the digest calls the same
+     * function, so one fact cannot get two phrasings on two surfaces.
+     */
+    expect(textOf(db.created)).toContain('— @payments (suggested, not paged)');
+  });
+
+  it('writes NONE beside NO_MATCH — a measurement, not the column’s null', async () => {
+    stubFetch();
+    fanOutDb([slack()]);
+    h.prisma.run = { findFirst: async () => run };
+    const routing = routingDb({
+      rules: [rule({ pathPattern: 'specs/other/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+    });
+
+    await processNotify(finished, 'j1');
+
+    /*
+     * `NONE` is the coherent partner of a null owner and it means "we looked".
+     * Leaving the column null here would say "nothing has tried to route this"
+     * about a row that also says NO_MATCH — two incompatible facts, which is
+     * exactly what `resolutionIsCoherent` refuses and what this caller used to
+     * store.
+     */
+    expect(routing.updates[0]?.data).toMatchObject({
+      ownerState: 'NO_MATCH',
+      ownerProvenance: 'NONE',
+    });
+    expect(routing.updates[0]?.data.ownerProvenance).not.toBeNull();
+  });
+
+  it('writes NONE beside NO_RULES in the single statement too', async () => {
+    stubFetch();
+    fanOutDb([slack()]);
+    h.prisma.run = { findFirst: async () => run };
+    const routing = routingDb({ rules: [], results: [failingResult()] });
+
+    await processNotify(finished, 'j1');
+
+    expect(routing.manyUpdates).toHaveLength(1);
+    expect(routing.manyUpdates[0]).toMatchObject({
+      data: { ownerState: 'NO_RULES', ownerProvenance: 'NONE' },
+    });
+  });
+
+  it('asks for `source` at all — the field without which every import pages', async () => {
+    stubFetch();
+    fanOutDb([slack()]);
+    h.prisma.run = { findFirst: async () => run };
+    const observed = routingDb({
+      rules: [rule({ pathPattern: 'specs/**', ownerTeamId: 'team_payments' })],
+      results: [failingResult()],
+      teams: [{ id: 'team_payments', slug: 'payments' }],
+    });
+
+    await processNotify(finished, 'j1');
+
+    /*
+     * The select, asserted directly. A copy of `OWNERSHIP_RULE_SELECT` that
+     * dropped `source` would not fail: every rule would read as hand-typed and
+     * every imported glob would page, which is the behaviour this round exists
+     * to stop and is invisible in the output.
+     */
+    expect(observed.ruleQuery[0]?.select).toMatchObject({ source: true, position: true });
   });
 });

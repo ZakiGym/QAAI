@@ -20,6 +20,7 @@ import {
   driftCountsAreMeaningful,
   newSurfaceWithoutTests,
   triggerHasRun,
+  verifyHealJobOptions,
 } from '@qaai/shared';
 import type {
   EnvironmentKind,
@@ -96,7 +97,6 @@ import {
   planSupersede,
   postCheckCode,
   resolveEcosystem,
-  verificationRunTag,
   HEAL_VERIFY_STATES,
   SCENARIO_KIND_LIST,
   SCENARIO_KIND_RISK,
@@ -137,6 +137,40 @@ import { untrusted } from '@qaai/agent';
 // the boundary wrong, and this is the rule the whole vocabulary rests on.
 import { forceStateOf } from '@qaai/shared';
 /*
+ * The suppression vocabulary the review door now writes through.
+ *
+ * `applySuppression` is THE constructor — there is no object-literal path to a
+ * suppression that skips its checks — and `createKnownIssueSchema` is the wire
+ * shape of the row it produces. `matchKnownIssue` is exact membership over
+ * 12-hex cause keys, which is what makes a mute safe: the key changes when the
+ * cause does.
+ */
+import {
+  SUPPRESSION_KIND_RULES,
+  applySuppression,
+  createKnownIssueSchema,
+  matchKnownIssue,
+} from '@qaai/shared';
+import type { KnownIssueMatcher } from '@qaai/shared';
+/*
+ * ── THE MUTE DOOR AND THE MUTE WRITER SHARE ONE VOCABULARY ─────────────────
+ *
+ * `verdictSuppression` is how every surface in both files reports a
+ * `reviewState` — never the bare state, because MUTED on its own is not a
+ * suppression. `SUPPRESSION_REFUSAL_PROSE` and `refusedPaths` are the refusal
+ * half: our sentence plus a field PATH, never a zod message, which quotes the
+ * value it rejected. routes/triage.ts owns the vocabulary because it owns the
+ * writer; routes/issues.ts already reaches into routes/surface.ts the same way.
+ */
+import {
+  KNOWN_ISSUE_COVER_SCAN,
+  SUPPRESSION_REFUSAL_PROSE,
+  knownIssueSelection,
+  knownIssueView,
+  refusedPaths,
+  verdictSuppression,
+} from './triage.js';
+/*
  * THIS IMPORT USED TO BE A RELATIVE PATH, UNDER A COMMENT THAT WAS FALSE.
  *
  * The comment said `suite-health.js` is not exported from the package barrel.
@@ -147,7 +181,7 @@ import { forceStateOf } from '@qaai/shared';
  * note asks for.
  */
 import type { SuiteHealthTestInput } from '@qaai/agent';
-import { effectivePlan, startRun } from '../lib/start-run.js';
+import { effectivePlan } from '../lib/start-run.js';
 /*
  * ── THE OUTWARD-FACING WRITE, AND THE ONE SEAM IT GOES THROUGH ─────────────
  *
@@ -839,7 +873,26 @@ agentRouter.post('/plans/:planId/approve', requireRole('MEMBER'), async (req, re
 
 // ─── Verdicts (§3.3) ─────────────────────────────────────────────────────────
 
+/**
+ * The verdict list the cockpit reviews from.
+ *
+ * ── WHY EVERY ROW CARRIES `suppression` AND NOT JUST `reviewState` ─────────
+ *
+ * `reviewState: MUTED` was written by two endpoints and read by nothing, and
+ * this list is where a human read it. "MUTED" on a screen means "handled" to
+ * everybody who sees it, and for the whole life of that column it meant
+ * nothing at all. It suppresses only while a `KnownIssue` that is IN FORCE
+ * backs it, so the state travels with that answer — computed by
+ * `verdictSuppression`, which asks `reviewStateSuppresses(state, liveIssue)`
+ * and therefore cannot be satisfied by a state alone.
+ *
+ * `?state=MUTED` still filters on the column, because the column is what the
+ * row holds. The filter answers "what did people mute"; `suppression.suppresses`
+ * answers "what is actually silent", and conflating the two is how a verdict
+ * that went red again stayed off the board.
+ */
 agentRouter.get('/verdicts', async (req, res) => {
+  const now = new Date();
   const state = typeof req.query.state === 'string' ? req.query.state : undefined;
   const verdicts = await prisma.triageVerdict.findMany({
     where: {
@@ -858,25 +911,121 @@ agentRouter.get('/verdicts', async (req, res) => {
       },
     },
   });
-  res.json({ verdicts });
+
+  /*
+   * ONE read for the whole page's mutes, keyed by id, and none at all when
+   * nothing on the page is muted. No `take`: the key set is bounded by the page
+   * above, and a cap here could hide a live issue and make a real mute read as
+   * absent — which would report a suppression that exists as one that does not.
+   */
+  const issueIds = [
+    ...new Set(
+      verdicts.map((v) => v.knownIssueId).filter((id): id is string => id !== null),
+    ),
+  ];
+  const issues =
+    issueIds.length === 0
+      ? new Map<string, KnownIssueMatcher>()
+      : new Map(
+          (
+            await prisma.knownIssue.findMany({
+              where: { id: { in: issueIds } },
+              select: { id: true, signatures: true, expiresAt: true, revokedAt: true },
+            })
+          ).map((row) => [row.id, row satisfies KnownIssueMatcher]),
+        );
+
+  res.json({
+    verdicts: verdicts.map((verdict) => ({
+      ...verdict,
+      suppression: verdictSuppression(
+        verdict.reviewState,
+        verdict.knownIssueId === null ? null : (issues.get(verdict.knownIssueId) ?? null),
+        now,
+      ),
+    })),
+  });
 });
 
 /**
  * The keyboard-first review action (§8). A human can accept the verdict,
  * override it, or mute it — and the override is what gates, not the model's
  * original call.
+ *
+ * ── THE DEFECT THIS CLOSES: THE MUTE THAT MUTED NOTHING ────────────────────
+ *
+ * `action: 'mute'` wrote `VerdictReviewState.MUTED` and NOTHING ELSE. That
+ * state is not a suppression — it suppresses only while a `KnownIssue` that is
+ * IN FORCE backs it (`reviewStateSuppresses`) — so for the whole life of this
+ * endpoint a human pressed mute, the board said MUTED, and the next run minted
+ * a fresh verdict and bought a fresh strong-model heal for a failure somebody
+ * had already judged. Noise and cost, every run, for ever.
+ *
+ * So a mute now writes three things in ONE transaction: the review state, the
+ * `KnownIssue` for this verdict's cause, and `TriageVerdict.knownIssueId`.
+ * Partially applied, it would be worse than before — a verdict pointing at an
+ * issue that does not exist, or an issue nothing points at.
+ *
+ * ── AN EXPIRY IS REQUIRED, NOT DEFAULTED ───────────────────────────────────
+ *
+ * A mute with no expiry is not a mute, it is a deletion nobody signed. The
+ * request must carry one and the refusal names the ceiling
+ * (`SUPPRESSION_KIND_RULES.MUTE`), because silently stamping fourteen days on a
+ * request that asked for none is a cap applied without being disclosed — and
+ * the person who pressed the button would believe the silence ends when they
+ * decided it should.
+ *
+ * ── WHY THE OWNER IS THE REVIEWING ACTOR, WITH `EXPLICIT_ASSIGNMENT` ───────
+ *
+ * That is the ONLY human-set provenance (`isHumanSetProvenance`, the predicate
+ * `applySuppression` asks). A glob may route a failure to a team; it may not
+ * decide the failure stops counting. Pressing mute IS the explicit assignment,
+ * so the actor's own id goes on the row and the audit says which answer was
+ * accepted.
+ *
+ * ── A MUTED VERDICT WHOSE MUTE IS OVER CAN BE REVIEWED AGAIN ───────────────
+ *
+ * `reviewState !== 'PENDING'` as the only gate meant a verdict muted once could
+ * never be touched again — including after its known issue expired, which is
+ * exactly the moment the failure goes red and somebody needs to act. The gate
+ * now asks `verdictSuppression`, so a mute that has stopped suppressing is
+ * re-reviewable and an ACCEPTED or OVERRIDDEN verdict still is not.
  */
 agentRouter.post('/verdicts/:verdictId/review', requireRole('MEMBER'), async (req, res) => {
   const actor = actorOf(req);
+  const now = new Date();
   const action = String(req.body?.action ?? '');
   const overrideTo = req.body?.overrideTo as string | undefined;
 
   const verdict = await prisma.triageVerdict.findUnique({
     where: { id: String(req.params.verdictId) },
+    // The project, which the mute needs: a `KnownIssue` is scoped to a project
+    // and a verdict only knows its result.
+    include: { testResult: { select: { runId: true, run: { select: { projectId: true } } } } },
   });
   if (!verdict) throw notFound('Verdict');
-  if (verdict.reviewState !== 'PENDING') {
-    throw conflict(`This verdict was already reviewed (${verdict.reviewState})`);
+
+  /*
+   * The issue named on the verdict, if any, and what it is currently doing.
+   * Read BEFORE the re-review gate below, because the gate's question is "is
+   * this verdict still silent" and the only honest answer comes from the issue
+   * rather than from the state.
+   */
+  const named: KnownIssueMatcher | null = verdict.knownIssueId
+    ? await prisma.knownIssue.findUnique({
+        where: { id: verdict.knownIssueId },
+        select: { id: true, signatures: true, expiresAt: true, revokedAt: true },
+      })
+    : null;
+  const current = verdictSuppression(verdict.reviewState, named, now);
+
+  const reReviewable =
+    verdict.reviewState === 'PENDING' ||
+    (verdict.reviewState === 'MUTED' && !current.suppresses);
+  if (!reReviewable) {
+    throw conflict(`This verdict was already reviewed (${verdict.reviewState})`, {
+      suppression: current,
+    });
   }
 
   const reviewState =
@@ -892,14 +1041,206 @@ agentRouter.post('/verdicts/:verdictId/review', requireRole('MEMBER'), async (re
     throw badRequest('overrideTo is required when overriding a verdict');
   }
 
-  const updated = await prisma.triageVerdict.update({
-    where: { id: verdict.id },
-    data: {
-      reviewState,
-      reviewedBy: actor.userId,
-      reviewedAt: new Date(),
-      overriddenTo: reviewState === 'OVERRIDDEN' ? (overrideTo as never) : null,
+  if (reviewState !== 'MUTED') {
+    const updated = await prisma.triageVerdict.update({
+      where: { id: verdict.id },
+      data: {
+        reviewState,
+        reviewedBy: actor.userId,
+        reviewedAt: now,
+        overriddenTo: reviewState === 'OVERRIDDEN' ? (overrideTo as never) : null,
+        /*
+         * `knownIssueId` IS LEFT ALONE. A verdict that was muted and then
+         * accepted after the mute expired still names the issue that silenced
+         * it, and that is evidence: the column is deliberately not a foreign
+         * key so the record survives the mute being deleted, and clearing it
+         * here would throw away the same fact for the same reason.
+         */
+      },
+    });
+
+    await audit({
+      actor,
+      action: `verdict.${action}`,
+      targetType: 'TriageVerdict',
+      targetId: verdict.id,
+      metadata: { from: verdict.verdict, to: overrideTo ?? verdict.verdict },
+    });
+
+    res.json({
+      verdict: updated,
+      suppression: verdictSuppression(updated.reviewState, named, now),
+    });
+    return;
+  }
+
+  // ─── The mute ──────────────────────────────────────────────────────────────
+
+  const projectId = verdict.testResult.run.projectId;
+  const clusterKey = verdict.clusterKey;
+  /*
+   * A mute is keyed on the CAUSE, and a verdict that predates cause clustering
+   * names none. Refused rather than keyed on the test or the result: either
+   * would silence failures nobody has inspected, which is the quarantine
+   * mistake this whole vocabulary exists to avoid.
+   */
+  if (!clusterKey) {
+    throw badRequest(
+      'This verdict predates cause clustering, so there is no cause key to mute. A mute is keyed on the cause — never on the test — so that a change in the cause un-mutes it.',
+      { paths: ['clusterKey'] },
+    );
+  }
+
+  const reason = String(req.body?.reason ?? '').trim();
+  if (!reason) {
+    throw badRequest(
+      'reason is required: a mute with no stated reason is a silence the next person cannot evaluate.',
+      { paths: ['reason'] },
+    );
+  }
+
+  const mute = SUPPRESSION_KIND_RULES.MUTE;
+  if (req.body?.expiresAt === undefined || req.body?.expiresAt === null) {
+    throw badRequest(
+      'expiresAt is required: a mute with no expiry is not a mute, it is a deletion nobody signed. It is not defaulted, because a silence that ends on a date you did not choose is a cap applied without being disclosed.',
+      { paths: ['expiresAt'], ceilingDays: mute.maxDays, why: mute.why },
+    );
+  }
+
+  /*
+   * THE WIRE SHAPE, through the same validator the standalone writer uses
+   * (`POST /triage/known-issues`). It is what refuses a signature that is not
+   * an exact 12-hex key, an owner a glob chose, and a title carrying a fence
+   * marker — and routing this door through it is what stops the two writers
+   * being able to store different things.
+   *
+   * `title` IS COMPOSED FROM QAAI'S OWN HASH when the caller sends none. Never
+   * from the test's name or the failure's error text: a title assembled from
+   * failure output is a title attacker-influenced text can choose, and this one
+   * ends up on a tracker ticket.
+   */
+  const candidate = createKnownIssueSchema.safeParse({
+    projectId,
+    title: typeof req.body?.title === 'string' ? req.body.title : `Muted cause ${clusterKey}`,
+    reason,
+    signatures: [clusterKey],
+    owner: { kind: 'USER', userId: actor.userId },
+    ownerProvenance: 'EXPLICIT_ASSIGNMENT',
+    expiresAt: req.body.expiresAt,
+    ...(typeof req.body?.trackerIssueId === 'string'
+      ? { trackerIssueId: req.body.trackerIssueId }
+      : {}),
+  });
+  if (!candidate.success) {
+    throw badRequest(
+      'That is not a mute this API can store: an expiry inside the ceiling and a stated reason are both required, and the cause key must be an exact 12-hex cluster key.',
+      { paths: refusedPaths(candidate.error.issues) },
+    );
+  }
+
+  /*
+   * AND THE DECISION, through the only constructor. The schema above says the
+   * request is well-formed; `applySuppression` says whether this suppression
+   * may exist at all — a human owner, an expiry inside the kind's ceiling
+   * measured against an injected `now`, and the denominator effect this
+   * endpoint believes it is causing checked against the kind's own rule rather
+   * than trusted. Its refusal vocabulary is what the 400 below reports, so one
+   * refusal reads the same here as it does at the standalone writer.
+   */
+  const decision = applySuppression(
+    {
+      kind: 'MUTE',
+      target: { scope: 'SIGNATURE', key: clusterKey },
+      reason: candidate.data.reason,
+      owner: candidate.data.owner,
+      ownerProvenance: candidate.data.ownerProvenance,
+      expiresAt: candidate.data.expiresAt,
+      // A mute never changes the denominator: the failure stays counted and
+      // stays measured, it just stops paging.
+      expectedDenominator: 'STAYS_COUNTED',
     },
+    now,
+  );
+  if (!decision.applied) {
+    throw badRequest(SUPPRESSION_REFUSAL_PROSE[decision.refusal], {
+      refusal: decision.refusal,
+      paths: [decision.path],
+      ceilingDays: mute.maxDays,
+      why: mute.why,
+    });
+  }
+
+  /*
+   * Does a known issue already cover this cause? `createdAt: 'asc'` is
+   * load-bearing: `matchKnownIssue` takes the FIRST in-force match, so the
+   * oldest cover wins and a cause muted twice is attributed to one row stably.
+   * A count that moves between two rows depending on iteration order is a count
+   * nobody can audit.
+   */
+  const scanned = await prisma.knownIssue.findMany({
+    where: { projectId, signatures: { has: clusterKey } },
+    orderBy: { createdAt: 'asc' },
+    take: KNOWN_ISSUE_COVER_SCAN + 1,
+    select: { id: true, signatures: true, expiresAt: true, revokedAt: true, matchCount: true },
+  });
+  const coverScanCapped = scanned.length > KNOWN_ISSUE_COVER_SCAN;
+  const live = matchKnownIssue(scanned.slice(0, KNOWN_ISSUE_COVER_SCAN), clusterKey, now);
+
+  /*
+   * EXTENDING NEVER SHORTENS. Re-muting a cause whose cover runs until Friday
+   * with a request that ends on Wednesday would quietly take two days off a
+   * live suppression nobody asked to change, so the later of the two wins and
+   * the response says when the request's own date was not the one applied.
+   */
+  const requested = decision.suppression.expiresAt;
+  const expiresAt =
+    live !== null && live.expiresAt.getTime() > requested.getTime() ? live.expiresAt : requested;
+
+  const written = await prisma.$transaction(async (tx) => {
+    const issue = live
+      ? await tx.knownIssue.update({
+          where: { id: live.id },
+          data: { expiresAt },
+          select: knownIssueSelection,
+        })
+      : await tx.knownIssue.create({
+          data: {
+            orgId: actor.orgId,
+            projectId,
+            title: candidate.data.title,
+            reason: candidate.data.reason,
+            signatures: candidate.data.signatures,
+            // Exactly one of the two, which the migration's
+            // `KnownIssue_one_owner` CHECK also enforces for every other writer
+            // there will ever be.
+            ownerUserId: actor.userId,
+            ownerTeamId: null,
+            ownerProvenance: candidate.data.ownerProvenance,
+            expiresAt,
+            trackerIssueId: candidate.data.trackerIssueId ?? null,
+            createdBy: actor.userId,
+          },
+          select: knownIssueSelection,
+        });
+
+    const updated = await tx.triageVerdict.update({
+      where: { id: verdict.id },
+      data: {
+        reviewState,
+        reviewedBy: actor.userId,
+        reviewedAt: now,
+        overriddenTo: null,
+        /*
+         * WHICH mute silenced this failure. Without it the verdict says MUTED
+         * and no reader can tell whether anything is behind that, which was the
+         * original defect — and it is why the column is not a foreign key: the
+         * evidence has to survive the mute being deleted.
+         */
+        knownIssueId: issue.id,
+      },
+    });
+
+    return { issue, updated };
   });
 
   await audit({
@@ -907,10 +1248,45 @@ agentRouter.post('/verdicts/:verdictId/review', requireRole('MEMBER'), async (re
     action: `verdict.${action}`,
     targetType: 'TriageVerdict',
     targetId: verdict.id,
-    metadata: { from: verdict.verdict, to: overrideTo ?? verdict.verdict },
+    metadata: {
+      from: verdict.verdict,
+      to: overrideTo ?? verdict.verdict,
+      projectId,
+      clusterKey,
+      knownIssueId: written.issue.id,
+      /** True when this extended a cover that already existed rather than minting one. */
+      extendedExistingIssue: live !== null,
+      reason,
+      /** Both dates, because they differ exactly when a longer live cover was kept. */
+      expiresAtRequested: requested.toISOString(),
+      expiresAt: written.issue.expiresAt.toISOString(),
+      ownerUserId: actor.userId,
+      ownerProvenance: candidate.data.ownerProvenance,
+      /** The cap, on the record beside what the scan found. */
+      coverScanCapped,
+    },
   });
 
-  res.json({ verdict: updated });
+  res.json({
+    verdict: written.updated,
+    knownIssue: knownIssueView(written.issue, now),
+    /** The one field anything downstream may act on. */
+    suppression: verdictSuppression(written.updated.reviewState, written.issue, now),
+    note: [
+      `This cause is muted until ${written.issue.expiresAt.toISOString()}: no verdict and no strong-model heal will be bought for it, every failure it silences is counted on the known issue, and it stops suppressing the moment it expires.`,
+      live !== null
+        ? `A known issue already covered this cause, so it was extended rather than duplicated — its ${live.matchCount} recorded match(es) stay on the one row.`
+        : null,
+      expiresAt.getTime() !== requested.getTime()
+        ? 'The cover already ran later than the expiry you asked for and the later date was kept: shortening a live mute is a different decision from extending one.'
+        : null,
+      coverScanCapped
+        ? `More than ${KNOWN_ISSUE_COVER_SCAN} known issues name this cause, so one past that cap may already cover it and was not consulted. Check the roster before muting it again: two rows for one cause split the match count.`
+        : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(' '),
+  });
 });
 
 // ─── Heals (§3.4) ────────────────────────────────────────────────────────────
@@ -1010,112 +1386,25 @@ function verificationOf(heal: {
   };
 }
 
-/**
- * Start the run that checks an applied heal, and say what to record about it.
+/*
+ * `startHealVerification` IS GONE FROM THIS FILE. It was the third copy — the
+ * other two were apps/worker/src/processors/triage.ts and the one real
+ * implementation in apps/worker/src/processors/verify-heal.ts that nothing
+ * imported — and two of the three each wrote the same four `verifyState`
+ * columns inline afterwards, which is how `verifiedAt` came to be stamped on
+ * one path and not the other.
  *
- * ── WHY `advisory` AND NOT `enforce` ────────────────────────────────────────
+ * THIS FILE CANNOT IMPORT THE SURVIVOR: it lives in apps/worker, and a relative
+ * cross-workspace import into a worker processor would drag Prisma, BullMQ and
+ * the worker's own context into the API process. So the apply path ENQUEUES,
+ * which is strictly better than the inline call it replaces: the job survives a
+ * crash between writing the patch and starting the run, where the inline call
+ * left `verifyState` NULL and a patch nothing would ever re-measure.
  *
- * A person has just approved a fix for a red test. Throwing 402 at them because
- * the org is at its monthly run cap would refuse the APPROVAL over the
- * VERIFICATION — the heal would not be applied at all, and the customer would be
- * left with the broken test and a billing error message. So the toll is
- * advisory: the heal applies, and a refused verification is recorded as
- * UNVERIFIABLE with the quota as its stated reason. "Applied, nobody checked,
- * here is why" is a true sentence; "we could not apply your fix because of your
- * plan" is a worse product.
- *
- * ── WHY IT CAN COME BACK UNVERIFIABLE BEFORE IT EVEN RUNS ───────────────────
- *
- * A test that has never run has no environment to re-run it in, and guessing one
- * would be running the customer's test against a URL nobody chose. That is an
- * honest "nobody checked", recorded as such, rather than a silently skipped
- * verification — which is the defect this whole path exists to close.
+ * The queue is `'qaai.verify-heal'` in packages/shared/src/jobs.ts, consumed by
+ * apps/worker/src/index.ts, and `verifyHealJobOptions` carries BOTH removal
+ * flags for the reason that function documents.
  */
-async function startHealVerification(args: {
-  orgId: string;
-  healId: string;
-  testId: string;
-  projectId: string;
-}): Promise<{ runId: string | null; state: 'PENDING' | 'UNVERIFIABLE'; note: string }> {
-  // The environment the test last ran in — the one a re-run must reproduce.
-  // Same rule the flake radar's confirmation runs use.
-  const last = await prisma.testResult.findFirst({
-    where: { testId: args.testId, orgId: args.orgId },
-    orderBy: { createdAt: 'desc' },
-    select: { run: { select: { environmentId: true } } },
-  });
-  const environmentId = last?.run.environmentId;
-  if (!environmentId) {
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: 'The heal was applied and nobody has checked it: this test has never run, so there is no environment to re-run it in. Run it yourself to find out whether the fix works.',
-    };
-  }
-
-  const started = await startRun({
-    db: prisma,
-    orgId: args.orgId,
-    mode: 'advisory',
-    unscope: unscoped,
-    data: {
-      orgId: args.orgId,
-      projectId: args.projectId,
-      environmentId,
-      trigger: 'MANUAL',
-      triggeredBy: verificationRunTag(args.healId),
-      totalCount: 1,
-      // One placeholder result: the run processor executes exactly the tests its
-      // result rows name, which is how a single-test run is expressed here.
-      results: { create: [{ orgId: args.orgId, testId: args.testId, status: 'SKIPPED' as const }] },
-    },
-  });
-
-  if (!started.created) {
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: `The heal was applied and nobody has checked it: the verifying run could not be started. ${started.quota.reason ?? 'This org is at its monthly run limit.'}`,
-    };
-  }
-
-  try {
-    await enqueue(
-      QUEUE_NAMES.run,
-      { orgId: args.orgId, runId: started.run.id },
-      // Idempotent on run id, like POST /runs: a retried approval cannot
-      // double-execute the verification.
-      { jobId: `run-${started.run.id}` },
-    );
-  } catch {
-    /*
-     * A run row with no job would sit PENDING until the sweep's deadline and
-     * then report itself unverifiable for the wrong reason. Mark it dead now and
-     * say the true reason.
-     */
-    await prisma.run
-      .update({
-        where: { id: started.run.id },
-        data: {
-          status: 'ERRORED',
-          finishedAt: new Date(),
-          errorMessage: 'The heal verification run could not be queued.',
-        },
-      })
-      .catch(() => {});
-    return {
-      runId: null,
-      state: 'UNVERIFIABLE',
-      note: 'The heal was applied and nobody has checked it: the verifying run could not be queued. Run the test yourself to find out whether the fix works.',
-    };
-  }
-
-  return {
-    runId: started.run.id,
-    state: 'PENDING',
-    note: `Applied, and now being checked: run ${started.run.id} re-runs this test on its own. Until it lands, nobody has confirmed the fix works.`,
-  };
-}
 
 /** Open proposals for one test, in the shape the lifecycle rules want. */
 async function openHealsFor(orgId: string, testId: string): Promise<OpenHeal[]> {
@@ -1502,22 +1791,35 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
    * exactly what would have happened, rather than a row waiting forever on a run
    * that was never created. The sweep only ever chases PENDING.
    */
-  const verification = await startHealVerification({
-    orgId: heal.orgId,
-    healId: heal.id,
-    testId: heal.testId,
-    projectId: heal.test.projectId,
-  });
-  await prisma.healProposal.update({
-    where: { id: heal.id },
-    data: {
-      verifyState: verification.state,
-      verifyRunId: verification.runId,
-      verifyNote: verification.note,
-      // Only an outcome stamps this. PENDING is not an outcome.
-      verifiedAt: verification.state === 'UNVERIFIABLE' ? new Date() : null,
-    },
-  });
+  /*
+   * ── NO SYNCHRONOUS STATE TO REPORT, AND THAT IS NOT A DOWNGRADE ───────────
+   *
+   * This used to report PENDING here. There is no run yet at this moment and
+   * `verifyState` is still NULL, so PENDING would be a claim about a run that
+   * does not exist — a thing reported as measured that was not measured. The
+   * CONSUMER writes those four columns, as the one writer, when it has an
+   * answer.
+   *
+   * A FAILED ENQUEUE LEAVES THE COLUMN NULL ON PURPOSE. The hole sweep in
+   * apps/worker/src/processors/flake.ts looks for exactly `verifyState: null`
+   * on a recently-decided heal and starts the verification itself, so NULL is
+   * the state that gets recovered. Writing UNVERIFIABLE here instead would make
+   * the row invisible to the only thing that would have rescued it.
+   */
+  let verificationRequested = true;
+  try {
+    await enqueue(
+      'qaai.verify-heal',
+      { orgId: heal.orgId, healId: heal.id, reason: 'APPLY' as const },
+      verifyHealJobOptions(heal.id),
+    );
+  } catch (err) {
+    verificationRequested = false;
+    logger.error(
+      { err, healId: heal.id, testId: heal.testId },
+      'could not queue the verification for an applied heal; the hole sweep will start it from the NULL verifyState',
+    );
+  }
 
   await audit({
     actor,
@@ -1534,21 +1836,37 @@ agentRouter.post('/heals/:healId/decide', requireRole('MEMBER'), async (req, res
       flags: check.flags,
       appliedVersion,
       superseded: supersede.ids,
-      // Whether anything is going to check this, on the record next to the
-      // apply. "Applied" and "verified" are different claims.
-      verification: { state: verification.state, runId: verification.runId },
+      /*
+       * Whether anything is going to check this, on the record next to the
+       * apply. "Applied", "being checked" and "verified" are three different
+       * claims, and this row may only make the weakest one: `state` and `runId`
+       * are NULL because at this instant there is no verification state and no
+       * run. `requested` is the fact this path actually knows.
+       */
+      verification: { state: null, runId: null, requested: verificationRequested },
     },
   });
 
   res.json({
-    heal: { ...updatedHeal, verifyState: verification.state, verifyRunId: verification.runId },
+    /*
+     * The ROW, not an overlay. The two fields this used to overwrite are the
+     * ones the consumer owns; reading them off `updatedHeal` means the response
+     * reports what is stored (NULL — nobody has checked yet) instead of a state
+     * composed here. If a caller has to overwrite a field to make it mean what
+     * it needs, that is two fields.
+     */
+    heal: updatedHeal,
     note: [
       applied.fuzz && applied.fuzz > 0
         ? `Applied, but the patch needed ${applied.fuzz} line(s) of fuzz — worth a glance in the editor.`
         : 'Applied to the test. Push it from Source control when you are ready.',
       // Before the gate prose, because "is this actually fixed" is the first
-      // question and used to have no answer at all.
-      verification.note,
+      // question and used to have no answer at all. It still has no ANSWER
+      // here — only a promise that something will go and look — and the
+      // sentence says exactly that rather than implying a result.
+      verificationRequested
+        ? 'A run is being queued to re-check it; nothing has confirmed the fix yet.'
+        : 'Nothing could be queued to re-check it right now; the verification sweep will pick it up. Nobody has confirmed the fix yet.',
       ...(supersede.ids.length > 0
         ? [`${supersede.ids.length} other open proposal(s) for this test were superseded.`]
         : []),
@@ -1834,16 +2152,16 @@ agentRouter.post('/heals/:healId/pull-request', requireRole('MEMBER'), async (re
       spans: [
         untrusted({
           /*
-           * RUNNER_OUTPUT, and that is a COMPROMISE worth naming rather than
-           * hiding. A heal explanation is a MODEL's prose about a failure, and
-           * `UNTRUSTED_PROVENANCES` has no MODEL_OUTPUT member — so the nearest
-           * true label is the run output the model was summarising, which is
-           * what the text is derived from and is untrusted for the same reason.
-           * The fence is identical either way; only the disclosure's wording is
-           * less precise than it should be. The vocabulary addition is in this
-           * round's `needsFromOtherFiles`.
+           * MODEL_OUTPUT, which is what this text actually is. It was
+           * RUNNER_OUTPUT — the nearest true label available before
+           * `UNTRUSTED_PROVENANCES` had a member for a model's own prose — and
+           * the fence was identical while the DISCLOSURE was wrong: a reader
+           * told "output printed by the test run" would go looking for this in
+           * the logs. Untrusted for the same reason either way, because the
+           * failure message and the page text that went INTO the explanation
+           * are attacker-influenceable.
            */
-          provenance: 'RUNNER_OUTPUT',
+          provenance: 'MODEL_OUTPUT',
           text: heal.explanation,
           origin: heal.test.filePath,
         }),

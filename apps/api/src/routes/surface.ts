@@ -47,8 +47,10 @@ import { z } from 'zod';
 import {
   COVERED_STATUSES,
   EXCLUDED_STATUSES,
+  SUPPRESSION_KIND_RULES,
   SURFACE_KINDS,
   SURFACE_STATUSES,
+  applySuppression,
   parseSurfaceKey,
 } from '@qaai/shared';
 import type { FlowMap, SurfaceItemCoverage, SurfaceKind, SurfaceStatus } from '@qaai/shared';
@@ -77,6 +79,7 @@ import type {
   OwnershipState,
 } from '../lib/ownership.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
+import { SUPPRESSION_REFUSAL_PROSE } from './triage.js';
 
 export const surfaceRouter: Router = Router();
 
@@ -801,10 +804,21 @@ const waiverBody = z.object({
    */
   reason: z.string().trim().min(10).max(1000),
   /**
-   * Optional, but the UI proposes one. A waiver with no expiry is how a
-   * denominator quietly shrinks forever.
+   * REQUIRED, and bounded by `SUPPRESSION_KIND_RULES.COVERAGE_WAIVER.maxDays`.
+   *
+   * It was optional, with a doc comment on this very field saying "a waiver
+   * with no expiry is how a denominator quietly shrinks forever" — and then
+   * permitting exactly that. A waiver is the ONLY kind that can make the
+   * coverage number go up, so an unbounded one is the single most valuable
+   * thing a person gaming the number could write, and this door was the only
+   * way to write it.
+   *
+   * The date is not validated here beyond being a date: the ceiling, the
+   * past-expiry case and the human-owner requirement all belong to
+   * `applySuppression`, which is the only constructor, and routing through it
+   * is what makes a refusal read the same here as it does at the mute door.
    */
-  expiresAt: z.coerce.date().optional(),
+  expiresAt: z.coerce.date(),
 });
 
 surfaceRouter.post(
@@ -821,8 +835,48 @@ surfaceRouter.post(
         `"${key}" is not a surface key. They look like ROUTE:/orders/:param or ENDPOINT:POST /api/refunds.`,
       );
     }
-    if (expiresAt && expiresAt.getTime() <= Date.now()) {
-      throw badRequest('A waiver that has already expired would have no effect.');
+
+    const actor = actorOf(req);
+    const now = new Date();
+    /*
+     * THE DECISION, through the only constructor — the fifth caller of
+     * `applySuppression` and the one that was missing.
+     *
+     * The schema above says the request is well-formed. This says whether a
+     * suppression of this KIND may exist at all: an expiry inside
+     * COVERAGE_WAIVER's own 365-day ceiling, not in the past, owned by a named
+     * human with a human-set provenance, and causing the denominator effect
+     * this endpoint believes it is causing rather than whichever one it turns
+     * out to cause. `expectedDenominator` is the load-bearing one here:
+     * LEAVES_DENOMINATOR is checked against the kind's rule, so a future caller
+     * that reused this door for a kind that only silences a failure would be
+     * refused instead of quietly removing a surface from the measurement.
+     */
+    const decision = applySuppression(
+      {
+        kind: 'COVERAGE_WAIVER',
+        target: { scope: 'SURFACE_ITEM', key },
+        reason,
+        owner: { kind: 'USER', userId: actor.userId },
+        // A waiver is a decision a person signs. Nothing else may set this.
+        ownerProvenance: 'EXPLICIT_ASSIGNMENT',
+        expiresAt,
+        expectedDenominator: 'LEAVES_DENOMINATOR',
+      },
+      now,
+    );
+    if (!decision.applied) {
+      /*
+       * The refusal and the PATH, never the rejected value: the reason and the
+       * key are a customer's own text and a refusal that quotes them is how
+       * untrusted text reaches a log line and a reader.
+       */
+      throw badRequest(SUPPRESSION_REFUSAL_PROSE[decision.refusal], {
+        refusal: decision.refusal,
+        paths: [decision.path],
+        ceilingDays: SUPPRESSION_KIND_RULES.COVERAGE_WAIVER.maxDays,
+        why: SUPPRESSION_KIND_RULES.COVERAGE_WAIVER.why,
+      });
     }
 
     const project = await projectOr404(String(req.params.projectId));
@@ -842,7 +896,6 @@ surfaceRouter.post(
       );
     }
 
-    const actor = actorOf(req);
     // The waiver's owner has to be readable by a human reviewing exclusions
     // months later, and ActorContext carries only an id.
     const owner = await prisma.user.findUnique({
@@ -858,13 +911,15 @@ surfaceRouter.post(
         reason,
         byUserId: actor.userId,
         byEmail: owner?.email ?? null,
-        expiresAt: expiresAt ?? null,
+        // From the decision, not from the body: non-null by construction, and
+        // the one value every reader of this row is entitled to assume exists.
+        expiresAt: decision.suppression.expiresAt,
       },
       update: {
         reason,
         byUserId: actor.userId,
         byEmail: owner?.email ?? null,
-        expiresAt: expiresAt ?? null,
+        expiresAt: decision.suppression.expiresAt,
       },
       select: { id: true, createdAt: true, expiresAt: true },
     });

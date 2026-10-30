@@ -792,9 +792,22 @@ export function VerdictCard({
           </button>
         </div>
       ) : (
-        <p className="text-ink-faint mt-4 font-mono text-micro">
-          reviewed · {verdict.reviewState.toLowerCase()}
-        </p>
+        <>
+          <p className="text-ink-faint mt-4 font-mono text-micro">
+            reviewed · {verdict.reviewState.toLowerCase()}
+          </p>
+          {/*
+           * WHAT THE REVIEW ACTUALLY DID. `MUTED` on its own suppresses
+           * nothing — it silences only while a `KnownIssue` that is IN FORCE
+           * backs it — and this panel said "reviewed · muted" for a mute whose
+           * issue had expired, been revoked, or never existed. The server's own
+           * sentence is rendered rather than one composed here, so the cockpit
+           * and the API cannot come to say different things about one row.
+           */}
+          {verdict.suppression?.note && (
+            <p className="text-ink-faint mt-1 text-micro">{verdict.suppression.note}</p>
+          )}
+        </>
       )}
     </section>
   );

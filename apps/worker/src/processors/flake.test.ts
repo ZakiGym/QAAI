@@ -23,6 +23,13 @@ import {
 } from '@qaai/shared';
 import type { FlakePolicy, TestResultStatus } from '@qaai/shared';
 import { verificationRunTag } from '@qaai/agent';
+/*
+ * The production expression under test. `processVerifyHeal(healVerificationPorts(), job)`
+ * is verbatim the body of the `VERIFY_HEAL_QUEUE` registration in
+ * apps/worker/src/index.ts, so the chain tests at the bottom of this file
+ * exercise the registration's own code rather than a re-derivation of it.
+ */
+import { processVerifyHeal } from './verify-heal.js';
 import type { FlakeSample } from './flake.js';
 
 // The worker's context opens Postgres and Redis at import time, so it is
@@ -31,8 +38,17 @@ const h = vi.hoisted(
   (): {
     prisma: Record<string, unknown>;
     enqueued: Array<{ runId: string; background: boolean }>;
-  } => ({ prisma: {}, enqueued: [] }),
+    /** Every `enqueueVerifyHeal` the hole sweep made, in order. */
+    verifyHealJobs: Array<{ orgId: string; healId: string; reason: string }>;
+    /** Heal ids whose enqueue throws, for the one-bad-row arm. */
+    verifyHealThrows: Set<string>;
+  } => ({ prisma: {}, enqueued: [], verifyHealJobs: [], verifyHealThrows: new Set() }),
 );
+
+beforeEach(() => {
+  h.verifyHealJobs.length = 0;
+  h.verifyHealThrows.clear();
+});
 
 vi.mock('../context.js', () => ({
   logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
@@ -42,6 +58,18 @@ vi.mock('../context.js', () => ({
 vi.mock('../queues.js', () => ({
   enqueueRun: async (job: { runId: string }, opts?: { background?: boolean }) => {
     h.enqueued.push({ runId: job.runId, background: opts?.background === true });
+  },
+  /*
+   * The hole sweep's producer. Recorded rather than ignored, because the thing
+   * under test is WHICH heals it asks for — a sweep that enqueued the wrong set
+   * (or the right set twice) would look identical with a no-op stand-in.
+   *
+   * `verifyHealThrows` is the Redis-blip arm: one org's failed enqueue must not
+   * stop the sweep for every other org.
+   */
+  enqueueVerifyHeal: async (job: { orgId: string; healId: string; reason: string }) => {
+    if (h.verifyHealThrows.has(job.healId)) throw new Error('redis is down');
+    h.verifyHealJobs.push(job);
   },
 }));
 
@@ -58,8 +86,11 @@ const {
   processFlakeTick,
   pruneFlakeHistory,
   verifyAppliedHeals,
+  healVerificationPorts,
+  startVerificationHoles,
   HEAL_AUDIT_ACTIONS,
   HEAL_VERIFY_DEADLINE_MINUTES,
+  HEAL_VERIFY_START_LOOKBACK_DAYS,
 } = await import('./flake.js');
 
 type Measurement = ReturnType<typeof measureSamples>;
@@ -1303,8 +1334,46 @@ const HEAL_DIFF = [
   "+  await expect(page.getByTestId('order-receipt')).toBeVisible();",
 ].join('\n');
 
+/**
+ * Project a row the way `select` does, so DROPPING A FIELD FROM A QUERY IS
+ * VISIBLE.
+ *
+ * A select-blind fake hands back every column whatever the query asked for, so
+ * deleting a `select` entry cannot fail a test — and one of those entries
+ * (`acceptance`, on the drift query) killed every retirement proposal in
+ * production while this file stayed green. `true` keys are copied; a nested
+ * `{ select }` recurses, which is how `test: { select: { projectId: true } }`
+ * on the heal read is honoured.
+ */
+function project(row: Row | null, select: Row | undefined): Row | null {
+  if (row === null) return null;
+  if (!select) return row;
+  const out: Row = {};
+  for (const [key, want] of Object.entries(select)) {
+    if (want === true) out[key] = row[key];
+    else if (want && typeof want === 'object' && 'select' in want) {
+      out[key] = project(row[key] ?? null, (want as Row).select as Row | undefined);
+    }
+  }
+  return out;
+}
+
 interface HealScenario {
   pendingHeals?: Row[];
+  /**
+   * Applied heals with `verifyState: null` — the rows `verifyAppliedHeals` is
+   * structurally unable to see. Answered by the `verifyState: null` branch of
+   * `healProposal.findMany` below.
+   */
+  holeHeals?: Row[];
+  /** Keyed by heal id, for the `loadHeal` port. Carries `test.projectId`. */
+  healsById?: Record<string, Row>;
+  /** The environment the test last ran in, for the `lastEnvironmentFor` port. */
+  lastEnvironmentId?: string | null;
+  /** The three reads `startRun`'s plan toll makes. */
+  subscription?: Row | null;
+  organization?: Row | null;
+  usage?: Row | null;
   /** Keyed by run id. */
   runs?: Record<string, { status: string; results: Row[] }>;
   versions?: Array<{ version: number; code: string }>;
@@ -1330,14 +1399,48 @@ function fakeHealPrisma(scenario: HealScenario) {
     transactions: [] as number[],
     /** The arguments the route-item read was made with. See the ORDER BY test. */
     coverageQueries: [] as Row[],
+    /** The arguments the hole query was made with. See the cap test. */
+    holeQueries: [] as Row[],
+    /** Run rows the verification port asked `startRun` to create. */
+    runCreates: [] as Row[],
+    /** The usage counter the toll incremented. A run nobody metered is a lie. */
+    usageUpserts: [] as Row[],
   };
 
   const prisma = {
     healProposal: {
-      findMany: async (args: Row) =>
-        args.where?.verifyState === 'PENDING'
+      /*
+       * HONOURS `select`, `take` AND `orderBy` on the hole branch, because the
+       * hole sweep uses all three and its CAP is a disclosed fact: a fake that
+       * ignored `take` could not show the cap biting, and `capped` is computed
+       * from `take + 1` rows coming back.
+       */
+      findMany: async (args: Row) => {
+        if (args.where && 'verifyState' in args.where && args.where.verifyState === null) {
+          calls.holeQueries.push(args);
+          const since = args.where?.decidedAt?.gte as Date | undefined;
+          let rows = (scenario.holeHeals ?? []).filter(
+            (row) => since === undefined || row.decidedAt === null || row.decidedAt >= since,
+          );
+          if (args.orderBy?.decidedAt === 'asc') {
+            rows = [...rows].sort(
+              (a, b) => (a.decidedAt?.getTime() ?? 0) - (b.decidedAt?.getTime() ?? 0),
+            );
+          }
+          if (typeof args.take === 'number') rows = rows.slice(0, args.take);
+          return rows.map((row) => project(row, args.select as Row | undefined));
+        }
+        return args.where?.verifyState === 'PENDING'
           ? (scenario.pendingHeals ?? [])
-          : (scenario.openHeals ?? []),
+          : (scenario.openHeals ?? []);
+      },
+      /** The `loadHeal` port's read. Honours `select`, including the nested test. */
+      findFirst: async (args: Row) => {
+        const row = scenario.healsById?.[args.where?.id] ?? null;
+        if (row === null) return null;
+        if (args.where?.orgId !== undefined && row.orgId !== args.where.orgId) return null;
+        return project(row, args.select as Row | undefined);
+      },
       create: async (args: Row) => {
         calls.healCreates.push(args.data);
         return args.data;
@@ -1374,6 +1477,10 @@ function fakeHealPrisma(scenario: HealScenario) {
     },
     run: {
       findMany: async () => [],
+      create: async (args: Row) => {
+        calls.runCreates.push(args.data);
+        return { id: 'run-new-1', ...args.data };
+      },
       findFirst: async (args: Row) => {
         const run = scenario.runs?.[args.where.id];
         return run ? { id: args.where.id, ...run } : null;
@@ -1385,12 +1492,49 @@ function fakeHealPrisma(scenario: HealScenario) {
     },
     triageVerdict: { findMany: async () => scenario.flakeVerdicts ?? [] },
     /*
+     * ── WHAT `startRun` NEEDS, AND WHY IT IS FAKED RATHER THAN BYPASSED ─────
+     *
+     * A verification run is a Run, so it goes through the ONE toll every path
+     * that creates a Run goes through: the plan gate and the usage counter. A
+     * port that inserted a row behind the plan's back would be a run the
+     * billing screen under-reports for ever, so the fake answers the toll's own
+     * three reads instead of the port skipping it.
+     *
+     * `runQuota` reads the subscription, the org plan and this period's usage;
+     * `unscope` defaults to calling through, so these are plain delegates.
+     */
+    subscription: { findUnique: async () => scenario.subscription ?? null },
+    organization: { findUnique: async () => scenario.organization ?? { plan: 'TEAM' } },
+    usageRecord: {
+      findUnique: async () => scenario.usage ?? null,
+      upsert: async (args: Row) => {
+        calls.usageUpserts.push(args);
+        return {};
+      },
+    },
+    /*
      * The investigation half of the tick, answered with nothing. Present so the
      * one test that goes through `processFlakeTick` reaches the sweeps below
      * rather than dying on a missing stand-in — and absent from the per-sweep
      * tests, which call their sweep directly.
      */
-    testResult: { findMany: async () => [], findFirst: async () => null },
+    testResult: {
+      findMany: async () => [],
+      /*
+       * The `lastEnvironmentFor` port. `in` and not `??` on the scenario key:
+       * an explicit `lastEnvironmentId: null` is the "this test has never run"
+       * case, and `null ?? 'env-1'` would quietly hand it an environment.
+       */
+      findFirst: async (args: Row = {}) =>
+        'lastEnvironmentId' in scenario
+          ? scenario.lastEnvironmentId === null
+            ? null
+            : project(
+                { run: { environmentId: scenario.lastEnvironmentId } },
+                args.select as Row | undefined,
+              )
+          : null,
+    },
     testFlakeHistory: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
     /*
      * HONOURS `select`, because a select-blind fake made deleting a field from
@@ -1640,6 +1784,572 @@ describe('verifying a heal that was applied', () => {
 
     expect(calls.healUpdates).toHaveLength(1);
     expect(calls.audits.at(-1)!.targetId).toBe('heal-good');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ITEM 2: THE ROLLBACK, AGAINST THE REAL WRITE.
+//
+// `processVerifyHeal` reporting `reverted: true` was pinned by a test against a
+// FAKE recorder that was told what to say. The actual revert — appending a new
+// TestVersion from `appliedVersion - 1` — was pinned only by the three
+// `calls.testUpdates` assertions above, which observe the WRITE and never the
+// RETURN, so no caller could be shown to learn what happened. A rollback nobody
+// has watched is a rollback.
+//
+// These go through `healVerificationPorts().recorder`, which is the EXACT
+// object the `VERIFY_HEAL_QUEUE` handler in apps/worker/src/index.ts passes to
+// `processVerifyHeal` — not a copy of it and not a re-derivation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const recorderArgs = (over: Row = {}): Row => ({
+  healId: 'heal-1',
+  orgId: 'org-1',
+  testId: 'test-1',
+  healState: 'AUTO_APPLIED',
+  verifyRunId: 'run-verify-1',
+  appliedVersion: 4,
+  decidedAt: new Date(Date.now() - 10 * 60_000),
+  createdAt: new Date(Date.now() - 20 * 60_000),
+  now: new Date(),
+  ...over,
+});
+
+describe('the revert tells its caller what it did', () => {
+  it('names the version restored AND the version it was appended as', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    const out = await healVerificationPorts().recorder.record(recorderArgs() as never);
+
+    // The RETURN, which is what the queue path reports to the customer.
+    expect(out).toEqual({
+      wrote: true,
+      state: 'STILL_FAILING',
+      reverted: true,
+      revertedToVersion: 3,
+    });
+    // And the WRITE it is a report of, in the same assertion block: a return
+    // value that agreed with itself while writing nothing would pass half of
+    // this test.
+    expect(calls.testUpdates).toHaveLength(1);
+    expect(calls.testUpdates[0]!.data.code).toBe('OLD CODE');
+    // Append, never rewind.
+    expect(calls.testUpdates[0]!.data.versions.create.version).toBe(5);
+    expect(calls.audits.at(-1)!.metadata).toMatchObject({
+      reverted: true,
+      revertedToVersion: 3,
+    });
+  });
+
+  it('reports the revert it could NOT do, and why, rather than a bare false', async () => {
+    /*
+     * The decision said revert and the history cannot support it: version 3 is
+     * not there, so writing "whatever came before" would put a version of the
+     * test in the customer's repository that this heal never replaced. The
+     * patch STAYS — and `reverted: false` on its own is indistinguishable from
+     * "no revert was asked for", which is a cap that bit and was not disclosed.
+     */
+    const { prisma, calls } = fakeHealPrisma({
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [{ version: 4, code: 'HEALED CODE' }],
+    });
+    h.prisma = prisma;
+
+    const out = await healVerificationPorts().recorder.record(recorderArgs() as never);
+
+    expect(out).toEqual({
+      wrote: true,
+      state: 'STILL_FAILING',
+      reverted: false,
+      revertedToVersion: null,
+    });
+    expect(calls.testUpdates).toEqual([]);
+    expect(String(calls.healUpdates[0]!.data.verifyNote)).toMatch(/could NOT be reverted/);
+  });
+
+  it('never reverts a heal a person approved, and says so in the return', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    const out = await healVerificationPorts().recorder.record(
+      recorderArgs({ healState: 'APPLIED' }) as never,
+    );
+
+    expect(out.reverted).toBe(false);
+    expect(out.revertedToVersion).toBeNull();
+    // The predecessor EXISTS here, so a false that came from the refusal above
+    // and a false that came from the decision are told apart by the write.
+    expect(calls.testUpdates).toEqual([]);
+  });
+
+  it('reports a run still in flight as "nothing was written", not as PENDING recorded', async () => {
+    /*
+     * THE LIE THIS PINS: a thing reported as measured that was not measured.
+     * `wrote: false` is the only field that separates "the row was already
+     * PENDING and I left it alone" from "I just wrote PENDING".
+     */
+    const { prisma, calls } = fakeHealPrisma({
+      runs: { 'run-verify-1': { status: 'RUNNING', results: [] } },
+    });
+    h.prisma = prisma;
+
+    const out = await healVerificationPorts().recorder.record(recorderArgs() as never);
+
+    expect(out).toEqual({
+      wrote: false,
+      state: 'PENDING',
+      reverted: false,
+      revertedToVersion: null,
+    });
+    expect(calls.healUpdates).toEqual([]);
+    expect(calls.audits).toEqual([]);
+    expect(calls.testUpdates).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The heal nothing would ever have checked.
+//
+// `verifyAppliedHeals` scans `where: { verifyState: 'PENDING' }`. A heal whose
+// apply committed and whose verification start then failed has `verifyState:
+// null` FOR EVER and no query in that sweep can find it — an applied patch in a
+// customer's test that nothing will re-measure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const holeHeal = (over: Row = {}): Row => ({
+  id: 'heal-hole',
+  orgId: 'org-1',
+  state: 'AUTO_APPLIED',
+  verifyState: null,
+  decidedAt: new Date(Date.now() - 60 * 60_000),
+  ...over,
+});
+
+describe('the applied heal with no verification state', () => {
+  it('is found and asked for, with the sweep reason on the job', async () => {
+    const { prisma } = fakeHealPrisma({ holeHeals: [holeHeal()] });
+    h.prisma = prisma;
+
+    const out = await startVerificationHoles(new Date());
+
+    expect(out).toMatchObject({ scanned: 1, enqueued: 1, capped: false, failed: 0 });
+    expect(h.verifyHealJobs).toEqual([
+      { orgId: 'org-1', healId: 'heal-hole', reason: 'SWEEP_FOUND_NO_START' },
+    ]);
+  });
+
+  it('asks the query for only the window it claims to read', async () => {
+    // The lookback is a BOUND and it is disclosed on the function. A query
+    // without the `decidedAt` floor would be reading the whole NULL section of
+    // the index while the constant said otherwise — a doc comment that
+    // contradicts the code under it.
+    const now = new Date();
+    const { prisma, calls } = fakeHealPrisma({ holeHeals: [holeHeal()] });
+    h.prisma = prisma;
+
+    await startVerificationHoles(now);
+
+    const where = calls.holeQueries[0]!.where;
+    expect(where.verifyState).toBeNull();
+    expect(where.state).toEqual({ in: ['APPLIED', 'AUTO_APPLIED'] });
+    expect((where.decidedAt.gte as Date).getTime()).toBe(
+      now.getTime() - HEAL_VERIFY_START_LOOKBACK_DAYS * 24 * 60 * 60_000,
+    );
+  });
+
+  it('refuses with a counted reason rather than silently skipping', async () => {
+    const now = new Date();
+    const { prisma } = fakeHealPrisma({
+      holeHeals: [
+        // Inside the grace period: the apply path's own start may be in flight.
+        holeHeal({ id: 'heal-fresh', decidedAt: new Date(now.getTime() - 60_000) }),
+        // No apply time, so the grace period cannot be measured.
+        holeHeal({ id: 'heal-no-time', decidedAt: null }),
+        holeHeal({ id: 'heal-real' }),
+      ],
+    });
+    h.prisma = prisma;
+
+    const out = await startVerificationHoles(now);
+
+    expect(out.scanned).toBe(3);
+    expect(out.enqueued).toBe(1);
+    expect(out.refusals).toEqual({ WITHIN_GRACE: 1, NO_APPLY_TIME: 1 });
+    expect(h.verifyHealJobs.map((job) => job.healId)).toEqual(['heal-real']);
+  });
+
+  it('DISCLOSES the cap when it bites, so the count reads as a floor', async () => {
+    /*
+     * A cap applied without being disclosed is one of the lies this product
+     * cannot afford. The query asks for `limit + 1` precisely so this can be
+     * SEEN rather than inferred from a length that happens to equal the limit.
+     */
+    const { prisma } = fakeHealPrisma({
+      holeHeals: Array.from({ length: 60 }, (_, i) =>
+        holeHeal({ id: `heal-${i}`, decidedAt: new Date(Date.now() - (60 + i) * 60_000) }),
+      ),
+    });
+    h.prisma = prisma;
+
+    const out = await startVerificationHoles(new Date());
+
+    expect(out.capped).toBe(true);
+    expect(out.scanned).toBe(50);
+    expect(out.enqueued).toBe(50);
+    expect(h.verifyHealJobs).toHaveLength(50);
+  });
+
+  it('one failed enqueue does not stop the sweep for every other org', async () => {
+    const { prisma } = fakeHealPrisma({
+      holeHeals: [holeHeal({ id: 'heal-bad' }), holeHeal({ id: 'heal-good' })],
+    });
+    h.prisma = prisma;
+    h.verifyHealThrows.add('heal-bad');
+
+    const out = await startVerificationHoles(new Date());
+
+    expect(out).toMatchObject({ scanned: 2, enqueued: 1, failed: 1 });
+    expect(h.verifyHealJobs.map((job) => job.healId)).toEqual(['heal-good']);
+  });
+
+  it('runs on the tick, and a failure there does not stop the rest of it', async () => {
+    /*
+     * Through `processFlakeTick`, because the question is whether the sweep is
+     * REACHED FROM PRODUCTION. A test that called `startVerificationHoles`
+     * directly would pass with the tick's call deleted, which is the exact
+     * defect — correct code connected to nothing — this whole round is about.
+     */
+    const { prisma } = fakeHealPrisma({ holeHeals: [holeHeal()] });
+    h.prisma = prisma;
+
+    await processFlakeTick({ at: new Date().toISOString() });
+
+    expect(h.verifyHealJobs).toEqual([
+      { orgId: 'org-1', healId: 'heal-hole', reason: 'SWEEP_FOUND_NO_START' },
+    ]);
+  });
+});
+
+describe('the ports the queue reaches this file through', () => {
+  it('starts exactly ONE test, tagged so the sweep can find the run again', async () => {
+    const { prisma, calls } = fakeHealPrisma({ lastEnvironmentId: 'env-7' });
+    h.prisma = prisma;
+
+    const started = await healVerificationPorts().runs.start({
+      orgId: 'org-1',
+      projectId: 'proj-1',
+      environmentId: 'env-7',
+      testId: 'test-1',
+      triggeredBy: verificationRunTag('heal-1'),
+    });
+
+    expect(started.created).toBe(true);
+    expect(calls.runCreates).toHaveLength(1);
+    const data = calls.runCreates[0]!;
+    // ONE test, and only one: re-running five thousand tests to verify one heal
+    // is why this has to be targeted.
+    expect(data.totalCount).toBe(1);
+    expect(data.results.create).toEqual([
+      { orgId: 'org-1', testId: 'test-1', status: 'SKIPPED' },
+    ]);
+    // The tag is what lets the sweep find this run again with no column
+    // pointing at it.
+    expect(data.triggeredBy).toBe(verificationRunTag('heal-1'));
+    // And it went through the toll: a run nobody metered is a run the billing
+    // screen under-reports for ever.
+    expect(calls.usageUpserts).toHaveLength(1);
+  });
+
+  it('reports the plan limit that BIT instead of creating a run behind it', async () => {
+    // `advisory`, so the heal still applies — but the verification is recorded
+    // UNVERIFIABLE with the org's own plan sentence as its reason. "Applied,
+    // nobody checked, here is why" is a true sentence; a silently skipped
+    // verification is the defect this whole path exists to close.
+    const { prisma, calls } = fakeHealPrisma({
+      lastEnvironmentId: 'env-7',
+      organization: { plan: 'FREE' },
+      usage: { quantity: 10_000n },
+    });
+    h.prisma = prisma;
+
+    const started = await healVerificationPorts().runs.start({
+      orgId: 'org-1',
+      projectId: 'proj-1',
+      environmentId: 'env-7',
+      testId: 'test-1',
+      triggeredBy: verificationRunTag('heal-1'),
+    });
+
+    expect(started.created).toBe(false);
+    expect(started.created === false && started.reason).toContain('runs included with');
+    expect(calls.runCreates).toEqual([]);
+  });
+
+  it('reads the environment the test last ran in, and NULL when it never has', async () => {
+    const ports = healVerificationPorts();
+    const { prisma } = fakeHealPrisma({ lastEnvironmentId: 'env-7' });
+    h.prisma = prisma;
+    expect(await ports.store.lastEnvironmentFor({ orgId: 'org-1', testId: 'test-1' })).toEqual({
+      environmentId: 'env-7',
+    });
+
+    // NULL means "this test has never run", so there is no environment to
+    // reproduce — which `startHealVerification` turns into an honest
+    // UNVERIFIABLE rather than guessing a URL to run the customer's test at.
+    const never = fakeHealPrisma({ lastEnvironmentId: null });
+    h.prisma = never.prisma;
+    expect(await ports.store.lastEnvironmentFor({ orgId: 'org-1', testId: 'test-1' })).toBeNull();
+  });
+
+  it('loads the heal with the project from its test, in one read', async () => {
+    const { prisma } = fakeHealPrisma({
+      healsById: {
+        'heal-1': {
+          id: 'heal-1',
+          orgId: 'org-1',
+          testId: 'test-1',
+          state: 'AUTO_APPLIED',
+          verifyState: null,
+          verifyRunId: null,
+          appliedVersion: 4,
+          decidedAt: new Date('2026-10-01T00:00:00.000Z'),
+          createdAt: new Date('2026-09-30T00:00:00.000Z'),
+          test: { projectId: 'proj-9' },
+        },
+      },
+    });
+    h.prisma = prisma;
+
+    const heal = await healVerificationPorts().store.loadHeal({
+      orgId: 'org-1',
+      healId: 'heal-1',
+    });
+
+    // `projectId` is on the TEST, not the proposal: a verification run is a Run
+    // and a Run needs a project. Two reads would be two chances for the test to
+    // have been deleted in between.
+    expect(heal?.projectId).toBe('proj-9');
+    // And `createdAt` comes back, because the verification deadline is
+    // `decidedAt ?? createdAt` — dropping it from the projection would make
+    // every heal with no apply time undateable.
+    expect(heal?.createdAt).toEqual(new Date('2026-09-30T00:00:00.000Z'));
+  });
+
+  it('refuses a heal from another org', async () => {
+    const { prisma } = fakeHealPrisma({
+      healsById: { 'heal-1': { id: 'heal-1', orgId: 'org-1', test: { projectId: 'p' } } },
+    });
+    h.prisma = prisma;
+    expect(
+      await healVerificationPorts().store.loadHeal({ orgId: 'org-2', healId: 'heal-1' }),
+    ).toBeNull();
+  });
+});
+
+describe('the whole chain, from the job to the customer code', () => {
+  /*
+   * `processVerifyHeal(healVerificationPorts(), job)` is VERBATIM the body of
+   * the `VERIFY_HEAL_QUEUE` registration in apps/worker/src/index.ts. Every
+   * other test of this path either stops at the sweep's enqueue or runs the
+   * processor against a FAKE recorder that was told what to say. This one runs
+   * the production expression and watches the customer's test change.
+   */
+  const queued = (over: Row = {}): Row => ({
+    id: 'heal-1',
+    orgId: 'org-1',
+    testId: 'test-1',
+    state: 'AUTO_APPLIED',
+    verifyState: 'PENDING',
+    verifyRunId: 'run-verify-1',
+    appliedVersion: 4,
+    decidedAt: new Date(Date.now() - 10 * 60_000),
+    createdAt: new Date(Date.now() - 20 * 60_000),
+    test: { projectId: 'proj-1' },
+    ...over,
+  });
+
+  it('REVERTS the applied version when the verification came back STILL RED', async () => {
+    const { prisma, calls } = fakeHealPrisma({
+      healsById: { 'heal-1': queued() },
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    const out = await processVerifyHeal(healVerificationPorts(), {
+      orgId: 'org-1',
+      healId: 'heal-1',
+      reason: 'SWEEP_FOUND_NO_START',
+    });
+
+    expect(out.outcome).toBe('RECORDED');
+    expect(out.verifyState).toBe('STILL_FAILING');
+    expect(out.reverted).toBe(true);
+    expect(out.revertedToVersion).toBe(3);
+    expect(out.note).toContain('reverted to version 3');
+
+    // The CODE moved, and it moved by APPENDING: the history of what QAAI wrote
+    // to a customer's test is not ours to edit.
+    expect(calls.testUpdates).toHaveLength(1);
+    expect(calls.testUpdates[0]!.data.code).toBe('OLD CODE');
+    expect(calls.testUpdates[0]!.data.versions.create.version).toBe(5);
+    // One transaction: the state, the audit row and the revert. A revert whose
+    // audit row failed to write is a change nobody can explain.
+    expect(calls.transactions).toEqual([3]);
+    expect(calls.audits.at(-1)!.action).toBe(HEAL_AUDIT_ACTIONS.reverted);
+  });
+
+  it('leaves a heal a PERSON approved in the customer code, still red', async () => {
+    // Silently rolling back an approved change is its own surprise. Nothing is
+    // suppressed: the test is still failing and still gating.
+    const { prisma, calls } = fakeHealPrisma({
+      healsById: { 'heal-1': queued({ state: 'APPLIED' }) },
+      runs: {
+        'run-verify-1': {
+          status: 'FAILED',
+          results: [{ status: 'FAILED', retriedAndPassed: false }],
+        },
+      },
+      versions: [
+        { version: 3, code: 'OLD CODE' },
+        { version: 4, code: 'HEALED CODE' },
+      ],
+    });
+    h.prisma = prisma;
+
+    const out = await processVerifyHeal(healVerificationPorts(), {
+      orgId: 'org-1',
+      healId: 'heal-1',
+      reason: 'OPERATOR',
+    });
+
+    expect(out.verifyState).toBe('STILL_FAILING');
+    expect(out.reverted).toBe(false);
+    expect(out.revertedToVersion).toBeNull();
+    expect(calls.testUpdates).toEqual([]);
+  });
+
+  it('starts the verifying run for an APPLY job, right after the apply', async () => {
+    /*
+     * The apply path's door. The job arrives seconds after the apply — inside
+     * `VERIFY_START_GRACE_MINUTES` — and it must NOT be refused, because it is
+     * the only start this heal is ever going to get.
+     */
+    const { prisma, calls } = fakeHealPrisma({
+      healsById: {
+        'heal-1': queued({
+          verifyState: null,
+          verifyRunId: null,
+          decidedAt: new Date(Date.now() - 2_000),
+        }),
+      },
+      lastEnvironmentId: 'env-7',
+    });
+    h.prisma = prisma;
+
+    const out = await processVerifyHeal(healVerificationPorts(), {
+      orgId: 'org-1',
+      healId: 'heal-1',
+      reason: 'APPLY',
+    });
+
+    expect(out.outcome).toBe('STARTED');
+    expect(out.verifyState).toBe('PENDING');
+    // A real Run, through the real toll, for exactly one test.
+    expect(calls.runCreates).toHaveLength(1);
+    expect(calls.runCreates[0]!.triggeredBy).toBe(verificationRunTag('heal-1'));
+    expect(calls.runCreates[0]!.totalCount).toBe(1);
+    // Queued in the background lane: a verification nobody is waiting on must
+    // not sit in front of the runs people are.
+    // `.at(-1)`, because `h.enqueued` accumulates across this file's cases and
+    // a whole-array assertion here would be asserting the order of every other
+    // test rather than this one's enqueue.
+    expect(h.enqueued.at(-1)).toEqual({ runId: 'run-new-1', background: true });
+    // And the four columns were written by the ONE writer, not by the caller.
+    expect(calls.healUpdates).toHaveLength(1);
+    expect(calls.healUpdates[0]!.data).toMatchObject({
+      verifyState: 'PENDING',
+      verifyRunId: 'run-new-1',
+      // PENDING is not an outcome, so it does not stamp a verification time.
+      verifiedAt: null,
+    });
+  });
+
+  it('records UNVERIFIABLE, never PENDING, when the test has never run', async () => {
+    // No environment to reproduce. Guessing one would be running the customer's
+    // test against a URL nobody chose, and PENDING would leave the sweep
+    // chasing a run that does not exist for ever.
+    const { prisma, calls } = fakeHealPrisma({
+      healsById: {
+        'heal-1': queued({
+          verifyState: null,
+          verifyRunId: null,
+          decidedAt: new Date(Date.now() - 2_000),
+        }),
+      },
+      lastEnvironmentId: null,
+    });
+    h.prisma = prisma;
+
+    const out = await processVerifyHeal(healVerificationPorts(), {
+      orgId: 'org-1',
+      healId: 'heal-1',
+      reason: 'APPLY',
+    });
+
+    expect(out.verifyState).toBe('UNVERIFIABLE');
+    expect(calls.runCreates).toEqual([]);
+    expect(calls.healUpdates[0]!.data.verifyState).toBe('UNVERIFIABLE');
+    // An outcome, so it IS stamped.
+    expect(calls.healUpdates[0]!.data.verifiedAt).toBeInstanceOf(Date);
+  });
+
+  it('reports a heal that is gone without failing the job', async () => {
+    // A project can be deleted mid-flight. Not an error.
+    const { prisma } = fakeHealPrisma({ healsById: {} });
+    h.prisma = prisma;
+    const out = await processVerifyHeal(healVerificationPorts(), {
+      orgId: 'org-1',
+      healId: 'heal-nope',
+      reason: 'OPERATOR',
+    });
+    expect(out.outcome).toBe('NO_SUCH_HEAL');
   });
 });
 

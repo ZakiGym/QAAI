@@ -49,12 +49,22 @@ import type { ChatCredentials, NotifyPrefs } from '../../../api/src/lib/chat-int
  * function, same precedence, no Prisma inside it. Three answers to "whose
  * failure is this" would be three answers, and the one on the page at 3am is
  * the one that has to agree with the one on the ticket.
+ *
+ * `routeOwner` AND NOT `assignOwner`, which is this round's repair. They match
+ * identically; the difference is that `routeOwner` writes down HOW STRONG the
+ * answer is, and this processor is the second writer of a verdict's owner
+ * columns. Writing `ownerState` without `ownerProvenance` left the row saying
+ * "we routed this" and "nothing has tried to route this" at the same time —
+ * `TriageVerdict.ownerProvenance`'s own schema comment says the two are
+ * "written together or not at all", and this was the caller that did not.
  */
 import {
   OWNERSHIP_RULE_SELECT,
-  assignOwner,
+  codeownersRuleIdsOf,
+  ownerClaimLabel,
   ownerLabel,
-  verdictOwnerColumns,
+  routeOwner,
+  verdictRoutingColumns,
 } from '../../../api/src/lib/ownership.js';
 import type {
   OwnerDirectory,
@@ -530,19 +540,20 @@ async function routeFailuresToOwners(
    * nobody has assigned anything" from "nothing has tried to route this". One
    * updateMany rather than N updates — the assignment is identical for every
    * row, and an install that never configured ownership is the common case.
+   *
+   * `ownerProvenance` goes in the same statement and its value is NONE, which
+   * is the coherent partner of an owner that is null — not the column's NULL,
+   * which means "nothing has tried". We tried; there was nothing to try with.
    */
   if (rules.length === 0) {
-    const assignment = assignOwner(
-      { id: 'none', filePath: '', suiteId: null, feature: null },
-      [],
-    );
+    const routed = routeOwner({ id: 'none', filePath: '', suiteId: null, feature: null }, []);
     const unrouted = results
       .filter((row) => row.verdict && row.verdict.ownerState === null)
       .map((row) => row.verdict!.id);
     if (unrouted.length > 0) {
       await prisma.triageVerdict.updateMany({
         where: { id: { in: unrouted } },
-        data: verdictOwnerColumns(assignment),
+        data: verdictRoutingColumns(routed),
       });
     }
     // Deliberately no labels: the alert says nothing about ownership when
@@ -550,9 +561,18 @@ async function routeFailuresToOwners(
     return { labels, capped };
   }
 
+  /*
+   * WHICH RULES WERE BULK-IMPORTED, read off `OwnershipRule.source` and handed
+   * to every routing call. Without it `provenanceOfMatch` cannot tell a glob
+   * somebody pasted out of a repository's CODEOWNERS file from a rule somebody
+   * typed here, and this processor would page a team on the strength of the
+   * first.
+   */
+  const codeownersRuleIds = codeownersRuleIdsOf(rules);
+
   const assignments = results.map((row) => ({
     row,
-    assignment: assignOwner(
+    assignment: routeOwner(
       {
         id: row.test.id,
         filePath: row.test.filePath,
@@ -560,6 +580,7 @@ async function routeFailuresToOwners(
         feature: row.test.feature,
       },
       rules,
+      { codeownersRuleIds },
     ),
   }));
 
@@ -592,14 +613,26 @@ async function routeFailuresToOwners(
   };
 
   const now = new Date();
-  const writes: Array<{ id: string; data: ReturnType<typeof verdictOwnerColumns> }> = [];
+  const writes: Array<{ id: string; data: ReturnType<typeof verdictRoutingColumns> }> = [];
   for (const { row, assignment } of assignments) {
     labels.set(
       failureOwnerKey(row.test),
-      assignment.owner ? ownerLabel(assignment.owner, directory) : null,
+      /*
+       * `mayPage`, ASKED — through `ownerClaimLabel`, which the digest calls
+       * too so the two surfaces cannot phrase one fact two ways.
+       *
+       * This is a PAGE. An owner that arrived from a bulk-imported glob is
+       * WEAK, and printing it here exactly as a human assignment is printed is
+       * how a team that was never asked learns to mute the channel. The name is
+       * still shown — it is the best lead there is — and it is shown as a
+       * suggestion.
+       */
+      assignment.owner
+        ? ownerClaimLabel(ownerLabel(assignment.owner, directory), assignment.pageable)
+        : null,
     );
     if (row.verdict && row.verdict.ownerState === null) {
-      writes.push({ id: row.verdict.id, data: verdictOwnerColumns(assignment, now) });
+      writes.push({ id: row.verdict.id, data: verdictRoutingColumns(assignment, now) });
     }
   }
 

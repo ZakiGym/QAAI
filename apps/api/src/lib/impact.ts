@@ -1657,6 +1657,51 @@ export interface PatchCoverageRow {
   key: string;
   status: SurfaceStatus;
   label: string;
+  /**
+   * The waiver behind a `WAIVED` status, when the caller read it.
+   *
+   * ── AN EXPIRED SUPPRESSION MUST NOT SUPPRESS ──────────────────────────────
+   *
+   * `CoverageItem.status` is a MATERIALISED answer: the waiver door writes
+   * `WAIVED` eagerly so the inventory is not stale until the next
+   * recomputation. The `CoverageWaiver` row is the AUTHORITY, and the two part
+   * company the moment the waiver lapses — nothing recomputes on a clock
+   * (recompute is enqueued from run, explore, generate, import and
+   * analyze-source, never from a timer), so on a quiet project a lapsed
+   * exclusion stays in effect for an unbounded time.
+   *
+   * That matters here more than anywhere else, because WAIVED is the only
+   * state that LEAVES the denominator: a lapsed waiver makes the percentage
+   * this gate prints on a pull request higher than the truth.
+   *
+   * `undefined` means the caller did not read the waiver and its `WAIVED` rows
+   * are taken at face value — the old behaviour, kept so a caller that cannot
+   * join is not silently given a different denominator. `null` means it read
+   * and there is NO waiver row, which is a `WAIVED` status with nothing behind
+   * it. Both of those are distinguishable from a date, and that is the point.
+   */
+  waiverExpiresAt?: Date | string | null;
+}
+
+/**
+ * Is the exclusion still a decision somebody is standing behind?
+ *
+ * A `WAIVED` row whose waiver is gone, or past its date, is demoted to
+ * UNCOVERED: back in the denominator, counted as a gap. Not to UNKNOWN — that
+ * is a statement about our extractor, and we know exactly what this is.
+ *
+ * A waiver with a NULL `expiresAt` is treated as in force. The column is
+ * nullable for rows written before the door required an expiry, and retroactively
+ * un-waiving a decision a human made is not this function's call to make — but
+ * it is NOT invisible: `denominatorDefinitionOf` in lib/coverage-store.ts counts
+ * those rows and names them in the sentence a customer signs.
+ */
+function waiverStillInForce(row: PatchCoverageRow, now: Date): boolean {
+  if (row.waiverExpiresAt === undefined) return true;
+  if (row.waiverExpiresAt === null) return false;
+  const at = row.waiverExpiresAt instanceof Date ? row.waiverExpiresAt : new Date(row.waiverExpiresAt);
+  if (Number.isNaN(at.getTime())) return false;
+  return at.getTime() > now.getTime();
 }
 
 /** `SurfaceStatus` and `PatchSurfaceState` share five members by design. */
@@ -1685,6 +1730,12 @@ export function patchCoverage(input: {
   /** The commit the inventory was measured against, from the snapshot. */
   inventoryCommitSha?: string | null;
   inventoryMeasuredAtIso?: string | null;
+  /**
+   * When the expiry of a waiver is measured against. Injected so a boundary
+   * case is testable and so this file does not read the clock; defaults to now
+   * for the callers that do not care.
+   */
+  now?: Date;
   /**
    * True when the caller could not read the whole diff — a cap, a page limit.
    * An incomplete diff cannot produce a trustworthy denominator.
@@ -1788,7 +1839,14 @@ export function patchCoverage(input: {
   }
 
   // ── The inventory, keyed by canonical route ────────────────────────────────
-  const inventory = new Map<string, { key: string; status: SurfaceStatus; label: string }>();
+  /*
+   * The WHOLE row, not a hand-copied subset. This map was typed
+   * `{key, status, label}` and re-listed those three fields, which silently
+   * dropped `waiverExpiresAt` and made the lapsed-waiver demotion below
+   * unreachable while reading as if it worked — a select-blind copy, and the
+   * reason the type is now the row's own.
+   */
+  const inventory = new Map<string, PatchCoverageRow>();
   let nonRouteRows = 0;
   for (const row of input.rows) {
     const parsed = parseSurfaceKey(row.key);
@@ -1796,11 +1854,7 @@ export function patchCoverage(input: {
       nonRouteRows += 1;
       continue;
     }
-    inventory.set(normalizeRoute(parsed.identity), {
-      key: row.key,
-      status: row.status,
-      label: row.label,
-    });
+    inventory.set(normalizeRoute(parsed.identity), row);
   }
   if (nonRouteRows > 0) {
     caveats.push(
@@ -1867,9 +1921,19 @@ export function patchCoverage(input: {
     NOT_IN_INVENTORY: 0,
   };
 
+  const now = input.now ?? new Date();
+  let lapsedWaivers = 0;
   for (const [route, hit] of [...touched.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
     const item = inventory.get(route)!;
-    const state = PATCH_STATE[item.status];
+    /*
+     * The one place the materialised status is not taken at its word. A lapsed
+     * or missing waiver is demoted to UNCOVERED here rather than anywhere
+     * upstream, because the enforcement point for an expiry has to be every
+     * READ — a sweep would narrow the window and still leave one.
+     */
+    const lapsed = item.status === 'WAIVED' && !waiverStillInForce(item, now);
+    if (lapsed) lapsedWaivers += 1;
+    const state = lapsed ? 'UNCOVERED' : PATCH_STATE[item.status];
     counts[state] += 1;
     routes.push({
       route,
@@ -1902,6 +1966,15 @@ export function patchCoverage(input: {
   // because we do not know what it is.
   const denominator =
     counts.COVERED + counts.ASSERTED_NOT_RUN + counts.UNCOVERED + counts.UNKNOWN;
+
+  if (lapsedWaivers > 0) {
+    caveats.push(
+      `${lapsedWaivers} changed route(s) are still marked WAIVED on the inventory but their ` +
+        `waiver has lapsed or is gone, so they are counted as GAPS here rather than excluded. ` +
+        `The inventory catches up on the next recomputation; this number is measured against ` +
+        `the waiver rows, which are the record of the decision.`,
+    );
+  }
 
   if (counts.NOT_IN_INVENTORY > 0) {
     caveats.push(

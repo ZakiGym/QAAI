@@ -59,8 +59,27 @@ import { enqueue } from '../lib/queues.js';
 import { open as openSecret, seal } from '../lib/vault.js';
 import { buildRepoTree } from '../lib/repo-export.js';
 import { zipTree } from '../lib/zip.js';
-import { pushRepo, repoHttpsUrl } from '../lib/git.js';
+import {
+  MAX_REPORTED_PATHS,
+  pullRequestAudit,
+  pullRequestStore,
+  pushRepo,
+  repoHttpsUrl,
+} from '../lib/git.js';
 import type { OwnershipRecord, RepoOwnership } from '../lib/git.js';
+/*
+ * ── THE OUTWARD-FACING WRITE, THROUGH THE ONE SEAM THAT ALREADY EXISTS ─────
+ *
+ * `openPullRequest` is the policy, `githubPullRequestHost` is the single
+ * injected git-host seam (it lives in github-app.ts with the injected fetch, the
+ * installation token and the pinned API host), and
+ * `pullRequestStore`/`pullRequestAudit` are its Prisma halves in git.ts. This
+ * route adds a DOOR onto them and not a second path: a pull request composed
+ * anywhere else would be a second place that decides what a repository, a branch
+ * and a base ref may be.
+ */
+import { branchNameFor, openPullRequest, prCauseKey } from '../lib/pull-request.js';
+import { githubPullRequestHost } from '../lib/github-app.js';
 import { signInWithProfile } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { canCreateProject, planFor } from '../lib/plan.js';
@@ -1471,6 +1490,18 @@ function repoOwnershipFor(args: {
   };
 }
 
+/*
+ * THE PULL-REQUEST HALF OF A PUSH IS NOW IN `gitPushSchema`, in
+ * packages/shared/src/schemas.ts, with `PR_CAUSE_IDENTITY_MAX` beside it.
+ *
+ * It was a second, route-local schema because that file belonged to another
+ * agent for one round. The cost of the split was not tidiness: the two fields
+ * `openPr` requires are a DEPENDENCY between fields, and neither schema could
+ * see both halves — so a body carrying `openPr` passed `gitPushSchema`
+ * untouched and the dependency was enforced by a second parse. One schema, one
+ * refusal, one path.
+ */
+
 /**
  * Push the repo to a connected git remote.
  *
@@ -1478,6 +1509,20 @@ function repoOwnershipFor(args: {
  * never implicit. The token is decrypted here, handed to the push, and dropped;
  * it is never logged, audited, or returned. Failures are reported with the
  * provider's message only after it has been checked for credential material.
+ *
+ * ── AND, WHEN ASKED, THE PULL REQUEST ───────────────────────────────────────
+ *
+ * `openPr` is what makes the generated suite reach a reviewer. Until it existed
+ * the only door onto `openPullRequest` was `POST
+ * /agent/heals/:healId/pull-request`, so a HEAL could be reviewed and a project's
+ * generated tests could not: they were pushed to a branch and nobody was told.
+ *
+ * THE TARGET IS NOT NEGOTIABLE AND THE REQUEST CANNOT NAME IT. The repository
+ * and the base branch are read off the `Integration` row by
+ * `pullRequestStore.loadTarget`, and the branch is composed by `branchNameFor`
+ * from the hash of the cause — so when `openPr` is set, a `branch` in the
+ * request is REFUSED rather than honoured, because a caller that could choose
+ * the head of a pull request could choose where QAAI's commits land.
  *
  * ── THE OWNERSHIP READER AND THE LEDGER REFRESH ARE ONE CHANGE ─────────────
  *
@@ -1515,6 +1560,18 @@ projectsRouter.post(
   const input = gitPushSchema.parse(req.body);
   const projectId = String(req.params.projectId);
 
+  /*
+   * Narrowed, not re-validated. `gitPushSchema` has already refused `openPr`
+   * without its two companions, so the three-way check below is what gives the
+   * compiler the non-optional types rather than a second guard — and `null` is
+   * what every branch reads to mean "nothing outward-facing was requested", not
+   * `false`, which would be a third state to get wrong.
+   */
+  const prRequest =
+    input.openPr === true && input.purpose !== undefined && input.causeIdentity !== undefined
+      ? { openPr: input.openPr, purpose: input.purpose, causeIdentity: input.causeIdentity }
+      : null;
+
   const project = await prisma.project.findUnique({
     where: { id: projectId },
     select: { id: true, name: true },
@@ -1534,7 +1591,42 @@ projectsRouter.post(
   const config = parseGitConfig(integration.config);
   if (!config.repo) throw badRequest('That integration has no repository configured');
 
-  const branch = input.branch ?? config.defaultBranch;
+  /*
+   * ── THE CAUSE, AND THE BRANCH COMPOSED FROM IT ─────────────────────────────
+   *
+   * `prCauseKey` hashes `(purpose | projectId | identity)` and `branchNameFor`
+   * takes 12 hex characters of the result, so the head of the pull request is
+   * `qaai/<segment>/<12 hex>` and there is no parameter anywhere on this path
+   * that a sentence could be passed as. The `projectId` comes from the route,
+   * the purpose is a member of a closed union, and the identity is already
+   * shape-bounded by `pushPullRequestSchema`.
+   *
+   * `prCauseKey` throws on a `projectId` carrying the separator. That is a
+   * 400 and not a 500: the id is in the URL, so a caller can fix it.
+   */
+  let prCause: { causeKey: string; branch: string } | null = null;
+  if (prRequest) {
+    let causeKey: string;
+    try {
+      causeKey = prCauseKey(prRequest.purpose, projectId, prRequest.causeIdentity);
+    } catch {
+      throw badRequest(
+        'That project id cannot be made into a pull-request cause key, so no pull request was requested.',
+      );
+    }
+    prCause = { causeKey, branch: branchNameFor({ purpose: prRequest.purpose, causeKey }) };
+    /*
+     * A REQUEST-SUPPLIED BRANCH IS REFUSED, NOT OVERRIDDEN — and the refusal is
+     * `gitPushSchema`'s, not a guard here. It used to be an `if` on this line,
+     * and that `if` is GONE rather than kept as a belt: with the schema
+     * refusing `openPr` beside `branch`, nothing could ever reach it, so it was
+     * code connected to nothing that also hid the schema from the test meant to
+     * pin it. The same reasoning routes/runs.ts records for the quarantine
+     * filter it deleted.
+     */
+  }
+
+  const branch = prCause?.branch ?? input.branch ?? config.defaultBranch;
 
   // Resolve (and host-pin) the destination BEFORE decrypting the token, so a
   // repointed remote can never cause the PAT to be produced at all.
@@ -1695,10 +1787,130 @@ projectsRouter.post(
       ownershipKnown: result.ownershipKnown,
       ledgerRefreshed,
       ledgerUnclaimed,
+      // Whether a review was asked for, on the row that records the push. A
+      // push that opened a pull request and one that did not are different
+      // acts in somebody's repository.
+      openPr: prRequest !== null,
     },
   });
 
-  res.json({ push: result, ledgerRefreshed, ledgerUnclaimed });
+  /*
+   * ── THE PULL REQUEST, AFTER THE LEDGER REFRESH AND NOT BEFORE ─────────────
+   *
+   * The order is the same argument the refresh itself rests on, one step
+   * further out. The branch is on the remote and the ledger agrees with it
+   * before a human is asked to review: a pull request opened first would, on a
+   * failed refresh, be a review request whose next update QAAI will refuse as
+   * BYTES_DIVERGED — a false accusation of a human edit, in a reviewer's inbox.
+   *
+   * Nothing here throws. `openPullRequest` returns an outcome and a sentence
+   * for every arm, which is what this route needs: the push has COMMITTED, and
+   * a throw would report a failed push to a caller whose repository already has
+   * the branch.
+   */
+  let pullRequest: {
+    outcome: string;
+    url: string | null;
+    note: string;
+    hostRefusal: string | null;
+    refusalPaths: readonly string[];
+    refusalTotal: number;
+    disclosures: unknown;
+    preserved: { named: number; total: number; capped: boolean; cap: number };
+  } | null = null;
+
+  if (prRequest && prCause) {
+    const prResult = await openPullRequest(
+      {
+        store: pullRequestStore(prisma, {
+          /*
+           * THE BRANCH THE PUSH ITSELF REPORTS WRITING, not the one composed
+           * above. `openPullRequest` re-derives the branch from the cause key
+           * and refuses when the two differ, so handing it this value is what
+           * makes that comparison a real check rather than one computation
+           * compared with itself.
+           */
+          pushedBranch: result.branch,
+        }),
+        /*
+         * The token is the one already opened for the push and is not read a
+         * second time. A non-GitHub integration cannot leak it here:
+         * `openPullRequest` compares `target.provider` with the host's and
+         * returns REFUSED before any request is made, so the header this host
+         * composes is never sent.
+         */
+        host: githubPullRequestHost({ token }),
+        audit: pullRequestAudit(prisma, { orgId: actor.orgId, userId: actor.userId }),
+      },
+      {
+        orgId: actor.orgId,
+        projectId,
+        purpose: prRequest.purpose,
+        causeKey: prCause.causeKey,
+        integrationId: integration.id,
+        /*
+         * THE FILES THE PUSH ACTUALLY WROTE, which is not the files it meant to
+         * write. `result.fileCount` is the size of QAAI's tree and ownership
+         * gates every write, so a body built from the intent would list a
+         * reviewer's own untouched files as QAAI's changes.
+         */
+        filePaths: result.ledgerRefresh.map((entry) => entry.path),
+        /*
+         * And what was LEFT ALONE, from the push's own report. This is the half
+         * that makes the rest of the diff trustworthy: "QAAI did not touch
+         * these files of yours" is a sentence only `pushRepo` can supply.
+         *
+         * A CAP BITES HERE AND IT IS DISCLOSED BELOW. `filesKept` names at most
+         * `MAX_REPORTED_PATHS` (200) while `keptCount` is the exact total, so on
+         * a push that preserved more than 200 files the body's own
+         * "**Files left alone** N" is the NAMED count and not the real one.
+         * `preserved` in the response carries both numbers and which cap bit,
+         * because a count that was quietly truncated reads as the whole story.
+         */
+        preservedPaths: result.filesKept.map((file) => file.path),
+        /*
+         * NO SPANS. The only untrusted text within reach of this route is a
+         * model's own prose, and `UNTRUSTED_PROVENANCES` has no member for
+         * model output — a span labelled `RUNNER_OUTPUT` over a model's
+         * sentence is a fence whose header lies in the one line a reader is
+         * most likely to believe. Passing none is the correct degradation; the
+         * heal path, which has an honest compromise documented at its call
+         * site, is where that quote lives today.
+         */
+        actorUserId: actor.userId,
+      },
+    );
+    pullRequest = {
+      outcome: prResult.outcome,
+      url: prResult.url,
+      note: prResult.note,
+      hostRefusal: prResult.hostRefusal,
+      /*
+       * zod PATHS and the TOTAL beside the capped list, never zod messages: a
+       * zod message quotes the offending value, and a stored value once turned
+       * into the literal text of an injected instruction in a customer-facing
+       * flag.
+       */
+      refusalPaths: prResult.refusalPaths,
+      refusalTotal: prResult.refusalTotal,
+      // What the body left out, carried rather than dropped.
+      disclosures: prResult.body?.disclosures ?? null,
+      /*
+       * THE CAP THAT BIT, AS A COUNT AND A REASON. `named` is how many
+       * preserved paths the pull request was given, `total` is how many files
+       * the push actually left alone, and `capped` says whether the two differ
+       * because `MAX_REPORTED_PATHS` bit — not because something else did.
+       */
+      preserved: {
+        named: result.filesKept.length,
+        total: result.keptCount,
+        capped: result.keptCount > result.filesKept.length,
+        cap: MAX_REPORTED_PATHS,
+      },
+    };
+  }
+
+  res.json({ push: result, ledgerRefreshed, ledgerUnclaimed, pullRequest });
 });
 
 

@@ -214,6 +214,21 @@ vi.mock('../queues.js', () => ({
    * message about a mock.
    */
   SUPPRESSION_QUEUE: 'qaai.suppression',
+  /*
+   * The heal-verification and mutant-closure queues, present for the same
+   * reason as the three above: the one test here that imports `../index.js`
+   * runs every `register(...)` at import time, so a name missing from this mock
+   * is a module-level TypeError rather than a skipped registration — which is
+   * exactly how one absent constant turned the permanently-failed handler's
+   * test red with a message about a mock.
+   *
+   * `VERIFY_HEAL_QUEUE` is kept in sync with `JobPayloads` by a `satisfies` in
+   * the real queues.ts; here it is a literal, because this is a FULL mock on
+   * purpose — a partial one would drag `new Queue(...)` in for every producer
+   * in that file and open a Redis connection at import.
+   */
+  VERIFY_HEAL_QUEUE: 'qaai.verify-heal',
+  MUTANT_CLOSURE_QUEUE: 'qaai.mutant-closure',
   armSuppressionSweep: async () => {},
   armFlakeTick: async () => {},
   armPreflightSweep: async () => {},
@@ -598,6 +613,16 @@ interface RunRow {
   skippedCount: number;
   /** Failures a quarantine suppressed. The column the fix added. */
   quarantinedFailedCount: number;
+  /**
+   * `Run.preflightChecks` — the environment evidence this processor writes and
+   * apps/worker/src/processors/triage.ts reads.
+   *
+   * On the FIXTURE TYPE rather than only in the write assertions, because the
+   * row is where the column has to end up: a test that watched the `update`
+   * call go by but could not see the result would pass against a write that
+   * landed on nothing.
+   */
+  preflightChecks?: unknown;
   gateResult: unknown;
   errorMessage: string | null;
   /** §5 fail-fast: stop at the first real failure. */
@@ -2613,6 +2638,108 @@ describe('a run whose environment never answered', () => {
     const checks = frame!.data.checks as Array<{ name: string; kind: string }>;
     expect(checks.map((c) => c.name)).toEqual(['BASE_URL']);
     expect(checks[0]!.kind).toBe('BLOCKED_BY_ENV');
+  });
+
+  /*
+   * ── THE PREFLIGHT'S ANSWERS, KEPT ─────────────────────────────────────────
+   *
+   * `Run.preflightChecks` existed with NO WRITER and NO READER. The checks were
+   * computed here, published on the live frame, and thrown away — so by the
+   * time apps/worker/src/processors/triage.ts asked "was this a broken
+   * environment rather than a broken app?", the evidence was gone and
+   * `classifyEnvironment([])` answered UNKNOWN on every run in the product.
+   * With no writer the whole ENV_ISSUE branch was a no-op.
+   *
+   * These three pin the column, the shape the reader validates, and the one
+   * shard that writes it.
+   */
+  it('records the preflight on the run, so triage can tell an outage from a defect', async () => {
+    const db = fakeDb();
+    h.probe = deadHost;
+
+    await processRun(job());
+
+    const wrote = db.runWrites.find((w) => w.data.preflightChecks !== undefined);
+    expect(wrote).toBeTruthy();
+    const checks = wrote!.data.preflightChecks as Array<Record<string, unknown>>;
+    /*
+     * FIELD FOR FIELD what `readPreflightChecks` validates: it checks `name`
+     * against `ENV_CHECK_NAMES` and `outcome` against `ENV_CHECK_OUTCOMES` and
+     * DROPS what it cannot read — so a write whose keys drifted would be
+     * silently discarded at the reader and the branch would go back to UNKNOWN
+     * with nothing failing.
+     */
+    expect(checks[0]).toMatchObject({
+      name: 'BASE_URL',
+      outcome: 'UNAVAILABLE',
+      kind: 'BLOCKED_BY_ENV',
+    });
+    expect(typeof checks[0]!.detail).toBe('string');
+    // And it landed on the row, not just in the call.
+    expect(db.run.preflightChecks).toBeTruthy();
+  });
+
+  it('records a CLEAN preflight too, because an empty list is not the same as no list', async () => {
+    /*
+     * A green preflight is deliberately NOT published on the live frame — a
+     * frame on every run is noise. The COLUMN is different: `null` means
+     * "nothing recorded a preflight" and an empty-of-problems list means "we
+     * looked and the environment was fine". `readPreflightChecks` treats those
+     * as different facts, so the write cannot be conditional on there being
+     * something wrong.
+     */
+    const db = fakeDb();
+
+    await processRun(job());
+
+    const wrote = db.runWrites.find((w) => w.data.preflightChecks !== undefined);
+    expect(wrote).toBeTruthy();
+    const checks = wrote!.data.preflightChecks as Array<Record<string, unknown>>;
+    expect(Array.isArray(checks)).toBe(true);
+    expect(checks.every((c) => c.outcome !== 'UNAVAILABLE')).toBe(true);
+    // No live frame, though: nothing was wrong.
+    expect(published('run.environment')).toEqual([]);
+  });
+
+  it('writes it from shard 0 only, so the column describes an environment with a name', async () => {
+    /*
+     * Every shard runs its own preflight against its own image and the column
+     * holds ONE of them. Writing from all of them is last-writer-wins: the row
+     * would describe an arbitrary shard and nobody could say which, which is a
+     * thing reported as measured that was not the thing measured.
+     *
+     * A SHARDED job has to claim its shard before it executes anything
+     * (`claimShard`), and the default fake's `runShard.updateMany` answers
+     * `count: 0` — so without this override BOTH shards bail before the
+     * preflight and the test would "pass" for shard 1 while proving nothing
+     * about shard 0.
+     */
+    const shardedDb = (index: number) => {
+      const db = fakeDb({ run: { shardCount: 2 } });
+      const rows = [
+        { index: 0, status: 'QUEUED', startedAt: null, heartbeatAt: null },
+        { index: 1, status: 'QUEUED', startedAt: null, heartbeatAt: null },
+      ];
+      h.prisma.runShard = {
+        updateMany: async (args: { where: { index?: number }; data: Record<string, unknown> }) => {
+          const hit = rows.filter((r) => args.where.index === undefined || r.index === args.where.index);
+          for (const row of hit) Object.assign(row, args.data);
+          return { count: hit.length };
+        },
+        findUnique: async (args: { where: { runId_index: { index: number } } }) =>
+          rows.find((r) => r.index === args.where.runId_index.index) ?? null,
+        findMany: async () => rows.map((r) => ({ ...r })),
+      };
+      return { db, index };
+    };
+
+    const zero = shardedDb(0);
+    await processRun({ ...job(), shard: { index: 0, count: 2 } });
+    expect(zero.db.runWrites.some((w) => w.data.preflightChecks !== undefined)).toBe(true);
+
+    const one = shardedDb(1);
+    await processRun({ ...job(), shard: { index: 1, count: 2 } });
+    expect(one.db.runWrites.some((w) => w.data.preflightChecks !== undefined)).toBe(false);
   });
 
   it('retries the probe before condemning the run', async () => {

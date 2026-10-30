@@ -7,6 +7,8 @@ interface Hoisted {
   db: Record<string, unknown>;
   actor: { userId: string; orgId: string; role: string; ip: string | null };
   audits: Row[];
+  /** Every job the route produced: queue, payload and BullMQ options. */
+  enqueued: Array<{ queue: string; payload: unknown; opts: unknown }>;
 }
 
 const h = vi.hoisted(
@@ -14,6 +16,7 @@ const h = vi.hoisted(
     db: {},
     actor: { userId: 'user_1', orgId: 'org_1', role: 'ADMIN', ip: null },
     audits: [],
+    enqueued: [],
   }),
 );
 
@@ -50,7 +53,17 @@ vi.mock('../lib/prisma.js', async () => {
   };
 });
 
-vi.mock('../lib/queues.js', () => ({ enqueue: async () => {} }));
+vi.mock('../lib/queues.js', () => ({
+  /*
+   * RECORDED, not swallowed. The apply path no longer starts the verification
+   * run inline — it enqueues `qaai.verify-heal` — so this mock's arguments are
+   * the only evidence that anything will ever re-measure the patch.
+   */
+  enqueue: async (queue: string, payload: unknown, opts: unknown) => {
+    h.enqueued.push({ queue, payload, opts });
+    return 'job_1';
+  },
+}));
 vi.mock('../lib/storage.js', () => ({ storage: {} }));
 vi.mock('../lib/events.js', () => ({ publish: () => {}, subscribe: () => () => {} }));
 vi.mock('../lib/audit.js', () => ({
@@ -204,6 +217,7 @@ const calls = {
 function install(scenario: Scenario = {}): void {
   calls.testUpdates.length = 0;
   calls.healUpdates.length = 0;
+  h.enqueued.length = 0;
   calls.healUpdateMany.length = 0;
   calls.runsCreated.length = 0;
   calls.metered.length = 0;
@@ -395,30 +409,94 @@ describe('POST /agent/heals/:id/decide', () => {
 });
 
 describe('verifying an applied heal', () => {
-  it('starts a single-test run tagged with the heal, and records it PENDING', async () => {
+  /*
+   * ── THE CONTRACT CHANGED, AND IT CHANGED ON PURPOSE ───────────────────────
+   *
+   * This route used to START THE RUN INLINE through a module-local
+   * `startHealVerification` — the THIRD copy of that function, beside one in
+   * apps/worker/src/processors/triage.ts and the real one in
+   * processors/verify-heal.ts that nothing imported. Two of the three each wrote
+   * the same four `verifyState` columns afterwards, which is how `verifiedAt`
+   * came to be stamped on one path and not the other.
+   *
+   * The inline call also had a hole the comment above it admitted: a crash
+   * between writing the patch and starting the run left `verifyState` NULL, and
+   * a NULL row is invisible to `verifyAppliedHeals` — a model's patch sitting in
+   * a customer's test with nothing that would ever re-measure it. A JOB survives
+   * that crash.
+   *
+   * So this route now ENQUEUES, and what it owes is narrower and checkable: ask
+   * for the verification, de-duplicate per heal, and CLAIM NOTHING about a run
+   * that does not exist yet. The three behaviours the old tests covered — a test
+   * that never ran is UNVERIFIABLE, the quota never refuses the approval — are
+   * the consumer's, and are tested in processors/verify-heal.test.ts.
+   */
+  it('asks for the verification through the queue, instead of a third copy of the start', async () => {
     install();
     const { body } = await call('/agent/heals/heal_1/decide', {
       method: 'POST',
       body: JSON.stringify({ approve: true }),
     });
 
-    // A real Run through the real queue, like the flake radar's confirmation
-    // runs: a result produced through a private path measures the private path.
-    expect(calls.runsCreated).toHaveLength(1);
-    const run = calls.runsCreated[0]!;
-    expect(run.triggeredBy).toBe('heal-verify:heal_1');
-    expect(run.totalCount).toBe(1);
-    expect(run.results.create).toEqual([{ orgId: 'org_1', testId: 't1', status: 'SKIPPED' }]);
-    expect(run.environmentId).toBe('env_1');
-    // And it is metered, because it costs a browser.
-    expect(calls.metered).toEqual(['runs']);
+    // NO RUN IS CREATED HERE any more. The consumer creates it.
+    expect(calls.runsCreated).toHaveLength(0);
 
-    const verification = calls.healUpdates.find((args) => args.data.verifyState !== undefined)!;
-    expect(verification.data.verifyState).toBe('PENDING');
-    expect(verification.data.verifyRunId).toBe('run_verify_1');
-    // PENDING is not an outcome, so nothing is stamped as verified.
-    expect(verification.data.verifiedAt).toBeNull();
-    expect(String(body.note)).toMatch(/nobody has confirmed the fix works/);
+    expect(h.enqueued).toHaveLength(1);
+    const job = h.enqueued[0]!;
+    expect(job.queue).toBe('qaai.verify-heal');
+    expect(job.payload).toEqual({ orgId: 'org_1', healId: 'heal_1', reason: 'APPLY' });
+
+    /*
+     * BOTH REMOVAL FLAGS, on a per-entity job id. A BullMQ job id is a Redis
+     * key: with `removeOnComplete` alone, a FAILED first verification keeps the
+     * id and every later verification of that heal is silently dropped for
+     * ever while `add()` still returns an id. That is a heal nothing ever
+     * re-measures — the defect the queue exists to close.
+     */
+    expect(job.opts).toEqual({
+      jobId: 'verify-heal-heal_1',
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+
+    /*
+     * AND NO CLAIM ABOUT A STATE THAT DOES NOT EXIST. This used to write
+     * `verifyState: 'PENDING'` here; at this instant the column is NULL and
+     * there is no run, so PENDING would be a thing reported as measured that
+     * was not measured. The CONSUMER is the one writer of those four columns.
+     */
+    expect(
+      calls.healUpdates.find((args) => args.data.verifyState !== undefined),
+    ).toBeUndefined();
+    expect(String(body.note)).toMatch(/nothing has confirmed the fix yet/);
+
+    // The audit row makes the weakest true claim and no stronger one.
+    expect(h.audits[0]!.metadata.verification).toEqual({
+      state: null,
+      runId: null,
+      requested: true,
+    });
+  });
+
+  it('leaves `verifyState` NULL, which is the state the hole sweep recovers', async () => {
+    /*
+     * NULL IS LOAD-BEARING. The sweep in apps/worker/src/processors/flake.ts
+     * looks for exactly `verifyState: null` on a recently-decided heal and
+     * starts the verification itself. Writing UNVERIFIABLE here when the
+     * enqueue fails would make the row invisible to the only thing that would
+     * have rescued it.
+     */
+    install();
+    await call('/agent/heals/heal_1/decide', {
+      method: 'POST',
+      body: JSON.stringify({ approve: true }),
+    });
+
+    for (const update of calls.healUpdates) {
+      expect(update.data.verifyState).toBeUndefined();
+      expect(update.data.verifyRunId).toBeUndefined();
+      expect(update.data.verifiedAt).toBeUndefined();
+    }
   });
 
   it('records the version it wrote, so a failed verification can be reverted', async () => {
@@ -433,9 +511,16 @@ describe('verifying an applied heal', () => {
     expect(h.audits[0]!.metadata.appliedVersion).toBe(4);
   });
 
-  it('applies the heal and says nobody checked when the test has never run', async () => {
-    // Guessing an environment would be running the customer's test against a URL
-    // nobody chose. "Applied, nobody checked, here is why" is the honest answer.
+  it('still applies the patch when the test has never run — the environment is the consumer problem', async () => {
+    /*
+     * "This test has never run, so there is no environment to re-run it in" is
+     * now `startHealVerification`'s answer in processors/verify-heal.ts, which
+     * writes UNVERIFIABLE itself (pinned in processors/verify-heal.test.ts).
+     * What this route owes is that the APPLY still succeeds and the
+     * verification is still asked for: the alternative — deciding here that
+     * nothing can check it — would need this file to re-read the environment,
+     * which is the duplication the collapse removed.
+     */
     install({ hasPreviousRun: false });
     const { status, body } = await call('/agent/heals/heal_1/decide', {
       method: 'POST',
@@ -445,15 +530,19 @@ describe('verifying an applied heal', () => {
     expect(status).toBe(200);
     expect(calls.testUpdates).toHaveLength(1);
     expect(calls.runsCreated).toHaveLength(0);
-    const verification = calls.healUpdates.find((args) => args.data.verifyState !== undefined)!;
-    expect(verification.data.verifyState).toBe('UNVERIFIABLE');
-    expect(String(verification.data.verifyNote)).toMatch(/never run/);
-    expect(String(body.note)).toMatch(/nobody has checked it/);
+    expect(h.enqueued).toHaveLength(1);
+    expect(String(body.note)).toMatch(/nothing has confirmed the fix yet/);
   });
 
   it('never refuses the approval because the org is out of runs', async () => {
-    // The toll is advisory here on purpose: throwing 402 would refuse the FIX
-    // over the VERIFICATION and leave the customer with the broken test.
+    /*
+     * The toll is advisory on purpose: throwing 402 would refuse the FIX over
+     * the VERIFICATION and leave the customer with a broken test and a billing
+     * message. The quota is now the CONSUMER's to meter — it is the thing that
+     * creates the run — and what this route must not do is let the quota reach
+     * the approval at all. Nothing here reads a plan limit any more, which is
+     * the strongest form of that guarantee.
+     */
     install({ plan: 'FREE', runsThisMonth: PLAN_LIMITS.FREE.maxRunsPerMonth ?? 100 });
     const { status } = await call('/agent/heals/heal_1/decide', {
       method: 'POST',
@@ -462,10 +551,10 @@ describe('verifying an applied heal', () => {
 
     expect(status).toBe(200);
     expect(calls.testUpdates).toHaveLength(1);
+    // No run created, nothing metered, and the verification still requested.
     expect(calls.runsCreated).toHaveLength(0);
-    const verification = calls.healUpdates.find((args) => args.data.verifyState !== undefined)!;
-    expect(verification.data.verifyState).toBe('UNVERIFIABLE');
-    expect(String(verification.data.verifyNote)).toMatch(/monthly run limit|runs included/);
+    expect(calls.metered).toEqual([]);
+    expect(h.enqueued).toHaveLength(1);
   });
 });
 

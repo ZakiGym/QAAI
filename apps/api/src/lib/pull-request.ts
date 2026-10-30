@@ -838,7 +838,7 @@ export async function openPullRequest(
   }
 
   // ── The claim. The INSERT is the decision. ─────────────────────────────────
-  const claimed = await deps.store.claim({
+  let claimed = await deps.store.claim({
     orgId: input.orgId,
     projectId: input.projectId,
     provider: target.provider,
@@ -854,26 +854,63 @@ export async function openPullRequest(
   });
 
   if (!claimed.created) {
-    /*
-     * Somebody else owns this cause. NOTHING IS SENT — not even when the winner
-     * is still REQUESTED, because "we were about to" plus a second attempt is
-     * how two PRs get opened for one cause, which is the defect the unique
-     * constraint exists to prevent. A REQUESTED row that never settles is
-     * visible and recoverable; a duplicate PR in a customer's repository is not.
-     */
     const existing = claimed.row;
-    return {
-      outcome: 'ALREADY_RECORDED',
-      record: existing,
-      url: existing.url,
-      note:
-        existing.url === null
-          ? `This cause already has a pull-request record (${existing.state}), so nothing was opened a second time.`
-          : `This cause already has a pull request: ${existing.url}`,
-      refusalPaths: [],
-      refusalTotal: 0,
-      hostRefusal: null,
-      body: built,
+
+    /*
+     * ── A DECLINED PULL REQUEST IS NOT A PERMANENT STOP ──────────────────────
+     *
+     * THE DEFECT. `@@unique([orgId, causeKey])` is owned by the record whatever
+     * its state, and this returned ALREADY_RECORDED for every one of them — so a
+     * cause whose pull request a reviewer CLOSED WITHOUT MERGING could never get
+     * a second one. For ever. The product's answer to "fix the review comments
+     * and send it again" was a note saying a pull request already exists, about
+     * a pull request nobody can open.
+     *
+     * CLOSED and FAILED do not claim an open review, so the cause is free again
+     * and the row is REUSED rather than a second one inserted: one record per
+     * cause keeps `@@unique` meaningful and keeps one audit trail per cause.
+     *
+     * THE THREE THAT STILL STOP A RETRY, and each for its own reason:
+     *   · OPEN — there is a live review; a second PR for one cause is the defect
+     *     the constraint exists to prevent;
+     *   · MERGED — it landed, and re-opening would propose the change again;
+     *   · REQUESTED — "we were about to", and "about to" plus a second attempt
+     *     is exactly how two PRs get opened for one cause. A REQUESTED row that
+     *     never settles is visible and recoverable; a duplicate pull request in
+     *     a customer's repository is not.
+     */
+    const reopenable = existing.state === 'CLOSED' || existing.state === 'FAILED';
+    if (!reopenable) {
+      return {
+        outcome: 'ALREADY_RECORDED',
+        record: existing,
+        url: existing.url,
+        note:
+          existing.url === null
+            ? `This cause already has a pull-request record (${existing.state}), so nothing was opened a second time.`
+            : `This cause already has a pull request: ${existing.url}`,
+        refusalPaths: [],
+        refusalTotal: 0,
+        hostRefusal: null,
+        body: built,
+      };
+    }
+
+    /*
+     * Back to REQUESTED, with the previous attempt's number, url and failure
+     * note CLEARED. Leaving the old url on a row that is being retried is two
+     * facts in one field: a reader could not tell the closed pull request from
+     * the one about to be opened.
+     */
+    claimed = {
+      created: true,
+      row: await deps.store.settle({
+        id: existing.id,
+        state: 'REQUESTED',
+        number: null,
+        url: null,
+        failureNote: null,
+      }),
     };
   }
 

@@ -73,6 +73,29 @@ export interface Verdict {
   explanation: string;
   evidence: Array<{ kind: string; ref: string; detail: string }>;
   reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED';
+  /**
+   * WHETHER THAT REVIEW STATE ACTUALLY SILENCES ANYTHING.
+   *
+   * Transcribed from `VerdictSuppression` in apps/api/src/routes/triage.ts,
+   * which every surface in that file and in routes/agent.ts now returns beside
+   * a `reviewState`. `suppresses` IS THE ONLY FIELD A SURFACE MAY RENDER AS
+   * "handled": `MUTED` on its own suppresses nothing — it silences only while a
+   * `KnownIssue` that is IN FORCE backs it — and `knownIssueId: null` on a
+   * MUTED verdict is not an impossible state, it is exactly what the old mute
+   * door wrote every time for as long as it existed.
+   *
+   * `reviewState: null` INSIDE this object means a state this client does not
+   * know, NOT "unreviewed". OPTIONAL at the top level because a server older
+   * than the field sends nothing, and `undefined` means "this client was not
+   * told" — which is not the same fact as `suppresses: false`.
+   */
+  suppression?: {
+    reviewState: 'PENDING' | 'ACCEPTED' | 'OVERRIDDEN' | 'MUTED' | null;
+    knownIssueId: string | null;
+    forceState: 'IN_FORCE' | 'EXPIRED' | 'REVOKED' | null;
+    suppresses: boolean;
+    note: string | null;
+  };
   model: string;
   /**
    * The cause columns. `GET /runs/:runId` returns the whole verdict row, so

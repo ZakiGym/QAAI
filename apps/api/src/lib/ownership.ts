@@ -65,19 +65,27 @@ import type {
   OwnershipState,
 } from '@qaai/shared';
 
+/*
+ * The provenance vocabulary, FROM THE BARREL. It arrived here by a four-dot
+ * relative path because `packages/shared/src/index.ts` did not re-export
+ * `./ownership` yet; it does now (`export * from './ownership'`), so the
+ * relative path is the stale half of a repaired pair and a cross-workspace
+ * relative import that no longer has a reason.
+ */
 import {
   OWNER_PROVENANCES,
   OWNER_PROVENANCE_STRENGTH,
   isHumanSetProvenance,
   mayPage,
   resolutionIsCoherent,
-} from '../../../../packages/shared/src/ownership.js';
+} from '@qaai/shared';
 import type {
   OwnableSubject,
   OwnerProvenance,
   OwnerResolution,
   OwnerStrength,
-} from '../../../../packages/shared/src/ownership.js';
+  OwnershipRuleSource,
+} from '@qaai/shared';
 
 /** Which of the four things a rule points at. */
 export type OwnershipSubject = 'TEST' | 'SUITE' | 'FEATURE' | 'PATH';
@@ -105,6 +113,22 @@ export const OWNERSHIP_RULE_SELECT = {
   feature: true,
   ownerUserId: true,
   ownerTeamId: true,
+  /*
+   * WHERE THE RULE CAME FROM, and it is in the SHARED select rather than in one
+   * caller's copy on purpose.
+   *
+   * `provenanceOfMatch` downgrades a winning match to CODEOWNERS_IMPORT — WEAK,
+   * and therefore not pageable — only when it is told the rule was imported,
+   * and every production caller passed nothing because there was no column to
+   * read. A select that asks for it in three places and forgets it in the
+   * fourth is the same silent failure `position` is commented for above: the
+   * fourth surface pages a team on the strength of a glob somebody pasted,
+   * while the other three correctly call it a suggestion.
+   *
+   * {@link codeownersRuleIdsOf} is what turns these rows into the set
+   * `routeOwner` takes, so no caller spells `'CODEOWNERS'` itself.
+   */
+  source: true,
 } as const;
 
 /** One `OwnershipRule` row, reduced to what matching needs. */
@@ -118,6 +142,23 @@ export interface OwnershipRuleInput {
   feature: string | null;
   ownerUserId: string | null;
   ownerTeamId: string | null;
+  /**
+   * `OWNERSHIP_RULE_SOURCES`, or null/absent.
+   *
+   * OPTIONAL, and ABSENT MEANS THE SAME AS NULL — nobody recorded where this
+   * rule came from. The column is nullable and deliberately not back-filled.
+   *
+   * NULL IS READ AS MANUAL HERE, and that is the one place in this round where
+   * a null may be read as a value. It is true rather than convenient: there was
+   * no importer until this round, so no row that predates the column can have
+   * been imported, and the migration that added it
+   * (20261029160000_run_selection_source_preflight_evidence_and_ownership_rule_source)
+   * states exactly that as its reason for not back-filling. The day a SECOND
+   * source joins `OWNERSHIP_RULE_SOURCES`, that reasoning stops holding for it
+   * — which is why {@link codeownersRuleIdsOf} asks "is it CODEOWNERS" and
+   * never "is it not MANUAL".
+   */
+  source?: string | null;
 }
 
 /** The test being routed. */
@@ -179,10 +220,19 @@ export const MAX_OWNERSHIP_RULES_PER_PROJECT = 500;
 /**
  * Validate and tidy a pattern, or throw a sentence saying what is wrong with it.
  *
- * The three rejections are the three places this dialect differs from the
- * gitignore syntax people half-remember, and each one is refused loudly rather
- * than reinterpreted — a pattern that silently means something other than what
- * it says routes failures to the wrong team and looks right while doing it.
+ * Most of the rejections are the places this dialect differs from the gitignore
+ * syntax people half-remember, and each one is refused loudly rather than
+ * reinterpreted — a pattern that silently means something other than what it
+ * says routes failures to the wrong team and looks right while doing it. The
+ * control-character refusal is the one that is not about the dialect at all;
+ * its own comment says what it is for.
+ *
+ * NO SENTENCE THIS FUNCTION THROWS QUOTES THE PATTERN, and that is load-bearing
+ * rather than taste: `parseCodeowners` puts these messages into its `skipped`
+ * reasons and the importer hands those to a customer, so a message carrying the
+ * offending line would be exactly the leak the importer refuses lines by NUMBER
+ * to avoid. (`compilePattern` below does interpolate, for a doubled slash —
+ * which is why the control-character check is here, in front of it.)
  */
 export function normalisePattern(raw: string): string {
   const pattern = raw.trim();
@@ -194,6 +244,33 @@ export function normalisePattern(raw: string): string {
     throw new OwnershipRuleError(
       `That path pattern is ${pattern.length} characters; the limit is ${MAX_PATTERN_LENGTH}. Split it into two rules.`,
     );
+  }
+  /*
+   * CONTROL CHARACTERS, refused here rather than downstream.
+   *
+   * THE DEFECT THIS CLOSES: an imported CODEOWNERS line is customer-authored
+   * text, `stripped.split(/\s+/)` does not treat U+0007 (or any other C0
+   * character that is not whitespace) as a separator, and nothing below this
+   * point looked. Such a pattern stored fine and then reached
+   * `compilePattern`'s doubled-slash refusal, which INTERPOLATES THE PATTERN —
+   * so a newline or an escape sequence out of a repository's own file ended up
+   * inside `OwnerAssignment.unusable[].reason`, which is copied verbatim into
+   * `TriageVerdict.ownerNote` and read by a human and a model. A path is
+   * customer-authored text by the same rule a locale tag is: report the field,
+   * never the value.
+   *
+   * It is in `normalisePattern` and not in the importer because this is the ONE
+   * validator both write paths run through — `parseCodeowners` calls it for
+   * exactly that reason — and a check in the importer alone would leave the
+   * hand-typed door open.
+   */
+  for (let index = 0; index < pattern.length; index += 1) {
+    const code = pattern.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) {
+      throw new OwnershipRuleError(
+        'That path pattern contains a control character. Remove it — a path is matched against `Test.filePath`, and a control character there breaks every line-oriented report it appears in.',
+      );
+    }
   }
   if (pattern.startsWith('!')) {
     throw new OwnershipRuleError(
@@ -854,18 +931,12 @@ export function ownerLabel(owner: OwnerRef, directory: OwnerDirectory): string {
  * This file supplies the half that vocabulary cannot: which provenance a MATCH
  * earns, given what matched and where the rule came from.
  *
- * WHY THE IMPORT IS A RELATIVE PATH AND NOT `@qaai/shared`. At this round's
- * baseline `packages/shared/src/index.ts` does not re-export `./ownership` and
- * `packages/shared/package.json` does not list it under `exports`, so
- * `@qaai/shared` publishes no name from it and apps/api cannot reach it by the
- * package name at all. lib/git.ts reaches `artifact-set.ts` by this same
- * four-dot path for exactly that reason. THE BARREL LINE IS OWED and is in this
- * round's needsFromOtherFiles; when it lands, change this import to
- * `from '@qaai/shared'` — nothing else changes. What is NOT an option is a
- * second copy of the strength table in this package:
- * `apps/api/scripts/check-enums.ts` diffs the shared file against
- * `schema.prisma`, so there is exactly one declaration of `OwnerProvenance` and
- * it is not this one.
+ * IT IS IMPORTED FROM `@qaai/shared`, which now re-exports `./ownership`. It
+ * used to arrive by a four-dot relative path because the barrel did not, and
+ * that path is gone from this file. What is NOT an option is a second copy of
+ * the strength table in this package: `apps/api/scripts/check-enums.ts` diffs
+ * the shared file against `schema.prisma`, so there is exactly one declaration
+ * of `OwnerProvenance` and it is not this one.
  */
 
 /**
@@ -896,17 +967,81 @@ export const PROVENANCE_BY_SUBJECT = {
  *               QAAI in mind, and an import brings a thousand at once. The
  *               shared table makes it WEAK for that reason alone.
  *
- * There is no `OwnershipRule.source` column, so this cannot be read off a row.
- * It is supplied by the caller that knows — the import endpoint knows which ids
- * it just created — and a caller that does NOT know passes nothing and gets
- * `QAAI`, which is the answer a hand-written rule deserves and the one a
- * pre-provenance row has always implicitly carried. The column is owed and is in
- * this round's needsFromOtherFiles; until it exists, a caller that guessed
- * CODEOWNERS for a hand-written rule would be understating a real assignment,
- * which is the safe direction of the two.
+ * IT IS NOW A COLUMN. `OwnershipRule.source` holds `OWNERSHIP_RULE_SOURCES`
+ * ('MANUAL' | 'CODEOWNERS') as TEXT, so this is read off the row rather than
+ * supplied by a caller that happens to remember — which is what
+ * {@link codeownersRuleIdsOf} does, in one place, for all three routing
+ * surfaces.
+ *
+ * TWO LISTS WITH THE SAME TWO MEANINGS, and the duplication is deliberate
+ * rather than overlooked. `RULE_ORIGINS` is this module's in-memory vocabulary
+ * for "where did the rule that matched come from"; `OWNERSHIP_RULE_SOURCES` is
+ * the DOMAIN OF A TEXT COLUMN, and a stored domain and an in-memory vocabulary
+ * drift for different reasons — the first needs a migration to change, the
+ * second does not. {@link RULE_ORIGIN_BY_SOURCE} maps one onto the other as a
+ * compiler-enforced record, so a third member of either list cannot arrive
+ * without somebody saying what it means in the other.
  */
 export const RULE_ORIGINS = ['QAAI', 'CODEOWNERS'] as const;
 export type RuleOrigin = (typeof RULE_ORIGINS)[number];
+
+/**
+ * The stored source → this module's origin.
+ *
+ * `satisfies Record<OwnershipRuleSource, RuleOrigin>`, so a third stored source
+ * is a compile error here rather than a row that silently routes as if a human
+ * had typed it.
+ */
+export const RULE_ORIGIN_BY_SOURCE = {
+  MANUAL: 'QAAI',
+  CODEOWNERS: 'CODEOWNERS',
+} as const satisfies Record<OwnershipRuleSource, RuleOrigin>;
+
+/**
+ * The rule ids `routeOwner` must treat as bulk-imported — ONE reader for the
+ * column, for all three routing surfaces.
+ *
+ * ── WHY A SET AND NOT A FIELD ON THE MATCH ──────────────────────────────────
+ *
+ * `routeOwner` already takes `codeownersRuleIds` and already downgrades a
+ * winning match to CODEOWNERS_IMPORT from it. The gap was never the predicate,
+ * it was that nothing in production ever built the set: the digest, the notify
+ * processor and the filing endpoint each passed nothing, so every imported glob
+ * claimed the strength of a rule somebody typed. This is the feeder.
+ *
+ * ── IT ASKS "IS IT CODEOWNERS", NEVER "IS IT NOT MANUAL" ────────────────────
+ *
+ * A row whose `source` is null, absent, or a spelling this build has never
+ * heard of is NOT in the set. Null is MANUAL (see `OwnershipRuleInput.source`)
+ * and an unrecognised spelling is unknown — and treating unknown as imported
+ * would silently stop a real assignment paging anybody, which is the failure
+ * mode `RULES_UNUSABLE` exists to make visible rather than one to introduce
+ * quietly.
+ */
+export function codeownersRuleIdsOf(
+  rules: readonly Pick<OwnershipRuleInput, 'id' | 'source'>[],
+): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const rule of rules) {
+    if (rule.source === CODEOWNERS_SOURCE) ids.add(rule.id);
+  }
+  return ids;
+}
+
+/**
+ * THE ONE SPELLING OF THE STORED VALUE, and the compiler is the validator.
+ *
+ * `OwnershipRule.source` is TEXT with its domain at the producer
+ * (`OWNERSHIP_RULE_SOURCES`), which means there is NO zod schema and NO
+ * database enum between a typo and a stored row: `source: 'CODEOWNER'` would
+ * insert, and `codeownersRuleIdsOf` would then never match it, so every
+ * imported rule would silently page. The annotation on this constant is the
+ * whole guard, and the importer and the reader share it so the two cannot
+ * disagree about the spelling — which is lesson H in the one form available for
+ * a TEXT column: a test over the producer ends at the validator the write path
+ * runs, and here that validator is `tsc`.
+ */
+export const CODEOWNERS_SOURCE: OwnershipRuleSource = 'CODEOWNERS';
 
 /**
  * What a surface may SAY about an owner.
@@ -1208,19 +1343,56 @@ export function routingResolution(
  * together or not at all" with `ownerState`, and `verdictOwnerColumns` above
  * writes `ownerState` and cannot write a provenance — it is handed an
  * `OwnerAssignment`, which does not carry one. Making its `provenance` argument
- * required would break `apps/worker/src/processors/notify.ts`, a file this
- * round's agent does not own; making it optional would write `ownerState`
- * without `ownerProvenance` and contradict the column's own documentation,
- * which is one of the lies this product cannot afford.
+ * required would have broken `apps/worker/src/processors/notify.ts`, which the
+ * round that added this function did not own; making it optional would write
+ * `ownerState` without `ownerProvenance` and contradict the column's own
+ * documentation, which is one of the lies this product cannot afford.
  *
- * So the writer that CAN tell the truth is a new function over `OwnerRouting`,
- * `verdictOwnerColumns` is left byte-identical for its remaining caller, and
- * the one-line edit that moves that caller over is in this round's
- * needsFromOtherFiles. When it lands, `verdictOwnerColumns` has no callers and
- * can be deleted.
+ * So the writer that CAN tell the truth is this function, over `OwnerRouting`.
+ *
+ * ─── THAT EDIT HAS NOW LANDED ───────────────────────────────────────────────
+ *
+ * `apps/worker/src/processors/notify.ts` writes through THIS function, so both
+ * verdict writers — it and `apps/api/src/routes/issues.ts` — write the
+ * provenance with the state. `verdictOwnerColumns` is NOT dead: it is the
+ * implementation of the five columns this one extends, called on the line
+ * below, and `ownership.test.ts` exercises it directly. It simply has no
+ * remaining PRODUCTION caller of its own, which is the point — there is one
+ * writer of a verdict's owner columns and it cannot omit the provenance.
  */
 export interface VerdictRoutingColumns extends VerdictOwnerColumns {
   ownerProvenance: OwnerProvenance;
+}
+
+/**
+ * THE OWNER LABEL A SURFACE MAY PRINT, given what the answer is worth.
+ *
+ * ── THE DEFECT THIS CLOSES ──────────────────────────────────────────────────
+ *
+ * `mayPage` has existed for a round and NOTHING ASKED IT. The digest printed
+ * `— @payments` and the 3am chat alert printed `— @payments`, identically, for
+ * an owner a person assigned and for an owner a glob landed on. No team has
+ * actually been paged by a bulk-imported glob yet, and the only reason is that
+ * `OwnershipRule.source` had no writer, so nothing could BE imported — the
+ * CODEOWNERS import lands in this same round and removes that accident. A
+ * digest that pages a team on the strength of a glob teaches that team to
+ * filter the digest, and then the RULES_UNUSABLE line gets filtered with it.
+ *
+ * ── WHY THE PHRASING IS HERE AND NOT IN EACH RENDERER ───────────────────────
+ *
+ * Two surfaces print this — `ownerSuffix` in the digest and the failure line in
+ * the chat alert — and the one thing worse than neither of them qualifying the
+ * claim is one of them qualifying it and the other not: a reader who sees
+ * "@payments" in the alert and "@payments (suggested, not paged)" in the digest
+ * concludes the two disagree about who owns it. `ownerLabel` is shared for exactly this
+ * reason and this is the same argument one step further on.
+ *
+ * It composes a STRING for a human out of two fields that stay separate in the
+ * model — `OwnerRouting` keeps `owner`, `provenance`, `kind` and `pageable`
+ * apart on purpose — so nothing here collapses two facts into one stored value.
+ */
+export function ownerClaimLabel(label: string, pageable: boolean): string {
+  return pageable ? label : `${label} (suggested, not paged)`;
 }
 
 export function verdictRoutingColumns(
@@ -1254,6 +1426,86 @@ export interface CodeownersEntry {
 
 /** How many lines of a CODEOWNERS file are read. GitHub's own ceiling is 3MB. */
 export const MAX_CODEOWNERS_LINES = 2_000;
+
+/**
+ * How many CHARACTERS of a CODEOWNERS upload are accepted at all.
+ *
+ * {@link MAX_CODEOWNERS_LINES} bounds the lines READ and reports what it did
+ * not read; this bounds what the request may CARRY, which is a different job
+ * and a refusal rather than a disclosure. A single 3MB line is two thousand
+ * lines as far as the line cap is concerned, and `normalisePattern` would then
+ * be handed a 3MB string.
+ *
+ * {@link MAX_CODEOWNERS_LINES} lines of {@link MAX_PATTERN_LENGTH} plus room
+ * for the owner tokens on each. A real CODEOWNERS file is three orders of
+ * magnitude under it.
+ */
+export const MAX_CODEOWNERS_CHARS = 600_000;
+
+/**
+ * One owner token out of a CODEOWNERS line, reduced to what QAAI can LOOK UP.
+ *
+ * ── WHY THIS IS A SHAPE AND NOT A RESOLUTION ────────────────────────────────
+ *
+ * Resolution needs the org's users, teams and memberships, which means Prisma,
+ * which this module deliberately does not have. What is pure is the question
+ * "what KIND of thing is this token claiming to be, and what is the one string
+ * we would look it up by" — and keeping that here is what stops the import
+ * endpoint inventing a second reading of `@acme/payments`.
+ *
+ * The three readings are GitHub's own:
+ *
+ *   `@acme/payments`  an org team. The SLUG is the part after the slash;
+ *                     `acme` is the GitHub org and means nothing to QAAI.
+ *   `@dana`           a user handle. QAAI stores no handles, so this is
+ *                     looked up as a TEAM SLUG and nothing else — matching it
+ *                     against a user by guessing an email would invent an
+ *                     address.
+ *   `dana@acme.com`   an email address. The one token that can name a user.
+ *
+ * `null` is "this is not an owner token at all", and the caller refuses the
+ * LINE for it rather than importing the half that parsed.
+ */
+export type CodeownersOwnerToken =
+  | { readonly kind: 'TEAM'; readonly slug: string }
+  | { readonly kind: 'USER'; readonly email: string };
+
+/** The token's shape, with no lookup and no guessing. */
+export function codeownersOwnerToken(raw: string): CodeownersOwnerToken | null {
+  const token = raw.trim();
+  if (!token || token.length > 200) return null;
+  for (let index = 0; index < token.length; index += 1) {
+    const code = token.charCodeAt(index);
+    if (code < 0x20 || code === 0x7f) return null;
+  }
+
+  if (token.startsWith('@')) {
+    const body = token.slice(1);
+    if (!body) return null;
+    /*
+     * `@acme/payments` → `payments`, `@dana` → `dana`. A token with TWO slashes
+     * is not a shape GitHub produces, so it is refused rather than read as its
+     * last segment: reading it would make `@acme/payments/oncall` import as the
+     * `oncall` team, which is an owner nobody named.
+     */
+    const parts = body.split('/');
+    if (parts.length > 2) return null;
+    const slug = (parts.length === 2 ? parts[1] : parts[0]) ?? '';
+    if (!slug || slug.includes('@')) return null;
+    return { kind: 'TEAM', slug };
+  }
+
+  /*
+   * An email, and only one `@` — `a@b@c` is not an address and is refused
+   * rather than reduced to one. The real check is the LOOKUP: a token that is
+   * not a user QAAI already knows about never becomes a rule, so the shape test
+   * here only has to be narrow enough to pick the right lookup.
+   */
+  const at = token.indexOf('@');
+  if (at <= 0 || token.indexOf('@', at + 1) !== -1) return null;
+  if (at === token.length - 1 || !token.slice(at + 1).includes('.')) return null;
+  return { kind: 'USER', email: token };
+}
 
 /**
  * Parse a CODEOWNERS file into rule drafts, deterministically and with no model
@@ -1366,18 +1618,18 @@ export function parseCodeowners(text: string): {
  */
 export { ISSUE_OWNER_STATES, ISSUE_SUBJECTS, OWNERSHIP_STATES } from '@qaai/shared';
 /*
- * And the provenance half, from the shared module the barrel does not publish
- * yet (see the import note in the provenance section). Re-exported for the same
- * reason the block above exists: a module that routes ownership is where a
- * caller looks for the words ownership is described in, and routes/issues.ts
- * would otherwise need the same four-dot relative path.
+ * And the provenance half. Re-exported for the same reason the block above
+ * exists: a module that routes ownership is where a caller looks for the words
+ * ownership is described in, and routes/issues.ts already imports these four
+ * from here. The barrel publishes them now, so this is a convenience and no
+ * longer the only way to reach them.
  */
 export type {
   OwnableSubject,
   OwnerProvenance,
   OwnerResolution,
   OwnerStrength,
-} from '../../../../packages/shared/src/ownership.js';
+} from '@qaai/shared';
 export type {
   IssueOwnerState,
   IssueSubject,

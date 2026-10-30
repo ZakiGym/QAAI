@@ -3,8 +3,10 @@
  *
  * ─── THE DEFECT THIS CLOSES ─────────────────────────────────────────────────
  *
- * `VerdictReviewState.MUTED` was written by two endpoints
- * (apps/api/src/routes/agent.ts, apps/api/src/routes/team.ts) and READ BY
+ * `VerdictReviewState.MUTED` was written by two endpoints — the single-verdict
+ * review in apps/api/src/routes/agent.ts and the bulk review in
+ * apps/api/src/routes/team.ts, BOTH of which now also write the `KnownIssue`
+ * behind it and point `TriageVerdict.knownIssueId` at it — and READ BY
  * NOTHING. So a reviewer who muted a failure changed one column and nothing
  * else: the next run minted a fresh verdict for the same cause and — when the
  * verdict was INTENDED_CHANGE — a fresh STRONG-MODEL heal for the same test.

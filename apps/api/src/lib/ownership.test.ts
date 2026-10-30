@@ -608,12 +608,26 @@ describe('the ownership vocabulary is re-exported, not just moved', () => {
  *      for twenty other tests, and an answer reached by blame must still say so.
  */
 
+/*
+ * These arrive from `@qaai/shared` rather than by a four-dot relative path
+ * through `packages/`: the barrel re-exports `./ownership` now, and the module
+ * under test imports them that way too. One resolution for one module, so the
+ * test cannot be exercising a second copy of the vocabulary.
+ */
 import {
   ASSIGNMENT_KINDS,
+  CODEOWNERS_SOURCE,
   KIND_BY_STRENGTH,
+  MAX_CODEOWNERS_CHARS,
   MAX_CODEOWNERS_LINES,
+  OWNERSHIP_RULE_SELECT,
   PROVENANCE_BY_SUBJECT,
+  RULE_ORIGINS,
+  RULE_ORIGIN_BY_SOURCE,
+  codeownersOwnerToken,
+  codeownersRuleIdsOf,
   consensusProvenance,
+  ownerClaimLabel,
   parseCodeowners,
   provenanceOfMatch,
   routeOwner,
@@ -624,9 +638,7 @@ import {
 
 describe('every rule subject earns a provenance, and the tables cannot disagree', () => {
   it('names every subject, and every value is a RULE_ provenance', async () => {
-    const { OWNER_PROVENANCES } = await import(
-      '../../../../packages/shared/src/ownership.js'
-    );
+    const { OWNER_PROVENANCES } = await import('@qaai/shared');
     const subjects = Object.keys(PROVENANCE_BY_SUBJECT).sort();
     expect(subjects).toEqual(['FEATURE', 'PATH', 'SUITE', 'TEST']);
     for (const provenance of Object.values(PROVENANCE_BY_SUBJECT)) {
@@ -638,7 +650,7 @@ describe('every rule subject earns a provenance, and the tables cannot disagree'
   });
 
   it('ranks a test rule above a path rule, the same order the shared file declares', async () => {
-    const { provenanceRank } = await import('../../../../packages/shared/src/ownership.js');
+    const { provenanceRank } = await import('@qaai/shared');
     expect(provenanceRank(PROVENANCE_BY_SUBJECT.TEST)).toBeLessThan(
       provenanceRank(PROVENANCE_BY_SUBJECT.SUITE),
     );
@@ -651,9 +663,7 @@ describe('every rule subject earns a provenance, and the tables cannot disagree'
   });
 
   it('agrees with mayPage about which strengths may be shown as an assignment', async () => {
-    const { OWNER_PROVENANCES, OWNER_PROVENANCE_STRENGTH, mayPage } = await import(
-      '../../../../packages/shared/src/ownership.js'
-    );
+    const { OWNER_PROVENANCES, OWNER_PROVENANCE_STRENGTH, mayPage } = await import('@qaai/shared');
     /*
      * The derivation, checked rather than asserted. `KIND_BY_STRENGTH` is meant
      * to be `mayPage` with a different name; a second threshold here is how a
@@ -789,7 +799,7 @@ describe('the verdict carries the provenance it was routed by', () => {
   });
 
   it('resolves to the shared OwnerResolution shape, coherently', async () => {
-    const { resolutionIsCoherent } = await import('../../../../packages/shared/src/ownership.js');
+    const { resolutionIsCoherent } = await import('@qaai/shared');
     for (const routed of [
       routeOwner(test(), [rule({ pathPattern: 'tests/**' })]),
       routeOwner(test(), []),
@@ -909,5 +919,223 @@ describe('a ticket for many tests claims the weakest provenance behind it', () =
       kind: 'UNOWNED',
     });
     expect(consensusProvenance([])).toEqual({ provenance: 'NONE', kind: 'UNOWNED' });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The CODEOWNERS column: one reader, one spelling, one phrasing
+//
+// `provenanceOfMatch` and `mayPage` have existed for a round and NOTHING IN
+// PRODUCTION FED THEM: `routeOwner`'s `codeownersRuleIds` was empty at every
+// call site because `OwnershipRule` had no `source` column, so every glob
+// pasted out of a repository's CODEOWNERS file claimed the strength of a rule
+// somebody typed. These are the three pieces that close it — the select that
+// asks for the column, the reader that turns rows into the set, and the one
+// phrasing both surfaces print.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('codeownersRuleIdsOf is the only reader of OwnershipRule.source', () => {
+  it('collects exactly the rules recorded as imported', () => {
+    const ids = codeownersRuleIdsOf([
+      { id: 'a', source: 'CODEOWNERS' },
+      { id: 'b', source: 'MANUAL' },
+      { id: 'c', source: 'CODEOWNERS' },
+    ]);
+    expect([...ids].sort()).toEqual(['a', 'c']);
+  });
+
+  it('treats NULL and ABSENT as not-imported, which is MANUAL and is true', () => {
+    /*
+     * The column is nullable and deliberately not back-filled. There was no
+     * importer before it existed, so no row that predates it can have been
+     * imported — which is the one case in this round where a null may be read
+     * as a value, and the migration says so as its reason for not filling it.
+     */
+    expect(codeownersRuleIdsOf([{ id: 'a', source: null }]).size).toBe(0);
+    expect(codeownersRuleIdsOf([{ id: 'a' }]).size).toBe(0);
+  });
+
+  it('asks "is it CODEOWNERS", never "is it not MANUAL"', () => {
+    /*
+     * A spelling this build has never heard of is UNKNOWN, and unknown is not
+     * imported. Reading it as imported would silently stop a real assignment
+     * paging anybody — RULES_UNUSABLE's failure mode, introduced quietly.
+     */
+    expect(codeownersRuleIdsOf([{ id: 'a', source: 'SOMETHING_LATER' }]).size).toBe(0);
+  });
+
+  it('is what `routeOwner` needs: the same rule, two strengths', () => {
+    const imported = rule({ id: 'rule_glob', pathPattern: 'tests/**', ownerTeamId: 'team_pay' });
+    const bare = routeOwner(test(), [imported]);
+    const weak = routeOwner(test(), [imported], {
+      codeownersRuleIds: codeownersRuleIdsOf([{ id: 'rule_glob', source: CODEOWNERS_SOURCE }]),
+    });
+
+    // Identical matching, identical owner, different strength — and only the
+    // first of the two may wake somebody up.
+    expect(bare.owner).toEqual(weak.owner);
+    expect(bare).toMatchObject({ provenance: 'RULE_PATH', kind: 'ASSIGNED', pageable: true });
+    expect(weak).toMatchObject({
+      provenance: 'CODEOWNERS_IMPORT',
+      kind: 'SUGGESTED',
+      pageable: false,
+    });
+  });
+});
+
+describe('the stored source has one spelling and the compiler is its validator', () => {
+  it('is a member of the domain the column accepts', async () => {
+    const { OWNERSHIP_RULE_SOURCES } = await import('@qaai/shared');
+    /*
+     * LESSON H, in the only form available for a TEXT column. There is no zod
+     * schema and no database enum between `source: 'CODEOWNER'` and a stored
+     * row — the annotation on `CODEOWNERS_SOURCE` is the whole guard, and this
+     * asserts the value it holds is one the domain actually names rather than
+     * merely that it is spelled the way this test spells it.
+     */
+    expect(OWNERSHIP_RULE_SOURCES).toContain(CODEOWNERS_SOURCE);
+  });
+
+  it('maps every stored source onto an origin this module can reason about', async () => {
+    const { OWNERSHIP_RULE_SOURCES } = await import('@qaai/shared');
+    // Compiler-enforced by `satisfies`; this is the run-time half, over the
+    // shared list rather than over the record's own keys — a check against its
+    // own keys could not notice a member added to the domain.
+    expect(Object.keys(RULE_ORIGIN_BY_SOURCE).sort()).toEqual([...OWNERSHIP_RULE_SOURCES].sort());
+    for (const origin of Object.values(RULE_ORIGIN_BY_SOURCE)) {
+      expect(RULE_ORIGINS).toContain(origin);
+    }
+  });
+
+  it('is in the SHARED select, so no surface can forget to ask', () => {
+    /*
+     * The three routing surfaces take their field list from here. A copy that
+     * dropped `source` would not fail — every rule would read as hand-typed
+     * and every imported glob would page, which is invisible in the output.
+     */
+    expect(OWNERSHIP_RULE_SELECT).toMatchObject({ source: true, position: true });
+  });
+});
+
+describe('ownerClaimLabel — one fact, one phrasing, two surfaces', () => {
+  it('prints a pageable owner bare', () => {
+    expect(ownerClaimLabel('@payments', true)).toBe('@payments');
+  });
+
+  it('qualifies a weak one, and still names it', () => {
+    /*
+     * The name is kept because it is the best lead there is. What changes is
+     * the claim: a digest or a 3am page that printed an imported glob's team
+     * exactly as a human assignment is how a team that was never asked learns
+     * to mute the channel.
+     */
+    expect(ownerClaimLabel('@payments', false)).toBe('@payments (suggested, not paged)');
+  });
+
+  it('agrees with `mayPage` for every provenance, rather than re-deciding', async () => {
+    const { OWNER_PROVENANCES, mayPage } = await import('@qaai/shared');
+    for (const provenance of OWNER_PROVENANCES) {
+      const qualified = ownerClaimLabel('@x', mayPage(provenance)) !== '@x';
+      expect(qualified).toBe(!mayPage(provenance));
+    }
+  });
+});
+
+describe('codeownersOwnerToken reads a token’s SHAPE and resolves nothing', () => {
+  it('reads an @org/team as its slug, which is the part QAAI stores', () => {
+    expect(codeownersOwnerToken('@acme/payments')).toEqual({ kind: 'TEAM', slug: 'payments' });
+  });
+
+  it('reads a bare @handle as a team slug, and never guesses an email for it', () => {
+    /*
+     * QAAI stores no GitHub handles. Matching `@dana` against a user by
+     * composing an address would INVENT one, which is the opposite of
+     * resolving from our own records.
+     */
+    expect(codeownersOwnerToken('@dana')).toEqual({ kind: 'TEAM', slug: 'dana' });
+  });
+
+  it('reads an email as a user', () => {
+    expect(codeownersOwnerToken('dana@acme.test')).toEqual({
+      kind: 'USER',
+      email: 'dana@acme.test',
+    });
+  });
+
+  it('refuses a shape GitHub does not produce rather than reading its last segment', () => {
+    // `@acme/payments/oncall` read as `oncall` would import a team nobody named.
+    expect(codeownersOwnerToken('@acme/payments/oncall')).toBeNull();
+  });
+
+  it('refuses what it cannot classify, so the caller refuses the LINE', () => {
+    for (const token of [
+      '',
+      '   ',
+      '@',
+      '@/',
+      'not-a-token',
+      'a@b@c',
+      'dana@localhost',
+      'dana@',
+      '@acme/pay@ments',
+      `@${'a'.repeat(300)}`,
+      '@team\u0007name',
+    ]) {
+      expect(codeownersOwnerToken(token)).toBeNull();
+    }
+  });
+});
+
+describe('normalisePattern refuses a control character, before anything quotes it', () => {
+  it('refuses it, and the sentence names the field and not the pattern', () => {
+    /*
+     * THE DEFECT: `stripped.split(/\s+/)` in `parseCodeowners` does not treat
+     * U+0007 as a separator, so such a pattern stored fine and then reached
+     * `compilePattern`'s doubled-slash refusal — which INTERPOLATES THE
+     * PATTERN. A newline or an escape sequence out of a customer's own file
+     * then landed in `OwnerAssignment.unusable[].reason`, which is copied into
+     * `TriageVerdict.ownerNote` and read by a human and a model.
+     */
+    let message = '';
+    try {
+      normalisePattern('specs/evil\u0007/**');
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('control character');
+    expect(message).not.toContain('evil');
+    expect(message).not.toContain('\u0007');
+  });
+
+  it('refuses a newline and a DEL, not only the obvious one', () => {
+    for (const bad of ['a\nb/**', 'a\rb/**', 'a\u007fb/**', 'a\u0000b/**']) {
+      expect(() => normalisePattern(bad)).toThrow(OwnershipRuleError);
+    }
+  });
+
+  it('is the validator the IMPORT path runs, so such a line is skipped by number', () => {
+    const parsed = parseCodeowners('specs/evil\u0007/** @acme/payments\nspecs/ok/** @acme/qa\n');
+    expect(parsed.entries.map((entry) => entry.pathPattern)).toEqual(['specs/ok/**']);
+    expect(parsed.skipped.map((row) => row.line)).toEqual([1]);
+    // And the skip reason carries no byte of the line, which is what lets the
+    // endpoint report it to a customer.
+    expect(parsed.skipped[0]!.reason).not.toContain('evil');
+  });
+
+  it('still accepts the patterns a real CODEOWNERS file contains', () => {
+    for (const good of ['*', 'tests/**', '/playwright.config.ts', 'e2e/', '*.spec.ts']) {
+      expect(normalisePattern(good)).toBe(good);
+    }
+  });
+});
+
+describe('MAX_CODEOWNERS_CHARS bounds what a request may CARRY', () => {
+  it('is a different job from the line cap, and sits above a real file', () => {
+    /*
+     * The line cap bounds what is READ and DISCLOSES what it did not read; this
+     * bounds what arrives at all and is a refusal. A single three-megabyte line
+     * is one line as far as the line cap is concerned.
+     */
+    expect(MAX_CODEOWNERS_CHARS).toBeGreaterThan(MAX_CODEOWNERS_LINES * 100);
   });
 });

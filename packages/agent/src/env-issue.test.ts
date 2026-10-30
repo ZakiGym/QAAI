@@ -28,7 +28,6 @@ import {
   classifyEnvironment,
   coverageForEnvIssueRun,
   envIssueSuppression,
-  envIssueTally,
   envRetryDecision,
   environmentAlert,
   probeEnvironment,
@@ -303,14 +302,6 @@ describe('a genuine environment failure takes the gate off, out loud', () => {
     });
   });
 
-  it('tallies for the one summariser, rather than writing a second sentence', () => {
-    expect(envIssueTally({ runs: 9, suppressed: 312 })).toEqual({
-      kind: 'ENV_ISSUE',
-      suppressions: 9,
-      suppressed: 312,
-      expired: 0,
-    });
-  });
 });
 
 // ─── 5. The coverage number for a run that measured nothing ──────────────────

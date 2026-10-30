@@ -80,6 +80,7 @@ import {
   consensusProvenance,
   ownableSurface,
   ownerLabel,
+  codeownersRuleIdsOf,
   routeOwner,
   verdictRoutingColumns,
 } from '../lib/ownership.js';
@@ -946,12 +947,23 @@ issuesRouter.post('/', requireRole('MEMBER'), async (req, res) => {
    * them is how a digest pages the wrong person. It arrives as a SUGGESTION in
    * the ticket, labelled as one.
    *
-   * `codeownersRuleIds` is empty here because `OwnershipRule` has no `source`
-   * column yet (the edit is in this round's report), so every stored rule is a
-   * rule somebody typed into QAAI — which is what it has always implicitly
-   * been. Understating an answer would be the safe error; this is not even
-   * that, it is the true one for every row that exists today.
+   * `codeownersRuleIds` IS SUPPLIED. `OwnershipRule.source` has a writer now —
+   * `POST /team/ownership/import-codeowners` — so an imported glob resolves to
+   * CODEOWNERS_IMPORT, which is WEAK and therefore NOT pageable. Until this was
+   * passed, the filing path wrote `ownerProvenance: 'RULE_PATH'` for a glob
+   * somebody pasted out of a CODEOWNERS file and the ticket presented a
+   * SUGGESTION as an ASSIGNMENT. All three `routeOwner` calls in this file take
+   * it, because a select that asks for `source` in two places and forgets it in
+   * the third is the silent failure `OWNERSHIP_RULE_SELECT` is commented for.
    */
+  /*
+   * WHICH of these rules were imported wholesale, computed ONCE for the page
+   * rather than per member. `codeownersRuleIdsOf` is the only thing that spells
+   * `'CODEOWNERS'`, so no caller can get the stored value wrong — see
+   * `CODEOWNERS_SOURCE`.
+   */
+  const codeownersRuleIds = codeownersRuleIdsOf(rules);
+
   const routingByResult = new Map<string, OwnerRouting>();
   for (const resultIdOfMember of members) {
     const test = testById.get(testIdByResult.get(resultIdOfMember) ?? '');
@@ -965,6 +977,7 @@ issuesRouter.post('/', requireRole('MEMBER'), async (req, res) => {
             ownableSurface({ key: resultIdOfMember, file: null, feature: null }),
         rules,
         {
+          codeownersRuleIds,
           lastEditor: test
             ? ((id) => (id ? { userId: id } : null))(editors.byTest.get(test.id))
             : null,
@@ -1500,6 +1513,7 @@ issuesRouter.post('/coverage', requireRole('MEMBER'), async (req, res) => {
    * which is what lets the ticket say "suggested owner" when it is one.
    */
   const gapRules = await ownershipRulesFor(project.id);
+  const gapCodeownersRuleIds = codeownersRuleIdsOf(gapRules);
   const assignments = gaps.map((gap) =>
     routeOwner(
       ownableSurface({
@@ -1508,6 +1522,7 @@ issuesRouter.post('/coverage', requireRole('MEMBER'), async (req, res) => {
         feature: gap.feature,
       }),
       gapRules,
+      { codeownersRuleIds: gapCodeownersRuleIds },
     ),
   );
   const consensus = consensusOwner(assignments);
@@ -1815,6 +1830,7 @@ issuesRouter.post('/from-gap', requireRole('MEMBER'), async (req, res) => {
   const present = new Set(surfaces.map((item) => item.entry.item.key));
   const missing = body.surfaceKeys.filter((key) => !present.has(key));
 
+  const surfaceCodeownersRuleIds = codeownersRuleIdsOf(rules);
   const routings = surfaces.map((item) =>
     routeOwner(
       ownableSurface({
@@ -1823,6 +1839,7 @@ issuesRouter.post('/from-gap', requireRole('MEMBER'), async (req, res) => {
         feature: item.feature,
       }),
       rules,
+      { codeownersRuleIds: surfaceCodeownersRuleIds },
     ),
   );
   const consensus = consensusOwner(routings);

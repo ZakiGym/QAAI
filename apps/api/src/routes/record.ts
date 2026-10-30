@@ -47,14 +47,29 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { Router } from 'express';
+import { z } from 'zod';
 import { cleanupRecordedSpec, startRecording, type RecordingSession } from '@qaai/runner';
 import { canonicalRoute } from '@qaai/agent';
 import {
+  destinationDecision,
   originFromSources,
   promoteRecordingSchema,
   type SurfaceKind,
   type SurfaceSource,
 } from '@qaai/shared';
+/*
+ * The fixture promoter. 929 lines with no production caller until the fixture
+ * endpoint at the bottom of this file: nothing in the product produced a
+ * `CapturedExchange[]`, so the allowlist, the redaction vocabulary and all
+ * seven refusals were reachable only from their own tests.
+ */
+import {
+  FIXTURE_CONVENTIONS,
+  FIXTURE_CONVENTION_SPEC,
+  REDACTION_WHY,
+  promoteRecording,
+} from '../lib/fixtures.js';
+import type { PromotionRefusal, RefusalDetail } from '../lib/fixtures.js';
 import { prisma } from '../lib/prisma.js';
 import { badRequest, conflict, notFound } from '../lib/errors.js';
 import { audit } from '../lib/audit.js';
@@ -985,3 +1000,401 @@ recordRouter.post('/projects/:projectId/record/promote', requireRole('MEMBER'), 
 
   res.status(201).json({ test, idempotent: false, recordingKey: input.recordingKey });
 });
+
+// ─── Promotion: the recording becomes a committed FIXTURE ────────────────────
+
+/**
+ * THE DOOR ON THE FIXTURE PROMOTER.
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * apps/api/src/lib/fixtures.ts is 929 lines — `promoteRecording`, the
+ * allowlist, `credentialShapesIn`, the redaction vocabulary, seven refusals and
+ * a cap ledger — and NOTHING IN THE PRODUCT EVER PRODUCED A
+ * `CapturedExchange[]`, so not one line of it could be reached by a request. It
+ * is the third round in a row of correct code connected to nothing, and this is
+ * the connection.
+ *
+ * ── THE EXCHANGES COME FROM THE CLIENT, AND THAT IS NOT A SHORTCUT ──────────
+ *
+ * `playwright codegen` — which is what `startRecording` above drives — hands
+ * back a SPEC. It does not hand back network traffic, and nothing else in this
+ * process is sitting in the browser's network stack. A promoter that waited for
+ * a capture produced somewhere inside QAAI would be waiting for a writer that
+ * does not exist, which is this round's defect written one more time.
+ *
+ * So the recorder or the browser extension uploads the HAR subset it already
+ * has. The seven fields of `CapturedExchange` are the narrow projection a
+ * fixture needs; everything else a HAR carries — timings, `_initiator`,
+ * page refs, whatever the capturing tool added — is DROPPED BY THE SCHEMA
+ * rather than reasoned about field by field.
+ *
+ * ── AND IT IS TREATED AS HOSTILE ────────────────────────────────────────────
+ *
+ * A capture is real traffic from a browser QAAI does not control, and what it
+ * produces here is proposed for a customer's REPOSITORY. So:
+ *
+ *   · `baseUrl` COMES FROM THE ENVIRONMENT ROW, never from the request. It is
+ *     the allowed-host check: a caller that could name its own base URL could
+ *     declare a third party's host as the application under test and have that
+ *     party's traffic — and its tokens — scrubbed by a looser allowlist and
+ *     written into the fixture. `extraHosts` widens it deliberately and is
+ *     visible in the request a human approves.
+ *   · THE DESTINATION IS COMPUTED, never taken from the request. See
+ *     {@link fixtureStem}. A file path is customer-authored text by the same
+ *     rule a locale tag is.
+ *   · EVERY REFUSAL AND EVERY REDACTION COMES BACK AS A COUNT AND A REASON,
+ *     on both paths. A fixture that silently dropped a credential-shaped body
+ *     is the same artifact as one that committed it, as far as the reviewer
+ *     signing it off can tell.
+ *   · NOTHING IS WRITTEN AND NOTHING IS PERSISTED. The reply is a PROPOSAL.
+ */
+
+/** Conventions, as the request may name them. `z.enum` over the module's own list. */
+const fixtureConventionSchema = z.enum(FIXTURE_CONVENTIONS);
+
+/**
+ * THREE CAPS IN A ROW, AND ONLY THE INNERMOST IS A DISCLOSURE.
+ *
+ * `express.json({ limit: '2mb' })` in index.ts refuses an oversized body with a
+ * 413 before this file runs. The schema below refuses a body that parsed but is
+ * absurd, with a 400 naming the PATH that was too long. `MAX_PROMOTED_EXCHANGES`
+ * and friends inside fixtures.ts then TRUNCATE, and report what they truncated.
+ *
+ * Each of these numbers is ABOVE the promoter's own matching ceiling on
+ * purpose. If the schema refused at 200 exchanges, `MAX_PROMOTED_EXCHANGES`
+ * could never bite and its cap disclosure — the sentence that stops a truncated
+ * fixture reading as a complete one — would be unreachable code.
+ */
+const MAX_UPLOADED_EXCHANGES = 1_000;
+const MAX_UPLOADED_HEADERS = 200;
+const MAX_UPLOADED_BODY_CHARS = 200_000;
+
+/**
+ * One captured exchange, as uploaded.
+ *
+ * NOT `.strict()`, and the asymmetry with the request envelope below is
+ * deliberate. The envelope's keys are QAAI's own API contract, so an unexpected
+ * one there is a caller bug worth refusing. These keys are a HAR ENTRY's, which
+ * is somebody else's schema with a dozen fields QAAI has no opinion about — and
+ * `.strict()`'s refusal is the one zod message that QUOTES THE OFFENDING KEY,
+ * so a strict schema here would compose a customer-facing error out of a key
+ * read from an uploaded file. Stripping is both the safe behaviour and the
+ * right one: `CapturedExchange`'s own comment says the reader's job is to fill
+ * in these seven fields and nothing it forgot can leak through.
+ */
+const capturedHeaderSchema = z.object({
+  name: z.string().min(1).max(200),
+  value: z.string().max(MAX_UPLOADED_BODY_CHARS),
+});
+
+const capturedExchangeSchema = z.object({
+  method: z.string().min(1).max(20),
+  url: z.string().min(1).max(4_000),
+  status: z.number().int().min(0).max(999),
+  requestHeaders: z.array(capturedHeaderSchema).max(MAX_UPLOADED_HEADERS).default([]),
+  responseHeaders: z.array(capturedHeaderSchema).max(MAX_UPLOADED_HEADERS).default([]),
+  requestBody: z.string().max(MAX_UPLOADED_BODY_CHARS).nullable().default(null),
+  responseBody: z.string().max(MAX_UPLOADED_BODY_CHARS).nullable().default(null),
+});
+
+/**
+ * WHAT THE CUSTOMER APPROVED, as a request.
+ *
+ * Every field is optional and the default is EMPTY, which promotes a fixture of
+ * methods, paths and status codes — a useful fixture and a safe one. That
+ * default is `FixtureApproval`'s own design and it is preserved here rather
+ * than softened: the question a reviewer asks is "what did they approve", not
+ * "what did QAAI decide to strip".
+ */
+const fixtureApprovalSchema = z
+  .object({
+    headerNames: z.array(z.string().min(1).max(200)).max(60).optional(),
+    queryParams: z.array(z.string().min(1).max(200)).max(60).optional(),
+    bodyExchangeKeys: z.array(z.string().min(1).max(600)).max(200).optional(),
+    bodyFields: z.array(z.string().min(1).max(300)).max(200).optional(),
+    extraHosts: z.array(z.string().min(1).max(260)).max(20).optional(),
+  })
+  .strict();
+
+const promoteFixtureSchema = z
+  .object({
+    projectId: z.string().min(1),
+    /** The base URL comes from this row and never from the request. */
+    environmentId: z.string().min(1),
+    /** Used for the file-name SLUG and nothing else. Never reaches a path verbatim. */
+    name: z.string().trim().min(1).max(160),
+    convention: fixtureConventionSchema,
+    approval: fixtureApprovalSchema.optional(),
+    exchanges: z.array(capturedExchangeSchema).min(1).max(MAX_UPLOADED_EXCHANGES),
+  })
+  .strict();
+
+/** How many grouped refusals the reply names before it starts counting. */
+const MAX_REFUSAL_GROUPS = 20;
+
+/** The directory a promoted fixture is proposed into. */
+const FIXTURE_DIRECTORY = 'fixtures';
+
+/**
+ * THE FIXTURE'S OWN KEY — content-addressed, over what QAAI can safely hash.
+ *
+ * `recordingKeyOf` above hashes a whole spec and `promotedFilePath` puts twelve
+ * characters of it in a file name; this is the same mechanism for the same
+ * reason (two promotions of the same traffic must land on the same path, or
+ * every re-record is a new file nobody reviews), narrowed in one way:
+ *
+ * ONLY THE METHOD, THE STATUS AND THE URL **PATHNAME** GO IN. The query string
+ * and the bodies are left out — `?token=…` is the commonest place a credential
+ * sits in a recording, and a digest is not a value but a key composed over one
+ * is a key nobody should have to reason about. Two recordings that differ only
+ * in their query strings therefore land on the same path, which costs a
+ * reviewer one comparison and is the cheap side of the trade.
+ *
+ * An unparseable URL contributes the CONSTANT below rather than its own text,
+ * so a malformed recording cannot steer the file name either.
+ */
+export function fixtureKeyOf(
+  exchanges: ReadonlyArray<{ method: string; url: string; status: number }>,
+): string {
+  const canonical = exchanges.map((exchange) => {
+    let pathname = '\u0000unparseable';
+    try {
+      pathname = new URL(exchange.url).pathname;
+    } catch {
+      // Deliberately not the URL: see above.
+    }
+    return [exchange.method.toUpperCase(), exchange.status, pathname];
+  });
+  return createHash('sha256').update(JSON.stringify(canonical), 'utf8').digest('hex');
+}
+
+/**
+ * The repo-relative STEM a fixture is proposed at, WITHOUT the extension —
+ * fixtures.ts supplies that per convention.
+ *
+ * Same rule as {@link promotedFilePath} and for the same reason: `name` is a
+ * human's sentence and never reaches the path verbatim. The path is a slug over
+ * a closed alphabet plus twelve characters of the key, so two recordings called
+ * the same thing do not land on the same file; an empty slug falls back to the
+ * key alone.
+ */
+export function fixtureStem(name: string, key: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60)
+    .replace(/-+$/, '');
+  const tail = key.slice(0, 12);
+  return `${FIXTURE_DIRECTORY}/${slug ? `${slug}-${tail}` : tail}`;
+}
+
+/**
+ * Group the refusals so the reply is bounded BY CONSTRUCTION rather than by a
+ * cap nobody reports.
+ *
+ * `promoteRecording` can emit one `CREDENTIAL_IN_APPROVED_CONTENT` per approved
+ * field per exchange, which is hundreds of rows saying the same two things. A
+ * reviewer needs the reason, the place and HOW MANY — so that is what comes
+ * back, and the group cap is disclosed if it bites.
+ */
+function groupRefusals(refusals: readonly RefusalDetail[]): {
+  groups: Array<{ reason: PromotionRefusal; at: string | null; why: string; count: number }>;
+  capped: number;
+} {
+  const byKey = new Map<
+    string,
+    { reason: PromotionRefusal; at: string | null; why: string; count: number }
+  >();
+  for (const refusal of refusals) {
+    const key = `${refusal.reason}\u0000${refusal.at ?? ''}`;
+    const seen = byKey.get(key);
+    if (seen) seen.count += 1;
+    else byKey.set(key, { ...refusal, count: 1 });
+  }
+  const all = [...byKey.values()];
+  return { groups: all.slice(0, MAX_REFUSAL_GROUPS), capped: all.length - MAX_REFUSAL_GROUPS };
+}
+
+recordRouter.post(
+  '/projects/:projectId/record/fixture',
+  requireRole('MEMBER'),
+  async (req, res) => {
+    const actor = actorOf(req);
+    const input = promoteFixtureSchema.parse(req.body);
+    const projectId = String(req.params.projectId);
+
+    /*
+     * The same rule as the spec promotion above: two places naming the project
+     * is two facts in one request, and preferring either silently would promote
+     * into a project the caller did not name.
+     */
+    if (input.projectId !== projectId) {
+      throw badRequest(
+        'the project in the path and the project in the body disagree, and which one was meant is not ours to guess',
+      );
+    }
+
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { id: true },
+    });
+    if (!project) throw notFound('Project');
+
+    /*
+     * THE BASE URL, FROM THE ROW. This is the allowed-host check — every
+     * exchange whose host is not this one (or an `extraHosts` entry the
+     * request's approver can see) is dropped and counted. A request-supplied
+     * base URL would turn that check into a decision the capture gets to make.
+     */
+    const environment = await prisma.environment.findUnique({
+      where: { id: input.environmentId },
+      select: { id: true, projectId: true, baseUrl: true },
+    });
+    if (!environment || environment.projectId !== projectId) throw notFound('Environment');
+
+    const key = fixtureKeyOf(input.exchanges);
+    const stem = fixtureStem(input.name, key);
+    const path = `${stem}${FIXTURE_CONVENTION_SPEC[input.convention].extension}`;
+
+    /*
+     * THE DESTINATION DECISION, REPORTED RATHER THAN ONLY ENFORCED.
+     *
+     * `promoteRecording` asks this same pure function and turns a REFUSED into
+     * `DESTINATION_REFUSED`; it does not surface UNDECIDED, which is the
+     * verdict every path gets in a project whose test layout nobody has
+     * measured — and today no project has one. UNDECIDED IS NOT A PASS: left
+     * unsaid it would read as "we checked where this repository keeps its
+     * fixtures and this is it", which is precisely the claim the three-state
+     * verdict exists to refuse. Asking twice costs nothing: the function is
+     * pure and the module's call is still the one that enforces.
+     */
+    const destination = destinationDecision({ path });
+
+    /*
+     * THE LEDGER IS READ AND DELIBERATELY NOT HANDED TO THE PROMOTER.
+     *
+     * `dispositionFor` documents `onDiskHash: null` as "nothing is there", and
+     * this process has NO WORKING TREE — it cannot tell an absent file from one
+     * it has not looked at. Passing null would make the pair
+     * (ledger says we own it, nothing on disk) resolve to NEW, which is
+     * `mayWriteDirectly`, which is a direct write earned by a measurement
+     * nobody took. So the promoter is given no ledger, every proposal comes
+     * back UNRECORDED / PROPOSED_EDIT — fail-closed, and the apply path re-reads
+     * the ledger at the instant of the write anyway — and the one fact this
+     * process CAN establish is reported as its own field rather than folded
+     * into the disposition.
+     */
+    const ledgerRow = await prisma.generatedArtifact.findFirst({
+      where: { projectId, path },
+      select: { path: true, ownership: true },
+    });
+
+    const result = promoteRecording({
+      exchanges: input.exchanges,
+      baseUrl: environment.baseUrl,
+      approval: input.approval ?? {},
+      convention: input.convention,
+      destinationStem: stem,
+      digest: (text) => createHash('sha256').update(text, 'utf8').digest('hex'),
+    });
+
+    const { groups, capped } = groupRefusals(result.report.refusals);
+    const caps = [...result.report.caps];
+    if (capped > 0) {
+      caps.push({
+        what: 'refusal groups',
+        count: capped,
+        reason: `Only ${MAX_REFUSAL_GROUPS} distinct refusals are named. The rest are NOT in this list, and every one of them still blocked the promotion.`,
+      });
+    }
+
+    await audit({
+      actor,
+      action: 'recording.promote_fixture',
+      targetType: 'Project',
+      targetId: projectId,
+      metadata: {
+        /*
+         * COUNTS ONLY. Not a header name, not a field path, not an exchange
+         * key, and above all not a value: every one of those is read out of a
+         * recording of real traffic, and an audit row is exported.
+         */
+        fixtureKey: key,
+        convention: input.convention,
+        promoted: result.ok,
+        exchangesIn: result.report.exchangesIn,
+        exchangesPromoted: result.report.exchangesPromoted,
+        redactionTotal: result.report.redactionTotal,
+        refusals: result.report.refusals.length,
+        caps: caps.length,
+        destinationVerdict: destination.verdict,
+      },
+    });
+
+    const artifact = result.ok ? result.set.artifacts[0] : null;
+
+    /*
+     * 200 ON BOTH PATHS, AND `promoted` IS THE ANSWER.
+     *
+     * A refusal here is not a malformed request — it is the product working: a
+     * credential survived the scrub, or an approved body is not JSON, or the
+     * recording scrubbed down to nothing. The REPORT is the payload on both
+     * paths (`PromotionReport`'s own comment says why), and the error envelope
+     * a 4xx goes through would throw it away. 201 would be a lie in the other
+     * direction: nothing was created, and nothing is persisted.
+     */
+    res.json({
+      promoted: result.ok,
+      fixture: artifact
+        ? {
+            path: artifact.path,
+            convention: input.convention,
+            why: artifact.why,
+            content: artifact.content,
+            disposition: artifact.disposition,
+            ownership: artifact.ownership,
+          }
+        : null,
+      /**
+       * The computed destination and what the layout rule actually said about
+       * it. `ALLOWED` carries no sentence of its own — it is the one verdict
+       * that means a layout WAS measured and this path is inside it — so the
+       * sentence is supplied here, as a measurement rather than as silence.
+       */
+      destination: {
+        path,
+        verdict: destination.verdict,
+        why:
+          destination.verdict === 'ALLOWED'
+            ? "This repository's measured test layout covers this directory."
+            : destination.why,
+      },
+      /**
+       * WHY THE DISPOSITION IS WHAT IT IS, which is not the same fact as the
+       * disposition. Two fields, because a caller that had to infer "was this
+       * measured?" from `PROPOSED_EDIT` would get it wrong.
+       */
+      dispositionWhy:
+        'Proposed, never written. This process has no working tree, so whether the bytes at that path are still the bytes QAAI last wrote there was NOT measured — and a disposition that claimed otherwise would earn a direct write from a measurement nobody took.',
+      /** A fact this process CAN establish: has QAAI ever recorded writing here? */
+      ledgerKnowsPath: ledgerRow !== null,
+      report: {
+        exchangesIn: result.report.exchangesIn,
+        exchangesPromoted: result.report.exchangesPromoted,
+        redactionTotal: result.report.redactionTotal,
+        /*
+         * COMPLETE, and walked over `REDACTION_KINDS` by `countByKind` rather
+         * than over the rows — so a kind that fired none is a kind this reply
+         * CONSIDERED and reports as zero. There is no cap on it and nothing to
+         * disclose, because it is one row per kind by construction.
+         */
+        byKind: result.report.byKind.map((row) => ({ ...row, why: REDACTION_WHY[row.kind] })),
+        refusals: groups,
+        caps,
+        disclosure: result.report.disclosure,
+      },
+    });
+  },
+);

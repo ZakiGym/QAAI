@@ -501,6 +501,31 @@ export function runScopedExpiry(now: Date): Date {
   return new Date(now.getTime() + RUN_SCOPED_EXPIRY_MS);
 }
 
+/**
+ * How far ahead the expiry SWEEP looks when it warns that a mute is about to
+ * run out, in days.
+ *
+ * ── WHY THIS IS NOT `EXPIRING_WINDOW_DEFAULT_DAYS` ─────────────────────────
+ *
+ * Two windows over one subject, and they answer DIFFERENT questions, which is
+ * why they are two numbers and not one that moved here.
+ *
+ *   · THIS one bounds a WARNING NOBODY ASKED FOR. The sweep in
+ *     apps/worker/src/processors/triage.ts logs it on a tick, so the window is
+ *     the lead time a team needs to act before a mute lapses — three days,
+ *     because a shorter one arrives too late to do anything with and a longer
+ *     one warns about every mute on every tick and becomes noise.
+ *   · `EXPIRING_WINDOW_DEFAULT_DAYS` (apps/api/src/routes/triage.ts) is the
+ *     default for a READ somebody asked for — "which mutes stop suppressing
+ *     soon?" — and it is a week, because that is the question a person asks on
+ *     a Monday. A caller can widen it; nobody can widen this one.
+ *
+ * It lives here rather than in either file so the two are at least VISIBLY
+ * different decisions with their reasons written down, instead of two literals
+ * in two workspaces that look like a copy of each other.
+ */
+export const SUPPRESSION_EXPIRY_WARNING_DAYS = 3;
+
 // ─── Mute matching ───────────────────────────────────────────────────────────
 
 /**

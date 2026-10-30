@@ -507,6 +507,70 @@ describe('one pull request per cause', () => {
     expect(host.opened).toBe(0);
   });
 
+  /*
+   * ── THE DECLINED CAUSE, WHICH USED TO BE STUCK FOR EVER ───────────────────
+   *
+   * `@@unique([orgId, causeKey])` is owned by the record whatever its state, so
+   * ALREADY_RECORDED was returned for a CLOSED one too: a cause whose pull
+   * request a reviewer declined could never get a second. "Fix the comments and
+   * send it again" had no answer.
+   */
+  function seedRecord(state: FakeState, recordState: PrRecordState, url: string | null): void {
+    state.rows.push({
+      id: 'pr_0',
+      orgId: ORG,
+      projectId: PROJECT,
+      repo: 'acme/shop',
+      branch: branchNameFor({ purpose: 'HEAL', causeKey: KEY }),
+      baseRef: 'main',
+      purpose: 'HEAL',
+      causeKey: KEY,
+      state: recordState,
+      number: url === null ? null : 7,
+      url,
+    });
+  }
+
+  for (const closed of ['CLOSED', 'FAILED'] as const) {
+    it(`re-opens a ${closed} cause, on the SAME record rather than a second one`, async () => {
+      const { store, state } = fakeStore();
+      seedRecord(state, closed, 'https://git.example/pr/7');
+      const host = fakeHost({
+        ok: true,
+        pr: { number: 9, url: 'https://git.example/pr/9', state: 'OPEN' },
+      });
+
+      const result = await openPullRequest({ store, host, audit: fakeAudit().sink }, input());
+
+      expect(result.outcome).not.toBe('ALREADY_RECORDED');
+      expect(host.opened).toBe(1);
+      expect(result.url).toBe('https://git.example/pr/9');
+      // ONE record per cause: the row is reused, so `@@unique` keeps meaning
+      // something and the cause keeps one audit trail.
+      expect(state.rows).toHaveLength(1);
+      expect(state.rows[0]!.id).toBe('pr_0');
+      expect(state.rows[0]!.state).toBe('OPEN');
+      // And the previous attempt's url was cleared on the way through, so no
+      // reader could see the declined PR and the new one in one field.
+      expect(state.settled[0]).toMatchObject({ id: 'pr_0', state: 'REQUESTED' });
+    });
+  }
+
+  for (const live of ['OPEN', 'MERGED', 'REQUESTED'] as const) {
+    it(`still refuses a ${live} cause, because that one is not free`, async () => {
+      const { store, state } = fakeStore();
+      seedRecord(state, live, live === 'REQUESTED' ? null : 'https://git.example/pr/7');
+      const host = fakeHost();
+
+      const result = await openPullRequest({ store, host, audit: fakeAudit().sink }, input());
+
+      expect(result.outcome).toBe('ALREADY_RECORDED');
+      expect(host.opened).toBe(0);
+      expect(state.rows).toHaveLength(1);
+      expect(state.rows[0]!.state).toBe(live);
+    });
+  }
+
   it('adopts the host own pull request rather than opening a second', async () => {
     const { store, state } = fakeStore();
     const host = fakeHost({ ok: false, refusal: 'ALREADY_EXISTS' }, {

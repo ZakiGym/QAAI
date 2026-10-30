@@ -124,6 +124,42 @@ export const RUN_FLAGS = {
     shape: 'boolean',
     help: 'Stop at the first REAL failure. A flake, a quarantined test and a skip stop nothing.',
   },
+  baseUrlOverride: {
+    flag: 'base-url',
+    shape: 'string',
+    /*
+     * Appended to the shared sentence rather than woven into it, like
+     * `changed-paths` above: `index.test.ts` asserts the contract's help text is
+     * CONTAINED here, so an edit on either side cannot leave the two surfaces
+     * documenting different behaviour.
+     *
+     * The appended half is about the SERVER'S AGE and not about the feature.
+     * A customer's CI points an updated CLI at whatever QAAI they run, and this
+     * field had no acceptor until `createRunSchema` gained one — so the CLI
+     * still reads it back off the created run and exits 2 when it is missing,
+     * because printing "running against the preview URL" while the run executed
+     * against the environment's own would be reporting a thing it did not
+     * measure. See `echoRefusals`.
+     */
+    help: 'Override the environment base URL for this run only — a preview deploy’s address. An http(s) URL with no credentials in it; the host is classified where the browser opens it, and a private, loopback or unparseable host BLOCKS the tests that need it rather than being attempted. The classification is the SERVER’s, not this CLI’s. A QAAI older than the field drops it silently, so the CLI reads it back off the run and exits 2 rather than claiming a target the run never used.',
+  },
+  branch: {
+    flag: 'branch',
+    shape: 'string',
+    help: 'The branch this run is for, so a re-run and a PR check can find it. Read back off the run: a QAAI older than the field drops it, and a run with no branch is a run a PR check cannot find.',
+  },
+  /*
+   * Set by this CLI from what it ASKED for, never typed, which is why it is
+   * `null` here like `trigger`.
+   *
+   * It is sent on exactly one path: `--impact`, where this CLI ran the analysis
+   * itself and the server would otherwise see a plain id list and honestly call
+   * it EXPLICIT. Every other value the server works out better than we can, and
+   * a declaration that WIDENS the claim is refused — so declaring FULL_SUITE
+   * "to be helpful" on a run that named a suite would turn a working invocation
+   * into a 400.
+   */
+  selectionSource: null,
 } as const satisfies Record<RunRequestKey, RunFlagSpec | null>;
 
 /**
@@ -134,17 +170,13 @@ export const RUN_FLAGS = {
  */
 export const EXTRA_FLAGS = {
   /*
-   * The appended sentence is not decoration. The contract's own help says the
-   * host is "classified before use", and THIS SURFACE DOES NOT CLASSIFY IT —
-   * resolving a name from inside the customer's CI runner answers a different
-   * question from resolving it on the worker that will fetch the page, so
-   * `classifyHost` belongs where the browser runs. A help line that claimed
-   * otherwise would be a doc comment contradicting the code under it, which is
-   * one of the lies this product cannot afford. The second half says what the
-   * CLI does instead, and it disappears the day a create path records the field.
+   * `base-url` MOVED OUT of this table and into `RUN_FLAGS`, because
+   * `createRunSchema` now has a `baseUrlOverride` field and this table is
+   * defined as the flags that are NOT run fields. The note that used to live
+   * here said the CLI does not classify the host — still true, and now stated
+   * on the flag itself — and that "no create path records this field yet",
+   * which was the actual bug rather than a caveat.
    */
-  'base-url':
-    'Override the environment base URL for this run only. Classified before use; a private or unresolvable host is refused, not attempted. The classification is the SERVER’s, not this CLI’s. No create path records this field yet, so the CLI sends it, reads it back off the run and exits 2 rather than claiming a target the run never used.',
   'impact-only':
     'Ask POST /impact/analyze and print the selected test ids without running them — the three-line curl recipe impact.ts documented, as a flag.',
   suppressions:
@@ -164,7 +196,11 @@ export const EXTRA_FLAGS = {
 export const TRANSPORT_FLAGS = {
   project:
     'The project id. Required by --impact, which asks POST /impact/analyze before the run.',
-  branch: 'The branch this run is for, so a re-run and a PR check can find it',
+  /*
+   * `branch` moved to `RUN_FLAGS`: it is a field of `createRunSchema` now, and
+   * this table is for the flags that are not. It was never transport — it was a
+   * run field with no acceptor, parked here because there was nowhere else.
+   */
   impact:
     'Compute --changed-paths from git, ask the API which tests the diff can reach, and run only those. Says what it SELECTED and what it SKIPPED. Falls back to the FULL SUITE, loudly, when the diff cannot be computed.',
   'impact-base':
@@ -219,6 +255,8 @@ export const RUN_FLAG_REFUSALS = {
   RERUN_WITH_SELECTION:
     'already decides which tests run, so it cannot be combined with --test, --changed-paths or --impact',
   REPORTER_NEEDS_WAIT: 'needs a finished run to report on, so it cannot be combined with --no-wait',
+  DEPLOY_CHECK_MUST_WAIT:
+    'cannot be used with `qaai deploy-check`: that command exists so a rollback step can key off its exit code, and a run that was only queued has no verdict to exit on. Use `qaai run --no-wait` if you want the run id',
 } as const;
 
 export type RunFlagRefusalCode = keyof typeof RUN_FLAG_REFUSALS;
@@ -266,21 +304,37 @@ export interface RunRequestBody {
   cacheWindowHours?: number;
   failFast?: boolean;
   /**
-   * NEITHER OF THESE IS A FIELD OF `createRunSchema` TODAY.
+   * BOTH OF THESE ARE FIELDS OF `createRunSchema` NOW, and were not.
    *
-   * `Run.baseUrlOverride` and `Run.branch` are columns with readers
+   * `Run.baseUrlOverride` and `Run.branch` were columns with readers
    * (`apps/api/src/lib/runners.ts`, `bisect.ts`, `run-selection.ts`) and no
-   * writer on any create path, and `createRunSchema` does not mention either —
-   * so a zod object that ignores unknown keys ACCEPTS these and DROPS them.
+   * writer on any create path, and the schema mentioned neither — so a zod
+   * object that ignores unknown keys ACCEPTED these and DROPPED them, and both
+   * flags worked on no server that existed.
    *
-   * They are sent anyway, and then `echoRefusals` reads them back off
-   * `GET /runs/:id` and REFUSES when the server did not keep them. That is the
-   * only arrangement that is not a lie: a CLI that printed "running against
+   * They are still read back: a customer's CI points an updated CLI at whatever
+   * QAAI they run, so `echoRefusals` compares what was sent against what the
+   * created run kept and REFUSES on a mismatch. That is the only arrangement
+   * that is not a lie — a CLI that printed "running against
    * https://preview-412.example.com" while the run executed against the
    * environment's default URL would be reporting a thing it did not measure.
    */
   baseUrlOverride?: string;
   branch?: string;
+  /**
+   * WHAT CHOSE THE TESTS, declared — and only on the one path where this CLI
+   * knows something the server cannot see.
+   *
+   * `--impact` computes the diff here, asks POST /impact/analyze here, and sends
+   * the resulting ids. To the server that is indistinguishable from a caller
+   * who typed them, so its honest answer is EXPLICIT while the truth is IMPACT.
+   *
+   * Nothing else is ever declared. The server works the other four out better
+   * than this CLI can, and a declaration that WIDENS the claim is refused with
+   * a 400 — so declaring FULL_SUITE on a run that also named a suite would turn
+   * a working invocation into a usage error.
+   */
+  selectionSource?: 'IMPACT';
 }
 
 export interface ImpactSource {
@@ -320,7 +374,17 @@ export const REQUEST_FLAG_SPECS: readonly RunFlagSpec[] = Object.values(
   RUN_FLAGS as Record<string, RunFlagSpec | null>,
 ).filter((spec): spec is RunFlagSpec => spec !== null);
 
-const KNOWN_FLAGS: ReadonlySet<string> = new Set<string>([
+/**
+ * Every flag `qaai run` has, which is the WHOLE grammar and not the run fields.
+ *
+ * Exported so `index.test.ts` can diff it against `cliRunOptionsSchema`'s keys.
+ * That schema is `.strict()`, and a strict validator with an incomplete key
+ * list is not strict, it is a validator that refuses working invocations: it
+ * knew the run fields and three of the CLI's own flags, so `qaai run --impact`
+ * passed this parser and was REFUSED by the schema. Whichever of the two was
+ * used to check a config file would have been the wrong one.
+ */
+export const KNOWN_FLAGS: ReadonlySet<string> = new Set<string>([
   ...REQUEST_FLAG_SPECS.map((spec) => spec.flag),
   ...Object.keys(EXTRA_FLAGS),
   ...Object.keys(TRANSPORT_FLAGS),
@@ -837,6 +901,44 @@ export function selectionOutcome(args: {
   };
 }
 
+/**
+ * WHAT THIS CLI DECLARES TO THE SERVER ABOUT WHO CHOSE THE TESTS.
+ *
+ * `POST /runs` works its own answer out from the request and refuses a
+ * declaration that WIDENS it, so the only declaration worth sending is one the
+ * server cannot reach by itself. There is exactly one:
+ *
+ *   impact — the analysis ran HERE (`--impact` asks POST /impact/analyze and
+ *   sends the ids it answered with). To the server that is a plain id list, so
+ *   its honest answer is EXPLICIT while the truth is IMPACT. Both are narrower
+ *   than the suite, so nothing downstream can claim more either way; what is
+ *   fixed is the PROVENANCE, which is what a release manager reads when they
+ *   ask why a gate pass was withheld.
+ *
+ * `null` for the other four, with the reason, and a
+ * `Record<SelectionOutcome['how'], …>` so a fifth selection source is a COMPILE
+ * ERROR here until somebody decides. Declaring a value the server works out for
+ * itself is not harmless: `FULL_SUITE` on a run that also named a suite is a
+ * WIDER claim than SUITE, and the server answers that with a 400 — so a
+ * well-meant declaration would turn a working invocation into a usage error.
+ */
+export const DECLARED_SELECTION_SOURCE = {
+  impact: 'IMPACT',
+  /** The server sees the diff and runs the analysis itself. Its answer is better. */
+  'changed-paths': null,
+  /** The server sees `testIds`. EXPLICIT is exactly what happened. */
+  'explicit-test-ids': null,
+  /** A different endpoint, which writes RERUN_FAILURES itself. */
+  'rerun-failures': null,
+  /** Nothing was selected. FULL_SUITE is the server's to decide, not ours. */
+  none: null,
+} as const satisfies Record<SelectionOutcome['how'], 'IMPACT' | null>;
+
+/** The declaration to send for this selection, or nothing. */
+export function declaredSelectionSource(how: SelectionOutcome['how']): 'IMPACT' | undefined {
+  return DECLARED_SELECTION_SOURCE[how] ?? undefined;
+}
+
 // ─── Which gate answers a selective run is allowed to claim ──────────────────
 
 /**
@@ -1015,12 +1117,17 @@ export function shardDisclosure(requested: number | undefined, granted: number |
 /**
  * Fields the CLI sent that the created run did not keep.
  *
- * `baseUrlOverride` and `branch` have no acceptor on `createRunSchema` today
- * (see `RunRequestBody`), and a zod object that ignores unknown keys accepts
- * and drops them. Printing "running against the preview URL" while the run
- * executed against the environment's default would be reporting a thing that
- * was not measured — so the mismatch is a REFUSAL, loud, with the exit code of
- * a usage error. It disappears on its own the day the server keeps the field.
+ * `baseUrlOverride` and `branch` now have an acceptor on `createRunSchema`, so
+ * on a current server this returns nothing. It is NOT dead code: a customer's
+ * CI points an updated CLI at whatever QAAI they run, and a server older than
+ * those fields is a zod object ignoring unknown keys — it accepts them and
+ * drops them, silently. Printing "running against the preview URL" while the
+ * run executed against the environment's default would be reporting a thing
+ * that was not measured, so the mismatch is a REFUSAL, loud, with the exit code
+ * of a usage error.
+ *
+ * The messages name the version gap rather than the implementation, because
+ * that is now the only thing it can be.
  */
 export function echoRefusals(
   sent: RunRequestBody,
@@ -1031,13 +1138,14 @@ export function echoRefusals(
     problems.push(
       '--base-url was sent and this QAAI did not record it, so the run executed against the ' +
         'ENVIRONMENT’s URL instead. Refusing rather than reporting a target that was not used. ' +
-        'The server needs `baseUrlOverride` on createRunSchema and a classifyHost check on it.',
+        'That server is older than `baseUrlOverride` on createRunSchema; upgrade QAAI, or drop ' +
+        'the flag and point the environment at the URL you want.',
     );
   }
   if (sent.branch !== undefined && (stored.branch ?? null) === null) {
     problems.push(
       '--branch was sent and this QAAI did not record it, so the run carries no branch and a ' +
-        'PR check cannot find it. The server needs `branch` on createRunSchema.',
+        'PR check cannot find it. That server is older than `branch` on createRunSchema.',
     );
   }
   return problems;
@@ -1055,8 +1163,27 @@ export interface SuppressionView {
     quarantines: number;
     waivers: number;
     expiredAndSilencedNothing: number;
+    /**
+     * Every kind that silenced something, including the two the five fields
+     * above have no word for.
+     *
+     * `knownIssues`, `quarantines` and `waivers` are three of the five
+     * suppression kinds. An ENV_ISSUE or a RETIREMENT can silence a failure
+     * too, and "12 failures suppressed by 0 known issues, 0 quarantines and 0
+     * waivers" is a failure suppressed without being counted — so the printed
+     * line names the leftover kinds from here rather than leaving them out.
+     *
+     * Optional: a server that reports the five and not this is not lying about
+     * anything, it just cannot name the leftovers, and the line says so.
+     */
+    byKind?: Array<{ kind: string; suppressions: number; suppressed: number; expired: number }>;
+    /** The cap on the server's ledger read, if it BIT. Null when it did not. */
+    truncated?: { limit: number; rowsRead: number; reason: string } | null;
   } | null;
 }
+
+/** The three kinds the five headline fields already name. */
+const NAMED_LEDGER_KINDS = ['MUTE', 'QUARANTINE', 'COVERAGE_WAIVER'];
 
 /**
  * "47 failures suppressed by 3 known issues" — the sentence that keeps this
@@ -1120,6 +1247,7 @@ export function suppressionLines(view: SuppressionView): string[] {
         (ledger.expiredAndSilencedNothing > 0
           ? ` ${ledger.expiredAndSilencedNothing} suppression(s) had EXPIRED and silenced nothing.`
           : ''),
+      ...truncationLines(ledger.truncated),
     ];
   }
 
@@ -1127,12 +1255,57 @@ export function suppressionLines(view: SuppressionView): string[] {
     `Suppression ledger: ${ledger.failuresSuppressed} failure(s) suppressed by ` +
       `${ledger.knownIssues} known issue(s), ${ledger.quarantines} quarantine(s) and ` +
       `${ledger.waivers} waiver(s). They are still failures that happened.`,
+    ...otherKindLines(ledger.byKind),
     ...(ledger.expiredAndSilencedNothing > 0
       ? [
           `  ${ledger.expiredAndSilencedNothing} suppression(s) had EXPIRED and silenced nothing — ` +
             'those tests gate again.',
         ]
       : []),
+    ...truncationLines(ledger.truncated),
+  ];
+}
+
+/**
+ * The kinds the three nouns above do not name.
+ *
+ * Without this, a run whose twelve failures were silenced by an ENV_ISSUE
+ * prints "12 failure(s) suppressed by 0 known issue(s), 0 quarantine(s) and 0
+ * waiver(s)" — every number correct and the sentence a lie, because the thing
+ * that did the suppressing is not in it. The kind NAMES come from the server's
+ * closed vocabulary and nothing else from the row is printed.
+ */
+function otherKindLines(
+  byKind: NonNullable<SuppressionView['suppressions']>['byKind'],
+): string[] {
+  if (byKind === undefined) return [];
+  const others = byKind.filter(
+    (tally) => !NAMED_LEDGER_KINDS.includes(tally.kind) && tally.suppressed > 0,
+  );
+  if (others.length === 0) return [];
+  return [
+    '  of those, ' +
+      others.map((tally) => `${tally.suppressed} by ${tally.suppressions} ${tally.kind}`).join(', ') +
+      ' — kinds the line above has no word for.',
+  ];
+}
+
+/**
+ * The cap the server applied, printed as a count and the reason it bit.
+ *
+ * A cap applied without being disclosed is one of the lies this product cannot
+ * afford, and the number it hides is always in the direction that flatters: a
+ * ledger read that stopped early reports FEWER suppressed failures than
+ * happened. The server's own sentence is printed rather than one composed here,
+ * because the server is the only thing that knows which cap bit.
+ */
+function truncationLines(
+  truncated: NonNullable<SuppressionView['suppressions']>['truncated'],
+): string[] {
+  if (truncated === undefined || truncated === null) return [];
+  return [
+    `  ! this ledger is CAPPED at ${truncated.limit} row(s) and the cap BIT (${truncated.rowsRead} ` +
+      `read): the counts above are a floor, not a total. ${truncated.reason}`,
   ];
 }
 
@@ -1188,4 +1361,103 @@ export function rerunLines(view: RerunView): string[] {
     lines.push(`  not re-run — ${excluded.name}: ${excluded.why}`);
   }
   return lines;
+}
+
+// ─── qaai deploy-check: the same run, with the suite pinned ──────────────────
+
+/**
+ * Flags `deploy-check` decides for itself, and therefore takes out of argv.
+ *
+ * `--suite` is the command's whole identity: it pins the smoke set. A caller's
+ * own `--suite` is read and re-added rather than forwarded, so it cannot appear
+ * twice.
+ */
+const DEPLOY_CHECK_PINNED: ReadonlySet<string> = new Set(['suite']);
+
+/**
+ * Flags `deploy-check` REFUSES rather than forwards.
+ *
+ * One member, and it is refused rather than dropped because dropping it is the
+ * defect this function exists to end: a flag accepted and silently ignored.
+ */
+const DEPLOY_CHECK_REFUSED: ReadonlyMap<string, RunFlagRefusalCode> = new Map([
+  ['no-wait', 'DEPLOY_CHECK_MUST_WAIT' as const],
+]);
+
+/** The default smoke suite, when the caller does not name one. */
+export const DEPLOY_CHECK_SUITE = 'smoke';
+
+export type DeployCheckArgs =
+  | { ok: true; args: string[] }
+  | { ok: false; refusals: FlagRefusal[] };
+
+/**
+ * `qaai deploy-check <flags>` as a `qaai run` argv.
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * `cmdDeployCheck` used to REBUILD the command line from six flags — `--env`,
+ * `--junit`, `--commit`, `--suite`, the reporter trio and `--wait` — and every
+ * other flag `qaai run` accepts was dropped on the floor. `deploy-check
+ * --shards 4` ran one worker; `--fail-fast` ran to the end; `--base-url` aimed
+ * at the environment's own URL; `--pr` landed the check on nothing; `--cache`,
+ * `--impact`, `--require-full-suite` and `--suppressions` did nothing at all.
+ * That is a cap applied without being disclosed, eight times over, on the
+ * command a deploy pipeline gates on.
+ *
+ * ── SO ARGV IS FORWARDED WHOLE ──────────────────────────────────────────────
+ *
+ * Which also fixes two bugs the hand-built list had by construction: a repeated
+ * flag (`--test`, `--changed-paths`) survives instead of collapsing to its last
+ * value, and the order-sensitive reporter pairs (`--reporter-out` belongs to the
+ * `--reporter` before it) keep their order without being special-cased.
+ *
+ * The value-consuming rule is {@link parseRawFlags}'s — a token after a flag is
+ * that flag's value unless it starts with `--` — and keeping the two identical
+ * is what stops this function stripping a value and leaving its flag behind.
+ *
+ * An UNKNOWN flag is deliberately NOT refused here: it is forwarded, and
+ * `parseRunCommand` refuses it. One parser owns that vocabulary, and a second
+ * list here is a second thing to forget to update.
+ */
+export function deployCheckArgs(args: readonly string[]): DeployCheckArgs {
+  const forwarded: string[] = [];
+  const refusals: FlagRefusal[] = [];
+  let suite: string | null = null;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.startsWith('--')) continue;
+    const key = arg.slice(2);
+    const next = args[i + 1];
+    const value = next !== undefined && !next.startsWith('--') ? next : undefined;
+
+    const refused = DEPLOY_CHECK_REFUSED.get(key);
+    if (refused !== undefined) {
+      refusals.push({ path: `--${key}`, code: refused });
+      if (value !== undefined) i++;
+      continue;
+    }
+
+    if (DEPLOY_CHECK_PINNED.has(key)) {
+      if (key === 'suite' && value !== undefined) suite = value;
+      if (value !== undefined) i++;
+      continue;
+    }
+
+    forwarded.push(arg);
+    if (value !== undefined) {
+      forwarded.push(value);
+      i++;
+    }
+  }
+
+  if (refusals.length > 0) return { ok: false, refusals };
+
+  /*
+   * This command's own decisions last, so they are the ones that stand.
+   * `--wait` is already the default; it is passed anyway, because the command's
+   * contract is that it waits and a default is a thing somebody changes.
+   */
+  return { ok: true, args: [...forwarded, '--suite', suite ?? DEPLOY_CHECK_SUITE, '--wait'] };
 }
