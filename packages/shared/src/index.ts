@@ -276,3 +276,76 @@ export * from './style-profile';
  */
 export * from './ownership';
 export * from './suppression';
+
+/*
+ * ── THE SECURITY VOCABULARY: EGRESS, THE GUARD, AND THE SEALED ENVELOPE ─────
+ *
+ * THE DEFECT THESE THREE LINES CLOSE is lesson A again, and this time the
+ * unreachable module was a SECURITY CONTROL. `scripts/check-wiring.ts` reported
+ * `packages/shared/src/egress-guard.ts` and `packages/agent/src/crawl/egress.ts`
+ * as DISCONNECTED — "nothing but a test file imports it, and the package barrel
+ * does not re-export it, so it ships as tested, unreachable code" — which for a
+ * guard that exists to stop the crawler reaching `169.254.169.254` is the whole
+ * defect wearing a green test suite. `egress.ts` and `sealed.ts` were in the
+ * same state: complete, tested, and importable by nothing.
+ *
+ * The crawl gate could not import the guard without this line, so it had
+ * declared a STRUCTURAL COPY of the guard's verdict type to compile at all.
+ * That copy is deleted in the same change this line lands — a barrel line that
+ * leaves a hand-copied type behind has closed half the gap, and a hand-copied
+ * projection is lesson F.
+ *
+ * ── THE STANDING TEST THIS BARREL APPLIES, CHECKED RATHER THAN CLAIMED ──────
+ *
+ * NO `node:` BUILTIN IN ANY OF THE THREE — grepped, not assumed. This is the
+ * one that could have 500ed the cockpit: `private-address.ts` imports
+ * `node:dns` and all three of these files import it `import type` ONLY, which
+ * erases. `egress.ts` takes its DNS as an injected `EgressIo`, `egress-guard.ts`
+ * its clock and sleep likewise, and `sealed.ts` holds no cryptography at all —
+ * which is why the one module here that NAMES encryption needs no crypto
+ * import. The implementations live in `apps/api/src/lib/vault.ts` and
+ * `session-store.ts`, and are deliberately NOT published from here.
+ *
+ * IMPORT ORDER: `egress` before `egress-guard`, which imports five values from
+ * it. `sealed` imports `SECRET_MASK` from `./constants`, published far above.
+ * No cycles.
+ *
+ * NAME COLLISIONS: one, and it is the reason this paragraph exists.
+ * `EgressAllowlistEntry` is a PRISMA MODEL name and an INTERFACE exported from
+ * `egress.ts`. They do not collide in TypeScript — the Prisma client is a
+ * separate module namespace nothing here re-exports — but a reviewer reading
+ * `EgressAllowlistEntry` in an API route is entitled to know which one they
+ * have. The interface is the in-memory shape the policy evaluates; the model is
+ * the row an operator wrote. `EgressPolicy`, `EgressDecision` and `EgressIo`
+ * are new names against this barrel, checked against the published set.
+ */
+export * from './egress';
+export * from './egress-guard';
+export * from './sealed';
+/*
+ * ── THE COLLISION THE PARAGRAPH ABOVE MISSED, AND WHY IT IS AN ALIAS ────────
+ *
+ * `GuardVerdict` IS EXPORTED BY TWO MODULES AND THE TWO MEAN NOTHING ALIKE.
+ * `codebase.ts` has had one since the enumerate rounds: GUARDED / UNGUARDED /
+ * UNKNOWN, the static-analysis answer to "does the source declare an auth guard
+ * on this route". `egress-guard.ts` has the egress guard's refuse-or-permit
+ * verdict. `export *` of both is an ERROR (TS2308), and the error is the lucky
+ * outcome — the dangerous one would have been a silent winner, because a
+ * caller writing `const v: GuardVerdict = await guardUrl(...)` against the
+ * static-analysis union would have been told its egress verdict was not a
+ * verdict, or worse, a `v.outcome === 'GUARDED'` comparison that is simply
+ * always false.
+ *
+ * The pre-existing name KEEPS ITS MEANING, because it has readers today and a
+ * barrel is not the place to rename someone else's published type. The egress
+ * one is published as `EgressGuardVerdict`, which is also the better name: this
+ * module publishes `EgressPermit`, `EgressDecision` and `EgressPolicy`, and
+ * `GuardVerdict` was the only member of that family not saying which guard.
+ *
+ * Both lines are explicit re-exports rather than one, so neither name is left
+ * resolving through an ambiguous `export *`: the winner is stated, not inferred
+ * from file order, and reordering the three lines above cannot change which
+ * `GuardVerdict` a caller gets.
+ */
+export type { GuardVerdict } from './codebase';
+export type { GuardVerdict as EgressGuardVerdict } from './egress-guard';

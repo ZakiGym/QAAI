@@ -1,11 +1,133 @@
 /**
  * Thin API client. Every call carries the session cookie, so the browser and
- * the API share one auth mechanism and the cockpit needs no token handling.
+ * the API share one auth mechanism — and on a mutation the cookie alone is no
+ * longer enough.
+ *
+ * ── THE DOUBLE-SUBMIT TOKEN, AND WHY THIS FILE HAS TO PARTICIPATE ──────────
+ *
+ * `apps/api/src/routes/auth.ts` mounts a CSRF guard over the whole `/auth`
+ * router: a mutating request that arrives carrying a session cookie must also
+ * carry that session's token in {@link CSRF_HEADER}. The API writes the token
+ * into a deliberately readable companion cookie — {@link CSRF_COOKIE}, NOT
+ * HttpOnly — for exactly one reason: the page has to be able to read it and
+ * echo it back. That is the whole mechanism. A cookie the browser attaches by
+ * itself proves nothing about who composed the request, because a cross-site
+ * form gets it attached too; a header the page had to READ a cookie to set
+ * does, because that same form cannot read our cookies.
+ *
+ * This paragraph used to say "the cockpit needs no token handling". It became
+ * false the moment the guard was mounted, and the cost was not theoretical: a
+ * writer with no reader meant every cookie-authenticated `/auth/*` mutation
+ * answered 403, including sign-out and switch-org — the two the sidebar calls
+ * (`signOut` and the org switcher in apps/web/components/shell/Sidebar.tsx) —
+ * so "Sign out" looked to a customer like a button that does nothing.
+ *
+ * FAIL CLOSED, AND NOWHERE ELSE. If the cookie cannot be read — a server
+ * render, a frame with no access to the jar, a malformed value — the header is
+ * OMITTED and the request still goes. The server then refuses it, which is the
+ * correct direction: a missing token is a 403, never a bypass. Nothing below
+ * decides that a request is exempt.
  */
 
+import { CSRF_COOKIE, CSRF_HEADER } from '@qaai/shared';
 import type { GateResult } from '@qaai/shared';
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+
+/**
+ * Which methods carry the token: the mutating ones, and only those.
+ *
+ * Mirrors `SAFE_METHODS` in apps/api/src/lib/sessions.ts. The guard skips a
+ * safe method, so a token on a GET is a token in a request nobody reads it in —
+ * which is a credential travelling through more referrers, proxies and access
+ * logs than it needs to.
+ */
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function methodNeedsCsrf(method: string | undefined): boolean {
+  // `fetch` defaults to GET when `init.method` is absent, so absence is safe.
+  return !SAFE_METHODS.has((method ?? 'GET').toUpperCase());
+}
+
+/**
+ * The CSRF token out of `document.cookie`, or null.
+ *
+ * ── IT DOES NOT TOUCH `document` ON THE SERVER ────────────────────────────
+ *
+ * This module is reachable from a Next server render, where `document` is
+ * undefined and a bare `document.cookie` is a crash rather than a miss. The
+ * guard is therefore a `typeof` check — and it must not become a silent bypass,
+ * so a miss returns null, the request goes WITHOUT the header, and the server
+ * refuses it. Reading the jar can also throw outright in a frame with no access
+ * to it, which gets the same answer for the same reason.
+ *
+ * MEASURED, SO THE SENTENCE ABOVE IS NOT DOING MORE WORK THAN THE CODE:
+ * deleting the `typeof` line ALONE changes nothing a test can see, because the
+ * `catch` below absorbs the server case too. It is kept because routing every
+ * server render through a thrown exception is a cost and a lie about which case
+ * is expected — not because it is the thing stopping the crash. Delete BOTH and
+ * "does not throw during a server render" in api.csrf.test.ts goes red, which
+ * is what actually pins this.
+ *
+ * ── IT DOES NOT SUBSTRING-MATCH THE JAR ───────────────────────────────────
+ *
+ * `document.cookie` is one string of `name=value` pairs joined by "; ", so
+ * `jar.includes('qaai_csrf=')` ALSO matches a cookie called `x_qaai_csrf` — a
+ * name that ENDS with ours — and would echo a stranger's value back as our
+ * token. The name is compared whole, per pair, after trimming the space the
+ * join leaves behind; the value is percent-decoded because the API writes it
+ * with `encodeURIComponent`.
+ *
+ * It reads the pair named {@link CSRF_COOKIE} and nothing else. The session
+ * cookie is HttpOnly and so is never in this jar at all, and no other value
+ * from it reaches a header. Nothing here is logged: the token is a credential
+ * (rule 11), and an unreadable one is reportable as "absent" without quoting
+ * any part of it.
+ */
+function readCsrfToken(): string | null {
+  if (typeof document === 'undefined') return null;
+
+  let jar: string;
+  try {
+    jar = document.cookie;
+  } catch {
+    // A frame with no access to the jar throws on the getter rather than
+    // returning ''. Same answer as a miss, and deliberately not an `allow`.
+    return null;
+  }
+
+  for (const pair of jar.split(';')) {
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    if (pair.slice(0, eq).trim() !== CSRF_COOKIE) continue;
+
+    const encoded = pair.slice(eq + 1).trim();
+    // The empty value is the cookie the API clears on sign-out. Absent, not ''.
+    if (encoded === '') return null;
+    try {
+      return decodeURIComponent(encoded);
+    } catch {
+      // A malformed escape is not a token, and guessing at one would be worse
+      // than not sending it.
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The CSRF header for this request, or no header at all.
+ *
+ * Omitted rather than sent empty. `csrfTokenMatches` compares lengths first so
+ * `''` is already a refusal, but a header that is always present claims the
+ * client holds a token; the absence is the true statement, and it is what the
+ * server's own OBSERVE counter counts.
+ */
+function csrfHeaders(method: string | undefined): Record<string, string> {
+  if (!methodNeedsCsrf(method)) return {};
+  const token = readCsrfToken();
+  return token === null ? {} : { [CSRF_HEADER]: token };
+}
 
 export class ApiError extends Error {
   constructor(
@@ -23,6 +145,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     credentials: 'include',
     headers: {
       ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...csrfHeaders(init.method),
       ...init.headers,
     },
   });

@@ -15,7 +15,9 @@
  * the list here, where it would quietly drift.
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -127,6 +129,200 @@ describe('childEnv', () => {
   it('lets tenant secrets win over an allowlisted passthrough', () => {
     const env = childEnv({ secrets: { LANG: 'tenant-choice' } });
     expect(env.LANG).toBe('tenant-choice');
+  });
+
+  /**
+   * THE ONE PLACE THE SECRETS CHANNEL IS NOT AN EXCEPTION.
+   *
+   * The test above is the intended behaviour and stays — a tenant secret
+   * SHOULD beat `LANG`. But the same statement let a secret beat `PATH`, and
+   * `Secret.name` is `/^[A-Z][A-Z0-9_]*$/` (packages/shared/src/schemas.ts), so
+   * `PATH` is a name a MEMBER can write. `plugins/external.ts` screens exactly
+   * these names out of `spec.env` and calls that screen the thing that stops
+   * the bare-name command allowlist being "decoration"; the secrets map walked
+   * straight past it.
+   */
+  describe('the interpreter-variable screen on the EXTRA channel', () => {
+  /*
+   * The channel the screen did not cover. `extra` is where plugins/cli.ts,
+   * plugins/mobile.ts and plugins/mutation.ts put a tenant's `spec.env`
+   * verbatim, so it is the same escalation as the secrets channel reached by a
+   * different door — and this file's own header claimed the list was "the floor
+   * under every other caller" while it was not.
+   */
+  it('withholds PATH from extra, leaving the platform’s own, and reports it', () => {
+    const withheld: string[] = [];
+    const env = childEnv({ extra: { PATH: '/tmp/planted' }, withheld });
+
+    /*
+     * NOT `toBeUndefined`. `PATH` is in PASSTHROUGH, so the child still gets the
+     * PLATFORM's PATH — which is the whole point: the tenant's value loses and
+     * the child can still find the allowlisted command. Asserting it was absent
+     * would pin the wrong behaviour and would fail for the right code.
+     */
+    expect(env.PATH).toBe(process.env.PATH);
+    expect(env.PATH).not.toBe('/tmp/planted');
+    expect(withheld).toEqual(['PATH']);
+  });
+
+  it('withholds the whole interpreter family from extra', () => {
+    for (const key of [
+      'NODE_OPTIONS',
+      'NODE_PATH',
+      'LD_PRELOAD',
+      'LD_AUDIT',
+      'DYLD_INSERT_LIBRARIES',
+      'PYTHONPATH',
+      'RUBYOPT',
+      'PERL5OPT',
+      'CLASSPATH',
+      'JAVA_TOOL_OPTIONS',
+      'MAVEN_OPTS',
+    ]) {
+      const env = childEnv({ extra: { [key]: 'tenant-chose-this' } });
+      // None of these is in PASSTHROUGH, so the tenant's value is the only
+      // candidate and withholding it means the name is absent entirely.
+      expect(env[key], `${key} should not reach the child through extra`).toBeUndefined();
+    }
+  });
+
+  it('still passes the variables a plugin legitimately sets through extra', () => {
+    // The screen must not become a blanket refusal: these are what
+    // performance.ts, playwright-harness.ts, visual-services.ts and load.ts
+    // actually pass, and a drop here would break every one of them.
+    const env = childEnv({
+      extra: { QAAI_RUN_ID: 'run_1', CI: '1', FORCE_COLOR: '0', APP_URL: 'https://app.test' },
+    });
+
+    expect(env).toMatchObject({
+      QAAI_RUN_ID: 'run_1',
+      CI: '1',
+      FORCE_COLOR: '0',
+      APP_URL: 'https://app.test',
+    });
+  });
+
+  it('CANNOT RE-POINT A BARE COMMAND NAME THROUGH EXTRA, proved by a real spawn', () => {
+    /*
+     * The control arm matters as much as the assertion: the same directory
+     * reaching PATH through the PASSTHROUGH does run the planted binary, which
+     * is what proves `spawnSync` here is capable of running it at all. Without
+     * that arm the first expectation would pass on a broken harness.
+     */
+    const dir = mkdtempSync(join(tmpdir(), 'qaai-extra-path-'));
+    const planted = join(dir, 'node-is-planted');
+    writeFileSync(planted, '#!/bin/sh\necho PLANTED-BINARY-RAN\n', { mode: 0o755 });
+
+    const hijacked = childEnv({ extra: { PATH: dir } });
+    const refused = spawnSync('node-is-planted', [], { env: hijacked, shell: false });
+    expect(refused.stdout?.toString() ?? '').not.toContain('PLANTED-BINARY-RAN');
+
+    const control = spawnSync('node-is-planted', [], {
+      env: { ...hijacked, PATH: dir },
+      shell: false,
+    });
+    expect(control.stdout?.toString() ?? '').toContain('PLANTED-BINARY-RAN');
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('screens extra and secrets the same way, so neither channel is the soft one', () => {
+    // Two facts in one assertion on purpose: the point is that the ANSWER does
+    // not depend on which door the name came through.
+    const viaExtra = childEnv({ extra: { LD_PRELOAD: '/tmp/x.so' } });
+    const viaSecrets = childEnv({ secrets: { LD_PRELOAD: '/tmp/x.so' } });
+
+    expect(viaExtra.LD_PRELOAD).toBeUndefined();
+    expect(viaSecrets.LD_PRELOAD).toBeUndefined();
+  });
+});
+
+describe('the interpreter-variable screen on the secrets channel', () => {
+    it('REFUSES A TENANT SECRET NAMED PATH, which would re-point an allowed command', () => {
+      const withheld: string[] = [];
+      const env = childEnv({ secrets: { PATH: '/tmp/planted' }, withheld });
+      expect(env.PATH).not.toBe('/tmp/planted');
+      expect(withheld).toEqual(['PATH']);
+    });
+
+    it('refuses the whole code-loading family, not only PATH', () => {
+      for (const key of [
+        'NODE_OPTIONS',
+        'NODE_PATH',
+        'LD_PRELOAD',
+        'LD_AUDIT',
+        'DYLD_INSERT_LIBRARIES',
+        'PYTHONPATH',
+        'RUBYOPT',
+        'PERL5OPT',
+        'CLASSPATH',
+        'JAVA_TOOL_OPTIONS',
+        'MAVEN_OPTS',
+      ]) {
+        const withheld: string[] = [];
+        const env = childEnv({ secrets: { [key]: 'tenant-value' }, withheld });
+        expect(key in env, `${key} reached the child`).toBe(false);
+        expect(withheld, `${key} was dropped silently`).toEqual([key]);
+      }
+    });
+
+    it('DISCLOSES the drop rather than making it silent', () => {
+      /*
+       * A refusal applied without being reported is the defect, not the
+       * refusal. The sink is optional because most callers have nowhere to put
+       * a note, and `childEnv` must not throw for something the tenant may have
+       * done by accident — but a caller that asks gets the names.
+       */
+      const withheld: string[] = [];
+      childEnv({ secrets: { PATH: 'x', NODE_OPTIONS: 'y', APP_PASSWORD: 'z' }, withheld });
+      expect(withheld.sort()).toEqual(['NODE_OPTIONS', 'PATH']);
+      // And the sink being absent is not an error, nor a bypass.
+      const env = childEnv({ secrets: { PATH: 'x' } });
+      expect(env.PATH).not.toBe('x');
+    });
+
+    it('still passes an ordinary credential whose name merely looks secret-ish', () => {
+      // The screen is about code loading, NOT about whose credential it is.
+      // `isForbiddenChildEnvKey` would match both of these and must not apply.
+      const env = childEnv({
+        secrets: { APP_PASSWORD: 'hunter2', API_TOKEN: 'tenant-token', DB_SECRET: 'v' },
+      });
+      expect(env.APP_PASSWORD).toBe('hunter2');
+      expect(env.API_TOKEN).toBe('tenant-token');
+      expect(env.DB_SECRET).toBe('v');
+    });
+
+    it('CANNOT RE-POINT A BARE COMMAND NAME, proved by a real spawn', () => {
+      /*
+       * The end-to-end version, because every assertion above is about an
+       * object and this one is about what the operating system does with it.
+       * libuv resolves the executable using the PATH in the env it is handed,
+       * so before the screen this exact arrangement ran the planted script:
+       * `classifyExternalCommand('vitest run')` ALLOWED, `screenSpecEnv({PATH})`
+       * refused it, and then the secrets map put it back.
+       */
+      const dir = mkdtempSync(join(tmpdir(), 'qaai-child-env-'));
+      try {
+        const planted = join(dir, 'qaai-planted-runner');
+        writeFileSync(planted, '#!/bin/sh\necho PLANTED_RAN\n', { mode: 0o755 });
+
+        const hijacked = childEnv({ secrets: { PATH: dir } });
+        const run = spawnSync('qaai-planted-runner', [], { env: hijacked, shell: false, encoding: 'utf8' });
+        expect(run.stdout ?? '').not.toContain('PLANTED_RAN');
+
+        /*
+         * The control: with the directory on PATH through the PASSTHROUGH (the
+         * worker image's own PATH), the same binary does run. Without this arm
+         * the assertion above would also pass if `spawnSync` were simply broken
+         * here — a pass that means "we did not check".
+         */
+        const honest = { ...childEnv(), PATH: dir };
+        const control = spawnSync('qaai-planted-runner', [], { env: honest, shell: false, encoding: 'utf8' });
+        expect(control.stdout ?? '').toContain('PLANTED_RAN');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 
   /**

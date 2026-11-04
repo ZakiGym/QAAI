@@ -9,6 +9,7 @@ import { parse as parseDotenv } from 'dotenv';
 import { z } from 'zod';
 import {
   CLOSURE_APPROVAL_POLICIES,
+  EGRESS_REFUSAL_SENTENCE,
   FIXTURE_PREFIX,
   GIT_INTEGRATION_KINDS,
   INLINE_EDIT_PREFIX,
@@ -18,6 +19,9 @@ import {
   SPEC_DRIVEN_TEST_TYPES,
   AUTH_PROFILE_CONFIG_SCHEMAS,
   authProfileSchema,
+  baseUrlEgressProblem,
+  controlEnforces,
+  controlMode,
   createEnvironmentSchema,
   createProjectSchema,
   createMonitorSchema,
@@ -32,6 +36,7 @@ import {
   locatorsFromFlowMap,
   isSupportedPair,
   pairMessage,
+  resolveEgressPolicy,
   updateEnvironmentSchema,
   updateGateRulesSchema,
   updateProjectSchema,
@@ -39,13 +44,28 @@ import {
   upsertSecretSchema,
 } from '@qaai/shared';
 import type {
+  ControlMode,
+  EgressAllowlistEntry,
+  EgressPolicy,
   FlowMap,
   GitIntegrationKind,
   Language,
   OwnershipVerdict,
+  SecurityControl,
   TestResultStatus,
   UiFramework,
 } from '@qaai/shared';
+/*
+ * ── WHY THIS ONE IMPORT IS BY PATH AND NOT FROM THE BARREL ──────────────────
+ *
+ * `private-address.ts` reaches for `node:dns`, and the barrel
+ * (`packages/shared/src/index.ts`) is what the web app's bundler consumes — so
+ * it is deliberately NOT re-exported from there, a hazard
+ * `scripts/check-wiring.ts` writes down after once recommending the change that
+ * would have broken the web build. `lib/issues.ts`, `lib/sso.ts` and
+ * `routes/api-surface.ts` all import it this way; this is the fourth.
+ */
+import { classifyHost } from '@qaai/shared/private-address';
 import {
   DEFAULT_GATE_RULES,
   checkQuarantineBudget,
@@ -84,6 +104,385 @@ import { signInWithProfile } from '@qaai/runner';
 import { openToken, parseGitConfig } from '../lib/integrations.js';
 import { canCreateProject, planFor } from '../lib/plan.js';
 import { actorOf, requireAuth, requireRole, requireScope } from '../middleware/auth.js';
+import { env } from '../env.js';
+/*
+ * ── THE SEALED SESSION, THROUGH THE MODULE THAT ALREADY OWNS IT ─────────────
+ *
+ * `sealSession` is the write half of `AuthProfile.storageState`'s sealed
+ * envelope and the ONLY production caller it had was the worker's hourly
+ * refresh tick — while the sign-in route below wrote the SAME column in
+ * plaintext, which the sweep then read as `LEGACY_PLAINTEXT` and nulled. Two
+ * writers of one field with opposite contracts is not a race, it is a feature
+ * that deletes itself, and the fix is this import rather than a second sealer.
+ *
+ * `currentKeyring()` and not `readVaultKeys(prisma)` for the key list, and the
+ * difference is load-bearing. MEASURED on this tree: `vaultKeysFrom([])` — what
+ * an empty `VaultKey` table yields, which is every install, since no migration
+ * seeds it — answers `{ keys: [] }`, and `sealSession` on that refuses
+ * `NO_WRITABLE_KEY`. `currentKeyring()` falls back to the IMPLICIT keyring (one
+ * ACTIVE LOCAL key, version 1, backed by `VAULT_MASTER_KEY`), which is the same
+ * key `lib/vault.ts` has always sealed secrets under. That is the fail-SAFE
+ * direction and `vault.ts` states the distinction: the fail-closed rules apply
+ * to what the keyring DECIDES, not to whether one exists.
+ */
+import {
+  SESSION_REFRESH_LEAD_MS,
+  SESSION_ROW_SELECT,
+  SESSION_STATE_RULES,
+  localSessionCipher,
+  masterKeyResolver,
+  sealSession,
+  sessionStateOf,
+} from '../lib/session-store.js';
+import type { SessionCipher } from '../lib/session-store.js';
+import { currentKeyring } from '../lib/vault.js';
+import { Prisma } from '../generated/prisma/client.js';
+
+// ─── Injected I/O ────────────────────────────────────────────────────────────
+
+/**
+ * EVERYTHING THESE ROUTES REACH FOR OUTSIDE THIS PROCESS AND OUTSIDE PRISMA.
+ *
+ * One narrow interface, injected, for the reason packages/shared/src/egress.ts
+ * gives at length about its own: a control that reaches for its clock or its
+ * cipher inline is a control no test can drive with a fake, and a control
+ * nobody can test with a fake is a control nobody trusts.
+ * `routes/api-surface.ts` already carries exactly this seam
+ * (`configureApiSurfaceIo`), so this is the house pattern rather than a new one.
+ */
+interface ProjectsIo {
+  /**
+   * The cipher the sign-in route seals a captured session with.
+   *
+   * NULL BY DEFAULT AND BUILT ON FIRST USE, never at import. `masterKeyResolver`
+   * THROWS at construction when `VAULT_MASTER_KEY` does not decode to 32 bytes,
+   * and a module-level constant would therefore turn a mis-set key into an
+   * unimportable router — which is the hazard `lib/vault.ts` records about its
+   * own keyring, and which would take every route in this file down with it.
+   */
+  sessionCipher: SessionCipher | null;
+  /**
+   * The clock `storageStateSealedAt` is stamped from, and the one the session
+   * states below are read against. Injected because `new Date()` written inline
+   * at the write site makes the stored timestamp untestable, and because two
+   * `new Date()` calls in one handler can straddle a second.
+   */
+  now: () => Date;
+}
+
+let io: ProjectsIo = { sessionCipher: null, now: () => new Date() };
+
+/**
+ * Point these routes at their I/O. Called by the test files with fakes.
+ *
+ * Returns the previous settings so a caller can restore them, which is what
+ * keeps one test from leaking a fake into the next.
+ */
+export function configureProjectsIo(next: Partial<ProjectsIo>): ProjectsIo {
+  const previous = io;
+  io = { ...io, ...next };
+  return previous;
+}
+
+/** The session cipher, built from the master key on first use. See {@link ProjectsIo}. */
+function sessionCipher(): SessionCipher {
+  io.sessionCipher ??= localSessionCipher(masterKeyResolver(env.VAULT_MASTER_KEY));
+  return io.sessionCipher;
+}
+
+// ─── The base URL's address class ────────────────────────────────────────────
+
+/**
+ * THE CONTROL THIS DOOR IS BRAKED BY. One spelling, so the audit is countable.
+ *
+ * `SECURITY_CONTROL_BRAKES.EGRESS_CLASSIFICATION` had ZERO production readers
+ * when this door was cut. Its `fallback` is ENFORCE and its `observeCounts`
+ * sentence promises "every connection that would have been refused, by context
+ * and by address class" — which is what {@link EGRESS_AUDIT_ACTION} below
+ * writes on an OBSERVE pass.
+ */
+const EGRESS_CONTROL: SecurityControl = 'EGRESS_CLASSIFICATION';
+
+/**
+ * ONE AUDIT ACTION, WITH THE OUTCOME IN THE ROW.
+ *
+ * Not `…refused` and `…observed` as two action names: a refusal and the
+ * OBSERVE-mode pass that would have been one are the same event under two
+ * modes, and an OBSERVE pass filed under a different action is a refusal
+ * applied-or-not that nobody can count in one query. "How many base URLs would
+ * we have refused, by class" is `GROUP BY metadata->>'addressClass'` over this
+ * one action. Rule 13's other half: a mode with no counter is an off switch
+ * with a reassuring name.
+ */
+const EGRESS_AUDIT_ACTION = 'environment.base-url.egress';
+
+/**
+ * A base URL this deployment may not open, named for the operator.
+ */
+interface BaseUrlProblem {
+  /** The field, so a form can highlight it. Always `['baseUrl']`. */
+  readonly path: readonly string[];
+  /**
+   * FOR THE OPERATOR, INSIDE THEIR OWN TENANT. Names the class, the deployment
+   * mode and the host. It goes in the audit row and NEVER in the response — the
+   * response carries {@link EGRESS_REFUSAL_SENTENCE}, one constant for every
+   * class, because "that is a link-local address" and "that is a private
+   * address" are two different facts about the inside of a network handed to
+   * whoever typed the URL.
+   */
+  readonly detail: string;
+  /** The class that decided it, for the OBSERVE count. Null for an unreadable URL. */
+  readonly addressClass: string | null;
+}
+
+/**
+ * IS THIS BASE URL'S HOST ONE THIS DEPLOYMENT MAY OPEN?
+ *
+ * ── WHAT THIS CLOSES ───────────────────────────────────────────────────────
+ *
+ * `environmentBaseUrl` in packages/shared/src/schemas.ts checks the SYNTAX —
+ * http(s), a length bound, no `user:pass@` — and its own header says in terms
+ * that it MUST NOT be described as having checked the address, naming this
+ * route as the one that owes the check. It was not made. MEASURED on this tree
+ * before the edit: `createEnvironmentSchema` and `updateEnvironmentSchema` both
+ * ACCEPTED and stored `http://169.254.169.254/` (the cloud metadata service on
+ * AWS, GCP and Azure alike), `http://127.0.0.1:6379/`, `http://10.0.0.5/` and
+ * `http://2130706433/` — and a MEMBER's FORM_LOGIN profile then drives a real
+ * browser at that URL and types vault plaintext into whatever answers, while
+ * the crawl's progress events report what it found. That is an SSRF and a
+ * port-reachability oracle for our own network.
+ *
+ * ── THE POLICY IS NOT RE-IMPLEMENTED HERE ──────────────────────────────────
+ *
+ * `baseUrlEgressProblem` is the policy and this function is its caller: the
+ * route classifies (it runs on Node and holds the `private-address` import) and
+ * that function decides. A SELF_HOSTED deployment legitimately points at
+ * `http://10.0.0.5:3000`, so this is NOT a blanket refusal, and the difference
+ * is the policy's to know rather than this file's.
+ *
+ * ── WHAT IT DECIDES, AND THE HALF IT DELIBERATELY LEAVES ALONE ─────────────
+ *
+ * The SYNCHRONOUS half only: an ambiguous host and an IP LITERAL whose class
+ * the policy does not permit. A NAME is left to the connection, and that is a
+ * measured decision rather than an oversight:
+ *
+ *   `classifyHost('localhost')` is a NAME with `internal: true`, exactly like
+ *   `metadata.google.internal` — there is no rule that refuses one and permits
+ *   the other. MEASURED: `apps/web/components/onboarding/StackStep.tsx:163`
+ *   offers a one-click button that sets the base URL to `http://localhost:5050`
+ *   to test the bundled demo, and `apps/api/prisma/seed.ts:40` stores that same
+ *   URL. Refusing internal names at this door would 400 that button in every
+ *   install, because NOTHING in this product writes `Environment.egressPolicy`
+ *   or `Organization.securityControlModes` today (also measured), so no operator
+ *   can declare themselves SELF_HOSTED or set this brake to OBSERVE through the
+ *   cockpit. A control that breaks a working product on the next deploy is the
+ *   defect this round exists to stop, not the one it ships.
+ *
+ *   The name's verdict is NOT dropped. It belongs at the moment the connection
+ *   is opened — `baseUrlEgressProblem`'s own header says that is "the only place
+ *   it CAN be caught, since a name resolved in the API process is not the name
+ *   the browser will resolve" — and that control is WIRED: `decideEgress`
+ *   through `defaultCrawlEgressGate` at apps/worker/src/processors/explore.ts:1745
+ *   and `guardCrawlAdapter` at the adapter boundary, and through the login guard
+ *   at apps/worker/src/processors/auth-refresh.ts:688. Both resolve the name,
+ *   refuse UNRESOLVED, and pin the addresses they classified.
+ *
+ * THIS FUNCTION MUST NOT BE DESCRIBED AS HAVING CHECKED WHERE A NAME POINTS.
+ * It has not, and a `null` return for a name means "nothing is decidable here
+ * without a resolver", which is the same sentence `baseUrlEgressProblem`
+ * attaches to its own.
+ */
+function baseUrlProblem(baseUrl: string, policy: EgressPolicy): BaseUrlProblem | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    /*
+     * Unreachable through either schema (`httpUrl` has already parsed it) and
+     * handled anyway, as a REFUSAL and not a pass: a helper that falls through
+     * to "allow" on an exception is the defect pattern worth hunting in one's
+     * own work, and this one would do it on the one input an attacker chose.
+     */
+    return {
+      path: ['baseUrl'],
+      detail: 'That base URL is not a URL this server can read, so its address was never classified.',
+      addressClass: null,
+    };
+  }
+
+  const classified = classifyHost(parsed.hostname);
+  const problem = baseUrlEgressProblem(classified, policy);
+  if (!problem) return null;
+  return {
+    path: problem.path,
+    detail: `${classified.host} ${problem.message}.`,
+    addressClass: classified.kind === 'address' ? classified.class : 'ambiguous',
+  };
+}
+
+/**
+ * THE ALLOWLIST THE REFUSAL NAMES, READ FROM THE TABLE THAT HOLDS IT.
+ *
+ * `resolveEgressPolicy` reads `allowlist` out of the `Environment.egressPolicy`
+ * JSON column; the entries an OWNER writes through
+ * `POST /settings/environments/:id/egress-allowlist` go into
+ * `model EgressAllowlistEntry`, which is a different place. Without this read
+ * the refusal below would name an escape that cannot be exercised — a message
+ * contradicting the code under it, which in a security path is the worst kind.
+ *
+ * ORG-WIDE ENTRIES (`environmentId: null`) ARE WHAT MAKES THE CREATE PATH
+ * REACHABLE AT ALL. An entry scoped to one environment cannot exist before that
+ * environment does, so a self-hosted customer whose staging app lives on
+ * `10.0.0.5` would otherwise be unable to create it — and unable to repoint an
+ * existing one, since the PATCH would be refused too. With the org-wide form
+ * the escape is: an OWNER names the host with their name and a reason, then the
+ * environment can be created at it.
+ *
+ * EXPIRED ENTRIES ARE DROPPED HERE. `baseUrlEgressProblem` matches on host and
+ * context and does NOT look at `expiresAt` — `allowlistEntryFor` in
+ * packages/shared/src/egress.ts is the one that does — so an entry that has run
+ * out would otherwise keep widening this door after it had stopped widening the
+ * connection, which is the five-expiring-suppressions-that-never-expired defect
+ * in a new field.
+ */
+async function widenByAllowlist(input: {
+  readonly policy: EgressPolicy;
+  readonly environmentId: string | null;
+  readonly now: Date;
+}): Promise<EgressPolicy> {
+  const rows = await prisma.egressAllowlistEntry.findMany({
+    where: {
+      OR: [
+        { environmentId: null },
+        ...(input.environmentId === null ? [] : [{ environmentId: input.environmentId }]),
+      ],
+    },
+    select: { host: true, contexts: true, ownerEmail: true, reason: true, expiresAt: true },
+  });
+
+  const entries: EgressAllowlistEntry[] = [];
+  for (const row of rows) {
+    if (row.expiresAt !== null && row.expiresAt.getTime() <= input.now.getTime()) continue;
+    entries.push({
+      host: row.host,
+      contexts: row.contexts as EgressAllowlistEntry['contexts'],
+      ownerEmail: row.ownerEmail,
+      reason: row.reason,
+      expiresAt: row.expiresAt === null ? null : row.expiresAt.toISOString(),
+    });
+  }
+  return { ...input.policy, allowlist: [...input.policy.allowlist, ...entries] };
+}
+
+/**
+ * THE DOOR. Refuse, or count what ENFORCE would have refused, or say nothing.
+ *
+ * ── THE BRAKE GATES THE REFUSAL AND THE WRITE, NOT ONLY THE REPORT ─────────
+ *
+ * Rule 13, and this round is where it earned its place. In OBSERVE the write
+ * goes through EXACTLY as it did before this door existed and an audit row
+ * records what enforcement would have stopped, by class. In ENFORCE the write
+ * does not happen at all: the caller throws, so there is no arm in which a
+ * refused base URL is stored. An operator who sets this control to OBSERVE gets
+ * today's behaviour plus a count, which is the only thing that makes the switch
+ * worth having.
+ *
+ * ── THE RESPONSE SAYS ONE SENTENCE ─────────────────────────────────────────
+ *
+ * {@link EGRESS_REFUSAL_SENTENCE} — the shared constant, identical for a
+ * loopback literal, a link-local literal, a private literal and an ambiguous
+ * host. `packages/shared/src/egress.test.ts` asserts that every member of
+ * `EGRESS_REFUSALS` produces that exact string, so this door cannot drift into
+ * a "more helpful" message. The class is in the AUDIT row, inside the tenant,
+ * where an operator is entitled to know it.
+ *
+ * Nor is the TIMING an oracle. Every refused class takes the identical path
+ * through here — the same allowlist read, the same brake read, the same audit
+ * write — so what a duration distinguishes is "refused" from "stored", which
+ * the status code says out loud anyway. It does not distinguish loopback from
+ * link-local from private, which is the comparison that would describe our own
+ * network to whoever is probing it.
+ */
+async function guardBaseUrl(input: {
+  readonly actor: ReturnType<typeof actorOf>;
+  readonly baseUrl: string;
+  /** `Environment.egressPolicy` as stored, or undefined on a create. */
+  readonly storedPolicy: unknown;
+  readonly environmentId: string | null;
+  readonly projectId: string;
+}): Promise<void> {
+  const now = io.now();
+  const policy = resolveEgressPolicy(input.storedPolicy);
+
+  const problem = baseUrlProblem(input.baseUrl, policy);
+  if (problem === null) return;
+
+  /*
+   * Only now is the allowlist worth a query. An entry can only ever turn a
+   * refusal into a pass — `baseUrlEgressProblem` consults it to return null
+   * earlier and for nothing else — so a base URL the policy already permits
+   * does not pay for a read.
+   */
+  const widened = await widenByAllowlist({
+    policy,
+    environmentId: input.environmentId,
+    now,
+  });
+  const remaining = baseUrlProblem(input.baseUrl, widened);
+  if (remaining === null) return;
+
+  const mode: ControlMode = await egressWriteMode(input.actor.orgId);
+  const enforcing = controlEnforces(mode);
+
+  await audit({
+    actor: input.actor,
+    action: EGRESS_AUDIT_ACTION,
+    targetType: 'Environment',
+    /*
+     * Null on a create: no environment was made, and naming the project id
+     * here would file this row against a different kind of thing. The project
+     * is in the metadata, and `audit()` stamps `requestId` on every row — which
+     * is what ties an OBSERVE-mode decision to the `environment.create` that
+     * goes through immediately after it.
+     */
+    targetId: input.environmentId,
+    metadata: {
+      control: EGRESS_CONTROL,
+      mode,
+      outcome: enforcing ? 'REFUSED' : 'WOULD_REFUSE',
+      wouldHaveRefused: !enforcing,
+      context: 'CRAWL',
+      projectId: input.projectId,
+      path: remaining.path.join('.'),
+      addressClass: remaining.addressClass,
+      deployment: widened.deployment,
+      // The operator's copy. Names the class and the host; never a credential,
+      // and a base URL's PATH is not in it — for a webhook the path is the
+      // bearer credential, and the habit is worth keeping everywhere.
+      detail: remaining.detail,
+    },
+  });
+
+  if (!enforcing) return;
+  throw badRequest(EGRESS_REFUSAL_SENTENCE, { refusedPaths: [remaining.path.join('.')] });
+}
+
+/**
+ * This organisation's setting for the egress brake, or the control's own default.
+ *
+ * `Organization` is scoped by its primary key rather than an `orgId` column and
+ * the tenancy extension in lib/prisma.ts handles that, so this read cannot
+ * return another tenant's row. `controlMode` never throws and falls back to
+ * `SECURITY_CONTROL_BRAKES[control].fallback` — ENFORCE here — for an absent or
+ * unreadable column, which is the direction the brake table chose.
+ */
+async function egressWriteMode(orgId: string): Promise<ControlMode> {
+  const org = await prisma.organization.findUnique({
+    where: { id: orgId },
+    select: { securityControlModes: true },
+  });
+  return controlMode(EGRESS_CONTROL, org?.securityControlModes ?? null);
+}
 
 /**
  * SCREAMING_SNAKE_CASE, matching upsertSecretSchema — used to filter a pasted
@@ -395,6 +794,23 @@ projectsRouter.post('/:projectId/environments', requireRole('MEMBER'), async (re
   });
   if (!project) throw notFound('Project');
 
+  /*
+   * THE ADDRESS CHECK THE SCHEMA SAYS IT HAS NOT MADE.
+   *
+   * Before the write, so an ENFORCE refusal leaves NO row behind. There is no
+   * stored policy to read on a create — the column lives on the row that does
+   * not exist yet — so the deployment default applies (`resolveEgressPolicy`
+   * answers `HOSTED_EGRESS_POLICY`: public only), widened by any ORG-WIDE
+   * allowlist entry an owner has written. See {@link guardBaseUrl}.
+   */
+  await guardBaseUrl({
+    actor,
+    baseUrl: input.baseUrl,
+    storedPolicy: undefined,
+    environmentId: null,
+    projectId: project.id,
+  });
+
   const environment = await prisma.environment.create({
     data: {
       orgId: actor.orgId,
@@ -534,10 +950,34 @@ projectsRouter.patch(
 
     const environment = await prisma.environment.findUnique({
       where: { id: String(req.params.environmentId) },
-      select: { id: true, projectId: true },
+      // `egressPolicy` is read because the check below is against THIS
+      // environment's policy: a SELF_HOSTED row legitimately points at a
+      // private address, and re-deciding that here would be a second copy of
+      // the rule.
+      select: { id: true, projectId: true, egressPolicy: true },
     });
     if (!environment || environment.projectId !== String(req.params.projectId)) {
       throw notFound('Environment');
+    }
+
+    /*
+     * ONLY WHEN THE EDIT TOUCHES `baseUrl`.
+     *
+     * An environment whose base URL was stored before this door existed — a
+     * customer with a `http://10.0.0.5/` staging box, which is most of the
+     * reason the SELF_HOSTED mode exists — must still be renameable and still
+     * be moveable between runner pools. Refusing a PATCH that does not mention
+     * the base URL would make an already-stored address a permanent lock on the
+     * row, which is a worse outcome than the one this control is for.
+     */
+    if (input.baseUrl !== undefined) {
+      await guardBaseUrl({
+        actor,
+        baseUrl: input.baseUrl,
+        storedPolicy: environment.egressPolicy,
+        environmentId: environment.id,
+        projectId: environment.projectId,
+      });
     }
 
     const updated = await prisma.environment.update({
@@ -1970,22 +2410,77 @@ projectsRouter.get('/:projectId/environments/:environmentId/auth-profiles', asyn
     where: { environmentId: String(req.params.environmentId) },
     orderBy: { createdAt: 'asc' },
     select: {
-      id: true,
+      /*
+       * ONE DEFINITION OF THE SESSION PROJECTION, and the compiler enforces
+       * that it names every field `SealedSessionRow` has (it carries `id` too).
+       * A field added to that interface and not here is a compile error rather
+       * than a field this reader silently stops selecting — the
+       * hand-copied-projection defect `SESSION_ROW_SELECT`'s own comment
+       * records, which has already shipped once in this repo.
+       */
+      ...SESSION_ROW_SELECT,
       name: true,
       kind: true,
       config: true,
-      storageStateExpiresAt: true,
-      // Never the storageState itself: it is a live session.
       updatedAt: true,
     },
   });
 
+  const now = io.now();
+
   res.json({
-    profiles: profiles.map((p) => ({
-      ...p,
-      signedIn:
-        p.storageStateExpiresAt !== null && p.storageStateExpiresAt > new Date(),
-    })),
+    /*
+     * BUILT FIELD BY FIELD AND NOT SPREAD. The select above now names
+     * `storageStateSealed` — the sealed envelope — and `storageState`, the
+     * legacy plaintext column. A `{ ...p }` here would put a live customer
+     * session in the response body of a GET that any authenticated member can
+     * make, which is a worse hole than the one being closed.
+     */
+    profiles: profiles.map((p) => {
+      /*
+       * ── `signedIn` WAS TWO FACTS IN ONE FIELD, AND THE WRONG ONE ──────────
+       *
+       * It read `storageStateExpiresAt !== null && > now`, which is the
+       * three-line test `sessionStateOf` exists to replace. MEASURED against
+       * the eight states: that expression answers TRUE for a
+       * `LEGACY_PLAINTEXT` row (which the gate REFUSES, and which the sign-in
+       * route above wrote until this slice), TRUE for `SEALED_UNVERSIONED` (a
+       * row a rotation sweep would skip and therefore will not use), and TRUE
+       * for a row a sweep marked `NEEDS_RESEAL` without clearing its expiry.
+       * Three states in which there is no session a run may carry, reported as
+       * signed in.
+       *
+       * `SESSION_STATE_RULES[state].usable` is the honest boolean — true for
+       * exactly `SEALED_FRESH` and `SEALED_EXPIRING` — and the STATE goes
+       * beside it, because "nothing has ever signed in here" and "we destroyed
+       * the session we were holding and you must sign in again" are different
+       * facts with different remedies, and `fault` is which of the two is ours.
+       *
+       * The state name, the sentence and the fault are all members of closed
+       * lists or fixed strings from `SESSION_STATE_RULES`; none of them can
+       * carry a cookie. (MEASURED: nothing in apps/web reads this endpoint
+       * today, so this is about not serving a false field rather than about a
+       * screen that is wrong.)
+       */
+      const state = sessionStateOf(p, now);
+      const rule = SESSION_STATE_RULES[state];
+      return {
+        id: p.id,
+        name: p.name,
+        kind: p.kind,
+        config: p.config,
+        updatedAt: p.updatedAt,
+        storageStateExpiresAt: p.storageStateExpiresAt,
+        signedIn: rule.usable,
+        session: {
+          state,
+          usable: rule.usable,
+          refreshDue: rule.refreshDue,
+          fault: rule.usable ? null : rule.fault,
+          why: rule.why,
+        },
+      };
+    }),
   });
 });
 
@@ -2151,26 +2646,150 @@ projectsRouter.post(
       { environmentKind: environment.kind, baseUrl: environment.baseUrl },
     );
 
-    if (result.ok) {
-      await prisma.authProfile.update({
-        where: { id: profile.id },
-        data: {
-          storageState: (result.storageState as object) ?? undefined,
-          storageStateExpiresAt: result.expiresAt,
-        },
+    /*
+     * ── THE SEAL, WHICH THIS ROUTE DID NOT APPLY ─────────────────────────────
+     *
+     * What stood here was
+     *
+     *   data: { storageState: (result.storageState as object) ?? undefined,
+     *           storageStateExpiresAt: result.expiresAt }
+     *
+     * and it was the ONLY user-triggered writer of `AuthProfile.storageState`.
+     * It wrote a LIVE CUSTOMER SESSION — cookies and origin storage, bearer
+     * enough to be that user — into the plaintext column, which made the claim
+     * that the field is sealed false for the one path a person can reach. The
+     * hourly sweep then read what the cockpit had just written as
+     * `LEGACY_PLAINTEXT` (its highest-precedence state, because that is the one
+     * state with a live secret in the clear in the database), refused it, and
+     * nulled it — so a session this route captured survived until the next tick
+     * and no longer than that.
+     *
+     * TWO FURTHER THINGS THAT LINE GOT WRONG, both worth naming because the
+     * replacement is what fixes them:
+     *
+     *   `?? undefined` on a login that produced NO session (a profile kind that
+     *   authenticates with a request header has none) wrote the EXPIRY ON ITS
+     *   OWN. `storageStateExpiresAt !== null && > now` then reported a valid
+     *   session for a profile that has none — exactly the pair-must-move-together
+     *   defect `SealedSessionWrite` was shaped to make unwritable, which is why
+     *   that type carries `storageState: null` on every single write.
+     *
+     *   Nothing recorded the key version, so a rotation sweep could not have
+     *   found the row.
+     */
+    /*
+     * Null unless a captured session could not be sealed. Declared out here
+     * because the audit row and the response both have to report it — a cap or
+     * a refusal applied without being reported is one of the lies this product
+     * cannot afford, and silently not caching a session is exactly that.
+     */
+    let sealRefusal: { readonly refusal: string; readonly detail: string } | null = null;
+
+    if (result.ok && result.storageState !== null && result.storageState !== undefined) {
+      const now = io.now();
+      const sealed = await sealSession({
+        profileId: profile.id,
+        storageState: result.storageState,
+        /*
+         * The login's own expiry, with the REFRESH LEAD as a floor when it
+         * reports none — the same answer apps/worker/src/processors/auth-refresh.ts
+         * gives, and for the reason it states: `succeeded()` in login.ts always
+         * stamps one, so this fallback is for a path that does not exist today
+         * and must not become a claim of validity if one appears. One refresh
+         * lead never over-claims, and the row it produces reads as
+         * SEALED_EXPIRING on the next gate — usable now, refreshed next tick.
+         */
+        expiresAt: result.expiresAt ?? new Date(now.getTime() + SESSION_REFRESH_LEAD_MS),
+        keys: currentKeyring().keys,
+        cipher: sessionCipher(),
+        now,
       });
+
+      if (sealed.ok) {
+        /*
+         * ONE STATEMENT, AND THE WHOLE OBJECT. `sealed.value` is a
+         * `SealedSessionWrite`, which carries `storageState: null` and the
+         * expiry together on purpose — spreading it is what makes "no writer
+         * ever puts plaintext here again" a property of the code instead of a
+         * sentence in the schema. Writing the fields out by hand here would be
+         * the hand-copied projection that has already cost this repo a slice.
+         */
+        await prisma.authProfile.update({
+          where: { id: profile.id },
+          data: {
+            ...sealed.value,
+            /*
+             * `Prisma.DbNull` AND NOT `null`, which is the one field of
+             * `SealedSessionWrite` whose Prisma encoding differs from its
+             * TypeScript value — overridden here rather than re-listed, so the
+             * spread above stays the thing that guarantees every column moves.
+             *
+             * The two sentinels are not interchangeable and the column's
+             * meaning depends on which: `JsonNull` stores the JSON value
+             * `null`, which reads back as a row that HAS a value, and
+             * `sessionStateOf` tests `storageState !== null` FIRST and would
+             * classify such a row `LEGACY_PLAINTEXT` — refusing the session
+             * this statement just sealed, for ever. `DbNull` is SQL NULL,
+             * which is the column being empty. Same distinction
+             * `routes/api-surface.ts` records about `jsonOrNull`.
+             */
+            storageState: Prisma.DbNull,
+          },
+        });
+      } else {
+        /*
+         * DISCARDED RATHER THAN STORED IN THE CLEAR, and said so. The two
+         * reachable refusals are `NO_WRITABLE_KEY`/`MORE_THAN_ONE_WRITABLE_KEY`
+         * (the key table disagrees with itself) and `UNKNOWN_KEY_VERSION` (an
+         * ACTIVE version this process holds no material for). Neither is a
+         * reason to fall back to plaintext — that is how a rotation ends with
+         * values under a key nobody meant to use — and neither is a reason to
+         * report the sign-in as having failed: the customer's login WORKED, and
+         * what did not work is ours.
+         *
+         * `sealed.detail` names the refusal and the key version and no part of
+         * the session; `session-store.ts` discards the cipher's own error for
+         * exactly that reason, so there is nothing here to quote from.
+         */
+        sealRefusal = sealed;
+      }
     }
 
-    // The message never contains a credential — see packages/runner/src/login.ts.
+    /*
+     * The message never contains a credential — see packages/runner/src/login.ts
+     * — and neither does this row. `storageStateKeyVersion` is an integer and
+     * the refusal is a member of a closed list; no cookie, no envelope and no
+     * part of the session goes in an audit row, a response or a log line.
+     */
     await audit({
       actor,
       action: result.ok ? 'auth-profile.sign-in' : 'auth-profile.sign-in.failed',
       targetType: 'AuthProfile',
       targetId: profile.id,
-      metadata: { name: profile.name, kind: profile.kind },
+      metadata: {
+        name: profile.name,
+        kind: profile.kind,
+        sessionSealed: result.ok && sealRefusal === null && result.storageState != null,
+        sealRefusal: sealRefusal?.refusal ?? null,
+      },
     });
 
-    res.json({ ok: result.ok, message: result.message, expiresAt: result.expiresAt });
+    res.json({
+      ok: result.ok,
+      message: result.message,
+      expiresAt: result.expiresAt,
+      /*
+       * TWO FACTS, TWO FIELDS. "The login worked" and "the session was kept"
+       * are different answers and a caller acts on them differently: the first
+       * says the selectors and the credentials are right, the second says the
+       * next run can carry this identity. Folding a seal failure into `ok:
+       * false` would report the customer's own login as broken for a fault that
+       * is entirely ours.
+       */
+      sessionStored: result.ok && sealRefusal === null && result.storageState != null,
+      sessionRefusal: sealRefusal === null ? null : sealRefusal.refusal,
+      sessionMessage: sealRefusal === null ? null : sealRefusal.detail,
+    });
   },
 );
 

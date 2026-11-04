@@ -26,6 +26,7 @@ import {
 import type { InteractionSurface, RawControl } from './crawl/interact.js';
 import { DISCOVERY_SOURCES } from './crawl/frontier.js';
 import { DISCOVERY_KINDS, HARVEST_ELEMENT_SELECTOR } from './crawl/harvest.js';
+import { CrawlEgressGate } from './crawl/egress.js';
 
 /**
  * What is and is not covered here, said plainly.
@@ -343,6 +344,67 @@ const BASE_OPTIONS = {
   version: 1,
 };
 
+/**
+ * A GATE THAT ALLOWS EVERYTHING, for the two tests that go through `crawlApp`.
+ *
+ * `crawlApp` is the production door and it ALWAYS builds an egress gate — that
+ * is the control, and it is deliberately not optional. The gate it builds uses
+ * the real resolver, so a `crawlApp` test that supplies none would do a REAL
+ * DNS LOOKUP for `app.test`, which is a reserved TLD that does not resolve;
+ * the gate would then fail closed, correctly, and the crawl would enumerate
+ * nothing. Both of these tests did exactly that when the gate landed, and the
+ * symptom was a bare `nodes).toHaveLength(2)` failing with zero — which is the
+ * control working, not a regression.
+ *
+ * So these two inject a permissive gate. They are testing the SHIPPED
+ * SIGNATURES — that `crawl` still returns a FlowMap, and that a legacy
+ * `maxPages` is honoured and named — and egress is not what they are about;
+ * `crawler.egress.test.ts` is, including the two tests there that drive the
+ * REAL guard through `crawlApp` against an IP literal (which needs no
+ * resolver) to prove the door cannot be opened ungated.
+ *
+ * The `runCrawl` tests below pass no gate and are UNGATED on purpose: it is the
+ * inner function, and keeping it injectable is what keeps DNS out of a unit
+ * test.
+ */
+function allowEverythingGate(): CrawlEgressGate {
+  let tick = 0;
+  return new CrawlEgressGate({
+    clock: () => (tick += 1_000),
+    guard: async (url) => {
+      const host = new URL(url).hostname;
+      return {
+        ok: true,
+        permit: {
+          kind: 'PINNED',
+          context: 'CRAWL',
+          target: { scheme: 'https:', host, port: '', origin: `https://${host}` },
+          pinned: {
+            host,
+            addresses: [{ address: '93.184.216.34', class: 'public' }],
+            pinnedAt: '2026-10-29T12:00:00.000Z',
+            fromLiteral: false,
+          },
+          wouldRefuse: null,
+          decision: {
+            context: 'CRAWL',
+            host,
+            allowed: true,
+            outcome: 'ALLOWED',
+            refusal: null,
+            decidedByClass: 'public',
+            allowlistedBy: null,
+            mode: 'ENFORCE',
+            pinned: null,
+            detail: 'the test gate allows everything',
+            warning: null,
+          },
+        },
+      };
+    },
+  });
+}
+
 describe('crawl / crawlApp — the shipped signatures', () => {
   /*
    * `crawl()` HAS NO CALLER IN THIS REPO — `explore.ts` calls `crawlApp()` —
@@ -356,7 +418,7 @@ describe('crawl / crawlApp — the shipped signatures', () => {
       'https://app.test/': { title: 'Home', links: ['/orders'] },
       'https://app.test/orders': { title: 'Orders', headings: ['Orders'] },
     });
-    const map = await crawl({ ...BASE_OPTIONS, adapter });
+    const map = await crawl({ ...BASE_OPTIONS, adapter, egressGate: allowEverythingGate() });
     // A FlowMap, not a CrawlOutcome: `map.nodes` and no `map.flowMap`.
     expect(Array.isArray(map.nodes)).toBe(true);
     expect(map.nodes.map((node) => node.route).sort()).toEqual(['/', '/orders']);
@@ -373,7 +435,13 @@ describe('crawl / crawlApp — the shipped signatures', () => {
       'https://app.test/b': {},
       'https://app.test/c': {},
     });
-    const outcome = await crawlApp({ ...BASE_OPTIONS, adapter, maxPages: 2, maxDepth: 3 });
+    const outcome = await crawlApp({
+      ...BASE_OPTIONS,
+      adapter,
+      maxPages: 2,
+      maxDepth: 3,
+      egressGate: allowEverythingGate(),
+    });
     expect(outcome.flowMap.nodes).toHaveLength(2);
     expect(outcome.budget.limits.pageBudget).toBe(2);
     expect(outcome.budget.policy.overridden).toContain('pageBudget');

@@ -36,8 +36,9 @@
  * provider's conformance was already decided before this module ran.
  */
 
-import type { NetworkEntry, RunContext } from '@qaai/shared';
-import { maskUrl } from '@qaai/shared';
+import * as dns from 'node:dns';
+import type { EgressGuardIo, EgressGuardVerdict, NetworkEntry, RunContext } from '@qaai/shared';
+import { guardUrl, maskUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
 import type { BrokerPublishConfig } from './contract-events.js';
 import { send } from './contract-events.js';
 
@@ -60,7 +61,7 @@ const PUBLISH_TIMEOUT_MS = 15_000;
  * comment above is the record of one of them learning a lesson the others had
  * not. An attacker only needs the copy that has not learned it yet.
  */
-import { isPrivateNetworkName } from '@qaai/shared/private-address';
+import { classifyAddress, classifyHost, isPrivateNetworkName } from '@qaai/shared/private-address';
 
 /**
  * Cloud metadata endpoints that answer on a PUBLIC-looking name. The IP forms
@@ -172,6 +173,138 @@ export function brokerOrigin(
   return { origin: `https://${host}${url.port ? `:${url.port}` : ''}${path}`, host };
 }
 
+// ─── The egress guard, at the one seam the broker token leaves through ──────
+
+/**
+ * MAY WE OPEN THIS BROKER REQUEST, AND TO WHICH ADDRESS.
+ *
+ * ── What `brokerOrigin` above decides, which is less than it looks ─────────
+ *
+ * NOTHING ABOUT WHERE THE HOST POINTS. Its host check is
+ * `isPrivateNetworkName`, which is a PATTERN MATCH —
+ * `INTERNAL_HOST.test(host) || !host.includes('.')` — plus the
+ * {@link METADATA_HOST} set and an IPv4-literal regex. That refuses every
+ * internal host an attacker would have to be careless to name and accepts
+ * every name they would actually register. MEASURED on this tree:
+ * `brokerOrigin('https://broker.attacker.test/')` returned
+ * `{origin:'https://broker.attacker.test', host:'broker.attacker.test'}`, and
+ * the broker token follows it to whatever that name resolves to. Its own
+ * comment already says so — "there is no allow-list to check against" — and
+ * `brokerHostFromSecretName` was the answer to the LOOKALIKE half of that.
+ * This is the answer to the RESOLUTION half, which nothing addressed.
+ *
+ * `brokerOrigin` is therefore kept exactly as it is: it runs before the token
+ * is read out of `ctx.secrets`, which is a property worth keeping.
+ *
+ * ── The context, which is not a label ──────────────────────────────────────
+ *
+ * `TRACKER_CALL` — "calling an issue tracker at a customer-named base URL" is
+ * this request to the character. `EGRESS_CONTEXT_RULES` gives it
+ * `targetsApplicationUnderTest: false` and `allowlistApplies: false`, so a
+ * private, loopback, reserved or link-local address is refused in EVERY
+ * deployment and cannot be allowlisted.
+ *
+ * THAT BREAKS NOTHING THAT WORKS TODAY, and the reason is worth stating
+ * because a Pact broker IS legitimately self-hosted: `brokerOrigin` ALREADY
+ * refuses `broker.internal`, `kubernetes.default.svc`, `10.0.0.5` and a bare
+ * label, and `contract-broker.test.ts` asserts it. So the class rule and the
+ * shipped behaviour agree, and the only thing that changes is that a name
+ * whose RECORDS point inside is now refused too.
+ */
+export type BrokerEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
+
+/**
+ * WHAT THIS CONTROL DOES NOT DO, STATED HERE BECAUSE A COMMENT IS WHAT THE NEXT
+ * REVIEWER TRUSTS INSTEAD OF READING THE CODE.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
+ * turns a check into a control: whoever opens the connection must connect to
+ * those addresses and must not resolve the name again. The transport here is
+ * `send()` in `contract-events.ts`, which uses Node's GLOBAL `fetch` — and
+ * MEASURED on Node v25.6.1, `fetch(url, { agent: new http.Agent({ lookup }) })`
+ * answered 200 and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw.
+ * There is no supported way to hand global `fetch` a resolver.
+ *
+ * ── TRUE OF `fetch`, AND THE CONCLUSION DRAWN FROM IT WAS WRONG ──────────────
+ *
+ * That sentence used to end the matter, and a reader took it to mean the pin
+ * cannot be enforced. It can. RE-MEASURED on Node v25.6.1 against a loopback
+ * server: `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200 with the
+ * lookup called ZERO times (the original measurement reproduces — the agent is
+ * IGNORED), but `http.request({ host, port, path, lookup })` -> 200 with the
+ * lookup called ONCE. Node core honours it, with NO dependency change.
+ *
+ * So the remedy is a TRANSPORT and not a dependency: moving this call off global
+ * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
+ * pin for free. The work is not done here; what is recorded is that the cheap
+ * option exists, because the previous wording closed the question.
+ *
+ * So the classification is real, EVERY address the name answers with is
+ * classified, and THE PIN IS NOT ENFORCED AT THE SOCKET. The residual hole is
+ * exactly one race — a record set answering a public address here and a private
+ * one to `fetch`. Named rather than papered over, the same way
+ * `REFRESH_PIN_LIMITATION` names it on the auth-refresh path. The remedy is one
+ * optional `lookup` parameter on `send()`; it is in the handover.
+ */
+export const BROKER_PIN_LIMITATION =
+  'The broker host was resolved and every address it answered with was classified, but Node’s ' +
+  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
+  'socket.';
+
+/**
+ * THE REAL GUARD, built from the environment's own policy when it has one.
+ *
+ * `policy` is `unknown` because that is how `Environment.egressPolicy` reads
+ * out of its JSONB column. Absent or unparseable falls through
+ * `resolveEgressPolicy` to the HOSTED policy — PUBLIC ONLY — which is the
+ * strictest reading; an absent policy must never be an open one. That is the
+ * same posture `signInWithProfile` takes with `SignInContext.egressPolicy`.
+ *
+ * Built lazily per publish rather than per process: a worker handles runs for
+ * many environments, and a module-level guard would apply one environment's
+ * policy to the next one's broker.
+ */
+export async function defaultBrokerEgressGuard(policy?: unknown): Promise<BrokerEgressGuard> {
+  const resolved = resolveEgressPolicy(policy);
+  const io: EgressGuardIo = {
+    classifyHost: (host) => classifyHost(host),
+    classifyAddress: (address) => classifyAddress(address),
+    /*
+     * EVERY address the name has, not the first — a record set mixing one
+     * routable address with 169.254.169.254 is the attack written down — and
+     * `verbatim: true` so the OS does not reorder and hide one.
+     */
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    // Monotonic, NOT the wall clock: an NTP step backwards mid-refusal would
+    // make the pad negative and therefore zero, and a refusal that skipped its
+    // pad is the timing oracle the floor exists to close.
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        // Unreffed: a draining worker must not be held open by a refusal's pad.
+        timer.unref?.();
+      }),
+  };
+  return (url) => guardUrl({ url, context: 'TRACKER_CALL', policy: resolved, io });
+}
+
+/**
+ * `Environment.egressPolicy`, as the run context carries it.
+ *
+ * `RunContext` in `packages/shared/src/types.ts` DOES NOT DECLARE THIS FIELD
+ * yet — threading it is one line there and one in the worker's run processor,
+ * neither of which this slice owns, and both are named in the handover. So it
+ * is read structurally, and the reading is the SAFE one in the meantime:
+ * `undefined` falls through `resolveEgressPolicy` to HOSTED, PUBLIC ONLY. The
+ * day the field lands this function keeps working and the per-environment
+ * brake arms itself.
+ */
+function egressPolicyOf(ctx: RunContext): unknown {
+  return (ctx as RunContext & { readonly egressPolicy?: unknown }).egressPolicy;
+}
+
 /**
  * A pact's own name for itself becomes a path segment. It comes from the
  * document, which is data, so it gets the same treatment a configured repo slug
@@ -278,6 +411,15 @@ export async function publishVerification(
   ctx: RunContext,
   config: BrokerPublishConfig,
   input: PublishInput,
+  /**
+   * The egress guard, injected. OPTIONAL so every existing caller keeps
+   * compiling and keeps getting the REAL guard — the production door at
+   * `packages/runner/src/plugins/contract.ts:2712` supplies none, so this
+   * function builds {@link defaultBrokerEgressGuard} itself and there is no
+   * path to the transport without a decision. A test supplies its own and
+   * never touches a resolver.
+   */
+  egress?: BrokerEgressGuard,
 ): Promise<PublishOutcome> {
   const started = Date.now();
 
@@ -363,6 +505,50 @@ export async function publishVerification(
         : {}),
     })),
   };
+
+  /*
+   * ── RESOLVE AND CLASSIFY, IMMEDIATELY BEFORE THE ONE LINE THAT CONNECTS ───
+   *
+   * ── Why here and not above the `config.auth` block ────────────────────────
+   *
+   * The instinct is to refuse before the credential is touched, and on the Jira
+   * path that is exactly right because the token is still CIPHERTEXT until the
+   * route unseals it. Here it buys nothing: `ctx.secrets` is already decrypted
+   * plaintext in this process, so assembling a header out of it sends nothing
+   * and reveals nothing. What the earlier position DID cost was measurable —
+   * it made the "skips, naming the secret, when the broker credential is not
+   * set" case in `contract-events.test.ts` resolve `broker.example.com`, which
+   * both changed that refusal's reason and put a live DNS query into a test
+   * that had none. The later position returns on the missing secret first, as
+   * it always did, and resolves nothing.
+   *
+   * What the guard still guarantees is the only thing that matters: NOTHING IS
+   * SENT. There is no arm below that reaches `send` on a refusal, and no
+   * exception arm that falls through to it.
+   *
+   * ── The refusal is SKIPPED, with ONE sentence ─────────────────────────────
+   *
+   * SKIPPED and never FAILED, because of the product rule that outranks
+   * everything else in this file: PUBLISHING IS NEVER THE REASON A CONTRACT
+   * TEST FAILS. The provider's conformance was decided before this function
+   * ran.
+   *
+   * And {@link refusalForCaller} gives ONE CONSTANT, identical for a loopback
+   * address, a link-local address, an unresolvable name and a context that may
+   * never reach outward. A refusal that varied would turn `publish.brokerUrl`
+   * into a port scanner whose report is the run's own step list. The operator's
+   * copy — the class, the address, the refusal code — stays in
+   * `verdict.operatorDetail` and is deliberately NOT returned.
+   */
+  const guard = egress ?? (await defaultBrokerEgressGuard(egressPolicyOf(ctx)));
+  const verdict = await guard(url);
+  if (!verdict.ok) {
+    return skipped(
+      `Verification results were not published: ${refusalForCaller(verdict).sentence} ` +
+        "The provider's conformance is unaffected.",
+      Date.now() - started,
+    );
+  }
 
   const sent = await send(ctx, url, 'POST', headers, JSON.stringify(payload), PUBLISH_TIMEOUT_MS);
   const durationMs = Date.now() - started;

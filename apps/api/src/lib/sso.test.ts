@@ -10,6 +10,9 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { EGRESS_REFUSAL_SENTENCE, guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import {
   createPublicKey,
   generateKeyPairSync,
@@ -25,9 +28,11 @@ import {
   constantTimeEqual,
   createPkce,
   decodeJwt,
+  defaultSsoEgressGuard,
   discoveryUrl,
   domainVerificationRecord,
   emailDomain,
+  guardOutboundUrl,
   identityFromUserinfo,
   normalizeDomain,
   normalizeIssuer,
@@ -46,6 +51,7 @@ import {
   type Jwk,
   type SamlAssertionFacts,
   type SamlExpectation,
+  type SsoEgressGuard,
 } from './sso.js';
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -735,5 +741,174 @@ describe('constantTimeEqual', () => {
     expect(constantTimeEqual(token, `${token}x`)).toBe(false);
     expect(constantTimeEqual('', '')).toBe(true);
     expect(constantTimeEqual('a', 'b')).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The egress guard on an issuer the org admin typed
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * WHAT `safeOutboundUrl` DECIDES, AND WHAT IT DOES NOT.
+ *
+ * It refuses the internal names it can RECOGNISE and decides nothing about
+ * where an ordinary name points. MEASURED on this tree before the change:
+ * `safeOutboundUrl('https://sso.attacker.test/', 'issuer URL')` returned that
+ * URL and the org's client secret followed it to whatever the name resolved
+ * to. `classifyHost('sso.attacker.test')` is `{kind:'name', internal:false}`,
+ * which is not permission — it is the statement that nothing has been decided.
+ *
+ * `guardOutboundUrl` is the resolving control. The tests below drive the REAL
+ * `guardUrl` with a FAKE resolver: the decision logic is the shipped one and
+ * only DNS, the clock and the sleep are injected. NOTHING HERE OPENS A SOCKET
+ * OR CONSULTS A REAL RESOLVER.
+ */
+describe('guardOutboundUrl resolves the provider host before a secret travels to it', () => {
+  /** Answers from a table and THROWS on anything else — see the note in issues.test.ts. */
+  function guardWith(zone: Readonly<Record<string, readonly string[]>>): SsoEgressGuard {
+    const io: EgressGuardIo = {
+      classifyHost: (host) => classifyHost(host),
+      classifyAddress: (address) => classifyAddress(address),
+      lookup: async (host) => {
+        const answers = zone[host];
+        if (answers === undefined) {
+          throw new Error(`fakeIo was asked to resolve ${host}, which this test never declared`);
+        }
+        return answers.map((address) => ({ address }));
+      },
+      now: () => new Date('2026-10-30T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      delay: async () => {},
+    };
+    return (url) => guardUrl({ url, context: 'SSO_METADATA', policy: resolveEgressPolicy(undefined), io });
+  }
+
+  it('still keeps every synchronous refusal safeOutboundUrl already made', async () => {
+    // The guard is ADDED, not substituted. A fake that throws on every host
+    // proves these refuse before any lookup is attempted.
+    const guard = guardWith({});
+    for (const bad of [
+      'http://accounts.google.com/',
+      'https://qa:hunter2@accounts.google.com/',
+      'https://localhost/',
+      'https://kubernetes.default.svc/',
+      'https://10.0.0.5/',
+      'https://accounts.google.com:8443/',
+    ]) {
+      await expect(guardOutboundUrl(bad, 'issuer URL', guard)).rejects.toBeInstanceOf(SsoError);
+    }
+  });
+
+  it.each([
+    ['the cloud metadata address', ['169.254.169.254']],
+    ['an RFC1918 address', ['10.0.0.5']],
+    ['loopback', ['127.0.0.1']],
+    ['a split answer, public record FIRST', ['93.184.216.34', '10.0.0.5']],
+    ['a split answer, private record FIRST', ['10.0.0.5', '93.184.216.34']],
+    ['no addresses at all', []],
+  ])('refuses an issuer host that resolves to %s', async (_label, addresses) => {
+    /*
+     * The ORDER of a split answer is the attack: a positional read of the first
+     * address lets whoever runs the zone choose the outcome by reordering their
+     * own records, and an adversary found exactly that last round.
+     */
+    const guard = guardWith({ 'sso.attacker.test': addresses });
+    await expect(
+      guardOutboundUrl('https://sso.attacker.test/', 'issuer URL', guard),
+    ).rejects.toBeInstanceOf(SsoError);
+  });
+
+  it('refuses an issuer host that does not resolve', async () => {
+    // A name we cannot vouch for is not a name we send a client secret to.
+    await expect(
+      guardOutboundUrl('https://sso.attacker.test/', 'issuer URL', guardWith({})),
+    ).rejects.toBeInstanceOf(SsoError);
+  });
+
+  it('still permits a real provider, so SSO keeps working', async () => {
+    const guard = guardWith({ 'accounts.google.com': ['93.184.216.34'] });
+    const url = await guardOutboundUrl(
+      'https://accounts.google.com/.well-known/openid-configuration',
+      'discovery URL',
+      guard,
+    );
+    expect(url.hostname).toBe('accounts.google.com');
+    expect(url.pathname).toBe('/.well-known/openid-configuration');
+  });
+
+  it('says the SAME sentence whatever the reason, so a sign-in page is not a port scanner', async () => {
+    const zones: Array<Record<string, readonly string[]>> = [
+      { 'sso.attacker.test': ['169.254.169.254'] },
+      { 'sso.attacker.test': ['10.0.0.5'] },
+      { 'sso.attacker.test': ['127.0.0.1'] },
+      { 'sso.attacker.test': [] },
+      {},
+    ];
+    const messages = new Set<string>();
+    for (const zone of zones) {
+      await guardOutboundUrl('https://sso.attacker.test/', 'issuer URL', guardWith(zone)).catch(
+        (err: unknown) => {
+          messages.add(err instanceof Error ? err.message : String(err));
+        },
+      );
+    }
+    expect(messages).toEqual(new Set([EGRESS_REFUSAL_SENTENCE]));
+    // And the operator's class/address detail never reaches it.
+    expect([...messages][0]).not.toMatch(/10\.0\.0\.5|169\.254|loopback|private|link-local/);
+  });
+
+  it('reports CONFIG, not PROVIDER, and the kind does not vary either', async () => {
+    // The thing to change is the issuer URL on the connection, which is
+    // configuration — and that is true whichever refusal fired, so the kind is
+    // not an oracle any more than the sentence is.
+    const kinds = new Set<string>();
+    for (const addresses of [['169.254.169.254'], ['10.0.0.5'], []]) {
+      await guardOutboundUrl(
+        'https://sso.attacker.test/',
+        'issuer URL',
+        guardWith({ 'sso.attacker.test': addresses }),
+      ).catch((err: unknown) => {
+        kinds.add(err instanceof SsoError ? err.kind : 'not-an-SsoError');
+      });
+    }
+    expect(kinds).toEqual(new Set(['CONFIG']));
+  });
+});
+
+describe('defaultSsoEgressGuard — the guard production actually gets', () => {
+  /*
+   * IP LITERALS ONLY: `classifyHost` answers `kind: 'address'` for a literal
+   * and `decideEgress` consults no resolver at all for one, so these exercise
+   * the REAL default guard with NO DNS QUERY and no socket.
+   */
+  it('refuses private, loopback and link-local with no policy configured', async () => {
+    const guard = await defaultSsoEgressGuard();
+    expect((await guard('https://169.254.169.254/')).ok).toBe(false);
+    expect((await guard('https://10.0.0.5/')).ok).toBe(false);
+    expect((await guard('https://127.0.0.1/')).ok).toBe(false);
+  });
+
+  it('refuses a private address even on a SELF_HOSTED policy with an allowlist entry', async () => {
+    // SSO_METADATA may never reach a private address — not in any deployment
+    // and not through the allowlist.
+    const guard = await defaultSsoEgressGuard({
+      deployment: 'SELF_HOSTED',
+      permittedClasses: ['public', 'private', 'loopback', 'reserved'],
+      allowlist: [
+        {
+          host: '10.0.0.5',
+          contexts: ['SSO_METADATA'],
+          ownerEmail: 'someone@acme.test',
+          reason: 'our internal Keycloak',
+          expiresAt: null,
+        },
+      ],
+    });
+    expect((await guard('https://10.0.0.5/')).ok).toBe(false);
+  });
+
+  it('permits a public address', async () => {
+    const guard = await defaultSsoEgressGuard();
+    expect((await guard('https://93.184.216.34/')).ok).toBe(true);
   });
 });

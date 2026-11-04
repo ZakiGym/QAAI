@@ -162,8 +162,28 @@ const h = vi.hoisted(
   }),
 );
 
+/*
+ * Hoisted, because `vi.mock`'s factory runs before the module body. Composed
+ * from a fixed byte so the key is deterministic without being a literal.
+ */
+const { MASTER_KEY } = vi.hoisted(() => ({
+  MASTER_KEY: Buffer.alloc(32, 11).toString('base64'),
+}));
+
 vi.mock('../context.js', () => ({
-  config: { concurrency: 2, artifactsLocal: true, anthropicApiKey: 'test' },
+  /*
+   * `vaultMasterKey` is a 32-byte key generated IN PROCESS, never a literal:
+   * rule 18 is absolute about key-shaped literals, and this is what makes the
+   * sealed-session round trip below run against the REAL AES-256-GCM cipher
+   * rather than a fake. A round trip that only ever ran against a fake proves
+   * nothing about the envelope the database will hold.
+   */
+  config: {
+    concurrency: 2,
+    artifactsLocal: true,
+    anthropicApiKey: 'test',
+    vaultMasterKey: MASTER_KEY,
+  },
   connection: { disconnect: () => {} },
   logger: {
     debug: () => {},
@@ -501,6 +521,18 @@ vi.mock('../repo-materialise.js', async (importOriginal) => {
 // arguments and the listeners, because the listener registered on 'failed' IS
 // the fix under test.
 vi.mock('bullmq', () => ({
+  /*
+   * `Queue` is here because run.ts now imports processors/auth-refresh.ts for
+   * the sealed-session reader, and that module imports `Queue` to arm its own
+   * sweep. It is never constructed from this file — auth-refresh builds its
+   * queue lazily — so a stub that throws on use is the honest shape: a test
+   * that opened a Redis connection would be a test of plumbing.
+   */
+  Queue: class {
+    constructor() {
+      throw new Error('no queue should be constructed in a run test');
+    }
+  },
   Worker: class {
     name: string;
     listeners = new Map<string, (...args: never[]) => void>();
@@ -517,6 +549,13 @@ vi.mock('bullmq', () => ({
 }));
 
 const { failRunFromDeadJob, processRun } = await import('./run.js');
+/*
+ * The real `Prisma` namespace, for `Prisma.DbNull` — the sentinel a write uses
+ * to EMPTY a nullable Json column, as against setting it to the JSON value
+ * `null`. The fake's `authProfile.update` applies the same translation the
+ * database would; see its own comment.
+ */
+const { Prisma } = await import('../../../api/src/generated/prisma/client.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A prisma stand-in around one run
@@ -543,7 +582,15 @@ interface TestRow {
   authProfileRequired: boolean;
 }
 
-/** An `AuthProfile` row, as the processor reads one. */
+/**
+ * An `AuthProfile` row, as the processor reads one.
+ *
+ * THE SEALED COLUMNS ARE MODELLED, all four of them, because the whole defect
+ * was that the processor selected two columns and the session lived in the
+ * other four: the sealing sweep nulls `storageState`, and a row type that
+ * stopped at the two old columns could not express the state the sweep leaves
+ * behind — so a fake built on it would have agreed that there was no session.
+ */
 interface ProfileRow {
   id: string;
   orgId: string;
@@ -553,6 +600,9 @@ interface ProfileRow {
   config: unknown;
   storageState: unknown;
   storageStateExpiresAt: Date | null;
+  storageStateSealed: string | null;
+  storageStateKeyVersion: number | null;
+  storageStateNeedsReseal: boolean;
 }
 
 /** One row from `prisma/schema.prisma` that could be stored or read back. */
@@ -641,8 +691,19 @@ interface Db {
   run: RunRow;
   results: ResultRow[];
   profiles: ProfileRow[];
-  /** Sessions written back to a profile, so a captured login is seen to cache. */
-  profileWrites: Array<{ id: string; storageState: unknown }>;
+  /**
+   * Sessions written back to a profile, so a captured login is seen to cache.
+   *
+   * The WHOLE `data` and not just `storageState`: the write is sealed when the
+   * brake is armed, so which COLUMNS it touches is the fact under test — a
+   * recorder that kept one field could not tell a sealed cache from a plaintext
+   * one, which is the difference the brake exists to make.
+   */
+  profileWrites: Array<{ id: string; data: Record<string, unknown> }>;
+  /** `VaultKey` rows, as `readVaultKeys` sees them. */
+  vaultKeys: Array<{ keyId: string; version: number; state: string }>;
+  /** `Organization.securityControlModes`, so the seal brake is armable in a test. */
+  securityControlModes: unknown;
   /** Ordered record of every write to the run row, so a test can see clobbering. */
   runWrites: Array<{ op: 'update' | 'updateMany'; data: Record<string, unknown>; matched: number }>;
   /** Runs updateMany matched, by id — proves an unfiltered where never fans out. */
@@ -756,6 +817,9 @@ function profileRow(over: Partial<ProfileRow> & { id: string }): ProfileRow {
     config: {},
     storageState: null,
     storageStateExpiresAt: null,
+    storageStateSealed: null,
+    storageStateKeyVersion: null,
+    storageStateNeedsReseal: false,
     ...over,
   };
 }
@@ -838,6 +902,10 @@ function fakeDb(
     quarantineBudgetPercent?: number | null;
     /** Mutate the world the instant the processor has taken its snapshot. */
     afterFindFirst?: (db: Db) => void;
+    /** `VaultKey` rows. Defaults to one ACTIVE version 1 — see the default below. */
+    vaultKeys?: Array<{ keyId: string; version: number; state: string }>;
+    /** `Organization.securityControlModes`. Null means every control's own default. */
+    securityControlModes?: unknown;
   } = {},
 ): Db {
   const db: Db = {
@@ -856,6 +924,14 @@ function fakeDb(
       })),
     profiles: opts.profiles ?? [],
     profileWrites: [],
+    /*
+     * ONE ACTIVE KEY, VERSION 1, which is what `masterKeyResolver` can resolve
+     * material for and what a deployment registers first. Defaulted rather than
+     * demanded of every test: a run of tests that name no profile opens no
+     * sealed session and should not have to know this table exists.
+     */
+    vaultKeys: opts.vaultKeys ?? [{ keyId: 'local-1', version: 1, state: 'ACTIVE' }],
+    securityControlModes: opts.securityControlModes ?? null,
     runWrites: [],
     flakeHistory: new Map(),
     /*
@@ -1079,7 +1155,18 @@ function fakeDb(
   h.prisma = {
     run: runModel,
     testResult: resultModel,
-    organization: { findUniqueOrThrow: async () => ({ plan: 'TEAM' }) },
+    /*
+     * `select` HONOURED, because the run reads TWO columns off this row now —
+     * the plan for retention and `securityControlModes` for the seal brake —
+     * and a fake that answered with the whole row would hide a query that
+     * forgot the second. `controlMode` falls back to the control's own default
+     * for a missing value, so a run that forgot to select it would read as
+     * ENFORCE and look correct.
+     */
+    organization: {
+      findUniqueOrThrow: async (args: { select?: Record<string, boolean> }) =>
+        projectRow({ plan: 'TEAM', securityControlModes: db.securityControlModes }, args.select),
+    },
     /*
      * The ledger read. `select` and the QUARANTINE exclusion are both honoured,
      * because both are load-bearing: `sourceId` is what makes "3 known issues"
@@ -1210,6 +1297,18 @@ function fakeDb(
      */
     pluginEnablement: { findMany: async () => [] },
     integration: { findFirst: async () => null },
+    /*
+     * THE VAULT KEY TABLE. `readVaultKeys` is how the run learns which key
+     * versions it may open a sealed session under, and `vaultKeysFrom`
+     * EXCLUDES any row whose `state` it cannot read — so a fake that ignored
+     * `select` and handed the whole row back would hide a query that forgot
+     * `state: true`, and the run would refuse every sealed session with
+     * NO_WRITABLE_KEY instead.
+     */
+    vaultKey: {
+      findMany: async (args: { select?: Record<string, boolean>; orderBy?: unknown }) =>
+        db.vaultKeys.map((row) => projectRow(row as unknown as MeasuredRow, args.select)),
+    },
     authProfile: {
       /*
        * Two lookups, and the difference matters: by `environmentId` for the
@@ -1217,20 +1316,43 @@ function fakeDb(
        * and by `id` for a profile a test named. The id lookup is scoped on the
        * org, because a test row's profile id is data — one from another tenant
        * must resolve to nothing rather than to their session.
+       *
+       * `select` IS HONOURED, and on this delegate it is the whole point: the
+       * defect was a query that selected `storageState` and
+       * `storageStateExpiresAt` and nothing else, so a select-blind fake would
+       * have handed the sealed columns over anyway and the missing projection
+       * would have been invisible.
        */
       findFirst: async (args: {
         where: { id?: string; orgId?: string; environmentId?: string };
+        select?: Record<string, boolean>;
       }) => {
         const { id, orgId: scope, environmentId } = args.where;
-        if (id !== undefined) {
-          return db.profiles.find((p) => p.id === id && p.orgId === scope) ?? null;
-        }
-        return db.profiles.find((p) => p.environmentId === environmentId) ?? null;
+        const found =
+          id !== undefined
+            ? (db.profiles.find((p) => p.id === id && p.orgId === scope) ?? null)
+            : (db.profiles.find((p) => p.environmentId === environmentId) ?? null);
+        return found === null
+          ? null
+          : projectRow(found as unknown as MeasuredRow, args.select);
       },
-      update: async (args: { where: { id: string }; data: { storageState?: unknown } }) => {
-        db.profileWrites.push({ id: args.where.id, storageState: args.data.storageState });
+      update: async (args: { where: { id: string }; data: Record<string, unknown> }) => {
+        db.profileWrites.push({ id: args.where.id, data: args.data });
         const row = db.profiles.find((p) => p.id === args.where.id);
-        if (row) row.storageState = args.data.storageState;
+        if (row) {
+          /*
+           * APPLIED THE WAY THE DATABASE WOULD, and that includes the nulls.
+           * `storageState` is a nullable Json column, so the write that empties
+           * it is `Prisma.DbNull` and the READ that comes back is `null`. A
+           * fake that echoed the sentinel back would make every later gate read
+           * report LEGACY_PLAINTEXT for a row the seal had just emptied — the
+           * select-blind-fake hazard in a second costume.
+           */
+          for (const [key, value] of Object.entries(args.data)) {
+            (row as unknown as MeasuredRow)[key] =
+              value === Prisma.DbNull || value === Prisma.JsonNull ? null : value;
+          }
+        }
         return {};
       },
     },

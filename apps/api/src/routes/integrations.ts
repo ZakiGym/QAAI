@@ -42,7 +42,7 @@ import {
   ChatWebhookError,
   DEFAULT_NOTIFY_PREFS,
   chatPayload,
-  checkChatDestination,
+  chatDestinationFor,
   isChatIntegrationKind,
   maskWebhookUrl,
   parseChatConfig,
@@ -460,7 +460,13 @@ integrationsRouter.post('/chat/:id/test', requireRole('ADMIN'), async (req, res)
   // Re-checked on the unsealed URL immediately before the POST — the same rule
   // the worker applies — so a ciphertext row that reached the database through
   // any path that skipped this API still cannot aim a payload off-host.
-  const destination = checkChatDestination(row.kind, credentials.url);
+  /*
+   * RESOLVES the host, which `checkChatDestination` does not: that one is a
+   * pattern match, so a webhook URL whose name answers 169.254.169.254 passed
+   * it with zero DNS queries — and the webhook URL IS the credential, because a
+   * Slack or Discord token lives in its path.
+   */
+  const destination = await chatDestinationFor(row.kind, credentials.url);
 
   let responseStatus: number | null = null;
   let error: string | null = null;

@@ -230,7 +230,10 @@ export function safeRelativePath(next: unknown, fallback = '/runs'): string {
  * comment above is the record of one of them learning a lesson the others had
  * not. An attacker only needs the copy that has not learned it yet.
  */
-import { isPrivateNetworkName } from '@qaai/shared/private-address';
+import * as dns from 'node:dns';
+import { classifyAddress, classifyHost, isPrivateNetworkName } from '@qaai/shared/private-address';
+import { guardUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo, EgressGuardVerdict } from '@qaai/shared';
 
 /**
  * Hosts an issuer is permitted to name in its discovery document, beyond its
@@ -255,6 +258,24 @@ const ISSUER_ALLOWED_HOSTS: Readonly<Record<string, readonly string[]>> = {
  * endpoint call carries the org's client secret. The trailing dot is removed
  * before every check and the NORMALISED host is what comes back, so a dot
  * cannot survive validation and be re-attached to the request.
+ *
+ * ── WHAT IT DECIDES, WHICH IS LESS THAN THE WORD "SAFE" SUGGESTS ───────────
+ *
+ * NOTHING ABOUT WHERE THE HOST POINTS. `isPrivateNetworkName` is a PATTERN
+ * MATCH — `INTERNAL_HOST.test(host) || !host.includes('.')` — so it refuses the
+ * internal names an attacker would have to be careless to use and accepts every
+ * name they would actually register. MEASURED on this tree:
+ * `safeOutboundUrl('https://sso.attacker.test/', 'issuer URL')` returned that
+ * URL, and `classifyHost('sso.attacker.test')` is
+ * `{kind:'name', internal:false}` — which is not permission, it is the
+ * statement that nothing has been decided. One A record and the org's client
+ * secret goes to the cloud metadata service.
+ *
+ * This function is kept exactly as it is, because it is SYNCHRONOUS and is
+ * called from `normalizeIssuer` on every stored-issuer read, including at write
+ * time before anything is fetched. The RESOLVING control is
+ * {@link guardOutboundUrl}, which this function's result is passed through
+ * before any byte leaves the process.
  */
 export function safeOutboundUrl(raw: string, what: string): URL {
   let url: URL;
@@ -291,6 +312,124 @@ export function safeOutboundUrl(raw: string, what: string): URL {
   const normalised = new URL(url.href);
   normalised.hostname = host;
   return normalised;
+}
+
+// ─── The egress guard, at the last point before bytes leave the process ─────
+
+/**
+ * MAY WE OPEN THIS REQUEST TO AN IDENTITY PROVIDER, AND TO WHICH ADDRESS.
+ *
+ * The context is `SSO_METADATA` and it is not a label: `EGRESS_CONTEXT_RULES`
+ * gives it `targetsApplicationUnderTest: false` and `allowlistApplies: false`,
+ * so a private, loopback, reserved or link-local address is refused in EVERY
+ * deployment and cannot be allowlisted — "add your internal host to the
+ * allowlist" would be advice to build an SSRF with paperwork.
+ *
+ * THAT BREAKS NOTHING THAT WORKS TODAY. {@link safeOutboundUrl} already refuses
+ * `keycloak.internal`, `kubernetes.default.svc`, an IP literal and a bare
+ * label, so the class rule and the shipped behaviour already agree; the only
+ * thing that changes is that a name whose RECORDS point inside is refused too.
+ * A self-hosted Keycloak on a public name keeps working exactly as before.
+ */
+export type SsoEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
+
+/**
+ * WHAT THIS CONTROL DOES NOT DO, STATED BECAUSE A COMMENT IS WHAT THE NEXT
+ * REVIEWER TRUSTS INSTEAD OF READING THE CODE.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
+ * turns a check into a control: whoever opens the connection must connect to
+ * those addresses and must not resolve the name again. The transport is
+ * `providerFetch` in `apps/api/src/routes/sso.ts`, which uses Node's GLOBAL
+ * `fetch` — and MEASURED on Node v25.6.1,
+ * `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200 and NEVER
+ * CALLED THE LOOKUP, while `{ dispatcher: … }` threw. There is no supported way
+ * to hand global `fetch` a resolver.
+ *
+ * So every address the name answers with is classified and THE PIN IS NOT
+ * ENFORCED AT THE SOCKET. The residual hole is exactly one race, and it is
+ * named here rather than papered over, the same way `REFRESH_PIN_LIMITATION`
+ * names it on the auth-refresh path.
+ */
+export const SSO_PIN_LIMITATION =
+  'The provider host was resolved and every address it answered with was classified, but Node’s ' +
+  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
+  'socket.';
+
+/**
+ * THE REAL GUARD, built from the deployment's own policy when it has one.
+ *
+ * `policy` is `unknown` because that is how `Environment.egressPolicy` reads
+ * out of its JSONB column. An SSO connection is ORG-level and has no
+ * environment, so today every caller passes nothing — and nothing falls through
+ * `resolveEgressPolicy` to the HOSTED policy, PUBLIC ONLY, which is the
+ * strictest reading. An absent policy must never be an open one.
+ */
+export async function defaultSsoEgressGuard(policy?: unknown): Promise<SsoEgressGuard> {
+  const resolved = resolveEgressPolicy(policy);
+  const io: EgressGuardIo = {
+    classifyHost: (host) => classifyHost(host),
+    classifyAddress: (address) => classifyAddress(address),
+    /*
+     * EVERY address the name has, not the first — a record set mixing one
+     * routable address with 169.254.169.254 is the attack written down — and
+     * `verbatim: true` so the OS does not reorder and hide one.
+     */
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    // Monotonic, NOT the wall clock: an NTP step backwards mid-refusal would
+    // make the pad negative and therefore zero, and a refusal that skipped its
+    // pad is the timing oracle the floor exists to close.
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      }),
+  };
+  return (url) => guardUrl({ url, context: 'SSO_METADATA', policy: resolved, io });
+}
+
+/**
+ * {@link safeOutboundUrl} AND THEN THE RESOLUTION IT CANNOT DO.
+ *
+ * This is the function `providerFetch` must call instead of `safeOutboundUrl`:
+ * it keeps every refusal that one makes, in the same order, and adds the one
+ * nobody was making. Shaped to RETURN THE SAME `URL` and THROW THE SAME
+ * `SsoError` so the call site is a one-line change and the three endpoints —
+ * discovery, token, JWKS — are all covered by it. The exact edit is in the
+ * handover; this slice does not own `apps/api/src/routes/sso.ts`.
+ *
+ * ── The refusal is ONE SENTENCE ────────────────────────────────────────────
+ *
+ * {@link refusalForCaller} returns `EGRESS_REFUSAL_SENTENCE` for every one of
+ * the seventeen refusals. An SSO failure is rendered at a sign-in page to
+ * whoever typed the issuer URL, and a message that distinguished "that is a
+ * link-local address" from "that host did not resolve" from "that host is not
+ * allowlisted" would turn a broken login into a port scanner for our own
+ * network with a readable report. `verdict.operatorDetail` holds the class, the
+ * address and the refusal code, and is deliberately NOT thrown.
+ *
+ * `'CONFIG'` is the kind, not `'PROVIDER'`: the thing to change is the issuer
+ * URL on the connection, which is configuration, and that is true whichever
+ * refusal fired — so the kind is not an oracle either.
+ */
+export async function guardOutboundUrl(
+  raw: string,
+  what: string,
+  guard: SsoEgressGuard,
+): Promise<URL> {
+  // The synchronous rules FIRST, unchanged: https only, no userinfo, no
+  // non-default port, no IP literal, no recognisable internal name, no `..` —
+  // and the normalised host, which is what gets resolved below. A refusal here
+  // costs no DNS query, which also means an obviously-bad URL never becomes a
+  // lookup somebody else pays for.
+  const url = safeOutboundUrl(raw, what);
+  const verdict = await guard(url.href);
+  if (!verdict.ok) {
+    throw new SsoError(refusalForCaller(verdict).sentence, 'CONFIG');
+  }
+  return url;
 }
 
 /**

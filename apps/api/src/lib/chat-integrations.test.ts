@@ -13,11 +13,17 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { EGRESS_REFUSAL_SENTENCE, guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import {
   ChatWebhookError,
   DEFAULT_NOTIFY_PREFS,
   chatPayload,
   checkChatDestination,
+  defaultChatEgressGuard,
+  guardChatDestination,
+  type ChatEgressGuard,
   decodeChatCredentials,
   encodeChatCredentials,
   integrationAad,
@@ -234,5 +240,201 @@ describe('isChatIntegrationKind', () => {
     }
     expect(isChatIntegrationKind('PAGERDUTY')).toBe(false);
     expect(isChatIntegrationKind('GITHUB')).toBe(false);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The egress guard on a generic WEBHOOK destination
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * WHAT `validateChatWebhookUrl` DECIDES FOR THE GENERIC KIND, AND WHAT IT DOES
+ * NOT.
+ *
+ * It refuses the internal names it can RECOGNISE and decides nothing about
+ * where an ordinary name points. MEASURED on this tree before the change:
+ * `validateChatWebhookUrl('WEBHOOK', 'https://hook.attacker.test/p/abc')`
+ * returned `{url, host: 'hook.attacker.test'}`, and the sealed envelope's URL —
+ * which IS the credential, since Slack, Teams and Discord all put the secret in
+ * the path — was posted to whatever that name resolved to.
+ *
+ * ALSO MEASURED, and the reason the named providers are left alone: SLACK,
+ * DISCORD and MSTEAMS all refuse `hook.attacker.test`,
+ * `hooks.slack.com.attacker.test` and `evil.example.net` already, through
+ * `webhookHostAllowed`, which is a real host allowlist and not a pattern.
+ *
+ * The tests below drive the REAL `guardUrl` with a FAKE resolver. NOTHING HERE
+ * OPENS A SOCKET OR CONSULTS A REAL RESOLVER.
+ */
+describe('guardChatDestination resolves a generic webhook host before delivering', () => {
+  /** Answers from a table and THROWS on anything else. */
+  function guardWith(zone: Readonly<Record<string, readonly string[]>>): ChatEgressGuard {
+    const io: EgressGuardIo = {
+      classifyHost: (host) => classifyHost(host),
+      classifyAddress: (address) => classifyAddress(address),
+      lookup: async (host) => {
+        const answers = zone[host];
+        if (answers === undefined) {
+          throw new Error(`fakeIo was asked to resolve ${host}, which this test never declared`);
+        }
+        return answers.map((address) => ({ address }));
+      },
+      now: () => new Date('2026-10-30T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      delay: async () => {},
+    };
+    return (url) =>
+      guardUrl({ url, context: 'WEBHOOK_DELIVERY', policy: resolveEgressPolicy(undefined), io });
+  }
+
+  it.each([
+    ['the cloud metadata address', ['169.254.169.254']],
+    ['an RFC1918 address', ['10.0.0.5']],
+    ['loopback', ['127.0.0.1']],
+    ['a split answer, public record FIRST', ['93.184.216.34', '10.0.0.5']],
+    ['a split answer, private record FIRST', ['10.0.0.5', '93.184.216.34']],
+    ['no addresses at all', []],
+  ])('refuses a generic webhook host that resolves to %s', async (_label, addresses) => {
+    /*
+     * The ORDER of a split answer is the attack: a positional read of the first
+     * address lets whoever runs the zone choose the outcome by reordering their
+     * own records. Both orders must refuse.
+     */
+    const answer = await guardChatDestination(
+      'WEBHOOK',
+      'https://hook.attacker.test/p/abc',
+      guardWith({ 'hook.attacker.test': addresses }),
+    );
+    expect(answer.ok).toBe(false);
+  });
+
+  it('refuses a generic webhook host that does not resolve', async () => {
+    const answer = await guardChatDestination(
+      'WEBHOOK',
+      'https://hook.attacker.test/p/abc',
+      guardWith({}),
+    );
+    expect(answer.ok).toBe(false);
+  });
+
+  it('still delivers to a generic webhook that resolves publicly', async () => {
+    const answer = await guardChatDestination(
+      'WEBHOOK',
+      'https://hook.acme.test/p/abcdefgh',
+      guardWith({ 'hook.acme.test': ['93.184.216.34'] }),
+    );
+    expect(answer).toEqual({ ok: true, url: 'https://hook.acme.test/p/abcdefgh' });
+  });
+
+  it('keeps every synchronous refusal checkChatDestination already made', async () => {
+    // The guard is ADDED, not substituted. The fake throws on every host, so
+    // these all refuse before any lookup is attempted.
+    const guard = guardWith({});
+    for (const [kind, url] of [
+      ['WEBHOOK', 'http://hook.acme.test/p'],
+      ['WEBHOOK', 'https://qa:hunter2@hook.acme.test/p'],
+      ['WEBHOOK', 'https://localhost/p'],
+      ['WEBHOOK', 'https://kubernetes.default.svc/p'],
+      ['WEBHOOK', 'not a url at all'],
+      ['NOT_A_KIND', 'https://hook.acme.test/p'],
+    ] as const) {
+      const answer = await guardChatDestination(kind, url, guard);
+      expect(answer.ok).toBe(false);
+    }
+  });
+
+  it('consults NO resolver for the named providers, whose hosts are allowlisted', async () => {
+    /*
+     * The pairing this asserts: `webhookHostAllowed` names hosts and never
+     * takes one from config, which is what makes it safe for these three to
+     * skip the lookup. The fake throws on every host, so a guard call here
+     * would fail this test loudly rather than silently. If `webhookHostAllowed`
+     * ever accepts a config-chosen host, this test is what notices.
+     */
+    const guard = guardWith({});
+    const slack = await guardChatDestination(
+      'SLACK',
+      'https://hooks.slack.com/services/T000/B000/xxxxxxxx',
+      guard,
+    );
+    expect(slack.ok).toBe(true);
+    const discord = await guardChatDestination(
+      'DISCORD',
+      'https://discord.com/api/webhooks/1/xxxxxxxx',
+      guard,
+    );
+    expect(discord.ok).toBe(true);
+  });
+
+  it('says the SAME sentence whatever the reason, so the cockpit is not a port scanner', async () => {
+    const zones: Array<Record<string, readonly string[]>> = [
+      { 'hook.attacker.test': ['169.254.169.254'] },
+      { 'hook.attacker.test': ['10.0.0.5'] },
+      { 'hook.attacker.test': ['127.0.0.1'] },
+      { 'hook.attacker.test': [] },
+      {},
+    ];
+    const reasons = new Set<string>();
+    for (const zone of zones) {
+      const answer = await guardChatDestination(
+        'WEBHOOK',
+        'https://hook.attacker.test/p/abc',
+        guardWith(zone),
+      );
+      if (!answer.ok) reasons.add(answer.reason);
+    }
+    expect(reasons).toEqual(new Set([EGRESS_REFUSAL_SENTENCE]));
+    expect([...reasons][0]).not.toMatch(/10\.0\.0\.5|169\.254|loopback|private|link-local/);
+  });
+
+  it('never puts the webhook URL — which IS the credential — in the refusal', async () => {
+    const answer = await guardChatDestination(
+      'WEBHOOK',
+      'https://hook.attacker.test/p/THE-SECRET-PATH-TOKEN',
+      guardWith({ 'hook.attacker.test': ['10.0.0.5'] }),
+    );
+    expect(answer.ok).toBe(false);
+    if (!answer.ok) {
+      expect(answer.reason).not.toContain('THE-SECRET-PATH-TOKEN');
+      expect(answer.reason).not.toContain('hook.attacker.test');
+    }
+  });
+});
+
+describe('defaultChatEgressGuard — the guard production actually gets', () => {
+  /*
+   * IP LITERALS ONLY: `classifyHost` answers `kind: 'address'` for a literal
+   * and `decideEgress` consults no resolver at all for one, so these exercise
+   * the REAL default guard with NO DNS QUERY and no socket.
+   */
+  it('refuses private, loopback and link-local with no policy configured', async () => {
+    const guard = await defaultChatEgressGuard();
+    expect((await guard('https://169.254.169.254/p')).ok).toBe(false);
+    expect((await guard('https://10.0.0.5/p')).ok).toBe(false);
+    expect((await guard('https://127.0.0.1/p')).ok).toBe(false);
+  });
+
+  it('refuses a private address even on a SELF_HOSTED policy with an allowlist entry', async () => {
+    // An operator who allowlists an internal host for webhook delivery has
+    // built an SSRF with paperwork, so WEBHOOK_DELIVERY ignores the allowlist.
+    const guard = await defaultChatEgressGuard({
+      deployment: 'SELF_HOSTED',
+      permittedClasses: ['public', 'private', 'loopback', 'reserved'],
+      allowlist: [
+        {
+          host: '10.0.0.5',
+          contexts: ['WEBHOOK_DELIVERY'],
+          ownerEmail: 'someone@acme.test',
+          reason: 'our internal chat bridge',
+          expiresAt: null,
+        },
+      ],
+    });
+    expect((await guard('https://10.0.0.5/p')).ok).toBe(false);
+  });
+
+  it('permits a public address', async () => {
+    const guard = await defaultChatEgressGuard();
+    expect((await guard('https://93.184.216.34/p')).ok).toBe(true);
   });
 });

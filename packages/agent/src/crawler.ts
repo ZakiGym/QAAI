@@ -164,6 +164,20 @@ import {
   VARIANT_CAPABILITY_LABELS,
 } from './crawl/variants.js';
 import type { SurfaceItem } from '@qaai/shared';
+import { CrawlEgressGate, DEFAULT_PIN_TTL_MS } from './crawl/egress.js';
+import type { CrawlEgressGuard } from './crawl/egress.js';
+/*
+ * THE GUARD ITSELF, AND WHY THESE TWO ARE VALUE IMPORTS WHILE THE IO IS LAZY.
+ *
+ * `guardUrl` and `resolveEgressPolicy` are pure — no `node:` builtin anywhere
+ * in `egress-guard.ts` or `egress.ts`, which is what makes them safe to import
+ * eagerly from the barrel. The DNS resolver is NOT: it lives behind
+ * {@link defaultCrawlEgressIo}, built with a dynamic import exactly as
+ * `packages/runner/src/preflight.ts` builds its `defaultHostGuardIo`, so a unit
+ * test that injects a gate never loads `node:dns` at all.
+ */
+import { guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo, EgressPolicy } from '@qaai/shared';
 
 /** Collapses `/orders/ORD-1001` → `/orders/:id` so states group sensibly. */
 export function normaliseRoute(pathname: string): string {
@@ -405,6 +419,24 @@ export interface CrawlOpenInput {
   /** How many pages to open. `frontier.limits.workers`, after the plan ceiling. */
   workers: number;
   storageState?: unknown;
+  /**
+   * CHROMIUM'S `--host-resolver-rules`, built from the egress gate's live pins.
+   *
+   * This field exists because a pin that cannot be DELIVERED is not a pin.
+   * Everywhere else in the product a pinned connection is made by handing the
+   * addresses to the transport — `pinnedLookup` for a Node agent,
+   * `pinnedRequestTarget` for a rewritten request. Neither reaches a browser:
+   * Chromium resolves inside its own network service, where a Node `lookup` is
+   * not consulted and `page.route` is too late (it sees the request after the
+   * socket is open). The launch argument is the only seam, which is why the
+   * gate's pins are per HOST rather than per URL and why this is a string
+   * fixed at launch rather than a callback.
+   *
+   * Absent means NO RULES, which resolves normally — so this pins and does not
+   * gate. The gating is {@link CrawlEgressGate.admit}, consulted before every
+   * navigation; this closes the rebinding window on the ones it allowed.
+   */
+  hostResolverRules?: string;
 }
 
 /**
@@ -479,6 +511,34 @@ export interface CrawlOptions {
   /** Inject a different browser. Defaults to `playwrightCrawlAdapter`. */
   adapter?: CrawlAdapter;
   onProgress?: (message: string) => void;
+
+  /**
+   * `Environment.egressPolicy`, raw from the JSONB column.
+   *
+   * THE CRAWL IS THE LARGEST OUTBOUND SURFACE IN THIS PRODUCT AND IT USED TO
+   * CLASSIFY NOTHING. `Environment.baseUrl` is validated by a `z.string().url()`
+   * plus an http/https check, so loopback, RFC1918, link-local and the IMDS
+   * address were all accepted at the door; every navigation and every
+   * robots/sitemap fetch then went out by name from inside the API container,
+   * and the crawl's own progress events reported which of them answered — a
+   * port-reachability oracle with a customer's hand on the dial.
+   *
+   * Raw `unknown` rather than an `EgressPolicy` because that is how the column
+   * reads, and `resolveEgressPolicy` is what turns it into a policy. A policy
+   * that cannot be parsed does not become "no policy": it falls back to the
+   * HOSTED one, which permits PUBLIC ONLY.
+   */
+  egressPolicy?: unknown;
+  /**
+   * The gate, injected. Supplying it is how a test gates a crawl WITHOUT DNS.
+   *
+   * `crawlApp` builds a real one when this is absent, so the production path
+   * cannot be reached ungated — that is deliberate and it is the difference
+   * between a control and an option. `runCrawl` gates only when it HAS a gate,
+   * because it is the inner function the existing crawler tests drive with a
+   * fake adapter and no network; see the note on `runCrawl`.
+   */
+  egressGate?: CrawlEgressGate;
 }
 
 /**
@@ -583,11 +643,35 @@ const PROGRESS_NOOP = (): void => {};
  *     phrase list has ever heard of.
  */
 export async function runCrawl(
-  adapter: CrawlAdapter,
+  rawAdapter: CrawlAdapter,
   options: CrawlOptions,
 ): Promise<CrawlOutcome> {
   const progress = options.onProgress ?? PROGRESS_NOOP;
   const caveats: string[] = [];
+
+  /*
+   * ── THE EGRESS GATE ────────────────────────────────────────────────────────
+   *
+   * Wrapped HERE and not in `crawlApp`, so the gate's refusals can reach
+   * `caveats` — the field whose whole job is "every reason the numbers above
+   * are a FLOOR". A crawl that silently enumerated less of an application
+   * because a policy refused part of it would report a smaller denominator as
+   * if it were the whole surface, and the coverage percentage would go UP on
+   * the day the control started working. That is the lie this product cannot
+   * afford, and the exclusion has to be counted and reported, not just applied.
+   *
+   * GATED ONLY WHEN THERE IS A GATE, and the asymmetry is deliberate.
+   * `crawlApp` — the only production entry, the one `apps/worker`'s explore
+   * processor calls — ALWAYS builds one, so no production crawl can run
+   * ungated. `runCrawl` is the inner function `crawler.test.ts` drives with a
+   * literal adapter and no network; making it construct a real resolver would
+   * put DNS in a unit test, which is the thing rule 8 forbids and the reason
+   * the gate is injectable at all. A caller here with no gate is ungated
+   * VISIBLY — it passed no policy and no gate — rather than by accident.
+   */
+  const egressGate = options.egressGate ?? null;
+  const adapter =
+    egressGate === null ? rawAdapter : guardCrawlAdapter({ adapter: rawAdapter, gate: egressGate });
 
   // ── 1. The budget ──
   //
@@ -1301,6 +1385,21 @@ export async function runCrawl(
      * happened.
      */
     caveats.push(...refusalSummary(excluded));
+    /*
+     * THE EGRESS REFUSALS, IN THE SAME LIST AS EVERY OTHER CAP THAT BIT.
+     *
+     * `summary().sentence` names BOTH numbers it has — the URLs refused, and
+     * how many more OBSERVE mode let through — so a brake that is on reads as
+     * a brake rather than as a clean run. `total === 0` is the only case that
+     * contributes nothing, and it means the gate was never asked, not that it
+     * allowed everything.
+     */
+    if (egressGate !== null) {
+      const egressSummary = egressGate.summary();
+      if (egressSummary.refused > 0 || egressSummary.wouldRefuse > 0) {
+        caveats.push(egressSummary.sentence);
+      }
+    }
     for (const bite of caps) {
       if (bite.bites > 0) caveats.push(bite.reason);
     }
@@ -1768,7 +1867,25 @@ export async function crawl(options: CrawlOptions): Promise<FlowMap> {
 }
 
 export async function crawlApp(options: CrawlOptions): Promise<CrawlOutcome> {
-  return runCrawl(options.adapter ?? playwrightCrawlAdapter(), options);
+  /*
+   * THE PRODUCTION DOOR, AND IT CANNOT BE OPENED UNGATED.
+   *
+   * `apps/worker/src/processors/explore.ts` calls this and nothing else, so
+   * building the gate HERE rather than asking the caller for one is what makes
+   * the control impossible to forget. A caller that supplies its own gate gets
+   * it — that is how a test gates a crawl without touching DNS — and a caller
+   * that supplies none gets a real one, never no gate at all. An `??` that
+   * fell through to "no gate" would be the fail-open arm rule 10 is about.
+   *
+   * `resolveEgressPolicy` decides what the raw column means, and its fallback
+   * is the HOSTED policy: PUBLIC ONLY. So an environment with no policy set, a
+   * malformed one, or a column written by an older build is strictest, not
+   * most permissive — which is the right direction for the default, and the
+   * reason an unparseable policy is not treated as "no policy".
+   */
+  const gate =
+    options.egressGate ?? (await defaultCrawlEgressGate(resolveEgressPolicy(options.egressPolicy)));
+  return runCrawl(options.adapter ?? playwrightCrawlAdapter(), { ...options, egressGate: gate });
 }
 
 // ─── Persisting the frontier, without a column of its own ───────────────────
@@ -2314,6 +2431,222 @@ const VARIANT_FACTS_SCRIPT = `(() => {
  * none. What IS untested is this boundary itself, and it is named in the report
  * rather than covered by a test that proves a mock matches a mock.
  */
+// ─── The egress gate, adopted at the adapter boundary ───────────────────────
+
+/**
+ * THE REAL RESOLVER, BUILT LAZILY.
+ *
+ * Imported through the package SUBPATH rather than the barrel for the reason
+ * `preflight.ts` and `private-address.ts` both write down: that module reaches
+ * for `node:dns`, and the barrel is what the cockpit's bundler consumes. The
+ * dynamic import means a test that injects a gate never loads `node:dns`.
+ *
+ * `lookup` must answer with EVERY address the name has, not the first — a
+ * record set that mixes one routable address with `169.254.169.254` is not a
+ * misconfiguration, it is the attack written down — so `all: true`, and
+ * `verbatim: true` so the OS does not reorder and hide one.
+ */
+export async function defaultCrawlEgressIo(): Promise<EgressGuardIo> {
+  const [addresses, dns] = await Promise.all([
+    import('@qaai/shared/private-address'),
+    import('node:dns'),
+  ]);
+  return {
+    classifyHost: (host) => addresses.classifyHost(host),
+    classifyAddress: (address) => addresses.classifyAddress(address),
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    /*
+     * `performance.now()` and NOT `Date.now()`. The wall clock is already
+     * spoken for — it stamps `PinnedResolution.pinnedAt`, a recorded fact — and
+     * an NTP step backwards mid-refusal would make the elapsed time negative,
+     * the pad negative and therefore zero. A refusal that skipped its pad is
+     * exactly the timing oracle the floor exists to close.
+     */
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        // Unreffed: a draining worker must not be held open by a refusal's pad.
+        timer.unref?.();
+      }),
+  };
+}
+
+/**
+ * A gate for one crawl, wired to the real guard and the real resolver.
+ *
+ * The `CRAWL` context is not a label — `EGRESS_CONTEXT_RULES` keys the
+ * allowlist and the third-party rule off it, and naming the wrong one here
+ * would quietly apply a webhook's policy to a crawl.
+ */
+export async function defaultCrawlEgressGate(policy: EgressPolicy): Promise<CrawlEgressGate> {
+  const io = await defaultCrawlEgressIo();
+  const guard: CrawlEgressGuard = (url) => guardUrl({ url, context: 'CRAWL', policy, io });
+  return new CrawlEgressGate({
+    guard,
+    clock: () => performance.now(),
+    pinTtlMs: DEFAULT_PIN_TTL_MS,
+  });
+}
+
+/**
+ * WRAP AN ADAPTER SO EVERY OUTBOUND PATH IT HAS GOES THROUGH THE GATE.
+ *
+ * ── Why a decorator and not five call sites ─────────────────────────────────
+ *
+ * The brief's instruction was to gate before every navigation, and the
+ * navigations are at four places in this file plus the robots/sitemap fetch.
+ * Editing those five is the obvious adoption and it is the WRONG one, because
+ * the sixth — the one somebody adds next round — would not be gated, and
+ * nothing would say so. "A security control with one unadopted call site is not
+ * a control" cuts against the patch-every-caller approach as much as against
+ * leaving the module unwired.
+ *
+ * So the gate goes at the ADAPTER BOUNDARY, which is the one seam every byte
+ * this crawl sends leaves through: `CrawlAdapter` has exactly two outbound
+ * surfaces, `fetcher.get` and `CrawlPage.goto`, and all four navigation sites
+ * in this file call the latter through the interface. A new `page.goto` added
+ * to the crawl loop is gated the moment it is written, because there is no
+ * ungated page to call it on.
+ *
+ * ── What a refusal looks like, and why it is not an exception ───────────────
+ *
+ * Both surfaces already have a THREE-STATE convention this file leans on
+ * everywhere: a failure is a VALUE, `status: null` means the read did not
+ * happen, and a thrown error is nobody's contract. A refusal therefore returns
+ * the same shape a transport failure returns — `status: null` plus a reason —
+ * and never a number, because a status code is a measurement and this
+ * connection was never made. (Lie #1: "a thing reported as measured that was
+ * not measured".) `goto` is documented NEVER THROWS and that stays true.
+ *
+ * ── The uniform refusal ────────────────────────────────────────────────────
+ *
+ * The reason text is `CrawlEgressGate.progressNote()` — one constant, taking no
+ * argument, for every refusal. Not the host, not the address class, not the
+ * refusal code, and above all not the difference between "that is a link-local
+ * address" and "that host did not resolve". For a crawl the tenant IS the
+ * adversary: they chose the base URL, and the network they are mapping is ours.
+ * Those two sentences are two different facts about the inside of our
+ * infrastructure, and handing either to the person probing it — in their own
+ * cockpit, through a progress event that already reports what answered — is the
+ * oracle this whole control exists to close.
+ */
+export function guardCrawlAdapter(input: {
+  readonly adapter: CrawlAdapter;
+  readonly gate: CrawlEgressGate;
+}): CrawlAdapter {
+  const { adapter, gate } = input;
+  const refusalNote = gate.progressNote();
+
+  const guardPage = (page: CrawlPage): CrawlPage => ({
+    ...page,
+    async goto(url) {
+      const verdict = await gate.admit({ url });
+      if (!verdict.ok) {
+        return {
+          requestedUrl: url,
+          /*
+           * `finalUrl` is the REQUESTED url and not the empty string, because
+           * the bounce ledger keys on it and a blank would collapse every
+           * refusal in a crawl into one node. It is the tenant's own input, so
+           * echoing it back discloses nothing they did not type.
+           */
+          finalUrl: url,
+          status: null,
+          failure: refusalNote,
+        };
+      }
+      return page.goto(url);
+    },
+    // Every other method is the real page's, bound by the spread above. The
+    // spread is why this cannot silently miss a method added to `CrawlPage`:
+    // a new reader is forwarded, and only the two outbound ones are overridden.
+  });
+
+  return {
+    fetcher:
+      adapter.fetcher === null
+        ? null
+        : {
+            get: async (url) => {
+              /*
+               * THE ATTACKER-INFLUENCED FETCH. robots.txt and sitemap.xml are
+               * documents the TARGET writes, and a sitemap may name any URL at
+               * all — so these are not "our own base URL" requests, they are a
+               * list of destinations supplied by the thing being tested. The
+               * real adapter calls `fetch(url, { redirect: 'follow' })`, which
+               * follows hops nothing classifies.
+               */
+              const verdict = await gate.admit({ url });
+              if (!verdict.ok) {
+                /*
+                 * `status: null` is what distinguishes "we could not fetch
+                 * robots.txt" from "this site publishes none", and that
+                 * distinction is why this is not an empty body with a 200. The
+                 * seeding axis reports UNAVAILABLE, never a zero.
+                 */
+                return { status: null, body: null, error: refusalNote };
+              }
+              return adapter.fetcher === null
+                ? { status: null, body: null, error: refusalNote }
+                : adapter.fetcher.get(url);
+            },
+          },
+    async open(openInput) {
+      /*
+       * THE BASE URL IS ADMITTED BEFORE THE BROWSER OPENS, and it has to be in
+       * that order for a reason that is easy to get backwards: the pins the
+       * launch argument is built from only exist once something has been
+       * admitted. Admitting the base URL first is what makes
+       * `hostResolverRules()` non-empty for the host the crawl is about.
+       *
+       * A REFUSED BASE URL STILL OPENS THE BROWSER. That looks wrong and is
+       * deliberate: `open` has no refusal shape in its contract, and inventing
+       * one (a throw, or a browser with no pages) would turn a policy refusal
+       * into an adapter crash the crawl reports as a broken environment. Every
+       * navigation is gated independently, so a refused base URL yields a
+       * browser whose every `goto` refuses — one uniform refusal per URL,
+       * counted, with the crawl reporting an empty enumeration rather than an
+       * error. The connection never happens either way.
+       */
+      await gate.admit({ url: openInput.baseUrl });
+      const rules = gate.hostResolverRules();
+      const browser = await adapter.open({
+        ...openInput,
+        // Empty string omitted rather than passed: `--host-resolver-rules=` is
+        // not the same argument as no argument, and an empty rule set has
+        // broken Chromium's resolver in the past.
+        ...(rules === '' ? {} : { hostResolverRules: rules }),
+      });
+      return {
+        ...browser,
+        pages: browser.pages.map(guardPage),
+        /*
+         * The variant drive is the fourth navigation site and it takes a URL,
+         * so it is gated too. It is easy to miss because it does not look like
+         * a navigation from here — it is `driveVariant(setup, url)` — which is
+         * the argument for gating at this boundary rather than at the four
+         * `page.goto` lines.
+         */
+        driveVariant: async (setup, url) => {
+          const verdict = await gate.admit({ url });
+          if (!verdict.ok) {
+            /*
+             * `REFUSED` is an existing member of `VARIANT_OUTCOMES`, so this
+             * needed no new vocabulary — and `facts: null` is the three-state
+             * convention: nobody looked. A zeroed `VariantPageFacts` here would
+             * be a measurement of a page this crawl never opened.
+             */
+            return { outcome: 'REFUSED', facts: null, detail: refusalNote };
+          }
+          return browser.driveVariant(setup, url);
+        },
+      };
+    },
+  };
+}
+
 export function playwrightCrawlAdapter(): CrawlAdapter {
   return {
     fetcher: {
@@ -2338,7 +2671,23 @@ export function playwrightCrawlAdapter(): CrawlAdapter {
       },
     },
     async open(input) {
-      const browser: Browser = await chromium.launch();
+      /*
+       * THE PIN, DELIVERED. Chromium resolves inside its own network service,
+       * so neither a Node `lookup` nor `page.route` can pin it — the launch
+       * argument is the only seam, which is why `CrawlOpenInput` carries a
+       * string fixed at launch rather than a callback.
+       *
+       * No rules means NO ARGUMENT, not an empty one: `--host-resolver-rules=`
+       * is a different thing to Chromium than its absence. A host with no rule
+       * resolves normally, so this PINS the hosts the gate admitted and gates
+       * nothing by itself — the gating is `CrawlEgressGate.admit`, consulted
+       * before every navigation by `guardCrawlAdapter`.
+       */
+      const browser: Browser = await chromium.launch(
+        input.hostResolverRules === undefined || input.hostResolverRules === ''
+          ? {}
+          : { args: [`--host-resolver-rules=${input.hostResolverRules}`] },
+      );
       const makeContext = async (
         overrides: Record<string, unknown> = {},
       ): Promise<BrowserContext> =>

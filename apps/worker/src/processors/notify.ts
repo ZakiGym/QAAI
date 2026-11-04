@@ -37,7 +37,7 @@ import { enqueueDelivery, type DeliveryJob } from '../queues.js';
  */
 import {
   chatPayload,
-  checkChatDestination,
+  chatDestinationFor,
   decodeChatCredentials,
   integrationAad,
   notifyPrefsOf,
@@ -854,7 +854,11 @@ export async function processDelivery(job: DeliveryJob, meta: DeliveryAttempt): 
    * any failure, so a config fixed mid-retry still lands and one that stays
    * broken burns down to FAILED.
    */
-  const destination = checkChatDestination(integration.kind, credentials.url);
+  /*
+   * RESOLVES the host. `checkChatDestination` is a pattern match that never
+   * looks a name up, and this is the path that posts a webhook token.
+   */
+  const destination = await chatDestinationFor(integration.kind, credentials.url);
   if (!destination.ok) {
     await recordFailure(destination.reason, null, '');
     if (finalAttempt) return;

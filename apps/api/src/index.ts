@@ -7,13 +7,18 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { env, isProd } from './env.js';
+import { controlEnforces, controlMode } from '@qaai/shared';
+import { csrfGuard, parseOrigin } from './middleware/csrf.js';
 import { logger, runWithRequestContext } from './lib/logger.js';
-import { disconnectPrisma } from './lib/prisma.js';
+import { disconnectPrisma, prisma, unscoped } from './lib/prisma.js';
+import { installKeyringAtBoot } from './lib/vault.js';
 import { closeQueues } from './lib/queues.js';
 import { startWorkerEventRelay } from './lib/events.js';
 import { attachActor } from './middleware/auth.js';
@@ -67,7 +72,21 @@ import { retentionRouter } from './routes/retention.js';
 import { exportOrgRouter } from './routes/export-org.js';
 import { observabilityMiddleware, rateLimitKey } from './lib/metrics.js';
 
-const app = express();
+/**
+ * EXPORTED so a test can drive a REQUEST through this stack rather than assert
+ * that a line of wiring exists.
+ *
+ * Nothing about the mounted order changes by exporting it; what changes is that
+ * the two side effects at the bottom of this file — `app.listen` and the Redis
+ * event relay — are behind a guard, so importing the composition root does not
+ * bind a port or dial Redis. `middleware/csrf.ts`'s header records the cost of
+ * the old shape: "a control whose decision cannot be driven by a test is a
+ * control nobody can trust", and it had to move its decision into a separate
+ * module to get one. The headers below cannot move anywhere — a header is set
+ * by a mount, and the mount IS the control — so the file became importable
+ * instead.
+ */
+export const app = express();
 
 app.disable('x-powered-by');
 // Trust exactly one proxy hop, so req.ip is the client and not the load balancer.
@@ -143,6 +162,262 @@ app.use(
 );
 
 app.use(attachActor);
+
+// ─── CSRF, and the headers (§ the security round) ────────────────────────────
+
+/*
+ * THE CSRF GUARD. The decision is `middleware/csrf.ts` and the reasoning lives
+ * there with it; this line is the mount, and the mount is the control.
+ *
+ * MOUNTED IMMEDIATELY AFTER `attachActor`, which is load-bearing in both
+ * directions. After, because the check only applies to a request whose
+ * credential the BROWSER attached, and `attachActor` is what knows whether this
+ * is a session or an API key. Before every router below, because a guard
+ * mounted per-router is a guard the next router forgets — the single mount here
+ * covers /projects, /settings, /integrations and everything else at once,
+ * including a router added next round.
+ */
+app.use(
+  csrfGuard({
+    webOrigin: parseOrigin(env.WEB_PUBLIC_URL),
+    log: (fields, message) => logger.warn(fields, message),
+  }),
+);
+
+/**
+ * ── THE SECURITY HEADERS helmet WAS NOT SENDING ────────────────────────────
+ *
+ * `contentSecurityPolicy: false` above is kept, and the comment beside it is
+ * accurate about WHY — the API serves JSON and artifact bytes, and helmet's
+ * default policy breaks inline artifact rendering. What it concluded from that
+ * was wrong: "CSP has nothing to protect here" is only true until this API
+ * serves one byte a browser will treat as a document, and it serves artifacts.
+ * An uploaded HTML artifact rendered inline from this origin is stored XSS
+ * against the cockpit's own domain.
+ *
+ * So the policy is the JSON-API one — `default-src 'none'` — which permits
+ * nothing at all: no script, no style, no frame, no form target. That is
+ * correct for every JSON response and it is correct for an artifact too, which
+ * should render no script of its own.
+ *
+ * MODE: `CONTENT_SECURITY_POLICY` defaults to OBSERVE, and OBSERVE here is
+ * `Content-Security-Policy-Report-Only` — a real header with a real report
+ * endpoint below, not a disabled feature. ENFORCE sends the same policy in the
+ * enforcing header.
+ *
+ * ── THE BRAKE NOBODY COULD ARM, AND WHAT ENFORCING ACTUALLY BREAKS ─────────
+ *
+ * This read was `controlMode('CONTENT_SECURITY_POLICY', null)` with the null
+ * written in. A stored mode cannot be reached from a hardcoded null, so the
+ * only value this control could ever have was its own default and there was no
+ * path from OBSERVE to ENFORCE short of editing the table — an on-switch
+ * nobody can reach, which is the same defect as a brake that does not brake
+ * with the sign flipped. The paragraph above named the consequence of leaving
+ * it at OBSERVE ("stored XSS against the cockpit's own domain") while the code
+ * under it made ENFORCE unreachable.
+ *
+ * THE NULL HAD A REAL REASON, which is why the fix is a lookup and not a
+ * deletion: this header is set for unauthenticated requests too, so there is
+ * not always an org in hand. The answer is per-request rather than per-process:
+ * the mount sits AFTER `attachActor`, so a cookie- or key-authenticated request
+ * knows its org, and an anonymous one gets the control's own fallback. That is
+ * coherent for this header specifically, because the policy rides on ONE
+ * RESPONSE and a response belongs to one tenant — an artifact uploaded by org B
+ * is served to org B, so org B's mode is the one that should govern it.
+ *
+ * AND THE BRAKE TABLE'S SENTENCE IS WRONG, which matters more than the lookup.
+ * `SECURITY_CONTROL_BRAKES.CONTENT_SECURITY_POLICY.enforcingBreaks` says "the
+ * cockpit, until its inline styles and scripts are accounted for" — but the
+ * cockpit is Next on another origin and never receives this header. What
+ * enforcing actually breaks is this API's own `text/html` responses, and there
+ * is one today: `GET /coverage/:projectId/attestation?format=html`
+ * (apps/api/src/routes/coverage.ts) is a print-ready document with an inline
+ * `<style>`, and `default-src 'none'` blocks it, so the page renders unstyled.
+ * That is a small, real, named cost against stored XSS on this origin — the
+ * trade an operator is entitled to make per org. packages/shared is not this
+ * file's to edit, so the replacement sentence is in the handover; this
+ * paragraph is the half that can be true today.
+ *
+ * The three headers after it are unconditional because none of them can break
+ * a JSON client: they constrain framing, referrer leakage and MIME sniffing.
+ */
+const API_CSP = [
+  "default-src 'none'",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  'report-uri /csp-report',
+].join('; ');
+
+/**
+ * How long one org's stored modes are reused for.
+ *
+ * A header is set on every response, and a database round trip per response for
+ * a brake that changes a few times a year is a cost nobody would accept — so
+ * the read is cached per process, and the limit is stated rather than implied:
+ * arming or releasing the brake takes effect within a minute, and each API
+ * replica holds its own copy. `middleware/csrf.ts` makes the same admission
+ * about its observe counts for the same reason.
+ */
+const SECURITY_MODE_TTL_MS = 60_000;
+/** Bounded: an unbounded map keyed by anything a request carries is a leak. */
+const SECURITY_MODE_CACHE_CAP = 1_000;
+const securityModeCache = new Map<string, { readonly modes: unknown; readonly readAt: number }>();
+
+/** Test-only reset, so one test's cached org cannot answer for the next. */
+export function resetSecurityModeCache(): void {
+  securityModeCache.clear();
+}
+
+/**
+ * `Organization.securityControlModes` for one org, cached.
+ *
+ * Unscoped because this runs before any tenancy scope is open — the same reason
+ * `middleware/auth.ts` reads the session unscoped — and it reads ONE column of
+ * ONE row by primary key.
+ */
+async function storedSecurityControlModes(orgId: string): Promise<unknown> {
+  const now = Date.now();
+  const cached = securityModeCache.get(orgId);
+  if (cached !== undefined && now - cached.readAt < SECURITY_MODE_TTL_MS) return cached.modes;
+
+  const org = await unscoped(() =>
+    prisma.organization.findUnique({
+      where: { id: orgId },
+      select: { securityControlModes: true },
+    }),
+  );
+  const modes = org?.securityControlModes ?? null;
+  // Cleared rather than evicted one-by-one: this is a cache, the cap is far
+  // above any real tenant count on one replica, and an LRU here would be more
+  // machinery than the thing it protects.
+  if (securityModeCache.size >= SECURITY_MODE_CACHE_CAP) securityModeCache.clear();
+  securityModeCache.set(orgId, { modes, readAt: now });
+  return modes;
+}
+
+/**
+ * THE SECURITY HEADERS, AND THE ONE OF THEM THAT HAS A MODE.
+ *
+ * Exported and parameterised on the lookup for one reason: a header this
+ * process sets on every response is testable by driving a request through
+ * {@link app}, and the lookup is the only thing in it that would otherwise need
+ * a database.
+ *
+ * FAILS TO THE CONTROL'S OWN FALLBACK. A lookup that throws — the database is
+ * down, the row is gone — resolves the mode as though nothing were stored,
+ * which is what `controlMode` itself does for a value it cannot parse. For this
+ * control the fallback is OBSERVE, so a failed read sends Report-Only rather
+ * than an enforcing header: the failure cannot wedge a tenant's own API on a
+ * header they did not choose, and it is recorded here rather than left to be
+ * inferred from the code.
+ */
+export function securityHeaders(input: {
+  /** `Organization.securityControlModes` for the actor's org. */
+  readonly modesFor: (orgId: string) => Promise<unknown>;
+}) {
+  return async function securityHeadersMiddleware(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ): Promise<void> {
+    const orgId = req.actor?.orgId;
+    let stored: unknown = null;
+    if (orgId !== undefined && orgId !== '') {
+      try {
+        stored = await input.modesFor(orgId);
+      } catch (err) {
+        // No org id, no stored value and no host in the log line: this is our
+        // own read failing, and the mode it produces is the fallback.
+        logger.warn({ err, control: 'CONTENT_SECURITY_POLICY' }, 'could not read the stored security control modes');
+        stored = null;
+      }
+    }
+
+    const mode = controlMode('CONTENT_SECURITY_POLICY', stored);
+    res.setHeader(
+      controlEnforces(mode) ? 'Content-Security-Policy' : 'Content-Security-Policy-Report-Only',
+      API_CSP,
+    );
+    // Not framed, by anyone. `frame-ancestors` above covers modern browsers;
+    // this covers the ones that do not implement it.
+    res.setHeader('X-Frame-Options', 'DENY');
+    // A referrer carries the path, and a path can carry an id or a token.
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    next();
+  };
+}
+
+app.use(securityHeaders({ modesFor: storedSecurityControlModes }));
+
+/**
+ * WHERE A CSP VIOLATION REPORT LANDS.
+ *
+ * This endpoint is what makes OBSERVE mode a measurement rather than a
+ * promise — `SECURITY_CONTROL_BRAKES.CONTENT_SECURITY_POLICY.observeCounts`
+ * says "every violation report, by directive, so the policy can be tightened on
+ * evidence", and without somewhere to send them that sentence would be a doc
+ * comment contradicting the code under it.
+ *
+ * UNAUTHENTICATED, because a browser posts it with no credential, and mounted
+ * behind the rate limiter above so it cannot be used as an amplifier. Only the
+ * DIRECTIVE is kept: a report also carries the blocked URI and the document
+ * URI, and those are a page's full URLs, which are the thing a log must not
+ * accumulate. 204 with no body, always — a report is fire-and-forget and a
+ * reporter must learn nothing from it.
+ */
+/**
+ * THE COUNT, which is the half that makes OBSERVE a measurement.
+ *
+ * In memory and per process, which is the honest limit — a restart loses them
+ * and two replicas each hold their own; the log line beside each increment is
+ * what survives. `csrfObserved` in middleware/csrf.ts takes the same position
+ * for the same reason, and the brake table's `observeCounts` sentence for this
+ * control ("every violation report, by directive, so the policy can be
+ * tightened on evidence") is only answerable with something to read.
+ *
+ * CAPPED ON DISTINCT DIRECTIVES, because the key comes out of a request body:
+ * a reporter can post any string it likes, and a map keyed on that is a memory
+ * leak with a security-sounding name. Past the cap everything lands under
+ * {@link CSP_DIRECTIVE_OVERFLOW}, so the total is never understated — a cap
+ * that bit without being counted is one of the lies this product cannot
+ * afford.
+ */
+const CSP_DIRECTIVE_CAP = 32;
+export const CSP_DIRECTIVE_OVERFLOW = 'other';
+const cspViolations = new Map<string, number>();
+
+export function cspObserved(): Readonly<Record<string, number>> {
+  return Object.fromEntries(cspViolations);
+}
+
+/** Test-only reset, so one test's counts cannot leak into the next. */
+export function resetCspObserved(): void {
+  cspViolations.clear();
+}
+
+app.post('/csp-report', express.json({ type: ['json', 'application/csp-report'] }), (req, res) => {
+  const body = req.body as { 'csp-report'?: { 'violated-directive'?: unknown } } | undefined;
+  const reported = body?.['csp-report']?.['violated-directive'];
+  const named = typeof reported === 'string' && reported.length > 0 ? reported.slice(0, 80) : 'unknown';
+  const directive =
+    cspViolations.has(named) || cspViolations.size < CSP_DIRECTIVE_CAP
+      ? named
+      : CSP_DIRECTIVE_OVERFLOW;
+  const observed = (cspViolations.get(directive) ?? 0) + 1;
+  cspViolations.set(directive, observed);
+
+  logger.warn(
+    {
+      control: 'CONTENT_SECURITY_POLICY',
+      directive,
+      observed,
+    },
+    'a content security policy violation was reported',
+  );
+  res.status(204).end();
+});
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
@@ -320,27 +595,132 @@ app.use('/', agentRouter);
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-startWorkerEventRelay(env.REDIS_URL);
+/**
+ * ── RUNNING, AS OPPOSED TO BEING IMPORTED ──────────────────────────────────
+ *
+ * Everything above composes the app; these two lines START it, and they are the
+ * reason this file could not be tested. A test that imported it bound
+ * `API_PORT` and dialled Redis, so the headers and the mount order — which are
+ * the control, not a detail of it — had no test at all, and `middleware/csrf.ts`
+ * had to move its decision into another module to get one.
+ *
+ * ── THE GUARD, AND THE TWO CANDIDATES THAT WOULD HAVE BROKEN A DEPLOYMENT ──
+ *
+ * It fails in the direction of STARTING, which is the opposite of this round's
+ * other defaults and is right for this one decision: a guard that wrongly
+ * refuses to listen is a silent outage, and there is no security answer being
+ * made here at all.
+ *
+ * NOT `env.NODE_ENV !== 'test'`, which was the first version of this line and
+ * would have broken CI. `.github/workflows/ci.yml` sets `NODE_ENV: test` for
+ * the whole dogfood job and then runs `npm run dev` and polls
+ * `http://localhost:4000/health/live` — so the API would never have come up,
+ * and the failure would have read as "the stack never came up" in a job that
+ * has nothing to do with this file.
+ *
+ * NOT `process.env.VITEST` either, which was the second version. The test
+ * runner sets it, so it reads well — and `scripts/check-wiring.ts` refused it
+ * on sight: an env var this source reads and `.env.example` does not document
+ * is DISCONNECTED, "nobody deploying this can discover it". Documenting it
+ * would be worse than the lint, because a value in `.env.example` is a knob an
+ * operator may set, and "the API does not start" must never be one.
+ *
+ * So the guard asks whether this file IS the entry, which needs no variable.
+ * MEASURED rather than assumed: `process.argv[1]` is the script's own path
+ * under `node dist/index.js` AND under `tsx watch src/index.ts` (this app's dev
+ * command, and the one the CI dogfood job starts through `npm run dev`), and it
+ * is the runner's entry under vitest.
+ *
+ * Its one failure mode is named rather than hidden: the comparison is between
+ * PATHS, so a path that reaches this file by a route Node spells differently —
+ * a symlink, a case-insensitive filesystem — answers "not the entry" and the
+ * API does not listen. `realpathSync` closes the symlink half, every arm that
+ * cannot answer starts the server, and the skip is LOGGED, so the one
+ * deployment that ever hits it says so in its first line of output instead of
+ * being a silent port that never opens.
+ */
+function startedAsTheEntrypoint(): boolean {
+  const entry = process.argv[1];
+  // No entry at all (`node -e`, an embedder): start. Every arm that cannot
+  // answer starts, because the wrong answer in the other direction is an
+  // outage with no message attached to it.
+  if (entry === undefined || entry === '') return true;
+  try {
+    return realpathSync(entry) === fileURLToPath(import.meta.url);
+  } catch {
+    return true;
+  }
+}
+export function startApiServer(): void {
+  startWorkerEventRelay(env.REDIS_URL);
 
-const server = app.listen(env.API_PORT, () => {
-  logger.info({ port: env.API_PORT }, 'qaai api listening');
-});
-
-/** Graceful shutdown (§11): stop accepting, drain, then release handles. */
-let shuttingDown = false;
-for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(signal, () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logger.info({ signal }, 'shutting down');
-
-    server.close(async () => {
-      await closeQueues().catch(() => {});
-      await disconnectPrisma().catch(() => {});
-      process.exit(0);
-    });
-
-    // Backstop: an SSE stream holds the server open indefinitely.
-    setTimeout(() => process.exit(0), 10_000).unref();
+  /*
+   * THE VAULT KEYRING, BEFORE THE FIRST REQUEST. `seal` and `open` are
+   * synchronous and are called from five routes and three worker processors, so
+   * the keyring cannot be fetched inside them — it is installed once, here.
+   * Without this the IMPLICIT keyring was always in force in this process and
+   * the whole `VaultKey` state machine was inert: see `installKeyringAtBoot`,
+   * which records what was measured.
+   *
+   * Awaited through `.then` rather than blocking the listen: a deployment with
+   * no registered keys (which is all of them today) resolves immediately on the
+   * implicit keyring, and one with MALFORMED rows throws, which takes the
+   * process down on purpose rather than serving requests that would seal under
+   * the wrong version.
+   */
+  void installKeyringAtBoot(
+    {
+      /*
+       * The keyring's OWN five columns, not `VAULT_KEY_SELECT` — that one is
+       * session-store's three-field projection and `VaultKeyRow` also carries
+       * the provider and its reference. Typed `satisfies` so dropping a column
+       * is a compile error here rather than a keyring missing a field.
+       */
+      listVaultKeys: () =>
+        prisma.vaultKey.findMany({
+          select: { keyId: true, version: true, state: true, provider: true, providerRef: true },
+          orderBy: { version: 'asc' },
+        }),
+    },
+    (level, fields, message) => logger[level](fields, message),
+  ).catch((err: unknown) => {
+    // `installKeyringAtBoot` reports a refused keyring itself and returns the
+    // implicit one; this is the unexpected-throw path (a database that cannot be
+    // read at all), which must not take the process down either — the first
+    // version called `process.exit(1)` here and killed the test runner from
+    // inside a module-level import.
+    logger.error({ err }, 'the vault keyring could not be installed; running on the implicit keyring');
   });
+
+  const server = app.listen(env.API_PORT, () => {
+    logger.info({ port: env.API_PORT }, 'qaai api listening');
+  });
+
+  /** Graceful shutdown (§11): stop accepting, drain, then release handles. */
+  let shuttingDown = false;
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(signal, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info({ signal }, 'shutting down');
+
+      server.close(async () => {
+        await closeQueues().catch(() => {});
+        await disconnectPrisma().catch(() => {});
+        process.exit(0);
+      });
+
+      // Backstop: an SSE stream holds the server open indefinitely.
+      setTimeout(() => process.exit(0), 10_000).unref();
+    });
+  }
+}
+
+if (startedAsTheEntrypoint()) {
+  startApiServer();
+} else {
+  logger.info(
+    { module: 'apps/api/src/index.ts' },
+    'imported rather than started, so no port is bound and no event relay is running',
+  );
 }

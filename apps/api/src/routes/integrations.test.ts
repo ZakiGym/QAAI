@@ -260,6 +260,7 @@ function makeDb() {
 
 const express = (await import('express')).default;
 const { integrationsRouter } = await import('./integrations.js');
+const { configureChatEgress } = await import('../lib/chat-integrations.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 const { openChatCredentials, sealChatCredentials } = await import('../lib/integrations.js');
 
@@ -305,8 +306,9 @@ async function call(
 let db: ReturnType<typeof makeDb>;
 
 beforeEach(() => {
+  configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
   db = makeDb();
-  h.prisma = db.client as Record<string, unknown>;
+  h.prisma = db.client;
   h.actor = { userId: 'user_1', orgId: 'org_1', role: 'ADMIN', ip: null };
   h.audits.length = 0;
 });
@@ -517,6 +519,101 @@ describe('PATCH /integrations/chat/:id', () => {
       name: 'renamed',
     });
     expect(chatOnGit.status).toBe(400);
+  });
+});
+
+/**
+ * The URL of a `fetch` call, for a stub that needs to tell the outbound leg
+ * from the test's own request to the router.
+ *
+ * `String(input)` would do it and lints as `no-base-to-string`, which is right
+ * to complain: `RequestInfo` includes `Request`, whose default stringification
+ * is `[object Request]`, so a stub that matched on it would silently stop
+ * matching the day a caller passed one.
+ */
+function fetchUrlOf(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input;
+  if (input instanceof URL) return input.href;
+  return input.url;
+}
+
+describe('POST /integrations/chat/:id/test — the host is resolved before the token travels', () => {
+  /*
+   * ── THE DEFECT ────────────────────────────────────────────────────────────
+   *
+   * This route checked the destination with `checkChatDestination`, a PATTERN
+   * MATCH THAT NEVER RESOLVES. MEASURED before the fix:
+   * `checkChatDestination('WEBHOOK', 'https://hooks.attacker.test/...')`
+   * returned ok with ZERO DNS queries, while `guardChatDestination` on the same
+   * input refused with one. The webhook URL IS the credential — a provider
+   * token lives in its path — so the POST carries a secret to whatever the name
+   * answers, and the body is signed with a vault-unsealed secret besides.
+   *
+   * `guardChatDestination` was written and tested in the round that left it with
+   * NO PRODUCTION CALLER. These tests are what make it reachable.
+   */
+  async function webhook(): Promise<string> {
+    const created = await call('POST', '/integrations/chat', {
+      kind: 'WEBHOOK',
+      name: 'Ops',
+      url: 'https://hooks.example.test/qaai',
+    });
+    return String((created.body).integration ? (created.body as Row & { integration: Row }).integration.id : (created.body).id);
+  }
+
+  it('REFUSES a destination whose host resolves inside, and posts nothing', async () => {
+    let posted = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      // Only the outbound leg: `call()` reaches this router over the same global.
+      if (fetchUrlOf(input).includes('hooks.example.test')) posted += 1;
+      return realFetch(input, init);
+    };
+
+    const id = await webhook();
+    const asked: string[] = [];
+    configureChatEgress(() =>
+      Promise.resolve((url: string) => {
+        asked.push(url);
+        return Promise.resolve({ ok: false } as never);
+      }),
+    );
+
+    const reply = await call('POST', `/integrations/chat/${id}/test`, {});
+    globalThis.fetch = realFetch;
+
+    // The guard was consulted with the stored destination...
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('hooks.example.test');
+    // ...and nothing left the process.
+    expect(posted).toBe(0);
+    // The refusal says nothing about WHY: this renders in the cockpit to
+    // whoever typed the URL, and a message distinguishing a class from an
+    // unresolvable name is a port scanner with a readable report.
+    const body = JSON.stringify(reply.body);
+    expect(body).not.toContain('169.254');
+    expect(body).not.toContain('CLASS_NOT_PERMITTED');
+  });
+
+  it('still posts when the guard allows, so the refusal is not unconditional', async () => {
+    // Without this arm the test above would also pass if the route had simply
+    // stopped working.
+    let posted = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      if (fetchUrlOf(input).includes('hooks.example.test')) {
+        posted += 1;
+        return Promise.resolve(new Response('ok', { status: 200 }));
+      }
+      return realFetch(input, init);
+    };
+
+    const id = await webhook();
+    configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
+    await call('POST', `/integrations/chat/${id}/test`, {});
+    globalThis.fetch = realFetch;
+
+    expect(posted).toBe(1);
   });
 });
 

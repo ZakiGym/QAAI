@@ -23,8 +23,20 @@
  *    path that skipped the API still cannot point a payload at the wrong host.
  */
 
-import type { ChatIntegrationKind, RunFinishedPref } from '@qaai/shared';
-import { CHAT_INTEGRATION_KINDS } from '@qaai/shared';
+import * as dns from 'node:dns';
+import type {
+  ChatIntegrationKind,
+  EgressGuardIo,
+  EgressGuardVerdict,
+  RunFinishedPref,
+} from '@qaai/shared';
+import {
+  CHAT_INTEGRATION_KINDS,
+  guardUrl,
+  refusalForCaller,
+  resolveEgressPolicy,
+} from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import { isInternalHostname, isIpLiteralHost } from './issues.js';
 
 export function isChatIntegrationKind(kind: string): kind is ChatIntegrationKind {
@@ -238,6 +250,21 @@ export function validateChatWebhookUrl(
   const host = url.hostname.toLowerCase().replace(/\.+$/, '');
 
   if (kind === 'WEBHOOK') {
+    /*
+     * A PATTERN MATCH, AND IT DECIDES NOTHING ABOUT WHERE THE HOST POINTS.
+     *
+     * `isInternalHostname` is `@qaai/shared/private-address`'s
+     * `isPrivateNetworkName` — `INTERNAL_HOST.test(host) || !host.includes('.')`
+     * — so it refuses the internal names an attacker would have to be careless
+     * to use and accepts every name they would actually register. MEASURED on
+     * this tree: `validateChatWebhookUrl('WEBHOOK', 'https://hook.attacker.test/p/abc')`
+     * returned that URL, and the sealed envelope's URL — which IS the credential
+     * — was posted to whatever the name resolved to.
+     *
+     * This stays, because it runs at WRITE time with no resolver and a bad URL
+     * should be refused before it is sealed. The RESOLVING control is
+     * {@link guardChatDestination}, at the send.
+     */
     if (isIpLiteralHost(host) || isInternalHostname(host) || !host.includes('.')) {
       throw new ChatWebhookError(
         `Refusing to send webhooks to ${host}: use a public hostname, not an IP or internal name.`,
@@ -283,6 +310,186 @@ export function checkChatDestination(
   } catch (err) {
     return { ok: false, reason: err instanceof Error ? err.message : 'invalid webhook URL' };
   }
+}
+
+// ─── The egress guard, at the send ──────────────────────────────────────────
+
+/**
+ * MAY WE DELIVER TO THIS WEBHOOK URL, AND TO WHICH ADDRESS.
+ *
+ * The context is `WEBHOOK_DELIVERY` and it is not a label: `EGRESS_CONTEXT_RULES`
+ * gives it `targetsApplicationUnderTest: false` and `allowlistApplies: false`,
+ * so a private, loopback, reserved or link-local address is refused in EVERY
+ * deployment and cannot be allowlisted — an operator who allowlisted an
+ * internal host for webhook delivery would have built an SSRF with paperwork.
+ *
+ * THAT BREAKS NOTHING THAT WORKS TODAY: `validateChatWebhookUrl` already
+ * refuses `hook.internal`, `kubernetes.default.svc`, an IP literal and a bare
+ * label, and it does so at write time as well as at send time. The only thing
+ * that changes is that a name whose RECORDS point inside is refused too.
+ */
+export type ChatEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
+
+/**
+ * WHAT THIS CONTROL DOES NOT DO.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
+ * turns a check into a control. The transports are `notify.ts`, `digest.ts` and
+ * the API's test-send endpoint, all of which use Node's GLOBAL `fetch` — and
+ * MEASURED on Node v25.6.1, `fetch(url, { agent: new http.Agent({ lookup }) })`
+ * answered 200 and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw.
+ * There is no supported way to hand global `fetch` a resolver.
+ *
+ * ── TRUE OF `fetch`, AND THE CONCLUSION DRAWN FROM IT WAS WRONG ──────────────
+ *
+ * That sentence used to end the matter, and a reader took it to mean the pin
+ * cannot be enforced. It can. RE-MEASURED on Node v25.6.1 against a loopback
+ * server: `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200 with the
+ * lookup called ZERO times (the original measurement reproduces — the agent is
+ * IGNORED), but `http.request({ host, port, path, lookup })` -> 200 with the
+ * lookup called ONCE. Node core honours it, with NO dependency change.
+ *
+ * So the remedy is a TRANSPORT and not a dependency: moving this call off global
+ * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
+ * pin for free. The work is not done here; what is recorded is that the cheap
+ * option exists, because the previous wording closed the question.
+ *
+ * So every address the name answers with is classified and THE PIN IS NOT
+ * ENFORCED AT THE SOCKET. Named rather than papered over, the same way
+ * `REFRESH_PIN_LIMITATION` names it on the auth-refresh path.
+ */
+export const CHAT_PIN_LIMITATION =
+  'The webhook host was resolved and every address it answered with was classified, but Node’s ' +
+  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
+  'socket.';
+
+/**
+ * THE REAL GUARD.
+ *
+ * `policy` is `unknown` because that is how `Environment.egressPolicy` reads
+ * out of its JSONB column. A chat integration is ORG-level and has no
+ * environment, so today every caller passes nothing — and nothing falls through
+ * `resolveEgressPolicy` to the HOSTED policy, PUBLIC ONLY, which is the
+ * strictest reading. An absent policy must never be an open one.
+ */
+export async function defaultChatEgressGuard(policy?: unknown): Promise<ChatEgressGuard> {
+  const resolved = resolveEgressPolicy(policy);
+  const io: EgressGuardIo = {
+    classifyHost: (host) => classifyHost(host),
+    classifyAddress: (address) => classifyAddress(address),
+    /*
+     * EVERY address the name has, not the first — a record set mixing one
+     * routable address with 169.254.169.254 is the attack written down — and
+     * `verbatim: true` so the OS does not reorder and hide one.
+     */
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    // Monotonic, NOT the wall clock: an NTP step backwards mid-refusal would
+    // make the pad negative and therefore zero, and a refusal that skipped its
+    // pad is the timing oracle the floor exists to close.
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        // Unreffed: a draining worker must not be held open by a refusal's pad.
+        timer.unref?.();
+      }),
+  };
+  return (url) => guardUrl({ url, context: 'WEBHOOK_DELIVERY', policy: resolved, io });
+}
+
+/**
+ * {@link checkChatDestination} AND THEN THE RESOLUTION IT CANNOT DO.
+ *
+ * This is the function the three senders must call instead of
+ * `checkChatDestination`: same `{ok, url} | {ok, reason}` shape, so the loop
+ * that must skip-and-record rather than throw is unchanged and the call site is
+ * a one-line `await`. `notify.ts`, `digest.ts` and the API's test-send endpoint
+ * are the three; the exact edits are in the handover, because this slice does
+ * not own them.
+ *
+ * ── Why only the generic WEBHOOK kind reaches the resolver ─────────────────
+ *
+ * Because only its host comes from the customer. MEASURED on this tree: SLACK,
+ * DISCORD and MSTEAMS all refuse `hook.attacker.test`,
+ * `hooks.slack.com.attacker.test` and `evil.example.net` through
+ * `webhookHostAllowed`, which is a real host allowlist and not a pattern. A
+ * resolver on those paths would add a DNS round trip and a new failure mode to
+ * destinations no config row can choose, and would put a live lookup inside
+ * every notify test. THE INVARIANT THAT MAKES THAT SAFE is that
+ * `webhookHostAllowed` names hosts and never accepts one from config — if that
+ * ever changes, this branch has to change with it, and
+ * `chat-integrations.test.ts` asserts that the named kinds consult no resolver
+ * so the pairing is visible rather than remembered.
+ *
+ * ── The refusal reason is ONE SENTENCE ─────────────────────────────────────
+ *
+ * {@link refusalForCaller} returns `EGRESS_REFUSAL_SENTENCE` for every one of
+ * the seventeen refusals. `reason` is recorded against the integration and
+ * shown in the cockpit to whoever typed the URL, so a message that
+ * distinguished "that is a link-local address" from "that host did not resolve"
+ * would turn a webhook integration into a port scanner with a readable report.
+ * `verdict.operatorDetail` holds the class, the address and the refusal code,
+ * and is deliberately NOT returned.
+ */
+/**
+ * THE GUARD EVERY SENDER GETS, injected so a test can hand it an answer.
+ *
+ * ── WHY THIS SEAM EXISTS HERE AND NOT IN EACH SENDER ─────────────────────────
+ *
+ * There are three senders — `apps/api/src/routes/integrations.ts` (the
+ * test-send endpoint), `apps/worker/src/processors/notify.ts` and
+ * `apps/worker/src/processors/digest.ts` — and for a while
+ * {@link guardChatDestination} had NO PRODUCTION CALLER at all: all three used
+ * the synchronous {@link checkChatDestination}, which is a pattern match that
+ * never resolves. MEASURED: `checkChatDestination('WEBHOOK',
+ * 'https://hooks.attacker.test/services/...')` returned ok with ZERO DNS
+ * queries, while `guardChatDestination` on the identical input refused with
+ * one. The webhook URL IS the credential — a Slack or Discord token lives in
+ * its path — so the request carries a secret to whatever the name answers.
+ *
+ * One factory shared by the three, rather than a seam in each: three seams are
+ * three things to stub and three chances for one of them to be forgotten, which
+ * is the shape of the defect this replaces.
+ *
+ * `configureChatEgress(null)` restores the real guard, which is what an
+ * `afterEach` wants so one test cannot leak its resolver into the next.
+ */
+export type ChatEgressGuardFactory = () => Promise<ChatEgressGuard>;
+
+let chatGuard: ChatEgressGuardFactory = () => defaultChatEgressGuard();
+
+export function configureChatEgress(next: ChatEgressGuardFactory | null): void {
+  chatGuard = next ?? (() => defaultChatEgressGuard());
+}
+
+/**
+ * Resolve, classify and refuse — the call every sender makes instead of
+ * {@link checkChatDestination}. Thin on purpose: it is the one line that is easy
+ * to get right and was missing in three places.
+ */
+export async function chatDestinationFor(
+  kind: string,
+  rawUrl: string,
+): Promise<{ ok: true; url: string } | { ok: false; reason: string }> {
+  return guardChatDestination(kind, rawUrl, await chatGuard());
+}
+
+export async function guardChatDestination(
+  kind: string,
+  rawUrl: string,
+  guard: ChatEgressGuard,
+): Promise<{ ok: true; url: string } | { ok: false; reason: string }> {
+  // The synchronous rules FIRST, unchanged — and they are what refuses an
+  // unparseable URL, a non-https scheme, embedded credentials and a wrong
+  // provider host, none of which should cost a lookup.
+  const checked = checkChatDestination(kind, rawUrl);
+  if (!checked.ok) return checked;
+  if (kind !== 'WEBHOOK') return checked;
+
+  const verdict = await guard(checked.url);
+  if (!verdict.ok) return { ok: false, reason: refusalForCaller(verdict).sentence };
+  return checked;
 }
 
 /**

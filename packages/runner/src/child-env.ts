@@ -104,10 +104,11 @@ const PASSTHROUGH = [
  * names are matched case-insensitively, and by substring for the generic ones,
  * because a leak through `MY_APP_SECRET_KEY` is the same leak.
  *
- * `ctx.secrets` is the deliberate exception and is applied by the caller AFTER
- * this guard runs — those are the tenant's own secrets, scoped to the tenant's
- * own environment, which is the one category of secret a test is supposed to
- * see.
+ * `ctx.secrets` is the deliberate exception to THIS list and is applied after
+ * it — those are the tenant's own secrets, scoped to the tenant's own
+ * environment, which is the one category of secret a test is supposed to see.
+ * It is NOT an exception to {@link isInterpreterEnvKey} below; see that
+ * function for the escalation that exception turned out to be.
  */
 const FORBIDDEN_SUBSTRINGS = [
   'SECRET',
@@ -137,6 +138,89 @@ const FORBIDDEN_SUBSTRINGS = [
 export function isForbiddenChildEnvKey(key: string): boolean {
   const upper = key.toUpperCase();
   return FORBIDDEN_SUBSTRINGS.some((bad) => upper.includes(bad));
+}
+
+/**
+ * Environment names that change HOW AN INTERPRETER LOADS CODE, or which binary
+ * a bare command name resolves to.
+ *
+ * ── THE ESCALATION THIS CLOSES, REPRODUCED END TO END ──────────────────────
+ *
+ * This list used to live in `plugins/external.ts`, where `screenSpecEnv`
+ * applies it to `spec.env` — the fix for defect (2) in that file's header:
+ * "THE PATH OVERRIDE, which defeats [the bare-name allowlist] on its own and
+ * was live … `env: { PATH: '<the workspace>' }` plus a planted file named
+ * `vitest` turns an allowlisted bare name back into tenant code."
+ *
+ * The same attack was still live through the OTHER channel, because
+ * `Secret.name` is `/^[A-Z][A-Z0-9_]*$/` (packages/shared/src/schemas.ts) — so
+ * `PATH`, `NODE_OPTIONS` and `LD_PRELOAD` are all legal secret names, and
+ * {@link childEnv} applied `secrets` LAST and unscreened, after the screened
+ * extras. Measured, with a real spawn: `classifyExternalCommand('vitest run')`
+ * ALLOWED, `screenSpecEnv({ PATH })` refused 1 and returned `{}`, and then
+ * `childEnv({ secrets: { PATH: <planted dir> } })` handed back that PATH and
+ * `spawnSync('vitest', ['run'], { env, shell: false })` printed the planted
+ * script's output. A MEMBER needed one secret row.
+ *
+ * So the list belongs HERE, at the single point every spawn in this package
+ * goes through, rather than in one plugin. `external.ts` re-exports it and
+ * keeps applying it to `spec.env` as well, which is not redundant: the spec
+ * screen REPORTS what it refused on the test result, and this one is the floor
+ * under every other caller — `playwright-harness.ts`, `load.ts`, `desktop.ts`
+ * and the rest all pass `secrets: ctx.secrets` straight through.
+ *
+ * ── Why this is an unconditional drop and not a mode ───────────────────────
+ *
+ * The same answer `FORBIDDEN_SUBSTRINGS` gives above, and the same one
+ * `COMMAND_POLICY_DEFAULTS.specEnv` already gives for the spec half, where the
+ * mode is ENFORCE by default with the stated reason "no documented workflow
+ * sets PATH or NODE_OPTIONS in a spec". None of these names is a credential for
+ * an application under test, so there is no legitimate traffic to brake: a
+ * secret named `PATH` is not a customer workflow, it is this escalation. What
+ * the drop owes instead is DISCLOSURE, which is {@link ChildEnvOptions.withheld}
+ * — a caller that passes the sink can say on the result that it happened, and
+ * `external.ts` does.
+ *
+ * Matched case-insensitively and, for the suffix forms, by suffix: the JVM and
+ * JS ecosystems both use `…_OPTS` / `…_OPTIONS` to mean "flags nobody passed on
+ * the command line", which is exactly the channel being closed.
+ */
+const INTERPRETER_ENV_NAMES = [
+  'PATH',
+  'NODE_OPTIONS',
+  'NODE_PATH',
+  'NODE_REPL_EXTERNAL_MODULE',
+  'NODE_EXTRA_CA_CERTS',
+  'LD_PRELOAD',
+  'LD_LIBRARY_PATH',
+  'LD_AUDIT',
+  'DYLD_INSERT_LIBRARIES',
+  'DYLD_LIBRARY_PATH',
+  'DYLD_FRAMEWORK_PATH',
+  'PYTHONPATH',
+  'PYTHONHOME',
+  'PYTHONSTARTUP',
+  'PYTHONEXECUTABLE',
+  'RUBYLIB',
+  'RUBYOPT',
+  'GEM_PATH',
+  'GEM_HOME',
+  'PERL5LIB',
+  'PERL5OPT',
+  'CLASSPATH',
+  'BUNDLE_GEMFILE',
+  'GOFLAGS',
+  'GOPATH',
+  'RUSTFLAGS',
+] as const;
+
+const INTERPRETER_ENV_SUFFIXES = ['_OPTIONS', '_OPTS'] as const;
+
+/** True when a tenant-supplied variable would change how code is loaded. */
+export function isInterpreterEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  if (INTERPRETER_ENV_NAMES.some((name) => name === upper)) return true;
+  return INTERPRETER_ENV_SUFFIXES.some((suffix) => upper.endsWith(suffix));
 }
 
 /**
@@ -170,13 +254,29 @@ export interface ChildEnvOptions {
    */
   extra?: Record<string, string | undefined>;
   /**
-   * The tenant's own secrets, from their environment's vault. Applied LAST and
-   * deliberately NOT screened: these are the credentials the test is meant to
-   * use to log into the app under test. The tenant already owns them, so there
-   * is nothing to protect them from — the screening above exists to stop the
-   * PLATFORM's secrets leaking, not the tenant's own.
+   * The tenant's own secrets, from their environment's vault. Applied LAST, and
+   * NOT screened against {@link isForbiddenChildEnvKey}: these are the
+   * credentials the test is meant to use to log into the app under test, the
+   * tenant already owns them, and that screen exists to stop the PLATFORM's
+   * secrets leaking rather than the tenant's own. A secret legitimately named
+   * `APP_PASSWORD` or `API_TOKEN` therefore still arrives.
+   *
+   * They ARE screened against {@link isInterpreterEnvKey}, which is a different
+   * question: not "whose credential is this" but "does this name change which
+   * code the child loads". See that function for the escalation.
    */
   secrets?: Record<string, string>;
+  /**
+   * A sink for the names {@link isInterpreterEnvKey} withheld from `extra` AND
+   * from `secrets` — both channels reach the same env object, and for a while
+   * only one of them was screened.
+   *
+   * Present so the drop is DISCLOSED rather than silent — a cap or a refusal
+   * applied without being reported is the defect, not the refusal. Optional
+   * because most callers have nowhere to put a note; `plugins/external.ts` has
+   * a result to write one on and passes it.
+   */
+  withheld?: string[];
 }
 
 /**
@@ -210,11 +310,54 @@ export function childEnv(options: ChildEnvOptions = {}): Record<string, string> 
     // a run for something the tenant did not do, so: drop it and leave the
     // assertion to the test suite, which covers every name in the env schema.
     if (isForbiddenChildEnvKey(key)) continue;
+    /*
+     * ── THE SCREEN APPLIES TO `extra` TOO, AND IT DID NOT ─────────────────────
+     *
+     * This header claims the interpreter list "belongs HERE, at the single point
+     * every spawn in this package goes through" and is "the floor under every
+     * other caller". It was applied to `secrets` only, so `extra` was an open
+     * second channel into the same env object — and `extra` is where THREE
+     * plugins put a tenant's `spec.env` verbatim: plugins/cli.ts, plugins/mobile.ts
+     * and plugins/mutation.ts (twice) spread it raw, while only plugins/external.ts
+     * runs it through `screenSpecEnv` first.
+     *
+     * MEASURED with a planted executable named `vitest`:
+     * `childEnv({ extra: { PATH: <planted dir> } })` returned that PATH and
+     * `spawnSync('vitest', ['run'], { env, shell: false })` ran the planted
+     * script. LD_PRELOAD, DYLD_INSERT_LIBRARIES, PYTHONPATH, CLASSPATH, NODE_PATH
+     * and NODE_OPTIONS all passed the same way. The escalation this file was
+     * written to remove was live through the channel it did not screen.
+     *
+     * Screened here rather than in the three plugins for the reason the header
+     * already gives: a per-plugin screen is one new plugin away from being
+     * reopened, and the point of a floor is that there is one. `external.ts`
+     * keeps its own `screenSpecEnv` because that one REPORTS what it refused on
+     * the test result; this one is the floor under it.
+     *
+     * No legitimate caller is affected: performance.ts, playwright-harness.ts,
+     * visual-services.ts and load.ts pass only `QAAI_*`, `CI` and `FORCE_COLOR`
+     * through `extra`. A caller that needs the child to load different code must
+     * say so by its command, not by an environment variable a tenant can set.
+     */
+    if (isInterpreterEnvKey(key)) {
+      options.withheld?.push(key);
+      continue;
+    }
     env[key] = value;
   }
 
-  // The tenant's own credentials, last so they win over anything above.
+  /*
+   * The tenant's own credentials, last so they win over anything above — EXCEPT
+   * the names that decide which code the child loads. `PATH` is the one that
+   * matters most: libuv resolves the executable using the PATH in the env
+   * object it is handed, so letting a secret win here turns an allowlisted bare
+   * command name back into tenant code. See `isInterpreterEnvKey`.
+   */
   for (const [key, value] of Object.entries(options.secrets ?? {})) {
+    if (isInterpreterEnvKey(key)) {
+      options.withheld?.push(key);
+      continue;
+    }
     env[key] = value;
   }
 

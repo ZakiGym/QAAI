@@ -139,7 +139,7 @@ rather than trusting the model's self-report, and refuses anything touching an
 | -------------------------- | ------------------------------------------------------------------------------- |
 | Auth, orgs, RBAC, sessions | scrypt from `node:crypto`; no native build step                                 |
 | Multi-tenancy              | Prisma extension; unique-lookup and unique-mutation paths both covered          |
-| Secrets vault              | AES-256-GCM, AAD-bound to `(orgId, name)`, versioned key                        |
+| Secrets vault              | AES-256-GCM, rotatable key ([docs/key-rotation.md](docs/key-rotation.md)); AAD `(orgId, name)` for existing secrets, `(model, row, field)` for fields sealed since |
 | Audit log                  | Append-only, CSV export helper, secret-masked metadata                          |
 | Projects, environments     | Plan limits enforced server-side                                                |
 | **Runner: E2E, Smoke**     | Real Playwright; steps, screenshot on failure, video, trace                     |

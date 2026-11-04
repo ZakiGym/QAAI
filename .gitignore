@@ -41,3 +41,21 @@ apps/api/src/generated/
 # up as a spurious modification in every diff depending on which ran last — and
 # the file itself says "This file should not be edited".
 apps/web/next-env.d.ts
+
+# Agent probe scratch: a one-off `it()` that proves a hole exists, a driver that
+# calls a function nobody has a caller for. They are written to establish a fact
+# and are throwaway by design, NOT durable regression coverage — the test that
+# stops a defect returning belongs beside the code it guards.
+#
+# IGNORED AND NOT DELETED, and the glob is `.probe*` rather than `.probe`
+# because the name is not stable: four different spellings appeared in one week
+# (.probe, .probe-auth-adversary, .probe-authz-r5, .probe-egress-adv). An ignore
+# that matches only the spelling somebody used last time works once.
+#
+# vitest.config.ts excludes the same glob, for a different reason worth keeping
+# separate: one session's scratch put ~29 tests into `npx vitest run` and moved
+# the suite count twice, so a number compared against a baseline was comparing
+# two denominators. Both lines are needed — this one keeps them out of history,
+# that one keeps them out of the count.
+.probe*/
+.verify-probes/

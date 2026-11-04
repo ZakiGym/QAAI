@@ -76,6 +76,8 @@ import {
   normalizeDomain,
   normalizeIssuer,
   parseDiscovery,
+  defaultSsoEgressGuard,
+  guardOutboundUrl,
   safeOutboundUrl,
   safeRelativePath,
   samlDisplayName,
@@ -96,6 +98,7 @@ import {
   type OidcEndpoints,
   type SamlAssertionFacts,
 } from '../lib/sso.js';
+import type { SsoEgressGuard } from '../lib/sso.js';
 
 export const ssoRouter: Router = Router();
 
@@ -156,6 +159,21 @@ const ANONYMOUS_ACTOR = '';
 // ─── Outbound HTTP ───────────────────────────────────────────────────────────
 
 /**
+ * HOW THIS ROUTER REACHES DNS, so a test can hand it an answer.
+ *
+ * One function rather than an options bag, because there is exactly one thing to
+ * inject here. `configureSsoEgress(null)` puts the real guard back, which is
+ * what an `afterEach` wants so one test cannot leak its resolver into the next.
+ */
+type SsoEgressGuardFactory = () => Promise<SsoEgressGuard>;
+
+let egressGuard: SsoEgressGuardFactory = () => defaultSsoEgressGuard();
+
+export function configureSsoEgress(next: SsoEgressGuardFactory | null): void {
+  egressGuard = next ?? (() => defaultSsoEgressGuard());
+}
+
+/**
  * One request to a provider, with the two rules lib/issues.ts exists to state:
  * a 3xx is an error rather than a hop (following one re-sends the client secret
  * to whatever Location names), and a provider that has not answered in
@@ -164,13 +182,44 @@ const ANONYMOUS_ACTOR = '';
  * The URL is re-validated here even though the caller already validated it —
  * this is the last point before bytes leave the process, and a second check
  * costs nothing.
+ *
+ * ── IT RESOLVES THE HOST, AND FOR A WHILE IT DID NOT ──────────────────────────
+ *
+ * This read `safeOutboundUrl(url, what)`, which is a PATTERN MATCH THAT NEVER
+ * RESOLVES: `isPrivateNetworkName` refuses `localhost`, a bare name and the
+ * recognisable internal spellings, and answers "not internal" for any name with
+ * a dot. So `https://sso.attacker.test` whose single A record is
+ * 169.254.169.254 was ACCEPTED with ZERO DNS queries — and this function is the
+ * one that carries the OIDC client secret, as an `authorization: Basic` header
+ * or a `client_secret` body field, to the token endpoint.
+ *
+ * `guardOutboundUrl` is the resolving version, in lib/sso.ts, and it was
+ * written and tested in the same round that left it with NO PRODUCTION CALLER —
+ * one of its own test blocks is titled "the guard production actually gets". It
+ * runs the same synchronous rules first (so an obviously-bad URL still costs no
+ * lookup), then classifies EVERY address the name answers with.
+ *
+ * The guard is INJECTED through {@link configureSsoEgress} rather than built
+ * inline, and that is not ceremony: a guard that constructs its own resolver
+ * cannot be driven by a test without real DNS, and a control nobody can test
+ * with a fake is a control nobody will trust. The default is
+ * `defaultSsoEgressGuard()` with no policy argument — an SSO connection is
+ * org-level and has no environment to read a policy from, so it falls through to
+ * HOSTED, PUBLIC ONLY, which is the strictest reading. An absent policy must
+ * never be an open one.
+ *
+ * WHAT THIS STILL DOES NOT DO: see `SSO_PIN_LIMITATION`. The addresses are
+ * classified and the pin is not enforced at the socket, because this uses global
+ * `fetch`. That residual hole is one deterministic re-resolution, not a timing
+ * race, and closing it means moving this call to a transport that accepts a
+ * resolver.
  */
 async function providerFetch(
   url: string,
   init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
   what: string,
 ): Promise<unknown> {
-  safeOutboundUrl(url, what);
+  await guardOutboundUrl(url, what, await egressGuard());
 
   let response: Response;
   try {
@@ -364,7 +413,13 @@ async function provisionAndSignIn(
   const user = await unscoped(async () => {
     const existing = await prisma.user.findUnique({
       where: { email },
-      select: { id: true, name: true },
+      /*
+       * `emailVerified` AND `passwordHash` are in this projection because the
+       * claim decision below needs both. They were not, which is the defect:
+       * this read took ANY row with that address, with no check of either, and
+       * then a membership in the customer's org was attached to it.
+       */
+      select: { id: true, name: true, emailVerified: true, passwordHash: true },
     });
     if (existing) return existing;
 
@@ -376,13 +431,121 @@ async function provisionAndSignIn(
         email,
         name: identity.name?.slice(0, 120) || email.split('@')[0]!,
         passwordHash: null,
-        // The IdP asserted it and we proved the domain, so it is verified in
-        // the only sense this column means.
+        /*
+         * The IdP asserted it and we proved the domain, so it is verified in
+         * the only sense this column means.
+         *
+         * THIS LINE IS NOW LOAD-BEARING FOR THE CLAIM CHECK BELOW, which keys
+         * on `emailVerified === null` and nothing else. A fresh row is not a
+         * claim because this write says so — three lines up, where a reader can
+         * see it, rather than through a separate "was it created" flag that no
+         * test could pin.
+         */
         emailVerified: new Date(),
       },
-      select: { id: true, name: true },
+      select: { id: true, name: true, emailVerified: true, passwordHash: true },
     });
   });
+
+  /*
+   * ── THE PRE-ACCOUNT-TAKEOVER, AND THE ANSWER PICKED ────────────────────────
+   *
+   * THE ATTACK: an attacker signs up at `POST /auth/signup` with
+   * victim@customer.com and a password they choose. The customer later
+   * configures SSO for customer.com. The victim signs in through the IdP, JIT
+   * finds the attacker's pre-made row and attaches a membership in the
+   * customer's org to it — and the attacker's password was never cleared, so
+   * they now hold password access to an account inside the customer's org.
+   *
+   * TWO CANDIDATE REMEDIES. Both were weighed; the second is implemented.
+   *
+   *   REFUSE a claim of a row whose address nobody proved. Correct in the
+   *   abstract and unshippable in practice: `User.emailVerified` is nullable and
+   *   nothing wrote it until this round, so EVERY existing user is unverified
+   *   and refusing would lock out the whole installed base at the moment their
+   *   org turns SSO on. That is why `EMAIL_VERIFICATION` defaults to OBSERVE,
+   *   and a refusal is a lockout no brake setting makes safe.
+   *
+   *   SEVER every credential that predates the claim, which is what happens
+   *   below. The person arriving holds the credential the ORG CONTROLS — its
+   *   own identity provider, for a domain it proved. Anything already on the
+   *   row was put there by whoever created it, and nobody ever proved that was
+   *   the owner. So the password is nulled and every live session is revoked.
+   *   NOBODY IS LOCKED OUT: the user is signing in successfully at this very
+   *   moment, by the route their org chose.
+   *
+   * ── WHY THIS IS NOT GATED ON `EMAIL_VERIFICATION`'s MODE ───────────────────
+   *
+   * Deliberately unconditional, and that is a decision rather than an omission.
+   * A brake exists to protect traffic that is legitimate TODAY (rule 13), and
+   * severance stops no legitimate traffic — the legitimate owner is being signed
+   * in as it runs. Gating it on a control whose documented default is OBSERVE
+   * would leave the takeover open in every deployment that had not armed
+   * anything, which is all of them. So there is nothing for a brake to protect
+   * and the refusal has no mode.
+   *
+   * ── WHAT IS DELIBERATELY NOT SEVERED ──────────────────────────────────────
+   *
+   * A row whose `emailVerified` is already set keeps its password. That user
+   * proved the address, so the password is theirs, and an org adding SSO must
+   * not silently take away the login its people already had.
+   *
+   * A row this function JUST CREATED is also not a claim, and `emailVerified`
+   * is the whole reason: the create path above stamps it. An earlier draft
+   * carried a separate "was it created" flag beside this condition; a mutation
+   * run proved no test could tell the difference, because a fresh row is never
+   * unverified — so the flag was removed rather than left for the next reader
+   * to mistake for a second guard.
+   */
+  if (user.emailVerified === null) {
+    const now = new Date();
+    const severedPassword = user.passwordHash !== null;
+
+    /*
+     * The password goes, and the address becomes verified by the same reasoning
+     * the create path above records: the IdP asserted it and we proved the
+     * domain. Written BEFORE the membership is attached, so there is no window
+     * in which a pre-claim credential and the org membership are both live.
+     */
+    await unscoped(() =>
+      prisma.user.update({
+        where: { id: user.id },
+        data: { passwordHash: null, emailVerified: now },
+      }),
+    );
+
+    /*
+     * And every session that predates the claim, because nulling the password
+     * alone leaves the attacker's live cookie — which, once the membership
+     * lands, can reach the customer's org through the switch-org route. This
+     * runs before `issueSession` below, so the session this login mints is not
+     * among them.
+     */
+    const revoked = await unscoped(() =>
+      prisma.session.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: now },
+      }),
+    );
+
+    if (severedPassword || revoked.count > 0) {
+      await audit({
+        actor: { userId: user.id, orgId: connection.orgId, ip: clientIp(req), impersonatedBy: null },
+        action: 'sso.claim_severed',
+        targetType: 'User',
+        targetId: user.id,
+        metadata: {
+          // COUNTS AND FLAGS ONLY (rule 11). No password, no hash, no fragment
+          // of one, no session token, and not the address either — only the
+          // domain, which the connection already proved.
+          assertedDomain: email.split('@')[1] ?? null,
+          passwordCleared: severedPassword,
+          sessionsRevoked: revoked.count,
+          connectionId: connection.id,
+        },
+      });
+    }
+  }
 
   const membership = await unscoped(() =>
     prisma.membership.findUnique({
@@ -1147,6 +1310,33 @@ ssoRouter.post('/saml/:connectionId/acs', async (req, res) => {
 
 const adminRouter: Router = Router();
 adminRouter.use(requireAuth, requireRole('ADMIN'));
+
+/*
+ * ── NO `requireScope` HERE, AND THAT IS A GAP RATHER THAN A DECISION ────────
+ *
+ * The six mutating routes below (connections ×3, domains ×3) check a ROLE and
+ * no SCOPE, so an API key created for CI — which inherits its creator's role —
+ * can point this org's single sign-on at an identity provider of its choosing,
+ * or verify a domain. That is a full account-takeover primitive reached by a
+ * key the customer believes is narrower than it is.
+ *
+ * It is not closed here because no member of `API_KEY_SCOPES` honestly names
+ * it. The six members are `tests:read|write`, `runs:read|write`,
+ * `secrets:write` and `git:push`, enumerated from the routes that already gate
+ * on them; `secrets:write` is the only one that is even adjacent, and reaching
+ * for it would mean a key labelled "may write my test credentials" could
+ * reconfigure who may sign in to the organisation. The vocabulary exists
+ * precisely to stop that kind of mislabelling, so the honest move is to leave
+ * the routes role-gated and name the missing scope rather than to pick the
+ * nearest word.
+ *
+ * THE EDIT THAT CLOSES IT is one member added to `API_KEY_SCOPES` in
+ * packages/shared/src/constants.ts — a file this round's ownership puts
+ * elsewhere — after which `requireScope('org:admin')` belongs on every route
+ * below and on the eight org-administration routes in `routes/settings.ts`.
+ * Written down here so the next reader knows the check is owed rather than
+ * concluding it was considered and found unnecessary.
+ */
 
 /** The plan gate on the configuration surface. */
 adminRouter.use(async (req, _res, next) => {

@@ -20,6 +20,7 @@ import type {
   TriageJob,
 } from '@qaai/shared';
 import { config, connection, logger, prisma } from './context.js';
+import { installKeyringAtBoot } from '../../api/src/lib/vault.js';
 import {
   ANALYZE_SOURCE_QUEUE,
   DELIVERY_JOB,
@@ -59,6 +60,12 @@ import {
 import { processVerifyHeal, type VerifyHealJob } from './processors/verify-heal.js';
 import { processMutantClosure, requestMutantClosure } from './processors/mutant-closure.js';
 import { processBisect } from './processors/bisect.js';
+import {
+  AUTH_REFRESH_QUEUE,
+  armAuthRefreshSweep,
+  processAuthRefreshTick,
+  type AuthRefreshJob,
+} from './processors/auth-refresh.js';
 import { armCheckSweep, processChecks } from './processors/checks.js';
 import { processDigestTick } from './processors/digest.js';
 import { ensureDeploymentCapabilities } from './processors/preflight.js';
@@ -389,6 +396,36 @@ register<ScheduleTickJob>(QUEUE_NAMES.schedule, 1, async (job) => {
   // throws must not cost the schedules their retry either.
   await processDigestTick().catch((err) => logger.error({ err }, 'the digest sweep failed'));
 });
+/*
+ * THE VAULT KEYRING, BEFORE THE FIRST JOB. Same reason as the API's boot: `seal`
+ * and `open` are synchronous and called from three processors in this process,
+ * so the keyring is installed once here. Without it the IMPLICIT keyring was
+ * always in force and the whole `VaultKey` state machine was inert — a secret
+ * the rotation sweep had moved to v2 was UNREADABLE to this worker, which is a
+ * run that fails for a reason nobody can see. `installKeyringAtBoot` records
+ * what was measured.
+ *
+ * Malformed rows take the process down rather than letting it seal under a
+ * version an operator believes is retired; zero rows — every install today —
+ * resolve to the implicit keyring in silence.
+ */
+void installKeyringAtBoot(
+  {
+    listVaultKeys: () =>
+      prisma.vaultKey.findMany({
+        select: { keyId: true, version: true, state: true, provider: true, providerRef: true },
+        orderBy: { version: 'asc' },
+      }),
+  },
+  (level, fields, message) => logger[level](fields, message),
+).catch((err: unknown) => {
+  // Logged, not fatal, and NOT `process.exit`: this runs at module load, so a
+  // process-killing handler here took the whole test runner down the moment
+  // anything imported this file. `installKeyringAtBoot` reports a refused
+  // keyring itself and leaves the implicit one in force.
+  logger.error({ err }, 'the vault keyring could not be installed; running on the implicit keyring');
+});
+
 void armScheduleTick().catch((err) => logger.error({ err }, 'could not arm the scheduler'));
 register<ImportJob>(QUEUE_NAMES.import, config.concurrency, async (payload) => {
   try {
@@ -758,6 +795,50 @@ register<PreflightJob>(PREFLIGHT_QUEUE, 1, async (payload) => {
  */
 void armPreflightSweep().catch((err) =>
   logger.error({ err }, 'could not arm the capability preflight sweep'),
+);
+
+/*
+ * ── THE SESSION REFRESH ─────────────────────────────────────────────────────
+ *
+ * `check-wiring` reported `qaai.auth-refresh` DISCONNECTED: "enqueued by
+ * apps/worker/src/processors/auth-refresh.ts and no worker in apps/worker
+ * registers a consumer. Every job on it waits forever." The sweep armed itself
+ * on every boot, the jobs piled up in Redis, and nothing drained them — so the
+ * control the whole slice was built for did not run at all.
+ *
+ * WHAT IT IS FOR. `AuthProfile.storageState` held live customer session cookies
+ * with an 8-hour TTL that was never refreshed, and an expired session SILENTLY
+ * DEGRADED every nightly run to anonymous — which also made every auth-gated
+ * route look covered by an anonymous test. This tick is what re-signs a profile
+ * before its session dies, and it is also the only thing that finds the rows
+ * the sealing migration emptied (`storageStateNeedsReseal`), which is the
+ * difference between "never signed in" and "we destroyed the plaintext that was
+ * here".
+ *
+ * CONCURRENCY 1, and not only for load. Each tick drives real browser logins
+ * against a customer's auth system, and two ticks interleaving would sign the
+ * same profile in twice — racing to write the same `storageStateSealed` column,
+ * with the loser's session left live in the customer's application and
+ * recorded nowhere. The hourly cadence means one lane is ample.
+ *
+ * Wrapped in an arrow for the same reason as the backup tick: register()'s
+ * second argument is the BullMQ Job, and that slot in `processAuthRefreshTick`
+ * is `Partial<AuthRefreshDeps>` — the test seam for injecting the clock, the
+ * cipher, the resolver and the sign-in. A Job landing there would be a silent
+ * no-op today and a confusing bug the day the two types grow a matching field.
+ */
+register<AuthRefreshJob>(AUTH_REFRESH_QUEUE, 1, async (payload) => {
+  // The tick's result is a per-profile tally the processor has already logged
+  // and persisted; `register` wants void, and returning the tally as a job
+  // return value would put profile ids into Redis for no reader.
+  await processAuthRefreshTick(payload);
+});
+// Repeatable hourly job, de-duplicated by jobId, so arming on every boot is
+// safe and a restart cannot double-schedule. It sets BOTH removeOnComplete and
+// removeOnFail: a BullMQ job id is a Redis key, and a per-entity id with only
+// one of the two means the second attempt is silently dropped.
+void armAuthRefreshSweep().catch((err) =>
+  logger.error({ err }, 'could not arm the session refresh sweep'),
 );
 
 /*

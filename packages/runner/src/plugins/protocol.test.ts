@@ -16,9 +16,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { SECRET_MASK } from '@qaai/shared';
-import type { ExecutableTest, RunContext, TestExecution } from '@qaai/shared';
+import {
+  EGRESS_REFUSAL_SENTENCE,
+  SECRET_MASK,
+  SELF_HOSTED_EGRESS_POLICY,
+  guardUrl,
+} from '@qaai/shared';
+import type { EgressGuardIo, ExecutableTest, RunContext, TestExecution } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import { protocolPlugin } from './protocol.js';
+import type { ProtocolEgressGuard } from './protocol.js';
 import { attachRunWorkspace } from '../run-workspace.js';
 
 // ─── Harness ─────────────────────────────────────────────────────────────────
@@ -45,8 +52,25 @@ async function listen(server: Server): Promise<string> {
   return `http://127.0.0.1:${address.port}`;
 }
 
-function httpServer(handler: RequestListener): Promise<string> {
-  return listen(createServer(handler));
+/**
+ * Every handler in this file is `async` — it reads a JSON body, or writes an SSE
+ * frame after a tick — and `RequestListener` declares a VOID return, so each
+ * call site raised `no-misused-promises`. The handler's promise is genuinely
+ * not awaited (node fires the event and moves on), which is correct here and is
+ * what the wider type says out loud; `void` at the single seam is the honest
+ * spelling of "this result is deliberately dropped", and it says so once rather
+ * than at nine call sites.
+ */
+type AsyncRequestListener = (
+  ...args: Parameters<RequestListener>
+) => void | Promise<void>;
+
+function httpServer(handler: AsyncRequestListener): Promise<string> {
+  return listen(
+    createServer((req, res) => {
+      void handler(req, res);
+    }),
+  );
 }
 
 function makeTest(spec: unknown, name = 'protocol test'): ExecutableTest {
@@ -437,7 +461,16 @@ describe('protocol plugin — WebSocket', () => {
       'PASSED Expect — the order arrives',
     ]);
     // The heartbeat and presence frames were passed over, not asserted on.
+    //
+    // The first line is the egress guard's own: this harness targets
+    // 127.0.0.1, the run context carries no `egressPolicy`, so the endpoint
+    // was decided under the self-hosted class list and the decision carries
+    // SELF_HOSTED_EGRESS_WARNING. It is asserted rather than filtered out,
+    // because a check that was skipped must be NAMED — a guard that passes
+    // silently in the one mode where it does nothing is indistinguishable from
+    // a guard that ran.
     expect(execution.console.map((entry) => entry.text)).toEqual([
+      expect.stringContaining('• This deployment is self-hosted'),
       expect.stringContaining('• connected'),
       expect.stringContaining('↑ {"type":"subscribe"}'),
       expect.stringContaining('↓ {"type":"heartbeat"'),
@@ -945,5 +978,301 @@ describe('protocol plugin — validate', () => {
     for (const spec of specs) {
       expect(() => protocolPlugin.validate(makeTest(spec))).not.toThrow();
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The egress guard on a customer-controlled absolute endpoint
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE HOLE THESE CLOSE, AND HOW IT WAS MEASURED.
+ *
+ * `resolveUrl` passes an absolute URL in `spec.endpoint` straight through, and
+ * before this change nothing anywhere in the plugin classified it: no pin, no
+ * resolve, no name-level check. `plugins/api.ts` has a same-origin check and
+ * this file deliberately does not — an off-base-URL endpoint is the documented
+ * legitimate case, and PROTOCOL is kept out of
+ * `BASE_URL_DEPENDENT_TEST_TYPES` for that reason — so the preflight guard that
+ * saves every other test type never applied here either. The result was
+ * `fetch(endpoint)` against any host a spec in the customer's repository named,
+ * from inside our network, with the status recorded in a `NetworkEntry` (a
+ * reachability oracle) and 300 characters of the answer returned in a step.
+ *
+ * So the rule is the CLASS rule and not a same-origin rule: a different PUBLIC
+ * host keeps working, a private or link-local one does not.
+ *
+ * EVERY CASE BELOW USES AN IP LITERAL OR AN INJECTED RESOLVER. `classifyHost`
+ * answers `kind: 'address'` for a literal and `decideEgress` consults no
+ * resolver at all for one, so the blocks that go through the real default
+ * guard make NO DNS QUERY; the split-answer cases inject a fake zone. Nothing
+ * here resolves a name for real.
+ */
+describe('a PROTOCOL endpoint is classified before it is opened', () => {
+  /** The real guard over a fake zone, so a NAME can be tested without DNS. */
+  function guardWith(
+    zone: Readonly<Record<string, readonly string[]>>,
+    policy = SELF_HOSTED_EGRESS_POLICY,
+  ): ProtocolEgressGuard {
+    const io: EgressGuardIo = {
+      classifyHost: (host) => classifyHost(host),
+      classifyAddress: (address) => classifyAddress(address),
+      lookup: async (host) => {
+        const answers = zone[host];
+        if (answers === undefined) {
+          throw new Error(`fakeIo was asked to resolve ${host}, which this test never declared`);
+        }
+        return answers.map((address) => ({ address }));
+      },
+      now: () => new Date('2026-10-30T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      // The 250ms refusal floor belongs to `egress-guard`'s own tests; a real
+      // sleep per refusal would cost this file seconds.
+      delay: async () => {},
+    };
+    return (url) => guardUrl({ url, context: 'PLUGIN_HTTP', policy, io });
+  }
+
+  const graphqlAt = (endpoint: string) =>
+    makeTest({
+      protocol: 'GRAPHQL',
+      endpoint,
+      /*
+       * A SHORT deadline, deliberately. 169.254.169.254 has no route from a
+       * test host, so with the schema default this fixture would hang until
+       * vitest's own 5s limit — and a test that times out is indistinguishable
+       * from an unrelated hang, which is a NON-RESULT when it is the thing a
+       * mutation run is reading. With 400ms a removed guard fails as the
+       * assertion it is.
+       */
+      timeoutMs: 400,
+      operations: [{ name: 'read orders', query: '{ orders { id } }' }],
+    });
+
+  const sseAt = (path: string) =>
+    makeTest({
+      protocol: 'SSE',
+      path,
+      connectTimeoutMs: 400,
+      expect: [{ name: 'first event', event: 'tick', count: 1, timeoutMs: 400 }],
+    });
+
+  const wsAt = (url: string) =>
+    makeTest({
+      protocol: 'WEBSOCKET',
+      url,
+      connectTimeoutMs: 400,
+      steps: [{ action: 'EXPECT', name: 'first frame', timeoutMs: 400 }],
+    });
+
+  /*
+   * 169.254.169.254 is the cloud metadata service on AWS, GCP and Azure alike,
+   * and it is in NEVER_PERMITTED_BY_DEFAULT — refused under every deployment
+   * mode, including the self-hosted class list this plugin falls back to when
+   * the run context carries no policy. These three go through the REAL default
+   * guard, which is what production gets.
+   */
+  it('refuses a GraphQL endpoint at the cloud metadata address', async () => {
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      graphqlAt('http://169.254.169.254/latest/meta-data/'),
+    );
+
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toBe(EGRESS_REFUSAL_SENTENCE);
+    // Not PASSED: a refused endpoint reported as a pass is a pass that means
+    // "we did not check". Not FAILED either: the customer's service was never
+    // evaluated, so blaming their code would be a lie in the other direction.
+    expect(execution.status).not.toBe('PASSED');
+    // And no answer came back — the reachability oracle is closed with it.
+    expect(execution.network).toEqual([]);
+  });
+
+  it('refuses an SSE stream at the cloud metadata address', async () => {
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      sseAt('http://169.254.169.254/latest/meta-data/'),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toBe(EGRESS_REFUSAL_SENTENCE);
+    expect(execution.network).toEqual([]);
+  });
+
+  it('refuses a WebSocket at the cloud metadata address, ws:// scheme and all', async () => {
+    /*
+     * `guardUrl` refuses any scheme that is not http(s), so a `ws://` URL has
+     * to be mapped before it is asked about — otherwise every WebSocket test in
+     * the product is refused as SCHEME_NOT_PERMITTED, which is a refusal for
+     * the wrong reason. A ws URL still resolves a host and still opens a TCP
+     * connection to it, which is the whole point.
+     */
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      wsAt('ws://169.254.169.254/'),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toBe(EGRESS_REFUSAL_SENTENCE);
+  });
+
+  it('refuses an octal-spelt loopback endpoint under a hosted policy', async () => {
+    /*
+     * MEASURED rather than assumed, and the measurement changes what this test
+     * can claim: `new URL('http://0177.0.0.1/graphql').hostname` is
+     * `'127.0.0.1'` — the WHATWG parser normalises octal and decimal IPv4
+     * forms itself, and so does `http://2130706433/x`. So the guard never sees
+     * the octal spelling and `AMBIGUOUS_HOST` is NOT what refuses this; the
+     * LOOPBACK CLASS is, once a policy says loopback is not reachable. The
+     * alternate-encoding arm in `decideEgress` still matters for a caller that
+     * passes a bare host rather than a URL — it is simply not this path.
+     */
+    const execution = await protocolPlugin.execute(
+      {
+        ...makeCtx('https://app.example.com'),
+        egressPolicy: { deployment: 'HOSTED' },
+      } as RunContext,
+      graphqlAt('http://0177.0.0.1/graphql'),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toBe(EGRESS_REFUSAL_SENTENCE);
+  });
+
+  it('refuses an endpoint carrying userinfo, before it looks at the host', async () => {
+    // `http://app.example.com@93.184.216.34/` reads as a trusted host to a
+    // human and to every log line; the parser correctly calls the host the IP.
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      graphqlAt('http://app.example.com@93.184.216.34/graphql'),
+    );
+    expect(execution.status).toBe('SKIPPED');
+  });
+
+  it('refuses a name whose records point inside — public record FIRST', async () => {
+    /*
+     * The ORDER is the attack. A positional read of the first address lets
+     * whoever runs the zone choose the outcome by reordering their own answer,
+     * and an adversary found exactly that last round. Both orders must refuse,
+     * and this plugin's fallback policy permits `private`, so what refuses here
+     * is the LINK-LOCAL address in the set — which no deployment reaches.
+     */
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      graphqlAt('http://graphql.attacker.test/graphql'),
+      guardWith({ 'graphql.attacker.test': ['93.184.216.34', '169.254.169.254'] }),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.network).toEqual([]);
+  });
+
+  it('refuses a name whose records point inside — link-local record FIRST', async () => {
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      graphqlAt('http://graphql.attacker.test/graphql'),
+      guardWith({ 'graphql.attacker.test': ['169.254.169.254', '93.184.216.34'] }),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.network).toEqual([]);
+  });
+
+  it('refuses an endpoint whose name does not resolve', async () => {
+    // A name we cannot vouch for is not a name we connect to.
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      graphqlAt('http://graphql.attacker.test/graphql'),
+      guardWith({}),
+    );
+    expect(execution.status).toBe('SKIPPED');
+  });
+
+  it('says the SAME sentence whatever the reason, so a spec is not a port scanner', async () => {
+    /*
+     * The step list is read by whoever wrote the spec, and the spec's endpoint
+     * is what is being refused. "that is a link-local address" / "that host did
+     * not resolve" / "that host is not on the allowlist" are three different
+     * facts about the inside of OUR network.
+     */
+    const zones: Array<Record<string, readonly string[]>> = [
+      { 'graphql.attacker.test': ['169.254.169.254'] },
+      { 'graphql.attacker.test': ['224.0.0.1'] },
+      { 'graphql.attacker.test': [] },
+      {},
+    ];
+    const messages = new Set<string | null>();
+    for (const zone of zones) {
+      const execution = await protocolPlugin.execute(
+        makeCtx('https://app.example.com'),
+        graphqlAt('http://graphql.attacker.test/graphql'),
+        guardWith(zone),
+      );
+      messages.add(execution.errorMessage);
+    }
+    expect(messages).toEqual(new Set([EGRESS_REFUSAL_SENTENCE]));
+  });
+
+  it('refuses a private endpoint when the environment policy says HOSTED', async () => {
+    /*
+     * The brake, armed. Once `Environment.egressPolicy` is threaded into
+     * `RunContext`, a hosted deployment narrows to PUBLIC ONLY and a
+     * `http://10.0.0.5/graphql` endpoint — which the unthreaded fallback
+     * permits, because a self-hosted install legitimately has one — is refused.
+     */
+    const execution = await protocolPlugin.execute(
+      {
+        ...makeCtx('https://app.example.com'),
+        egressPolicy: { deployment: 'HOSTED' },
+      } as RunContext,
+      graphqlAt('http://10.0.0.5/graphql'),
+    );
+    expect(execution.status).toBe('SKIPPED');
+    expect(execution.errorMessage).toBe(EGRESS_REFUSAL_SENTENCE);
+  });
+
+  it('COUNTS and allows in OBSERVE instead of refusing, and says it did', async () => {
+    /*
+     * Rule 13: a brake that does not brake is worse than no brake. OBSERVE must
+     * let today's behaviour continue AND make the fact visible, so the
+     * transcript carries the line. The connection is then ATTEMPTED and fails
+     * because nothing is listening on port 1 — which is exactly the point: the
+     * guard did not stop it, and under ENFORCE the test above shows it does.
+     *
+     * The target is loopback:1 rather than an RFC1918 address because a
+     * connection to 10.0.0.5 has no route and hangs until the TCP timeout,
+     * which timed this test out at 5s. Loopback on a closed port refuses
+     * immediately and is refused by the same HOSTED class rule.
+     */
+    const execution = await protocolPlugin.execute(
+      {
+        ...makeCtx('https://app.example.com'),
+        egressPolicy: { deployment: 'HOSTED', mode: 'OBSERVE' },
+      } as RunContext,
+      graphqlAt('http://127.0.0.1:1/graphql'),
+    );
+    expect(execution.status).not.toBe('SKIPPED');
+    expect(execution.console.map((entry) => entry.text).join('\n')).toContain(
+      'would have been refused by the egress policy',
+    );
+  });
+
+  it('still reaches a DIFFERENT public host, which is the documented legitimate case', async () => {
+    /*
+     * A guard that refuses everything passes an attack suite and breaks the
+     * product. `spec.endpoint` naming another public origin is what this plugin
+     * is FOR, so the rule is the class rule and emphatically not same-origin:
+     * the base URL here is one host and the endpoint is a real server on
+     * another, and it must still run.
+     */
+    const elsewhere = await httpServer(async (req, res) => {
+      expect(req.url).toBe('/graphql');
+      sendJson(res, { data: { orders: [{ id: 'ord_1' }] } });
+    });
+
+    const execution = await protocolPlugin.execute(
+      makeCtx('http://127.0.0.2:1/'),
+      graphqlAt(`${elsewhere}/graphql`),
+    );
+
+    expect(execution.status).toBe('PASSED');
+    // One entry: the operation. Introspection is off in this fixture.
+    expect(execution.network).toHaveLength(1);
+    expect(execution.network[0]!.url).toBe(`${elsewhere}/graphql`);
   });
 });

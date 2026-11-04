@@ -47,7 +47,8 @@
  */
 
 import { inflateRawSync } from 'node:zlib';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SsoEgressGuard } from '../lib/sso.js';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type Row = Record<string, any>;
 
@@ -60,7 +61,13 @@ const IDP_CERT = '-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE---
 interface Hoisted {
   prisma: Record<string, unknown>;
   currentOrg: () => string | null;
-  actor: { userId: string; orgId: string; role: string; ip: string | null };
+  /*
+   * `scopes` is part of the actor because `requireScope` is the real function
+   * now. A session actor holds the `'*'` sentinel, which is what a human with a
+   * role holds in production — an actor with no `scopes` at all would make the
+   * real guard throw and the stub-shaped hole would reopen as a 500.
+   */
+  actor: { userId: string; orgId: string; role: string; ip: string | null; scopes: string[] };
   audits: Row[];
   /** Which orgs are on a plan that includes SSO. */
   ssoOrgs: Set<string>;
@@ -73,7 +80,7 @@ interface Hoisted {
 const h = vi.hoisted((): Hoisted => ({
   prisma: {},
   currentOrg: () => null,
-  actor: { userId: 'user_admin', orgId: 'org_a', role: 'ADMIN', ip: null },
+  actor: { userId: 'user_admin', orgId: 'org_a', role: 'ADMIN', ip: null, scopes: ['*'] },
   audits: [],
   ssoOrgs: new Set<string>(),
   samlVerify: null,
@@ -131,7 +138,19 @@ vi.mock('../lib/prisma.js', async () => {
   };
 });
 
-vi.mock('../middleware/auth.js', async () => {
+/*
+ * `requireAuth` is replaced because this file has no session rows and no
+ * cookies; everything else is the REAL middleware.
+ *
+ * `requireScope` USED TO BE A PASS-THROUGH STUB HERE — `() => (…) => next()` —
+ * and that is the test-fake trap the house rules name: with it in place,
+ * adding `requireScope` to any route in sso.ts would be undetectable, and
+ * deleting one already there would be too. It is now the real exported
+ * function, which is a pure predicate over `req.actor.scopes`, so the stub
+ * cannot absorb a control. That is also why `h.actor` carries `scopes`.
+ */
+vi.mock('../middleware/auth.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../middleware/auth.js')>();
   const { ROLE_RANK } = await import('@qaai/shared');
   const { withTenant } = await import('../lib/prisma.js');
   return {
@@ -147,7 +166,7 @@ vi.mock('../middleware/auth.js', async () => {
       }
       next();
     },
-    requireScope: () => (_req: Row, _res: Row, next: () => void) => next(),
+    requireScope: actual.requireScope,
     actorOf: (req: Row) => req.actor,
   };
 });
@@ -471,7 +490,7 @@ function makeDb() {
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
-const { ssoRouter } = await import('./sso.js');
+const { ssoRouter, configureSsoEgress } = await import('./sso.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 const { hashToken } = await import('../lib/crypto.js');
 const { spAcsUrl, spEntityId, domainVerificationRecord } = await import('../lib/sso.js');
@@ -631,7 +650,7 @@ const SAML_RESPONSE = Buffer.from('<samlp:Response/>', 'utf8').toString('base64'
 beforeEach(() => {
   db = makeDb();
   h.prisma = db.client;
-  h.actor = { userId: 'user_admin', orgId: 'org_a', role: 'ADMIN', ip: null };
+  h.actor = { userId: 'user_admin', orgId: 'org_a', role: 'ADMIN', ip: null, scopes: ['*'] };
   h.audits.length = 0;
   h.ssoOrgs = new Set(['org_a', 'org_b']);
   h.verifyCalls.length = 0;
@@ -644,6 +663,189 @@ beforeEach(() => {
 });
 
 // ─── The outbound leg ────────────────────────────────────────────────────────
+
+/**
+ * The URL of a `fetch` call, for a stub that needs to tell the outbound leg
+ * from the test's own request to the router.
+ *
+ * `String(input)` would do it and lints as `no-base-to-string`, which is right
+ * to complain: `RequestInfo` includes `Request`, whose default stringification
+ * is `[object Request]`, so a stub that matched on it would silently stop
+ * matching the day a caller passed one.
+ */
+function fetchUrlOf(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input;
+  if (input instanceof URL) return input.href;
+  return input.url;
+}
+
+describe('the outbound leg resolves the provider host before a secret travels to it', () => {
+  /*
+   * ── THE DEFECT ────────────────────────────────────────────────────────────
+   *
+   * `providerFetch` checked the provider URL with `safeOutboundUrl`, which is a
+   * PATTERN MATCH THAT NEVER RESOLVES: it refuses `localhost`, a bare name and
+   * the recognisable internal spellings, and answers "not internal" for any
+   * name with a dot. So `https://idp.attacker.test` whose single A record is
+   * 169.254.169.254 was accepted with ZERO DNS queries — on the function that
+   * carries the OIDC client secret to the token endpoint.
+   *
+   * `guardOutboundUrl` is the resolving version. It was written, tested, and
+   * left with NO PRODUCTION CALLER; one of its own test blocks in lib/sso.ts is
+   * titled "the guard production actually gets". These tests are what make that
+   * title true.
+   *
+   * The guard is injected rather than built inline so this can be driven with a
+   * fake: a control that needs real DNS to test is a control nobody tests.
+   */
+  /*
+   * The shapes the real guard returns, built here rather than inlined so the
+   * tests cannot drift from `GuardVerdict`. These are full verdicts on purpose:
+   * a partial literal typechecks in a test file that vitest never typechecks,
+   * which is how a fake comes to assert a shape production does not produce.
+   */
+  const refusedVerdict = () =>
+    ({
+      ok: false,
+      refusal: 'CLASS_NOT_PERMITTED',
+      operatorDetail: 'link-local 169.254.169.254',
+      context: 'SSO_METADATA',
+      decision: null,
+      target: null,
+      paddedMs: 0,
+    }) as Awaited<ReturnType<SsoEgressGuard>>;
+
+  const allowedVerdict = () =>
+    ({
+      ok: true,
+      permit: { kind: 'UNPINNED', url: 'https://idp.acme.test/', host: 'idp.acme.test' },
+    }) as unknown as Awaited<ReturnType<SsoEgressGuard>>;
+
+  afterEach(() => {
+    configureSsoEgress(null);
+  });
+
+  it('REFUSES a provider whose host resolves inside, before any request leaves', async () => {
+    const asked: string[] = [];
+    let fetched = 0;
+    const realFetch = globalThis.fetch;
+    /*
+     * Counts only requests to the PROVIDER. `call()` reaches the router over a
+     * loopback socket with this same global, so a bare counter counts the
+     * test's own request and reads as "something leaked" on a clean run.
+     */
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      if (fetchUrlOf(input).includes('attacker.test')) fetched += 1;
+      return realFetch(input, init);
+    };
+    configureSsoEgress(() => Promise.resolve((url: string) => {
+      asked.push(url);
+      // What the real guard answers for a name whose records point at IMDS.
+      return Promise.resolve(refusedVerdict());
+    }));
+
+    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: 'https://idp.attacker.test', oidcClientId: 'client_1' });
+    seedDomain(connection);
+    const reply = await call('GET', `/sso/start/${connection.id}`);
+    globalThis.fetch = realFetch;
+
+    // The guard was consulted, with the discovery URL derived from the issuer.
+    expect(asked).toEqual(['https://idp.attacker.test/.well-known/openid-configuration']);
+    // And NOTHING left the process.
+    expect(fetched).toBe(0);
+    /*
+     * 302 and not a 4xx: this router answers a failed login by redirecting to
+     * the sign-in page with an error, which is the house style for a surface a
+     * browser lands on. What matters is WHERE — it must not be the IdP, and it
+     * must not carry the refusal's detail in the URL, which would make the
+     * redirect itself the oracle.
+     */
+    expect(reply.status).toBe(302);
+    const location = reply.location;
+    expect(location).not.toContain('attacker.test');
+    expect(location).not.toContain('169.254');
+    expect(location).not.toContain('CLASS_NOT_PERMITTED');
+  });
+
+  it('does not tell the caller WHY it was refused', async () => {
+    // An SSO failure renders at a sign-in page to whoever typed the issuer URL.
+    // A message distinguishing "that is a link-local address" from "that host
+    // did not resolve" turns a broken login into a port scanner for our own
+    // network, with a readable report.
+    configureSsoEgress(() => Promise.resolve(() => Promise.resolve(refusedVerdict())));
+
+    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: 'https://idp.attacker.test', oidcClientId: 'client_1' });
+    seedDomain(connection);
+    const reply = await call('GET', `/sso/start/${connection.id}`);
+
+    const body = JSON.stringify(reply.body ?? {});
+    expect(body).not.toContain('169.254.169.254');
+    expect(body).not.toContain('link-local');
+    expect(body).not.toContain('CLASS_NOT_PERMITTED');
+  });
+
+  it('consults the guard for EVERY outbound leg, not only discovery', async () => {
+    /*
+     * Discovery, JWKS, the token endpoint and userinfo all go through
+     * `providerFetch`, which is the point of putting the guard there rather
+     * than at one call site: a provider that passes discovery can still name a
+     * JWKS or token URL pointing inside, and the token leg is the one carrying
+     * the client secret.
+     */
+    const asked: string[] = [];
+    configureSsoEgress(() => Promise.resolve((url: string) => {
+      asked.push(url);
+      return Promise.resolve(refusedVerdict());
+    }));
+
+    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: 'https://idp.attacker.test', oidcClientId: 'client_1' });
+    seedDomain(connection);
+    await call('GET', `/sso/start/${connection.id}`);
+
+    // One leg reached, and it was guarded. The others are unreachable from here
+    // because this one refused — which is the fail-closed ordering we want.
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('/.well-known/openid-configuration');
+  });
+
+  it('lets a provider on a public host through, so the guard is not a blanket refusal', async () => {
+    // The other half: without this, the three tests above would also pass if
+    // `providerFetch` simply always threw.
+    const asked: string[] = [];
+    let fetched = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() => {
+      fetched += 1;
+      return Promise.resolve(
+        new Response(JSON.stringify({ issuer: 'https://idp.acme.test' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    });
+    configureSsoEgress(() => Promise.resolve((url: string) => {
+      asked.push(url);
+      return Promise.resolve(allowedVerdict());
+    }));
+
+    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: 'https://idp.acme.test', oidcClientId: 'client_1' });
+    seedDomain(connection);
+    await call('GET', `/sso/start/${connection.id}`);
+    globalThis.fetch = realFetch;
+
+    /*
+     * `endpointsFor` memoises discovery in a MODULE-LEVEL `discoveryCache` that
+     * no test resets, so a sibling test that already warmed this issuer would
+     * make the guard look unconsulted here. Assert on the issuer this test owns
+     * and tolerate the cache by checking the guard saw it OR the fetch happened
+     * — what must never be true is that neither did.
+     */
+    expect(asked.length + fetched).toBeGreaterThan(0);
+    if (asked.length > 0) {
+      expect(asked[0]).toBe('https://idp.acme.test/.well-known/openid-configuration');
+    }
+  });
+});
 
 describe('GET /sso/start/:id — SAML', () => {
   it('sends an AuthnRequest whose ID is the value stored as samlRequestId', async () => {
@@ -1225,7 +1427,269 @@ describe('admin connections and domains are scoped to the caller’s org', () =>
   });
 
   it('refuses a VIEWER', async () => {
-    h.actor = { userId: 'user_v', orgId: 'org_a', role: 'VIEWER', ip: null };
+    h.actor = { userId: 'user_v', orgId: 'org_a', role: 'VIEWER', ip: null, scopes: ['*'] };
     expect((await call('GET', '/sso/connections')).status).toBe(403);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SSO JIT PRE-ACCOUNT-TAKEOVER
+//
+// `provisionAndSignIn` did `prisma.user.findUnique({ where: { email } })` and
+// `if (existing) return existing` — it claimed ANY row with that address, with
+// no check of `emailVerified` and no check of `passwordHash`, and then attached
+// a membership in the customer's org to it.
+//
+// THE ATTACK, which is what these tests construct: sign up at /auth/signup as
+// victim@customer.com with a password of your choosing, wait for the customer
+// to configure SSO for customer.com, and when the real victim signs in through
+// the identity provider the membership lands on YOUR row with YOUR password
+// still on it.
+//
+// Every test here drives the real ACS route, which is the production call site.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('an SSO login that claims an existing row', () => {
+  /** The row an attacker leaves behind: unverified address, password they chose. */
+  function seedPreMadeRow(over: Row = {}): Row {
+    const row: Row = {
+      id: 'user_premade',
+      email: 'ada@acme.test',
+      name: 'Not Ada',
+      // A stored scrypt digest, not a password and not a key-shaped literal.
+      passwordHash: 'scrypt$attacker-chose-this',
+      emailVerified: null,
+      isSuperuser: false,
+      lastLoginAt: null,
+      createdAt: new Date(CLOCK_BASE),
+      updatedAt: new Date(CLOCK_BASE),
+      ...over,
+    };
+    db.tables.user.push(row);
+    return row;
+  }
+
+  function seedLiveSession(userId: string, over: Row = {}): Row {
+    const row: Row = {
+      id: `session_${userId}_${db.tables.session.length}`,
+      userId,
+      tokenHash: hashToken(`pre-claim-cookie-${db.tables.session.length}`),
+      activeOrgId: null,
+      ip: null,
+      userAgent: null,
+      expiresAt: new Date(Date.now() + 3_600_000),
+      revokedAt: null,
+      createdAt: new Date(CLOCK_BASE),
+      ...over,
+    };
+    db.tables.session.push(row);
+    return row;
+  }
+
+  async function signInThroughIdp(connection: Row): Promise<Reply> {
+    h.samlVerify = () => factsFor(connection);
+    return call('POST', `/sso/saml/${connection.id}/acs`, undefined, {
+      SAMLResponse: SAML_RESPONSE,
+    });
+  }
+
+  it('severs the password on a row whose address nobody ever proved', async () => {
+    const connection = seedConnection();
+    seedDomain(connection);
+    const premade = seedPreMadeRow();
+
+    const reply = await signInThroughIdp(connection);
+
+    // The login SUCCEEDS — the whole reason severance was chosen over a
+    // refusal is that nobody is locked out.
+    expect(reply.status).toBe(302);
+    expect(reply.cookies.join(';')).toContain('qaai_session=');
+    // And the password that was never proved to be anybody's is gone.
+    expect(premade.passwordHash).toBeNull();
+    // The address is now verified, by the same reasoning the create path uses:
+    // the IdP asserted it and the domain was proved.
+    expect(premade.emailVerified).not.toBeNull();
+  });
+
+  it('revokes the sessions that predate the claim, and not the one it just minted', async () => {
+    /*
+     * Nulling the password alone is NOT enough, which is the half an attacker
+     * would still have walked through: the pre-made row carries a live cookie,
+     * and once the membership lands that cookie can reach the customer's org
+     * through /auth/switch-org.
+     */
+    const connection = seedConnection();
+    seedDomain(connection);
+    const premade = seedPreMadeRow();
+    const stale = seedLiveSession(premade.id);
+    const alsoStale = seedLiveSession(premade.id);
+
+    await signInThroughIdp(connection);
+
+    expect(stale.revokedAt).not.toBeNull();
+    expect(alsoStale.revokedAt).not.toBeNull();
+
+    // Exactly one live session, and it is the one this login minted.
+    const live = db.tables.session.filter((s) => s.revokedAt === null);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.activeOrgId).toBe('org_a');
+  });
+
+  it('severs BEFORE the membership exists, so the two are never both live', async () => {
+    const connection = seedConnection();
+    seedDomain(connection);
+    const premade = seedPreMadeRow();
+    seedLiveSession(premade.id);
+
+    await signInThroughIdp(connection);
+
+    // The ordering is the guarantee; what is observable afterwards is that the
+    // membership landed on a row with nothing pre-claim still attached to it.
+    expect(db.tables.membership).toHaveLength(1);
+    expect(db.tables.membership[0]).toMatchObject({ orgId: 'org_a', userId: premade.id });
+    expect(premade.passwordHash).toBeNull();
+    expect(db.tables.session.filter((s) => s.userId === premade.id && s.revokedAt === null))
+      .toHaveLength(1);
+  });
+
+  it('LEAVES A VERIFIED USER’S PASSWORD ALONE', async () => {
+    /*
+     * The other direction, and it is the one that keeps this from being a
+     * lockout. A user who proved their address owns that password; an org
+     * adding SSO must not silently take away the login its people already had.
+     */
+    const connection = seedConnection();
+    seedDomain(connection);
+    const genuine = seedPreMadeRow({
+      name: 'Ada',
+      emailVerified: new Date(CLOCK_BASE),
+      passwordHash: 'scrypt$chosen-by-the-real-ada',
+    });
+    const theirSession = seedLiveSession(genuine.id);
+
+    await signInThroughIdp(connection);
+
+    expect(genuine.passwordHash).toBe('scrypt$chosen-by-the-real-ada');
+    expect(theirSession.revokedAt).toBeNull();
+    // Nothing to report, so nothing is reported.
+    expect(h.audits.some((a) => a.action === 'sso.claim_severed')).toBe(false);
+  });
+
+  it('does not depend on EMAIL_VERIFICATION being in ENFORCE', async () => {
+    /*
+     * The brake for email verification defaults to OBSERVE, because enforcing
+     * it would lock out every existing user. If severance were gated on that
+     * mode the takeover would stay open in every deployment that had armed
+     * nothing — which is all of them. The org below has stored no modes.
+     */
+    const connection = seedConnection();
+    seedDomain(connection);
+    const premade = seedPreMadeRow();
+
+    await signInThroughIdp(connection);
+
+    expect(premade.passwordHash).toBeNull();
+  });
+
+  it('records the severance without quoting any part of the credential', async () => {
+    const connection = seedConnection();
+    seedDomain(connection);
+    const premade = seedPreMadeRow();
+    const stale = seedLiveSession(premade.id);
+    const hashBefore = premade.passwordHash as string;
+
+    await signInThroughIdp(connection);
+
+    const row = h.audits.find((a) => a.action === 'sso.claim_severed');
+    expect(row).toBeDefined();
+    expect(row!.metadata).toMatchObject({
+      assertedDomain: 'acme.test',
+      passwordCleared: true,
+      sessionsRevoked: 1,
+    });
+
+    /*
+     * Rule 11, asserted rather than assumed, and asserted over EVERY audit row
+     * this login wrote rather than only the severance one: the password digest
+     * and the revoked session's token hash are credentials, and they must
+     * appear nowhere at all.
+     */
+    const serialised = JSON.stringify(h.audits);
+    expect(serialised).not.toContain(hashBefore);
+    expect(serialised).not.toContain(hashBefore.slice(-12));
+    expect(serialised).not.toContain(stale.tokenHash as string);
+
+    /*
+     * THE ADDRESS IS CHECKED ON THE SEVERANCE ROW ONLY, and the reason is worth
+     * writing down because the first draft of this test asserted it globally
+     * and failed. The pre-existing `sso.login` row carries the asserted NameID
+     * in `metadata.subject`, which is deliberate and not this slice's to
+     * change: that row exists to say WHO signed in, the audit log is an
+     * ADMIN-only surface, and an address there is the same grade of fact as the
+     * `userId` beside it. The severance row is different — it is written about
+     * a person who may not be a customer at all, so it carries the DOMAIN the
+     * connection proved and nothing more, exactly as the domain-refusal row
+     * above it does.
+     */
+    expect(JSON.stringify(row)).not.toContain('ada@acme.test');
+  });
+
+  it('still refuses a claim on an address outside the connection’s proved domains', async () => {
+    // The pre-existing guard has to keep working: severance is a thing that
+    // happens AFTER the domain check, never instead of it.
+    const connection = seedConnection();
+    seedDomain(connection);
+    const outsider = seedPreMadeRow({ id: 'user_outside', email: 'eve@elsewhere.test' });
+
+    h.samlVerify = () =>
+      factsFor(connection, { nameId: 'eve@elsewhere.test', attributes: {} });
+    const reply = await call('POST', `/sso/saml/${connection.id}/acs`, undefined, {
+      SAMLResponse: SAML_RESPONSE,
+    });
+
+    expect(ssoError(reply)).toContain('outside the domains verified');
+    // Nothing was touched, which is what "before any user row" means.
+    expect(outsider.passwordHash).not.toBeNull();
+    expect(db.tables.membership).toHaveLength(0);
+  });
+
+  it('does not run the severance over a row it has just created', async () => {
+    /*
+     * THE TITLE USED TO SAY "is not treated as a claim" AND THE TEST COULD NOT
+     * TELL. Worth recording, because it is the trap the house rules name: the
+     * end state is IDENTICAL either way. If the create path stopped stamping
+     * `emailVerified`, the fresh row would fall into the severance branch and
+     * come out with a null password and a verified address — the same three
+     * values this test was asserting — and with no audit row either, because
+     * severance only reports when it actually took something away. A mutation
+     * run proved the assertions were insensitive.
+     *
+     * So the thing that distinguishes the two paths is asserted directly: the
+     * number of writes to the user row. One write (the `lastLoginAt` stamp
+     * every login makes) means the claim branch was not entered; two means it
+     * was.
+     */
+    const connection = seedConnection();
+    seedDomain(connection);
+
+    const userModel = db.client.user as { update: (args: Row) => Promise<Row> };
+    const real = userModel.update.bind(userModel);
+    const updates: Row[] = [];
+    userModel.update = async (args: Row) => {
+      updates.push(args.data as Row);
+      return real(args);
+    };
+
+    await signInThroughIdp(connection);
+
+    expect(updates).toHaveLength(1);
+    expect(Object.keys(updates[0]!)).toEqual(['lastLoginAt']);
+
+    const created = db.tables.user[0]!;
+    expect(created.passwordHash).toBeNull();
+    expect(created.emailVerified).not.toBeNull();
+    // And no severance row, because a report of work that did not happen is the
+    // kind of number that gets quoted at a customer and cannot be defended.
+    expect(h.audits.some((a) => a.action === 'sso.claim_severed')).toBe(false);
   });
 });

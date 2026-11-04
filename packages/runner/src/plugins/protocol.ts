@@ -22,11 +22,22 @@
 
 import { spawn } from 'node:child_process';
 import { isAbsolute } from 'node:path';
-import { PROTOCOL_KINDS, maskDeep, protocolTestSpecSchema } from '@qaai/shared';
+import {
+  PROTOCOL_KINDS,
+  SELF_HOSTED_EGRESS_POLICY,
+  guardUrl,
+  maskDeep,
+  protocolTestSpecSchema,
+  refusalForCaller,
+  resolveEgressPolicy,
+} from '@qaai/shared';
 import { childEnv } from '../child-env.js';
 import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 import type {
   ConsoleEntry,
+  EgressGuardIo,
+  EgressGuardVerdict,
+  EgressPolicy,
   ExecutableTest,
   GraphqlProtocolSpec,
   GrpcProtocolSpec,
@@ -84,6 +95,25 @@ function readPath(value: unknown, path: string): unknown {
   }, value);
 }
 
+/**
+ * An absolute URL in the spec PASSES THROUGH; a path inherits the base URL.
+ *
+ * THAT IS DELIBERATE AND IT STAYS. An off-base-URL endpoint is the documented
+ * legitimate case for this plugin — `preflight.ts` keeps PROTOCOL out of
+ * `BASE_URL_DEPENDENT_TEST_TYPES` for exactly this reason ("a gRPC or WebSocket
+ * endpoint is named by the test's own spec") — so a same-origin check like the
+ * one `plugins/api.ts` applies would refuse working customer tests, and this
+ * function is not where the decision belongs.
+ *
+ * What it does mean is that `spec.endpoint` chooses an arbitrary HOST, from a
+ * file in the customer's own repository, which the worker then fetches from
+ * inside our network. Before {@link guardProtocolTarget} nothing classified it:
+ * measured on this tree, zero occurrences of a pin, a resolve or a name-level
+ * check anywhere in this file. `fetch` answered `http://169.254.169.254/`, the
+ * status went into a `NetworkEntry` (a reachability oracle) and 300 characters
+ * of the body came back in a step. The guard is the control; this function only
+ * builds the string.
+ */
 function resolveUrl(baseUrl: string, path: string): string {
   return /^https?:\/\//i.test(path) ? path : new URL(path, baseUrl).toString();
 }
@@ -94,6 +124,225 @@ function resolveWsUrl(baseUrl: string, path: string): string {
   const url = new URL(path, baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.toString();
+}
+
+// ─── The egress guard, at every seam this plugin opens a connection from ────
+
+/**
+ * MAY THIS PLUGIN OPEN THIS URL, AND TO WHICH ADDRESS.
+ *
+ * The context is `PLUGIN_HTTP` and it is not a label: `EGRESS_CONTEXT_RULES`
+ * describes it as "a mediated HTTP call made by plugin code, which is untrusted
+ * by definition", gives it `targetsApplicationUnderTest: true` — so a
+ * self-hosted install may legitimately reach its own private hosts — and
+ * `allowlistApplies: true`, so an operator can name one internal host with
+ * their own email against it. Naming `WEBHOOK_DELIVERY` here instead would
+ * refuse every self-hosted endpoint in every deployment.
+ */
+export type ProtocolEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
+
+/**
+ * WHAT THIS CONTROL DOES NOT DO.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
+ * turns a check into a control. The transports here are Node's GLOBAL `fetch`
+ * (GraphQL, SSE) and the runtime's GLOBAL `WebSocket`, and MEASURED on Node
+ * v25.6.1: `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200
+ * and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw. Neither global
+ * takes a resolver, and `undici` — which has `connect: { lookup }` — is present
+ * in the tree but is not a declared dependency of any workspace.
+ *
+ * So every address the name answers with is classified and THE PIN IS NOT
+ * ENFORCED AT THE SOCKET. The residual hole is exactly one race: a record set
+ * answering a public address to this guard and a private one to the transport.
+ * It is named rather than papered over, the same way `REFRESH_PIN_LIMITATION`
+ * names it on the auth-refresh path.
+ */
+export const PROTOCOL_PIN_LIMITATION =
+  'The endpoint host was resolved and every address it answered with was classified, but neither ' +
+  'Node’s global fetch nor its global WebSocket can be handed a resolver, so the pinned address ' +
+  'set is not enforced at the socket.';
+
+/**
+ * THE POLICY A PROTOCOL ENDPOINT IS DECIDED UNDER, AND THE ONE PLACE THE
+ * UNTHREADED CASE IS DECIDED.
+ *
+ * ── Why an absent policy is NOT read as HOSTED here, unlike everywhere else ─
+ *
+ * `signInWithProfile` reads an absent `egressPolicy` as HOSTED — PUBLIC ONLY —
+ * and that is right for a LOGIN, because a login URL that was never classified
+ * was never permitted either. It would be WRONG here, and the difference is the
+ * whole of rule 13.
+ *
+ * `RunContext` does not carry `Environment.egressPolicy` yet (threading it is
+ * one line in `packages/shared/src/types.ts` and one in the worker's run
+ * processor; both are in the handover). So "absent" today means "this
+ * deployment could not tell us", NOT "this deployment is hosted". Reading it as
+ * HOSTED would refuse `http://localhost:4000/graphql` for EVERY self-hosted
+ * install at once — a brake nobody can arm, taking away traffic that works
+ * today, which is the regression this round exists to stop rather than cause.
+ *
+ * So the unthreaded case is {@link SELF_HOSTED_EGRESS_POLICY}, which is an
+ * EXISTING named constant and not a new one, and it still bites hard:
+ * `NEVER_PERMITTED_BY_DEFAULT` — link-local, multicast, unspecified and
+ * unparseable — is refused in it, so 169.254.169.254 and `0177.0.0.1` are
+ * refused, as are a non-http(s) scheme, userinfo in the URL and a name that
+ * does not resolve. What it permits that a hosted policy would not is a
+ * private, loopback or reserved address, and the decision then carries
+ * {@link SELF_HOSTED_EGRESS_WARNING}, which {@link guardProtocolTarget} writes
+ * into the transcript — because a check that was skipped must be NAMED rather
+ * than silently not performed.
+ *
+ * The moment the field is threaded, a stored policy decides and a HOSTED
+ * deployment narrows to public-only with no change here.
+ */
+export function protocolEgressPolicy(raw: unknown): EgressPolicy {
+  return raw === undefined || raw === null ? SELF_HOSTED_EGRESS_POLICY : resolveEgressPolicy(raw);
+}
+
+/**
+ * `Environment.egressPolicy`, as the run context carries it.
+ *
+ * Read STRUCTURALLY because `RunContext` does not declare the field yet — see
+ * {@link protocolEgressPolicy}. The day it lands this keeps working.
+ */
+function egressPolicyOf(ctx: RunContext): unknown {
+  return (ctx as RunContext & { readonly egressPolicy?: unknown }).egressPolicy;
+}
+
+/**
+ * THE REAL GUARD, BUILT LAZILY.
+ *
+ * `private-address.ts` reaches for `node:dns`, so it is imported through the
+ * package SUBPATH and DYNAMICALLY — the same arrangement `defaultCrawlEgressIo`
+ * and `defaultHostGuardIo` use, and it means a test that injects a guard never
+ * loads a resolver at all.
+ */
+export async function defaultProtocolEgressGuard(policy?: unknown): Promise<ProtocolEgressGuard> {
+  const [addresses, dns] = await Promise.all([
+    import('@qaai/shared/private-address'),
+    import('node:dns'),
+  ]);
+  const resolved = protocolEgressPolicy(policy);
+  const io: EgressGuardIo = {
+    classifyHost: (host) => addresses.classifyHost(host),
+    classifyAddress: (address) => addresses.classifyAddress(address),
+    /*
+     * EVERY address the name has, not the first — a record set mixing one
+     * routable address with 169.254.169.254 is the attack written down — and
+     * `verbatim: true` so the OS does not reorder and hide one.
+     */
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    // Monotonic, NOT the wall clock: an NTP step backwards mid-refusal would
+    // make the pad negative and therefore zero, and a refusal that skipped its
+    // pad is the timing oracle the floor exists to close.
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        // Unreffed: a draining worker must not be held open by a refusal's pad.
+        timer.unref?.();
+      }),
+  };
+  return (url) => guardUrl({ url, context: 'PLUGIN_HTTP', policy: resolved, io });
+}
+
+/**
+ * THE URL THE GUARD IS ASKED ABOUT, WHICH IS NOT ALWAYS THE URL WE CONNECT TO.
+ *
+ * `guardUrl` refuses any scheme that is not http or https, because `file:`,
+ * `gopher:` and `data:` are not pages. A WebSocket URL is `ws:` or `wss:` and
+ * would therefore be refused as SCHEME_NOT_PERMITTED — which would break every
+ * WebSocket test in the product and would be a refusal for the wrong reason.
+ *
+ * But a `ws://` URL STILL RESOLVES A HOST and still opens a TCP connection to
+ * it: `ws://169.254.169.254/` reaches the cloud metadata service exactly as
+ * `http://169.254.169.254/` does, and the WebSocket handshake is an HTTP
+ * Upgrade over the same port. So the scheme is mapped to the one the guard
+ * reads — `ws:`→`http:`, `wss:`→`https:` — and the host, the port and the
+ * userinfo, which is all this guard looks at, are untouched. Anything else
+ * (`file:`, a relative string that somehow survived) is handed over AS IT IS,
+ * so the guard refuses it rather than this function guessing.
+ */
+function egressUrlFor(url: string): string {
+  if (/^ws:\/\//i.test(url)) return `http://${url.slice('ws://'.length)}`;
+  if (/^wss:\/\//i.test(url)) return `https://${url.slice('wss://'.length)}`;
+  return url;
+}
+
+/**
+ * ASK THE GUARD, AND RECORD WHAT IT ANSWERED.
+ *
+ * ── The refusal is ONE SENTENCE, and the reason is this plugin specifically ─
+ *
+ * {@link refusalForCaller} returns {@link EGRESS_REFUSAL_SENTENCE} for all
+ * seventeen refusals. The step list of a run is read by whoever wrote the spec,
+ * and the spec's `endpoint` is the thing being refused — so a message that
+ * distinguished "that is a link-local address" from "that host did not resolve"
+ * from "that host is not on the allowlist" would turn a PROTOCOL test into a
+ * port scanner for OUR network with a readable report, which is what
+ * `NetworkEntry.status` and the 300-character body snippet already half were.
+ * `verdict.operatorDetail` holds the class, the address and the refusal code,
+ * and it is deliberately NOT recorded here.
+ *
+ * ── The SELF_HOSTED warning is written down rather than skipped silently ────
+ *
+ * A guard that passes silently in the one mode where it does nothing is
+ * indistinguishable from a guard that ran. So when the decision permitted a
+ * non-public target under a self-hosted class list, the sentence saying so goes
+ * into the transcript. It names no address and no class, so it is safe where
+ * the refusal sentence is safe.
+ */
+async function guardProtocolTarget(
+  guard: ProtocolEgressGuard,
+  recorder: StepRecorder,
+  url: string,
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly sentence: string }> {
+  const verdict = await guard(egressUrlFor(url));
+  if (!verdict.ok) return { ok: false, sentence: refusalForCaller(verdict).sentence };
+
+  if (verdict.permit.decision.warning !== null) {
+    recorder.log('•', verdict.permit.decision.warning);
+  }
+  if (verdict.permit.kind === 'OBSERVED') {
+    /*
+     * The brake let this through and it must be VISIBLE, not merely counted
+     * somewhere an operator has to go looking. A mode that nobody can see the
+     * effect of is an off switch with a reassuring name.
+     */
+    recorder.log(
+      '•',
+      'This connection would have been refused by the egress policy; the policy is in OBSERVE ' +
+        'mode, so it was allowed and counted.',
+    );
+  }
+  return { ok: true };
+}
+
+/**
+ * A target this plugin will not open. Never a FAILED test and never a PASSED
+ * one.
+ *
+ * SKIPPED for the same reason {@link skippedForMissingTool} is: the customer's
+ * service was not evaluated, so calling it FAILED blames their code for our
+ * refusal. And emphatically not PASSED — a refused endpoint reported as a pass
+ * is "a pass that means we did not check", which is the lie this product cannot
+ * afford, and on this surface it would mean an unreachable service looking
+ * tested.
+ */
+function refusedByEgress(
+  test: ExecutableTest,
+  startedAt: number,
+  recorder: StepRecorder,
+  secrets: Readonly<Record<string, string>>,
+  sentence: string,
+): TestExecution {
+  recorder.skip('Open the endpoint', sentence);
+  return finish(test, startedAt, recorder, [], secrets, {
+    status: 'SKIPPED',
+    errorMessage: sentence,
+  });
 }
 
 /** Structural equality good enough for assertion literals, as in the API plugin. */
@@ -595,6 +844,7 @@ async function runGraphql(
   test: ExecutableTest,
   spec: GraphqlProtocolSpec,
   startedAt: number,
+  egress: ProtocolEgressGuard,
 ): Promise<TestExecution> {
   const vars: Record<string, string> = { ...ctx.secrets, ...spec.variables };
   const endpoint = resolveUrl(ctx.baseUrl, interpolate(spec.endpoint, vars));
@@ -604,6 +854,20 @@ async function runGraphql(
   });
   const recorder = new StepRecorder(ctx, test.id);
   const network: NetworkEntry[] = [];
+
+  /*
+   * BEFORE THE FIRST REQUEST, AND BEFORE THE INTROSPECTION ONE.
+   *
+   * `spec.endpoint` may be an absolute URL — that is the documented legitimate
+   * case — so it chooses the host, from a file in the customer's repository,
+   * and the introspection POST below is the FIRST thing that would reach it.
+   * Interpolated headers carry vault secrets, so a refusal after this point
+   * would already have sent them.
+   */
+  const allowed = await guardProtocolTarget(egress, recorder, endpoint);
+  if (!allowed.ok) {
+    return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
+  }
 
   const post = async (
     body: string,
@@ -847,6 +1111,7 @@ async function runWebSocket(
   test: ExecutableTest,
   spec: WebsocketProtocolSpec,
   startedAt: number,
+  egress: ProtocolEgressGuard,
 ): Promise<TestExecution> {
   const vars: Record<string, string> = { ...ctx.secrets, ...spec.variables };
   const recorder = new StepRecorder(ctx, test.id);
@@ -868,6 +1133,19 @@ async function runWebSocket(
   } catch (err) {
     recorder.record('Connect', Date.now(), [`Could not build a WebSocket URL: ${errorText(err)}`]);
     return finish(test, startedAt, recorder, network, ctx.secrets);
+  }
+
+  /*
+   * GATED BEFORE THE SOCKET IS CONSTRUCTED. `new WebSocket(url)` connects
+   * immediately — there is no later seam — and `headerBag` above has already
+   * interpolated vault secrets into the handshake headers, so a refusal after
+   * this point would have sent them. `ws://` is mapped to `http://` for the
+   * guard by `egressUrlFor`, because a ws URL resolves a host exactly like an
+   * http one and the guard reads only the host, the port and the userinfo.
+   */
+  const allowed = await guardProtocolTarget(egress, recorder, url);
+  if (!allowed.ok) {
+    return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
   }
 
   const frames: string[] = [];
@@ -1166,6 +1444,7 @@ async function runSse(
   test: ExecutableTest,
   spec: SseProtocolSpec,
   startedAt: number,
+  egress: ProtocolEgressGuard,
 ): Promise<TestExecution> {
   const vars: Record<string, string> = { ...ctx.secrets, ...spec.variables };
   const recorder = new StepRecorder(ctx, test.id);
@@ -1175,6 +1454,13 @@ async function runSse(
     accept: 'text/event-stream',
     'cache-control': 'no-cache',
   });
+
+  // `spec.path` takes an absolute URL exactly as `spec.endpoint` does, so this
+  // is the same door and it is gated before the stream is opened.
+  const allowed = await guardProtocolTarget(egress, recorder, url);
+  if (!allowed.ok) {
+    return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
+  }
 
   const controller = new AbortController();
   const onRunAbort = () => controller.abort();
@@ -1643,7 +1929,31 @@ async function runGrpc(
 
 // ─── Plugin ──────────────────────────────────────────────────────────────────
 
-export const protocolPlugin: RunnerPlugin = {
+/**
+ * The plugin, PLUS the one seam a test needs.
+ *
+ * `RunnerPlugin.execute` takes two parameters, so a `protocolPlugin` typed as
+ * `RunnerPlugin` cannot be handed a third even though the function accepts one
+ * — the interface narrows the call signature, and a test that injected a guard
+ * would be a TS2554. Widening the EXPORTED type rather than `RunnerPlugin`
+ * itself keeps the change inside this file: the registry still consumes it as a
+ * `RunnerPlugin` (an extra OPTIONAL parameter is assignable), and a test can
+ * decide without a resolver.
+ *
+ * Adding `egress?` to `RunnerPlugin` in `packages/shared/src/types.ts` would be
+ * the better home for it once more than one plugin needs it, and the other
+ * plugins that fetch — `api.ts`, `email.ts`, `load.ts` — all do. It is in the
+ * handover.
+ */
+export interface ProtocolPlugin extends RunnerPlugin {
+  execute(
+    ctx: RunContext,
+    test: ExecutableTest,
+    egress?: ProtocolEgressGuard,
+  ): Promise<TestExecution>;
+}
+
+export const protocolPlugin: ProtocolPlugin = {
   type: 'PROTOCOL',
 
   validate(test: ExecutableTest): void {
@@ -1686,18 +1996,49 @@ export const protocolPlugin: RunnerPlugin = {
     }
   },
 
-  async execute(ctx: RunContext, test: ExecutableTest): Promise<TestExecution> {
+  async execute(
+    ctx: RunContext,
+    test: ExecutableTest,
+    /**
+     * The egress guard, injected. OPTIONAL so `RunnerPlugin.execute` keeps its
+     * shape and every production caller keeps compiling — the worker's harness
+     * supplies none, so this door builds {@link defaultProtocolEgressGuard}
+     * itself and there is no path to a transport without a decision. A test
+     * supplies its own and never touches a resolver.
+     */
+    egress?: ProtocolEgressGuard,
+  ): Promise<TestExecution> {
     const startedAt = Date.now();
     const spec = protocolTestSpecSchema.parse(test.spec);
 
+    /*
+     * ── THE PRODUCTION DOOR FILLS IN THE GUARD ───────────────────────────────
+     *
+     * Built HERE, once, rather than inside each of the three drivers, for the
+     * reason `signInWithProfile` gives about the same decision: a control each
+     * driver has to remember is a control the next driver forgets. The three
+     * drivers below take it as a REQUIRED parameter, so a fourth protocol
+     * cannot be added without being handed one.
+     */
+    const guard = egress ?? (await defaultProtocolEgressGuard(egressPolicyOf(ctx)));
+
     switch (spec.protocol) {
       case 'GRAPHQL':
-        return runGraphql(ctx, test, spec, startedAt);
+        return runGraphql(ctx, test, spec, startedAt, guard);
       case 'WEBSOCKET':
-        return runWebSocket(ctx, test, spec, startedAt);
+        return runWebSocket(ctx, test, spec, startedAt, guard);
       case 'SSE':
-        return runSse(ctx, test, spec, startedAt);
+        return runSse(ctx, test, spec, startedAt, guard);
       case 'GRPC':
+        /*
+         * NOT GATED, AND SAYING SO IS THE POINT. gRPC does not use `fetch` or
+         * `WebSocket` — it shells out to `grpcurl` with `spec.target`, which is
+         * a host:port and not a URL, so neither `guardUrl` nor `egressUrlFor`
+         * reads it and a `host:port` handed to `new URL()` parses as a scheme.
+         * It is the same hole by a different transport; it is outside this
+         * slice's listed items and it is in the handover rather than left
+         * unsaid.
+         */
         return runGrpc(ctx, test, spec, startedAt);
     }
   },

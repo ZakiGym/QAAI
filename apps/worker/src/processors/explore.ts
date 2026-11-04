@@ -22,19 +22,43 @@ import {
   withObservation,
   withResumePoint,
 } from '@qaai/agent';
-import { signalsFromFlowMap } from '@qaai/agent';
+import { defaultCrawlEgressGate, signalsFromFlowMap } from '@qaai/agent';
 import {
   auditTestsAgainstCrawl,
   normalizeRoute,
   obsolescenceSignalsFor,
   routeExclusionsFromCrawl,
 } from '@qaai/agent';
-import type { PriorObsolescenceSignal, SuiteHealthTestInput } from '@qaai/agent';
+import type { CrawlEgressRow, PriorObsolescenceSignal, SuiteHealthTestInput } from '@qaai/agent';
 import type { ObsolescenceExclusion, RouteExclusion } from '@qaai/agent';
 import type { AuthProfileChoice, CrawlOutcome, TypeSignals, TypeVerdict } from '@qaai/agent';
 import { signInWithProfile } from '@qaai/runner';
 import type { LoginFailure, LoginResult } from '@qaai/runner';
-import { adjudicateCrawl } from '@qaai/shared';
+import { adjudicateCrawl, controlMode, resolveEgressPolicy } from '@qaai/shared';
+import type { ControlMode } from '@qaai/shared';
+/*
+ * THE SEALED SESSION'S READER, FROM THE MODULE THAT OWNS THE WHOLE PATH.
+ *
+ * `processors/auth-refresh.ts` says in its own re-export comment why it is the
+ * single specifier: this file and run.ts each re-derived "is this session
+ * fresh" from the raw columns, three spellings of one expression and wrong in
+ * all three. Importing the reader rather than re-deriving it is what makes
+ * that edit a deletion.
+ */
+import {
+  SESSION_ROW_SELECT,
+  SESSION_SEAL_CONTROL,
+  countSessionGate,
+  openCachedSession,
+  readVaultKeys,
+  sessionDegradation,
+  workerSessionCipher,
+} from './auth-refresh.js';
+import type {
+  SealedSessionRow,
+  SessionCipher,
+  SessionDegradationTally,
+} from '../../../api/src/lib/session-store.js';
 import type {
   AuthProfileKind,
   CrawlAcceptance,
@@ -758,6 +782,86 @@ export function planRolePasses(input: {
   };
 }
 
+// ─── The crawl's cached-session decision ─────────────────────────────────────
+
+/** What a role pass is handed back. `LoginResult`'s own shape, narrowed. */
+export type RoleSignIn = Pick<LoginResult, 'ok' | 'storageState' | 'message' | 'failure'>;
+
+/**
+ * THE CACHED-SESSION HALF OF THE CRAWL'S `signIn` ADAPTER.
+ *
+ * ── Why this is a function and not four lines in the closure ───────────────
+ *
+ * Because the four lines it replaces were untestable, and that is how they came
+ * to be wrong. `processExplore` needs a database, a browser and a crawl budget,
+ * so nothing in this repository ever executed the expression
+ *
+ *     profile?.storageState &&
+ *     (!profile.storageStateExpiresAt || profile.storageStateExpiresAt > new Date())
+ *
+ * at all — it read a NULL expiry as "valid for ever", it could not see the
+ * sealed column, and both facts were invisible to every test. Exported so the
+ * production closure and `explore.test.ts` run the SAME code; the closure is
+ * three lines long as a result, which is the point.
+ *
+ * ── NULL MEANS "DRIVE THE LOGIN", NOT "CRAWL ANONYMOUSLY" ──────────────────
+ *
+ * The one return value this must never produce is a successful sign-in with no
+ * session: `runRolePasses` would hand `storageState: null` to `deps.crawl` and
+ * enumerate the application as an anonymous visitor UNDER THIS ROLE'S NAME,
+ * which is how an auth-gated route came to look covered. Null sends the caller
+ * to the real login, and whatever that returns is a typed `RoleCrawlOutcome` —
+ * disclosed on `RoleCrawlAttempt`, never dropped.
+ */
+export async function cachedSessionForRole(
+  profile: SealedSessionRow,
+  options: {
+    readonly keys: Awaited<ReturnType<typeof readVaultKeys>>;
+    readonly cipher: SessionCipher | null;
+    readonly now: Date;
+    readonly mode: ControlMode;
+    /** The seal brake's count. Every decision lands in it, used ones included. */
+    readonly tallies: Map<string, SessionDegradationTally>;
+    readonly onLoginNeeded?: (facts: { state: string; source: string }) => void;
+  },
+): Promise<RoleSignIn | null> {
+  const cached = await openCachedSession(profile, {
+    keys: options.keys,
+    cipher: options.cipher,
+    now: options.now,
+    mode: options.mode,
+  });
+  /*
+   * SIGNED_IN AND NOT A DEGRADATION, for the reason run.ts's per-profile path
+   * records: the caller signs the role in when this returns null, so a cache
+   * miss here is the normal first pass and not a run the brake took away.
+   */
+  countSessionGate(
+    options.tallies,
+    profile.id,
+    cached.gate,
+    cached.storageState !== null ? 'USED' : 'SIGNED_IN',
+  );
+
+  if (cached.storageState !== null) {
+    return {
+      ok: true,
+      storageState: cached.storageState,
+      /*
+       * The SOURCE and the STATE, not the session. Both are members of closed
+       * lists — `CACHED_SESSION_SOURCES` and `SESSION_STATES` — so this
+       * sentence, which lands on `RoleCrawlAttempt.detail` and is read in the
+       * cockpit, can carry no part of a cookie.
+       */
+      message: `used the cached session (${cached.source}, ${cached.gate.state})`,
+      failure: null,
+    };
+  }
+
+  options.onLoginNeeded?.({ state: cached.gate.state, source: cached.source });
+  return null;
+}
+
 // ─── Running the passes ──────────────────────────────────────────────────────
 
 /**
@@ -1379,6 +1483,129 @@ export function loginRoutesFrom(passes: readonly RolePassResult[]): string[] {
 }
 
 /**
+ * ONE ROW PER (host, outcome, class, refusal, day), UPSERTED.
+ *
+ * ── Why this is a FLOOR and says so ───────────────────────────────────────
+ *
+ * `CrawlEgressRow.hosts` is a SAMPLE capped at `HOST_SAMPLE_CAP` while its
+ * `count` is the real, unbounded total. So a row that saw 400 distinct refused
+ * hosts hands over ten of them and the number 400. Writing one database row per
+ * sampled host would silently turn 400 into 10 — a cap applied without being
+ * disclosed, which is the third lie in the list this product cannot afford.
+ *
+ * Instead the per-host rows carry an EVEN SHARE of the count and the LAST row
+ * carries the remainder, so the stored counts sum to the true total; and
+ * `hostsOmitted` records how many hosts were dropped, which is what makes the
+ * table readable as a floor. The alternative — one row with a null host — would
+ * have been simpler and useless, because the host is the single thing an
+ * operator needs in order to write an allowlist entry.
+ *
+ * ── Why it never throws ───────────────────────────────────────────────────
+ *
+ * A tally is diagnosis. A crawl that enumerated an application correctly must
+ * not fail because its diagnostic write did, so every error is logged and
+ * swallowed. That is the one place in this round where swallowing is right, and
+ * it is right because the failure mode is a MISSING COUNT rather than an
+ * unapplied refusal: the refusal already happened, inside the gate, before this
+ * function was reached.
+ */
+async function recordEgressTally(input: {
+  readonly orgId: string;
+  readonly environmentId: string;
+  readonly rows: readonly CrawlEgressRow[];
+}): Promise<void> {
+  if (input.rows.length === 0) return;
+  /*
+   * MIDNIGHT UTC. The bucket granularity is a day and the unique index includes
+   * it, so two crawls on the same day must compute the SAME instant or they
+   * write two rows that both claim to be today. `setUTCHours` and not local
+   * midnight: a worker's timezone is not a fact about the customer.
+   */
+  const bucketDate = new Date();
+  bucketDate.setUTCHours(0, 0, 0, 0);
+
+  for (const row of input.rows) {
+    const hosts = row.hosts.length === 0 ? [''] : row.hosts;
+    const share = Math.floor(row.count / hosts.length);
+    for (const [index, host] of hosts.entries()) {
+      // The LAST sampled host carries the remainder, so the stored counts sum
+      // to `row.count` exactly rather than to a rounded-down approximation.
+      const count = index === hosts.length - 1 ? row.count - share * (hosts.length - 1) : share;
+      /*
+       * ── WHY THIS IS NOT AN `upsert`, WHICH IS A FACT ABOUT THE TABLE ───────
+       *
+       * `@@unique([orgId, environmentId, context, outcome, addressClass,
+       * refusal, host, bucketDate])` CANNOT BE USED AS AN UPSERT KEY, for two
+       * reasons that point the same way:
+       *
+       *   1. Prisma types a compound-unique `where` as NON-NULL on every
+       *      member, and `addressClass` and `refusal` are both nullable here —
+       *      `addressClass` is null when no address was classified at all, and
+       *      `refusal` is null exactly when the outcome is ALLOWED. So the
+       *      upsert does not compile for the rows that matter most.
+       *   2. More importantly, POSTGRES TREATS TWO NULLS AS DISTINCT in a
+       *      unique index. Even if it compiled, that index would not dedupe an
+       *      ALLOWED row or an unresolvable-host row — the two cases where
+       *      `refusal`/`addressClass` are null — so the "one row per bucket"
+       *      guarantee its own comment claims does not hold for them.
+       *
+       * So: `updateMany` (which accepts nulls in `where`) and `create` only if
+       * nothing matched. A race can still produce two rows for one bucket, and
+       * that is the honest trade: the COUNTS ADD, so the total an operator
+       * reads stays correct, and a duplicate row is a cosmetic duplicate rather
+       * than a wrong number. Recorded here rather than papered over, and the
+       * index fix — a partial index or sentinel-free dedupe — belongs to
+       * whoever owns the schema.
+       */
+      try {
+        const bumped = await prisma.egressDecisionTally.updateMany({
+          where: {
+            orgId: input.orgId,
+            environmentId: input.environmentId,
+            context: 'CRAWL',
+            outcome: row.outcome,
+            addressClass: row.addressClass,
+            refusal: row.refusal,
+            host,
+            bucketDate,
+          },
+          data: { count: { increment: count } },
+        });
+        if (bumped.count === 0) {
+          await prisma.egressDecisionTally.create({
+            data: {
+              orgId: input.orgId,
+              environmentId: input.environmentId,
+              context: 'CRAWL',
+              outcome: row.outcome,
+              addressClass: row.addressClass,
+              refusal: row.refusal,
+              host,
+              bucketDate,
+              count,
+              // Charged ONCE, to the first row, so a ten-host sample of forty
+              // hosts does not report thirty omitted ten times over.
+              hostsOmitted: index === 0 ? Math.max(0, row.count - hosts.length) : 0,
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn(
+          /*
+           * The OUTCOME and the CLASS, never the host. This line goes to the
+           * install's logs, and while a crawl's own tenant chose the host, a
+           * log line is the one place an address leaks furthest from the person
+           * who typed it. The row it failed to write is identified by its shape.
+           */
+          { err, outcome: row.outcome, addressClass: row.addressClass },
+          'could not record an egress decision tally row',
+        );
+      }
+    }
+  }
+}
+
+/**
  * Adjudicates the UNION, which is the thing that replaces the denominator.
  *
  * The shrink test lives here and nowhere else, for the reason `runRolePasses`
@@ -1442,7 +1669,22 @@ export async function processExplore(job: ExploreJob): Promise<void> {
     // minting an assertion against a real system is forging a real identity —
     // and a refusal that depends on a caller remembering an argument is not a
     // refusal.
-    select: { id: true, baseUrl: true, projectId: true, crawlPolicy: true, kind: true },
+    /*
+     * `egressPolicy` IS READ HERE AND PASSED TO THE CRAWL, and a field added to
+     * this projection without a reader is half the defect it was minted to fix.
+     * Its reader is `crawlApp`, which hands it to `resolveEgressPolicy`; an
+     * absent or malformed value falls back to the HOSTED policy — PUBLIC ONLY —
+     * so dropping this line would not open the crawl up, it would silently make
+     * every self-hosted install's private-network policy stop applying.
+     */
+    select: {
+      id: true,
+      baseUrl: true,
+      projectId: true,
+      crawlPolicy: true,
+      kind: true,
+      egressPolicy: true,
+    },
   });
   if (!environment) throw new Error(`Environment ${environmentId} not found for org ${orgId}`);
 
@@ -1494,9 +1736,23 @@ export async function processExplore(job: ExploreJob): Promise<void> {
 
   const [subscription, org] = await Promise.all([
     prisma.subscription.findUnique({ where: { orgId }, select: { plan: true, status: true } }),
-    prisma.organization.findUnique({ where: { id: orgId }, select: { plan: true } }),
+    prisma.organization.findUnique({
+      where: { id: orgId },
+      // `securityControlModes` on the read that was already here, rather than a
+      // second query: the seal brake is per ORG, and one more column on a row
+      // this function already fetches is the cheapest way for a control to be
+      // armable at all. A brake nobody can reach is rule 13's defect inverted.
+      select: { plan: true, securityControlModes: true },
+    }),
   ]);
   const orgPlan: Plan = effectivePlan(subscription, org?.plan ?? null).effective;
+  /*
+   * THE SEAL BRAKE FOR THIS ORG. `controlMode` falls back to the control's own
+   * default (ENFORCE) for a missing or malformed stored value, so an org that
+   * has never touched the setting gets the documented behaviour and not an
+   * accidental off switch.
+   */
+  const sealMode: ControlMode = controlMode(SESSION_SEAL_CONTROL, org?.securityControlModes ?? null);
 
   /*
    * The environment's auth profiles, read once and used for two different
@@ -1517,7 +1773,6 @@ export async function processExplore(job: ExploreJob): Promise<void> {
     where: { orgId, environmentId },
     orderBy: { createdAt: 'asc' },
     select: {
-      id: true,
       name: true,
       kind: true,
       // THE ROLE AXIS. Null means "nobody said what this profile is", which
@@ -1525,8 +1780,23 @@ export async function processExplore(job: ExploreJob): Promise<void> {
       // the anonymous visitor.
       role: true,
       config: true,
-      storageState: true,
-      storageStateExpiresAt: true,
+      /*
+       * EVERY COLUMN THE GATE DECIDES ON, THROUGH ONE DEFINITION.
+       *
+       * This was `storageState` and `storageStateExpiresAt` only, which is why
+       * the sealing sweep turned every authenticated pass of every customer's
+       * application into a fresh unattended login: the sealed columns were not
+       * selected, so nothing in this file could see the session that was
+       * actually there. `SESSION_ROW_SELECT` is `satisfies
+       * Record<keyof SealedSessionRow, true>`, so a column added to the row
+       * type is a compile error here rather than a column this query silently
+       * stops reading.
+       *
+       * It carries `id: true`, which is why this object no longer names `id`
+       * itself: two spellings of one column is a TS2783 and, worse, an
+       * invitation to delete the wrong one.
+       */
+      ...SESSION_ROW_SELECT,
     },
   });
   const authProfileChoices: AuthProfileChoice[] = profiles.map((profile) => ({
@@ -1588,6 +1858,54 @@ export async function processExplore(job: ExploreJob): Promise<void> {
     select: { role: true, outcome: true, attemptedAt: true },
   });
 
+  /*
+   * ── ONE EGRESS GATE FOR THE WHOLE JOB, BUILT HERE SO ITS COUNTS SURVIVE ───
+   *
+   * `crawlApp` builds its own gate when none is passed, and that is what makes
+   * the production path impossible to run ungated. It is built HERE instead for
+   * one reason: a gate constructed inside `crawlApp` is garbage the moment the
+   * crawl returns, and its tally goes with it. `EgressDecisionTally` is the
+   * table that answers "what would ENFORCE have refused on this install?" —
+   * the question an operator has to answer BEFORE arming a brake — and a mode
+   * that counts nothing is an off switch with a reassuring name.
+   *
+   * ONE gate across every role pass, deliberately. The pin cache is per host
+   * and the roles crawl the same hosts, so sharing it means one resolver round
+   * trip per host for the whole job rather than one per role; and the tally
+   * then counts the job, which is the unit an operator reads.
+   */
+  const egressGate = await defaultCrawlEgressGate(resolveEgressPolicy(environment.egressPolicy));
+
+  /*
+   * ── THE KEYS AND THE CIPHER FOR THE CACHED SESSIONS, READ ONCE ─────────────
+   *
+   * Once per job and not once per role: the key table is the same for every
+   * pass, and a `findMany` inside the `signIn` closure would re-read it for
+   * every identity the plan probes.
+   *
+   * The cipher is NULLABLE on purpose — see `workerSessionCipher`. A malformed
+   * `VAULT_MASTER_KEY` must not throw out of here: it would take down the
+   * ANONYMOUS pass too, and that pass needs no key at all.
+   */
+  const sessionKeys = await readVaultKeys(prisma);
+  const sessionCipher = workerSessionCipher();
+  if (sessionKeys.unreadableVersions.length > 0) {
+    logger.warn(
+      { versions: sessionKeys.unreadableVersions, projectId },
+      'vault key rows whose state could not be read; sealed sessions under them will not open',
+    );
+  }
+  /*
+   * THE SEAL BRAKE'S COUNT, PER PROFILE AND PER STATE.
+   *
+   * `SECURITY_CONTROL_BRAKES.SESSION_STATE_SEAL.observeCounts` is what this
+   * pays: a mode that does not count is an off switch with a reassuring name.
+   * It is also the number that says how many profiles are still being written
+   * in the clear by a writer that predates the sealing migration, which is the
+   * worklist for retiring that column.
+   */
+  const sessionTallies = new Map<string, SessionDegradationTally>();
+
   const passes = await runRolePasses(
     {
       /*
@@ -1613,6 +1931,19 @@ export async function processExplore(job: ExploreJob): Promise<void> {
           ...(job.maxPages > 0 ? { maxPages: job.maxPages } : {}),
           ...(job.maxDepth > 0 ? { maxDepth: job.maxDepth } : {}),
           crawlPolicy: environment.crawlPolicy,
+          /*
+           * THE CRAWL'S EGRESS POLICY. Without this the crawl would still be
+           * gated — `crawlApp` builds a gate whether or not a policy arrives —
+           * but it would be gated by the HOSTED default on every deployment,
+           * so a self-hosted customer's own `permittedClasses` and allowlist
+           * would be ignored and their internal staging app would become
+           * uncrawlable. The fail-closed default is the right one to have; it
+           * is the wrong one to be stuck with.
+           */
+          egressPolicy: environment.egressPolicy,
+          // The gate built above, so ONE tally covers every role pass and
+          // outlives the crawl that produced it.
+          egressGate,
           plan: orgPlan,
           storageState: input.storageState,
           role: input.role,
@@ -1637,21 +1968,32 @@ export async function processExplore(job: ExploreJob): Promise<void> {
        * `message` can quote the page and `storageState` IS the session.
        */
       signIn: async (identity) => {
+        /*
+         * ── THE CACHED SESSION, THROUGH THE SEALED READER ───────────────────
+         *
+         * `cachedSessionForRole` holds the whole decision — see its own comment
+         * for the expression it replaces and why that expression was wrong in
+         * a way no test could see. A non-null answer is final; NULL means
+         * "there is no carryable session", which sends this closure to the real
+         * login and never to an anonymous crawl under this role's name.
+         *
+         * `new Date()` per call and NOT a clock hoisted to the top of the job:
+         * a crawl of a large application runs for minutes, and a `now` taken
+         * before the first pass would report a session that has since entered
+         * the refresh lead as FRESH.
+         */
         const profile = profiles.find((candidate) => candidate.id === identity.authProfileId);
-        const fresh =
-          profile?.storageState &&
-          (!profile.storageStateExpiresAt || profile.storageStateExpiresAt > new Date())
-            ? profile.storageState
-            : null;
-        if (fresh !== null) {
-          return {
-            ok: true,
-            storageState: fresh,
-            message: 'used the cached session',
-            failure: null,
-          };
-        }
         if (!profile) {
+          /*
+           * CHECKED BEFORE THE SESSION AND NOT AFTER IT, AND THAT ORDER IS
+           * HALF THE FIX. It used to sit after `profile?.storageState && …`,
+           * so a deleted profile fell through the freshness expression as
+           * `null` before reaching its own refusal — harmless by luck,
+           * because `null` happened to mean the same thing there, and exactly
+           * the pattern that made every other `null` on this path unreadable.
+           * Doing it here is also what lets `cachedSessionForRole` take a row
+           * rather than `row | undefined`, so nothing below needs a `!`.
+           */
           return {
             ok: false,
             storageState: null,
@@ -1665,6 +2007,26 @@ export async function processExplore(job: ExploreJob): Promise<void> {
             },
           };
         }
+        const cached = await cachedSessionForRole(profile, {
+          keys: sessionKeys,
+          cipher: sessionCipher,
+          now: new Date(),
+          mode: sealMode,
+          tallies: sessionTallies,
+          /*
+           * A login driven because the cache could not answer is worth a line:
+           * it is an unattended credential-using call at the customer's own
+           * login form that a usable cache would have avoided, and the state
+           * name is how an operator tells "never signed in" from "the sweep
+           * emptied it and has not refilled it yet".
+           */
+          onLoginNeeded: (facts) =>
+            logger.info(
+              { ...facts, role: identity.role, projectId },
+              'no carryable cached session for this role; driving a login',
+            ),
+        });
+        if (cached) return cached;
         const secrets = await secretsFor(orgId, environmentId);
         const result = await signInWithProfile(
           { id: profile.id, name: profile.name, kind: profile.kind, config: profile.config },
@@ -1672,7 +2034,20 @@ export async function processExplore(job: ExploreJob): Promise<void> {
           // `environmentKind` is required with no default, because MOCK_IDP is
           // refused on PRODUCTION and a refusal that depends on a caller
           // remembering an argument is not a refusal.
-          { environmentKind: environment.kind, baseUrl: environment.baseUrl },
+          {
+            environmentKind: environment.kind,
+            baseUrl: environment.baseUrl,
+            /*
+             * THE LOGIN'S EGRESS POLICY. Without it the login is still guarded
+             * — `signInWithProfile` builds a guard whether or not a policy
+             * arrives — but it would be guarded by the HOSTED default on every
+             * deployment, so a self-hosted customer's own permitted classes
+             * would be ignored and their internal staging app could not be
+             * signed into. The fail-closed default is the right one to have and
+             * the wrong one to be stuck with.
+             */
+            egressPolicy: environment.egressPolicy,
+          },
         );
         return {
           ok: result.ok,
@@ -1684,6 +2059,53 @@ export async function processExplore(job: ExploreJob): Promise<void> {
     },
     rolePlan,
   );
+
+  /*
+   * ── WHAT THE EGRESS CONTROL DECIDED, PERSISTED ─────────────────────────────
+   *
+   * THE DEFECT THIS CLOSES: `EgressDecisionTally` was reported DISCONNECTED —
+   * "a schema entry for a feature that does not exist" — and the gate's own
+   * open problem said the install-wide number ("we would have refused 1,204
+   * connections, 1,198 of them loopback from CRAWL") was a GROUP BY over a
+   * table with no writer. This is the writer. Without it the rollout brake is
+   * unusable in the only way that matters: an operator cannot see what ENFORCE
+   * would stop, so the honest choice is never to arm it.
+   *
+   * WRITTEN AFTER THE PASSES AND BEFORE THE ACCEPTANCE GATE, deliberately. The
+   * acceptance gate can reject a crawl's whole graph — and a REJECTED crawl's
+   * refusals are exactly the ones worth seeing, because "the policy refused
+   * most of this application" is a very good reason for a crawl to have come
+   * back too small. Counting only accepted crawls would hide the cause and
+   * leave the symptom.
+   *
+   * NEVER THROWS. A tally is diagnosis, and a failed upsert must not fail a
+   * crawl that succeeded — that would make the observability of a control into
+   * a new way for the product to break.
+   */
+  await recordEgressTally({ orgId, environmentId, rows: egressGate.operatorRows() });
+
+  /*
+   * ── WHAT THE SEAL BRAKE DECIDED ON THIS JOB, REPORTED ─────────────────────
+   *
+   * A cap or a refusal applied without being counted and reported is one of the
+   * lies this product cannot ship, and the OBSERVE half of a brake is worthless
+   * unless somebody can read it. Logged with a DENOMINATOR — `used` beside
+   * `degraded` and `blocked` — because "we would have refused 412" is only
+   * defensible beside how many decisions there were.
+   *
+   * Counts and state names only. The tally is keyed on (profile id, session
+   * state): a cuid and a member of a closed list, neither of which can carry a
+   * cookie. There is deliberately no row written: the sealed-session control
+   * has no tally TABLE, and inventing one here would be a schema decision this
+   * slice does not own — see `openProblems`.
+   */
+  const sessionBrake = sessionDegradation(sessionTallies.values());
+  if (sessionBrake.total > 0) {
+    logger.info(
+      { ...sessionBrake, mode: sealMode, projectId, environmentId },
+      'cached-session decisions for this crawl',
+    );
+  }
 
   /*
    * ── THE ACCEPTANCE GATE, NOW OVER THE UNION ────────────────────────────────

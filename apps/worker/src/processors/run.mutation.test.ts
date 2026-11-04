@@ -319,6 +319,38 @@ function install(): Captured {
     testFlakeHistory: { findUnique: async () => null, upsert: async () => ({}) },
     pluginEnablement: { findMany: async () => [] },
     integration: { findFirst: async () => null },
+    /*
+     * `VaultKey`, WHICH THIS FAKE DID NOT HAVE AND THE RUN NOW READS.
+     *
+     * apps/worker/src/processors/run.ts resolves the sealed-session keyring
+     * before it touches a test, so a fake with no `vaultKey` makes
+     * `prisma.vaultKey.findMany` a TypeError, `processRun` aborts into its own
+     * catch, and EVERY assertion in this file about what the run did fails with
+     * an empty array — which is how six tests here failed for a reason none of
+     * them is about.
+     *
+     * HONOURS `select` AND `orderBy`, and THROWS on anything else: a fake that
+     * ignored `select` would make dropping `state: true` from
+     * `VAULT_KEY_SELECT` undetectable, and a key whose state cannot be read
+     * must seal and open nothing. EMPTY on purpose — this file's runs use no
+     * auth profile, so an empty keyring is the honest fixture and `sealSession`
+     * refusing on it is never reached.
+     */
+    vaultKey: {
+      findMany: async (args: { select?: unknown; orderBy?: unknown }) => {
+        if (args.orderBy === undefined || (args.orderBy as { version?: string }).version !== 'asc') {
+          throw new Error('fake prisma: vaultKey.findMany without orderBy version asc');
+        }
+        const select = args.select as Record<string, true> | undefined;
+        if (!select) throw new Error('fake prisma: vaultKey.findMany with no select');
+        for (const key of ['keyId', 'version', 'state']) {
+          if (select[key] !== true) {
+            throw new Error(`fake prisma: vaultKey.findMany stopped selecting ${key}`);
+          }
+        }
+        return [];
+      },
+    },
     authProfile: { findFirst: async () => null, update: async () => ({}) },
     visualBaseline: { findFirst: async () => null, upsert: async () => ({}) },
     runShard: {

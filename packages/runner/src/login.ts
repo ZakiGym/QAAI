@@ -118,10 +118,12 @@ import {
   AUTH_PROFILE_CONFIG_SCHEMAS,
   authAdapterUnavailable,
   authProfileKindRefusedOn,
+  chromiumHostResolverRules,
 } from '@qaai/shared';
 import type {
   AuthAdapterUnavailable,
   AuthCapability,
+  EgressPermit,
 } from '@qaai/shared';
 
 // ─── What a login can fail at, and whose problem it is ───────────────────────
@@ -362,7 +364,13 @@ export interface LoginStorageState {
  *
  * Narrow enough to fake in an object literal, which is the whole point: the
  * fakes in `login.test.ts` are page scripts, and the one real implementation
- * ({@link playwrightLoginBrowser}) has no judgement in it to get wrong.
+ * ({@link playwrightLoginBrowser}) has almost no judgement in it to get wrong.
+ * ALMOST, and the exception is named rather than glossed: it decides whether to
+ * pass `--host-resolver-rules`, because Chromium's pin is a launch argument and
+ * there is nowhere else to make that call. `playwrightCrawlAdapter` carries the
+ * same single decision for the same reason, and neither is covered by a unit
+ * test — a launch argument cannot be asserted without launching a browser, so
+ * what the tests assert is that the right string reached the factory.
  *
  * `waitFor` returns false rather than throwing, because "the success locator
  * never appeared" is an ordinary measurement here and the control flow around
@@ -375,7 +383,16 @@ export interface LoginBrowser {
   fill(selector: string, value: string, timeoutMs: number): Promise<boolean>;
   click(selector: string, timeoutMs: number): Promise<boolean>;
   waitFor(selector: string, timeoutMs: number): Promise<boolean>;
-  /** For a failure message. Masked before it reaches a caller. */
+  /**
+   * The page title.
+   *
+   * KEPT ON THE INTERFACE AND NO LONGER READ BY ANY DRIVER. See
+   * {@link titleLeakRemoved} for why the three readers were deleted. It stays
+   * here because `playwrightLoginBrowser` and every injected surface implement
+   * it, and removing a method from a published interface to make a point would
+   * break those implementations for no safety gain — but a new reader of it is
+   * a new information leak, and that is what the note is for.
+   */
   title(): Promise<string>;
   storageState(): Promise<LoginStorageState>;
   close(): Promise<void>;
@@ -506,8 +523,15 @@ export interface MockIdpSurface {
  * functions below — the seam is a contract rather than a convention.
  */
 export interface LoginSurfaces {
-  /** Opens a browser. Defaults to {@link playwrightLoginBrowser}. */
-  browser?: () => Promise<LoginBrowser>;
+  /**
+   * Opens a browser. Defaults to {@link playwrightLoginBrowser}.
+   *
+   * It takes a {@link LoginBrowserLaunch} because Chromium's pin is a LAUNCH
+   * argument and nothing else can reach its resolver — so a factory that
+   * ignored this opens an unpinned browser, which is the measured defect. A
+   * test's factory may ignore it; the real one must not.
+   */
+  browser?: (launch: LoginBrowserLaunch) => Promise<LoginBrowser>;
   mailbox?: MailboxSurface;
   otpSink?: OtpSinkSurface;
   /**
@@ -521,6 +545,25 @@ export interface LoginSurfaces {
   now?: () => number;
   /** Injected so a poll does not really sleep. Defaults to `setTimeout`. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * THE EGRESS GUARD. Every login browser is wrapped in it — see
+   * {@link guardLoginBrowser}.
+   *
+   * It lives on `surfaces` rather than being threaded through each driver's
+   * signature because `surfaces` ALREADY reaches all six of them, and a control
+   * that has to be passed at six call sites is a control the seventh driver
+   * omits. {@link signInWithProfile} fills it in with
+   * {@link defaultLoginEgressGuard} when a caller supplies none, so the
+   * production path cannot run unguarded; a test supplies its own and never
+   * loads `node:dns`.
+   *
+   * ABSENT HERE REFUSES EVERYTHING. `openBrowser` falls back to a guard that
+   * says no, not to one that says yes. That is the difference between failing
+   * closed and a control with an off switch nobody can see — and it makes the
+   * omission loud (every login refuses) instead of silent (every login
+   * unguarded).
+   */
+  egress?: LoginEgressGuard;
 }
 
 /**
@@ -956,8 +999,586 @@ function requireSecrets(
   return { ok: true, values: names.map((name) => secrets[name] ?? '') };
 }
 
-async function openBrowser(surfaces: LoginSurfaces): Promise<LoginBrowser> {
-  return (surfaces.browser ?? playwrightLoginBrowser)();
+// ─── The egress guard, at the one seam every driver shares ──────────────────
+
+/**
+ * WHAT THE GUARD ANSWERED: yes or no, AND WHICH ADDRESSES IT AUTHORISED.
+ *
+ * ── WHY THIS TYPE GREW A SECOND FIELD, AND WHY THAT IS NOT A LEAK ──────────
+ *
+ * It used to be `{ ok: boolean }` and nothing else, on the argument that a
+ * login failure is rendered into the cockpit and stored on the profile, so
+ * anything this carried would be an SSRF probe's reply ticket. The CONCLUSION
+ * was right and the PREMISE was wrong: the leak is what a REFUSAL MESSAGE says,
+ * not what this type holds. {@link LOGIN_EGRESS_REFUSAL} is still the one
+ * sentence every refusal gets — no host, no class, no address, no reason — and
+ * `permit` never reaches a {@link LoginResult}. It is read in exactly one place
+ * ({@link planLoginLaunch}) and turned into a Chromium launch argument.
+ *
+ * Measured, 2026-10-30, against this tree with the real `guardUrl`: a login
+ * whose name answered `93.184.216.34` to the guard and `169.254.169.254` to the
+ * browser typed BOTH vault secrets into the link-local host. The guard had the
+ * pinned address in its hand, this type had nowhere to put it, and
+ * `defaultLoginEgressGuard` dropped it on the floor — so the browser resolved
+ * the name a SECOND time, unguarded, and `PinnedResolution` documents that as
+ * "a caller that takes `allowed` and then hands the hostname to fetch has not
+ * applied this control". That was this file.
+ *
+ * `permit` is OPTIONAL because a guard built by hand may have no permit to
+ * offer, and absent is read as "this guard pinned nothing" — which refuses the
+ * credential rather than typing it unpinned. See {@link LoginHostApproval}.
+ */
+export interface LoginEgressVerdict {
+  readonly ok: boolean;
+  /**
+   * The permit, FOR PINNING ONLY.
+   *
+   * Never rendered, never stored, never put in a message. `EgressPermit`
+   * carries the host, the address class and the refusal that would have fired,
+   * all of which are facts about the inside of the network — so the one thing
+   * this file does with it is read `pinned.addresses` and build
+   * `--host-resolver-rules`.
+   */
+  readonly permit?: EgressPermit | null;
+}
+
+/**
+ * MAY THIS LOGIN TOUCH THIS URL, AND AT WHICH ADDRESS. One function, injected.
+ */
+export type LoginEgressGuard = (url: string) => Promise<LoginEgressVerdict>;
+
+/**
+ * WHY NO LOGIN FAILURE QUOTES THE PAGE TITLE ANY MORE.
+ *
+ * Three failure paths used to append `(page title: "…")`: a driver action that
+ * returned false, a success locator that never appeared, and a TOTP code field
+ * that never appeared. It was put there to help somebody debug a wrong
+ * selector, and it is an information leak from inside the network.
+ *
+ * The login drives a browser to a URL off a profile row that any MEMBER can
+ * edit, from inside the API container. With the title echoed back, that is a
+ * read primitive: point a profile at an internal host, fail the login on
+ * purpose, and the response carries the `<title>` of whatever answered —
+ * `Grafana`, `phpMyAdmin`, `Kubernetes Dashboard`, the name of an internal
+ * tool. The egress guard now refuses those hosts, so the two controls overlap;
+ * they are kept separate because the title would still be a leak for a host the
+ * policy legitimately permits, such as a self-hosted install's own staging box
+ * where the interesting page is one hop inside.
+ *
+ * The selectors are still named in every message — they came from the profile
+ * and tell the customer nothing they did not write — so a wrong selector is
+ * still diagnosable. {@link LoginBrowser.title} is kept on the interface and
+ * read by nothing; `login.egress.test.ts` asserts a refused login's text
+ * carries no page title.
+ *
+ * @internal Documentation anchor. There is no runtime behaviour here.
+ */
+export const titleLeakRemoved = true;
+
+/**
+ * THE ONE SENTENCE A REFUSED LOGIN MAY SAY. Identical for every reason.
+ *
+ * A login failure is stored on the profile row and rendered in the cockpit, so
+ * this string is an answer handed back to whoever configured the URL — and for
+ * this control that person is the adversary. A message that distinguished "that
+ * is a link-local address" from "that host did not resolve" from "that host is
+ * not on the allowlist" would turn a failed login into a port scanner with a
+ * readable report. The operator-facing detail stays inside the guard's own
+ * `EgressDecision.detail` and never travels here.
+ */
+export const LOGIN_EGRESS_REFUSAL =
+  'Refused by this environment’s egress policy. Nothing was sent and no credential was typed.';
+
+/**
+ * THE REAL GUARD, BUILT LAZILY.
+ *
+ * `LOGIN` is not a label: `EGRESS_CONTEXT_RULES` keys the allowlist and the
+ * third-party rule off the context, and this one TYPES VAULT PLAINTEXT into
+ * whatever answers — which is why the guard refuses an https→http downgrade for
+ * it rather than treating the hop as the application's business.
+ *
+ * Imported through the SUBPATH for `private-address` and dynamically, because
+ * that module reaches for `node:dns`; a test that injects a guard never loads
+ * it. Same shape as `preflight.ts`'s `defaultHostGuardIo` and the crawler's
+ * `defaultCrawlEgressIo`.
+ */
+export async function defaultLoginEgressGuard(policy?: unknown): Promise<LoginEgressGuard> {
+  const [addresses, dns, shared] = await Promise.all([
+    import('@qaai/shared/private-address'),
+    import('node:dns'),
+    import('@qaai/shared'),
+  ]);
+  const resolved = shared.resolveEgressPolicy(policy);
+  const io = {
+    classifyHost: (host: string) => addresses.classifyHost(host),
+    classifyAddress: (address: string) => addresses.classifyAddress(address),
+    lookup: (host: string) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    monotonicMs: () => performance.now(),
+    delay: (ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      }),
+  };
+  return async (url) => {
+    const verdict = await shared.guardUrl({ url, context: 'LOGIN', policy: resolved, io });
+    /*
+     * THE PERMIT IS CARRIED, NOT DROPPED. This line used to read
+     * `return { ok: verdict.ok }`, which threw away the pinned address the
+     * guard had just resolved and classified — so the browser resolved the name
+     * again, by itself, with the rebinding window wide open. See
+     * {@link LoginEgressVerdict} for the probe that measured it.
+     *
+     * `permit: null` on the refusal arm rather than an omitted field, because
+     * `GuardVerdict` has no `permit` on that arm at all and an explicit null is
+     * the difference between "no permit" and "nobody looked".
+     */
+    return verdict.ok ? { ok: true, permit: verdict.permit } : { ok: false, permit: null };
+  };
+}
+
+/**
+ * WHAT THE LOGIN BROWSER WAS LAUNCHED WITH, which is the only pin it can have.
+ *
+ * Chromium resolves names inside its own network service, so neither a Node
+ * `lookup` hook nor `page.route` can reach that resolution — by the time a
+ * route handler sees a request the name is already an address.
+ * `--host-resolver-rules` is the supported seam and it is a LAUNCH ARGUMENT,
+ * fixed for the life of the process. `packages/agent/src/crawler.ts` takes the
+ * same string for the crawl's browser and says the same thing above it.
+ *
+ * Which is why the factory on {@link LoginSurfaces} takes this: a browser
+ * opened before the guard has answered cannot be pinned afterwards, so
+ * {@link planLoginLaunch} runs FIRST and the launch argument is built from its
+ * answer. An empty string means NO ARGUMENT, not an empty one —
+ * `--host-resolver-rules=` is a different thing to Chromium than its absence.
+ */
+export interface LoginBrowserLaunch {
+  /** The `--host-resolver-rules` value, or `''` for no argument at all. */
+  readonly hostResolverRules: string;
+}
+
+/**
+ * HOW A HOST GOT INTO THE RECORD, because `fill` has to branch on it.
+ *
+ * This is the type the old code was missing. There was a `Set<string>` of
+ * approved hosts, the comment above it called it "the pin cache", and it held
+ * NO ADDRESSES AT ALL — so "approved" and "pinned" were the same word for two
+ * different facts, and the login typed the vault plaintext into a host it had
+ * approved by name and never pinned.
+ *
+ *   PINNED    The guard resolved and classified these addresses AND they are in
+ *             the launch argument, so the browser's own resolution is
+ *             overridden. The credential may be typed.
+ *   OBSERVED  The policy is in OBSERVE mode. The connection happens exactly as
+ *             it did before this control existed — BY NAME, rebinding window
+ *             open — because that is what observe MEANS, and taking the login
+ *             away from an operator who set the brake would be the silent
+ *             behaviour change rule 13 forbids. The credential may be typed:
+ *             that is today's behaviour, unchanged, which is the whole point of
+ *             the mode. ENFORCE is the default ({@link
+ *             SECURITY_CONTROL_BRAKES}.EGRESS_CLASSIFICATION), so this arm is
+ *             reached only where somebody armed the brake on purpose.
+ *   UNPINNED  The guard said yes and we have no pin the BROWSER will honour —
+ *             either the guard offered no permit, or the host was first seen
+ *             AFTER launch, when the argument can no longer be changed. The
+ *             navigation proceeds, because refusing it would take away a hop
+ *             that works today (a magic link, an SSO assertion POST); the
+ *             CREDENTIAL does not, because this is the exact shape of the
+ *             defect: approved by name, resolved a second time by somebody
+ *             else. No driver in this file fills on a post-launch host.
+ *   REFUSED   The guard said no. Nothing is sent and nothing is typed, and the
+ *             answer is remembered so a second navigation to the same host does
+ *             not pay the refusal pad twice.
+ */
+export type LoginHostApproval =
+  | { readonly kind: 'PINNED'; readonly addresses: readonly string[] }
+  | { readonly kind: 'OBSERVED' }
+  | { readonly kind: 'UNPINNED' }
+  | { readonly kind: 'REFUSED' };
+
+/** What a host's verdict means for the launch argument and for `fill`. */
+function approvalFor(verdict: LoginEgressVerdict): LoginHostApproval {
+  if (!verdict.ok) return { kind: 'REFUSED' };
+  const permit = verdict.permit ?? null;
+  if (permit === null) {
+    /*
+     * ALLOWED WITH NO PERMIT, read as "this guard pinned nothing". FAIL CLOSED:
+     * a success arm that falls through to "pinned" would make deleting the pin
+     * undetectable, which is how the defect got here. The real guard always
+     * carries a permit — see {@link defaultLoginEgressGuard} — so this arm is a
+     * hand-built `LoginSurfaces`, and the honest reading of a guard that
+     * authorised no address is that no credential may be typed.
+     */
+    return { kind: 'UNPINNED' };
+  }
+  if (permit.kind === 'OBSERVED') return { kind: 'OBSERVED' };
+  if (permit.pinned.addresses.length === 0) {
+    /*
+     * A PIN THAT AUTHORISES NOTHING is as dangerous as no pin: both
+     * `chromiumHostResolverRules` and `pinnedLookup` answer with nothing for an
+     * empty address list, and a resolver that answers nothing falls back to the
+     * system one — the rebinding window this pin exists to close, reopened by
+     * an empty success. `packages/agent/src/crawl/egress.ts` refuses the same
+     * case and spells out why. REFUSED rather than UNPINNED, because the guard
+     * claimed to pin and produced nothing, which is a broken permit and not a
+     * mode.
+     */
+    return { kind: 'REFUSED' };
+  }
+  return { kind: 'PINNED', addresses: permit.pinned.addresses.map((pin) => pin.address) };
+}
+
+/**
+ * THE LAUNCH ARGUMENT, DECIDED BEFORE THE BROWSER EXISTS.
+ *
+ * The order is the control and it is easy to get backwards: the pin a browser
+ * can honour is a LAUNCH argument, so the guard has to answer for the entry URL
+ * BEFORE `chromium.launch`. `guardCrawlAdapter.open` admits the base URL first
+ * for exactly this reason and says so; this is the same shape, one URL at a
+ * time, because a login drives one entry point.
+ *
+ * ── A REFUSED HOST IS MAPPED TO NOTHING RATHER THAN LEFT OUT ───────────────
+ *
+ * `chromiumHostResolverRules` omits a host it holds no pin for, and omission
+ * means the browser RESOLVES IT NORMALLY. For the pinned hosts that is correct
+ * — the function pins and does not decide — but for a host this login has
+ * already REFUSED, leaving it out is the hole: a page, an iframe, a redirect or
+ * a stray `goto` would reach it by name. `MAP <host> ~NOTFOUND` is Chromium's
+ * own way to say "this name does not resolve", so the refusal survives inside
+ * the browser as well as at `goto`. Belt and braces on purpose: `goto` is still
+ * the gate, and the rule is what covers the surfaces `goto` does not see.
+ *
+ * `planLoginLaunch` NEVER THROWS. A guard that throws is a refusal, and a
+ * refused entry URL still returns a plan: `open` has no refusal shape in its
+ * contract, so a browser whose every navigation refuses is a cleaner failure
+ * than an adapter crash the cockpit reports as a broken environment. The same
+ * argument is written out in `guardCrawlAdapter.open`.
+ */
+export async function planLoginLaunch(
+  guard: LoginEgressGuard,
+  entryUrl: string,
+): Promise<{
+  readonly hostResolverRules: string;
+  readonly approved: ReadonlyMap<string, LoginHostApproval>;
+}> {
+  const host = hostOf(entryUrl);
+  const hostname = hostnameOf(entryUrl);
+  if (host === null || hostname === null) {
+    // Not a URL this product can open. No rule to write and nothing approved;
+    // `goto` refuses it with the one sentence like everything else.
+    return { hostResolverRules: '', approved: new Map() };
+  }
+
+  let verdict: LoginEgressVerdict;
+  try {
+    verdict = await guard(entryUrl);
+  } catch {
+    // FAILS CLOSED, the same way `admit` does: an exception is a refusal, not
+    // permission. A login that read a broken resolver as a yes would be
+    // unguarded for exactly as long as something was broken.
+    verdict = { ok: false, permit: null };
+  }
+
+  const approval = approvalFor(verdict);
+  const approved = new Map<string, LoginHostApproval>([[host, approval]]);
+
+  if (approval.kind === 'PINNED' && verdict.permit != null) {
+    /*
+     * BUILT BY THE SHARED FUNCTION, not by a hand-written `MAP` here. A second
+     * renderer of the same argument is a second thing to get wrong, and
+     * `chromiumHostResolverRules` already refuses an OBSERVED permit and
+     * de-duplicates repeated addresses.
+     */
+    return { hostResolverRules: chromiumHostResolverRules([verdict.permit]), approved };
+  }
+
+  if (approval.kind === 'REFUSED') {
+    /*
+     * THE PATTERN IS THE HOSTNAME, NOT `host:port`, and the difference is not
+     * cosmetic. Chromium matches a resolver rule on the NAME it is about to
+     * resolve; a pattern carrying a port matches only that port, so
+     * `MAP app.example.com:8443 ~NOTFOUND` would leave the same name reachable
+     * on every other port. A refusal has to cover the name.
+     *
+     * The record above is keyed on `host` WITH the port, because that is what
+     * `browser.url()` reports and what `fill` compares — two keys for two
+     * different questions, which is why both are computed here rather than one
+     * being derived from the other at the point of use.
+     *
+     * A BRACKETED IPv6 LITERAL GETS NO RULE, and the reason is a fact rather
+     * than a fudge: an IP literal is never resolved, so there is no resolution
+     * to subvert and nothing for a rule to protect. `goto` is the control for
+     * it, as it is for every refused host.
+     */
+    return {
+      hostResolverRules: hostname.startsWith('[') ? '' : `MAP ${hostname} ~NOTFOUND`,
+      approved,
+    };
+  }
+
+  /*
+   * OBSERVED and UNPINNED get NO RULE, and for opposite reasons. OBSERVED is
+   * the brake: the name resolves normally because that is what the operator
+   * asked for. UNPINNED has no address to write — and `fill` is what refuses
+   * the credential there, since a `~NOTFOUND` for a host the guard ALLOWED
+   * would break a working login rather than protect one.
+   */
+  return { hostResolverRules: '', approved };
+}
+
+/**
+ * The host a URL names INCLUDING ITS PORT, or null when it is not a URL.
+ *
+ * The port is kept because this is the key of the approval record and
+ * `browser.url()` reports it: a virtual host on a non-default port is a
+ * different server, and treating `app.example.com:8443` as approved because
+ * `app.example.com:443` was would be an approval nobody gave.
+ */
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The host a URL names WITHOUT its port, which is what a resolver rule matches.
+ *
+ * Chromium resolves a NAME; the port is the socket's business and belongs
+ * nowhere in a `--host-resolver-rules` pattern that is meant to cover a host.
+ * See the REFUSED arm of {@link planLoginLaunch}.
+ */
+function hostnameOf(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * WRAP A LOGIN BROWSER SO NOTHING LEAVES, AND NO SECRET IS TYPED, UNGUARDED.
+ *
+ * ── THE DEFECT, AND WHICH THIRD OF IT WAS STILL OPEN ───────────────────────
+ *
+ * A MEMBER's FORM_LOGIN profile drives a browser to a URL off the profile row
+ * and `fill`s the environment's vault username and password into whatever
+ * answers. {@link ownOriginUrl} already closed one part of that: a `loginUrl`
+ * naming ANOTHER ORIGIN is refused, loudly, with the customer's own
+ * `additionalOrigins` as the remedy. Three were left:
+ *
+ *   1. NOTHING CLASSIFIED THE HOST. `http://169.254.169.254/` IS its own
+ *      origin, so the same-origin check passed it unchanged and the login drove
+ *      a browser to the instance metadata service from inside the container.
+ *      CLOSED by the guard below.
+ *
+ *   2. THE CHECK WAS ON THE CONFIGURED URL, NOT ON THE PAGE BEING TYPED INTO.
+ *      `ownOriginUrl` runs once, against the config. The browser then navigates
+ *      and the application may redirect it anywhere. CLOSED by `fill`, which
+ *      re-reads the host the browser is ACTUALLY on.
+ *
+ *   3. THE NAME WAS RESOLVED TWICE AND ONLY ONCE BY US. Measured on this tree:
+ *      the guard resolved `app.example.com` to a public address, pinned it,
+ *      classified it, and returned `{ ok: true }` with the pin discarded; the
+ *      browser then resolved the same name ITSELF and got `169.254.169.254`;
+ *      the URL-bar host never changed, so (2) saw nothing wrong; and both vault
+ *      secrets were typed into the link-local host. CLOSED by
+ *      {@link planLoginLaunch}, which hands the pinned addresses to Chromium as
+ *      `--host-resolver-rules` before the browser opens, and by the `fill`
+ *      check below, which now asks whether the host is PINNED and not merely
+ *      approved.
+ *
+ * So the guard is applied at the BROWSER, not at the call sites. `goto` and
+ * `postForm` are the outbound surfaces and are gated. `fill` is gated on the
+ * host the browser is ACTUALLY ON at the moment of typing — and it is gated for
+ * every driver at once, with no argument threaded through `performFormLogin`,
+ * `performTotpMfa`, `performMagicLink` and the rest. A control each driver has
+ * to remember is a control the next driver forgets.
+ *
+ * ── WHY `fill` REFUSES RATHER THAN RE-CHECKING THE ORIGIN ──────────────────
+ *
+ * The approval record is the approval: a host is in it because the guard
+ * resolved and classified it on the way in. Re-deriving the answer here from
+ * the URL would be a second decision path that could disagree with the first,
+ * which is the thing `private-address.ts` opens by warning against.
+ */
+export function guardLoginBrowser(
+  browser: LoginBrowser,
+  guard: LoginEgressGuard,
+  /**
+   * What {@link planLoginLaunch} decided, seeding the record.
+   *
+   * REQUIRED, with no default. A default of "nothing was pinned" would make
+   * every login refuse its own credential, and a default of "everything is
+   * pinned" would be an off switch nobody can see — so the caller has to say
+   * what the browser was actually launched with. `openBrowser` is the only
+   * production caller and it passes the plan it just built.
+   */
+  launched: ReadonlyMap<string, LoginHostApproval>,
+): LoginBrowser {
+  /*
+   * THE RECORD OF APPROVAL, AND IT HOLDS THE ADDRESSES.
+   *
+   * It is not a cache for speed. It is what `fill` consults, which is why it is
+   * written only where the guard answered and never from a URL alone — and why
+   * it holds a {@link LoginHostApproval} rather than a bare host: the previous
+   * version was a `Set<string>` under a comment calling it "the pin cache",
+   * which held no pin, and a `fill` that consulted it could not tell an
+   * approved host from a pinned one.
+   */
+  const record = new Map<string, LoginHostApproval>(launched);
+
+  const refusedNavigation = (url: string): LoginNavigation => ({
+    ok: false,
+    url,
+    status: null,
+    /*
+     * ONE SENTENCE, THE SAME ONE, FOR EVERY REFUSAL. It names no host, no
+     * address, no class and no reason. A login failure is stored on the profile
+     * and rendered in the cockpit, so a message that distinguished "that is a
+     * link-local address" from "that host did not resolve" would answer an SSRF
+     * probe with the shape of our network — and the person who set the base URL
+     * is the one asking.
+     */
+    error: LOGIN_EGRESS_REFUSAL,
+  });
+
+  const admit = async (url: string): Promise<boolean> => {
+    const host = hostOf(url);
+    if (host === null) return false;
+
+    const already = record.get(host);
+    if (already !== undefined) {
+      /*
+       * DECIDED ONCE PER HOST. The entry URL was decided before launch, so
+       * asking again here would be a SECOND decision path against the same name
+       * — and a resolver that answered differently the second time is precisely
+       * the rebinding this control closes. A remembered REFUSED also means a
+       * retry does not pay the guard's refusal pad twice.
+       */
+      return already.kind !== 'REFUSED';
+    }
+
+    let verdict: LoginEgressVerdict;
+    try {
+      verdict = await guard(url);
+    } catch {
+      // FAILS CLOSED. A guard that throws is a refusal: a login that treated an
+      // exception as permission would be unguarded for exactly as long as
+      // something was broken, which is when it matters most.
+      record.set(host, { kind: 'REFUSED' });
+      return false;
+    }
+
+    const approval = approvalFor(verdict);
+    if (approval.kind === 'PINNED') {
+      /*
+       * PINNED BY THE GUARD, UNPINNABLE BY THE BROWSER. This host was first
+       * seen AFTER launch, so its addresses are not in `--host-resolver-rules`
+       * and Chromium will resolve the name itself. Recorded UNPINNED rather
+       * than PINNED, because recording the guard's pin here would be a pin the
+       * browser never received — a control that looks applied and is not.
+       */
+      record.set(host, { kind: 'UNPINNED' });
+      return true;
+    }
+    record.set(host, approval);
+    return approval.kind !== 'REFUSED';
+  };
+
+  return {
+    ...browser,
+
+    goto: async (url, timeoutMs) =>
+      (await admit(url)) ? browser.goto(url, timeoutMs) : refusedNavigation(url),
+
+    /*
+     * `postForm` DELIVERS A MINTED SAML ASSERTION, which is a single-use
+     * credential, so it is gated exactly like a navigation. It is optional on
+     * the interface and the conditional spread keeps it that way: a surface
+     * without it must stay without it, because `loginCapabilities` reads
+     * `typeof … === 'function'` and a wrapper that always defined it would
+     * report SAML as available on a browser that cannot do it.
+     */
+    ...(browser.postForm === undefined
+      ? {}
+      : {
+          postForm: async (
+            url: string,
+            fields: Readonly<Record<string, string>>,
+            timeoutMs: number,
+          ) =>
+            (await admit(url))
+              ? await browser.postForm!(url, fields, timeoutMs)
+              : refusedNavigation(url),
+        }),
+
+    fill: async (selector, value, timeoutMs) => {
+      /*
+       * THE LINE THAT TYPES THE VAULT PLAINTEXT. Two questions, not one.
+       *
+       * WHICH HOST: the one the browser is on NOW — read from the live browser,
+       * not from the URL we asked for — so a redirect to an unapproved host is
+       * caught here even though the navigation that reached it was approved.
+       *
+       * AND WAS IT PINNED: `approved` is not enough and that is the defect this
+       * line used to carry. A host can be approved by NAME and reached at an
+       * address nobody classified, because the browser resolves the name a
+       * second time inside its own network service. So the credential is typed
+       * only where the launch argument overrode that resolution (PINNED) or
+       * where the operator deliberately armed the brake (OBSERVED, which is
+       * today's behaviour by definition). UNPINNED, REFUSED and absent all
+       * refuse.
+       *
+       * `false` rather than a throw, because that is this method's own
+       * convention and `drive()` turns it into a DRIVER_ERROR. The refusal text
+       * is the uniform one and is not derived from the host.
+       */
+      const host = hostOf(browser.url());
+      if (host === null) return false;
+      const approval = record.get(host);
+      if (approval === undefined) return false;
+      if (approval.kind !== 'PINNED' && approval.kind !== 'OBSERVED') return false;
+      return browser.fill(selector, value, timeoutMs);
+    },
+  };
+}
+
+/**
+ * The fallback guard: REFUSES EVERYTHING.
+ *
+ * Reached only when a caller built `LoginSurfaces` by hand and set no `egress`.
+ * It refuses rather than permits because the alternative is an unguarded login
+ * that looks exactly like a guarded one, and a fail-open default is the defect
+ * pattern worth hunting in one's own work. The symptom of the omission is every
+ * login refusing, which somebody notices in a minute; the symptom of the other
+ * choice is nothing at all.
+ */
+const REFUSE_ALL_EGRESS: LoginEgressGuard = async () => ({ ok: false, permit: null });
+
+/**
+ * THE ONE PLACE A LOGIN BROWSER IS MADE, AND IT IS PINNED BEFORE IT OPENS.
+ *
+ * The ENTRY URL is the argument, and it has to be: the pin a Chromium process
+ * can honour is fixed at launch, so the guard answers for that URL first and
+ * the launch argument is built from the answer. Every driver already has the
+ * entry URL in hand — it is `ownOriginUrl`'s output and the next thing each one
+ * navigates to — so this takes nothing new from the call sites.
+ *
+ * Wrapping at the construction point rather than at the drivers is what makes
+ * it impossible for a driver — including one added next round — to hold an
+ * unguarded browser: there is no unguarded browser to hold.
+ */
+async function openBrowser(surfaces: LoginSurfaces, entryUrl: string): Promise<LoginBrowser> {
+  const guard = surfaces.egress ?? REFUSE_ALL_EGRESS;
+  const plan = await planLoginLaunch(guard, entryUrl);
+  const browser = await (surfaces.browser ?? playwrightLoginBrowser)({
+    hostResolverRules: plan.hostResolverRules,
+  });
+  return guardLoginBrowser(browser, guard, plan.approved);
 }
 
 /**
@@ -1032,13 +1653,11 @@ async function drive(
     return failed(mask, 'DRIVER_ERROR', step, `${what} failed: ${errorText(err)}`);
   }
   if (!ok) {
-    const title = await browser.title().catch(() => '');
-    return failed(
-      mask,
-      'DRIVER_ERROR',
-      step,
-      `${what} failed` + (title ? ` (page title: "${title}")` : '') + '.',
-    );
+    /*
+     * NO PAGE TITLE. See {@link titleLeakRemoved} — the title is a fact about
+     * a page inside the network, read back out through a failure message.
+     */
+    return failed(mask, 'DRIVER_ERROR', step, `${what} failed.`);
   }
   return null;
 }
@@ -1067,14 +1686,13 @@ async function confirm(
   }
   if (appeared) return null;
 
-  const title = await browser.title().catch(() => '');
+  // NO PAGE TITLE. See {@link titleLeakRemoved}.
   return failed(
     mask,
     'REJECTED',
     step,
-    `"${successSelector}" never appeared` +
-      (title ? ` (page title: "${title}")` : '') +
-      '. Either the credentials are wrong or the success locator is.',
+    `"${successSelector}" never appeared. Either the credentials are wrong or the ` +
+      'success locator is.',
   );
 }
 
@@ -1202,7 +1820,9 @@ export async function performFormLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, entry.url);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -1348,7 +1968,9 @@ export async function performTotpMfaLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, entry.url);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -1381,14 +2003,13 @@ export async function performTotpMfaLogin(
       );
     }
     if (!prompted) {
-      const title = await browser.title().catch(() => '');
+      // NO PAGE TITLE. See {@link titleLeakRemoved}.
       return failed(
         mask,
         'REJECTED',
         'CREDENTIAL',
-        `The authenticator code field "${config.codeSelector}" never appeared` +
-          (title ? ` (page title: "${title}")` : '') +
-          '. The password was not accepted, so the second factor was never reached.',
+        `The authenticator code field "${config.codeSelector}" never appeared. The ` +
+          'password was not accepted, so the second factor was never reached.',
       );
     }
 
@@ -1505,7 +2126,9 @@ export async function performMagicLinkLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, requestUrl);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -1701,7 +2324,9 @@ export async function performPasskeyLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, entry.url);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -1835,7 +2460,9 @@ export async function performPhoneOtpLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, entry.url);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -2005,7 +2632,9 @@ export async function performMockIdpLogin(
 
   let browser: LoginBrowser;
   try {
-    browser = await openBrowser(surfaces);
+    // The ENTRY URL is the pin: the browser is launched with the addresses the
+    // guard authorised for it. See {@link openBrowser}.
+    browser = await openBrowser(surfaces, entry.url);
   } catch (err) {
     return failed(mask, 'DRIVER_ERROR', 'NAVIGATE', `No browser: ${errorText(err)}`);
   }
@@ -2230,8 +2859,37 @@ function submitAssertionForm(arg: {
  * cookie jar attached or the session it establishes is not the session we then
  * capture.
  */
-export async function playwrightLoginBrowser(): Promise<LoginBrowser> {
-  const browser = await chromium.launch();
+export async function playwrightLoginBrowser(
+  launch: LoginBrowserLaunch = { hostResolverRules: '' },
+): Promise<LoginBrowser> {
+  /*
+   * THE PIN, DELIVERED. Chromium resolves inside its own network service, so
+   * neither a Node `lookup` nor `page.route` can pin it — this argument is the
+   * only seam, which is why `LoginBrowserLaunch` carries a string fixed at
+   * launch rather than a callback.
+   *
+   * No rules means NO ARGUMENT, not an empty one: `--host-resolver-rules=` is
+   * a different thing to Chromium than its absence, and an empty rule set has
+   * broken its resolver before. `packages/agent/src/crawler.ts` does the same
+   * for the crawl's browser and says so in the same words.
+   *
+   * A host with no rule resolves NORMALLY, so this pins and gates nothing by
+   * itself — the gating is {@link guardLoginBrowser}, consulted before every
+   * navigation and before every `fill`. Saying it twice because getting it
+   * backwards is a control that looks applied and is not.
+   *
+   * The DEFAULT is the unpinned one, and it is here for a reason worth naming:
+   * `playwrightLoginBrowser` is exported and a caller outside this file may
+   * open one directly. It cannot be made to refuse — there is nothing to refuse
+   * at launch — so the thing that protects such a caller is that `fill` typing
+   * the credential requires a PINNED record, which an unpinned browser cannot
+   * obtain. The default opens a browser; it does not open a credential.
+   */
+  const browser = await chromium.launch(
+    launch.hostResolverRules === ''
+      ? {}
+      : { args: [`--host-resolver-rules=${launch.hostResolverRules}`] },
+  );
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -2361,6 +3019,16 @@ export interface SignInContext {
    * already used for the same question by the crawl.
    */
   additionalOrigins?: readonly string[];
+  /**
+   * `Environment.egressPolicy`, raw from the JSONB column.
+   *
+   * Read by {@link signInWithProfile}, which hands it to
+   * {@link defaultLoginEgressGuard}. Omitted means the HOSTED policy — PUBLIC
+   * ONLY — because an absent policy must be the strictest reading and not an
+   * open one. It is `unknown` rather than an `EgressPolicy` because that is how
+   * the column reads, and parsing it is the guard's job.
+   */
+  egressPolicy?: unknown;
 }
 
 /**
@@ -2391,9 +3059,32 @@ export async function signInWithProfile(
   context: SignInContext,
 ): Promise<LoginResult> {
   const mask = maskerFor(secrets);
-  const surfaces = context.surfaces ?? {};
   const baseUrl = context.baseUrl;
   const origins = context.additionalOrigins ?? [];
+
+  /*
+   * ── THE PRODUCTION DOOR FILLS IN THE EGRESS GUARD ──────────────────────────
+   *
+   * This is the entry point every production caller uses — the run processor,
+   * the explore processor, the auth-refresh processor and the cockpit's "test
+   * this profile" route — so building the guard HERE is what makes it
+   * impossible to reach a driver without one. A caller that supplies its own
+   * keeps it (that is how a test guards a login without touching DNS); a caller
+   * that supplies none gets the real one, never none at all.
+   *
+   * `context.egressPolicy` is the environment's own column. Absent or
+   * unparseable falls back through `resolveEgressPolicy` to the HOSTED policy,
+   * PUBLIC ONLY — so an environment with no policy is the STRICTEST case rather
+   * than the open one, and a self-hosted install that needs its own private
+   * range sets the column rather than losing the control.
+   *
+   * Built BEFORE the first refusal check below so that there is exactly one
+   * place this happens, rather than one per driver.
+   */
+  const surfaces: LoginSurfaces = {
+    ...(context.surfaces ?? {}),
+    egress: context.surfaces?.egress ?? (await defaultLoginEgressGuard(context.egressPolicy)),
+  };
 
   const refused = authProfileKindRefusedOn(profile.kind, context.environmentKind);
   if (refused) {

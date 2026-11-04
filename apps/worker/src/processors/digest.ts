@@ -1264,6 +1264,26 @@ export function candidateFor(
  * sent, and "why didn't I get the digest" deserves an answer that is not a
  * shrug. The same contract notify.ts holds itself to.
  */
+/*
+ * ── WHY THIS SENDER NEEDS NO EGRESS GUARD, MEASURED RATHER THAN ASSUMED ──────
+ *
+ * The other two senders (`apps/api/src/routes/integrations.ts` and
+ * `processors/notify.ts`) now go through `chatDestinationFor`, which RESOLVES
+ * the host. This one does not, and that is correct rather than an omission:
+ * `partitionDestinations` above refuses the generic `WEBHOOK` kind outright, and
+ * WEBHOOK is the only kind whose host a tenant chooses. What reaches here is
+ * SLACK, MSTEAMS or DISCORD, and `webhookHostAllowed`
+ * (apps/api/src/lib/chat-integrations.ts:166) pins each of those to exact
+ * provider hosts — `hooks.slack.com`, `discord.com`/`discordapp.com`, and
+ * Microsoft's own `outlook.office(365).com` / `*.webhook.office.com` /
+ * `*.logic.azure.com`. None of those is attacker-choosable, which is also why
+ * `guardChatDestination` itself returns early for a non-WEBHOOK kind.
+ *
+ * So adding the call here would resolve a host that is already a constant, and
+ * a guard that cannot refuse anything is a guard a reader will trust for more
+ * than it does. The reason is written down instead — and if this function ever
+ * learns to deliver the generic kind, the guard is the first thing it owes.
+ */
 async function deliver(
   orgId: string,
   destinations: Destination[],

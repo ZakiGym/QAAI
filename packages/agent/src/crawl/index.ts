@@ -54,3 +54,40 @@ export * from './harvest.js';
 export * from './interact.js';
 export * from './observe.js';
 export * from './variants.js';
+
+/*
+ * ── THE CRAWL'S EGRESS GATE ─────────────────────────────────────────────────
+ *
+ * `scripts/check-wiring.ts` reported `crawl/egress.ts` DISCONNECTED: "nothing
+ * but a test file imports it, and the package barrel does not re-export it — so
+ * it ships as tested, unreachable code". For a gate whose entire purpose is to
+ * stop the crawler reaching `169.254.169.254` from inside the API container,
+ * that is the defect wearing a green suite, and it is the fourth round running
+ * in which the headline finding was a module with excellent vocabulary and no
+ * door.
+ *
+ * This line is the door. `crawler.ts` is the caller — it constructs one gate
+ * per crawl and asks it before every navigation — which is the half that makes
+ * this a control rather than a vocabulary.
+ *
+ * ORDER AND CYCLES: `egress.ts` imports values and types from `@qaai/shared`
+ * only (`EXCLUSION_KINDS`, and the guard's verdict type), nothing from the four
+ * modules above, so it adds no cycle and may go last.
+ *
+ * NAME COLLISIONS, CHECKED BOTH WAYS. Every name in `egress.ts` was greped
+ * against the names already reachable from this barrel and from the package
+ * barrel above it. Two worth recording because each is one word over two
+ * questions:
+ *   · `GuardAnswer` here is the EGRESS guard's verdict (an alias for
+ *     `EgressGuardVerdict`). @qaai/shared separately publishes `GuardVerdict`,
+ *     which is `codebase.ts`'s static-analysis GUARDED / UNGUARDED / UNKNOWN
+ *     and means nothing like it; the shared barrel keeps the two apart by
+ *     alias and neither name is re-exported from here under the other's
+ *     meaning.
+ *   · `MonotonicClock` is a new name against this barrel — `frontier.ts`,
+ *     `harvest.js`, `interact.js`, `observe.js` and `variants.js` export no
+ *     clock type — but it is a GENERIC one, so it is the member of this file
+ *     most likely to collide with a sixth module later.
+ * `tsc -p packages/agent/tsconfig.json` reports no TS2308 on this file.
+ */
+export * from './egress.js';

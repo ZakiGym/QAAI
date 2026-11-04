@@ -576,9 +576,39 @@ model User {
   avatarUrl     String?
   /// §11 — grants access to /admin. Never settable through the public API.
   isSuperuser   Boolean   @default(false)
-  /// Encrypted TOTP seed (§1 2FA). Null until the user enrols.
+  /// SEALED TOTP seed (§1 2FA). Null until the user enrols. Sealed and not
+  /// hashed, deliberately: codes are COMPUTED from it, so it has to be
+  /// readable. The recovery codes beside it are hashed, for the opposite reason
+  /// — they are only ever compared. See `SEALED_FIELDS` in
+  /// packages/shared/src/sealed.ts.
   totpSecretEnc String?
+  /// Which vault key version sealed it. NULL BESIDE A NON-NULL SEED is the
+  /// legacy state and the reason this column exists: `apps/api/src/lib/vault.ts`
+  /// supports exactly one key version and `User.totpSecretEnc` has never had a
+  /// version column at all, so a TOTP seed cannot participate in a rotation. A
+  /// null here means "sealed under whatever version 1 was", which is a fact a
+  /// sweep must be able to see rather than assume.
+  totpSecretKeyVersion Int?
+  /// WHEN THE USER SAID THEY WANTED A SECOND FACTOR.
+  ///
+  /// NOT the same fact as `totpConfirmedAt`, and this round is the reason they
+  /// are two columns. `apps/api/src/routes/auth.ts` reads
+  /// `if (user.totpEnabledAt && !input.totpCode) throw` and then NEVER LOOKS AT
+  /// THE CODE — presence is checked and the value is not — and the enrolment
+  /// path never verified a code either. So a row may have `totpEnabledAt` set
+  /// for a user whose authenticator never saw the seed, and enforcing
+  /// verification on that row locks them out of their own organisation.
   totpEnabledAt DateTime?
+  /// WHEN A SUPPLIED CODE ACTUALLY VERIFIED AGAINST THE SEED.
+  ///
+  /// THE PAIR (totpEnabledAt SET, totpConfirmedAt NULL) MEANS NOT ENROLLED, and
+  /// that reading is the one thing that neither locks out a user who never
+  /// completed enrolment nor accepts a second factor nobody has proved. Every
+  /// row that exists when this column lands is in exactly that state, which is
+  /// why it is nullable with no back-fill: defaulting it to `totpEnabledAt`
+  /// would assert that a code verified for every user who ever opened the
+  /// enrolment screen.
+  totpConfirmedAt DateTime?
   lastLoginAt   DateTime?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
@@ -591,6 +621,8 @@ model User {
 
   teamMemberships  TeamMember[]
   ownedRules       OwnershipRule[]
+  /// Single-use TOTP recovery codes. Hashed, never sealed — see the model.
+  totpRecoveryCodes TotpRecoveryCode[]
   coverageWaivers  CoverageWaiver[]
   /// Requirement→test links this person ASSERTED. The back-relation exists so
   /// `onDelete: SetNull` can fire: a link's author leaving must not delete the
@@ -625,14 +657,42 @@ model Session {
   activeOrgId String?
   ip          String?
   userAgent   String?
+  /// What the person calls this device, so "sign out my lost laptop" is a thing
+  /// they can actually do. A list of sessions by `createdAt` and a truncated
+  /// user-agent is not a list anybody can act on, which is most of why there has
+  /// never been a way to revoke one. CLIENT-SUPPLIED and therefore bounded and
+  /// never trusted; it is a label, not an identity.
+  deviceLabel String?
+  /// Last request served on this session. Null for a session that has made none
+  /// since the column landed — NOT back-filled from `createdAt`, because "signed
+  /// in three weeks ago" and "last used three weeks ago" are the two facts a
+  /// person uses to decide which session to kill, and conflating them would make
+  /// the screen useless for its only purpose.
+  lastSeenAt  DateTime?
   expiresAt   DateTime
   revokedAt   DateTime?
+  /// WHY IT STOPPED WORKING. TEXT with the domain at the producer
+  /// (`SESSION_REVOCATION_REASONS` in packages/shared/src/constants.ts, written
+  /// through `revokeSessionSchema`), for the same reason as
+  /// `Run.selectionSource`: nothing filters rows on it.
+  ///
+  /// NULL BESIDE A NON-NULL `revokedAt` is legal and meaningful — a session
+  /// revoked before this column existed. A reader renders that as "revoked,
+  /// reason not recorded" and must never pick a member to stand in for it.
+  revokedReason String?
+  /// The user id that revoked it, or null for an automatic revocation (an
+  /// expiry sweep, a password change, SSO enforcement). Not a relation: the
+  /// record of who ended a session must outlive the account that did it.
+  revokedBy     String?
   createdAt   DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
   @@index([expiresAt])
+  /// "List my live sessions" — the read the revocation screen makes, and the
+  /// one that has to be cheap because it is on the account page.
+  @@index([userId, revokedAt])
 }
 
 /// Email verification and password reset both use this table, discriminated by `purpose`.
@@ -666,6 +726,42 @@ model Organization {
   /// the invoice.paid already applied must not mark a healthy org PAST_DUE.
   /// Same single-clock rule as Subscription.planSyncedAt, for the same reason.
   billingStateAt DateTime?
+  /// THIS ORGANISATION REFUSES PASSWORD LOGIN.
+  ///
+  /// `SsoConnection` has existed for several rounds and signing in with a
+  /// password has always still worked beside it, so an enterprise that bought
+  /// SSO got SSO AS AN OPTION — which is not what SSO is for. The flag is the
+  /// customer's decision; whether we HONOUR it is
+  /// `SECURITY_CONTROL_BRAKES.ENFORCE_SSO`, and not honouring a stored security
+  /// setting is worse than not offering one.
+  ///
+  /// DEFAULT FALSE, which is the only safe back-fill: defaulting it true would
+  /// lock every existing organisation out of the password login they are using
+  /// today, including the ones with no SSO connection configured at all.
+  enforceSso     Boolean      @default(false)
+  /// PER-CONTROL ROLLOUT BRAKES: `{ "<SecurityControl>": "OBSERVE" | "ENFORCE" }`.
+  ///
+  /// Validated by `securityControlModesSchema`; read by `controlMode()` in
+  /// packages/shared/src/constants.ts, which falls back to
+  /// `SECURITY_CONTROL_BRAKES[control].fallback` for an absent or unreadable
+  /// entry — ENFORCE for ten of the thirteen controls.
+  ///
+  /// NULLABLE WITH NO DEFAULT, and the three states are the contract, exactly
+  /// as `Environment.crawlPolicy` records: null means this organisation never
+  /// chose, so every control takes its own default; `{}` means somebody looked
+  /// at the screen and ACCEPTED every default, which is a decision they can be
+  /// held to. Defaulting the column would erase the difference.
+  ///
+  /// A JSON column and not an env var for the reason `check-wiring.ts` refuses
+  /// one: an env var arms one answer for every org in the install at once,
+  /// which is the opposite of a brake.
+  securityControlModes Json?
+  /// Per-org override on `LOGIN_THROTTLE_DEFAULTS`, clamped by
+  /// `resolveLoginThrottle`. The brake for a throttle is the THRESHOLD and not
+  /// the mode, so this is where a customer whose CI signs in on every build
+  /// raises it — and the clamp is why `maxFailures: 0` cannot lock the whole
+  /// install out on its first attempt.
+  loginThrottlePolicy  Json?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -681,6 +777,8 @@ model Organization {
   featureFlags   FeatureFlagOverride[]
   ssoConnections SsoConnection[]
   runners        Runner[]
+  egressAllowlist EgressAllowlistEntry[]
+  egressTallies   EgressDecisionTally[]
 
   @@index([slug])
 }
@@ -729,6 +827,21 @@ model ApiKey {
   lastUsedAt DateTime?
   expiresAt  DateTime?
   revokedAt  DateTime?
+  /// WHEN THIS KEY WAS REPLACED, and by implication when its grace window
+  /// started. Rotation exists because a customer cannot redeploy every pipeline
+  /// at the same instant; without it the only way to replace a key is to break
+  /// every caller at once, which is why keys do not get replaced.
+  rotatedAt  DateTime?
+  /// The key this one REPLACES. Not a relation to itself: the predecessor is
+  /// deletable and the record of what replaced what must outlive it, the same
+  /// argument `VisualBaseline.environmentId` carries.
+  replacesKeyId String?
+  /// While this is in the future BOTH this key and the one it replaced
+  /// authorise. Null means no grace window — the replacement is immediate.
+  ///
+  /// A grace window nobody closes is two live keys, which is the state rotation
+  /// was called to end, so `rotateApiKeySchema` bounds it at a week.
+  rotationGraceUntil DateTime?
   createdAt  DateTime  @default(now())
 
   org Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
@@ -1030,6 +1143,35 @@ model Environment {
   /// stored `{}` has ACCEPTED every default, and that is a decision somebody
   /// made and can be held to. Defaulting the column would erase the difference.
   crawlPolicy Json?
+  /// WHICH HOST CLASSES A CONNECTION MADE FOR THIS ENVIRONMENT MAY REACH.
+  ///
+  /// ── THE DEFECT ────────────────────────────────────────────────────────────
+  ///
+  /// `baseUrl` above is validated by `httpUrl` in
+  /// packages/shared/src/schemas.ts — `z.string().url()` plus an http/https
+  /// check and NOTHING ELSE — so loopback, RFC1918, link-local and the cloud
+  /// metadata address were all accepted at the door. A MEMBER's FORM_LOGIN
+  /// profile then drives a real browser at that URL and TYPES VAULT PLAINTEXT
+  /// into whatever answers, and the crawl's progress events report what it
+  /// found, which makes the crawler a port-reachability oracle for our own
+  /// network.
+  ///
+  /// ── THE SHAPE, AND THE DEFAULT ───────────────────────────────────────────
+  ///
+  /// `EgressPolicy` in packages/shared/src/egress.ts: a deployment mode, a
+  /// rollout mode, the permitted address classes and an allowlist. Read through
+  /// `resolveEgressPolicy`, which INTERSECTS a stored class list with the
+  /// deployment mode's base list — so a row that names `link-local` does not
+  /// get it, including a row written before `egressPolicySchema` existed.
+  ///
+  /// NULLABLE WITH NO DEFAULT, same three-state contract as `crawlPolicy`
+  /// above: null means this environment never chose, and `resolveEgressPolicy`
+  /// answers `HOSTED_EGRESS_POLICY` — PUBLIC ONLY, which is the safe reading
+  /// for every row that exists today, including the ones in a self-hosted
+  /// install. A self-hosted customer testing an internal app must therefore
+  /// STORE a policy saying so, and that is deliberate: the permissive answer is
+  /// the one somebody has to ask for.
+  egressPolicy Json?
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt
 
@@ -1046,6 +1188,8 @@ model Environment {
   roleCrawlAttempts     RoleCrawlAttempt[]
   reEnumerationTriggers ReEnumerationTrigger[]
   surfaceDrifts         SurfaceDriftRecord[]
+  egressAllowlist       EgressAllowlistEntry[]
+  egressTallies         EgressDecisionTally[]
 
   @@unique([projectId, name])
   @@index([orgId])
@@ -1067,6 +1211,9 @@ model Secret {
   updatedAt     DateTime @updatedAt
 
   environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  /// WHICH TESTS MAY RECEIVE THIS SECRET. NO ROWS MEANS NO TESTS — see
+  /// `SecretScope`, where absence being the deny is the whole design.
+  scopes      SecretScope[]
 
   @@unique([environmentId, name])
   @@index([orgId])
@@ -1157,9 +1304,97 @@ model AuthProfile {
   tenantId              String?
   /// What a human calls the tenant. Shown in reports; never compared.
   tenantLabel           String?
-  /// Cached Playwright storageState, refreshed on expiry (§2).
+  /// LEGACY PLAINTEXT. WRITE NOTHING HERE EVER AGAIN.
+  ///
+  /// ── WHAT THIS COLUMN WAS, AND WHY IT IS THE WORST ONE IN THE SCHEMA ──────
+  ///
+  /// A cached Playwright `storageState` — LIVE CUSTOMER SESSION COOKIES for the
+  /// customer's own application — in a plain, unencrypted JSON column. Not
+  /// hashed, not sealed, not masked on export until somebody added a pattern
+  /// for it in apps/api/src/routes/export-org.ts. Everything else in this
+  /// product that is a credential goes through the §1 vault; this one did not,
+  /// and it is the single highest-value secret QAAI holds, because possession
+  /// of it IS possession of the customer's session.
+  ///
+  /// ── WHAT THE MIGRATION DID TO THE ROWS THAT HAD ONE ─────────────────────
+  ///
+  /// IT DELETED THEM. Every non-null `storageState` was set to NULL, its
+  /// `storageStateExpiresAt` was set to NULL with it, and
+  /// `storageStateNeedsReseal` was set TRUE on that row. SQL cannot encrypt —
+  /// the vault key is not in the database and must never be — so the only two
+  /// options were "leave plaintext in place under a column that claims to be
+  /// sealed" and "drop the cache". The cache is REGENERABLE: a profile with no
+  /// session signs in again on its next run, which is a path that already
+  /// exists and already works. Plaintext session cookies are not regenerable
+  /// once they have leaked.
+  ///
+  /// Both columns were nulled together on purpose. Nulling the state and
+  /// leaving the expiry would make
+  /// `storageStateExpiresAt !== null && > now` (apps/api/src/routes/projects.ts)
+  /// report a valid session for a profile that has none — two facts in one
+  /// field, which is a defect even when both values are individually defensible.
+  ///
+  /// The column is NOT DROPPED in the same migration, deliberately: dropping it
+  /// while apps/worker/src/processors/explore.ts and
+  /// apps/api/src/routes/projects.ts still name it would be a deploy that fails
+  /// on the old image. It is dropped once no code reads it, which is a second
+  /// migration and a separate decision.
   storageState          Json?
+  /// When the cached session stops being usable. Nulled together with
+  /// `storageState` by the sealing migration; see that column's note.
   storageStateExpiresAt DateTime?
+  /// THE SEALED SESSION. A serialised `SealedEnvelope`
+  /// (packages/shared/src/sealed.ts): `qs1.<keyId>.<version>.<alg>.<payload>`,
+  /// AAD-bound to `AuthProfile.storageState` and THIS ROW'S ID, so a session
+  /// lifted from one profile and pasted onto another fails to open rather than
+  /// opening as somebody else's session.
+  ///
+  /// One TEXT column and not five, matching `Secret.valueEnc`: five columns is
+  /// five chances for a writer to update four of them, and a partially-updated
+  /// envelope is an undecryptable row that looks fine.
+  storageStateSealed    String?
+  /// The key version, denormalised out of the envelope so that "which rows are
+  /// still sealed under key 1" is an INDEXED query rather than a string scan —
+  /// which is the question a rotation sweep and a compromise both ask first.
+  ///
+  /// `envelopeMatchesVersionColumn` is what stops the two disagreeing, and the
+  /// direction of the drift matters: a row whose column says 2 while its
+  /// envelope says 1 is a row a sweep SKIPS and a compromised key keeps opening.
+  storageStateKeyVersion Int?
+  /// When it was last sealed. Distinct from `storageStateRefreshedAt` below:
+  /// one is when we re-encrypted, the other is when we re-authenticated, and a
+  /// rotation sweep moves the first without touching the second.
+  storageStateSealedAt  DateTime?
+  /// TRUE WHEN THIS PROFILE'S SESSION MUST BE OBTAINED AGAIN BEFORE IT CAN BE
+  /// USED.
+  ///
+  /// Set TRUE by the sealing migration for every row that held plaintext, and
+  /// set TRUE by a rotation sweep for a row it could not open. It is the
+  /// explicit, queryable form of "there is no usable session here", which the
+  /// old schema could only express as a null that was indistinguishable from a
+  /// profile nobody had ever signed in as.
+  ///
+  /// DEFAULT FALSE: a profile created after this migration seals its session on
+  /// the way in, so false is the correct state for every new row, and the
+  /// migration sets it true only where it actually destroyed something.
+  storageStateNeedsReseal Boolean          @default(false)
+  /// WHEN THE SESSION WAS LAST RE-AUTHENTICATED.
+  ///
+  /// The defect this closes: the 8-hour TTL on `storageStateExpiresAt` is never
+  /// refreshed, so an expired session SILENTLY DEGRADES every nightly run to
+  /// anonymous — and an anonymous run makes every auth-gated route look covered
+  /// by an anonymous test, which is a coverage number assembled out of our own
+  /// silence. A refresh needs to know when it last succeeded to know whether to
+  /// try again.
+  storageStateRefreshedAt DateTime?
+  /// When a refresh was last ATTEMPTED, successful or not. Two columns, because
+  /// (attempted recently, refreshed long ago) is exactly the state that means
+  /// "sign-in is broken" and a single column cannot express it.
+  storageStateRefreshAttemptedAt DateTime?
+  /// Consecutive failed refreshes. The backoff's input, and the number that
+  /// makes "this profile has not been able to sign in for six nights" a fact
+  /// somebody can be told rather than a silence.
+  storageStateRefreshFailures Int          @default(0)
   createdAt             DateTime           @default(now())
   updatedAt             DateTime           @updatedAt
 
@@ -1182,6 +1417,12 @@ model AuthProfile {
   /// "Which identities belong to the other tenant?" — the cross-tenant sweep's
   /// own query, run once per sweep per tenant pair.
   @@index([tenantId])
+  /// "Which sessions are still under the old key, or need one at all?" — the
+  /// two reads a rotation sweep and the refresh processor make, and the reason
+  /// `storageStateKeyVersion` is a column rather than a field inside the
+  /// envelope string.
+  @@index([storageStateKeyVersion])
+  @@index([storageStateNeedsReseal])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -8534,4 +8775,580 @@ model RecordingPromotion {
   /// The claim. See the header.
   @@unique([projectId, recordingKey])
   @@index([projectId, state])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The security controls (§1) — key rotation, secret scoping, egress, and the
+// auth platform rows the product has been missing.
+//
+// Enums mirror packages/shared/src/{sealed,egress,constants}.ts.
+// `npm run check:enums -w @qaai/api` diffs them and fails CI on drift.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// WHAT ONE VAULT KEY MAY DO. Mirrors VAULT_KEY_STATES in
+/// packages/shared/src/sealed.ts; `check:enums` diffs them.
+///
+/// ── Why this enum exists at all ─────────────────────────────────────────────
+///
+/// `apps/api/src/lib/vault.ts` supports exactly ONE key version:
+/// `keyForVersion` reads `if (version === 1)` and throws for everything else,
+/// `needsRotation` has NO CALLER in the repo, and the file's own header
+/// describes a lazy re-encrypt that does not exist. The practical consequence is
+/// the sentence nobody wants in an incident review: A COMPROMISE OF THE MASTER
+/// KEY CANNOT BE REMEDIATED. Rotating it makes every sealed secret permanently
+/// unreadable, so the only available response to a leaked key is to keep using
+/// it.
+///
+/// MANY KEYS MAY BE READABLE AND EXACTLY ONE IS WRITABLE. That is the whole
+/// mechanism, and it is why this is four states and not a boolean.
+///
+/// FILTERED ON, which is what earns a Postgres type: `selectSealingKey` asks
+/// for the ACTIVE row before every seal, and "which rows are still under a
+/// COMPROMISED key" is the blast radius of an incident.
+///
+/// COMPROMISED is deliberately distinct from RETIRED. A retired key is finished
+/// with; a compromised one is an incident, and one state for both would make
+/// "we rotated" and "we were breached" the same fact — which is the fact an
+/// auditor is asking about.
+enum VaultKeyState {
+  ACTIVE
+  READABLE
+  RETIRED
+  COMPROMISED
+}
+
+/// WHO HOLDS THE KEY MATERIAL. Mirrors VAULT_KEY_PROVIDERS in
+/// packages/shared/src/sealed.ts.
+///
+/// LOCAL is the master key this deployment already has in `VAULT_MASTER_KEY`.
+/// KMS is a key whose material never enters this process, and the row then
+/// carries a REFERENCE the provider understands — never the key. The product
+/// works with no KMS configured, which is the condition any key-provider
+/// environment variable is held to.
+enum VaultKeyProvider {
+  LOCAL
+  KMS
+}
+
+/// WHERE A RE-ENCRYPTION SWEEP IS. Mirrors KEY_ROTATION_STATES in
+/// packages/shared/src/sealed.ts.
+///
+/// A sweep exists so rotation is RESUMABLE and AUDITABLE. Resumable, because
+/// re-sealing every secret in a large install is not one transaction and a
+/// process that dies halfway must not start again from the top. Auditable,
+/// because "we rotated the key" is a claim, and the rows it re-sealed, the rows
+/// it could not, and the point it reached are the evidence.
+///
+/// FAILED keeps its cursor, which is the difference between a sweep that can be
+/// resumed and one that has to be re-run. `RESUMABLE_ROTATION_STATES` is the
+/// list a scheduler picks up.
+enum KeyRotationState {
+  PENDING
+  RUNNING
+  PAUSED
+  COMPLETED
+  FAILED
+}
+
+/// WHICH TESTS MAY RECEIVE ONE ENVIRONMENT SECRET. Mirrors SECRET_SCOPE_KINDS
+/// in packages/shared/src/constants.ts.
+///
+/// ── THE DEFECT ──────────────────────────────────────────────────────────────
+///
+/// There is no per-test scoping. Every decrypted secret in an environment is
+/// injected into every test process, so a test that needs a payment provider's
+/// test key also receives the production database password. One compromised
+/// generated test reads the lot.
+///
+/// FILTERED ON: "which scope rows apply to this test" is the read the injector
+/// makes before it will hand over anything, and it runs once per test.
+///
+/// ENVIRONMENT_WIDE is the broadest member and is deliberately the
+/// uncomfortable one. It re-creates today's behaviour for ONE secret at a time,
+/// EXPLICITLY, with an author and a required reason — which is the difference
+/// between a decision and an accident.
+enum SecretScopeKind {
+  TEST
+  SUITE
+  TEST_TYPE
+  AUTH_PROFILE
+  ENVIRONMENT_WIDE
+}
+
+/// WHAT HAPPENED TO ONE EGRESS DECISION. Mirrors EGRESS_OUTCOMES in
+/// packages/shared/src/egress.ts.
+///
+/// GROUPED ON, and that is the entire reason this feature can ever be switched
+/// on: "we would have refused 1,204 connections, 1,198 of them loopback from
+/// CRAWL" is a `GROUP BY outcome, context, addressClass` over
+/// `EgressDecisionTally`, and it is the answer an operator needs before they
+/// dare enforce.
+///
+/// WOULD_REFUSE is the third member and the one a two-member version would have
+/// got wrong: it is an OBSERVE-mode refusal, meaning the connection WAS made
+/// and enforcement would have stopped it. Recording that as ALLOWED would be a
+/// refusal applied-or-not without being counted, which is one of the lies this
+/// product cannot afford.
+enum EgressOutcome {
+  ALLOWED
+  REFUSED
+  WOULD_REFUSE
+}
+
+/// WHAT BECAME OF ONE SIGN-IN ATTEMPT. Mirrors LOGIN_ATTEMPT_OUTCOMES in
+/// packages/shared/src/constants.ts.
+///
+/// GROUPED ON: the throttle reads a count of recent failures per identifier,
+/// and the operator's view is a group-by over this column.
+///
+/// ── NO ORACLE, WHICH IS WHY UNKNOWN_IDENTIFIER MAY BE STORED ───────────────
+///
+/// The RESPONSE to every failed login is identical — one message, one status —
+/// so nothing a caller can observe distinguishes these members. This enum is
+/// what the OPERATOR reads afterwards, inside their own tenant, where the
+/// difference between "somebody forgot their password" and "somebody is walking
+/// a list of addresses" is the whole value of the table. Collapsing them to
+/// avoid the oracle would remove the one signal that says which is happening.
+///
+/// BAD_TOTP is the member that matters most this round: `apps/api/src/routes/auth.ts`
+/// checks that a code was SUPPLIED and never looks at its value, so this
+/// outcome has never been reachable and its count has always been zero for the
+/// most flattering possible reason.
+enum LoginAttemptOutcome {
+  SUCCESS
+  BAD_PASSWORD
+  BAD_TOTP
+  UNKNOWN_IDENTIFIER
+  LOCKED_OUT
+  SSO_REQUIRED
+  EMAIL_UNVERIFIED
+}
+
+/// ONE VAULT KEY. Many readable, exactly one writable.
+///
+/// GLOBAL (no `orgId`): a vault key is deployment infrastructure and not
+/// customer data, the same argument `FeatureFlag` and `StripeEventSeen` carry.
+/// It must be added to `GLOBAL_MODELS` in apps/api/src/lib/prisma.ts or the
+/// tenancy extension will try to stamp an `orgId` on it and every write will
+/// fail.
+///
+/// NO KEY MATERIAL IS IN THIS TABLE AND NONE MAY EVER BE. `providerRef` is an
+/// identifier a KMS understands; for a LOCAL key it is null, because the
+/// material is the deployment's existing master key and naming it here would be
+/// the first step towards putting it in a database.
+model VaultKey {
+  id String @id @default(cuid())
+
+  /// Stable identifier written into every envelope sealed under it. Not secret —
+  /// it is a label, and an envelope has to carry it so a key can be found again
+  /// after a renumbering.
+  keyId   String        @unique
+  /// Monotonic. Carried in the envelope, so a version MUST NEVER BE REUSED: two
+  /// keys sharing a version is two different ciphertexts that both claim to be
+  /// openable by one key, and no reader can tell which is which.
+  version Int           @unique
+  state   VaultKeyState
+  provider VaultKeyProvider @default(LOCAL)
+  /// A REFERENCE, never material. Null for LOCAL; required for KMS, because a
+  /// KMS key that names nothing is a key under which everything sealed is
+  /// unopenable and the failure only surfaces as a decrypt error months later.
+  providerRef String?
+
+  /// Why this key exists, or why it was moved. Required, because a key state
+  /// change with no note is the one an incident review cannot reconstruct.
+  note String
+
+  createdAt   DateTime  @default(now())
+  /// When it became ACTIVE. Null for a key registered as READABLE from the
+  /// start, which is how an imported historical key is recorded.
+  activatedAt DateTime?
+  /// When it stopped sealing new values. Set on the transition to READABLE.
+  rotatedOutAt DateTime?
+  /// When it stopped opening anything. Set only once a sweep PROVED there is
+  /// nothing sealed under it; retiring a key with rows still under it loses
+  /// that data, so the sweep record is the evidence rather than somebody's
+  /// recollection.
+  retiredAt   DateTime?
+  /// When it was declared compromised. Beside `state = COMPROMISED` rather than
+  /// derived from it, because the pair (state COMPROMISED, compromisedAt null)
+  /// can only arise from a bug in the declaring path, and a column that cannot
+  /// express the inconsistency cannot reveal it.
+  compromisedAt DateTime?
+  updatedAt   DateTime  @updatedAt
+
+  sweepsFrom KeyRotationSweep[] @relation("RotationFromKey")
+  sweepsTo   KeyRotationSweep[] @relation("RotationToKey")
+
+  /// "Which key seals new values?" — asked before every seal. Exactly one row
+  /// should match; `selectSealingKey` REFUSES rather than picking when more do.
+  @@index([state])
+}
+
+/// ONE RE-ENCRYPTION SWEEP, resumable and auditable.
+///
+/// GLOBAL for the same reason as `VaultKey`: it is a rotation of deployment
+/// infrastructure. It must be added to `GLOBAL_MODELS` in
+/// apps/api/src/lib/prisma.ts.
+///
+/// ── Why the progress numbers are four columns and not a percentage ──────────
+///
+/// Because "we rotated the key" is a claim, and the only honest form of it is
+/// "we visited 14,208 rows, re-sealed 14,201, could not open 7, and stopped at
+/// this cursor". A percentage computed from two of those is the shape that lets
+/// a half-finished rotation be reported as done — and a key retired on the
+/// strength of a done rotation that was not is how data is lost.
+///
+/// `unopenable` is the number that must never be swallowed. A row the sweep
+/// could not open is a row that will stay under the old key for ever, so
+/// retiring that key destroys it; the sweep therefore cannot reach COMPLETED
+/// with a non-zero `unopenable`, which is enforced by the processor and stated
+/// here so the next reader knows the column is load-bearing.
+model KeyRotationSweep {
+  id String @id @default(cuid())
+
+  /// Which sealed field this sweep is for. One of `SEALED_FIELD_KEYS`
+  /// (packages/shared/src/sealed.ts), TEXT with the domain at the producer —
+  /// nothing filters rows on it and a fourth sealed field should be a feature,
+  /// not a migration plus a deploy.
+  fieldKey String
+
+  fromKeyVersion Int
+  toKeyVersion   Int
+  state          KeyRotationState @default(PENDING)
+
+  /// Rows this sweep has visited. NOT a total it predicted: a count of what was
+  /// actually read, so it can never be ahead of the work.
+  visited    Int @default(0)
+  /// Rows re-sealed under `toKeyVersion`.
+  resealed   Int @default(0)
+  /// Rows the sweep COULD NOT OPEN. See the header: a sweep with a non-zero
+  /// count here may not be reported as complete, because the old key is still
+  /// the only thing that can read those rows.
+  unopenable Int @default(0)
+  /// Rows skipped because they were already under the target version. Counted
+  /// separately from `resealed` so a resumed sweep's figures stay honest about
+  /// what IT did.
+  skipped    Int @default(0)
+
+  /// Where to pick up. The row id the last successful batch ended on; null
+  /// before the first batch. This is the column that makes a FAILED sweep
+  /// resumable rather than restartable.
+  cursor String?
+
+  /// What went wrong, for a FAILED sweep. NEVER CONTAINS CIPHERTEXT, PLAINTEXT,
+  /// A NONCE OR KEY MATERIAL — it is a `SealRefusal` and a row id, which is
+  /// everything an operator needs and nothing they must not have.
+  error String?
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  fromKey VaultKey @relation("RotationFromKey", fields: [fromKeyVersion], references: [version])
+  toKey   VaultKey @relation("RotationToKey", fields: [toKeyVersion], references: [version])
+
+  /// ONE SWEEP PER (FIELD, FROM, TO). A second sweep over the same pair would
+  /// re-read every row, double the work, and report two different progress
+  /// figures for one rotation — at which point neither can be used as the
+  /// evidence for retiring the old key.
+  @@unique([fieldKey, fromKeyVersion, toKeyVersion])
+  /// "Is there a sweep to pick up?" — the scheduler's read.
+  @@index([state])
+}
+
+/// WHICH TESTS MAY RECEIVE ONE SECRET. NO ROWS MEANS NO TESTS.
+///
+/// ── DEFAULT DENY, STRUCTURALLY ──────────────────────────────────────────────
+///
+/// The absence of a row IS the denial. To widen a secret you write a row, and
+/// the row has an author, a timestamp and — for the broad kinds — a reason. A
+/// `Secret.scopeEverything Boolean @default(true)` column would have made the
+/// permissive answer the cheap one, which is exactly how the current state (no
+/// scoping at all) came about.
+///
+/// This is the control whose ENFORCE mode breaks every existing install, and it
+/// is the one control in this round whose brake defaults to OBSERVE. No secret
+/// in any customer's database has a scope row today, so default-DENY in ENFORCE
+/// mode takes the credentials away from suites that have always had them. The
+/// OBSERVE count is the worklist for writing these rows; see
+/// `SECURITY_CONTROL_BRAKES.SECRET_TEST_SCOPING`.
+model SecretScope {
+  id       String @id @default(cuid())
+  orgId    String
+  secretId String
+
+  kind SecretScopeKind
+  /// What the kind names — a test id, a suite id, a `TestType`, an auth profile
+  /// id. NULL EXACTLY FOR ENVIRONMENT_WIDE, which names nothing because it is
+  /// every test in the environment. `secretScopeSchema` refuses the other three
+  /// combinations.
+  value String?
+
+  /// Why this secret is this widely available. Required by
+  /// `SECRET_SCOPE_RULES[kind].requiresReason` for the three broad kinds; a
+  /// single named test speaks for itself.
+  reason String?
+
+  /// The user who widened it. Not a relation: the record of who granted access
+  /// to a credential must outlive the account that did it.
+  createdBy String?
+  createdAt DateTime @default(now())
+
+  /// No back-relation on `Organization`: this is an org-owned CHILD model,
+  /// reached only through its `Secret`, which is the `ORG_OWNED_CHILD_MODELS`
+  /// pattern apps/api/src/lib/prisma.ts documents. It still carries `orgId` and
+  /// is still scoped by the tenancy extension like everything else.
+  secret Secret @relation(fields: [secretId], references: [id], onDelete: Cascade)
+
+  /// One row per (secret, kind, value). A duplicate is not a wider grant, it is
+  /// two authors who each believed they were the one who opened it, and the
+  /// audit cannot then say who.
+  @@unique([secretId, kind, value])
+  @@index([orgId])
+  /// "Which secrets may this test receive?" — the injector's read, once per test.
+  @@index([kind, value])
+}
+
+/// ONE INTERNAL HOST A CUSTOMER INTENDS TO TEST, NAMED ON PURPOSE.
+///
+/// ── Why an owner and a reason are columns and not conventions ───────────────
+///
+/// An allowlist entry is a permanent hole in the one control standing between a
+/// customer-supplied string and our own network, and an entry nobody owns is an
+/// entry nobody will ever remove. Both columns are NOT NULL, because a consumer
+/// cannot forget a field it cannot construct the row without — the same
+/// structural argument the suppression vocabulary makes about expiries, which
+/// became structural only after five separate mechanisms had each shipped
+/// without one.
+///
+/// ── Why `expiresAt` is nullable here and not there ─────────────────────────
+///
+/// A test environment pointed at `app.internal` is a permanent fact about the
+/// install, not a temporary accommodation, and forcing a date onto it would
+/// produce an annual outage and a renewal nobody reads. The equivalent of the
+/// expiry here is the OWNER: a named human, in a table an auditor can read.
+///
+/// `host` IS MATCHED EXACTLY — never as a suffix and never as a pattern.
+/// `*.internal` would be a wildcard over a namespace somebody else can register
+/// names in, which is the same property that makes an exact-key mute safe and a
+/// regex mute a quarantine wearing a mute's name.
+model EgressAllowlistEntry {
+  id            String  @id @default(cuid())
+  orgId         String
+  /// Null for an org-wide entry. An entry scoped to one environment is the
+  /// narrower and preferred form; the org-wide one exists because a tracker or
+  /// a plugin host is not per-environment.
+  environmentId String?
+
+  /// Already normalised: lower-case, no trailing dot. `localhost.` resolves
+  /// exactly like `localhost`, so an entry stored in one spelling would never
+  /// match a host classified in the other.
+  host     String
+  /// Which `EgressContext` members this entry widens. EMPTY MEANS NOTHING,
+  /// never everything — `egressAllowlistEntrySchema` refuses an empty array,
+  /// because the other reading is the API-key scope defect transplanted into
+  /// the egress control.
+  contexts String[]
+
+  /// A person. Required.
+  ownerEmail String
+  /// Why this host is reachable on purpose. Required.
+  reason     String
+
+  expiresAt DateTime?
+  createdBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  environment Environment? @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, environmentId, host])
+  @@index([orgId])
+  /// "Is this host allowlisted for this environment?" — asked on every egress
+  /// decision, which in a crawl is thousands of times.
+  @@index([environmentId, host])
+}
+
+/// COUNTED EGRESS DECISIONS, BUCKETED PER DAY.
+///
+/// ── Why this table is the reason the control can be switched on ────────────
+///
+/// Rule: a cap or a refusal applied without being counted and reported is one
+/// of the lies this product cannot afford. These rows are the count. "We would
+/// have refused 1,204 connections, 1,198 of them loopback from CRAWL" is a
+/// `GROUP BY` over them, and it is what an operator reads BEFORE moving the
+/// brake from OBSERVE to ENFORCE.
+///
+/// ── Why a tally and not a row per decision ─────────────────────────────────
+///
+/// A crawl makes thousands of connections. A row per decision would be an
+/// inventory of every internal hostname a crawl touched, which is both unbounded
+/// and the single most useful thing for an attacker to read. The day bucket
+/// collapses repeats; the HOST is kept because an operator cannot write an
+/// allowlist entry without it, and the writer is responsible for capping
+/// distinct hosts per bucket and recording that the cap bit (see
+/// `hostsOmitted`) rather than silently dropping them.
+///
+/// NO PATH, EVER. For a webhook the path IS the bearer credential, and
+/// `resolvesPublicly` already refuses to name one in a refusal for that reason.
+model EgressDecisionTally {
+  id            String  @id @default(cuid())
+  orgId         String
+  environmentId String?
+
+  /// `EgressContext` (packages/shared/src/egress.ts). TEXT with the domain at
+  /// the producer: nothing filters rows on it — the reads group by it — and an
+  /// eighth context should be a feature rather than a migration plus a deploy.
+  context String
+  outcome EgressOutcome
+  /// `AddressClass`. NULL when no address was classified at all — an
+  /// unresolvable name, an ambiguous literal. Null is NOT a class and a reader
+  /// must render it as "no address was classified", never as `public`.
+  addressClass String?
+  /// `EgressRefusal`. Null exactly when `outcome` is ALLOWED.
+  refusal      String?
+  /// The host, normalised. What an operator needs in order to write an
+  /// allowlist entry; never a URL and never a path.
+  host         String
+  /// The UTC date this bucket is for, at midnight. The bucket granularity.
+  bucketDate   DateTime
+
+  count Int @default(0)
+  /// How many DISTINCT hosts this bucket dropped because the writer's per-bucket
+  /// host cap bit. Non-zero means the tally is a FLOOR and the reader must say
+  /// so — a cap that bit without being disclosed is the defect, not the cap.
+  hostsOmitted Int @default(0)
+
+  firstAt DateTime @default(now())
+  lastAt  DateTime @updatedAt
+
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  environment Environment? @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  /// The bucket's identity. The upsert key, so a crawl's thousands of decisions
+  /// become one row per (host, outcome, class, day).
+  @@unique([orgId, environmentId, context, outcome, addressClass, refusal, host, bucketDate])
+  @@index([orgId, bucketDate])
+  /// "What would enforcement have refused here?" — the operator's read before
+  /// they arm the brake.
+  @@index([environmentId, outcome])
+}
+
+/// ONE SINGLE-USE TOTP RECOVERY CODE.
+///
+/// GLOBAL (no `orgId`), like `User` and `Session` and for the same reason: it
+/// belongs to a person, not to an organisation. It must be added to
+/// `GLOBAL_MODELS` in apps/api/src/lib/prisma.ts.
+///
+/// ── HASHED AND NOT SEALED, AND THE DIFFERENCE IS THE POINT ─────────────────
+///
+/// A sealed value can be OPENED, so a sealed recovery code is a credential this
+/// process can read, print and leak. A hash cannot be opened by anybody,
+/// including us, which is the correct property for a value whose only use is to
+/// be COMPARED. The TOTP seed beside it is sealed rather than hashed for the
+/// opposite reason: codes are computed from it, so it has to be readable.
+///
+/// `usedAt` PER CODE and not a count on the user: "three of your ten codes are
+/// gone" is a different fact from "three uses have happened", and a code that
+/// works twice is a code that is not single-use.
+model TotpRecoveryCode {
+  id     String @id @default(cuid())
+  userId String
+
+  /// SHA-256 of the normalised code, hex. The code itself is shown once, at
+  /// enrolment, and is never stored or logged in any form.
+  codeHash String @unique
+
+  usedAt    DateTime?
+  /// The IP the code was redeemed from, for the incident review that follows a
+  /// recovery-code use. Null until redeemed.
+  usedFromIp String?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// "How many codes does this user have left?" — shown on the security page,
+  /// and the number that decides whether to prompt for a re-mint.
+  @@index([userId, usedAt])
+}
+
+/// THE PER-IDENTIFIER FAILURE COUNTER AND LOCK.
+///
+/// GLOBAL, like `Session`: an identifier is not yet known to belong to any
+/// organisation when the counter is incremented, which is the whole point of
+/// throttling per identifier. It must be added to `GLOBAL_MODELS` in
+/// apps/api/src/lib/prisma.ts.
+///
+/// ── WHY `identifierHash` AND NOT THE IDENTIFIER ────────────────────────────
+///
+/// A row is created for addresses that have NO ACCOUNT — that is what makes
+/// per-identifier throttling possible without telling the caller which accounts
+/// exist. So a plaintext column would accumulate whatever list an attacker is
+/// walking, and this table would become a readable address book that nothing in
+/// the product needs.
+///
+/// THAT IS A KEY, NOT ANONYMISATION, and saying so is part of the column: an
+/// email can be recovered from its hash by a dictionary in seconds. What the
+/// hash buys is that the table cannot be READ as a list, while the operator's
+/// own join — from a `User.email` they already hold — still works.
+model LoginThrottle {
+  id String @id @default(cuid())
+
+  /// SHA-256 of the lower-cased identifier, hex.
+  identifierHash String @unique
+
+  /// Consecutive failures inside the current window.
+  failures     Int      @default(0)
+  /// When the current window started. The window is a property of the policy
+  /// (`resolveLoginThrottle`), so this is the only clock stored.
+  windowStart  DateTime @default(now())
+  /// When the lock lifts. Null means not locked. A reader must compare it with
+  /// the clock rather than trusting a boolean — a `locked` column would be the
+  /// expired-suppression bug with a column behind it.
+  lockedUntil  DateTime?
+  /// How many times this identifier has been locked, ever. Not reset by a
+  /// successful login: "locked out forty times this month" is the signal that
+  /// separates a forgetful human from a password list.
+  lockCount    Int      @default(0)
+
+  lastFailureAt DateTime?
+  lastSuccessAt DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  /// "Which identifiers are locked right now?" — the operator's read, and the
+  /// sweep that clears expired locks.
+  @@index([lockedUntil])
+}
+
+/// ONE SIGN-IN ATTEMPT, AS EVIDENCE.
+///
+/// GLOBAL, for the same reason as `LoginThrottle`, and it must be added to
+/// `GLOBAL_MODELS` in apps/api/src/lib/prisma.ts.
+///
+/// Separate from `LoginThrottle` on purpose: that table is ONE ROW the gate
+/// reads and writes on every attempt, and this one is the append-only log an
+/// operator reads afterwards. Merging them would put an unbounded log on the
+/// hot path of every login.
+///
+/// NEVER THE PASSWORD, NEVER THE CODE, NEVER A TOKEN. The outcome, a hash, an
+/// IP and a user agent. `BAD_TOTP` says a code did not verify; nothing here
+/// says what it was, and `check-enums.security.test.ts` asserts no column on
+/// this model could hold one.
+model LoginAttempt {
+  id String @id @default(cuid())
+
+  /// SHA-256 of the lower-cased identifier, hex. See `LoginThrottle`.
+  identifierHash String
+  outcome        LoginAttemptOutcome
+  ip             String?
+  userAgent      String?
+  createdAt      DateTime            @default(now())
+
+  /// "What has happened to this identifier lately?" — the throttle's evidence
+  /// read and the operator's.
+  @@index([identifierHash, createdAt])
+  /// "Is somebody walking a list?" — a group-by over outcomes in a window.
+  @@index([outcome, createdAt])
 }

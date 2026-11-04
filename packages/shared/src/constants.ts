@@ -1187,3 +1187,591 @@ export const SUPPRESSION_LEDGER_SCAN_CAP = 2_000;
 
 /** Prefix on every API key so leak-scanners can pattern-match it. */
 export const API_KEY_PREFIX = 'qaai_';
+
+// ─── Security controls and their rollout brakes (§1) ─────────────────────────
+//
+// ── WHY THERE IS A TABLE AND NOT THIRTEEN CONSTANTS IN THIRTEEN FILES ───────
+//
+// Every control in this round changes behaviour for a deployment that is
+// working today. Three of them would stop traffic that is legitimate: scoping
+// secrets per test takes env vars away from tests that have always received
+// them, enforcing email verification locks out a user base in which NOTHING has
+// ever written `User.emailVerified`, and a strict CSP breaks a cockpit that was
+// written without one. The other ten close a hole and break nothing.
+//
+// A brake is only a brake if its default is discoverable and its OBSERVE mode
+// COUNTS what it would have refused. A mode with no counter is an off switch
+// with a reassuring name, and this product has shipped one of those before.
+//
+// ── WHY A ROW AND NOT AN ENVIRONMENT VARIABLE ───────────────────────────────
+//
+// Same argument `Environment.crawlPolicy` records: an env var arms one answer
+// for every org and every environment in the install at once, which is the
+// opposite of a brake, and `scripts/check-wiring.ts` refuses one. The stored
+// value lives on `Organization.securityControlModes` (per org) and, for egress,
+// on `Environment.egressPolicy` (per environment, because a seeded throwaway
+// and a production site want opposite answers).
+
+/** OBSERVE counts what ENFORCE would have refused. Nothing else. */
+export const CONTROL_MODES = ['OBSERVE', 'ENFORCE'] as const;
+export type ControlMode = (typeof CONTROL_MODES)[number];
+
+/**
+ * The controls this round builds, one name each.
+ *
+ * Five agents build against this list in parallel, which is the whole reason it
+ * is one list: two spellings of "the egress control" is two counters, two
+ * stored modes and two answers to "is it on".
+ *
+ * `CSRF_TOKEN` and `CONTENT_SECURITY_POLICY` are members although neither is a
+ * refusal made in our own code — both are refusals made by the BROWSER on our
+ * instructions, and both still need a mode, a default and a count, because a
+ * CSP delivered report-only IS observe mode and is useless unless somebody
+ * reads the reports.
+ */
+export const SECURITY_CONTROLS = [
+  'EGRESS_CLASSIFICATION',
+  'SESSION_STATE_SEAL',
+  'VAULT_KEY_ROTATION',
+  'SECRET_TEST_SCOPING',
+  'TOTP_VERIFICATION',
+  'LOGIN_THROTTLE',
+  'SESSION_REVOCATION',
+  'EMAIL_VERIFICATION',
+  'API_KEY_SCOPE',
+  'ROLE_RANK_GUARD',
+  'ENFORCE_SSO',
+  'CSRF_TOKEN',
+  'CONTENT_SECURITY_POLICY',
+] as const;
+export type SecurityControl = (typeof SECURITY_CONTROLS)[number];
+
+/** What one control's brake is set to out of the box, and what each mode costs. */
+export interface SecurityControlBrake {
+  /**
+   * The mode when nothing has been stored. ENFORCE unless enforcing would stop
+   * traffic that is legitimate today — see the three OBSERVE entries, each of
+   * which names the traffic.
+   */
+  readonly fallback: ControlMode;
+  /** What ENFORCE could break in a working deployment. 'nothing' is a claim, so it is spelt out. */
+  readonly enforcingBreaks: string;
+  /** What OBSERVE must COUNT. A mode with no counter is an off switch. */
+  readonly observeCounts: string;
+}
+
+/**
+ * The compiler-enforced presence record. A `Record<SecurityControl, …>` cannot
+ * be written without naming every member, so a fourteenth control is a type
+ * error here rather than a control with no default and no counter.
+ *
+ * Both halves, because one without the other passes while the two disagree:
+ * this is the compile-time half, and `controlModeSchema.options` /
+ * `securityControlSchema.options` in schemas.ts are the run-time half. Eight
+ * `GateRule` kinds shipped UNSAVEABLE for two slices because only one existed.
+ */
+export const SECURITY_CONTROL_BRAKES = {
+  EGRESS_CLASSIFICATION: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'Nothing legitimate. A self-hosted install reaches its own private hosts through the ' +
+      'SELF_HOSTED deployment mode and the allowlist, NOT by turning the control off — so the ' +
+      'escape for the customer who tests an internal app is a policy, not an OBSERVE.',
+    observeCounts:
+      'every connection that would have been refused, by context and by address class, so ' +
+      '"we would have refused 1,204 connections" is answerable before anyone enforces.',
+  },
+  SESSION_STATE_SEAL: {
+    fallback: 'ENFORCE',
+    /*
+     * ── THIS SENTENCE SAID "Nothing, by construction" AND THAT WAS FALSE ────
+     *
+     * It claimed "the first run after it signs in again", and the run does not:
+     * apps/worker/src/processors/run.ts resolves the DEFAULT identity without
+     * ever driving a login, so a profile the refresh sweep has sealed and
+     * nulled used to leave that path with no session and the suite ran
+     * ANONYMOUSLY — the exact defect the control was minted to end, caused by
+     * the control. A doc comment that contradicts the code under it is the
+     * worst kind of defect in a security file, because the comment is what the
+     * next reviewer trusts instead of reading the code. Rewritten to say what
+     * breaks now that both consumers open the sealed column.
+     */
+    enforcingBreaks:
+      'Tests and crawls on a profile whose stored session this image cannot vouch for. ENFORCE ' +
+      'is what lets the hourly sweep SEAL a session and NULL the plaintext column, and it is ' +
+      'what turns an unopenable, expired, unversioned or re-seal-marked session into a typed ' +
+      'BLOCKED_BY_ENV refusal instead of an anonymous pass that makes every auth-gated route ' +
+      'look covered. Concretely: a run whose tests name no profile reports those tests FAILED ' +
+      'rather than running them signed out, and a role crawl reports LOGIN_FAILED rather than ' +
+      'enumerating the application as an anonymous visitor under that role\'s name. Every one of ' +
+      'those states is on the refresh sweep\'s own worklist, so the refusal clears within an ' +
+      'hour without an operator touching anything — except ABSENT, which the sweep skips on ' +
+      'purpose because a profile that never had a session is new and not stale, and which is ' +
+      'therefore the one state that is NOT refused: it carries no session today, it carried none ' +
+      'before, and refusing it would be a brake nobody can release. ' +
+      'OBSERVE, PRECISELY: it is the HOURLY SWEEP that honours the mode — under OBSERVE it leaves ' +
+      'the plaintext column exactly as it is and writes a refreshed session into it the way every ' +
+      'writer did before this control, and both consumers CARRY a valid plaintext session in ' +
+      'either mode, so a deployment whose writers still produce plaintext goes on working. ' +
+      'WHAT OBSERVE DOES NOT HOLD BACK is the cockpit sign-in route ' +
+      '(apps/api/src/routes/projects.ts): it reads no mode and seals unconditionally, so a person ' +
+      'pressing "Sign in" produces a SEALED row in both modes. That is deliberate — writing ' +
+      'plaintext again would be the regression this control exists to end — and it is stated ' +
+      'because the sentence this replaced implied the whole API half stayed on plaintext under ' +
+      'OBSERVE, which it no longer does. The consequence an operator must know: on a deployment ' +
+      'whose VaultKey table is unseeded, that route REFUSES to seal and discards the captured ' +
+      'session rather than storing it in the clear, and OBSERVE does not release that — the ' +
+      'refusal is reported on the response and in the audit row (`sealRefusal`) rather than ' +
+      'being silent, and the remedy is to seed the key table, not to change the mode.',
+    observeCounts:
+      'every run that would have been reported NOT_RUN and instead went anonymous, per profile ' +
+      'and per session state, beside how many were considered — and, in the sweep, every ' +
+      'profile whose plaintext column a seal would have replaced, which is the worklist an ' +
+      'operator reads before arming. THE TWO ARE SEPARATE BUCKETS and were not: both landed in ' +
+      '`degraded`, so one number meant "runs that went anonymous" in the run and the crawl and ' +
+      '"profiles a seal would replace" in the sweep. The run-side buckets now count WHAT THE ' +
+      'CONSUMER DID rather than what the gate said, because the two disagree by design on three ' +
+      'paths — a carried LEGACY_PLAINTEXT row, an ABSENT profile the run deliberately does not ' +
+      'refuse, and a cache miss that drives a fresh login — and all three used to be reported as ' +
+      'refused or degraded runs that in fact ran. See `SessionGateOutcome`.',
+  },
+  VAULT_KEY_ROTATION: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'Nothing. Version 1 keeps opening everything it opened before; what ENFORCE adds is that an ' +
+      'UNKNOWN key version is a named refusal rather than a decrypt attempt.',
+    observeCounts: 'every open attempted against a key version this deployment cannot name.',
+  },
+  SECRET_TEST_SCOPING: {
+    // THE DANGEROUS ONE. Read the sentence below before arming it.
+    fallback: 'OBSERVE',
+    enforcingBreaks:
+      'Every test in every existing install. Today all of an environment\'s decrypted secrets are ' +
+      'injected into every test process, so no secret has a scope row and default-DENY means a ' +
+      'suite that has always had its credentials suddenly has none. ENFORCE is safe only after ' +
+      'the OBSERVE count has been read and scopes have been written.',
+    observeCounts:
+      'per test and per secret, every injection that default-DENY would have withheld — which is ' +
+      'also the exact worklist for writing the scope rows.',
+  },
+  TOTP_VERIFICATION: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'Nothing, and the reason is a schema decision rather than a hope: a row with ' +
+      '`totpEnabledAt` set and `totpConfirmedAt` null is treated as NOT ENROLLED, because the ' +
+      'code was never checked at enrolment either, so such a user may hold a seed their ' +
+      'authenticator never saw. That is the only reading that neither locks them out nor accepts ' +
+      'an unverified second factor.',
+    observeCounts:
+      'every login that supplied a code which did not verify and was admitted anyway. This count ' +
+      'is the size of the hole; it must not be left running.',
+  },
+  LOGIN_THROTTLE: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'A shared NAT or a CI job that signs in on every build can trip a per-identifier counter. ' +
+      'The brake for that is the THRESHOLD, not the mode — so the mode defaults to ENFORCE and ' +
+      'the thresholds are generous and stored beside the counter. ' +
+      'AND ONE THING NEITHER MODE CONTROLS, named here because nobody owned it: `LoginThrottle` ' +
+      'arrives in a hand-written migration, so between this code reaching a deployment and ' +
+      '`prisma migrate deploy` running, the relation does not exist. MEASURED by driving the real ' +
+      'router with that one relation answering P2021: login answered 500 FOR EVERY CALLER, which ' +
+      'is fail-closed and a total outage at once. The read now tells a MISSING RELATION ' +
+      '("this control is not installed") apart from an UNREADABLE one ("I cannot tell whether you ' +
+      'are locked out") by Postgres\'s own error code: the first admits the login, and the second ' +
+      'still answers 500, because an unreadable lock assumed open is the control being switched ' +
+      'off by a dropped connection. The missing-relation window is NOT a mode an operator can ' +
+      'set, it clears itself the moment the migration runs, and every login it admits is counted ' +
+      'and logged AT ERROR naming the remedy.',
+    observeCounts:
+      'every attempt that would have been locked out, per identifier — and, independently of the ' +
+      'mode, every login admitted while the relation was absent, as an audit row whose ' +
+      '`wouldHaveRefused` is NULL rather than false, because nothing was read and a measured ' +
+      'answer nobody measured is the lie this product cannot afford.',
+  },
+  SESSION_REVOCATION: {
+    fallback: 'ENFORCE',
+    /*
+     * ── THIS SENTENCE SAID "no request path ever honoured it" AND THAT WAS
+     *    FALSE, AND THE MODE HAS NO READER AT ALL ─────────────────────────────
+     *
+     * Both halves were wrong in the same direction — overstating a hole, which
+     * in a security file is as damaging as hiding one, because the next
+     * reviewer trusts the paragraph instead of reading the code.
+     *
+     * MEASURED: `apps/api/src/middleware/auth.ts` reads
+     * `if (!session || session.revokedAt || session.expiresAt < new Date())
+     * return null;` in `actorFromSession`, on EVERY request, and has since that
+     * function was written. There is no token cache and no expiry window, so a
+     * revocation is already immediate. apps/api/src/lib/sessions.ts's own
+     * header records the same finding.
+     *
+     * And MEASURED the other way: grepping every workspace for this control
+     * name finds NO production reader. The only other hits are
+     * `AUTH_LIFECYCLE_FLOWS`, an unrelated vocabulary in packages/agent that
+     * happens to share the spelling. So the mode changes nothing an operator
+     * can observe and the `observeCounts` promise below was never kept — which
+     * is rule 13's defect inverted: a brake nobody can arm.
+     *
+     * Left UNCONDITIONAL rather than given a reader. Honouring `revokedAt` is
+     * not a behaviour change anybody needs to stage: it has been the behaviour
+     * for as long as the column has been read, OBSERVE would mean serving
+     * requests on sessions a customer has explicitly killed, and a brake whose
+     * OBSERVE position is "ignore the revocation" is not an escape hatch, it is
+     * an off switch for the feature. Said here instead of implied.
+     */
+    enforcingBreaks:
+      'Nothing, and NOT because this mode is enforcing. `Session.revokedAt` is honoured ' +
+      'unconditionally in `actorFromSession` (apps/api/src/middleware/auth.ts) on every request ' +
+      'and has been since that function was written, so a revocation is already immediate. This ' +
+      'control has NO production reader: setting it changes nothing. It is kept in the list ' +
+      'because the vocabulary is persisted and removing a member is a migration, and it is ' +
+      'documented as unconditional rather than left looking settable.',
+    observeCounts:
+      'NOTHING, and that is the honest answer rather than an unkept promise: there is no reader, ' +
+      'so there is no decision to count. An OBSERVE here would have to mean serving requests on ' +
+      'sessions the customer has killed, which is not a staging position.',
+  },
+  EMAIL_VERIFICATION: {
+    // THE SECOND DANGEROUS ONE.
+    fallback: 'OBSERVE',
+    enforcingBreaks:
+      'Every existing user. `User.emailVerified` is nullable and NOTHING has ever written it, so ' +
+      'enforcing verification locks out the whole installed base at once. ENFORCE is safe only ' +
+      'after a back-fill or a verification campaign.',
+    observeCounts:
+      'every sign-in and every SSO JIT provision on an address nobody has proved ownership of — ' +
+      'which, with SSO JIT, is the pre-condition for an account takeover.',
+  },
+  API_KEY_SCOPE: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'Any key created with an empty scope array, because TODAY an empty array is read as the ' +
+      'wildcard (apps/api/src/middleware/auth.ts). ENFORCE makes the empty array mean NOTHING. ' +
+      'The OBSERVE count is how many keys that is before the meaning flips.',
+    observeCounts: 'every request authorised by a key whose scopes are empty.',
+  },
+  ROLE_RANK_GUARD: {
+    fallback: 'ENFORCE',
+    /*
+     * NO PRODUCTION READER EITHER, and this one is a DECISION rather than an
+     * omission — recorded here because the previous paragraph read as though
+     * the mode did something.
+     *
+     * The rank rule lives in `apps/api/src/routes/settings.ts`, which refuses
+     * an ADMIN changing an OWNER's role and says at the call site why it is not
+     * gated: an OBSERVE default would leave a privilege escalation open in
+     * every deployment, and the refusal costs an ADMIN nothing they are
+     * supposed to be able to do. Measured there: `PATCH
+     * /settings/members/<owner>` with `{ role: 'MEMBER' }` from an ADMIN
+     * session answered 200 and the OWNER became a MEMBER.
+     */
+    enforcingBreaks:
+      'Nothing a customer does deliberately, and NOT because this mode is enforcing. The rank ' +
+      'rule in apps/api/src/routes/settings.ts is UNCONDITIONAL: this control has no production ' +
+      'reader, so setting it changes nothing. Gating it would mean an OBSERVE default that left ' +
+      'an ADMIN able to demote an OWNER — a privilege escalation, not a workflow — in every ' +
+      'install. Documented as unconditional rather than left looking settable.',
+    observeCounts:
+      'NOTHING, for the same reason: there is no reader and therefore no decision to count. The ' +
+      'refusal is applied, audited as `member.role.change` being absent, and never staged.',
+  },
+  ENFORCE_SSO: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'Nothing unless an org sets the flag. The flag is the customer\'s decision; this mode is ' +
+      'only about whether we honour it, and not honouring a stored security setting is worse ' +
+      'than not offering it.',
+    observeCounts: 'every password login into an org that has asked for SSO-only.',
+  },
+  CSRF_TOKEN: {
+    fallback: 'ENFORCE',
+    enforcingBreaks:
+      'A cookie-authenticated client that does not send the token. Bearer-token callers (the CLI, ' +
+      'the Action, every API key) are unaffected, because a CSRF check only applies where the ' +
+      'browser attaches the credential by itself.',
+    observeCounts: 'every cookie-authenticated mutating request that arrived without a valid token.',
+  },
+  CONTENT_SECURITY_POLICY: {
+    // THE THIRD DANGEROUS ONE, and the one where OBSERVE has a name of its own.
+    fallback: 'OBSERVE',
+    enforcingBreaks:
+      'The cockpit, until its inline styles and scripts are accounted for. OBSERVE here means ' +
+      'Content-Security-Policy-Report-Only, which is a real header with a real report endpoint ' +
+      'and not a disabled feature.',
+    observeCounts: 'every violation report, by directive, so the policy can be tightened on evidence.',
+  },
+} as const satisfies Record<SecurityControl, SecurityControlBrake>;
+
+/**
+ * THE TWO NAMES THE DOUBLE-SUBMIT TOKEN TRAVELS UNDER, PUBLISHED ONCE.
+ *
+ * ── WHY THEY LIVE HERE AND NOT IN THE API ──────────────────────────────────
+ *
+ * The `CSRF_TOKEN` control is the only one in {@link SECURITY_CONTROLS} that
+ * needs BOTH HALVES OF THE PRODUCT to agree on a literal: the API writes a
+ * readable companion cookie and requires a header echoing it, and `apps/web`
+ * has to read that exact cookie and send that exact header. They were declared
+ * in apps/api/src/lib/sessions.ts and RETYPED in apps/web/lib/api.ts, because
+ * `apps/web` must not import from `apps/api` — a duplication across a workspace
+ * boundary, which is one rename from the defect this whole round exists to
+ * undo: every cookie-authenticated `/auth/*` mutation answering 403, sign-out
+ * and switch-org included, with nothing in either workspace looking wrong.
+ *
+ * A compiler cannot catch two string literals drifting apart. It can catch an
+ * import, so the names are published here and both sides import them.
+ *
+ * NEITHER IS A SECRET. The cookie is deliberately NOT HttpOnly — the page has
+ * to be able to read it — and these are its NAME and the HEADER's name, never
+ * a token value. Rule 11 is about the value, which is derived per session in
+ * `csrfTokenFor` and is published nowhere.
+ */
+/** The header the cockpit echoes the readable companion cookie back in. */
+export const CSRF_HEADER = 'x-qaai-csrf';
+/** The readable companion cookie. NOT HttpOnly, by design. */
+export const CSRF_COOKIE = 'qaai_csrf';
+
+/** True when this mode applies its refusal. OBSERVE counts and allows. */
+export function controlEnforces(mode: ControlMode): boolean {
+  return mode === 'ENFORCE';
+}
+
+/**
+ * Read one control's mode out of whatever `Organization.securityControlModes`
+ * holds, falling back to the control's own default.
+ *
+ * FAILS CLOSED ON AMBIGUITY in the direction the brake table chose: an
+ * unparseable or unknown stored value resolves to `fallback`, which is ENFORCE
+ * for ten of the thirteen. It never throws — the input is JSON from a settings
+ * screen, and a control that crashes on a malformed row is a control that is
+ * off for as long as the row is malformed.
+ */
+export function controlMode(control: SecurityControl, stored: unknown): ControlMode {
+  const fallback: ControlMode = SECURITY_CONTROL_BRAKES[control].fallback;
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return fallback;
+  const raw = (stored as Record<string, unknown>)[control];
+  return raw === 'OBSERVE' || raw === 'ENFORCE' ? raw : fallback;
+}
+
+/**
+ * WHOSE SIDE OF THE FIREWALL THIS DEPLOYMENT IS ON.
+ *
+ * Mirrors `ProbeHostMode` in packages/runner/src/preflight.ts, which already
+ * had exactly this pair for exactly this reason: a self-hosted QAAI exists to
+ * test `http://localhost:3000`, and refusing that would break the install for
+ * every customer running behind their own firewall. Named here so the egress
+ * policy and the preflight cannot disagree about what the two words mean.
+ *
+ * NOT a Prisma enum: it is a property of the INSTALL, stored inside the
+ * `Environment.egressPolicy` JSON beside the rest of the policy, and nothing
+ * filters rows on it. Its run-time parity is in packages/shared/src/egress.test.ts.
+ */
+export const EGRESS_DEPLOYMENT_MODES = ['HOSTED', 'SELF_HOSTED'] as const;
+export type EgressDeploymentMode = (typeof EGRESS_DEPLOYMENT_MODES)[number];
+
+/**
+ * WHICH TESTS MAY RECEIVE ONE ENVIRONMENT SECRET. Stored by `SecretScope.kind`.
+ *
+ * ── THE DEFECT ──────────────────────────────────────────────────────────────
+ *
+ * There is no per-test scoping at all: every decrypted secret in an environment
+ * is injected into every test process, so a test that needs a payment
+ * provider's test key also receives the production database password. One
+ * compromised generated test reads the lot.
+ *
+ * ── WHY ABSENCE IS THE DENY, AND WHY THAT IS STRUCTURAL ─────────────────────
+ *
+ * A secret with NO `SecretScope` row reaches NOTHING. The default is therefore
+ * a property of the data rather than a convention somebody has to remember: to
+ * widen a secret you write a row, and the row has an author, a timestamp and a
+ * reason. A `scopeEverything: boolean` column would have made the permissive
+ * answer the cheap one, which is how the current state happened.
+ *
+ * ENVIRONMENT_WIDE exists and is deliberately the broadest and most
+ * uncomfortable member. It re-creates today's behaviour for ONE secret at a
+ * time, EXPLICITLY, with somebody's name on it — which is the difference
+ * between a decision and an accident. `SECRET_SCOPE_RULES` requires a reason
+ * for it.
+ */
+export const SECRET_SCOPE_KINDS = [
+  'TEST',
+  'SUITE',
+  'TEST_TYPE',
+  'AUTH_PROFILE',
+  'ENVIRONMENT_WIDE',
+] as const;
+export type SecretScopeKind = (typeof SECRET_SCOPE_KINDS)[number];
+
+/** What one scope kind names, and how uncomfortable it ought to be. */
+export interface SecretScopeRule {
+  /** What `SecretScope.value` holds for this kind. ENVIRONMENT_WIDE names nothing. */
+  readonly names: 'TEST_ID' | 'SUITE_ID' | 'TEST_TYPE' | 'AUTH_PROFILE_ID' | 'NOTHING';
+  /** Broadest first: 0 is one test, 4 is every test in the environment. */
+  readonly breadth: 0 | 1 | 2 | 3 | 4;
+  /** True when a human must say WHY. The broad ones; a single test speaks for itself. */
+  readonly requiresReason: boolean;
+}
+
+/**
+ * The compiler-enforced presence record, with `secretScopeKindSchema.options`
+ * in schemas.ts as the run-time half.
+ */
+export const SECRET_SCOPE_RULES = {
+  TEST: { names: 'TEST_ID', breadth: 0, requiresReason: false },
+  SUITE: { names: 'SUITE_ID', breadth: 1, requiresReason: false },
+  TEST_TYPE: { names: 'TEST_TYPE', breadth: 2, requiresReason: true },
+  AUTH_PROFILE: { names: 'AUTH_PROFILE_ID', breadth: 3, requiresReason: true },
+  ENVIRONMENT_WIDE: { names: 'NOTHING', breadth: 4, requiresReason: true },
+} as const satisfies Record<SecretScopeKind, SecretScopeRule>;
+
+/**
+ * WHAT BECAME OF ONE SIGN-IN ATTEMPT. Stored by `LoginAttempt.outcome`.
+ *
+ * ── NO ORACLE, AND THAT IS WHY UNKNOWN_IDENTIFIER MAY BE STORED ─────────────
+ *
+ * The RESPONSE to every failed login is identical — one message, one status,
+ * one timing budget — so nothing a caller can observe distinguishes
+ * UNKNOWN_IDENTIFIER from BAD_PASSWORD from LOCKED_OUT. This enum is what the
+ * OPERATOR reads afterwards, inside their own tenant, and the distinction is
+ * the difference between "somebody forgot their password" and "somebody is
+ * walking a list of addresses". Collapsing the two to avoid the oracle would
+ * remove the one signal that says which is happening.
+ *
+ * BAD_TOTP is a member and it is the one that matters most this round: today
+ * `apps/api/src/routes/auth.ts` checks that a code was SUPPLIED and never looks
+ * at its value, so this outcome has never been reachable and the count of it
+ * has always been zero for the most flattering possible reason.
+ */
+export const LOGIN_ATTEMPT_OUTCOMES = [
+  'SUCCESS',
+  'BAD_PASSWORD',
+  'BAD_TOTP',
+  'UNKNOWN_IDENTIFIER',
+  'LOCKED_OUT',
+  'SSO_REQUIRED',
+  'EMAIL_UNVERIFIED',
+] as const;
+export type LoginAttemptOutcome = (typeof LOGIN_ATTEMPT_OUTCOMES)[number];
+
+/**
+ * How long a per-identifier counter runs before it locks, and for how long.
+ *
+ * Generous on purpose: the brake for a throttle is the threshold, not the mode
+ * (see `SECURITY_CONTROL_BRAKES.LOGIN_THROTTLE`). A CI job that signs in on
+ * every build must not trip it, and an attacker walking a password list must.
+ *
+ * Clamped by `resolveLoginThrottle` so a stored override cannot set
+ * `maxFailures: 0`, which would lock every identifier in the install out on its
+ * first attempt — the same class of defect `resolveFlakePolicy` clamps against.
+ */
+export interface LoginThrottlePolicy {
+  /** Failures within the window before the identifier is locked. */
+  readonly maxFailures: number;
+  /** The window the counter is measured over, in minutes. */
+  readonly windowMinutes: number;
+  /** How long a lock lasts, in minutes. */
+  readonly lockMinutes: number;
+}
+
+export const LOGIN_THROTTLE_DEFAULTS: LoginThrottlePolicy = {
+  maxFailures: 10,
+  windowMinutes: 15,
+  lockMinutes: 15,
+};
+
+/**
+ * Merge a stored per-org override onto the defaults, clamping every field.
+ *
+ * Never throws and never trusts — same contract as `resolveFlakePolicy`, and
+ * the same reason: the input is JSON from a settings screen, and a policy that
+ * cannot be parsed must resolve to the default rather than to zero. Both
+ * directions are clamped, because `maxFailures: 1` locks out the installed base
+ * and `maxFailures: 10_000` is no throttle at all.
+ */
+export function resolveLoginThrottle(raw: unknown): LoginThrottlePolicy {
+  const d = LOGIN_THROTTLE_DEFAULTS;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return d;
+  const o = raw as Record<string, unknown>;
+  const num = (value: unknown, fallback: number, min: number, max: number): number =>
+    typeof value === 'number' && Number.isFinite(value)
+      ? Math.min(max, Math.max(min, Math.trunc(value)))
+      : fallback;
+  return {
+    maxFailures: num(o.maxFailures, d.maxFailures, 3, 100),
+    windowMinutes: num(o.windowMinutes, d.windowMinutes, 1, 24 * 60),
+    lockMinutes: num(o.lockMinutes, d.lockMinutes, 1, 24 * 60),
+  };
+}
+
+/**
+ * WHY A SESSION STOPPED WORKING. Stored by `Session.revokedReason` as TEXT.
+ *
+ * TEXT and not a Prisma enum, on the house argument `Run.selectionSource`
+ * records: nothing filters rows on it (the reads are "list my sessions" and
+ * "revoke this one"), so an enum would be one more Postgres type whose only job
+ * is to need a drift guard. The domain is enforced by `sessionRevocationReasonSchema`
+ * in schemas.ts, which is the only write path.
+ *
+ * NULL beside a non-null `revokedAt` is a legal and meaningful state: a session
+ * revoked before this list existed. A reader must render it as "revoked, reason
+ * not recorded" and never pick a member to stand in for it.
+ */
+export const SESSION_REVOCATION_REASONS = [
+  'USER_SIGNED_OUT',
+  'USER_REVOKED_DEVICE',
+  'ADMIN_REVOKED',
+  'PASSWORD_CHANGED',
+  'TOTP_CHANGED',
+  'ALL_SESSIONS_REVOKED',
+  'KEY_COMPROMISE',
+  'SSO_ENFORCED',
+] as const;
+export type SessionRevocationReason = (typeof SESSION_REVOCATION_REASONS)[number];
+
+/**
+ * WHAT A `VerificationToken` IS FOR. Stored by `VerificationToken.purpose` as TEXT.
+ *
+ * The column has carried the comment `// "EMAIL_VERIFY" | "PASSWORD_RESET" |
+ * "INVITE"` since the init migration and there has never been a TypeScript list
+ * to check a writer against, so the three spellings lived in whichever route
+ * happened to need one. This is that list. The column stays TEXT — converting a
+ * populated column to an enum is a data migration bought for nothing, since
+ * nothing groups on it.
+ */
+export const VERIFICATION_TOKEN_PURPOSES = [
+  'EMAIL_VERIFY',
+  'PASSWORD_RESET',
+  'INVITE',
+] as const;
+export type VerificationTokenPurpose = (typeof VERIFICATION_TOKEN_PURPOSES)[number];
+
+/**
+ * THE SCOPES AN API KEY MAY HOLD.
+ *
+ * ── THE DEFECT THIS LIST EXISTS TO CLOSE ────────────────────────────────────
+ *
+ * `apps/api/src/middleware/auth.ts` reads
+ * `scopes: key.scopes.length > 0 ? key.scopes : ['*']`, so A KEY CREATED WITH
+ * AN EMPTY SCOPE ARRAY HOLDS EVERY SCOPE. `POST /settings/api-keys` hand-parses
+ * `req.body.scopes` with no schema and no vocabulary, so "create a read-only
+ * key" and "create a key with no restrictions at all" are the same request with
+ * a different body — and the restrictive-looking one is the unrestricted one.
+ *
+ * The six members are the scopes `requireScope` actually gates on today,
+ * enumerated from the routes rather than invented: a seventh spelling in a
+ * request body is a scope no route will ever check, which is a key the customer
+ * believes is narrower than it is.
+ *
+ * `'*'` IS DELIBERATELY NOT A MEMBER. It is the sentinel `requireScope` gives a
+ * SESSION actor, who is a human with a role, and it must not be storable on a
+ * key: a key that can name the wildcard is the empty array with extra steps.
+ */
+export const API_KEY_SCOPES = [
+  'tests:read',
+  'tests:write',
+  'runs:read',
+  'runs:write',
+  'secrets:write',
+  'git:push',
+] as const;
+export type ApiKeyScope = (typeof API_KEY_SCOPES)[number];

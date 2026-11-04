@@ -203,7 +203,10 @@ export function githubRepoSlug(repo: string): string {
  * Re-exported under the original name so callers here and in
  * lib/chat-integrations.ts do not move.
  */
-import { isPrivateNetworkName } from '@qaai/shared/private-address';
+import * as dns from 'node:dns';
+import { classifyAddress, classifyHost, isPrivateNetworkName } from '@qaai/shared/private-address';
+import { guardUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo, EgressGuardVerdict } from '@qaai/shared';
 
 export { isPrivateNetworkName as isInternalHostname };
 /** IPv4 literal or anything with a colon (IPv6, or a port smuggled into a host). */
@@ -219,6 +222,24 @@ export function isIpLiteralHost(host: string): boolean {
  * credentials, no IP literal and no internal-only name. A hostname is not proof
  * of where it resolves, so this narrows the blast radius rather than closing it;
  * the redirect ban is what stops the token travelling further than this host.
+ *
+ * ── WHAT THIS FUNCTION DECIDES, WHICH IS LESS THAN IT LOOKS ────────────────
+ *
+ * NOTHING ABOUT WHERE THE HOST POINTS. `isPrivateNetworkName` is a PATTERN
+ * MATCH — `INTERNAL_HOST.test(host) || !host.includes('.')` — so it refuses the
+ * names an attacker would have to be careless to use and accepts every name
+ * they would actually register. MEASURED on this tree:
+ * `jiraSite('https://jira.attacker.test/')` returns
+ * `https://jira.attacker.test`, and `classifyHost('jira.attacker.test')` is
+ * `{kind:'name', internal:false}` — which is not a verdict, it is the statement
+ * that NOTHING HAS BEEN DECIDED. One A record pointing at 169.254.169.254 and
+ * the vault-unsealed Jira credential goes to the cloud metadata service.
+ *
+ * This function is therefore KEPT AS IT IS and is not the control. It runs at
+ * PARSE time, before the token is unsealed, which is a property worth keeping:
+ * a repointed integration fails while the credential is still ciphertext. The
+ * control is {@link sendToJira}, which RESOLVES the host and classifies every
+ * address it answers with before any byte leaves the process.
  */
 export function jiraSite(baseUrl: string): string {
   const raw = baseUrl.trim();
@@ -522,6 +543,173 @@ async function sendJson(
   return { status: response.status, json };
 }
 
+// ─── The egress guard, at the one seam a customer-named host is reached ──────
+
+/**
+ * MAY WE OPEN A REQUEST TO THIS JIRA SITE, AND TO WHICH ADDRESS.
+ *
+ * ── Why only Jira, when three providers share one `sendJson` ───────────────
+ *
+ * Because only Jira's host comes from config. `API_HOST` above is a
+ * compile-time constant per provider and the module header states the rule it
+ * exists to keep: "a configured repo/URL is only ever used to derive a PATH; it
+ * can never choose the host." Resolving `api.github.com` through this guard
+ * would add a DNS round trip and a new failure mode to a destination no
+ * customer can influence, and it would put a real resolver inside
+ * `apps/api/src/routes/issues.test.ts`, which stubs `fetch` and would then
+ * depend on the network. So the guard is applied exactly where the attack
+ * surface is.
+ *
+ * ── It is a PORT, and the real one is built lazily ─────────────────────────
+ *
+ * Same shape as `defaultLoginEgressGuard` in `packages/runner/src/login.ts`
+ * and `defaultCrawlEgressIo` in `packages/agent/src/crawler.ts`: a
+ * one-function interface so a unit test decides without a resolver, and a
+ * `default…` builder so no production path can reach the send without one.
+ */
+export type TrackerEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
+
+/**
+ * WHAT THIS CONTROL DOES NOT DO, STATED HERE BECAUSE A COMMENT IS WHAT THE NEXT
+ * REVIEWER TRUSTS.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
+ * turns a check into a control: whoever opens the connection must connect to
+ * those addresses and must not resolve the name again. The transport here is
+ * Node's GLOBAL `fetch`, and MEASURED on Node v25.6.1:
+ * `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200 and NEVER
+ * CALLED THE LOOKUP, while `{ dispatcher: new http.Agent(…) }` threw. There is
+ * no supported way to hand global `fetch` a resolver, and `undici` — which has
+ * `connect: { lookup }` — is present in the tree but is not a declared
+ * dependency of any workspace.
+ *
+ * ── THAT IS TRUE OF `fetch` AND THE CONCLUSION DRAWN FROM IT WAS WRONG ───────
+ *
+ * This paragraph used to end "there is no supported way", and a reader took it
+ * to mean the pin cannot be enforced. It can. RE-MEASURED on Node v25.6.1
+ * against a loopback server:
+ *
+ *   · `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200, lookup called
+ *     ZERO times. The original measurement reproduces: the agent is IGNORED.
+ *   · `http.request({ host, port, path, lookup })`        -> 200, lookup called
+ *     ONCE. Node core honours it, with NO dependency change.
+ *
+ * So the remedy is a transport, not a dependency: moving this call off global
+ * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
+ * pin for free. `undici`'s `{ dispatcher: new undici.Agent({ connect: { lookup } }) }`
+ * also works and keeps `fetch`, but needs the package declared — it currently
+ * resolves only out of the dev tree, under electron, so it would be absent
+ * under `npm ci --omit=dev`.
+ *
+ * Both are real work and neither is done here. What is recorded is that the
+ * cheaper one exists, because the previous wording closed the question.
+ *
+ * So the classification is real, every address the name answers with is
+ * classified, and THE PIN IS NOT ENFORCED AT THE SOCKET. The residual hole is
+ * exactly one race: a record set that answers a public address to this guard
+ * and a private one to `fetch`. It is named rather than papered over, the same
+ * way `REFRESH_PIN_LIMITATION` names it on the auth-refresh path, and the
+ * remedy is a transport that takes `lookup: pinnedLookup(permit)` — see the
+ * handover.
+ */
+export const TRACKER_PIN_LIMITATION =
+  'The Jira host was resolved and every address it answered with was classified, but Node’s ' +
+  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
+  'socket.';
+
+/**
+ * THE REAL GUARD.
+ *
+ * `TRACKER_CALL` is not a label. `EGRESS_CONTEXT_RULES` keys the allowlist and
+ * the third-party rule off the context, and this one has
+ * `targetsApplicationUnderTest: false` and `allowlistApplies: false` — so a
+ * private, loopback, reserved or link-local address is refused in EVERY
+ * deployment and cannot be allowlisted, because "add your internal host to the
+ * allowlist" would be advice to build an SSRF with paperwork. That is the same
+ * answer `jiraSite` already gives by pattern for the names it can recognise, so
+ * no Jira integration that works today stops working: an integration pointed at
+ * `jira.internal` is refused before this change and after it.
+ *
+ * `policy` is `unknown` because that is how `Environment.egressPolicy` reads
+ * out of its JSONB column. An issue-tracker integration is org-level and has no
+ * environment, so today every caller passes nothing — and nothing falls through
+ * `resolveEgressPolicy` to the HOSTED policy, PUBLIC ONLY, which is the
+ * strictest reading. An absent policy must never be an open one.
+ */
+export async function defaultTrackerEgressGuard(policy?: unknown): Promise<TrackerEgressGuard> {
+  const resolved = resolveEgressPolicy(policy);
+  const io: EgressGuardIo = {
+    classifyHost: (host) => classifyHost(host),
+    classifyAddress: (address) => classifyAddress(address),
+    /*
+     * EVERY address the name has, not the first: a record set mixing one
+     * routable address with 169.254.169.254 is not a misconfiguration, it is
+     * the attack written down. `verbatim: true` so the OS does not reorder and
+     * hide one.
+     */
+    lookup: (host) => dns.promises.lookup(host, { all: true, verbatim: true, family: 0 }),
+    now: () => new Date(),
+    /*
+     * `performance.now()` and NOT `Date.now()`: the wall clock is spoken for
+     * (it stamps `PinnedResolution.pinnedAt`), and an NTP step backwards
+     * mid-refusal would make the elapsed time negative, the pad negative and
+     * therefore zero — a refusal that skipped its pad is the timing oracle the
+     * floor exists to close.
+     */
+    monotonicMs: () => performance.now(),
+    delay: (ms) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      }),
+  };
+  return (url) => guardUrl({ url, context: 'TRACKER_CALL', policy: resolved, io });
+}
+
+/**
+ * THE ONLY WAY A JIRA REQUEST IS MADE, so a fourth caller cannot forget the
+ * guard.
+ *
+ * `fileOnJira` and the JIRA branch of {@link updateIssue} both go through here.
+ * Putting the guard at the two call sites instead would be two places to
+ * remember and `apps/api/src/routes/repro.ts` already proves how that ends — it
+ * holds a THIRD copy of this request, duplicated on purpose, and it is named in
+ * the handover because it needs this same door.
+ *
+ * ── The refusal is ONE SENTENCE, and that is deliberate ────────────────────
+ *
+ * {@link refusalForCaller} returns {@link EGRESS_REFUSAL_SENTENCE} for all
+ * seventeen refusals. A message that distinguished "that is a link-local
+ * address" from "that host did not resolve" from "that host is not on the
+ * allowlist" would turn a Jira integration into a port scanner with a readable
+ * report, filed by whoever can edit the integration row. The operator's copy —
+ * the class, the address and the refusal code — stays in
+ * `verdict.operatorDetail` and is deliberately NOT thrown.
+ */
+async function sendToJira(
+  cfg: Extract<IssueTrackerConfig, { kind: 'JIRA' }>,
+  path: string,
+  headers: Record<string, string>,
+  payload: unknown,
+  method: 'POST' | 'PUT',
+  egress?: TrackerEgressGuard,
+): Promise<{ status: number; json: unknown }> {
+  const url = `${cfg.site}${path}`;
+  const guard = egress ?? (await defaultTrackerEgressGuard());
+  const verdict = await guard(url);
+  if (!verdict.ok) {
+    /*
+     * REFUSED BEFORE THE REQUEST, and the token is already unsealed by the time
+     * we are here — so "refused" has to mean nothing was sent, not that a send
+     * failed. There is no arm of this branch that falls through to `sendJson`;
+     * an exception handler that reaches the transport anyway is the defect
+     * pattern worth hunting in one's own work.
+     */
+    throw new IssueFilingError(refusalForCaller(verdict).sentence);
+  }
+  return sendJson(url, headers, payload, 'JIRA', method);
+}
+
 /** A sentence per failure shape, saying what the user has to change. */
 function describeFailure(provider: IssueTrackerKind, status: number): string {
   const name = TRACKER_LABEL[provider];
@@ -599,6 +787,7 @@ async function fileOnJira(
   cfg: Extract<IssueTrackerConfig, { kind: 'JIRA' }>,
   token: string,
   issue: { title: string; body: string },
+  egress?: TrackerEgressGuard,
 ): Promise<CreatedIssue> {
   /*
    * v2 rather than v3 on purpose: v3 only accepts Atlassian Document Format,
@@ -606,8 +795,9 @@ async function fileOnJira(
    * request shape covers both deployments; the cost is that markdown shows up
    * as literal text in the Jira description.
    */
-  const { status, json } = await sendJson(
-    `${cfg.site}/rest/api/2/issue`,
+  const { status, json } = await sendToJira(
+    cfg,
+    '/rest/api/2/issue',
     {
       // Cloud authenticates an API token as Basic email:token; a Data Center
       // personal access token is a bearer. The presence of an email is what
@@ -625,7 +815,8 @@ async function fileOnJira(
         issuetype: { name: cfg.issueType },
       },
     },
-    'JIRA',
+    'POST',
+    egress,
   );
 
   if (status !== 201) throw new IssueFilingError(describeFailure('JIRA', status), 'PROVIDER');
@@ -794,6 +985,14 @@ export async function updateIssue(
   token: string,
   key: string,
   patch: IssuePatch,
+  /**
+   * The egress guard, injected. OPTIONAL so every existing caller keeps
+   * compiling and keeps getting the real guard — `sendToJira` builds
+   * {@link defaultTrackerEgressGuard} when nobody supplies one, which is what
+   * makes it impossible to reach the Jira transport without a decision. A test
+   * supplies its own and never touches a resolver.
+   */
+  egress?: TrackerEgressGuard,
 ): Promise<void> {
   const title = patch.title === undefined ? undefined : patch.title.slice(0, MAX_TITLE);
   const body = patch.body === undefined ? undefined : patch.body.slice(0, MAX_BODY);
@@ -821,8 +1020,9 @@ export async function updateIssue(
   if (cfg.kind === 'JIRA') {
     // v2 like the create path, so one request shape covers Cloud and Data
     // Center. A successful edit answers 204 with no body.
-    const { status } = await sendJson(
-      `${cfg.site}/rest/api/2/issue/${plainKey(key, 'JIRA')}`,
+    const { status } = await sendToJira(
+      cfg,
+      `/rest/api/2/issue/${plainKey(key, 'JIRA')}`,
       {
         authorization: cfg.email
           ? `Basic ${Buffer.from(`${cfg.email}:${token}`).toString('base64')}`
@@ -835,8 +1035,8 @@ export async function updateIssue(
           ...(body === undefined ? {} : { description: body }),
         },
       },
-      'JIRA',
       'PUT',
+      egress,
     );
     if (status !== 204 && status !== 200) {
       throw new IssueFilingError(describeEditFailure('JIRA', status), 'PROVIDER');
@@ -898,8 +1098,10 @@ export function createIssue(
   cfg: IssueTrackerConfig,
   token: string,
   issue: { title: string; body: string },
+  /** See {@link updateIssue}'s own `egress` parameter: optional, real by default. */
+  egress?: TrackerEgressGuard,
 ): Promise<CreatedIssue> {
   if (cfg.kind === 'GITHUB') return fileOnGithub(cfg, token, issue);
-  if (cfg.kind === 'JIRA') return fileOnJira(cfg, token, issue);
+  if (cfg.kind === 'JIRA') return fileOnJira(cfg, token, issue, egress);
   return fileOnLinear(cfg, token, issue);
 }

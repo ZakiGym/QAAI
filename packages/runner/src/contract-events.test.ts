@@ -23,6 +23,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { ExecutableTest, RunContext } from '@qaai/shared';
 import { contractPlugin } from './plugins/contract.js';
 import { brokerOrigin, publishVerification, verificationResultsUrl } from './contract-broker.js';
+import type { BrokerEgressGuard } from './contract-broker.js';
+import { guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import { collectMessages } from './contract-events.js';
 
 let server: Server;
@@ -759,16 +763,61 @@ describe('publishing is never the reason a contract test fails', () => {
     expect(outcome.network).toBeNull();
   });
 
-  it('skips when the broker cannot be reached, and says the verdict stands', async () => {
+  /**
+   * ── THIS TEST TOUCHED REAL DNS AND ASSERTED A PRE-GUARD SENTENCE ──────────
+   *
+   * It passed no `egress` argument, which is OPTIONAL, so it got the REAL
+   * `defaultBrokerEgressGuard` and a REAL lookup of `broker.invalid` — hence
+   * the 20-second timeout it carried. Rule: every lookup, socket and clock in a
+   * test is an injected narrow interface; a control that needs the network to
+   * exercise is a control nobody can trust the tests about.
+   *
+   * It also asserted `responseBodySnippet === 'the broker was unreachable'`,
+   * which is the TRANSPORT's wording. `publishVerification` acquired an egress
+   * guard in front of the transport, so an unresolvable host is now refused
+   * BEFORE a socket is opened and never reaches that sentence — the assertion
+   * was pinning the layer that no longer answers.
+   *
+   * WHAT THE TEST IS ACTUALLY FOR is the product rule the describe block names:
+   * publishing is never the reason a contract test fails. That holds whichever
+   * layer refuses, and it is what is asserted now, with the resolver injected
+   * so nothing here leaves the process.
+   */
+  it('skips when the broker host cannot be resolved, and says the verdict stands', async () => {
+    /** Answers from a table and THROWS on an undeclared host, so no lookup escapes. */
+    const io: EgressGuardIo = {
+      classifyHost: (host) => classifyHost(host),
+      classifyAddress: (address) => classifyAddress(address),
+      lookup: async (host) => {
+        throw new Error(`fakeIo was asked to resolve ${host}: this test declares no zone at all`);
+      },
+      now: () => new Date('2026-10-30T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      // The refusal floor is injected away: asserting the pad is egress-guard's
+      // job, and a real sleep per refusal costs this file a second for nothing.
+      delay: async () => {},
+    };
+    const egress: BrokerEgressGuard = (url) =>
+      guardUrl({ url, context: 'TRACKER_CALL', policy: resolveEgressPolicy(undefined), io });
+
     const outcome = await publishVerification(
       context(),
       { brokerUrl: 'https://broker.invalid', providerVersion: '1', pactVersion: 'x' },
       publishInput,
+      egress,
     );
+
+    // The product rule, which is the whole point of this block.
     expect(outcome.status).toBe('SKIPPED');
     expect(outcome.detail).toContain('unaffected');
-    expect(outcome.network?.responseBodySnippet).toBe('the broker was unreachable');
-  }, 20_000);
+    /*
+     * And the refusal names NO address, port or class — the step list a
+     * customer reads must not become a port scanner. Asserted as an absence
+     * rather than against a fixed sentence, which is what made the old
+     * assertion break when the deciding layer moved.
+     */
+    expect(outcome.detail).not.toMatch(/\b\d{1,3}(\.\d{1,3}){3}\b/);
+  });
 
   it('leaves a passing verification GREEN when the broker is unusable', async () => {
     const result = await contractPlugin.execute(

@@ -93,10 +93,13 @@ import {
    * which silently dropped the field while this file read around it.
    */
   SUPPRESSION_LEDGER_SCAN_CAP,
+  controlEnforces,
+  controlMode,
   testResultVariantSchema,
   variantKeyOf,
 } from '@qaai/shared';
 import type {
+  ControlMode,
   GridIntegrationKind,
   MeasuredVariant,
   MeasurementPlan,
@@ -106,6 +109,33 @@ import type {
 } from '@qaai/shared';
 import { gridWsEndpoint } from '../grids.js';
 import { open as openSecret } from '../vault.js';
+/*
+ * THE SEALED SESSION'S READER AND WRITER, FROM THE MODULE THAT OWNS THE PATH.
+ *
+ * `processors/auth-refresh.ts` says in its own re-export comment why it is the
+ * single specifier: this file and explore.ts each re-derived "is this session
+ * fresh" from the raw columns — one expression spelt three times and wrong in
+ * all three — and the sealing sweep then made all three answer `null`, which
+ * this file turned into `{ ok: true, storageState: null }` and ran anonymously.
+ */
+import {
+  SESSION_REFRESH_LEAD_MS,
+  SESSION_ROW_SELECT,
+  SESSION_SEAL_CONTROL,
+  countSessionGate,
+  openCachedSession,
+  readVaultKeys,
+  sealSession,
+  sessionDegradation,
+  workerSessionCipher,
+} from './auth-refresh.js';
+import type { SessionDegradationTally } from '../../../api/src/lib/session-store.js';
+/*
+ * `Prisma.DbNull` for the one column that has to be EMPTIED rather than set to
+ * the JSON value `null`. Imported from the API's generated client by relative
+ * path, exactly as processors/auth-refresh.ts and processors/preflight.ts do.
+ */
+import { Prisma } from '../../../api/src/generated/prisma/client.js';
 import type {
   ExecutableTest,
   GateResult,
@@ -392,7 +422,14 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
        * — and a refusal that depends on a caller remembering an argument is not
        * a refusal. Same reason explore.ts selects it.
        */
-      environment: { select: { id: true, baseUrl: true, kind: true } },
+      /*
+       * `egressPolicy` is read because the RUN signs in too, and the login
+       * types vault plaintext into whatever answers. Its reader is
+       * `signInWithProfile` below; a field selected with no reader is half the
+       * defect it was minted to fix, and a login with no policy falls back to
+       * the HOSTED one (PUBLIC ONLY) rather than to no guard.
+       */
+      environment: { select: { id: true, baseUrl: true, kind: true, egressPolicy: true } },
       project: {
         select: {
           id: true,
@@ -507,9 +544,43 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
   try {
     const org = await prisma.organization.findUniqueOrThrow({
       where: { id: orgId },
-      select: { plan: true },
+      // `securityControlModes` on the read that was already here, rather than a
+      // second query: the seal brake is per ORG, and one more column on a row
+      // this function already fetches is the cheapest way for the control to be
+      // armable at all. A brake nobody can reach is rule 13's defect inverted.
+      select: { plan: true, securityControlModes: true },
     });
     const retentionDays = RETENTION_DAYS[org.plan] ?? 30;
+    /*
+     * ── THE SEAL BRAKE, AND THE KEYS A CACHED SESSION OPENS UNDER ────────────
+     *
+     * Read once per run, not once per profile: the key table is the same for
+     * every identity this run resolves, and a `findMany` inside
+     * `resolveSession` would re-read it per test that names a profile.
+     *
+     * The cipher is NULLABLE on purpose — see `workerSessionCipher`. A
+     * malformed `VAULT_MASTER_KEY` must fail CLOSED per profile and not throw
+     * out of here: throwing would ERROR the whole run, including every test
+     * that needs no identity at all.
+     */
+    const sealMode: ControlMode = controlMode(SESSION_SEAL_CONTROL, org.securityControlModes);
+    const sessionKeys = await readVaultKeys(prisma);
+    const sessionCipher = workerSessionCipher();
+    if (sessionKeys.unreadableVersions.length > 0) {
+      logger.warn(
+        { versions: sessionKeys.unreadableVersions, runId: run.id },
+        'vault key rows whose state could not be read; sealed sessions under them will not open',
+      );
+    }
+    /*
+     * THE BRAKE'S COUNT, PER PROFILE AND PER SESSION STATE.
+     *
+     * `SECURITY_CONTROL_BRAKES.SESSION_STATE_SEAL.observeCounts` is what this
+     * pays. `used` is counted beside `degraded` and `blocked` because "we would
+     * have refused 412 runs" is only defensible beside how many there were, and
+     * a refusal count with no denominator is a number nobody can quote.
+     */
+    const sessionTallies = new Map<string, SessionDegradationTally>();
     const expiresAt = new Date(Date.now() + retentionDays * 86_400_000);
 
     const baseUrl = run.baseUrlOverride ?? run.environment.baseUrl;
@@ -608,15 +679,105 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
     const authProfile = await prisma.authProfile.findFirst({
       where: { orgId, environmentId: run.environment.id },
       orderBy: { createdAt: 'asc' },
-      select: { id: true, storageState: true, storageStateExpiresAt: true },
+      /*
+       * EVERY COLUMN THE GATE DECIDES ON, THROUGH ONE DEFINITION. This was
+       * `{ id, storageState, storageStateExpiresAt }`, which is why the sealing
+       * sweep turned this path anonymous: the sealed columns were not selected,
+       * so nothing here could see the session that was actually there.
+       * `SESSION_ROW_SELECT` is `satisfies Record<keyof SealedSessionRow, true>`,
+       * so a column added to the row type is a compile error here rather than a
+       * column this query silently stops reading.
+       */
+      select: SESSION_ROW_SELECT,
     });
-    const defaultSession =
-      authProfile?.storageState &&
-      (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
-        ? authProfile
-        : null;
-    const storageState = defaultSession?.storageState ?? null;
-    const defaultProfileId = defaultSession?.id ?? null;
+
+    /*
+     * ── THE RUN'S DEFAULT IDENTITY, THROUGH THE SEALED READER ────────────────
+     *
+     * This replaced:
+     *
+     *     authProfile?.storageState &&
+     *     (!authProfile.storageStateExpiresAt || authProfile.storageStateExpiresAt > new Date())
+     *
+     * which read a NULL expiry as "valid for ever", could not see the sealed
+     * column at all, and produced a `null` that six lines later became
+     * `session = { ok: true, storageState }` — a successful run with no
+     * session, which is an anonymous run reported as a pass.
+     */
+    let storageState: unknown = null;
+    let defaultProfileId: string | null = null;
+    /**
+     * THE DEFAULT IDENTITY'S TYPED REFUSAL, or null when there is nothing to
+     * refuse.
+     *
+     * ── Why ABSENT is excluded, and it is not a loophole ───────────────────
+     *
+     * `sessionGate` refuses all seven unusable states under ENFORCE, and six of
+     * them are on the refresh sweep's own worklist (`processAuthRefreshTick`'s
+     * `where`: needs-reseal, unversioned, no-expiry, expiring/expired, and a
+     * legacy plaintext row), so refusing them costs at most an hour and then
+     * clears itself. ABSENT is the ONE state that sweep skips on purpose — "not
+     * stale, they are new" — and this path deliberately drives no login, so a
+     * refusal here would never clear: every default-identity test on an
+     * environment whose first profile has never signed in would be refused for
+     * ever. That is rule 13's defect inverted, a brake nobody can release. An
+     * ABSENT profile also carried no session yesterday, so nothing is being
+     * taken away and nothing is being claimed; it is COUNTED like every other
+     * decision and it is not refused.
+     */
+    let defaultNotRun: { kind: NotRunKind; why: string } | null = null;
+    /** The session state behind the default identity, for the refusal sentences. */
+    let defaultSessionState: string | null = null;
+    if (authProfile) {
+      const read = await openCachedSession(authProfile, {
+        keys: sessionKeys,
+        cipher: sessionCipher,
+        now: new Date(),
+        mode: sealMode,
+      });
+      storageState = read.storageState;
+      defaultSessionState = read.gate.state;
+      /*
+       * The profile id is attached only when a session was actually carried: a
+       * run that claims an identity it does not hold is worse than one that
+       * claims none, and `attachAuthProfile` below is what the harness's own
+       * refusal keys on.
+       */
+      defaultProfileId = read.storageState === null ? null : authProfile.id;
+      if (read.storageState === null && read.gate.state !== 'ABSENT' && controlEnforces(sealMode)) {
+        defaultNotRun = {
+          kind: 'BLOCKED_BY_ENV',
+          /*
+           * The gate's own sentence when it produced one; otherwise the store's
+           * refusal plus the same standing clause. The second case is the one
+           * the gate cannot speak to: a row it called USABLE that this process
+           * could not OPEN — no master key, a drifted version column, a tag
+           * failure — which is strictly worse than any state it refuses and
+           * must never read as "there is no session here".
+           */
+          why:
+            read.gate.notRun?.why ??
+            `${read.detail} The test was NOT RUN rather than run signed out: an anonymous run ` +
+              'of a page behind a login passes most assertions and would report the route as ' +
+              'covered.',
+        };
+      }
+      /*
+       * COUNTED AFTER THE DECISION AND NOT BEFORE IT. This path's answer is not
+       * the gate's: a LEGACY_PLAINTEXT row is CARRIED under ENFORCE while the
+       * gate reports `notRun`, and an ABSENT profile is run ANONYMOUSLY under
+       * ENFORCE because refusing it would be a brake nobody can release. Both
+       * exceptions are above, so the outcome is only knowable here — counting
+       * off `read.gate` reported this run's real behaviour wrongly in both
+       * cases, which is the number an operator reads before arming.
+       */
+      countSessionGate(
+        sessionTallies,
+        authProfile.id,
+        read.gate,
+        read.storageState !== null ? 'USED' : defaultNotRun !== null ? 'REFUSED' : 'ANONYMOUS',
+      );
+    }
 
     /*
      * ── One session per PROFILE per run ──────────────────────────────────────
@@ -646,8 +807,35 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
      */
     type ResolvedSession =
       | { ok: true; storageState: unknown }
-      | { ok: false; why: string; fault: 'CONFIG' | 'ENVIRONMENT' };
+      | {
+          ok: false;
+          why: string;
+          fault: 'CONFIG' | 'ENVIRONMENT';
+          /**
+           * THE TYPED KIND, for the refusals that have one.
+           *
+           * NOT optional, and every site writes it: a refusal that forgot the
+           * field would be `undefined`, and `undefined` written to
+           * `TestResult.notRunKind` means "nothing was recorded" — which is
+           * the state that column shipped in. Non-null only for the cached
+           * session refusals, where `BLOCKED_BY_ENV` is what excludes the
+           * result from a pass rate and from a coverage denominator. The three
+           * CONFIG refusals below are suite defects rather than environment
+           * gaps and carry null on purpose.
+           */
+          notRun: { kind: NotRunKind; why: string } | null;
+        };
     const sessions = new Map<string, ResolvedSession>();
+    /*
+     * THE DEFAULT IS SEEDED ONLY WHEN IT IS USABLE.
+     *
+     * It used to be seeded unconditionally, so a test that NAMED the default
+     * profile inherited whatever the default had — including nothing. Now an
+     * unusable default leaves the cache empty for that id, which sends such a
+     * test through `resolveSession` and therefore through a real sign-in that
+     * can repair the profile. Inheriting a refusal would have been strictly
+     * worse than attempting the login the row is asking for.
+     */
     if (defaultProfileId) sessions.set(defaultProfileId, { ok: true, storageState });
 
     const resolveSession = async (profileId: string): Promise<ResolvedSession> => {
@@ -661,19 +849,23 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           // session.
           where: { id: profileId, orgId },
           select: {
-            id: true,
             name: true,
             kind: true,
             config: true,
             environmentId: true,
-            storageState: true,
-            storageStateExpiresAt: true,
+            /*
+             * Every column the gate decides on, through one definition — see
+             * the default identity's read above. It carries `id: true`, which
+             * is why this object no longer names `id` itself.
+             */
+            ...SESSION_ROW_SELECT,
           },
         });
         if (!profile) {
           return {
             ok: false,
             fault: 'CONFIG',
+            notRun: null,
             why: `This test runs as auth profile ${profileId}, which no longer exists in this organisation.`,
           };
         }
@@ -688,14 +880,45 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           return {
             ok: false,
             fault: 'CONFIG',
+            notRun: null,
             why: `Auth profile "${profile.name}" belongs to a different environment, so it cannot be used for this run.`,
           };
         }
 
-        const fresh =
-          profile.storageState &&
-          (!profile.storageStateExpiresAt || profile.storageStateExpiresAt > new Date());
-        if (fresh) return { ok: true, storageState: profile.storageState };
+        /*
+         * ── THE CACHED SESSION, THROUGH THE SEALED READER ────────────────────
+         *
+         * This was `profile.storageState && (!expiresAt || expiresAt > now)`,
+         * which reads a NULL expiry as "valid for ever" and cannot see the
+         * sealed column — so once the sweep had sealed a profile, every test
+         * that named it paid a fresh unattended login.
+         *
+         * A NULL here is never "run it anonymously": it sends this resolver to
+         * the real sign-in below, and if that cannot produce a session the
+         * answer is a refusal with a reason. `new Date()` per profile and not a
+         * clock hoisted to the start of the run, because a suite can execute
+         * for longer than the refresh lead.
+         */
+        const cached = await openCachedSession(profile, {
+          keys: sessionKeys,
+          cipher: sessionCipher,
+          now: new Date(),
+          mode: sealMode,
+        });
+        /*
+         * SIGNED_IN AND NOT A DEGRADATION. This path drives a login when the
+         * cache misses, so "no usable cached session" costs the customer
+         * nothing here and must not be counted as a run that was refused or
+         * went anonymous — which is what deriving the outcome from the gate
+         * did.
+         */
+        countSessionGate(
+          sessionTallies,
+          profile.id,
+          cached.gate,
+          cached.storageState !== null ? 'USED' : 'SIGNED_IN',
+        );
+        if (cached.storageState !== null) return { ok: true, storageState: cached.storageState };
 
         // No usable session: sign in now. This is the step that never existed —
         // a run could only ever use a session somebody had captured by hand.
@@ -708,13 +931,27 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
             // is refused on PRODUCTION and a refusal that depends on a caller
             // remembering an argument is not a refusal. `baseUrl` is the run's,
             // so a `baseUrlOverride` still decides where the login happens.
-            { environmentKind: run.environment.kind, baseUrl },
+            {
+              environmentKind: run.environment.kind,
+              baseUrl,
+              egressPolicy: run.environment.egressPolicy,
+            },
           );
         } catch (err) {
           return {
             ok: false,
             // The attempt was MADE and the environment did not complete it.
             fault: 'ENVIRONMENT',
+            /*
+             * NULL, and that is the EXISTING decision rather than an omission:
+             * a role whose login was driven and did not complete is recorded
+             * FAILED with no typed kind, because a skip does not block a gate
+             * and a suite whose permission tests quietly stopped running would
+             * keep merging green. Typing these as BLOCKED_BY_ENV too would
+             * also take them out of the coverage denominator, which is a
+             * separate decision with its own evidence — see `openProblems`.
+             */
+            notRun: null,
             why: `Signing in as "${profile.name}" threw: ${
               err instanceof Error ? err.message : 'unknown error'
             }`,
@@ -725,6 +962,8 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           return {
             ok: false,
             fault: 'ENVIRONMENT',
+            // NULL for the reason the throw path above records.
+            notRun: null,
             why: `Could not sign in as auth profile "${profile.name}": ${result.message}`,
           };
         }
@@ -739,23 +978,103 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
             ok: false,
             // A product gap in how this profile KIND works, not an outage.
             fault: 'CONFIG',
+            notRun: null,
             why:
               `Auth profile "${profile.name}" is a ${profile.kind}, which produces a request header ` +
               'rather than a browser session, so a test cannot be run as that role yet.',
           };
         }
 
+        /*
+         * ── THE CACHE WRITE, SEALED WHEN THE BRAKE IS ARMED ──────────────────
+         *
+         * This wrote `storageState` in the clear, unconditionally, which under
+         * ENFORCE would have defeated the reader twelve lines above it: the
+         * next read of this profile would be `LEGACY_PLAINTEXT`, the gate
+         * refuses it, and this resolver would drive a brand-new login on every
+         * run of every test that names this profile, for ever. A reader whose
+         * own writer re-breaks the row is not a fix, it is a loop.
+         *
+         * So the write follows the same brake the sweep does
+         * (`refreshProfile`): ENFORCE seals and nulls the legacy column through
+         * `SealedSessionWrite`, OBSERVE writes exactly what this line has
+         * always written. Two modes, one meaning — today's behaviour continues
+         * until somebody arms the control.
+         *
+         * A SEAL FAILURE COSTS THE CACHE, NEVER THE RUN. The session is in
+         * hand and the tests that need it can have it; what is lost is the
+         * saving on the next run, and the alternative — storing it in the clear
+         * while the brake says otherwise — is the one thing the sealed column
+         * exists to prevent. `sealSession`'s refusal detail is reportable
+         * without quoting any part of the session, which is why it may be
+         * logged; the DATA is not, because it carries the envelope.
+         */
+        const cacheWrite: Prisma.AuthProfileUpdateInput | null = await (async () => {
+          if (!controlEnforces(sealMode)) {
+            // Exactly what this line has always written. OBSERVE is "today's
+            // behaviour continues", and this is today's behaviour.
+            return {
+              storageState: result.storageState as Prisma.InputJsonValue,
+              storageStateExpiresAt: result.expiresAt,
+            };
+          }
+          if (sessionCipher === null) {
+            logger.warn(
+              { profileId, runId: run.id },
+              'captured session not cached: this process holds no usable vault master key, and ' +
+                'it is NOT stored in the clear',
+            );
+            return null;
+          }
+          const sealed = await sealSession({
+            profileId: profile.id,
+            storageState: result.storageState,
+            /*
+             * The login's own expiry, and the refresh lead as a floor when it
+             * reports none — the same rule and the same reason as
+             * `refreshProfile`: the expiry moving with the state is what stops
+             * a row claiming a valid session it does not have.
+             */
+            expiresAt: result.expiresAt ?? new Date(Date.now() + SESSION_REFRESH_LEAD_MS),
+            keys: sessionKeys.keys,
+            cipher: sessionCipher,
+            now: new Date(),
+          });
+          if (!sealed.ok) {
+            /*
+             * The refusal CODE and the store's own sentence. Both are closed
+             * vocabularies about the envelope and the keys and neither can
+             * carry the session — `session-store.ts` asserts that for every
+             * refusal it produces, which is what makes logging them safe. The
+             * `data` is NOT logged, because it carries the envelope.
+             */
+            logger.warn(
+              { profileId, runId: run.id, refusal: sealed.refusal, detail: sealed.detail },
+              'captured session not cached: it could not be sealed and is NOT stored in the clear',
+            );
+            return null;
+          }
+          return {
+            ...sealed.value,
+            /*
+             * `Prisma.DbNull` AND NOT THE BARE `null` `SealedSessionWrite`
+             * CARRIES. `storageState` is `Json?`, so Prisma's update input is
+             * `NullableJsonNullValueInput | InputJsonValue` and a bare `null`
+             * is not a member — assigning the write object straight through is
+             * a type error. `DbNull` is SQL NULL, which is what the sealing
+             * migration's own `SET "storageState" = NULL` produced.
+             */
+            storageState: Prisma.DbNull,
+          };
+        })();
+
         // Persisted so the next run — and the crawler — reuse it instead of
         // logging in again. A write failure costs a re-login, never the run.
-        await prisma.authProfile
-          .update({
-            where: { id: profile.id },
-            data: {
-              storageState: result.storageState,
-              storageStateExpiresAt: result.expiresAt,
-            },
-          })
-          .catch((err) => logger.warn({ err, profileId }, 'could not cache the captured session'));
+        if (cacheWrite) {
+          await prisma.authProfile
+            .update({ where: { id: profile.id }, data: cacheWrite })
+            .catch((err) => logger.warn({ err, profileId }, 'could not cache the captured session'));
+        }
 
         logger.info({ runId: run.id, profileId }, 'signed in for this run');
         return { ok: true, storageState: result.storageState };
@@ -1417,10 +1736,48 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
           ok: false,
           // The binding was deleted out from under the test: a suite defect.
           fault: 'CONFIG',
+          notRun: null,
           why:
             'This test is marked as requiring a signed-in role, and the auth profile it was ' +
             'bound to no longer exists — so it was not run rather than run signed out. ' +
-            'Re-bind it to a profile in the test editor.',
+            'Re-bind it to a profile in the test editor.' +
+            /*
+             * The SESSION STATE when there was a profile to read, appended
+             * rather than replacing the sentence above: "the binding is gone"
+             * and "the binding is there and its session is unusable" are
+             * different remedies, and an operator reading one result row needs
+             * to know which. A state name is a member of a closed list and
+             * carries no part of any session.
+             */
+            (defaultSessionState === null || defaultSessionState === 'ABSENT'
+              ? ''
+              : ` The environment's first profile holds a session this run could not carry ` +
+                `(${defaultSessionState}).`),
+        };
+      } else if (defaultNotRun) {
+        /*
+         * ── THE ANONYMOUS PASS, REFUSED ────────────────────────────────────
+         *
+         * This branch was `session = { ok: true, storageState }` and nothing
+         * else, so a `storageState` of `null` was a SUCCESSFUL resolution with
+         * no session — a run executed signed out and reported as a pass, which
+         * makes every auth-gated route it touched look covered by a test that
+         * was never signed in. With the sealing sweep armed that was every
+         * default-identity test in the install, on the first hourly tick.
+         *
+         * `defaultNotRun` is non-null only when the store HELD a session this
+         * run could not carry and the brake is ENFORCE. A profile that never
+         * had one (ABSENT) is not refused — see that variable's own comment for
+         * why refusing it would be a brake nobody can release — and OBSERVE
+         * keeps today's behaviour and counts it.
+         */
+        session = {
+          ok: false,
+          // The configured identity is not usable: an environment gap, not a
+          // defect in the suite. `BLOCKED_BY_ENV` is what carries that.
+          fault: 'ENVIRONMENT',
+          notRun: defaultNotRun,
+          why: defaultNotRun.why,
         };
       } else {
         session = { ok: true, storageState };
@@ -1545,9 +1902,26 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
          * role, the role could not be produced, and nothing was executed
          * anonymously in its place.
          */
-        execution = syntheticExecution(test.id, 'FAILED', session.why);
+        execution = syntheticExecution(
+          test.id,
+          'FAILED',
+          session.why,
+          /*
+           * The typed kind when the refusal carries one — today that is the
+           * cached-session refusal and only that — so `TestResult.notRunKind`
+           * holds `BLOCKED_BY_ENV` and the result is excluded from a pass rate
+           * and from a coverage denominator. `?? undefined` and not `?? null`
+           * because the parameter is optional and absent is NOT `NOT_RUN`.
+           */
+          session.notRun ?? undefined,
+        );
         logger.warn(
-          { testId: test.id, profileId: declaredProfileId, runId: run.id },
+          {
+            testId: test.id,
+            profileId: declaredProfileId,
+            runId: run.id,
+            notRunKind: session.notRun?.kind ?? null,
+          },
           'test not executed: its auth profile could not be signed in',
         );
       } else {
@@ -1720,6 +2094,33 @@ export async function processRun(job: ShardedRunJob): Promise<void> {
       if (execution.status !== 'PASSED' && execution.status !== 'SKIPPED') {
         await enqueueTriage({ orgId, runId: run.id, testResultId: result.id });
       }
+    }
+
+    /*
+     * ── WHAT THE SEAL BRAKE DECIDED ON THIS RUN, REPORTED ────────────────────
+     *
+     * A refusal applied without being counted and reported is one of the lies
+     * this product cannot ship, and the OBSERVE half of a brake is worthless
+     * unless somebody can read it. Logged with the DENOMINATOR — `used` beside
+     * `degraded` and `blocked` — because "we would have refused 412 runs" is
+     * only defensible beside how many decisions there were.
+     *
+     * INSIDE the try, after the loop: the tally is built per profile as the
+     * suite resolves identities, so the numbers do not exist before the loop
+     * and the two variables are out of scope after it.
+     *
+     * Counts and the mode only. The tally is keyed on (profile id, session
+     * state): a cuid and a member of a closed list, neither of which can carry
+     * a cookie. No row is written: the sealed-session control has no tally
+     * table, and minting one here would be a schema decision this slice does
+     * not own — see `openProblems`.
+     */
+    const sessionBrake = sessionDegradation(sessionTallies.values());
+    if (sessionBrake.total > 0) {
+      logger.info(
+        { ...sessionBrake, mode: sealMode, runId: run.id },
+        'cached-session decisions for this run',
+      );
     }
   } catch (err) {
     // The loop already converts a plugin throwing into a FAILED result, so
@@ -2282,9 +2683,20 @@ function syntheticExecution(
    *
    * Threaded through rather than re-derived by `persistExecution` out of the
    * message it was handed, because the caller holds the kind as DATA and the
-   * message is where it goes to become a string. Absent for the one caller that
-   * has no kind — a test whose auth profile would not sign in, which is a
-   * FAILED result and not a not-run at all — and absent is not `NOT_RUN`.
+   * message is where it goes to become a string.
+   *
+   * ── Which session refusals carry one, and which deliberately do not ──────
+   *
+   * This used to say "absent for the one caller that has no kind — a test
+   * whose auth profile would not sign in". Two of the three session refusals
+   * still have none, for that same reason: a login that was DRIVEN and did not
+   * complete, and a profile that is bound wrong, are FAILED results about the
+   * suite and the application. The CACHED-SESSION refusal does carry one —
+   * `BLOCKED_BY_ENV` — because nothing was attempted at all: the stored session
+   * could not be vouched for, the test was not run signed out in its place, and
+   * `BLOCKED_BY_ENV` is the kind the NOT_RUN_KINDS guidance says must be
+   * excluded from a pass rate and from a coverage denominator. Absent is still
+   * not `NOT_RUN`.
    */
   notRun?: { kind: NotRunKind; why: string },
 ): TestExecution {

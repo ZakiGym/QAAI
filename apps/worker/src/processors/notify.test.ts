@@ -69,6 +69,7 @@ const {
   renderRunAlert,
   suppressedCauseCount,
 } = await import('./notify.js');
+const { configureChatEgress } = await import('../../../api/src/lib/chat-integrations.js');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -209,6 +210,7 @@ const monitorDown = {
 };
 
 beforeEach(() => {
+  configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
   h.prisma = {};
   h.log = [];
   h.enqueued = [];

@@ -274,6 +274,55 @@ const SUPPRESSION_FILE = fileURLToPath(
 const OWNERSHIP_FILE = fileURLToPath(
   new URL('../../../packages/shared/src/ownership.ts', import.meta.url),
 );
+/*
+ * The security vocabularies: versioned sealed values and their key states, and
+ * the egress decision. In @qaai/shared and NOT in constants.ts for the same
+ * reason as the thirteen above -- `sealed.ts` holds the envelope parser, the
+ * key-state rule table, `selectSealingKey` and `selectOpeningKey` beside the
+ * vocabulary, and `egress.ts` holds the policy defaults, `decideEgress` and
+ * `assertConnectingTo` beside its own; those are the only code that interprets
+ * either.
+ *
+ * `SECRET_SCOPE_KINDS` and `LOGIN_ATTEMPT_OUTCOMES` are in constants.ts rather
+ * than in a file of their own, and that is this script's default home for a
+ * cross-cutting enum -- `NotRunKind` and the re-enumeration lifecycle live
+ * there on the same argument. Neither has a module whose readers it sits beside.
+ *
+ * Deliberately NOT paired below, and none of these is an omission:
+ *
+ *   * `SEAL_ALGORITHMS`, `SEAL_REFUSALS`, `SEALED_FIELD_KEYS` and
+ *     `RESUMABLE_ROTATION_STATES` are not columns. An algorithm and a key id
+ *     live INSIDE the serialised envelope string (`SealedEnvelope`), a refusal
+ *     is an answer computed per call and never stored, a sealed-field key is
+ *     TEXT on `KeyRotationSweep.fieldKey` with the domain at the producer, and
+ *     the resumable list is `KEY_ROTATION_STATES` minus its terminal members.
+ *   * `EGRESS_CONTEXTS`, `EGRESS_REFUSALS` and `EGRESS_DEPLOYMENT_MODES` are
+ *     TEXT or JSON for the same reason: a context and a refusal are TEXT on
+ *     `EgressDecisionTally` with their domain at the producer and the reads
+ *     GROUP BY them rather than filtering, and a deployment mode lives inside
+ *     the `Environment.egressPolicy` JSON. `EGRESS_OUTCOMES` is the one that
+ *     earned a Postgres type, and it earned it the way
+ *     `DeploymentCapabilityStatus` did: it is the column the group-by is ON.
+ *   * `CONTROL_MODES`, `SECURITY_CONTROLS`, `SESSION_REVOCATION_REASONS`,
+ *     `VERIFICATION_TOKEN_PURPOSES` and `API_KEY_SCOPES` are JSON or TEXT.
+ *     The first two live inside `Organization.securityControlModes`, the third
+ *     is TEXT on `Session.revokedReason` (nothing filters on it), the fourth is
+ *     the pre-existing TEXT `VerificationToken.purpose` -- converting a
+ *     populated column to an enum is a data migration bought for nothing -- and
+ *     the fifth is a `TEXT[]` on `ApiKey.scopes`.
+ *
+ * Every one of those has its run-time parity against its own zod schema's
+ * `.options` in packages/shared/src/{sealed,egress,constants}.test.ts, and its
+ * compile-time half as a `satisfies Record<K, V>` presence record in the
+ * module. Both halves, because one without the other passes while the two
+ * disagree.
+ */
+const SEALED_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/sealed.ts', import.meta.url),
+);
+const EGRESS_FILE = fileURLToPath(
+  new URL('../../../packages/shared/src/egress.ts', import.meta.url),
+);
 
 /**
  * Enums that must exist identically on both sides, and the TS declaration that
@@ -305,7 +354,9 @@ const PAIRS: Array<{
     | 'testTypeDecl'
     | 'artifactSet'
     | 'suppression'
-    | 'ownership';
+    | 'ownership'
+    | 'sealed'
+    | 'egress';
   kind?: 'array' | 'union';
 }> = [
   { prismaEnum: 'TestType', tsConst: 'TEST_TYPES' },
@@ -866,6 +917,69 @@ const PAIRS: Array<{
   },
   { prismaEnum: 'RetirementState', tsConst: 'RETIREMENT_STATES', source: 'suppression' },
   { prismaEnum: 'OwnerProvenance', tsConst: 'OWNER_PROVENANCES', source: 'ownership' },
+  /*
+   * THE SECURITY CONTROLS (this round). Six, and the reason to be strict about
+   * these six is different from every pair above them. The enumeration enums
+   * decide what is in the denominator and the measurement enums decide what is
+   * in the numerator; a value that falls through a switch in either produces a
+   * wrong number. A value that falls through a switch in one of these six
+   * produces a credential that is not protected, a key that cannot be rotated
+   * after a leak, or a login that accepts any six digits.
+   *
+   *   `VaultKeyState`        FILTERED ON. `selectSealingKey` asks for the
+   *                          ACTIVE row before every seal, and "which rows are
+   *                          still under a COMPROMISED key" is the blast radius
+   *                          of an incident. A state the database accepts and
+   *                          TypeScript cannot name has NO ENTRY in
+   *                          `VAULT_KEY_STATE_RULES`, so `canOpen` and `canSeal`
+   *                          both read `undefined` -- and the two ways that can
+   *                          go are "every key is unusable" and "a COMPROMISED
+   *                          key opens everything", depending on which
+   *                          direction the caller's truthiness test runs.
+   *   `VaultKeyProvider`     filtered on: the LOCAL and KMS read paths are
+   *                          different code. A provider the database accepts
+   *                          and TypeScript cannot name is a key whose material
+   *                          nothing knows how to fetch, and the failure is a
+   *                          decrypt error months later rather than a
+   *                          registration that refused.
+   *   `KeyRotationState`     filtered on by the scheduler
+   *                          (`RESUMABLE_ROTATION_STATES`). A state outside
+   *                          that list is a sweep nothing ever picks up, which
+   *                          presents as a rotation that stalled silently --
+   *                          and a stalled rotation is the evidence somebody
+   *                          will use to retire a key that still has rows
+   *                          under it.
+   *   `SecretScopeKind`      filtered on once per test ("which scope rows apply
+   *                          to this test"). A kind TypeScript cannot name has
+   *                          no entry in `SECRET_SCOPE_RULES`, so `requiresReason`
+   *                          reads `undefined` and the broadest scope in the
+   *                          product stops needing a justification.
+   *   `EgressOutcome`        GROUPED ON, and the highest-stakes of the six.
+   *                          "We would have refused 1,204 connections" is a
+   *                          group-by over this column and it is the ONLY thing
+   *                          that lets an operator arm the egress brake. A
+   *                          member MISSING from the Prisma enum cannot be
+   *                          stored, so a WOULD_REFUSE decision would be
+   *                          written as ALLOWED or not at all -- a refusal
+   *                          applied-or-not without being counted, which is one
+   *                          of the lies this product cannot afford.
+   *   `LoginAttemptOutcome`  grouped on by the throttle and by the operator.
+   *                          BAD_TOTP is the member this round exists for: it
+   *                          has never been reachable, because
+   *                          apps/api/src/routes/auth.ts checks that a code was
+   *                          SUPPLIED and never looks at its value. A member
+   *                          missing from the Prisma enum is an attempt that
+   *                          cannot be recorded, and an unrecorded attempt is
+   *                          indistinguishable from one that never happened --
+   *                          which is exactly how a password-spraying run looks
+   *                          like silence.
+   */
+  { prismaEnum: 'VaultKeyState', tsConst: 'VAULT_KEY_STATES', source: 'sealed' },
+  { prismaEnum: 'VaultKeyProvider', tsConst: 'VAULT_KEY_PROVIDERS', source: 'sealed' },
+  { prismaEnum: 'KeyRotationState', tsConst: 'KEY_ROTATION_STATES', source: 'sealed' },
+  { prismaEnum: 'SecretScopeKind', tsConst: 'SECRET_SCOPE_KINDS', source: 'constants' },
+  { prismaEnum: 'EgressOutcome', tsConst: 'EGRESS_OUTCOMES', source: 'egress' },
+  { prismaEnum: 'LoginAttemptOutcome', tsConst: 'LOGIN_ATTEMPT_OUTCOMES', source: 'constants' },
 ];
 
 /*
@@ -977,6 +1091,8 @@ const testTypeDecl = readFileSync(TEST_TYPE_DECL_FILE, 'utf8');
 const artifactSet = readFileSync(ARTIFACT_SET_FILE, 'utf8');
 const suppression = readFileSync(SUPPRESSION_FILE, 'utf8');
 const ownership = readFileSync(OWNERSHIP_FILE, 'utf8');
+const sealed = readFileSync(SEALED_FILE, 'utf8');
+const egress = readFileSync(EGRESS_FILE, 'utf8');
 const SOURCES: Record<
   | 'constants'
   | 'types'
@@ -994,7 +1110,9 @@ const SOURCES: Record<
   | 'testTypeDecl'
   | 'artifactSet'
   | 'suppression'
-  | 'ownership',
+  | 'ownership'
+  | 'sealed'
+  | 'egress',
   { text: string; label: string }
 > = {
   constants: { text: constants, label: 'constants.ts' },
@@ -1014,6 +1132,8 @@ const SOURCES: Record<
   artifactSet: { text: artifactSet, label: 'shared/artifact-set.ts' },
   suppression: { text: suppression, label: 'shared/suppression.ts' },
   ownership: { text: ownership, label: 'shared/ownership.ts' },
+  sealed: { text: sealed, label: 'shared/sealed.ts' },
+  egress: { text: egress, label: 'shared/egress.ts' },
 };
 const problems: string[] = [];
 

@@ -44,8 +44,9 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { signupSchema } from '@qaai/shared';
+import { API_KEY_PREFIX, signupSchema } from '@qaai/shared';
 import { hashToken } from '../lib/crypto.js';
+import { CSRF_HEADER, csrfTokenFor } from '../lib/sessions.js';
 
 /**
  * `any` is off for test files by policy (see eslint.config.js). It is used for
@@ -159,6 +160,32 @@ const MODELS = [
   'invite',
   'verificationToken',
   'auditLog',
+  /*
+   * The three tables the login path started touching with the security round.
+   * Without them `prisma.loginThrottle` is `undefined` on the Proxy and the
+   * throttle READ — which is deliberately not wrapped, because a lock state
+   * that cannot be read must not be assumed open — threw a TypeError inside the
+   * handler and answered 500 to every correct password.
+   */
+  'loginThrottle',
+  'loginAttempt',
+  'totpRecoveryCode',
+  /*
+   * API keys, because `middleware/auth.ts` now DECIDES something about them
+   * rather than just reading them: an empty scope list used to be the wildcard,
+   * and the `API_KEY_SCOPE` brake is what flips that meaning. Without this
+   * table `prisma.apiKey` is `undefined` on the Proxy and every Bearer request
+   * 500s inside the credential path.
+   */
+  'apiKey',
+  /*
+   * Present and EMPTY on purpose. `requireScope('secrets:write')` on the
+   * secret-scope writes must refuse before the handler reads anything, and the
+   * way to prove the gate is not vacuous is that a key which DOES hold the
+   * scope gets past it and lands on `ownedSecret`'s 404 instead. That read
+   * needs the model to exist; it must never need a row.
+   */
+  'secret',
 ] as const;
 
 type ModelName = (typeof MODELS)[number];
@@ -197,6 +224,17 @@ function matches(row: Row, where: Row): boolean {
       const filter = cond as Row;
       if ('in' in filter) {
         if (!(filter.in as unknown[]).includes(value)) return false;
+        continue;
+      }
+      /*
+       * `gt` is modelled because the rotation-grace reader IS a `gt`:
+       * `rotationGraceUntil: { gt: now }` is the whole difference between "the
+       * old key still works" and "the window has closed". A fake that ignored
+       * it would pass the grace test with the comparison deleted.
+       */
+      if ('gt' in filter) {
+        const bound = filter.gt as Date;
+        if (!(value instanceof Date) || value.getTime() <= bound.getTime()) return false;
         continue;
       }
       // Loud on purpose: a fake that shrugs at a filter it does not know passes
@@ -259,10 +297,32 @@ const MODEL_OPTIONS: Record<ModelName, ModelOptions> = {
       isSuperuser: false,
       totpSecretEnc: null,
       totpEnabledAt: null,
+      /*
+       * Explicitly null for the same reason `passwordHash` is, and the stakes
+       * are higher: login reads `user.totpConfirmedAt !== null` with a STRICT
+       * comparison on purpose, so an absent column (`undefined`) takes the
+       * ENROLLED branch and demands a code nobody can supply. That is the
+       * fail-closed direction the handler documents, and a fake that omitted
+       * the column would make every login here fail for a reason unrelated to
+       * the test.
+       */
+      totpConfirmedAt: null,
+      totpSecretKeyVersion: null,
       lastLoginAt: null,
     },
   },
-  organization: { defaults: { plan: 'FREE', limitOverrides: null } },
+  organization: {
+    defaults: {
+      plan: 'FREE',
+      limitOverrides: null,
+      // Login resolves its brake modes and throttle policy off the org. Null is
+      // "nothing stored", which `controlMode()` turns into each control's
+      // documented fallback — the state every existing customer is in.
+      enforceSso: false,
+      securityControlModes: null,
+      loginThrottlePolicy: null,
+    },
+  },
   membership: { scoped: true, defaults: { role: 'MEMBER' } },
   session: {
     defaults: { activeOrgId: null, ip: null, userAgent: null, revokedAt: null },
@@ -270,6 +330,43 @@ const MODEL_OPTIONS: Record<ModelName, ModelOptions> = {
   invite: { scoped: true, defaults: { role: 'MEMBER', acceptedAt: null } },
   verificationToken: { defaults: { usedAt: null } },
   auditLog: { scoped: true, defaults: {} },
+  // The literal rather than CLOCK_BASE: this table is declared above it.
+  loginThrottle: {
+    defaults: {
+      failures: 0,
+      windowStart: new Date('2026-07-01T00:00:00.000Z'),
+      lockedUntil: null,
+      lockCount: 0,
+    },
+  },
+  loginAttempt: { defaults: { ip: null, userAgent: null } },
+  totpRecoveryCode: { defaults: { usedAt: null, usedFromIp: null } },
+  /*
+   * Every nullable column from `model ApiKey` is defaulted EXPLICITLY, and the
+   * four rotation columns matter most: `rotationGraceOpen` filters on
+   * `revokedAt: null` and `rotationGraceUntil: { gt: now }`, and an absent
+   * column (`undefined`) satisfies a `null` filter in this fake exactly as a
+   * real null does — so omitting them would make the grace lookup match rows
+   * it must not.
+   *
+   * `scopes: []` is the DEFAULT here because it is the default in
+   * schema.prisma, which is the whole reason the empty array had to be given a
+   * meaning: a row written by anything that forgot the field arrives empty.
+   */
+  apiKey: {
+    scoped: true,
+    defaults: {
+      userId: null,
+      scopes: [],
+      lastUsedAt: null,
+      expiresAt: null,
+      revokedAt: null,
+      rotatedAt: null,
+      replacesKeyId: null,
+      rotationGraceUntil: null,
+    },
+  },
+  secret: { scoped: true, defaults: {} },
 };
 
 /** Ordering is asserted (`orderBy: createdAt`), so the clock must not tie. */
@@ -350,6 +447,7 @@ function makeDb() {
         rows().splice(rows().indexOf(row), 1);
         return row;
       },
+      count: async ({ where }: Row = {}) => find(where).length,
       upsert: async ({ where, create, update, select }: Row) => {
         const row = find(where)[0];
         if (row) {
@@ -362,6 +460,28 @@ function makeDb() {
   };
 
   MODEL_OPTIONS.invite.hydrate = (row) => ({
+    ...row,
+    org: tables.organization.find((o) => o.id === row.orgId) ?? null,
+  });
+  /*
+   * Login reads `membership.org` to resolve the organisation's brake modes and
+   * throttle policy. Without this the nested select projects `org: null`, which
+   * the handler reads as "the membership's organisation cannot be read" and
+   * refuses the login — correctly, and for a reason that has nothing to do with
+   * any test in this file.
+   */
+  MODEL_OPTIONS.membership.hydrate = (row) => ({
+    ...row,
+    org: tables.organization.find((o) => o.id === row.orgId) ?? null,
+  });
+  /*
+   * `actorFromApiKey` reads the brake modes through `org: { select: … }` on the
+   * key's own row rather than issuing a second query, so the relation has to
+   * resolve or `controlMode` is handed `undefined` for every key and silently
+   * falls back — which would make the OBSERVE half of these tests pass while
+   * the stored mode was being ignored.
+   */
+  MODEL_OPTIONS.apiKey.hydrate = (row) => ({
     ...row,
     org: tables.organization.find((o) => o.id === row.orgId) ?? null,
   });
@@ -407,6 +527,7 @@ function makeDb() {
 const express = (await import('express')).default;
 const { authRouter } = await import('./auth.js');
 const { settingsRouter } = await import('./settings.js');
+const { apiKeyScopeObserved, resetApiKeyScopeObserved } = await import('../middleware/auth.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 
 const app = express();
@@ -434,16 +555,39 @@ interface Reply {
   setCookie: string | null;
 }
 
+/*
+ * THE CSRF TOKEN A BROWSER ECHOES BACK.
+ *
+ * `authRouter` guards every cookie-authenticated mutation with a double-submit
+ * token: the API sets a readable `qaai_csrf` cookie and the page returns it in
+ * `x-qaai-csrf`. Derived here from the session token rather than threaded
+ * through every call site, because the derivation is the mechanism — a test
+ * that passed a hard-coded string would still pass if the binding to the
+ * session broke, and auth.test.ts owns the assertions about the guard itself.
+ */
+function csrfFor(cookie: string | undefined): Row {
+  const raw = /qaai_session=([^;]+)/.exec(cookie ?? '')?.[1];
+  return raw === undefined ? {} : { [CSRF_HEADER]: csrfTokenFor(hashToken(decodeURIComponent(raw))) };
+}
+
 async function call(
   method: string,
   path: string,
-  opts: { body?: unknown; cookie?: string } = {},
+  opts: { body?: unknown; cookie?: string; bearer?: string } = {},
 ): Promise<Reply> {
   const res = await fetch(`${baseUrl}${path}`, {
     method,
     headers: {
       ...(opts.body === undefined ? {} : { 'content-type': 'application/json' }),
       ...(opts.cookie ? { cookie: opts.cookie } : {}),
+      /*
+       * No CSRF header is sent with a bearer credential, and that is the point
+       * rather than an omission: a CSRF check only applies where the BROWSER
+       * attached the credential. A key that needed one would mean the CLI had
+       * to read a cookie.
+       */
+      ...(opts.bearer ? { authorization: `Bearer ${opts.bearer}` } : {}),
+      ...csrfFor(opts.cookie),
     },
     ...(opts.body === undefined ? {} : { body: JSON.stringify(opts.body) }),
   });
@@ -478,14 +622,23 @@ const NEW_PASSWORD = 'a-different-long-one';
 let idSeq = 0;
 const fixtureId = (prefix: string) => `${prefix}_fixture_${++idSeq}`;
 
-function seedOrg(name: string): Row {
+function seedOrg(name: string, over: Row = {}): Row {
   const org = {
     id: fixtureId('org'),
     name,
     slug: name.toLowerCase(),
     plan: 'FREE',
     limitOverrides: null,
+    /*
+     * "Nothing stored", which is the state every existing customer is in and
+     * which `controlMode()` resolves to each control's documented fallback.
+     * Pushed directly rather than through `insert`, so the table's defaults do
+     * not apply and this has to be named here — an absent column would make
+     * every brake test read `undefined` and pass for the wrong reason.
+     */
+    securityControlModes: null,
     createdAt: new Date(CLOCK_BASE),
+    ...over,
   };
   db.tables.organization.push(org);
   return org;
@@ -542,6 +695,38 @@ function seedSession(userId: string, orgId: string, raw = fixtureId('session-tok
   return `qaai_session=${raw}`;
 }
 
+/**
+ * An API key, seeded exactly the way one is minted: a row keyed by the HMAC of
+ * the raw string, which is the only form that exists after creation.
+ *
+ * THE RAW VALUE IS COMPOSED AT RUN TIME from the exported `API_KEY_PREFIX` plus
+ * an obviously-fake tail, and never written as a literal — a finished commit
+ * was once rejected by push protection for a key-shaped string that existed
+ * only to explain why a key had been removed.
+ */
+function seedApiKey(orgId: string, over: Row = {}): { raw: string; row: Row } {
+  const raw = `${API_KEY_PREFIX}${['not', 'a', 'real', 'key', String(++idSeq)].join('-')}`;
+  const row: Row = {
+    id: fixtureId('apikey'),
+    orgId,
+    userId: null,
+    name: 'ci',
+    keyHash: hashToken(raw),
+    keyPrefix: raw.slice(0, API_KEY_PREFIX.length + 8),
+    scopes: [],
+    lastUsedAt: null,
+    expiresAt: null,
+    revokedAt: null,
+    rotatedAt: null,
+    replacesKeyId: null,
+    rotationGraceUntil: null,
+    createdAt: new Date(CLOCK_BASE),
+    ...over,
+  };
+  db.tables.apiKey.push(row);
+  return { raw, row };
+}
+
 function seedInvite(over: Row & { orgId: string; email: string }): string {
   const raw = fixtureId('invite-token');
   db.tables.invite.push({
@@ -570,6 +755,9 @@ beforeEach(() => {
   h.mail.driver = 'console';
   h.mail.fail = false;
   h.mail.sent = [];
+  // The OBSERVE tally is module state in middleware/auth.ts, so one test's
+  // counts would otherwise be read by the next.
+  resetApiKeyScopeObserved();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -954,6 +1142,19 @@ describe('POST /auth/password/forgot', () => {
 });
 
 describe('POST /auth/password/reset', () => {
+  /*
+   * THE RESET ROW, FOUND BY PURPOSE AND NEVER BY POSITION.
+   *
+   * `verificationToken[0]` used to be the reset token because nothing else
+   * minted one. Signup now issues an EMAIL_VERIFY token of its own, so index 0
+   * is that row and the reset token sits behind it — and a test that expired
+   * index 0 was expiring the wrong token, letting a live reset link through
+   * while asserting it had been refused. Two of these read as a reset-link
+   * bypass until the rows were printed.
+   */
+  const resetRow = (): Row =>
+    db.tables.verificationToken.find((r: Row) => r.purpose === 'PASSWORD_RESET')!;
+
   const seedResettableUser = async () => {
     const org = seedOrg('Acme');
     const signup = await call('POST', '/auth/signup', { body: signupBody({ orgName: 'Acme Two' }) });
@@ -1008,19 +1209,19 @@ describe('POST /auth/password/reset', () => {
   it('refuses an expired token', async () => {
     const { token } = await seedResettableUser();
     // A reset link is a password; it must not stay usable in an inbox for a day.
-    db.tables.verificationToken[0]!.expiresAt = new Date(Date.now() - 1000);
+    resetRow().expiresAt = new Date(Date.now() - 1000);
 
     const res = await call('POST', '/auth/password/reset', {
       body: { token, password: NEW_PASSWORD },
     });
 
     expect(res.status).toBe(400);
-    expect(db.tables.verificationToken[0]!.usedAt).toBeNull();
+    expect(resetRow().usedAt).toBeNull();
   });
 
   it('refuses a token that is not a password reset, and one that is invented', async () => {
     const { token } = await seedResettableUser();
-    db.tables.verificationToken[0]!.purpose = 'EMAIL_VERIFY';
+    resetRow().purpose = 'EMAIL_VERIFY';
 
     expect(
       (await call('POST', '/auth/password/reset', { body: { token, password: NEW_PASSWORD } }))
@@ -1173,6 +1374,30 @@ describe('PATCH /settings/members/:userId', () => {
     expect(db.tables.membership.find((m) => m.userId === owner.id)!.role).toBe('ADMIN');
     // The guard counts OWNERs, so the survivor is untouched.
     expect(db.tables.membership.find((m) => m.userId === second.id)!.role).toBe('OWNER');
+  });
+
+  it('does not let an ADMIN DEMOTE an OWNER', async () => {
+    const { org, owner } = seedTeam();
+    const second = seedUser('sam@acme-corp.test');
+    seedMember(org.id, second.id, 'OWNER');
+    const admin = seedUser('ada@acme-corp.test');
+    seedMember(org.id, admin.id, 'ADMIN');
+
+    const res = await call('PATCH', `/settings/members/${owner.id}`, {
+      cookie: seedSession(admin.id, org.id),
+      body: { role: 'MEMBER' },
+    });
+
+    /*
+     * The other half of the rank rule. DELETE has refused an ADMIN removing an
+     * OWNER since it was written; PATCH had no equivalent guard, so an ADMIN
+     * reached the same end with a different verb — measured at 200 with the
+     * OWNER left holding MEMBER. Not the last-owner guard: there are two
+     * OWNERs here deliberately, so only the rank rule can refuse this.
+     */
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toBe('Only an owner can change the role of another owner.');
+    expect(db.tables.membership.find((m) => m.userId === owner.id)!.role).toBe('OWNER');
   });
 
   it('lets only an OWNER mint another OWNER', async () => {
@@ -1425,5 +1650,487 @@ describe('the invite round trip', () => {
     });
 
     expect(res.status).toBe(403);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API keys: the empty scope array, the write that made it storable, and
+// rotation
+//
+// Every test below drives a REAL request through the real `middleware/auth.ts`
+// credential path and the real `routes/settings.ts` handlers over the loopback
+// socket. None of them calls the decision function directly, because the defect
+// was never in a function — it was that no production call site reached one.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('an empty API-key scope list is not a wildcard', () => {
+  it('refuses a key stored with no scopes, because API_KEY_SCOPE falls back to ENFORCE', async () => {
+    const { org } = seedTeam();
+    const { raw } = seedApiKey(org.id, { scopes: [] });
+
+    /*
+     * THE DEFECT: `scopes: key.scopes.length > 0 ? key.scopes : ['*']` handed
+     * this key the wildcard, and `requireScope` short-circuits on `'*'`, so a
+     * key created to do nothing could do everything. The org has stored no
+     * modes at all — the state every existing customer is in — so the
+     * control's own ENFORCE fallback is what answers.
+     */
+    const res = await call('GET', '/settings/api-keys', { bearer: raw });
+
+    expect(res.status).toBe(401);
+    // Nothing was counted: a refusal is not an observation.
+    expect(apiKeyScopeObserved()).toEqual({});
+  });
+
+  it('is indistinguishable from an unknown key, so the refusal is not an oracle', async () => {
+    const { org } = seedTeam();
+    const { raw } = seedApiKey(org.id, { scopes: [] });
+    const invented = `${API_KEY_PREFIX}${['no', 'such', 'key'].join('-')}`;
+
+    const empty = await call('GET', '/settings/api-keys', { bearer: raw });
+    const unknown = await call('GET', '/settings/api-keys', { bearer: invented });
+
+    // Same status AND same body. "Your key has no scopes" would tell a prober
+    // that the string they hold is a real key for a real organisation.
+    expect(empty.status).toBe(unknown.status);
+    expect(empty.body).toEqual(unknown.body);
+  });
+
+  it('keeps today’s answer in OBSERVE and COUNTS the key it would have refused', async () => {
+    /*
+     * Rule 13: the mode gates THE REFUSAL, not only the report, and OBSERVE
+     * must count what it would have done. An operator reads this count to size
+     * the blast radius before arming the brake.
+     */
+    const org = seedOrg('Observant', { securityControlModes: { API_KEY_SCOPE: 'OBSERVE' } });
+    const owner = seedUser('obs@acme-corp.test', { passwordHash: 'scrypt$x' });
+    seedMember(org.id, owner.id, 'OWNER');
+    const { raw, row } = seedApiKey(org.id, { scopes: [] });
+
+    const first = await call('GET', '/settings/api-keys', { bearer: raw });
+    const second = await call('GET', '/settings/api-keys', { bearer: raw });
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    // Per request, keyed by the key's cuid — never by the key, its hash or its
+    // prefix.
+    expect(apiKeyScopeObserved()).toEqual({ [row.id as string]: 2 });
+  });
+
+  it('reads the mode off the key’s OWN organisation, not whichever org asked last', async () => {
+    const enforcing = seedOrg('Enforcing');
+    const observing = seedOrg('Observing', {
+      securityControlModes: { API_KEY_SCOPE: 'OBSERVE' },
+    });
+    const user = seedUser('two@acme-corp.test', { passwordHash: 'scrypt$x' });
+    seedMember(enforcing.id, user.id, 'OWNER');
+    seedMember(observing.id, user.id, 'OWNER');
+
+    const strict = seedApiKey(enforcing.id, { scopes: [] });
+    const lax = seedApiKey(observing.id, { scopes: [] });
+
+    expect((await call('GET', '/settings/api-keys', { bearer: strict.raw })).status).toBe(401);
+    expect((await call('GET', '/settings/api-keys', { bearer: lax.raw })).status).toBe(200);
+  });
+
+  it('still authorises a key that names its scopes, under either mode', async () => {
+    // The refusals above have to be about the EMPTY list and nothing else.
+    const { org } = seedTeam();
+    const { raw } = seedApiKey(org.id, { scopes: ['runs:read'] });
+
+    expect((await call('GET', '/settings/api-keys', { bearer: raw })).status).toBe(200);
+  });
+});
+
+describe('requireScope on the secret-scope writes', () => {
+  /*
+   * THE KEY IS ATTACHED TO THE OWNER, and that detail is what makes these two
+   * tests mean anything. These routes carry `requireRole('ADMIN')` as well, and
+   * an ORG key (`userId: null`) resolves to role MEMBER — so without the
+   * `userId` both the refusal and the allowance came back 403 from the ROLE
+   * guard and the scope check was never reached. The first draft of this block
+   * passed in the refusing direction for exactly that wrong reason.
+   */
+  const seedAdminKey = (orgId: string, userId: string, scopes: string[]) =>
+    seedApiKey(orgId, { userId, scopes }).raw;
+
+  it('refuses a key that does not hold secrets:write', async () => {
+    const { org, owner } = seedTeam();
+    const raw = seedAdminKey(org.id, owner.id as string, ['runs:write']);
+
+    /*
+     * THE DEFECT: ~120 mutating routes check no scope, so a key a customer
+     * created for CI runs could widen who may read a production credential.
+     * The 403 arrives before `ownedSecret` reads anything, which is why the
+     * `secret` table is empty here.
+     */
+    const res = await call('POST', '/settings/secrets/sec_1/scopes', {
+      bearer: raw,
+      body: { kind: 'ENVIRONMENT_WIDE', value: null, reason: 'because' },
+    });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('lets a key that holds secrets:write past the gate, and the 404 proves the gate ran', async () => {
+    const { org, owner } = seedTeam();
+    const raw = seedAdminKey(org.id, owner.id as string, ['secrets:write']);
+
+    const res = await call('POST', '/settings/secrets/sec_1/scopes', {
+      bearer: raw,
+      body: { kind: 'ENVIRONMENT_WIDE', value: null, reason: 'because' },
+    });
+
+    // 404 and not 403: the scope check passed and the handler ran, which is how
+    // this test proves the refusal above is not vacuous.
+    expect(res.status).toBe(404);
+  });
+
+  it('still lets a session actor through, because a human has a role instead', async () => {
+    const { cookie } = seedTeam();
+
+    const res = await call('POST', '/settings/secrets/sec_1/scopes', {
+      cookie,
+      body: { kind: 'ENVIRONMENT_WIDE', value: null, reason: 'because' },
+    });
+
+    expect(res.status).toBe(404);
+  });
+
+  /*
+   * THE REVOKE ROUTE GETS ITS OWN PAIR, and the reason is a mutation result
+   * rather than symmetry: with only the POST covered, deleting
+   * `requireScope('secrets:write')` from the DELETE declaration changed no test
+   * at all. Two routes, two guards, two tests — a guard nothing pins is a guard
+   * the next refactor removes.
+   */
+  it('refuses the scope REVOKE to a key that does not hold secrets:write', async () => {
+    const { org, owner } = seedTeam();
+    const raw = seedAdminKey(org.id, owner.id as string, ['runs:write']);
+
+    const res = await call('DELETE', '/settings/secrets/sec_1/scopes/scope_1', { bearer: raw });
+
+    // Revoking a scope narrows access rather than widening it, and it is still
+    // gated: a key that may not grant a credential may not take one away
+    // either, because "who can read this secret" is one decision.
+    expect(res.status).toBe(403);
+  });
+
+  it('lets the scope REVOKE past the gate for a key that holds it', async () => {
+    const { org, owner } = seedTeam();
+    const raw = seedAdminKey(org.id, owner.id as string, ['secrets:write']);
+
+    const res = await call('DELETE', '/settings/secrets/sec_1/scopes/scope_1', { bearer: raw });
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe('POST /settings/api-keys — the write side of the empty array', () => {
+  it('refuses an explicitly empty scope list', async () => {
+    const { cookie } = seedTeam();
+
+    /*
+     * THE DEFECT: the route hand-parsed `req.body.scopes` with no schema, so
+     * `{"scopes": []}` was storable and the middleware read it as the
+     * wildcard. `createApiKeySchema` existed and refused it, and had ZERO
+     * production call sites.
+     */
+    const res = await call('POST', '/settings/api-keys', {
+      cookie,
+      body: { name: 'ci', scopes: [] },
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error?.details?.refusedPaths).toEqual(['scopes [too_small]']);
+    expect(db.tables.apiKey).toHaveLength(0);
+  });
+
+  it('refuses the wildcard and a scope outside the vocabulary', async () => {
+    const { cookie } = seedTeam();
+
+    // `'*'` is deliberately not a member of API_KEY_SCOPES: a key able to name
+    // it is the empty array with extra steps.
+    const wildcard = await call('POST', '/settings/api-keys', {
+      cookie,
+      body: { name: 'ci', scopes: ['*'] },
+    });
+    const invented = await call('POST', '/settings/api-keys', {
+      cookie,
+      body: { name: 'ci', scopes: ['tests:delete'] },
+    });
+
+    expect(wildcard.status).toBe(400);
+    expect(invented.status).toBe(400);
+    expect(db.tables.apiKey).toHaveLength(0);
+  });
+
+  it('refuses a duplicated scope', async () => {
+    const { cookie } = seedTeam();
+    const res = await call('POST', '/settings/api-keys', {
+      cookie,
+      body: { name: 'ci', scopes: ['runs:read', 'runs:read'] },
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('STILL ACCEPTS THE COCKPIT’S REQUEST, which sends only a name', async () => {
+    /*
+     * THE ANTI-REGRESSION TEST, and the reason the schema is applied to a body
+     * with this route's historical defaults filled in rather than to `req.body`
+     * raw. `apps/web/app/settings/page.tsx:1142` posts `{ name }` and nothing
+     * else; `createApiKeySchema` requires `scopes` (min 1) and `expiresAt`
+     * (required, nullable). Wired naively, the cockpit's own "create key"
+     * button would 400 — which is exactly the shape of the two regressions this
+     * round exists to undo.
+     */
+    const { cookie } = seedTeam();
+
+    const res = await call('POST', '/settings/api-keys', { cookie, body: { name: 'ci' } });
+
+    expect(res.status).toBe(201);
+    expect(res.body.key.scopes).toEqual(['runs:write', 'runs:read']);
+    expect(res.body.key.secret.startsWith(API_KEY_PREFIX)).toBe(true);
+    // The never-expires key a caller that has never heard of expiry has always
+    // got. `null` is the stored answer, not an absent column.
+    expect(db.tables.apiKey[0]!.expiresAt).toBeNull();
+  });
+
+  it('stores a named scope list and an explicit expiry', async () => {
+    const { cookie } = seedTeam();
+    const res = await call('POST', '/settings/api-keys', {
+      cookie,
+      body: { name: 'ci', scopes: ['tests:read'], expiresAt: '2027-01-01T00:00:00.000Z' },
+    });
+
+    expect(res.status).toBe(201);
+    expect(db.tables.apiKey[0]).toMatchObject({ scopes: ['tests:read'] });
+    expect((db.tables.apiKey[0]!.expiresAt as Date).toISOString()).toBe('2027-01-01T00:00:00.000Z');
+  });
+
+  it('never puts the key itself in the audit row', async () => {
+    const { cookie } = seedTeam();
+    const res = await call('POST', '/settings/api-keys', { cookie, body: { name: 'ci' } });
+
+    const secret = res.body.key.secret as string;
+    const created = db.tables.auditLog.find((r) => r.action === 'apikey.create')!;
+    const serialised = JSON.stringify(created);
+
+    expect(serialised).not.toContain(secret);
+    // Not a fragment of it either (rule 11): nothing truncated, nothing hashed.
+    expect(serialised).not.toContain(secret.slice(API_KEY_PREFIX.length, API_KEY_PREFIX.length + 8));
+  });
+
+  it('a key created through this route authenticates immediately', async () => {
+    // The round trip, so the two halves cannot drift: what the write stores is
+    // what the credential path accepts.
+    const { cookie } = seedTeam();
+    const created = await call('POST', '/settings/api-keys', { cookie, body: { name: 'ci' } });
+
+    const res = await call('GET', '/settings/api-keys', {
+      bearer: created.body.key.secret as string,
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('POST /settings/api-keys/:keyId/rotate', () => {
+  it('keeps the replaced key working while its successor’s grace window is open', async () => {
+    /*
+     * `ApiKey.rotationGraceUntil` says "while this is in the future BOTH this
+     * key and the one it replaced authorise", and NOTHING read it and nothing
+     * wrote it. This route is the writer; `rotationGraceOpen` in
+     * middleware/auth.ts is the reader.
+     */
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'] });
+
+    const rotated = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 30 },
+    });
+
+    expect(rotated.status).toBe(201);
+    // The predecessor is revoked AND stamped rotatedAt. Both are load-bearing.
+    expect(old.row.revokedAt).not.toBeNull();
+    expect(old.row.rotatedAt).not.toBeNull();
+
+    // And it still authenticates, which is the entire point of a grace window.
+    expect((await call('GET', '/settings/api-keys', { bearer: old.raw })).status).toBe(200);
+    expect(
+      (await call('GET', '/settings/api-keys', { bearer: rotated.body.key.secret as string }))
+        .status,
+    ).toBe(200);
+  });
+
+  it('kills the replaced key once the window closes', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'] });
+
+    await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 30 },
+    });
+
+    /*
+     * The clock is moved by moving the ROW rather than by faking time: the
+     * reader is a `rotationGraceUntil: { gt: now }` filter, and a row whose
+     * window is in the past is the same state a real clock would reach. The
+     * fake models `gt`, so deleting the comparison fails this test.
+     */
+    const successor = db.tables.apiKey.find((k) => k.replacesKeyId === old.row.id)!;
+    successor.rotationGraceUntil = new Date(Date.now() - 1_000);
+
+    expect((await call('GET', '/settings/api-keys', { bearer: old.raw })).status).toBe(401);
+    // The replacement is unaffected; only the inherited window closed.
+    expect(successor.revokedAt).toBeNull();
+  });
+
+  it('an immediate rotation gives no window at all', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'] });
+
+    // graceMinutes defaults to 0, so a caller who says nothing gets the strict
+    // answer rather than a window somebody forgot to close.
+    await call('POST', `/settings/api-keys/${old.row.id}/rotate`, { cookie, body: {} });
+
+    const successor = db.tables.apiKey.find((k) => k.replacesKeyId === old.row.id)!;
+    expect(successor.rotationGraceUntil).toBeNull();
+    expect((await call('GET', '/settings/api-keys', { bearer: old.raw })).status).toBe(401);
+  });
+
+  it('does NOT revive a key a human revoked, even with an open window beside it', async () => {
+    /*
+     * The dangerous direction. "Revoke this leaked key" must not be undone by a
+     * grace window, so the reader requires `rotatedAt` on the key being
+     * presented — which only a rotation writes.
+     */
+    const { org } = seedTeam();
+    const revoked = seedApiKey(org.id, {
+      scopes: ['runs:read'],
+      revokedAt: new Date(CLOCK_BASE),
+      rotatedAt: null,
+    });
+    seedApiKey(org.id, {
+      scopes: ['runs:read'],
+      replacesKeyId: revoked.row.id,
+      rotationGraceUntil: new Date(Date.now() + 600_000),
+    });
+
+    expect((await call('GET', '/settings/api-keys', { bearer: revoked.raw })).status).toBe(401);
+  });
+
+  it('does not let a revoked successor’s window hold the door open', async () => {
+    const { org } = seedTeam();
+    const old = seedApiKey(org.id, {
+      scopes: ['runs:read'],
+      revokedAt: new Date(CLOCK_BASE),
+      rotatedAt: new Date(CLOCK_BASE),
+    });
+    seedApiKey(org.id, {
+      scopes: ['runs:read'],
+      replacesKeyId: old.row.id,
+      rotationGraceUntil: new Date(Date.now() + 600_000),
+      revokedAt: new Date(CLOCK_BASE),
+    });
+
+    expect((await call('GET', '/settings/api-keys', { bearer: old.raw })).status).toBe(401);
+  });
+
+  it('carries the scopes over rather than widening them to this route’s defaults', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['tests:read'] });
+
+    const rotated = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 0 },
+    });
+
+    // A rotation that silently re-applied `['runs:write','runs:read']` would
+    // WIDEN a key the customer had restricted — an escalation dressed as
+    // hygiene.
+    expect(rotated.body.key.scopes).toEqual(['tests:read']);
+  });
+
+  it('narrows on request, and refuses to narrow to nothing', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['tests:read', 'runs:read'] });
+
+    const empty = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { scopes: [] },
+    });
+    expect(empty.status).toBe(400);
+    expect(old.row.revokedAt).toBeNull();
+
+    const narrowed = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { scopes: ['runs:read'] },
+    });
+    expect(narrowed.body.key.scopes).toEqual(['runs:read']);
+  });
+
+  it('refuses a grace window longer than a week', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'] });
+
+    const res = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 60 * 24 * 8 },
+    });
+
+    expect(res.status).toBe(400);
+    expect(old.row.revokedAt).toBeNull();
+  });
+
+  it('refuses to rotate an already-revoked key', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'], revokedAt: new Date(CLOCK_BASE) });
+
+    const res = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 30 },
+    });
+
+    // Otherwise rotation is a way to un-revoke a key that leaked.
+    expect(res.status).toBe(409);
+  });
+
+  it('cannot rotate another org’s key', async () => {
+    const { cookie } = seedTeam();
+    const other = seedOrg('Beta');
+    const theirs = seedApiKey(other.id, { scopes: ['runs:read'] });
+
+    const res = await call('POST', `/settings/api-keys/${theirs.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 30 },
+    });
+
+    // 404 rather than 403: "exists but not yours" and "does not exist" must be
+    // indistinguishable or the API is an id oracle.
+    expect(res.status).toBe(404);
+    expect(theirs.row.revokedAt).toBeNull();
+  });
+
+  it('is refused to a plain member, and never puts the new key in the audit row', async () => {
+    const { org, cookie } = seedTeam();
+    const old = seedApiKey(org.id, { scopes: ['runs:read'] });
+    const member = seedUser('mel-rot@acme-corp.test');
+    seedMember(org.id, member.id, 'MEMBER');
+
+    const refused = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie: seedSession(member.id, org.id),
+      body: { graceMinutes: 30 },
+    });
+    expect(refused.status).toBe(403);
+
+    const rotated = await call('POST', `/settings/api-keys/${old.row.id}/rotate`, {
+      cookie,
+      body: { graceMinutes: 30 },
+    });
+    const row = db.tables.auditLog.find((r) => r.action === 'apikey.rotate')!;
+    expect(JSON.stringify(row)).not.toContain(rotated.body.key.secret as string);
+    // What it DOES record: which key replaced which, and how long both live.
+    expect(row.metadata).toMatchObject({ replacesKeyId: old.row.id, graceMinutes: 30 });
   });
 });

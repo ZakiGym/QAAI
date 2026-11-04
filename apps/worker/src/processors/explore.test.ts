@@ -628,6 +628,8 @@ const {
   roleAttemptReport,
   routesNewToRole,
   staleRoleAttempts,
+  cachedSessionForRole,
+  runRolePasses,
 } = await import('./explore.js');
 const { LOGIN_FAILURES } = await import('@qaai/runner');
 const { ANONYMOUS_ROLE } = await import('@qaai/shared');
@@ -1921,5 +1923,314 @@ describe('a route absent for a reason that is not deletion', () => {
     // First writer wins, and the order is the precedence: the crawl's own
     // refusal is the more specific reason.
     expect(exclusions.exclusions[0]!.detail).toContain('would end the session');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (4) THE SEALED SESSION: the crawl must still run AS THE IDENTITY
+//
+// `sealSession` had a production caller and `openSession` had NONE. The hourly
+// sweep seals the column and NULLS the plaintext, while the crawl's `signIn`
+// adapter read `profile.storageState` only — so the first tick after deploy
+// turned every working authenticated pass into a fresh unattended login, and
+// where that login could not be driven the role was lost altogether. That is
+// the exact defect the seal was minted to end, caused by the seal.
+//
+// NO BROWSER, NO DNS, NO KEY ON DISK: `runRolePasses` takes its crawl and its
+// login as injected functions, and the cipher is the REAL AES-256-GCM one over
+// a key generated in-process — a round trip that only ever ran against a fake
+// proves nothing about the envelope the database will hold.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const { localSessionCipher, masterKeyResolver, sealSession } = await import(
+  '../../../api/src/lib/session-store.js'
+);
+
+type SealedSessionRow = import('../../../api/src/lib/session-store.js').SealedSessionRow;
+type SessionDegradationTally =
+  import('../../../api/src/lib/session-store.js').SessionDegradationTally;
+
+describe('the crawl reads the sealed session, so a sealed profile is still an identity', () => {
+  const SESSION_NOW = new Date('2026-10-29T12:00:00.000Z');
+  const ACTIVE_KEY = { keyId: 'local-1', version: 1, state: 'ACTIVE' as const };
+  const KEYS = { keys: [ACTIVE_KEY], unreadableVersions: [] as number[] };
+  /*
+   * Composed at run time, never written as a literal: rule 18 is absolute
+   * about credential-shaped literals, and a session cookie is the most
+   * credential-shaped value this product holds. The leak assertion greps for
+   * it.
+   */
+  const COOKIE = ['qaai', 'fake', 'crawl', 'cookie'].join('-') + '-00000000';
+  const SESSION = { cookies: [{ name: 'sid', value: COOKIE }], origins: [] };
+
+  const key = localSessionCipher(masterKeyResolver(Buffer.alloc(32, 7).toString('base64')));
+
+  /** A row as the sealing sweep leaves one: sealed, versioned, plaintext NULL. */
+  async function sealedProfile(id = 'p_admin'): Promise<SealedSessionRow> {
+    const sealed = await sealSession({
+      profileId: id,
+      storageState: SESSION,
+      expiresAt: new Date(SESSION_NOW.getTime() + 8 * 3_600_000),
+      keys: KEYS.keys,
+      cipher: key,
+      now: SESSION_NOW,
+    });
+    if (!sealed.ok) throw new Error(`fixture could not seal: ${sealed.refusal}`);
+    return { id, ...sealed.value };
+  }
+
+  function blankProfile(over: Partial<SealedSessionRow> = {}): SealedSessionRow {
+    return {
+      id: 'p_admin',
+      storageState: null,
+      storageStateExpiresAt: null,
+      storageStateSealed: null,
+      storageStateKeyVersion: null,
+      storageStateNeedsReseal: false,
+      ...over,
+    };
+  }
+
+  /**
+   * The production composition, exactly: the crawl's `signIn` is
+   * `cachedSessionForRole` and, only on a NULL, a real login. The login here is
+   * a recorder, so "did this profile cost a sign-in" is a measured fact.
+   */
+  function driver(
+    profile: SealedSessionRow,
+    options: { mode?: 'OBSERVE' | 'ENFORCE'; loginOk?: boolean; cipher?: typeof key | null } = {},
+  ) {
+    const crawled: Array<{ role: string | null; storageState: unknown }> = [];
+    const logins: string[] = [];
+    const tallies = new Map<string, SessionDegradationTally>();
+    const deps = {
+      crawl: async (input: { role: string | null; storageState: unknown }) => {
+        crawled.push(input);
+        return outcomeFor({ routes: ['/', '/admin'] });
+      },
+      signIn: async (identity: { authProfileId: string; role: string }) => {
+        const cached = await cachedSessionForRole(profile, {
+          keys: KEYS,
+          cipher: options.cipher === undefined ? key : options.cipher,
+          now: SESSION_NOW,
+          mode: options.mode ?? 'ENFORCE',
+          tallies,
+        });
+        if (cached) return cached;
+        logins.push(identity.authProfileId);
+        return options.loginOk
+          ? {
+              ok: true,
+              storageState: SESSION,
+              message: 'signed in',
+              failure: null,
+            }
+          : {
+              ok: false,
+              storageState: null,
+              message: 'sign-in failed',
+              failure: {
+                kind: 'REJECTED',
+                step: 'SUBMIT',
+                fault: 'THEIRS',
+                detail: 'wrong password',
+                unavailable: null,
+              },
+            };
+      },
+    };
+    const plan = planRolePasses({
+      profiles: [{ id: profile.id, name: 'Admin', kind: 'FORM_LOGIN', role: 'admin' }],
+    });
+    return { deps, plan, crawled, logins, tallies };
+  }
+
+  /*
+   * ── THE REGRESSION, THROUGH THE CRAWL'S OWN DRIVER ──────────────────────
+   *
+   * Seal the session, confirm the plaintext column is gone, then run the role
+   * passes. The admin pass must carry the SESSION — not `undefined`, which is
+   * the anonymous pass, and not `null`, which `runRolePasses` refuses — and it
+   * must cost NO login, because the cache answered.
+   *
+   * Revert `cachedSessionForRole` to `profile.storageState && (!expiresAt ||
+   * expiresAt > now)` and this is red twice: the admin pass carries nothing,
+   * and a login is driven for a profile whose session was sitting there.
+   */
+  it('carries the sealed session into the role pass, and drives no login', async () => {
+    const profile = await sealedProfile();
+    expect(profile.storageState).toBeNull();
+    const { deps, plan, crawled, logins } = driver(profile);
+
+    const passes = await runRolePasses(deps as never, plan);
+
+    const admin = crawled.find((call) => call.role === 'admin');
+    expect(admin).toBeDefined();
+    expect((admin?.storageState as typeof SESSION).cookies[0]?.value).toBe(COOKIE);
+    expect(logins).toEqual([]);
+    expect(passes.find((p) => p.role === 'admin')?.outcome).toBe('CRAWLED');
+    // And the anonymous pass still ran, with no session at all.
+    expect(crawled.find((call) => call.role === null)?.storageState).toBeUndefined();
+  });
+
+  /*
+   * LEGACY_PLAINTEXT KEEPS WORKING. apps/api/src/routes/projects.ts still
+   * writes the live session into that column, so this is the row a cockpit
+   * "Sign in" produces until the API half lands. Refusing it would take a
+   * working crawl away every time somebody pressed that button, to protect a
+   * value that is already in the clear.
+   */
+  it('carries a legacy plaintext session rather than losing the role', async () => {
+    const { deps, plan, crawled, logins } = driver(
+      blankProfile({
+        storageState: SESSION,
+        storageStateExpiresAt: new Date(SESSION_NOW.getTime() + 3_600_000),
+      }),
+    );
+
+    await runRolePasses(deps as never, plan);
+
+    expect((crawled.find((c) => c.role === 'admin')?.storageState as typeof SESSION).cookies[0]
+      ?.value).toBe(COOKIE);
+    expect(logins).toEqual([]);
+  });
+
+  /*
+   * ── AND A SESSION THE GATE REFUSES NEVER BECOMES AN ANONYMOUS CRAWL ─────
+   *
+   * NEEDS_RESEAL is the state the sealing migration leaves behind, so this is
+   * every profile in the install on the first boot after deploy. The honest
+   * answers are "drive the login" and, if that fails, a TYPED role outcome on
+   * `RoleCrawlAttempt` — never a crawl under this role's name with no session,
+   * which would put an anonymous enumeration in the admin row.
+   */
+  it('refuses to crawl as a role whose session it could not obtain, and says whose fault', async () => {
+    const { deps, plan, crawled, logins } = driver(
+      blankProfile({ storageStateNeedsReseal: true }),
+      { loginOk: false },
+    );
+
+    const passes = await runRolePasses(deps as never, plan);
+
+    expect(logins).toEqual(['p_admin']);
+    // ONE crawl, and it is the anonymous one. Nothing ran as "admin".
+    expect(crawled).toHaveLength(1);
+    expect(crawled[0]?.role).toBeNull();
+    const admin = passes.find((p) => p.role === 'admin');
+    expect(admin?.outcome).toBe('LOGIN_FAILED');
+    expect(admin?.contributed).toBe(false);
+    // NULL, not 0: a zero here would be a measurement of a crawl that never ran.
+    expect(admin?.routesReached).toBeNull();
+  });
+
+  /*
+   * A SEALED SESSION THIS PROCESS CANNOT OPEN IS NOT AN ABSENT ONE. With no
+   * usable master key the pass goes to the login and, failing that, to a typed
+   * refusal — it does not quietly enumerate the application signed out.
+   */
+  it('does not treat a session it cannot decrypt as no session at all', async () => {
+    const profile = await sealedProfile();
+    const { deps, plan, crawled, logins } = driver(profile, { cipher: null, loginOk: false });
+
+    await runRolePasses(deps as never, plan);
+
+    expect(logins).toEqual(['p_admin']);
+    expect(crawled.map((c) => c.role)).toEqual([null]);
+  });
+
+  /*
+   * THE BRAKE'S COUNT, WITH A DENOMINATOR. "We would have refused 412" is only
+   * defensible beside how many decisions there were, so `used` is counted too.
+   */
+  it('counts every cached-session decision, used ones included', async () => {
+    const used = driver(await sealedProfile());
+    await runRolePasses(used.deps as never, used.plan);
+    expect([...used.tallies.values()]).toEqual([
+      {
+        profileId: 'p_admin',
+        state: 'SEALED_FRESH',
+        degraded: 0,
+        blocked: 0,
+        used: 1,
+        signedIn: 0,
+        wouldSeal: 0,
+      },
+    ]);
+
+    /*
+     * ── THESE TWO ASSERTED `blocked: 1` AND `degraded: 1`, AND BOTH WERE A
+     *    NUMBER DESCRIBING SOMETHING THAT DID NOT HAPPEN ────────────────────
+     *
+     * The outcome used to be derived from the gate, which refuses NEEDS_RESEAL
+     * under ENFORCE and permits an anonymous run under OBSERVE. Neither is what
+     * this path does: a cache miss here sends the closure to the REAL LOGIN,
+     * which succeeds (`loginOk: true`) and the role is crawled AS THE IDENTITY.
+     * So the brake took nothing away, nothing ran anonymously, nothing was
+     * refused — and an operator reading `blocked` to decide whether arming the
+     * brake would break anything was being shown runs that keep working.
+     *
+     * `SIGNED_IN` in BOTH modes, which is the tell: the mode changes nothing on
+     * this path, and two different numbers for one unchanged behaviour is how
+     * the old derivation announced that it was measuring the wrong thing. The
+     * login having actually run is asserted, not assumed.
+     */
+    const refused = driver(blankProfile({ storageStateNeedsReseal: true }), { loginOk: true });
+    await runRolePasses(refused.deps as never, refused.plan);
+    expect(refused.logins).toEqual(['p_admin']);
+    expect([...refused.tallies.values()]).toEqual([
+      {
+        profileId: 'p_admin',
+        state: 'NEEDS_RESEAL',
+        degraded: 0,
+        blocked: 0,
+        used: 0,
+        signedIn: 1,
+        wouldSeal: 0,
+      },
+    ]);
+
+    const observed = driver(blankProfile({ storageStateNeedsReseal: true }), {
+      mode: 'OBSERVE',
+      loginOk: true,
+    });
+    await runRolePasses(observed.deps as never, observed.plan);
+    expect(observed.logins).toEqual(['p_admin']);
+    expect([...observed.tallies.values()]).toEqual([
+      {
+        profileId: 'p_admin',
+        state: 'NEEDS_RESEAL',
+        degraded: 0,
+        blocked: 0,
+        used: 0,
+        signedIn: 1,
+        wouldSeal: 0,
+      },
+    ]);
+  });
+
+  /*
+   * Rule 11 on the one path that holds a live session in a local. The message
+   * this adapter produces lands on `RoleCrawlAttempt.detail` and is rendered in
+   * the cockpit, so it may name the SOURCE and the STATE and nothing else.
+   */
+  it('never names any part of the session in the message it reports', async () => {
+    const rows: SealedSessionRow[] = [
+      await sealedProfile(),
+      blankProfile({ storageState: SESSION, storageStateExpiresAt: SESSION_NOW }),
+      blankProfile({ storageStateNeedsReseal: true }),
+    ];
+    for (const row of rows) {
+      const answer = await cachedSessionForRole(row, {
+        keys: KEYS,
+        cipher: key,
+        now: SESSION_NOW,
+        mode: 'ENFORCE',
+        tallies: new Map(),
+      });
+      if (answer === null) continue;
+      expect(answer.message).not.toContain(COOKIE);
+      expect(answer.message).not.toContain(row.storageStateSealed ?? 'n/a');
+      expect(answer.message).toMatch(/SEALED|LEGACY_PLAINTEXT/);
+    }
   });
 });

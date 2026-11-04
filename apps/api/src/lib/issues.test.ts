@@ -29,8 +29,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { IssueFilingError, updateIssue } from './issues.js';
-import type { IssueTrackerConfig } from './issues.js';
+import { EGRESS_REFUSAL_SENTENCE, guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo, EgressPolicy } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
+import { IssueFilingError, createIssue, defaultTrackerEgressGuard, updateIssue } from './issues.js';
+import type { IssueTrackerConfig, TrackerEgressGuard } from './issues.js';
 
 const TOKEN = 'ghp_atokenthatmustneverappearanywhere';
 
@@ -258,5 +261,282 @@ describe('updateIssue refuses an empty patch', () => {
       /has to change the title, the body, or both/,
     );
     expect(sent).toEqual([]);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The egress guard on the Jira path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * WHAT THESE PROVE, AND WHY THE OLD CHECK DID NOT.
+ *
+ * `jiraSite` refuses the names it can RECOGNISE — `localhost`, `*.internal`,
+ * `*.svc`, an IP literal, a single label. It decides nothing about where an
+ * ordinary name points, and MEASURED on this tree before the change:
+ * `jiraSite('https://jira.attacker.test/')` returned
+ * `https://jira.attacker.test` and the vault-unsealed Jira credential went
+ * there. `classifyHost('jira.attacker.test')` is
+ * `{kind:'name', internal:false}`, which is not permission — it is the
+ * statement that nothing has been decided.
+ *
+ * So the tests below drive the REAL `guardUrl` with a FAKE resolver. The
+ * decision logic is the shipped one; only DNS, the clock and the sleep are
+ * injected, because a control that cannot be tested with a fake is a control
+ * nobody trusts. NOTHING HERE OPENS A SOCKET OR CONSULTS A RESOLVER.
+ */
+
+/**
+ * A resolver that answers from a table and THROWS on anything else.
+ *
+ * Throwing rather than returning an empty answer is the point: a fake that
+ * quietly resolves an unlisted host is a fake that makes a deleted call site
+ * undetectable, which is how a fix shipped unreachable in an earlier round.
+ */
+function fakeIo(zone: Readonly<Record<string, readonly string[]>>): EgressGuardIo {
+  return {
+    classifyHost: (host) => classifyHost(host),
+    classifyAddress: (address) => classifyAddress(address),
+    lookup: async (host) => {
+      const answers = zone[host];
+      if (answers === undefined) {
+        throw new Error(`fakeIo was asked to resolve ${host}, which this test never declared`);
+      }
+      return answers.map((address) => ({ address }));
+    },
+    now: () => new Date('2026-10-30T00:00:00.000Z'),
+    monotonicMs: () => 0,
+    // The refusal floor is injected away: asserting the pad is `egress-guard`'s
+    // job, and a real 250ms sleep per refusal would cost this file a second.
+    delay: async () => {},
+  };
+}
+
+/** The Jira fixture, repointed at one host. The rest of the config is irrelevant here. */
+function jira2(site: string): IssueTrackerConfig {
+  return { ...(jira as Extract<IssueTrackerConfig, { kind: 'JIRA' }>), site };
+}
+
+/** A guard over the real decision logic and a fake zone. */
+function guardWith(
+  zone: Readonly<Record<string, readonly string[]>>,
+  policy: EgressPolicy = resolveEgressPolicy(undefined),
+): TrackerEgressGuard {
+  const io = fakeIo(zone);
+  return (url) => guardUrl({ url, context: 'TRACKER_CALL', policy, io });
+}
+
+describe('the Jira path resolves its host before it sends the token', () => {
+  it('refuses a public-looking Jira host that resolves to the cloud metadata address', async () => {
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'jira.attacker.test': ['169.254.169.254'] });
+
+    await expect(
+      updateIssue(jira2('https://jira.attacker.test'), TOKEN, 'QA-12', patch, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    // Nothing was sent. "Refused" has to mean the request never happened, not
+    // that it happened and failed — the token is already unsealed by here.
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses a public-looking Jira host that resolves inside an RFC1918 range', async () => {
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'jira.attacker.test': ['10.0.0.5'] });
+
+    await expect(
+      updateIssue(jira2('https://jira.attacker.test'), TOKEN, 'QA-12', patch, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses a split DNS answer with the public record FIRST', async () => {
+    /*
+     * The order is the attack. A positional read of `addresses[0]` lets whoever
+     * runs the zone choose the outcome by record order, and an adversary found
+     * exactly that last round. Both orders must refuse.
+     */
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'jira.attacker.test': ['93.184.216.34', '10.0.0.5'] });
+
+    await expect(
+      updateIssue(jira2('https://jira.attacker.test'), TOKEN, 'QA-12', patch, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses a split DNS answer with the private record FIRST', async () => {
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'jira.attacker.test': ['10.0.0.5', '93.184.216.34'] });
+
+    await expect(
+      updateIssue(jira2('https://jira.attacker.test'), TOKEN, 'QA-12', patch, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    expect(sent).toEqual([]);
+  });
+
+  it('refuses a Jira host that does not resolve at all', async () => {
+    // A name we cannot vouch for is not a name we send a credential to. There
+    // is no reading of a failed lookup that makes the destination safer.
+    stubFetch({ status: 204 });
+    const egress = guardWith({});
+
+    await expect(
+      updateIssue(jira2('https://jira.attacker.test'), TOKEN, 'QA-12', patch, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    expect(sent).toEqual([]);
+  });
+
+  it('still sends to a Jira site that resolves publicly — the product keeps working', async () => {
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'acme.atlassian.net': ['93.184.216.34'] });
+
+    await updateIssue(jira, TOKEN, 'QA-12', patch, egress);
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.url).toBe('https://acme.atlassian.net/rest/api/2/issue/QA-12');
+    expect(sent[0]!.method).toBe('PUT');
+  });
+
+  it('guards the CREATE path too, not only the edit', async () => {
+    /*
+     * Both Jira requests go through one `sendToJira`, so a fourth caller cannot
+     * forget the guard. If the create path were ever given its own `sendJson`
+     * call, this is the test that notices.
+     */
+    stubFetch({ status: 201, body: { key: 'QA-13' } });
+    const egress = guardWith({ 'jira.attacker.test': ['169.254.169.254'] });
+
+    await expect(
+      createIssue(jira2('https://jira.attacker.test'), TOKEN, { title: 't', body: 'b' }, egress),
+    ).rejects.toBeInstanceOf(IssueFilingError);
+    expect(sent).toEqual([]);
+  });
+
+  it('says the SAME sentence whatever the reason, so it is not a port scanner', async () => {
+    /*
+     * "that is a link-local address" / "that host did not resolve" / "that host
+     * resolves inside a private range" are three different facts about the
+     * inside of a network, handed to whoever can edit the integration row. One
+     * constant means one answer.
+     */
+    stubFetch({ status: 204 });
+    const reasons: Array<Record<string, readonly string[]>> = [
+      { 'jira.attacker.test': ['169.254.169.254'] },
+      { 'jira.attacker.test': ['10.0.0.5'] },
+      { 'jira.attacker.test': ['127.0.0.1'] },
+      { 'jira.attacker.test': [] },
+      {},
+    ];
+    const messages = new Set<string>();
+    for (const zone of reasons) {
+      await updateIssue(
+        jira2('https://jira.attacker.test'),
+        TOKEN,
+        'QA-12',
+        patch,
+        guardWith(zone),
+      ).catch((err: unknown) => {
+        messages.add(err instanceof Error ? err.message : String(err));
+      });
+    }
+    expect(messages).toEqual(new Set([EGRESS_REFUSAL_SENTENCE]));
+  });
+
+  it('never puts any part of the token in the refusal', async () => {
+    stubFetch({ status: 204 });
+    const egress = guardWith({ 'jira.attacker.test': ['10.0.0.5'] });
+
+    const err = await updateIssue(
+      jira2('https://jira.attacker.test'),
+      TOKEN,
+      'QA-12',
+      patch,
+      egress,
+    ).catch((caught: unknown) => caught);
+
+    const text = err instanceof Error ? `${err.message}${err.stack ?? ''}` : String(err);
+    expect(text).not.toContain(TOKEN);
+    // Not truncated either: a prefix of a credential is still a credential.
+    expect(text).not.toContain(TOKEN.slice(0, 8));
+  });
+
+  it('leaves GitHub and Linear unguarded, because their host is a compile-time constant', async () => {
+    /*
+     * The guard is applied where the attack surface is. `API_HOST` cannot be
+     * influenced by config, so resolving it would buy nothing and would put a
+     * real resolver into every test that files a GitHub issue. The fake throws
+     * on any host it was not given, so a guard call on these paths would fail
+     * this test loudly rather than silently.
+     */
+    stubFetch({ status: 200, body: { number: 7 } });
+    const egress = guardWith({});
+
+    await updateIssue(github, TOKEN, 'acme/storefront#7', patch, egress);
+    expect(sent[0]!.url).toBe('https://api.github.com/repos/acme/storefront/issues/7');
+  });
+});
+
+describe('defaultTrackerEgressGuard — the guard production actually gets', () => {
+  /*
+   * IP LITERALS ONLY in this block, deliberately: `classifyHost` answers
+   * `kind: 'address'` for a literal and `decideEgress` consults no resolver at
+   * all, so these exercise the REAL default guard — the real policy, the real
+   * classifier, the real `node:dns` import — with NO DNS QUERY and no socket.
+   */
+  it('refuses the cloud metadata address with no policy configured', async () => {
+    const guard = await defaultTrackerEgressGuard();
+    const verdict = await guard('https://169.254.169.254/rest/api/2/issue');
+    expect(verdict.ok).toBe(false);
+  });
+
+  it('refuses an RFC1918 address with no policy configured — HOSTED is the fallback', async () => {
+    // An absent policy must be the STRICTEST reading and not an open one.
+    const guard = await defaultTrackerEgressGuard();
+    expect((await guard('https://10.0.0.5/x')).ok).toBe(false);
+    expect((await guard('https://127.0.0.1/x')).ok).toBe(false);
+  });
+
+  it('refuses a private address even when the stored policy says SELF_HOSTED', async () => {
+    /*
+     * TRACKER_CALL has `allowlistApplies: false` and
+     * `targetsApplicationUnderTest: false`. There is no deployment in which
+     * calling an issue tracker legitimately reaches a private address, so
+     * neither a permissive deployment mode nor an allowlist entry widens it —
+     * "add your internal host to the allowlist" would be advice to build an
+     * SSRF with paperwork.
+     */
+    const guard = await defaultTrackerEgressGuard({
+      deployment: 'SELF_HOSTED',
+      permittedClasses: ['public', 'private', 'loopback', 'reserved'],
+      allowlist: [
+        {
+          host: '10.0.0.5',
+          contexts: ['TRACKER_CALL'],
+          ownerEmail: 'someone@acme.test',
+          reason: 'our internal Jira',
+          expiresAt: null,
+        },
+      ],
+    });
+    expect((await guard('https://10.0.0.5/x')).ok).toBe(false);
+  });
+
+  it('permits a public address, so a real Jira Cloud site is reachable', async () => {
+    const guard = await defaultTrackerEgressGuard();
+    expect((await guard('https://93.184.216.34/x')).ok).toBe(true);
+  });
+
+  it('refuses an octal-spelt loopback literal rather than handing it to a resolver', async () => {
+    // `0177.0.0.1` is 127.0.0.1 to something downstream, and a resolver would
+    // give the octal form a second chance.
+    const guard = await defaultTrackerEgressGuard();
+    expect((await guard('https://0177.0.0.1/x')).ok).toBe(false);
+  });
+
+  it('refuses a URL carrying userinfo before it looks at the host at all', async () => {
+    // `https://acme.atlassian.net@10.0.0.1/` reads as a trusted host to a human
+    // and to every log line, and the parser correctly calls the host 10.0.0.1.
+    const guard = await defaultTrackerEgressGuard();
+    expect((await guard('https://acme.atlassian.net@93.184.216.34/x')).ok).toBe(false);
   });
 });

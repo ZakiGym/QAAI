@@ -32,7 +32,8 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { AUTH_PROFILE_KINDS, SECRET_MASK } from '@qaai/shared';
+import { AUTH_PROFILE_KINDS, guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import {
   AUTH_CAPABILITIES,
   AUTH_PROFILE_CONFIG_SCHEMAS,
@@ -58,6 +59,7 @@ import {
 } from './login.js';
 import type {
   LoginBrowser,
+  LoginEgressGuard,
   LoginNavigation,
   LoginResult,
   LoginStorageState,
@@ -202,8 +204,54 @@ function fakeClock(startMs = 0) {
   };
 }
 
+/**
+ * A permissive egress guard, for the tests that are not about egress.
+ *
+ * `openBrowser` wraps every login browser in `guardLoginBrowser`, and a
+ * `LoginSurfaces` with no `egress` falls back to a guard that REFUSES
+ * EVERYTHING — deliberately, because the alternative is an unguarded login that
+ * looks exactly like a guarded one. These tests build `surfaces` by hand, so
+ * they got that fallback and every navigation and every `fill` refused; the
+ * forty failures were the control working, not a regression.
+ *
+ * So the default here says yes, and the tests that are ABOUT egress
+ * (`login.egress.test.ts`) pass their own guard and assert the refusals. This
+ * is the same split as `crawler.test.ts`'s `allowEverythingGate`.
+ *
+ * ── WHY IT IS THE REAL GUARD AND NOT `async () => ({ ok: true })` ──────────
+ *
+ * It WAS that, and that is what hid the defect fixed on 2026-10-30: a verdict
+ * carries the PERMIT with the addresses the guard pinned, `guardLoginBrowser`
+ * now refuses to type a credential at a host it holds no pin for, and a fixture
+ * that answered `{ ok: true }` with no permit would simply have turned the new
+ * control off for every test in this file — the loudest possible version of
+ * rule 9's trap, where the fake is wider than the thing it stands for.
+ *
+ * So it is `guardUrl` with the real classifiers over an INJECTED resolver that
+ * answers a public documentation address for every name. No DNS, no network;
+ * `classifyHost` and `classifyAddress` are pure.
+ */
+const ALLOW_ALL_EGRESS: LoginEgressGuard = (() => {
+  const policy = resolveEgressPolicy(undefined);
+  const io = {
+    classifyHost,
+    classifyAddress,
+    // `93.184.216.34` is a documentation address and classifies `public`, which
+    // the HOSTED policy permits. Every name gets it, so no test in this file
+    // turns on which host it chose.
+    lookup: async (_host: string) => [{ address: '93.184.216.34' }],
+    now: () => new Date('2026-10-30T00:00:00.000Z'),
+    monotonicMs: () => 0,
+    delay: async () => {},
+  };
+  return async (url: string) => {
+    const verdict = await guardUrl({ url, context: 'LOGIN', policy, io });
+    return verdict.ok ? { ok: true, permit: verdict.permit } : { ok: false, permit: null };
+  };
+})();
+
 function surfacesWith(browser: LoginBrowser, over: LoginSurfaces = {}): LoginSurfaces {
-  return { browser: async () => browser, ...over };
+  return { browser: async () => browser, egress: ALLOW_ALL_EGRESS, ...over };
 }
 
 /** RFC 6238's own seed: ASCII "12345678901234567890" in base32. */
@@ -1155,12 +1203,26 @@ describe('capturing the session', () => {
 // ─── Secrets never come back out ─────────────────────────────────────────────
 
 describe('nothing a login touches gets into the result', () => {
-  it('masks a page title that echoes a credential', async () => {
+  it('NEVER PUTS THE PAGE TITLE IN THE MESSAGE AT ALL, masked or not', async () => {
     /*
-     * The chokepoint, not the convention. Nothing in login.ts deliberately puts
-     * a secret in a message; this is the line that catches the time somebody
-     * does, and an application that renders the submitted email in its title is
-     * ordinary.
+     * THIS TEST USED TO ASSERT THE TITLE WAS MASKED. It asserted
+     * `message).toContain(SECRET_MASK)`, and it passed because three failure
+     * paths appended `(page title: "…")` and the masker scrubbed the credential
+     * out of it. The masking worked. The echo was the defect.
+     *
+     * A page title is a fact about a page INSIDE THE NETWORK, and the login
+     * drives a browser to a URL off a profile row any MEMBER can edit. Echoing
+     * the title back made a deliberately-failed login into a read primitive:
+     * the response carried the `<title>` of whatever answered — `Grafana`,
+     * `phpMyAdmin`, the name of an internal tool. Masking a credential out of
+     * that string never addressed it, because the leak was not the credential;
+     * it was the title.
+     *
+     * So the assertion is now the stronger one: NO PART of the title reaches
+     * the message, and there is nothing to mask because nothing is read. The
+     * masker's own chokepoint is still tested by the next case, which quotes
+     * what was typed through a driver error — that path is a real one and the
+     * mask is the right answer there.
      */
     const result = await performFormLogin(
       formConfig(),
@@ -1172,7 +1234,54 @@ describe('nothing a login touches gets into the result', () => {
     expect(result.ok).toBe(false);
     expect(result.message).not.toContain('ada@example.com');
     expect(result.message).not.toContain('correct-horse');
-    expect(result.message).toContain(SECRET_MASK);
+    // The non-secret half of the title is the SSRF leak, and it is gone too.
+    expect(result.message).not.toContain('Welcome back');
+    expect(result.message).not.toContain('page title');
+  });
+
+  it('never returns the title from a DRIVER failure either — all three paths', async () => {
+    /*
+     * THERE WERE THREE ECHOES, AND MUTATION TESTING CAUGHT THAT ONLY ONE WAS
+     * COVERED. The test above drives `confirm()`'s REJECTED path. Restoring the
+     * echo in `drive()` — the arm taken when a fill or click reports failure —
+     * turned NO test red, because nothing exercised it with a title set.
+     *
+     * `broken: ['#username']` makes `fill` report failure, which is the
+     * `drive()` arm. The third echo was the TOTP code-field path and is covered
+     * by the case after this one.
+     */
+    const result = await performFormLogin(
+      formConfig(),
+      { u: 'ada@example.com', p: 'correct-horse' },
+      BASE,
+      surfacesWith(
+        fakeBrowser({
+          title: 'Welcome back ada@example.com — correct-horse',
+          broken: ['#username'],
+        }),
+      ),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.failure?.kind).toBe('DRIVER_ERROR');
+    expect(result.message).not.toContain('Welcome back');
+    expect(result.message).not.toContain('page title');
+    expect(result.message).not.toContain('ada@example.com');
+  });
+
+  it('never returns the title when the TOTP code field never appears', async () => {
+    // The third of the three echoes. `visible: ['#home']` is absent and the
+    // code selector never shows, which is the TOTP_MFA REJECTED arm.
+    const result = await performTotpMfaLogin(
+      { ...formConfig(), seedSecretName: 'seed', codeSelector: '#code' },
+      { u: 'ada', p: 'pw', seed: RFC_SEED },
+      BASE,
+      surfacesWith(fakeBrowser({ title: 'Grafana — Internal Metrics' })),
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.message).not.toContain('Grafana');
+    expect(result.message).not.toContain('page title');
   });
 
   it('masks a driver error that quotes what was typed', async () => {

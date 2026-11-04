@@ -81,6 +81,52 @@ import {
   pairMessage,
 } from './constants';
 /*
+ * The security vocabularies, imported and not restated — the same argument as
+ * every other vocabulary import in this file, and the stakes are different in
+ * kind. A `z.enum(['OBSERVE','ENFORCE'])` written out here would be a second
+ * copy of a rollout brake, and the first thing a second copy of a brake does is
+ * disagree with the one the code reads — at which point a control reports that
+ * it is enforcing and is not.
+ *
+ * `SECRET_SCOPE_RULES`, `ROLE_RANK`, `EGRESS_CONTEXT_RULES` and `parseEnvelope`
+ * are imported as VALUES and not merely as lists, for the reason the matrix
+ * import below records: a refinement that re-implemented "which scopes need a
+ * reason", "does this actor outrank that one" or "is this a readable envelope"
+ * would be a second opinion about the same fact, and a second opinion about an
+ * authorization rule is a privilege-escalation waiting for the two to diverge.
+ */
+import {
+  API_KEY_SCOPES,
+  CONTROL_MODES,
+  EGRESS_DEPLOYMENT_MODES,
+  LOGIN_ATTEMPT_OUTCOMES,
+  ROLE_RANK,
+  SECRET_SCOPE_KINDS,
+  SECRET_SCOPE_RULES,
+  SECURITY_CONTROLS,
+  SESSION_REVOCATION_REASONS,
+  VERIFICATION_TOKEN_PURPOSES,
+} from './constants';
+import {
+  EGRESS_CONTEXTS,
+  EGRESS_CONTEXT_RULES,
+  EGRESS_OUTCOMES,
+  EGRESS_REFUSALS,
+  NEVER_PERMITTED_BY_DEFAULT,
+} from './egress';
+import {
+  KEY_ROTATION_STATES,
+  SEALED_FIELD_KEYS,
+  SEAL_ALGORITHMS,
+  SEAL_REFUSALS,
+  VAULT_KEY_PROVIDERS,
+  VAULT_KEY_STATES,
+  parseEnvelope,
+} from './sealed';
+import type { VaultKeyRef } from './sealed';
+import type { EgressPolicy } from './egress';
+import type { HostClass } from './private-address';
+/*
  * The matrix and declaration vocabularies, imported and not restated — the same
  * argument as the surface and ladder imports below, and sharpest here because
  * `z.enum(['chromium', 'firefox', 'webkit'])` written out in this file WAS the
@@ -284,11 +330,43 @@ const slug = z
   .max(48)
   .regex(/^[a-z0-9][a-z0-9-]*[a-z0-9]$/, 'lowercase letters, digits and dashes only');
 
-/** Rejects non-http(s) schemes so a base URL can never become file:// or javascript:. */
+/**
+ * Rejects non-http(s) schemes so a base URL can never become file:// or javascript:.
+ *
+ * ── WHY `new URL()` IS WRAPPED, AND WHY THAT IS NOT DEFENSIVE PADDING ──────
+ *
+ * `z.string().url()` validates by PATTERN and `new URL()` validates by the
+ * WHATWG parser, and the two disagree. Zod v4 does not short-circuit: a failed
+ * check does not stop the refinements after it from running. So for a string
+ * the pattern accepts and the parser rejects, this refinement used to THROW —
+ * out of `safeParse`, which is the one function whose contract is that it does
+ * not throw.
+ *
+ * MEASURED at HEAD 1544943 on Node v25.6.1: `createEnvironmentSchema.safeParse({
+ * …, baseUrl: 'http://[::1%25lo0]/' })` threw `TypeError: Invalid URL` from this
+ * line, and the real `POST /projects/:id/environments` answered 500 instead of
+ * 400 — so an attacker-chosen host turned a validation refusal into an
+ * unhandled exception, and a 500 beside a 400 is a response an attacker can
+ * tell apart. `createRunSchema` (`baseUrlOverride`) and `createProjectSchema`
+ * (`repoUrl`) threw on the same input, as does every other field built on this
+ * one.
+ *
+ * Returning FALSE is the only safe reading and it cannot widen anything: a
+ * string the parser refuses was never ACCEPTED before this change, it was a
+ * 500. The refusal now travels as a refusal.
+ */
 const httpUrl = z
   .string()
   .url()
-  .refine((u) => ['http:', 'https:'].includes(new URL(u).protocol), 'must be http or https');
+  .refine((u) => {
+    let parsed: URL;
+    try {
+      parsed = new URL(u);
+    } catch {
+      return false;
+    }
+    return ['http:', 'https:'].includes(parsed.protocol);
+  }, 'must be http or https');
 
 /**
  * A git branch name — no spaces, no leading dash, no `..`, no path tricks.
@@ -476,10 +554,62 @@ export const updateProjectSchema = z
  */
 export const runnerPoolName = z.string().trim().min(1).max(64);
 
+/**
+ * WHERE A BROWSER INSIDE QAAI'S NETWORK IS POINTED, on a caller's say-so.
+ *
+ * ── WHAT THIS FIELD WAS VALIDATED BY, AND WHAT THAT LEFT OPEN ──────────────
+ *
+ * `httpUrl` and nothing else: `z.string().url()` plus an http/https protocol
+ * check. So an environment could be created with
+ * `http://169.254.169.254/latest/meta-data/` or `http://localhost:5432` or
+ * `https://user:pass@internal.corp/`, and a MEMBER's FORM_LOGIN profile would
+ * then drive a real browser at it and TYPE VAULT PLAINTEXT into whatever
+ * answered, with the crawl's progress events reporting what it found.
+ *
+ * Meanwhile `baseUrlOverride` in `createRunSchema` below — the PER-RUN version
+ * of the same field, added later — has carried `.max(2048)` and a userinfo
+ * refusal since it was written. The stored field was the weaker of the two, and
+ * it is the one that persists, gets read by every reporter and is handed to the
+ * runner on every nightly run.
+ *
+ * ── THE DIVISION OF LABOUR, WHICH IS THE HOUSE'S AND NOT NEW ───────────────
+ *
+ *   HERE: the SYNTAX. http(s) only, a length bound, and NO USERINFO — a URL
+ *   carrying `user:pass@` is stored, logged by the worker, printed in a report
+ *   and handed to the runner, which is the one place a credential is guaranteed
+ *   to be written down. Exactly the three checks `baseUrlOverride` already
+ *   makes, so the two fields stop disagreeing.
+ *
+ *   NOT HERE: the ADDRESS CLASS. `classifyHost` lives in
+ *   packages/shared/src/private-address.ts, which imports `node:dns`, and this
+ *   file is re-exported from the package barrel that the web app's bundler
+ *   consumes — so a value import of it here would break the web build, a hazard
+ *   `scripts/check-wiring.ts` writes down. The class check therefore runs at the
+ *   route (`apps/api/src/routes/projects.ts`), which is where
+ *   `apps/api/src/routes/api-surface.ts` and `routes/runs.ts` already do theirs,
+ *   and it runs against {@link egressPolicySchema}. {@link baseUrlEgressProblem}
+ *   below is the function it calls, so the POLICY is not re-implemented at the
+ *   route either.
+ *
+ * THIS SCHEMA MUST NOT BE DESCRIBED AS HAVING CHECKED THE ADDRESS. It has not.
+ */
+const environmentBaseUrl = httpUrl.max(2048).refine((value) => {
+  // Wrapped for the reason spelled out on `httpUrl`: zod v4 runs this
+  // refinement even when `.url()` above has already failed, so an unwrapped
+  // `new URL()` here turns a 400 into a 500 on an attacker-chosen host.
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return parsed.username === '' && parsed.password === '';
+}, 'must not carry a username or password');
+
 export const createEnvironmentSchema = z.object({
   name: z.string().min(1).max(60),
   kind: z.enum(ENVIRONMENT_KINDS),
-  baseUrl: httpUrl,
+  baseUrl: environmentBaseUrl,
   /**
    * Execute this environment's runs on the customer's own agents instead of
    * QAAI's workers (ENTERPRISE). Null — the default — means the cloud pool.
@@ -496,7 +626,9 @@ export const createEnvironmentSchema = z.object({
 export const updateEnvironmentSchema = z
   .object({
     name: z.string().min(1).max(60).optional(),
-    baseUrl: httpUrl.optional(),
+    /** See `environmentBaseUrl`: the same three syntax checks, because a PATCH
+     *  that bypassed them would make the create path's rule decorative. */
+    baseUrl: environmentBaseUrl.optional(),
     /** See createEnvironmentSchema. `null` moves the environment back to the cloud pool. */
     runnerPool: runnerPoolName.nullish(),
   })
@@ -3079,7 +3211,13 @@ export const createRunSchema = z.object({
   baseUrlOverride: httpUrl
     .max(2048)
     .refine((u) => {
-      const parsed = new URL(u);
+      // Wrapped for the reason spelled out on `httpUrl`. Same input, same 500.
+      let parsed: URL;
+      try {
+        parsed = new URL(u);
+      } catch {
+        return false;
+      }
       return parsed.username === '' && parsed.password === '';
     }, 'must not carry a username or password')
     .nullish(),
@@ -8300,3 +8438,671 @@ export const cliRunOptionsSchema = z
       });
     }
   });
+
+// ─── The security controls — the write paths (§1) ────────────────────────────
+//
+// The RUN-TIME half of each parity guard. Every schema below is
+// `z.enum(SAME_ARRAY)`, so its `.options` is DERIVED from the list and the two
+// CANNOT disagree — said plainly rather than dressed up as a guard, which is
+// the mistake a previous round made. What the derivation buys is the OTHER
+// direction: a member added to the list is instantly storable through this
+// file, so the `GateRule` defect (eight kinds storable nowhere for two slices)
+// cannot recur for these.
+//
+// The parity that is real for these lists is schema.prisma ⇄ TypeScript, which
+// `apps/api/scripts/check-enums.ts` performs and
+// `apps/api/scripts/check-enums.security.test.ts` proves it NAMES.
+
+export const controlModeSchema = z.enum(CONTROL_MODES);
+export const securityControlSchema = z.enum(SECURITY_CONTROLS);
+export const egressDeploymentModeSchema = z.enum(EGRESS_DEPLOYMENT_MODES);
+export const egressContextSchema = z.enum(EGRESS_CONTEXTS);
+export const egressOutcomeSchema = z.enum(EGRESS_OUTCOMES);
+export const egressRefusalSchema = z.enum(EGRESS_REFUSALS);
+export const vaultKeyStateSchema = z.enum(VAULT_KEY_STATES);
+export const vaultKeyProviderSchema = z.enum(VAULT_KEY_PROVIDERS);
+export const keyRotationStateSchema = z.enum(KEY_ROTATION_STATES);
+export const sealAlgorithmSchema = z.enum(SEAL_ALGORITHMS);
+export const sealRefusalSchema = z.enum(SEAL_REFUSALS);
+export const sealedFieldKeySchema = z.enum(SEALED_FIELD_KEYS);
+export const secretScopeKindSchema = z.enum(SECRET_SCOPE_KINDS);
+export const loginAttemptOutcomeSchema = z.enum(LOGIN_ATTEMPT_OUTCOMES);
+export const sessionRevocationReasonSchema = z.enum(SESSION_REVOCATION_REASONS);
+export const verificationTokenPurposeSchema = z.enum(VERIFICATION_TOKEN_PURPOSES);
+export const apiKeyScopeSchema = z.enum(API_KEY_SCOPES);
+
+/**
+ * ONE EGRESS ALLOWLIST ENTRY — the self-hosted customer's legitimate escape.
+ *
+ * REFUSES AN ENTRY WITH NO OWNER AND NO REASON, which is the whole point of the
+ * schema. An allowlist entry is a permanent hole in the one control standing
+ * between a customer-supplied string and our own network, and an entry nobody
+ * owns is an entry nobody will ever remove — the same failure that produced
+ * five suppression mechanisms whose expiries nobody set.
+ *
+ * AN EMPTY `contexts` ARRAY MEANS NOTHING, NEVER EVERYTHING. It is refused
+ * outright, because the alternative reading is the API-key scope defect
+ * (`apps/api/src/middleware/auth.ts` reads an empty scope array as the
+ * wildcard) transplanted into the egress control, where it would turn the
+ * narrowest-looking entry into the broadest.
+ *
+ * The HOST is matched exactly and is normalised here — lower-cased, trailing
+ * dots stripped — because `localhost.` resolves exactly like `localhost` and an
+ * entry stored in one spelling would never match a host classified in the
+ * other. Normalising at the door rather than at each comparison is the same
+ * decision `normalizeHost` records.
+ */
+export const egressAllowlistEntrySchema = z
+  .object({
+    host: z
+      .string()
+      .trim()
+      .min(1)
+      .max(253)
+      .transform((value) => value.toLowerCase().replace(/\.+$/, ''))
+      .refine(
+        (value) => /^[a-z0-9._:[\]-]+$/.test(value),
+        'is not a host QAAI can read; allowlist a host, never a URL or a pattern',
+      )
+      .refine(
+        (value) => !value.includes('*'),
+        'may not be a wildcard: a pattern over a namespace somebody else can register names in is not an allowlist',
+      ),
+    contexts: z
+      .array(egressContextSchema)
+      .min(1, 'name at least one context; an empty list would otherwise have to mean every context')
+      .max(EGRESS_CONTEXTS.length),
+    ownerEmail: z.string().email().max(254),
+    reason: z.string().trim().min(10, 'say why this host is reachable on purpose').max(500),
+    /** Null is legal here, unlike a suppression. See `EgressAllowlistEntry`. */
+    expiresAt: z.coerce.date().nullable(),
+  })
+  .superRefine((value, ctx) => {
+    /*
+     * A third-party context may never be widened. An operator who allowlists an
+     * internal host for webhook delivery or SSO metadata has built an SSRF with
+     * paperwork, and the paperwork is the part that makes it survive review.
+     * Refused here as well as in `decideEgress`, because a stored entry that can
+     * never take effect is a hole somebody believes they have.
+     */
+    for (const [index, context] of value.contexts.entries()) {
+      if (!EGRESS_CONTEXT_RULES[context].allowlistApplies) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['contexts', index],
+          message:
+            'this context aims at a third party on the internet, so it may never be widened to ' +
+            'reach a private address — not in any deployment',
+        });
+      }
+    }
+  });
+
+/**
+ * THE STORED EGRESS POLICY for one environment.
+ *
+ * `permittedClasses` is validated but deliberately NOT trusted as the final
+ * word: `resolveEgressPolicy` in egress.ts intersects it with the deployment
+ * mode's base list, so a row that names `link-local` does not get it. Two
+ * places, and that is not redundancy — this one refuses it at the door with a
+ * path a form can highlight, and that one refuses it for the rows already in
+ * the database before this schema existed.
+ */
+export const egressPolicySchema = z
+  .object({
+    deployment: egressDeploymentModeSchema,
+    mode: controlModeSchema,
+    permittedClasses: z
+      .array(
+        z.enum([
+          'public',
+          'loopback',
+          'link-local',
+          'private',
+          'multicast',
+          'reserved',
+          'unspecified',
+          'unparseable',
+        ]),
+      )
+      .min(1, 'permit at least one class; an empty list is an unresolved policy, not a locked-down one'),
+    allowlist: z.array(egressAllowlistEntrySchema).max(500),
+  })
+  .superRefine((value, ctx) => {
+    for (const [index, cls] of value.permittedClasses.entries()) {
+      if (NEVER_PERMITTED_BY_DEFAULT.includes(cls)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['permittedClasses', index],
+          message:
+            'no deployment permits this class by default — the cloud metadata service lives in ' +
+            'one of them, and an ambiguous literal is in another. Use an allowlist entry, which ' +
+            'has an owner and a reason',
+        });
+      }
+    }
+  });
+
+/**
+ * WHICH CONTROLS THIS ORGANISATION HAS ARMED. Stored on
+ * `Organization.securityControlModes`.
+ *
+ * `z.partialRecord` AND NOT `z.record`, and the difference is load-bearing: in
+ * zod 4 a `z.record` over an enum is EXHAUSTIVE — it demands every member — so
+ * it would have refused `{ EGRESS_CLASSIFICATION: 'OBSERVE' }`, which is the
+ * normal shape of this column, and the only way to satisfy it would be a
+ * fourteen-key object written on every save.
+ *
+ * Partial on purpose, beyond that: an absent control falls back to
+ * `SECURITY_CONTROL_BRAKES[control].fallback`, which is ENFORCE for ten of the
+ * thirteen. A full record would mean a fourteenth control could not be added
+ * without a write over every org row, and it would make the absent case — the
+ * one every existing org is in — unexpressible.
+ *
+ * An UNKNOWN control key is still refused, which is the half that matters: a
+ * stored key no reader can name is a brake somebody believes they have set.
+ */
+export const securityControlModesSchema = z.partialRecord(
+  securityControlSchema,
+  controlModeSchema,
+);
+
+/**
+ * CHECKING A SEALED VALUE ON ITS WAY IN.
+ *
+ * A FACTORY and not a constant, because "is this key version one we have" is a
+ * fact about the DEPLOYMENT and not about the string: a schema that could
+ * answer it from the value alone would be a schema that cannot answer it at
+ * all. The caller passes the key rows it read.
+ *
+ * REFUSES AN UNKNOWN KEY VERSION rather than storing it, which is the
+ * fail-closed direction and the one that matters: a row written under a version
+ * this deployment cannot name is a row nothing will ever open and nothing will
+ * ever report, because the only symptom is a decrypt failure months later.
+ *
+ * The messages name the REFUSAL and the VERSION (an integer) and never a byte
+ * of the payload — an error about a secret must be reportable without quoting
+ * any part of it.
+ */
+export function sealedValueSchema(keys: readonly VaultKeyRef[]) {
+  return z
+    .object({
+      fieldKey: sealedFieldKeySchema,
+      rowId: z.string().min(1).max(64),
+      /** The serialised envelope. Never logged; see `SealedEnvelope.payload`. */
+      sealed: z.string().min(1).max(1_000_000),
+      /** The denormalised integer column. Checked against the envelope, not trusted. */
+      keyVersion: z.number().int().positive(),
+    })
+    .superRefine((value, ctx) => {
+      const parsed = parseEnvelope(value.sealed);
+      if (!parsed.ok) {
+        ctx.addIssue({ code: 'custom', path: ['sealed'], message: parsed.detail });
+        return;
+      }
+      if (parsed.value.keyVersion !== value.keyVersion) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['keyVersion'],
+          message:
+            `the envelope is sealed under key version ${parsed.value.keyVersion} and this column ` +
+            `says ${value.keyVersion}. A row whose column is ahead of its envelope is a row a ` +
+            'rotation sweep will skip and a retired key will keep opening',
+        });
+        return;
+      }
+      if (!keys.some((key) => key.version === parsed.value.keyVersion)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['keyVersion'],
+          message:
+            `no vault key in this deployment has version ${parsed.value.keyVersion}, so this ` +
+            'value could never be opened again. It is refused rather than stored',
+        });
+      }
+    });
+}
+
+/**
+ * CREATING AN API KEY.
+ *
+ * ── THE DEFECT THIS SCHEMA EXISTS TO CLOSE ─────────────────────────────────
+ *
+ * `apps/api/src/middleware/auth.ts` reads
+ * `scopes: key.scopes.length > 0 ? key.scopes : ['*']`, so AN EMPTY SCOPE ARRAY
+ * IS A WILDCARD. And `POST /settings/api-keys` hand-parses `req.body.scopes`
+ * with no schema and no vocabulary at all, so "create a restricted key" and
+ * "create a key with no restrictions" are the same request with a different
+ * body — and the restrictive-looking one is the unrestricted one.
+ *
+ * HERE AN EMPTY ARRAY MEANS NOTHING, and it is refused rather than silently
+ * meaning nothing, because a key that authorises no request is not a thing
+ * anybody wants either. `'*'` is refused by the vocabulary: it is the sentinel
+ * `requireScope` hands a SESSION actor, who is a human with a role, and a key
+ * able to name it is the empty array with extra steps.
+ *
+ * `expiresAt` is REQUIRED AND NULLABLE, which is not the same as optional. An
+ * API key with no expiry is a defensible choice for a CI token somebody
+ * rotates by hand; an API key whose creator never considered the question is
+ * how a key from 2019 is still in a pipeline. `null` is the considered answer
+ * and `undefined` is not available.
+ */
+export const createApiKeySchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  scopes: z
+    .array(apiKeyScopeSchema)
+    .min(
+      1,
+      'name at least one scope. An empty list means NO scopes — it is not a shorthand for all of ' +
+        'them, whatever the middleware has been doing',
+    )
+    .max(API_KEY_SCOPES.length)
+    .refine(
+      (scopes) => new Set(scopes).size === scopes.length,
+      'lists a scope twice; a duplicate is a sign the caller is assembling this list from two places',
+    ),
+  expiresAt: z.coerce.date().nullable(),
+});
+
+/**
+ * ROTATING AN API KEY — minting the replacement while the old one still works.
+ *
+ * `graceMinutes` is the window in which BOTH keys authorise, which is what
+ * makes rotation possible for a customer who cannot redeploy every pipeline at
+ * the same instant. Bounded at a week: a grace window nobody closes is two live
+ * keys, which is the state rotation was supposed to end.
+ */
+export const rotateApiKeySchema = z.object({
+  graceMinutes: z.number().int().min(0).max(60 * 24 * 7).default(0),
+  /** Carried over from the key being replaced unless the caller narrows it. */
+  scopes: z.array(apiKeyScopeSchema).min(1).max(API_KEY_SCOPES.length).optional(),
+});
+
+/**
+ * CHANGING SOMEBODY'S ROLE.
+ *
+ * ── THE DEFECT ─────────────────────────────────────────────────────────────
+ *
+ * `requireRole('ADMIN')` guards the member-update route and nothing compares
+ * the actor against the TARGET, so AN ADMIN CAN DEMOTE AN OWNER — and, having
+ * done so, is the most senior member left. That is a privilege escalation
+ * reachable from a settings screen with two clicks.
+ *
+ * ── THE RULE, AND WHY IT IS STRICTLY-EXCEEDS ───────────────────────────────
+ *
+ * The actor's rank must be STRICTLY GREATER than the target's CURRENT rank and
+ * than the role being assigned. Strictly, not "at least": an ADMIN demoting
+ * another ADMIN is lateral and an OWNER demoting another OWNER removes the only
+ * check on either of them, and both are the sort of thing that should require
+ * the rank above. The one deliberate consequence is that a sole OWNER cannot
+ * be demoted by anybody, which is correct — an organisation with no OWNER has
+ * nobody who can grant one.
+ *
+ * `ROLE_RANK` is imported rather than re-implemented. A second opinion about
+ * who outranks whom is a privilege escalation waiting for the two to diverge.
+ */
+export const roleChangeSchema = z
+  .object({
+    /** The role of the person making the change, from the session — never from the body. */
+    actorRole: z.enum(ORG_ROLES),
+    /** The target's role as stored RIGHT NOW. Read inside the same transaction as the write. */
+    targetCurrentRole: z.enum(ORG_ROLES),
+    nextRole: z.enum(ORG_ROLES),
+    /** Refuses the degenerate case ahead of the rank rule, so the message is the useful one. */
+    actorIsTarget: z.boolean(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.actorIsTarget) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['nextRole'],
+        message:
+          'nobody may change their own role. A self-promotion needs a second person, and a ' +
+          'self-demotion by a sole OWNER leaves an organisation nobody can administer',
+      });
+      return;
+    }
+    const actor = ROLE_RANK[value.actorRole];
+    if (actor <= ROLE_RANK[value.targetCurrentRole]) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['targetCurrentRole'],
+        message:
+          'the actor does not outrank this member, so may not change their role. An ADMIN ' +
+          'demoting an OWNER is a privilege escalation, not an administrative action',
+      });
+    }
+    if (actor <= ROLE_RANK[value.nextRole]) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['nextRole'],
+        message:
+          'the actor may not grant a role at or above their own. Granting equal rank is how one ' +
+          'compromised account becomes two',
+      });
+    }
+  });
+
+/**
+ * ENROLLING IN TOTP, AND CONFIRMING THE ENROLMENT.
+ *
+ * ── THE DEFECT, WHICH IS THE MOST SERIOUS ONE IN THIS ROUND ────────────────
+ *
+ * `apps/api/src/routes/auth.ts` reads
+ * `if (user.totpEnabledAt && !input.totpCode) throw` — and then NEVER LOOKS AT
+ * THE CODE AGAIN. Presence is checked; the value is not. A second factor is
+ * present and a second factor is unverified, which is worse than none, because
+ * it is the one the customer believes in.
+ *
+ * ── WHY `confirmed` CANNOT BE SET WITHOUT A CODE ───────────────────────────
+ *
+ * Enrolment has two steps and the schema makes the second one unskippable: a
+ * body claiming `confirmed: true` with no `code` is REFUSED. Today's enrolment
+ * path has no second step at all, which is why `User.totpEnabledAt` may be set
+ * for a user whose authenticator never saw the seed — and why
+ * `totpConfirmedAt` is a separate column rather than a back-fill of the
+ * existing one. A row with `totpEnabledAt` set and `totpConfirmedAt` null is
+ * NOT ENROLLED, which is the only reading that neither locks that user out nor
+ * accepts an unverified factor.
+ *
+ * THE CODE IS NOT A SECRET THIS SCHEMA MAY ECHO. It is six digits with a
+ * thirty-second life, and the message on a bad one must not quote it — which
+ * `z.string().regex()` would do, since a zod message carries the offending
+ * value. Hence the explicit `message` on the regex: report a PATH, never a zod
+ * message.
+ */
+export const totpEnrolmentSchema = z
+  .object({
+    /** Set only once a supplied code has verified against the stored seed. */
+    confirmed: z.boolean(),
+    /** The code from the authenticator. Never logged, never echoed. */
+    code: z
+      .string()
+      .regex(/^\d{6}$/, 'must be the six digits from your authenticator app')
+      .optional(),
+    /** How many single-use recovery codes to mint. Zero is refused; see below. */
+    recoveryCodeCount: z.number().int().min(8).max(16).default(10),
+  })
+  .superRefine((value, ctx) => {
+    if (value.confirmed && value.code === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['code'],
+        message:
+          'an enrolment cannot be confirmed without a code that verified. Marking it confirmed ' +
+          'on presence alone is the defect this field exists to close',
+      });
+    }
+  });
+
+/**
+ * VERIFYING A SINGLE-USE RECOVERY CODE.
+ *
+ * Recovery codes are HASHED AND NOT SEALED, and the difference is the point: a
+ * sealed value can be opened, so a sealed recovery code is a credential this
+ * process can read, print and leak. A hash cannot be opened by anybody,
+ * including us, which is the correct property for a value whose only use is to
+ * be COMPARED. The TOTP seed is sealed rather than hashed for the opposite
+ * reason — we have to compute codes from it, so we have to be able to read it.
+ *
+ * `usedAt` per code, not a count: "three of your ten codes are gone" is a
+ * different fact from "three uses have happened", and a code that works twice
+ * is a code that is not single-use.
+ */
+export const recoveryCodeSchema = z.object({
+  code: z
+    .string()
+    .trim()
+    .min(8)
+    .max(64)
+    .transform((value) => value.replace(/[\s-]/g, '').toLowerCase()),
+});
+
+/**
+ * MINTING A SESSION. The expiry is required.
+ *
+ * `Session.expiresAt` is already NOT NULL in the database, so this schema is
+ * not inventing the rule — it is the write path for the code that creates
+ * sessions, which does not have one, and a creator that forgets the field gets
+ * a Prisma error at run time rather than a refusal with a path. The same
+ * argument every schema in this file makes.
+ *
+ * `deviceLabel` is what makes "sign out my lost laptop" a thing a person can
+ * do: a list of sessions by `createdAt` and a truncated user-agent is not a
+ * list anybody can act on. It is NOT trusted — it is a label the client
+ * supplies, bounded and never rendered as HTML.
+ */
+export const createSessionSchema = z.object({
+  expiresAt: z.coerce.date().refine((value) => value.getTime() > 0, 'must be a real instant'),
+  deviceLabel: z.string().trim().min(1).max(80).nullable(),
+});
+
+/** REVOKING A SESSION. The reason is required; `null` is for rows that predate the column. */
+export const revokeSessionSchema = z.object({
+  reason: sessionRevocationReasonSchema,
+});
+
+/**
+ * SCOPING ONE ENVIRONMENT SECRET TO THE TESTS THAT MAY RECEIVE IT.
+ *
+ * ── THE DEFECT ─────────────────────────────────────────────────────────────
+ *
+ * There is no scoping at all: every decrypted secret in an environment is
+ * injected into every test process, so a test that needs a payment provider's
+ * test key also receives the production database password. One compromised
+ * generated test reads the lot.
+ *
+ * ── DEFAULT DENY, STRUCTURALLY ─────────────────────────────────────────────
+ *
+ * A secret with NO scope row reaches NOTHING. The default is a property of the
+ * data rather than a convention: to widen a secret you write a row, and the row
+ * has an author, a timestamp and — for the broad kinds — a reason. The reason
+ * requirement comes from `SECRET_SCOPE_RULES` and is not restated here, because
+ * a second opinion about which scopes are uncomfortable is how the broadest one
+ * quietly stops needing justification.
+ */
+export const secretScopeSchema = z
+  .object({
+    kind: secretScopeKindSchema,
+    /** What the kind names — a test id, a suite id, a test type, a profile id. Null for ENVIRONMENT_WIDE. */
+    value: z.string().trim().min(1).max(120).nullable(),
+    reason: z.string().trim().min(10).max(500).nullable(),
+  })
+  .superRefine((input, ctx) => {
+    const rule = SECRET_SCOPE_RULES[input.kind];
+    if (rule.names === 'NOTHING' && input.value !== null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['value'],
+        message: 'this scope names nothing, because it is every test in the environment',
+      });
+    }
+    if (rule.names !== 'NOTHING' && input.value === null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['value'],
+        message: 'this scope must name what it applies to',
+      });
+    }
+    if (rule.requiresReason && input.reason === null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['reason'],
+        message:
+          'a scope this broad needs a reason. The broadest one re-creates the behaviour this ' +
+          'table exists to end, so it is allowed only with somebody willing to say why',
+      });
+    }
+  });
+
+/**
+ * STARTING A KEY ROTATION.
+ *
+ * `from` and `to` are both named rather than "rotate to the newest", because a
+ * sweep is resumable and an operator resuming one must be able to see which
+ * pair of versions it was for. `RESUMABLE_ROTATION_STATES` in sealed.ts is what
+ * decides whether an existing sweep is picked up instead of a new one being
+ * started; a second sweep over the same pair would re-read every row and double
+ * the work while reporting two different progress figures for one rotation.
+ */
+export const startKeyRotationSchema = z
+  .object({
+    fromKeyVersion: z.number().int().positive(),
+    toKeyVersion: z.number().int().positive(),
+    fieldKey: sealedFieldKeySchema,
+  })
+  .superRefine((value, ctx) => {
+    if (value.toKeyVersion <= value.fromKeyVersion) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['toKeyVersion'],
+        message:
+          'a rotation moves rows FORWARD. Re-sealing under an older version would put them back ' +
+          'under the key the rotation was called to get off',
+      });
+    }
+  });
+
+/**
+ * REGISTERING A VAULT KEY.
+ *
+ * NO KEY MATERIAL CROSSES THIS SCHEMA. `providerRef` is an identifier the
+ * provider understands — a KMS key name — and for a LOCAL key it is null,
+ * because the material is the deployment's existing master key and naming it
+ * here would be the first step towards putting it in a request body.
+ *
+ * A KMS key with no `providerRef` is refused: it names material nothing can
+ * find, so every value sealed under it would be unopenable and the failure
+ * would surface as a decrypt error long after the registration looked fine.
+ */
+export const registerVaultKeySchema = z
+  .object({
+    keyId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9_-]+$/, 'may contain letters, digits, dashes and underscores'),
+    version: z.number().int().positive(),
+    state: vaultKeyStateSchema,
+    provider: vaultKeyProviderSchema,
+    /** A reference, never material. Null for LOCAL. */
+    providerRef: z.string().trim().min(1).max(500).nullable(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.provider === 'KMS' && value.providerRef === null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['providerRef'],
+        message:
+          'a KMS key must name the key the provider holds. Without it nothing sealed under this ' +
+          'version could ever be opened',
+      });
+    }
+    if (value.provider === 'LOCAL' && value.providerRef !== null) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['providerRef'],
+        message:
+          'a LOCAL key has no provider reference, and this field must never become a place to ' +
+          'put key material',
+      });
+    }
+  });
+
+/**
+ * RECORDING ONE LOGIN ATTEMPT.
+ *
+ * `identifierHash` AND NOT THE IDENTIFIER. A throttle row is created for
+ * addresses that have no account — that is the point of per-identifier
+ * throttling without an oracle — so the plaintext column would accumulate
+ * whatever list an attacker is walking, and the table would become a readable
+ * address book that nothing in the product needs.
+ *
+ * That is a key, not anonymisation, and the comment says so rather than
+ * implying a protection it does not provide: an email can be recovered from its
+ * hash by a dictionary. What the hash buys is that the table cannot be READ as
+ * a list, and that the operator's own join (from a `User.email` they already
+ * hold) still works.
+ */
+export const recordLoginAttemptSchema = z.object({
+  identifierHash: z.string().regex(/^[0-9a-f]{64}$/, 'must be a hex SHA-256 digest'),
+  outcome: loginAttemptOutcomeSchema,
+  ip: z.string().max(64).nullable(),
+  userAgent: z.string().max(500).nullable(),
+});
+
+/**
+ * ISSUING A VERIFICATION TOKEN. The purpose comes from the vocabulary.
+ *
+ * `VerificationToken.purpose` has carried the comment
+ * `// "EMAIL_VERIFY" | "PASSWORD_RESET" | "INVITE"` since the init migration
+ * with no TypeScript list to check a writer against, so the three spellings
+ * lived in whichever route needed one. A fourth spelling is a token nothing
+ * will ever redeem — which, for EMAIL_VERIFY, is an account whose address is
+ * never proved, and with SSO JIT provisioning that is the pre-condition for a
+ * takeover.
+ */
+export const issueVerificationTokenSchema = z.object({
+  email: z.string().email().max(254),
+  purpose: verificationTokenPurposeSchema,
+  expiresAt: z.coerce.date(),
+});
+
+/**
+ * IS THIS BASE URL'S HOST ONE THIS DEPLOYMENT MAY REACH, decided WITHOUT DNS.
+ *
+ * ── Why this is a function and not a refinement on `environmentBaseUrl` ────
+ *
+ * Because `classifyHost` lives in packages/shared/src/private-address.ts, which
+ * imports `node:dns`, and this file is re-exported from the package barrel that
+ * the web app's bundler consumes — the hazard `scripts/check-wiring.ts` writes
+ * down, having once recommended the thing that would break the web build. So
+ * the CALLER classifies (it is a route, running on Node, holding the import
+ * already) and this function applies the POLICY, which is the half that must
+ * not be written twice.
+ *
+ * ── What it does and does NOT decide ──────────────────────────────────────
+ *
+ * It decides the SYNCHRONOUS half: an ambiguous host, and an IP LITERAL whose
+ * class the policy does not permit. It does NOT resolve a name, so a name that
+ * points at `127.0.0.1` passes here and is caught by `decideEgress` at the
+ * moment the connection is opened — which is the only place it CAN be caught,
+ * since a name resolved in the API process is not the name the browser will
+ * resolve. `routes/runs.ts` and `routes/api-surface.ts` already split the work
+ * exactly this way.
+ *
+ * THE CALLER MUST NOT DESCRIBE A `null` RETURN AS "THE HOST IS SAFE". It means
+ * "nothing is decidable without a resolver", and the resolver's verdict is
+ * still owed.
+ */
+export function baseUrlEgressProblem(
+  host: HostClass,
+  policy: EgressPolicy,
+): { readonly path: readonly string[]; readonly message: string } | null {
+  if (host.kind === 'ambiguous') {
+    /*
+     * Treated exactly as a loopback address, which is the contract
+     * `classifyHost` states: `0177.0.0.1`, `0x7f.0.0.1` and `2130706433` are
+     * all 127.0.0.1 to something downstream, and handing one on as "a name we
+     * could look up" gives the octal form a second chance.
+     */
+    return {
+      path: ['baseUrl'],
+      message: `is not a host QAAI will guess at: ${host.why}`,
+    };
+  }
+  if (host.kind !== 'address') return null;
+  if (policy.permittedClasses.includes(host.class)) return null;
+  const allowlisted = policy.allowlist.some(
+    (entry) => entry.host === host.host && entry.contexts.includes('CRAWL'),
+  );
+  if (allowlisted) return null;
+  return {
+    path: ['baseUrl'],
+    message:
+      `is a ${host.class} address, which this ${policy.deployment} deployment does not reach. ` +
+      'If it is an internal host you intend to test, add it to this environment\'s egress ' +
+      'allowlist with an owner and a reason',
+  };
+}

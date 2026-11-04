@@ -73,10 +73,21 @@ exportOrgRouter.use(requireRole('OWNER'));
  *                 SsoLoginRequest.stateHash/nonceHash, User.passwordHash.
  *                 Verifiers. Exporting them hands over an offline cracking
  *                 target for credentials that are still live.
- *   storageState  AuthProfile.storageState — a cached Playwright session: real,
- *                 unexpired cookies for the customer's own application. This is
- *                 the sharpest one in the schema, because it is a plain JSON
- *                 column with an innocuous name and it is a live session token.
+ *   storageState  AuthProfile.storageState and EVERY COLUMN WHOSE NAME STARTS
+ *                 WITH IT — a cached Playwright session: real, unexpired
+ *                 cookies for the customer's own application. This is the
+ *                 sharpest one in the schema, because it had an innocuous name
+ *                 and was a live session token.
+ *
+ *                 THE PREFIX IS LOAD-BEARING AND WAS MEASURED. This pattern was
+ *                 `/^storageState$/`, anchored, and the sealing round added
+ *                 `storageStateSealed` — the ciphertext of that same session.
+ *                 `/Enc$/`, `/secret/i` and `/token$/i` do not catch that name
+ *                 either, so for one round an org export carried the sealed
+ *                 session out of the building while the manifest below told the
+ *                 recipient it had been withheld. Ciphertext is not nothing: it
+ *                 is an offline target, and the manifest saying otherwise was
+ *                 the worse half of the defect.
  *   signature     WebhookDelivery.signature — an HMAC under the integration's
  *                 secret. Not reversible, but it is a per-message oracle and it
  *                 has no portability value.
@@ -87,13 +98,22 @@ exportOrgRouter.use(requireRole('OWNER'));
 const EXCLUDED_COLUMN_PATTERNS: ReadonlyArray<RegExp> = [
   /Enc$/,
   /Hash$/,
-  /^storageState$/,
+  // UNANCHORED, so `storageStateSealed` goes with `storageState`. See above.
+  /^storageState/,
   /^signature$/,
   /^hint$/,
   /^pkceVerifier/,
   /secret/i,
   /token$/i,
   /password/i,
+  /*
+   * `VaultKey.providerRef` — a KMS key reference. The schema says plainly that
+   * this column never holds key material, and that is true; it is excluded
+   * anyway because it names the customer's key in their own cloud account, and
+   * the default for anything that identifies a credential is EXCLUDED. It
+   * matches none of the patterns above.
+   */
+  /^providerRef$/,
 ];
 
 export function isExcludedColumn(name: string): boolean {
@@ -530,7 +550,40 @@ export const EXCLUSION_NOTES = [
     what: 'Cached browser session state (AuthProfile.storageState)',
     why:
       'It is a live, unexpired set of cookies for YOUR application, captured so tests do not have ' +
-      'to log in every run. It is a session token wearing the name of a config field.',
+      'to log in every run. It is a session token wearing the name of a config field.\n\n' +
+      /*
+       * ── WHY THIS SENTENCE NAMES NINE COLUMNS AND NOT ONE ────────────────────
+       *
+       * The pattern above is `/^storageState/`, UNANCHORED, and the comment
+       * beside it records why: the sealing round added `storageStateSealed` and
+       * an anchored pattern let the ciphertext out while this entry told the
+       * recipient it had been withheld. Making the pattern a prefix fixed the
+       * leak and left this entry describing one column out of nine — the SAME
+       * defect inverted, and the one that matters here, because EXCLUSION_NOTES
+       * is the shipped artefact a recipient reads instead of the source.
+       *
+       * MEASURED on this tree against the real `redactRow`: a row carrying the
+       * family is returned as `id, name, kind, config`, with nine names in the
+       * dropped set. Seven of those nine are NOT credentials — an expiry, a key
+       * version, two timestamps, a flag and a counter — so the previous
+       * sentence was not merely terse, it left a recipient unable to tell
+       * "QAAI does not have this" from "QAAI would not give me this", which is
+       * the distinction `redactRow`'s own doc comment says the dropped set
+       * exists to preserve.
+       *
+       * They go WITH the session rather than being carved out, and that is a
+       * choice with a stated cost: the family moves as one unit, so a column
+       * added to it next round is withheld by default instead of being exported
+       * until somebody notices. The cost is that an operator reading an export
+       * cannot see when a cached session expires or how many refreshes have
+       * failed — which is a question for the cockpit, against live data, not
+       * for a file that outlives the request.
+       */
+      'The non-secret members of that family — the expiry, the key version, the re-seal flag and ' +
+      'the refresh counters — go with it rather than being carved out, so that a column added to ' +
+      'this family in a future round is withheld by default. They are operational state about a ' +
+      'credential, they answer nothing a recipient can act on outside this installation, and the ' +
+      'cockpit reports them against live data.',
     whatYouGetInstead: 'The auth profile’s name, kind and non-secret config.',
   },
   {
