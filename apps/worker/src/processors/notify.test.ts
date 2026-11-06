@@ -18,6 +18,8 @@
 
 import { createHmac } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EGRESS_REFUSAL_SENTENCE } from '@qaai/shared';
+import type { EgressPermit } from '@qaai/shared';
 
 // The worker's context opens Postgres, Redis and the LLM at import time, so it
 // is replaced wholesale; `h.prisma` is swapped per test through the proxy.
@@ -69,7 +71,9 @@ const {
   renderRunAlert,
   suppressedCauseCount,
 } = await import('./notify.js');
-const { configureChatEgress } = await import('../../../api/src/lib/chat-integrations.js');
+const { CHAT_RESPONSE_MAX_BYTES, configureChatEgress, configureChatTransport } = await import(
+  '../../../api/src/lib/chat-integrations.js'
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -209,14 +213,87 @@ const monitorDown = {
   payload: { name: 'checkout', streak: 3, runId: 'run9' },
 };
 
+/**
+ * A PINNED permit for the host in `url` — what the real guard returns, and what
+ * this harness used to drop.
+ *
+ * The stub answered `{ ok: true, permit: null }`, and `permit: null` means "no
+ * guard decided about this host", so every generic-WEBHOOK delivery in this
+ * file took the BY-NAME branch and the pinned transport was never reached by
+ * the processor at all. A harness that cannot reach the control passes whether
+ * the control is wired or not.
+ */
+function pinnedPermitFor(url: string): EgressPermit {
+  const host = new URL(url).hostname;
+  return {
+    kind: 'PINNED',
+    context: 'WEBHOOK_DELIVERY',
+    target: { host, scheme: 'https:', port: '' },
+    decision: { allowed: true },
+    pinned: { host, addresses: [{ address: '93.184.216.34', class: 'public' }] },
+    wouldRefuse: null,
+  } as unknown as EgressPermit;
+}
+
+function observedPermitFor(url: string): EgressPermit {
+  const host = new URL(url).hostname;
+  return {
+    kind: 'OBSERVED',
+    context: 'WEBHOOK_DELIVERY',
+    target: { host, scheme: 'https:', port: '' },
+    decision: { outcome: 'WOULD_REFUSE' },
+    pinned: null,
+    wouldRefuse: 'CLASS_NOT_PERMITTED',
+    observedBy: 'POLICY',
+  } as unknown as EgressPermit;
+}
+
+interface PinnedCall {
+  host: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+  maxBytes: number;
+}
+
+/**
+ * The pinned transport, captured. The default installed in `beforeEach` THROWS,
+ * so a delivery that opens a pinned socket in a test that did not expect one
+ * fails loudly instead of trying to reach 93.184.216.34 for real.
+ */
+function capturePinned(status = 200): PinnedCall[] {
+  const calls: PinnedCall[] = [];
+  configureChatTransport(async (permit, url, init) => {
+    calls.push({
+      host: permit.kind === 'PINNED' ? permit.pinned.host : '',
+      url,
+      headers: { ...init.headers },
+      body: init.body ?? '',
+      maxBytes: init.maxBytes,
+    });
+    return { ok: true, response: { status, headers: {}, text: 'ok', truncated: false } };
+  });
+  return calls;
+}
+
 beforeEach(() => {
-  configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
+  configureChatEgress(() =>
+    Promise.resolve((url: string) =>
+      Promise.resolve({ ok: true, permit: pinnedPermitFor(url) } as never),
+    ),
+  );
+  configureChatTransport(() => {
+    throw new Error('this test opened a pinned socket without stubbing the transport');
+  });
   h.prisma = {};
   h.log = [];
   h.enqueued = [];
 });
 
 afterEach(() => {
+  // The REAL transport, restored, so one test cannot leak its fake into the
+  // next — the same reason `configureChatEgress(null)` exists.
+  configureChatTransport(null);
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
 });
@@ -430,8 +507,20 @@ describe('processDelivery records every attempt on the row', () => {
     expect(fetches[0]!.init.body).toBe(JSON.stringify({ content: 'hello' }));
   });
 
-  it('signs a generic WEBHOOK — with the event alongside — and records the signature it sent', async () => {
+  it('signs a generic WEBHOOK — with the event alongside — and sends it OVER THE PIN, not by name', async () => {
+    /*
+     * ── THE DEFECT THIS ARM NOW CLOSES ────────────────────────────────────────
+     *
+     * This test used to assert against a stubbed global `fetch`, which was
+     * exactly what the processor called: `chatDestinationFor` resolved the host
+     * and handed back a PINNED ADDRESS SET, the processor read `ok`, dropped the
+     * permit and called `fetch(destination.url)` — a SECOND resolution of the
+     * same name with no cache between them. The webhook token lives in the PATH
+     * and the body carries an HMAC over it, so whoever runs the zone answers the
+     * second query differently and collects both. `fetches` must now be empty.
+     */
     const fetches = stubFetch();
+    const pinned = capturePinned();
     const db = deliveryDb({
       row: row(),
       integration: slack({
@@ -445,10 +534,84 @@ describe('processDelivery records every attempt on the row', () => {
     // The generic-webhook body names the event so a receiver can route
     // without parsing prose; the signature covers exactly these bytes.
     const body = JSON.stringify({ event: 'run.finished', text: 'hello' });
-    expect(fetches[0]!.init.body).toBe(body);
     const expected = `sha256=${createHmac('sha256', 'topsecret').update(body).digest('hex')}`;
-    expect(fetches[0]!.init.headers?.['x-qaai-signature-256']).toBe(expected);
+    expect(fetches).toEqual([]);
+    expect(pinned).toHaveLength(1);
+    expect(pinned[0]!.host).toBe('ci.customer.example');
+    expect(pinned[0]!.url).toBe('https://ci.customer.example/hooks/qaai');
+    expect(pinned[0]!.body).toBe(body);
+    expect(pinned[0]!.headers['x-qaai-signature-256']).toBe(expected);
+    // The cap is this call site's, not a default inside the transport.
+    expect(pinned[0]!.maxBytes).toBe(CHAT_RESPONSE_MAX_BYTES);
     expect(db.updates[0]).toMatchObject({ status: 'SENT', signature: expected });
+  });
+
+  it('counts the OBSERVE-mode fall-back rather than taking it silently', async () => {
+    /*
+     * An OBSERVED permit authorised NO address, so this delivery connects by
+     * name exactly as it did before the control existed — which is what OBSERVE
+     * promises. What must not happen is that it happens QUIETLY: the pinned
+     * transport is never called (the fall-back is a branch taken on purpose,
+     * not an exception handler retrying), and the worker log says the pin did
+     * not apply. A mode with no counter is an off switch with a reassuring name.
+     */
+    const fetches = stubFetch();
+    const pinned = capturePinned();
+    configureChatEgress(() =>
+      Promise.resolve((url: string) =>
+        Promise.resolve({ ok: true, permit: observedPermitFor(url) } as never),
+      ),
+    );
+    const db = deliveryDb({
+      row: row(),
+      integration: slack({
+        kind: 'WEBHOOK',
+        configEnc: sealed('https://ci.customer.example/hooks/qaai'),
+      }),
+    });
+
+    await processDelivery(JOB, FIRST_OF_FIVE);
+
+    expect(pinned).toEqual([]);
+    expect(fetches).toHaveLength(1);
+    expect(db.updates[0]).toMatchObject({ status: 'SENT' });
+    expect(h.log).toContain(
+      'warn:webhook egress is in OBSERVE mode; this delivery connected by name and the pin was not enforced',
+    );
+  });
+
+  it('records a refused PIN without saying which address refused, and sends nothing', async () => {
+    /*
+     * The pinned transport reports a closed refusal vocabulary. What the
+     * delivery row may say is one sentence — it renders in the cockpit to
+     * whoever typed the URL, and a message distinguishing "the permit pinned
+     * another host" from "that address refused the connection" is a port
+     * scanner with a readable report. The refusal CODE goes to the worker log,
+     * which is the operator's and not the tenant's.
+     */
+    const fetches = stubFetch();
+    configureChatTransport(async () => ({
+      ok: false,
+      refusal: 'HOST_NOT_THE_PINNED_ONE',
+      operatorDetail: 'the permit pinned ci.customer.example and this URL names elsewhere.test',
+    }));
+    const db = deliveryDb({
+      row: row(),
+      integration: slack({
+        kind: 'WEBHOOK',
+        configEnc: sealed('https://ci.customer.example/hooks/qaai-SECRET-PATH-TOKEN'),
+      }),
+    });
+
+    await expect(processDelivery(JOB, FIRST_OF_FIVE)).rejects.toThrow();
+
+    expect(fetches).toEqual([]);
+    const recorded = String(db.updates[0]!.lastError);
+    expect(recorded).toBe(EGRESS_REFUSAL_SENTENCE);
+    // Neither the operator detail nor the credential may reach the row.
+    expect(recorded).not.toContain('elsewhere.test');
+    expect(recorded).not.toContain('SECRET-PATH-TOKEN');
+    expect(recorded).not.toContain('HOST_NOT_THE_PINNED_ONE');
   });
 
   it('sends NOTHING when the credential envelope cannot be unsealed, and counts the attempt', async () => {

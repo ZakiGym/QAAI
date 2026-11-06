@@ -27,6 +27,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { EgressPermit } from '@qaai/shared';
 
 type Row = Record<string, any>;
 
@@ -260,7 +261,9 @@ function makeDb() {
 
 const express = (await import('express')).default;
 const { integrationsRouter } = await import('./integrations.js');
-const { configureChatEgress } = await import('../lib/chat-integrations.js');
+const { CHAT_RESPONSE_MAX_BYTES, configureChatEgress, configureChatTransport } = await import(
+  '../lib/chat-integrations.js'
+);
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 const { openChatCredentials, sealChatCredentials } = await import('../lib/integrations.js');
 
@@ -305,8 +308,67 @@ async function call(
 
 let db: ReturnType<typeof makeDb>;
 
+/**
+ * A PINNED permit for the host in `url`, which is what the real guard returns
+ * and what this harness used to throw away.
+ *
+ * The stub used to answer `{ ok: true, permit: null }`, and that mattered more
+ * than it looks: `permit: null` means "no guard decided about this host", so
+ * every WEBHOOK test-send in this file took the BY-NAME branch and the pinned
+ * transport was never exercised by the route at all. A harness that cannot
+ * reach the control is a harness that passes whether the control is wired or
+ * not — which is how this defect survived four rounds of green suites.
+ */
+function pinnedPermitFor(url: string): EgressPermit {
+  const host = new URL(url).hostname;
+  return {
+    kind: 'PINNED',
+    context: 'WEBHOOK_DELIVERY',
+    target: { host, scheme: 'https:', port: '' },
+    decision: { allowed: true },
+    pinned: { host, addresses: [{ address: '93.184.216.34', class: 'public' }] },
+    wouldRefuse: null,
+  } as unknown as EgressPermit;
+}
+
+/**
+ * The pinned transport, captured. A test that means to send through it installs
+ * one of these; the default below THROWS, so a route that opens a pinned socket
+ * in a test that did not expect one fails loudly instead of trying to reach
+ * 93.184.216.34 for real.
+ */
+interface PinnedCall {
+  host: string;
+  url: string;
+  init: { method: string; headers?: Record<string, string>; body?: string; maxBytes: number };
+}
+function capturePinned(status = 200): PinnedCall[] {
+  const calls: PinnedCall[] = [];
+  configureChatTransport(async (permit, url, init) => {
+    calls.push({
+      host: permit.kind === 'PINNED' ? permit.pinned.host : '',
+      url,
+      init: {
+        method: init.method,
+        ...(init.headers ? { headers: { ...init.headers } } : {}),
+        ...(init.body === undefined ? {} : { body: init.body }),
+        maxBytes: init.maxBytes,
+      },
+    });
+    return { ok: true, response: { status, headers: {}, text: 'ok', truncated: false } };
+  });
+  return calls;
+}
+
 beforeEach(() => {
-  configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
+  configureChatEgress(() =>
+    Promise.resolve((url: string) =>
+      Promise.resolve({ ok: true, permit: pinnedPermitFor(url) } as never),
+    ),
+  );
+  configureChatTransport(() => {
+    throw new Error('this test opened a pinned socket without stubbing the transport');
+  });
   db = makeDb();
   h.prisma = db.client;
   h.actor = { userId: 'user_1', orgId: 'org_1', role: 'ADMIN', ip: null };
@@ -314,6 +376,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // The REAL transport, restored, so one test cannot leak its fake into the
+  // next — the same reason `configureChatEgress(null)` exists.
+  configureChatTransport(null);
   vi.unstubAllGlobals();
 });
 
@@ -579,14 +644,19 @@ describe('POST /integrations/chat/:id/test — the host is resolved before the t
       }),
     );
 
+    const pinned = capturePinned();
+
     const reply = await call('POST', `/integrations/chat/${id}/test`, {});
     globalThis.fetch = realFetch;
 
     // The guard was consulted with the stored destination...
     expect(asked).toHaveLength(1);
     expect(asked[0]).toContain('hooks.example.test');
-    // ...and nothing left the process.
+    // ...and nothing left the process, by EITHER transport. Counting only
+    // `fetch` would have missed a pinned send, and counting only the pinned
+    // transport would have missed a by-name one.
     expect(posted).toBe(0);
+    expect(pinned).toEqual([]);
     // The refusal says nothing about WHY: this renders in the cockpit to
     // whoever typed the URL, and a message distinguishing a class from an
     // unresolvable name is a port scanner with a readable report.
@@ -595,9 +665,18 @@ describe('POST /integrations/chat/:id/test — the host is resolved before the t
     expect(body).not.toContain('CLASS_NOT_PERMITTED');
   });
 
-  it('still posts when the guard allows, so the refusal is not unconditional', async () => {
-    // Without this arm the test above would also pass if the route had simply
-    // stopped working.
+  it('still posts when the guard allows, THROUGH THE PINNED TRANSPORT and not by name', async () => {
+    /*
+     * Without this arm the test above would also pass if the route had simply
+     * stopped working. And the thing it has to prove is now sharper than
+     * "something was posted": the permit must reach the SOCKET.
+     *
+     * MEASURED before this round: the route called `fetch(destination.url)`,
+     * which resolves the name a SECOND time — so the guard's classified address
+     * set decided nothing and a rebound name sent the webhook token, which
+     * lives in the path, to whatever the second answer pointed at. `posted`
+     * below is the count of by-name sends and it must now be ZERO.
+     */
     let posted = 0;
     const realFetch = globalThis.fetch;
     globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
@@ -609,11 +688,94 @@ describe('POST /integrations/chat/:id/test — the host is resolved before the t
     };
 
     const id = await webhook();
-    configureChatEgress(() => Promise.resolve(() => Promise.resolve({ ok: true, permit: null } as never)));
-    await call('POST', `/integrations/chat/${id}/test`, {});
+    const pinned = capturePinned();
+    const { body } = await call('POST', `/integrations/chat/${id}/test`, {});
     globalThis.fetch = realFetch;
 
+    expect(body).toMatchObject({ ok: true, responseStatus: 200 });
+    // Through the pin, with the permit's own host, and NOT by name.
+    expect(pinned).toHaveLength(1);
+    expect(pinned[0]!.host).toBe('hooks.example.test');
+    expect(pinned[0]!.url).toBe('https://hooks.example.test/qaai');
+    expect(pinned[0]!.init.method).toBe('POST');
+    // The cap is the call site's, not a default inside the transport.
+    expect(pinned[0]!.init.maxBytes).toBe(CHAT_RESPONSE_MAX_BYTES);
+    expect(posted).toBe(0);
+
+    // COUNTED, not assumed: the audit row says which transport carried it.
+    const tested = h.audits.filter((a) => a.action === 'integration.test');
+    expect(tested).toHaveLength(1);
+    expect(tested[0]!.metadata.transport).toBe('PINNED');
+  });
+
+  it('connects BY NAME in OBSERVE mode, and the audit row counts it', async () => {
+    /*
+     * An OBSERVED permit authorised NO address, so there is nothing to pin to
+     * and the connection happens exactly as it did before this control existed
+     * — which is what OBSERVE promises. The point of this test is that the
+     * fall-back is a BRANCH TAKEN ON PURPOSE and not an exception handler
+     * quietly retrying: the pinned transport must never be called, and the
+     * audit row must say the pin did not apply. A mode with no counter is an
+     * off switch with a reassuring name.
+     */
+    let posted = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      if (fetchUrlOf(input).includes('hooks.example.test')) {
+        posted += 1;
+        return Promise.resolve(new Response('ok', { status: 200 }));
+      }
+      return realFetch(input, init);
+    };
+
+    const id = await webhook();
+    const pinned = capturePinned();
+    configureChatEgress(() =>
+      Promise.resolve(() =>
+        Promise.resolve({
+          ok: true,
+          permit: {
+            kind: 'OBSERVED',
+            context: 'WEBHOOK_DELIVERY',
+            target: { host: 'hooks.example.test', scheme: 'https:', port: '' },
+            decision: { outcome: 'WOULD_REFUSE' },
+            pinned: null,
+            wouldRefuse: 'CLASS_NOT_PERMITTED',
+            observedBy: 'POLICY',
+          },
+        } as never),
+      ),
+    );
+
+    const { body } = await call('POST', `/integrations/chat/${id}/test`, {});
+    globalThis.fetch = realFetch;
+
+    expect(body).toMatchObject({ ok: true, responseStatus: 200 });
     expect(posted).toBe(1);
+    expect(pinned).toEqual([]);
+    const tested = h.audits.filter((a) => a.action === 'integration.test');
+    expect(tested[0]!.metadata.transport).toBe('BY_NAME_OBSERVE_MODE');
+  });
+
+  it('records BY_NAME_ALLOWLISTED_HOST for Slack, which holds no permit to pin', async () => {
+    // SLACK never reaches the guard — its host comes from a real allowlist no
+    // config row can choose from — so there is no pin to enforce and the count
+    // must say WHICH by-name case this was. Collapsing the two by-name values
+    // would hide the rollout brake being used.
+    const created = await call('POST', '/integrations/chat', {
+      kind: 'SLACK',
+      name: 'Eng',
+      url: SLACK_URL,
+    });
+    const id = created.body.integration.id as string;
+    const pinned = capturePinned();
+    vi.stubGlobal('fetch', async () => new Response('ok', { status: 200 }));
+
+    await call('POST', `/integrations/chat/${id}/test`);
+
+    expect(pinned).toEqual([]);
+    const tested = h.audits.filter((a) => a.action === 'integration.test');
+    expect(tested[0]!.metadata.transport).toBe('BY_NAME_ALLOWLISTED_HOST');
   });
 });
 
@@ -656,7 +818,7 @@ describe('POST /integrations/chat/:id/test', () => {
     expect(body.deliveryId).toBe(delivery.id);
   });
 
-  it('signs a WEBHOOK test with the sealed secret', async () => {
+  it('signs a WEBHOOK test with the sealed secret, and the signature travels over the PIN', async () => {
     const created = await call('POST', '/integrations/chat', {
       kind: 'WEBHOOK',
       name: 'CI hook',
@@ -665,17 +827,16 @@ describe('POST /integrations/chat/:id/test', () => {
     });
     const id = created.body.integration.id as string;
 
-    const sent: Array<{ init: Row }> = [];
-    vi.stubGlobal('fetch', async (_url: string | URL, init: Row) => {
-      sent.push({ init });
-      return new Response('ok', { status: 200 });
-    });
-
+    // The generic kind is the one that gets a permit, so the signed body is
+    // handed to the pinned transport and not to `fetch`.
+    const pinned = capturePinned();
     await call('POST', `/integrations/chat/${id}/test`);
-    const headers = sent[0]!.init.headers as Record<string, string>;
+
+    expect(pinned).toHaveLength(1);
+    const headers = pinned[0]!.init.headers ?? {};
     expect(headers['x-qaai-signature-256']).toMatch(/^sha256=[0-9a-f]{64}$/);
     // The generic-webhook body carries the event so receivers can route.
-    expect(JSON.parse(sent[0]!.init.body as string)).toMatchObject({ event: 'test' });
+    expect(JSON.parse(pinned[0]!.init.body as string)).toMatchObject({ event: 'test' });
   });
 
   it('reports a provider refusal honestly and records the FAILED row', async () => {

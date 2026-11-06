@@ -12,8 +12,10 @@
  * customer's broker token in an Authorization header, and the destination comes
  * out of a config value someone can edit. This repo has shipped that bug twice —
  * once as a PAT posted to an attacker-chosen host, once as a trailing-dot
- * hostname that walked straight past every guard. The rules, all enforced below
- * before the token is ever read out of the vault:
+ * hostname that walked straight past every guard. The rules, enforced below —
+ * the URL ones before the token is ever read out of the vault, the address ones
+ * immediately before the one line that connects, which is where they have to be
+ * and where `publishVerification` explains itself at length:
  *
  *   - The origin is captured from the CONFIGURED broker URL, validated once, and
  *     is the only host any request goes to. The pact document is not consulted:
@@ -25,8 +27,18 @@
  *     be reached over http is a broker QAAI SKIPS.
  *   - No credentials in the URL, no IP literal, no internal/metadata hostname,
  *     and the trailing dot is stripped BEFORE any of those checks.
- *   - `redirect: 'manual'`. A 3xx is refused, never followed — following one
- *     re-sends the Authorization header to whatever `Location` names.
+ *   - A 3xx IS REFUSED, NEVER FOLLOWED — following one re-sends the
+ *     Authorization header to whatever `Location` names. The pinned transport
+ *     cannot follow one at all (it is not a configurable option there, which is
+ *     stronger than the `redirect: 'manual'` this path used to rely on), and the
+ *     observe arm still passes that flag for the same reason.
+ *   - THE ADDRESS IS PINNED AND THE SOCKET GOES TO IT. The guard resolves and
+ *     classifies every address the broker's name answers with, and the publish
+ *     is then made to those addresses with the permit's own resolver, so the
+ *     name cannot be re-resolved to somewhere else between the check and the
+ *     connection. That rebind was a working, 100%-reliable credential leak until
+ *     this round; `BROKER_PIN_LIMITATION` below has the measurement and names
+ *     what is still not covered.
  *   - No token, no response body, and no header is ever logged or returned. The
  *     only broker text a user sees is a status-derived sentence written here.
  *
@@ -37,10 +49,16 @@
  */
 
 import * as dns from 'node:dns';
-import type { EgressGuardIo, EgressGuardVerdict, NetworkEntry, RunContext } from '@qaai/shared';
+import type {
+  EgressGuardIo,
+  EgressGuardVerdict,
+  EgressPermit,
+  NetworkEntry,
+  RunContext,
+} from '@qaai/shared';
 import { guardUrl, maskUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
-import type { BrokerPublishConfig } from './contract-events.js';
-import { send } from './contract-events.js';
+import type { BrokerPublishConfig, PinnedSent } from './contract-events.js';
+import { BODY_SNIPPET_LIMIT, send, sendPinned } from './contract-events.js';
 
 /** A broker that has not answered in this long is not going to. */
 const PUBLISH_TIMEOUT_MS = 15_000;
@@ -76,17 +94,55 @@ const METADATA_HOST = new Set([
   'metadata.azure.com',
 ]);
 
-/** Why the publish did not happen, or where it landed. */
+/**
+ * WHETHER THE PIN WAS ENFORCED FOR THE CONNECTION THIS OUTCOME DESCRIBES.
+ *
+ * Rule: a control that is skipped must be COUNTED, never defaulted silently. An
+ * OBSERVE-mode permit authorises no address, so this path connects by name with
+ * the token exactly as it did before the guard existed — which is what the brake
+ * promises — and that fact leaves the function on the outcome rather than only
+ * in a comment.
+ *
+ * NOT rendered to the tenant anywhere. `detail` is the sentence they read; this
+ * is a fact about our own control, and saying "the policy would have refused
+ * your broker" to whoever typed the URL would turn the step list into the
+ * classification oracle `refusalForCaller` exists to prevent.
+ */
+export type PublishPin = 'ENFORCED' | 'OBSERVE_BY_NAME';
+
+/**
+ * Why the publish did not happen, or where it landed.
+ *
+ * `pin` is OPTIONAL and absent means "no connection was attempted" — a URL this
+ * module refuses, a secret that is not set, a guard that said no. Optional
+ * rather than required because `plugins/contract.ts` builds two `PublishOutcome`
+ * literals of its own for cases where nothing was published at all, and that
+ * file is not this slice's to edit; absent is the honest reading for both of
+ * them. Every arm below that reaches a transport sets it.
+ */
 export type PublishOutcome =
-  | { status: 'PUBLISHED'; detail: string; durationMs: number; network: NetworkEntry }
-  | { status: 'SKIPPED'; detail: string; durationMs: number; network: NetworkEntry | null };
+  | {
+      status: 'PUBLISHED';
+      detail: string;
+      durationMs: number;
+      network: NetworkEntry;
+      pin?: PublishPin;
+    }
+  | {
+      status: 'SKIPPED';
+      detail: string;
+      durationMs: number;
+      network: NetworkEntry | null;
+      pin?: PublishPin;
+    };
 
 function skipped(
   detail: string,
   durationMs = 0,
   network: NetworkEntry | null = null,
+  pin?: PublishPin,
 ): PublishOutcome {
-  return { status: 'SKIPPED', detail, durationMs, network };
+  return { status: 'SKIPPED', detail, durationMs, network, ...(pin === undefined ? {} : { pin }) };
 }
 
 /**
@@ -214,42 +270,178 @@ export function brokerOrigin(
 export type BrokerEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
 
 /**
- * WHAT THIS CONTROL DOES NOT DO, STATED HERE BECAUSE A COMMENT IS WHAT THE NEXT
- * REVIEWER TRUSTS INSTEAD OF READING THE CODE.
+ * WHAT THIS CONTROL NOW DOES, AND WHAT IT STILL DOES NOT. STATED HERE BECAUSE A
+ * COMMENT IS WHAT THE NEXT REVIEWER TRUSTS INSTEAD OF READING THE CODE — and
+ * because the paragraph this one replaces said the fix was impossible, which is
+ * the worst thing a comment in a security file can do.
  *
- * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
- * turns a check into a control: whoever opens the connection must connect to
- * those addresses and must not resolve the name again. The transport here is
- * `send()` in `contract-events.ts`, which uses Node's GLOBAL `fetch` — and
- * MEASURED on Node v25.6.1, `fetch(url, { agent: new http.Agent({ lookup }) })`
- * answered 200 and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw.
- * There is no supported way to hand global `fetch` a resolver.
+ * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that turns
+ * a check into a control: whoever opens the connection must connect to those
+ * addresses and must not resolve the name again. Until this round the transport
+ * was `send()` in `contract-events.ts`, which calls global `fetch(url)` BY NAME
+ * — so the name was resolved a SECOND time, by the transport, and the permit
+ * was discarded. RE-MEASURED ON THIS PATH with the real
+ * {@link defaultBrokerEgressGuard} and the real `send`, against a loopback
+ * server, with `dns.promises.lookup` (the guard's) and `dns.lookup` (the
+ * transport's) patched to answer a public-classified address once and
+ * `127.0.0.1` after that:
  *
- * ── TRUE OF `fetch`, AND THE CONCLUSION DRAWN FROM IT WAS WRONG ──────────────
+ *     guard verdict: ok, pinned [{"address":"3fff::1","class":"public"}]
+ *     dns queries  : #1 broker.attacker.test -> 3fff::1   (the guard's)
+ *                    #2 broker.attacker.test -> 127.0.0.1 (the transport's)
+ *     internal saw : POST .../verification-results
+ *                    host: broker.attacker.test:55741 | credentialed: TRUE
  *
- * That sentence used to end the matter, and a reader took it to mean the pin
- * cannot be enforced. It can. RE-MEASURED on Node v25.6.1 against a loopback
- * server: `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200 with the
- * lookup called ZERO times (the original measurement reproduces — the agent is
- * IGNORED), but `http.request({ host, port, path, lookup })` -> 200 with the
- * lookup called ONCE. Node core honours it, with NO dependency change.
+ * Two queries, no cache between them, no timing precision needed, 100%
+ * reliable, and the broker token attached. Not a race: a rebind.
  *
- * So the remedy is a TRANSPORT and not a dependency: moving this call off global
- * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
- * pin for free. The work is not done here; what is recorded is that the cheap
- * option exists, because the previous wording closed the question.
+ * ── ONE REFINEMENT THE SAME MEASUREMENT PRODUCED, BECAUSE IT IS THIS PATH ───
  *
- * So the classification is real, EVERY address the name answers with is
- * classified, and THE PIN IS NOT ENFORCED AT THE SOCKET. The residual hole is
- * exactly one race — a record set answering a public address here and a private
- * one to `fetch`. Named rather than papered over, the same way
- * `REFRESH_PIN_LIMITATION` names it on the auth-refresh path. The remedy is one
- * optional `lookup` parameter on `send()`; it is in the handover.
+ * `brokerOrigin` allows ONLY https, and over https the same rebind delivered a
+ * TCP connection to the loopback server and NO HTTP REQUEST AND NO CREDENTIAL
+ * ("fetch failed" — the internal host cannot present a certificate for the
+ * attacker's name). So on THIS path the shipped bug was: an attacker-chosen
+ * internal address, connected to from a QAAI worker, with the token delivered
+ * only where the rebind target can also present a certificate for the
+ * attacker's own name. The reachability oracle was unconditional; the
+ * credential delivery was not. Recorded because the brief described the plain
+ * HTTP version, and the difference is a fact about this module rather than a
+ * reason to care less.
+ *
+ * ── THE CLAIM THAT KEPT IT OPEN WAS HALF TRUE ───────────────────────────────
+ *
+ * The old paragraph said: "MEASURED, `fetch(url, { agent: new http.Agent({
+ * lookup }) })` answered 200 and NEVER CALLED THE LOOKUP — there is no
+ * supported way to hand global `fetch` a resolver." The measurement about
+ * `fetch` REPRODUCES exactly; the conclusion drawn from it did not follow.
+ * `http.request({ host, port, path, lookup })` answers 200 with the lookup
+ * called ONCE, Node core, no dependency change.
+ *
+ * ── SO THE PIN IS ENFORCED AT THE SOCKET NOW ────────────────────────────────
+ *
+ * The publish goes through `sendPinned` in `contract-events.ts`, which hands the
+ * permit's {@link pinnedLookup} to an `http.Agent`/`https.Agent`. The socket
+ * goes to a CLASSIFIED ADDRESS and the NAME stays in the request, so the Host
+ * header, SNI and the certificate check all keep working; the URL is not
+ * rewritten to an address literal. The name is never resolved a second time, so
+ * the rebind above cannot happen.
+ *
+ * ── WHAT IS STILL NOT ENFORCED, NAMED RATHER THAN PAPERED OVER ──────────────
+ *
+ *   · AN OBSERVED PERMIT IS NOT PINNED, BY DESIGN, and this path then connects
+ *     BY NAME with the token exactly as it did before any of this existed — the
+ *     rebinding window open. That is what OBSERVE means and it is the brake an
+ *     operator deliberately armed; `login.ts` makes the identical choice for the
+ *     identical reason and even types the credential. ENFORCE is the default, so
+ *     nothing reaches that arm unless somebody set the mode. It is COUNTED, not
+ *     silent: every outcome that attempted a connection carries
+ *     {@link PublishOutcome.pin}.
+ *   · RUN CANCELLATION NO LONGER TEARS THE SOCKET DOWN. `send` built an
+ *     `AbortSignal` from `ctx.signal`; `PinnedRequestInit` takes a `timeoutMs`
+ *     and no signal. A cancelled run therefore waits out
+ *     {@link PUBLISH_TIMEOUT_MS} instead of aborting, and `sendPinned` refuses
+ *     to START a request on an already-cancelled run. An optional `signal` on
+ *     `PinnedRequestInit` is the one-line fix and is in the handover.
+ *   · `brokerOrigin` IS UNCHANGED and still decides nothing about where a name
+ *     points. It refuses the hosts QAAI can name as bad before the token is read
+ *     out of the vault; the guard is what classifies the addresses; this is what
+ *     connects to them and to nothing else.
  */
 export const BROKER_PIN_LIMITATION =
-  'The broker host was resolved and every address it answered with was classified, but Node’s ' +
-  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
-  'socket.';
+  'The broker host is resolved, every address it answers with is classified, and the publish is ' +
+  'made to those addresses with the permit’s own lookup, so the name is never resolved twice. ' +
+  'What remains: an OBSERVE-mode permit authorises no address and connects by name as it always ' +
+  'did (counted, never silent), and a cancelled run waits out the publish timeout instead of ' +
+  'aborting the socket.';
+
+/**
+ * THE PINNED TRANSPORT, injected for exactly the same reason the guard is.
+ *
+ * The production door supplies NEITHER — `plugins/contract.ts:2712` calls
+ * `publishVerification(ctx, config, input)` — so the default built here is what
+ * ships, and there is no path from this function to a socket that skipped a
+ * decision. A test supplies its own to drive the 200/401/404/3xx arms without
+ * opening a connection to a public address, which is a thing a unit test must
+ * never do.
+ *
+ * WHAT A FAKE TRANSPORT CANNOT PROVE, said plainly so nobody reads a green
+ * suite as evidence it does: that the pin is honoured at the socket. That is
+ * proved against REAL loopback sockets with the name rebound, in
+ * `contract-events.test.ts` ("the pin is enforced at the socket") and in
+ * `packages/shared/src/pinned-request.test.ts`. The tests here assert the
+ * PRODUCT rules — published, skipped, which sentence, no token anywhere — plus
+ * the one structural fact they can prove: that the permit handed to the
+ * transport is the GUARD'S OWN, addresses and all.
+ */
+export type BrokerTransport = (
+  permit: EgressPermit,
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+) => Promise<PinnedSent>;
+
+/**
+ * The transport production gets: `sendPinned`, with this module's own timeout
+ * and this module's own body cap.
+ *
+ * {@link BODY_SNIPPET_LIMIT} is the cap because it is the one `contract-events.ts`
+ * already documents and applies, and a second number invented here is how one of
+ * them stops being the real one. It is applied to a body this path NEVER READS —
+ * `entry()` below writes a note of its own and deliberately never carries the
+ * broker's bytes, because a broker's error page can echo the request and the
+ * request carried the token. So `truncated` is not reported anywhere, and that is
+ * safe for the one reason that matters: no byte of the broker's answer reaches a
+ * return value, a log line or a network entry.
+ */
+function defaultBrokerTransport(ctx: RunContext): BrokerTransport {
+  return (permit, url, headers, body) =>
+    sendPinned(ctx, permit, url, 'POST', headers, body, PUBLISH_TIMEOUT_MS, BODY_SNIPPET_LIMIT);
+}
+
+/**
+ * THE OBSERVE-MODE ARM: connect BY NAME, exactly as this path always did.
+ *
+ * An OBSERVED permit authorised NO ADDRESS — `decideEgress` refuses to issue a
+ * pin on an observed refusal, and `pinnedLookup` and `pinnedRequest` both refuse
+ * one rather than let a caller borrow a pin it was not given. So the choice is
+ * the caller's, and this is it: the connection happens the way it did before
+ * this control existed, with the token, rebinding window open, because that is
+ * what OBSERVE MEANS. Taking the publish away from an operator who armed the
+ * brake would be the silent behaviour change the brake exists to avoid.
+ * `login.ts`'s `LoginHostApproval` makes the identical call and even types the
+ * credential there.
+ *
+ * ENFORCE is the default (`resolveEgressPolicy` with no policy at all is HOSTED
+ * and ENFORCE), so nothing reaches here unless somebody set the mode on purpose.
+ * And it is COUNTED: the outcome carries `pin: 'OBSERVE_BY_NAME'`.
+ *
+ * Normalised into {@link PinnedSent} so there is ONE shape downstream. Two
+ * near-identical branches reading two different result types is how one of them
+ * drifts.
+ */
+async function sendByName(
+  ctx: RunContext,
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+): Promise<PinnedSent> {
+  const sent = await send(ctx, url, 'POST', headers, body, PUBLISH_TIMEOUT_MS);
+  if (sent.transportError !== null) {
+    return { ok: false, refusal: 'TRANSPORT_FAILED', durationMs: sent.durationMs };
+  }
+  return {
+    ok: true,
+    // `send` returns a null status ONLY with a transport error, which returned
+    // above. The 0 is the compiler's question answered, not a case: it lands in
+    // the opaque-response arm below, which already means "not a status".
+    status: sent.status ?? 0,
+    headers: sent.headers,
+    text: sent.text,
+    // `send` reads the whole body. Not a default — a fact about that transport.
+    truncated: false,
+    durationMs: sent.durationMs,
+  };
+}
 
 /**
  * THE REAL GUARD, built from the environment's own policy when it has one.
@@ -420,6 +612,13 @@ export async function publishVerification(
    * never touches a resolver.
    */
   egress?: BrokerEgressGuard,
+  /**
+   * The pinned transport, injected. OPTIONAL for the same reason and with the
+   * same consequence as `egress` above: the production door supplies none, so
+   * production gets {@link defaultBrokerTransport} and the pin is enforced. See
+   * {@link BrokerTransport} for what a fake one does and does not prove.
+   */
+  transport?: BrokerTransport,
 ): Promise<PublishOutcome> {
   const started = Date.now();
 
@@ -523,8 +722,10 @@ export async function publishVerification(
    * it always did, and resolves nothing.
    *
    * What the guard still guarantees is the only thing that matters: NOTHING IS
-   * SENT. There is no arm below that reaches `send` on a refusal, and no
-   * exception arm that falls through to it.
+   * SENT. There is no arm below that reaches a transport on a refusal, and no
+   * exception arm that falls through to one. And the guard's PERMIT now travels
+   * to the transport rather than being discarded, so "classified" and
+   * "connected to" are the same addresses — see the two arms below.
    *
    * ── The refusal is SKIPPED, with ONE sentence ─────────────────────────────
    *
@@ -550,7 +751,29 @@ export async function publishVerification(
     );
   }
 
-  const sent = await send(ctx, url, 'POST', headers, JSON.stringify(payload), PUBLISH_TIMEOUT_MS);
+  /*
+   * ── AND NOW THE HALF THAT USED TO BE THROWN AWAY: THE PIN ─────────────────
+   *
+   * `verdict.permit` carries the ADDRESS SET the guard resolved and classified.
+   * This call site used to read `verdict.ok`, discard the permit and call global
+   * `fetch(url)` by name — so the name was resolved a SECOND time, by the
+   * transport, and an attacker who owns the nameserver answered that query with
+   * 127.0.0.1 while the token went along for the ride. See
+   * {@link BROKER_PIN_LIMITATION} above for the end-to-end measurement.
+   *
+   * The permit now travels to the transport, which connects to those addresses
+   * and never resolves the name again. The two arms are the two kinds of permit
+   * and they are NOT the same permission: PINNED carries addresses, OBSERVED
+   * carries none and means "connect as you always did" — see
+   * {@link sendByName}. Which one happened is recorded on the outcome.
+   */
+  const permit = verdict.permit;
+  const pin: PublishPin = permit.kind === 'PINNED' ? 'ENFORCED' : 'OBSERVE_BY_NAME';
+  const body = JSON.stringify(payload);
+  const answered =
+    permit.kind === 'PINNED'
+      ? await (transport ?? defaultBrokerTransport(ctx))(permit, url, headers, body)
+      : await sendByName(ctx, url, headers, body);
   const durationMs = Date.now() - started;
 
   /*
@@ -561,30 +784,69 @@ export async function publishVerification(
   const entry = (note: string | null): NetworkEntry => ({
     method: 'POST',
     url: maskUrl(url),
-    status: sent.status,
-    durationMs: sent.durationMs,
+    status: answered.ok ? answered.status : null,
+    durationMs: answered.durationMs,
     responseBodySnippet: note,
   });
 
-  if (sent.transportError !== null) {
+  if (!answered.ok) {
+    /*
+     * ── THE REFUSAL VOCABULARY DOES NOT GROW BY ONE PER TRANSPORT ───────────
+     *
+     * `sendPinned` answers with a CODE from a closed set, and the codes split
+     * into exactly the two sentences this file already said, plus one about our
+     * own state:
+     *
+     *   TRANSPORT_FAILED, TIMED_OUT  the broker did not answer. "Unreachable",
+     *                                which is what this arm has always said.
+     *   RUN_CANCELLED                the run was torn down before the publish.
+     *                                Nothing about the host, so no oracle; and
+     *                                saying "unreachable" for it would be a
+     *                                sentence that is simply not true.
+     *   everything else              QAAI refused to open it. Unreachable by
+     *                                construction here — a PINNED permit with
+     *                                addresses, for the very URL the guard
+     *                                decided about — so this arm is defence in
+     *                                depth, and it answers with the guard's own
+     *                                ONE CONSTANT rather than a fourth sentence.
+     *
+     * No code, status or timing difference is rendered: the same sentence covers
+     * a connection refused at the pinned address and one that timed out, which
+     * is what stops `publish.brokerUrl` from being a port scanner whose report
+     * is the run's own step list.
+     */
+    const unreachable = answered.refusal === 'TRANSPORT_FAILED' || answered.refusal === 'TIMED_OUT';
+    if (answered.refusal === 'RUN_CANCELLED') {
+      return skipped(
+        `Verification results were not published: the run was cancelled first. The provider's conformance is unaffected.`,
+        durationMs,
+        entry('run cancelled'),
+        pin,
+      );
+    }
     return skipped(
-      `Verification results were not published: the broker was unreachable. The provider's conformance is unaffected.`,
+      unreachable
+        ? `Verification results were not published: the broker was unreachable. The provider's conformance is unaffected.`
+        : `Verification results were not published: ${refusalForCaller(verdict).sentence} ` +
+            "The provider's conformance is unaffected.",
       durationMs,
-      entry('the broker was unreachable'),
+      entry(unreachable ? 'the broker was unreachable' : 'refused before the socket'),
+      pin,
     );
   }
 
-  // A null status only happens with a transport error, which returned above.
-  const status = sent.status ?? 0;
+  const status = answered.status;
 
-  // Node's fetch hands back the real 3xx under `redirect: 'manual'`; a
-  // spec-strict runtime hands back an opaque response with status 0. Both mean
-  // the same thing and neither is followed while we are holding the token.
+  // The pinned transport hands back the real 3xx and never follows one; so does
+  // `fetch` under `redirect: 'manual'` on the observe arm, while a spec-strict
+  // runtime hands back an opaque response with status 0. All three mean the same
+  // thing and none of them is followed while we are holding the token.
   if (status === 0 || (status >= 300 && status < 400)) {
     return skipped(
       'Verification results were not published: the broker answered with a redirect, and QAAI will not follow one while holding your token. Check `publish.brokerUrl`.',
       durationMs,
       entry('redirect refused'),
+      pin,
     );
   }
 
@@ -593,6 +855,7 @@ export async function publishVerification(
       `Verification results were not published: the broker rejected the credential (${status}). Re-enter the secret named in \`publish.auth.secretName\`.`,
       durationMs,
       entry('credential rejected'),
+      pin,
     );
   }
   if (status === 404) {
@@ -600,6 +863,7 @@ export async function publishVerification(
       `Verification results were not published: the broker returned 404 — it does not know a pact for ${input.consumerName} → ${input.providerName} at that version. Check \`publish.${(config.pactVersion ?? '').trim().length > 0 ? 'pactVersion' : 'consumerVersion'}\`.`,
       durationMs,
       entry('no such pact'),
+      pin,
     );
   }
   if (status >= 400) {
@@ -607,6 +871,7 @@ export async function publishVerification(
       `Verification results were not published: the broker returned ${status}. The provider's conformance is unaffected.`,
       durationMs,
       entry(`broker returned ${status}`),
+      pin,
     );
   }
 
@@ -615,5 +880,6 @@ export async function publishVerification(
     detail: `Published ${input.success ? 'a passing' : 'a failing'} verification for ${input.consumerName} → ${input.providerName} (provider version ${config.providerVersion}).`,
     durationMs,
     network: entry(null),
+    pin,
   };
 }

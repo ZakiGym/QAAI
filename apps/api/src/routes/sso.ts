@@ -52,6 +52,24 @@ import type { Request } from 'express';
 import { promises as dns } from 'node:dns';
 import { deflateRawSync } from 'node:zlib';
 import { z } from 'zod';
+import { EGRESS_REFUSAL_SENTENCE } from '@qaai/shared';
+import type { EgressPermit } from '@qaai/shared';
+/*
+ * BY PATH, NOT THROUGH THE BARREL, and this is the same rule `vault.ts` follows
+ * for `sealed.ts`: `pinned-request.ts` imports `node:http` and `node:https`,
+ * `packages/shared/src/index.ts` is imported by `apps/web`, and a barrel line
+ * for it would drag Node's HTTP stack into a browser bundle. `private-address.ts`
+ * (which imports `node:dns`) is handled the same way.
+ *
+ * MEASURED: `@qaai/shared/pinned-request` does NOT resolve — "Package subpath
+ * './pinned-request' is not defined by exports" — because that package's
+ * `exports` map lists five entries and this is not one of them. Adding it is one
+ * line in a file this slice does not own, and it is in needsFromOtherFiles; the
+ * relative path is what works today and it is the shape `vault.ts`, `kms.ts` and
+ * `rotate-vault-key.ts` already use.
+ */
+import { pinnedRequest } from '../../../../packages/shared/src/pinned-request.js';
+import type { PinnedRequestRefusal } from '../../../../packages/shared/src/pinned-request.js';
 import { prisma, unscoped } from '../lib/prisma.js';
 import { generateToken, hashToken } from '../lib/crypto.js';
 import { ApiError, badRequest, conflict, notFound } from '../lib/errors.js';
@@ -90,6 +108,7 @@ import {
   SsoError,
   SSO_PROTOCOLS,
   SSO_REQUEST_TTL_MS,
+  PROVIDER_RESPONSE_MAX_BYTES,
   REQUEST_TIMEOUT_MS,
   txtRecordsProveOwnership,
   validateIdTokenClaims,
@@ -174,6 +193,246 @@ export function configureSsoEgress(next: SsoEgressGuardFactory | null): void {
 }
 
 /**
+ * WHAT THIS ROUTER COUNTED ABOUT ITS OWN OUTBOUND CONNECTIONS.
+ *
+ * A closed vocabulary, because rule 7 of the round that wired the pin says a
+ * cap or a refusal applied without being counted is one nobody can defend, and
+ * the OBSERVE arm below is exactly such a decision: it connects by name, with
+ * the rebinding window open, and the only honest way to ship that is to be able
+ * to say how often it happened.
+ *
+ * `PINNED_SENT` is the denominator. A refusal count with no denominator is the
+ * kind of number that gets quoted at a customer and cannot be defended — the
+ * same reason `countGuard` in egress-guard.ts counts permits as well as
+ * refusals.
+ *
+ * NO HOST, NO URL, NO REFUSAL DETAIL IN THE KEY. A row per connection would be
+ * an inventory of every identity-provider host this install talks to, keyed by
+ * outcome, which is the thing an attacker would most like to read — and the
+ * webhook lesson applies doubly here, because a token endpoint URL is reached
+ * while holding a client secret.
+ */
+export type SsoTransportOutcome = 'PINNED_SENT' | 'OBSERVED_BY_NAME' | PinnedRequestRefusal;
+
+const transportCounts = new Map<SsoTransportOutcome, number>();
+
+function countTransport(outcome: SsoTransportOutcome): void {
+  transportCounts.set(outcome, (transportCounts.get(outcome) ?? 0) + 1);
+}
+
+/** A snapshot, copied so a reader cannot mutate the counter it is reading. */
+export function ssoTransportCounts(): ReadonlyMap<SsoTransportOutcome, number> {
+  return new Map(transportCounts);
+}
+
+/**
+ * Zero the counters. For a test that needs to attribute a count to its own
+ * request, in the same spirit as `configureSsoEgress(null)` — nothing in
+ * production calls it, and a counter that cannot be zeroed is a counter two
+ * tests have to share.
+ */
+export function resetSsoTransportCounts(): void {
+  transportCounts.clear();
+}
+
+/** One provider answer, reduced to what the parsing below needs. */
+interface ProviderAnswer {
+  readonly status: number;
+  readonly text: string;
+  /**
+   * True when the cap bit. Carried rather than dropped because a capped body
+   * reported as a whole one is how a reader comes to believe a provider
+   * answered something it did not — and here it would be `parseDiscovery`
+   * reading a half-document and blaming the provider for the field it cut off.
+   */
+  readonly truncated: boolean;
+}
+
+/**
+ * WHAT A FAILED CONNECTION SAYS OUT LOUD, AND WHY IT IS NOT MORE HELPFUL.
+ *
+ * The four control refusals — an OBSERVED permit, an unparseable URL, a scheme
+ * the transport will not open, a URL whose host is not the pinned one — all map
+ * to `EGRESS_REFUSAL_SENTENCE`, which is the single sentence
+ * `guardOutboundUrl` already throws for all seventeen guard refusals. So a
+ * caller cannot tell "the guard refused this" from "the pin refused this", and
+ * the sign-in page does not become a readable report on our own network.
+ *
+ * The two transport refusals keep the two sentences this function has always
+ * said, and that distinction got SAFER rather than riskier with the pin in
+ * place: it used to be made about whatever the name resolved to, internal
+ * addresses included, and it is now only ever made about an address the guard
+ * classified as public. `operatorDetail` holds the host and the socket error
+ * and is deliberately not thrown.
+ */
+function refusalFor(refusal: PinnedRequestRefusal): SsoError {
+  if (refusal === 'TIMED_OUT') {
+    return new SsoError('Your identity provider did not answer in time. Try signing in again.', 'CONFIG');
+  }
+  if (refusal === 'TRANSPORT_FAILED') {
+    return new SsoError('Your identity provider was unreachable. Try signing in again.', 'CONFIG');
+  }
+  return new SsoError(EGRESS_REFUSAL_SENTENCE, 'CONFIG');
+}
+
+/**
+ * Read a `fetch` body with the same cap the pinned transport applies.
+ *
+ * `await response.text()` has no limit, which is what this path did: a provider
+ * — or whatever a rebound name pointed at — could stream until the process ran
+ * out of memory, on a leg reachable by an ANONYMOUS request to /sso/start. Only
+ * the OBSERVE arm still uses `fetch`, and it gets the cap too, because "observe
+ * mode" means the pin is not enforced, not that nothing is.
+ */
+async function readCapped(
+  body: ReadableStream<Uint8Array> | null,
+): Promise<{ text: string; truncated: boolean }> {
+  if (body === null) return { text: '', truncated: false };
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      bytes += value.byteLength;
+      if (bytes > PROVIDER_RESPONSE_MAX_BYTES) {
+        // Keep the bytes up to the cap and say so. Destroying the stream is
+        // what stops a hostile server streaming forever.
+        chunks.push(value.subarray(0, Math.max(0, PROVIDER_RESPONSE_MAX_BYTES - (bytes - value.byteLength))));
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  return { text: Buffer.concat(chunks).toString('utf8'), truncated };
+}
+
+/** The headers every leg sends, with the caller's on top. */
+function providerHeaders(extra: Record<string, string> | undefined): Record<string, string> {
+  return { accept: 'application/json', 'user-agent': 'qaai', ...(extra ?? {}) };
+}
+
+/**
+ * THE PINNED ARM. The socket goes to an address the guard classified, and the
+ * NAME stays in the request so Host, SNI and the certificate check keep working.
+ *
+ * `pinnedRequest` makes NO DNS QUERY of its own — that is the whole point — and
+ * it never follows a redirect, which is the same rule this function has always
+ * stated for the same reason: following one would re-send the client secret to
+ * whatever `Location` names.
+ */
+async function sendPinned(
+  /*
+   * DELIBERATELY NOT NARROWED to the PINNED member. `providerFetch` only ever
+   * calls this with one, and if a future branch got that wrong the transport's
+   * own NOT_PINNED refusal is what answers — a refusal, not a connection by
+   * name. Narrowing the parameter would move that decision to the compiler and
+   * delete the run-time arm that fails closed.
+   */
+  permit: EgressPermit,
+  target: URL,
+  init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
+): Promise<ProviderAnswer> {
+  const result = await pinnedRequest(permit, target.href, {
+    method: init.method,
+    headers: providerHeaders(init.headers),
+    body: init.body,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    maxBytes: PROVIDER_RESPONSE_MAX_BYTES,
+  });
+  if (!result.ok) {
+    countTransport(result.refusal);
+    /*
+     * THE REFUSAL CODE AND THE HOST, FOR AN OPERATOR — AND NOT
+     * `result.operatorDetail`. That field is free text from the transport and
+     * may one day carry a URL; on this path a URL holds no credential, but a
+     * sibling path's webhook URL holds the token IN the path, and a log line
+     * that is safe only because of a fact about one caller is a log line that
+     * leaks the day a second caller copies it. The closed vocabulary plus the
+     * host is everything a diagnosis needs.
+     */
+    logger.warn(
+      { host: permit.kind === 'PINNED' ? permit.pinned.host : null, refusal: result.refusal },
+      'sso provider request refused by the pinned transport',
+    );
+    /*
+     * FAILS CLOSED, with no arm that falls through to "send it anyway". A
+     * refused pin means the connection did not happen, and the one thing this
+     * must never do is retry by name — which is precisely the bypass the pin
+     * exists to close.
+     */
+    throw refusalFor(result.refusal);
+  }
+  countTransport('PINNED_SENT');
+  return {
+    status: result.response.status,
+    text: result.response.text,
+    truncated: result.response.truncated,
+  };
+}
+
+/**
+ * THE OBSERVE ARM, AND WHY IT CONNECTS BY NAME.
+ *
+ * An OBSERVED permit authorises NO ADDRESS: `decideEgress` refuses to issue a
+ * pin on an observed refusal, so `permit.pinned` is `null` and `pinnedRequest`
+ * answers NOT_PINNED. Borrowing a pin it was not given is not an option and
+ * refusing outright is not either — the whole meaning of the OBSERVE brake is
+ * "this install's traffic keeps working while we measure what we would have
+ * refused", and a self-hosted deployment delivering SSO through an endpoint the
+ * policy dislikes is traffic that works today.
+ *
+ * So it connects exactly as this function did before the pin existed, by name,
+ * with the rebinding window open — and it is COUNTED as OBSERVED_BY_NAME and
+ * logged for the operator, because an unpinned connection that nobody can count
+ * is the one that gets described as pinned in a year's time.
+ */
+async function sendByName(
+  permit: Extract<EgressPermit, { kind: 'OBSERVED' }>,
+  target: URL,
+  init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
+): Promise<ProviderAnswer> {
+  countTransport('OBSERVED_BY_NAME');
+  /*
+   * The HOST and the refusal that was skipped, and nothing else. `GuardedTarget`
+   * carries no path and no query on purpose, so there is no URL here to leak a
+   * token out of — and the client secret is in a header or a body this never
+   * touches.
+   */
+  logger.warn(
+    { host: permit.target.host, context: permit.context, wouldRefuse: permit.wouldRefuse },
+    'sso provider reached by name under the OBSERVE brake: the pinned address set is not enforced for this connection',
+  );
+
+  let response: Response;
+  try {
+    response = await fetch(target.href, {
+      method: init.method,
+      headers: providerHeaders(init.headers),
+      body: init.body,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const reason =
+      err instanceof Error && err.name === 'TimeoutError' ? 'did not answer in time' : 'was unreachable';
+    throw new SsoError(`Your identity provider ${reason}. Try signing in again.`, 'CONFIG');
+  }
+
+  // `opaqueredirect` cannot happen with `redirect: 'manual'` on Node's fetch,
+  // but it is cheap to treat as the 3xx it is rather than as a 0-status answer.
+  const status = response.type === 'opaqueredirect' ? 302 : response.status;
+  const read = await readCapped(response.body);
+  return { status, text: read.text, truncated: read.truncated };
+}
+
+/**
  * One request to a provider, with the two rules lib/issues.ts exists to state:
  * a 3xx is an error rather than a hop (following one re-sends the client secret
  * to whatever Location names), and a provider that has not answered in
@@ -183,7 +442,7 @@ export function configureSsoEgress(next: SsoEgressGuardFactory | null): void {
  * this is the last point before bytes leave the process, and a second check
  * costs nothing.
  *
- * ── IT RESOLVES THE HOST, AND FOR A WHILE IT DID NOT ──────────────────────────
+ * ── IT RESOLVES THE HOST, AND FOR A WHILE IT DID NOT ─────────────────────────
  *
  * This read `safeOutboundUrl(url, what)`, which is a PATTERN MATCH THAT NEVER
  * RESOLVES: `isPrivateNetworkName` refuses `localhost`, a bare name and the
@@ -208,54 +467,73 @@ export function configureSsoEgress(next: SsoEgressGuardFactory | null): void {
  * HOSTED, PUBLIC ONLY, which is the strictest reading. An absent policy must
  * never be an open one.
  *
- * WHAT THIS STILL DOES NOT DO: see `SSO_PIN_LIMITATION`. The addresses are
- * classified and the pin is not enforced at the socket, because this uses global
- * `fetch`. That residual hole is one deterministic re-resolution, not a timing
- * race, and closing it means moving this call to a transport that accepts a
- * resolver.
+ * ── AND IT NOW HONOURS THE PIN AT THE SOCKET, WHICH IT DID NOT ──────────────
+ *
+ * For four rounds this paragraph said the pin could not be enforced because
+ * global `fetch` cannot be handed a resolver. The measurement behind that is
+ * real and still reproduces — `fetch(url, { agent })` ignores the agent, 0
+ * lookup calls — but the conclusion was wrong: an `http.Agent` carrying a
+ * `lookup`, driven by `http.request`, is honoured by Node core with no
+ * dependency change. RE-MEASURED on this tree against a loopback server:
+ * `http.request` BY NAME consults `dns.lookup` once and reaches the server;
+ * through an agent carrying a `lookup` it consults `dns.lookup` ZERO times.
+ *
+ * So the discarded half of the guard's answer — the permit — is now threaded
+ * into `pinnedRequest`, and the second DNS query that made the whole check
+ * cosmetic is gone. `SSO_PIN_LIMITATION` states what is still not enforced, and
+ * the honest short version is: OBSERVE mode, which authorises no address at all
+ * and therefore connects by name.
+ *
+ * FOUR LEGS come through here — discovery, JWKS, the token endpoint and
+ * userinfo — which is why the guard belongs here and not at one call site, and
+ * why the permit is obtained PER URL. A provider that passes discovery can
+ * still name a JWKS or token URL pointing inside, and the token leg is the one
+ * carrying the secret.
  */
 async function providerFetch(
   url: string,
   init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string },
   what: string,
 ): Promise<unknown> {
-  await guardOutboundUrl(url, what, await egressGuard());
+  const { url: target, permit } = await guardOutboundUrl(url, what, await egressGuard());
 
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method: init.method,
-      headers: { accept: 'application/json', 'user-agent': 'qaai', ...(init.headers ?? {}) },
-      body: init.body,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-  } catch (err) {
-    const reason =
-      err instanceof Error && err.name === 'TimeoutError' ? 'did not answer in time' : 'was unreachable';
-    throw new SsoError(`Your identity provider ${reason}. Try signing in again.`, 'CONFIG');
-  }
+  const answer =
+    permit.kind === 'PINNED'
+      ? await sendPinned(permit, target, init)
+      : await sendByName(permit, target, init);
 
-  if ((response.status >= 300 && response.status < 400) || response.type === 'opaqueredirect') {
+  if (answer.status >= 300 && answer.status < 400) {
     throw new SsoError(
       'Your identity provider answered with a redirect, and QAAI will not follow one while holding a client secret. Check the issuer URL on the connection.',
       'CONFIG',
     );
   }
 
-  // Read as text and parse defensively: an error page is usually HTML, and the
-  // body is never logged or echoed — it can contain the token we just asked for.
+  if (answer.truncated) {
+    /*
+     * REFUSED, not parsed. A truncated discovery document would be reported to
+     * an administrator as "your provider has no `issuer`", which is a lie about
+     * the provider; and a truncated token response would be "no ID token
+     * returned", which sends somebody hunting a scope they already granted.
+     */
+    throw new SsoError(
+      'Your identity provider sent a larger response than QAAI will read. Check the issuer URL on the connection.',
+      'CONFIG',
+    );
+  }
+
+  // Parsed defensively: an error page is usually HTML, and the body is never
+  // logged or echoed — it can contain the token we just asked for.
   let json: unknown = null;
   try {
-    const text = await response.text();
-    json = text ? JSON.parse(text) : null;
+    json = answer.text ? JSON.parse(answer.text) : null;
   } catch {
     json = null;
   }
 
-  if (response.status >= 400) {
+  if (answer.status >= 400) {
     throw new SsoError(
-      `Your identity provider refused the request (${response.status}). Check the client id and secret on the connection.`,
+      `Your identity provider refused the request (${answer.status}). Check the client id and secret on the connection.`,
       'CONFIG',
     );
   }

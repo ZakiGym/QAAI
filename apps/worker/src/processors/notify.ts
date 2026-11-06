@@ -22,7 +22,6 @@
  */
 
 import { createHmac, randomUUID } from 'node:crypto';
-import { describeWebhookFailure } from '@qaai/shared';
 import type { GateResult, NotifyJob } from '@qaai/shared';
 import { logger, prisma } from '../context.js';
 import { open as openSecret } from '../vault.js';
@@ -41,9 +40,14 @@ import {
   decodeChatCredentials,
   integrationAad,
   notifyPrefsOf,
+  sendChatPayload,
   wantsRunFinished,
 } from '../../../api/src/lib/chat-integrations.js';
-import type { ChatCredentials, NotifyPrefs } from '../../../api/src/lib/chat-integrations.js';
+import type {
+  ChatCredentials,
+  ChatSendOutcome,
+  NotifyPrefs,
+} from '../../../api/src/lib/chat-integrations.js';
 /*
  * The ownership resolver, imported the way digest.ts imports it — same
  * function, same precedence, no Prisma inside it. Three answers to "whose
@@ -841,9 +845,10 @@ export async function processDelivery(job: DeliveryJob, meta: DeliveryAttempt): 
   }
 
   /*
-   * Destination rules are digest.ts's, via the shared checkChatDestination,
-   * with one deliberate difference: a generic WEBHOOK is delivered, not
-   * skipped. Posting to a customer-chosen host is this processor's §7
+   * Destination rules are digest.ts's, via the shared chatDestinationFor — NOT
+   * `checkChatDestination`, which this sentence used to name and which is a
+   * pattern match that never resolves a name. One deliberate difference from
+   * the digest remains: a generic WEBHOOK is delivered, not skipped. Posting to a customer-chosen host is this processor's §7
    * contract, and the HMAC signature is what makes that contract honourable —
    * but it must be https on a public name, because a signature does not help
    * anyone who broadcasts the body in clear or aims it inside the cluster.
@@ -855,8 +860,10 @@ export async function processDelivery(job: DeliveryJob, meta: DeliveryAttempt): 
    * broken burns down to FAILED.
    */
   /*
-   * RESOLVES the host. `checkChatDestination` is a pattern match that never
-   * looks a name up, and this is the path that posts a webhook token.
+   * RESOLVES the host, and HANDS BACK THE PERMIT. `checkChatDestination` is a
+   * pattern match that never looks a name up, and this is the path that posts a
+   * webhook token. The permit carries the classified address set the send must
+   * go to; dropping it here is what left the pin unenforced for four rounds.
    */
   const destination = await chatDestinationFor(integration.kind, credentials.url);
   if (!destination.ok) {
@@ -885,30 +892,43 @@ export async function processDelivery(job: DeliveryJob, meta: DeliveryAttempt): 
     headers['x-qaai-signature-256'] = signature;
   }
 
-  let status: number | null = null;
-  let error: string | null = null;
-  try {
-    const response = await fetch(destination.url, {
-      method: 'POST',
-      headers,
-      body,
-      // A 3xx is an error, not a hop. Following one would re-post the body —
-      // and the webhook token in the URL — to whatever Location named.
-      redirect: 'manual',
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    status = response.status;
-    if (response.status >= 300 && response.status < 400) {
-      error = 'redirected; not followed';
-    } else if (!response.ok) {
-      error = `HTTP ${response.status}`;
-    }
-  } catch (err) {
-    // Deliberately not err.message: a fetch failure embeds the URL, and the
-    // URL is the credential. The shared classifier names the failure CLASS
-    // (refused / DNS / TLS / reset) from the wrapped syscall code instead —
-    // debuggable without the echo.
-    error = describeWebhookFailure(err, REQUEST_TIMEOUT_MS / 1000);
+  /*
+   * ── TO THE ADDRESS THE PERMIT AUTHORISED, NOT TO WHATEVER THE NAME SAYS ───
+   *
+   * This was `fetch(destination.url)`. `chatDestinationFor` resolves the host
+   * and hands back a PINNED ADDRESS SET, and `fetch` resolves the name AGAIN —
+   * two queries per delivery with no cache between them, so whoever runs the
+   * zone answers the second one differently and the POST lands wherever they
+   * like. It carries the webhook token IN ITS PATH and an HMAC over the body
+   * besides, so that is a credential delivered to an attacker's address with no
+   * timing precision needed. `sendChatPayload` is the one transport now, and
+   * `CHAT_PIN_LIMITATION` says what it does and does not pin.
+   *
+   * Still no redirect followed, for the same reason as before: a 3xx would
+   * re-post the body and the token to a host nothing classified.
+   */
+  const outcome: ChatSendOutcome = await sendChatPayload(destination, {
+    headers,
+    body,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+  });
+  const status = outcome.status;
+  const error = outcome.error;
+
+  /*
+   * THE PIN THAT DID NOT APPLY, COUNTED. An OBSERVE-mode permit authorises no
+   * address, so this delivery connected by name exactly as it did before the
+   * control existed — which is what OBSERVE promises — and a mode with no
+   * counter is an off switch with a reassuring name. Logged whether the
+   * delivery landed or not, because the question is about the CONTROL and not
+   * about this provider's mood. The three allowlisted provider kinds hold no
+   * permit at all and are not this count: see CHAT_PIN_LIMITATION.
+   */
+  if (outcome.transport === 'BY_NAME_OBSERVE_MODE') {
+    logger.warn(
+      { integrationId: integration.id, kind: integration.kind, transport: outcome.transport },
+      'webhook egress is in OBSERVE mode; this delivery connected by name and the pin was not enforced',
+    );
   }
 
   if (error) {
@@ -917,6 +937,14 @@ export async function processDelivery(job: DeliveryJob, meta: DeliveryAttempt): 
         integrationId: integration.id,
         kind: integration.kind,
         error,
+        /*
+         * The transport's REFUSAL CODE, which is a closed vocabulary — and
+         * never its `operatorDetail`, which may carry an unbounded Node error
+         * message from a path whose URL is the credential. Same rule that keeps
+         * `err.message` out of `lastError`.
+         */
+        refusal: outcome.refusal,
+        transport: outcome.transport,
         attempt: meta.attempt,
         of: meta.maxAttempts,
       },

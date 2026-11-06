@@ -46,7 +46,12 @@
  * copy of that one.
  */
 
+import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import { inflateRawSync } from 'node:zlib';
+import { guardUrl, resolveEgressPolicy } from '@qaai/shared';
+import type { EgressGuardIo, EgressPermit } from '@qaai/shared';
+import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import type { SsoEgressGuard } from '../lib/sso.js';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -490,7 +495,8 @@ function makeDb() {
 // ─── The app under test ──────────────────────────────────────────────────────
 
 const express = (await import('express')).default;
-const { ssoRouter, configureSsoEgress } = await import('./sso.js');
+const { ssoRouter, configureSsoEgress, ssoTransportCounts, resetSsoTransportCounts } =
+  await import('./sso.js');
 const { errorHandler, notFoundHandler } = await import('../middleware/errors.js');
 const { hashToken } = await import('../lib/crypto.js');
 const { spAcsUrl, spEntityId, domainVerificationRecord } = await import('../lib/sso.js');
@@ -566,6 +572,57 @@ async function call(
 function ssoError(reply: Reply): string {
   const url = new URL(reply.location, WEB_PUBLIC_URL);
   return url.searchParams.get('sso_error') ?? '';
+}
+
+/*
+ * ── THE ALLOWED VERDICT USED TO BE A FAKE THAT COULD ABSORB THE CONTROL ────
+ *
+ * It read `{ kind: 'UNPINNED', url, host }`, cast through `unknown` — a shape
+ * `guardUrl` has never produced. `EgressPermit` has exactly two members, PINNED
+ * and OBSERVED, and the point of that is that a caller must decide what to do
+ * with each. A permit of a third kind sent `providerFetch` down the OBSERVE
+ * branch, so the pinned arm would have had NO test at all and this round's
+ * actual fix could have been deleted with this file green.
+ *
+ * It now takes the REAL permit the real `guardUrl` builds, which is also why
+ * {@link pinnedPermitFor} exists rather than a literal.
+ */
+const allowedVerdict = (permit: EgressPermit) =>
+  ({ ok: true, permit }) as Awaited<ReturnType<SsoEgressGuard>>;
+
+/**
+ * A PINNED PERMIT FROM THE REAL GUARD, with one address substituted.
+ *
+ * Built by driving the shipped `guardUrl` with a fake resolver, so every field
+ * — `decision`, `pinnedAt`, `fromLiteral`, the context — is the shape
+ * production produces and not a literal that can drift from it.
+ *
+ * THE ONE INVENTED FACT is the address, swapped for a loopback one so no socket
+ * this file opens can leave the machine. `classifyAddress('127.0.0.1')` is
+ * `loopback` and SSO_METADATA may never reach one in any deployment, so the real
+ * guard will never issue this permit — which is exactly the point: the swap
+ * stands in for the attacker's second DNS answer, and the tests assert the
+ * transport goes to the SUBSTITUTED address and never asks the resolver.
+ */
+async function pinnedPermitFor(host: string, address: string): Promise<EgressPermit> {
+  const io: EgressGuardIo = {
+    classifyHost: (h) => classifyHost(h),
+    classifyAddress: (a) => classifyAddress(a),
+    lookup: async () => [{ address: '93.184.216.34' }],
+    now: () => new Date('2026-11-05T00:00:00.000Z'),
+    monotonicMs: () => 0,
+    delay: async () => {},
+  };
+  const verdict = await guardUrl({
+    url: `https://${host}/.well-known/openid-configuration`,
+    context: 'SSO_METADATA',
+    policy: resolveEgressPolicy(undefined),
+    io,
+  });
+  if (!verdict.ok) throw new Error('the real guard refused the fixture host');
+  const permit = verdict.permit;
+  if (permit.kind !== 'PINNED') throw new Error('the real guard issued no pin');
+  return { ...permit, pinned: { ...permit.pinned, addresses: [{ address, class: 'loopback' }] } };
 }
 
 let db: ReturnType<typeof makeDb>;
@@ -715,11 +772,6 @@ describe('the outbound leg resolves the provider host before a secret travels to
       paddedMs: 0,
     }) as Awaited<ReturnType<SsoEgressGuard>>;
 
-  const allowedVerdict = () =>
-    ({
-      ok: true,
-      permit: { kind: 'UNPINNED', url: 'https://idp.acme.test/', host: 'idp.acme.test' },
-    }) as unknown as Awaited<ReturnType<SsoEgressGuard>>;
 
   afterEach(() => {
     configureSsoEgress(null);
@@ -809,41 +861,412 @@ describe('the outbound leg resolves the provider host before a secret travels to
   });
 
   it('lets a provider on a public host through, so the guard is not a blanket refusal', async () => {
-    // The other half: without this, the three tests above would also pass if
-    // `providerFetch` simply always threw.
+    /*
+     * The other half: without this, the three tests above would also pass if
+     * `providerFetch` simply always threw.
+     *
+     * ── IT NO LONGER STUBS GLOBAL `fetch`, BECAUSE THAT WOULD PROVE NOTHING ──
+     *
+     * It used to install a `globalThis.fetch` returning a 200 discovery
+     * document. The pinned arm does not call `fetch` — that was the defect — so
+     * the stub is no longer on the path and a test built on it would be
+     * asserting about a function production stopped calling. What this asserts
+     * instead is that the guard was consulted and the request REACHED THE
+     * TRANSPORT: `providerFetch` counted a pinned outcome, which it only does
+     * after `pinnedRequest` has opened (or failed to open) a real socket.
+     *
+     * The socket itself cannot succeed here, and that is a property of the
+     * path rather than of this test: `safeOutboundUrl` pins every provider URL
+     * to https on the default port, and an unprivileged process cannot listen
+     * on 443 (MEASURED: `listen EACCES 127.0.0.1:443`). The transport's
+     * delivery of a real request and a real body is proved against a real
+     * loopback socket in `packages/shared/src/pinned-request.test.ts`.
+     */
+    const issuerHost = 'idp.acme.test';
     const asked: string[] = [];
-    let fetched = 0;
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = (() => {
-      fetched += 1;
-      return Promise.resolve(
-        new Response(JSON.stringify({ issuer: 'https://idp.acme.test' }), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
-      );
-    });
+    resetSsoTransportCounts();
+    const permit = await pinnedPermitFor(issuerHost, '127.0.0.1');
     configureSsoEgress(() => Promise.resolve((url: string) => {
       asked.push(url);
-      return Promise.resolve(allowedVerdict());
+      return Promise.resolve(allowedVerdict(permit));
     }));
 
-    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: 'https://idp.acme.test', oidcClientId: 'client_1' });
+    const connection = seedConnection({ protocol: 'OIDC', oidcIssuer: `https://${issuerHost}`, oidcClientId: 'client_1' });
     seedDomain(connection);
     await call('GET', `/sso/start/${connection.id}`);
-    globalThis.fetch = realFetch;
 
     /*
      * `endpointsFor` memoises discovery in a MODULE-LEVEL `discoveryCache` that
      * no test resets, so a sibling test that already warmed this issuer would
      * make the guard look unconsulted here. Assert on the issuer this test owns
-     * and tolerate the cache by checking the guard saw it OR the fetch happened
-     * — what must never be true is that neither did.
+     * and tolerate the cache by checking the guard saw it OR a transport
+     * outcome was counted — what must never be true is that neither happened.
      */
-    expect(asked.length + fetched).toBeGreaterThan(0);
+    const counts = ssoTransportCounts();
+    const attempted = [...counts.values()].reduce((sum, n) => sum + n, 0);
+    expect(asked.length + attempted).toBeGreaterThan(0);
     if (asked.length > 0) {
-      expect(asked[0]).toBe('https://idp.acme.test/.well-known/openid-configuration');
+      expect(asked[0]).toBe(`https://${issuerHost}/.well-known/openid-configuration`);
+      // The PINNED arm, not the OBSERVE one. A fabricated permit shape used to
+      // make this go down the unpinned branch without anything noticing.
+      expect(counts.get('OBSERVED_BY_NAME')).toBeUndefined();
+      expect(attempted).toBe(1);
     }
+  });
+});
+
+/**
+ * ═════════════════════════════════════════════════════════════════════════════
+ * THE PIN, AT THE SOCKET, DRIVEN THROUGH THE REAL ROUTE AGAINST A REAL SOCKET.
+ * ═════════════════════════════════════════════════════════════════════════════
+ *
+ * ── THE DEFECT, AS AN ADVERSARY MEASURED IT ────────────────────────────
+ *
+ * `guardOutboundUrl` resolved the provider name, classified every address and
+ * PINNED them — and then `providerFetch` called global `fetch(url)` BY NAME,
+ * which resolves independently. Two DNS queries per request, with no cache
+ * between them, so whoever owns the zone answers the second one differently and
+ * the OIDC client secret goes wherever they like. No timing precision; 100%
+ * reliable.
+ *
+ * ── WHAT THIS BLOCK MEASURES, AND WHY THAT IS THE RIGHT MEASUREMENT ────────
+ *
+ * The defect WAS the second DNS query. So the test counts them: it patches the
+ * REAL `dns.lookup` — the one `node:net` consults, reached through
+ * `createRequire` because this file mocks the `node:dns` ESM module — to record
+ * every call and to answer `127.0.0.1`, which is exactly the attacker's second
+ * answer. A loopback server stands in for the internal host.
+ *
+ * MEASURED on this tree before writing these tests, with a probe against a
+ * loopback server:
+ *
+ *   http.request BY NAME                 -> dns.lookup called ONCE, server HIT
+ *   http.request through an agent lookup -> dns.lookup called ZERO times
+ *   global fetch BY NAME                 -> dns.lookup called ONCE, server HIT
+ *
+ * So "zero recorded system lookups during a real /sso/start" is not a proxy for
+ * the fix; it is the fix, stated as a number. Revert `sendPinned` to
+ * `fetch(target.href, …)` — the exact old code — and the count becomes 1.
+ *
+ * ── AND WHAT IT CANNOT MEASURE HERE, STATED RATHER THAN IMPLIED ───────────
+ *
+ * `safeOutboundUrl` requires https on the DEFAULT PORT, so every provider URL
+ * this path can produce is port 443 — and an unprivileged process cannot
+ * listen there (MEASURED: `listen EACCES 127.0.0.1:443`). The loopback server
+ * below therefore CANNOT be reached at the URL's port whichever transport runs,
+ * so `hits === []` alone would be a VACUOUS assertion and is not what these
+ * tests rest on. It is asserted anyway, because it is the thing that would
+ * break if a future transport rewrote the URL to an address literal with a
+ * port of its own. The non-vacuous assertions are the lookup count and which
+ * arm of `providerFetch` ran.
+ *
+ * That the pinned transport DELIVERS a request and returns a body is proved
+ * against a real loopback socket in `packages/shared/src/pinned-request.test.ts`,
+ * where the URL is free to carry a port.
+ */
+describe('the pinned transport: the socket goes where the guard said', () => {
+  /** The real `dns.lookup`, which `node:net` consults — `node:dns` is mocked here. */
+  const nodeDns = createRequire(import.meta.url)('dns') as typeof import('node:dns');
+
+  const servers: import('node:http').Server[] = [];
+
+  /** A loopback server standing in for the internal host, recording every hit. */
+  async function internalServer(): Promise<{ port: number; hits: string[] }> {
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(req.url ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ issuer: 'whatever' }));
+    });
+    servers.push(server);
+    await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no port');
+    return { port: address.port, hits };
+  }
+
+  /**
+   * REBIND THE NAME, the way an attacker who owns the zone does.
+   *
+   * Returns the recorded hostnames and a restore function. The answer is
+   * `127.0.0.1` so that a transport which resolves the name reaches THIS
+   * machine rather than the internet — nothing in this file may reach a host
+   * the test does not control.
+   */
+  function rebind(name: string): { asked: string[]; restore: () => void } {
+    const asked: string[] = [];
+    const real = nodeDns.lookup;
+    const patched = (host: string, options: unknown, callback?: unknown): void => {
+      if (host !== name) {
+        (real as unknown as (...args: unknown[]) => void)(host, options, callback);
+        return;
+      }
+      asked.push(host);
+      const done = (typeof options === 'function' ? options : callback) as (
+        err: Error | null,
+        address?: unknown,
+        family?: number,
+      ) => void;
+      const all = typeof options === 'object' && options !== null && (options as { all?: boolean }).all === true;
+      done(null, all ? [{ address: '127.0.0.1', family: 4 }] : '127.0.0.1', 4);
+    };
+    // @ts-expect-error the builtin is patched deliberately; `net` reads it at call time.
+    nodeDns.lookup = patched;
+    return {
+      asked,
+      restore: () => {
+        nodeDns.lookup = real;
+      },
+    };
+  }
+
+  afterEach(() => {
+    configureSsoEgress(null);
+    for (const server of servers.splice(0)) server.close();
+  });
+
+  it('makes ZERO DNS queries of its own, so a rebound name reaches nothing', async () => {
+    const issuerHost = 'sso.pin-socket.test';
+    const internal = await internalServer();
+    const rebound = rebind(issuerHost);
+    resetSsoTransportCounts();
+
+    const permit = await pinnedPermitFor(issuerHost, '127.0.0.1');
+    const asked: string[] = [];
+    configureSsoEgress(() =>
+      Promise.resolve((url: string) => {
+        asked.push(url);
+        return Promise.resolve(allowedVerdict(permit));
+      }),
+    );
+
+    const connection = seedConnection({
+      protocol: 'OIDC',
+      oidcIssuer: `https://${issuerHost}`,
+      // Without this the route returns early, BEFORE discovery, and the whole
+      // test passes while measuring nothing.
+      oidcClientId: 'client_1',
+    });
+    seedDomain(connection);
+
+    let reply: Reply;
+    try {
+      reply = await call('GET', `/sso/start/${connection.id}`);
+    } finally {
+      rebound.restore();
+    }
+
+    // The guard WAS consulted, once, for the discovery URL derived from the issuer.
+    expect(asked).toEqual([`https://${issuerHost}/.well-known/openid-configuration`]);
+
+    /*
+     * THE ASSERTION THIS WHOLE ROUND IS FOR. The transport asked the SYSTEM
+     * RESOLVER nothing. Before the fix it asked it once — and that second
+     * query, answered `127.0.0.1` by whoever owns the zone, is how the client
+     * secret reached an internal host with an `authorization` header on it.
+     */
+    expect(rebound.asked).toEqual([]);
+
+    // And the pinned arm ran: a real socket was opened to 127.0.0.1:443 and the
+    // kernel refused it. Not the OBSERVE arm, which would have connected by name.
+    const counts = ssoTransportCounts();
+    expect(counts.get('OBSERVED_BY_NAME')).toBeUndefined();
+    expect((counts.get('TRANSPORT_FAILED') ?? 0) + (counts.get('TIMED_OUT') ?? 0)).toBe(1);
+
+    // Nothing reached the stand-in internal server. See the block header for
+    // why this is a guard against a future transport and not the discriminator.
+    expect(internal.hits).toEqual([]);
+
+    // The login page gets the refusal, and no part of it is an oracle.
+    expect(reply.status).toBe(302);
+    expect(reply.location).not.toContain('127.0.0.1');
+    expect(reply.location).not.toContain(issuerHost);
+    expect(reply.location).not.toContain('TRANSPORT_FAILED');
+  });
+
+  it('refuses a permit pinned to a DIFFERENT host than the URL names', async () => {
+    /*
+     * A caller that pinned `a` and then passed a URL for `b` would send b's
+     * path to a's addresses under b's Host header — worse than no pin at all.
+     * `providerFetch` obtains the permit per URL so this cannot happen by
+     * accident, and the transport refuses it if it ever does.
+     */
+    const issuerHost = 'sso.pin-mismatch.test';
+    const internal = await internalServer();
+    const rebound = rebind(issuerHost);
+    resetSsoTransportCounts();
+
+    const permit = await pinnedPermitFor('sso.somewhere-else.test', '127.0.0.1');
+    configureSsoEgress(() => Promise.resolve(() => Promise.resolve(allowedVerdict(permit))));
+
+    const connection = seedConnection({
+      protocol: 'OIDC',
+      oidcIssuer: `https://${issuerHost}`,
+      oidcClientId: 'client_1',
+    });
+    seedDomain(connection);
+
+    let reply: Reply;
+    try {
+      reply = await call('GET', `/sso/start/${connection.id}`);
+    } finally {
+      rebound.restore();
+    }
+
+    expect(ssoTransportCounts().get('HOST_NOT_THE_PINNED_ONE')).toBe(1);
+    expect(rebound.asked).toEqual([]);
+    expect(internal.hits).toEqual([]);
+    expect(reply.status).toBe(302);
+    // The uniform egress sentence, not a helpful one naming either host.
+    expect(ssoError(reply)).not.toContain(issuerHost);
+    expect(ssoError(reply)).not.toContain('somewhere-else');
+  });
+
+  it('REFUSES a body over the cap instead of parsing the part it read', async () => {
+    /*
+     * ── A CAP THAT WAS NOT THERE AT ALL ───────────────────────────────
+     *
+     * `providerFetch` read `await response.text()` with NO limit, on a leg
+     * reachable by an ANONYMOUS GET /sso/start, so a provider — or whatever a
+     * rebound name pointed at — could stream until the process died. The round
+     * that wired the pin was briefed that "every call site already has a
+     * documented cap"; this one did not, and `PROVIDER_RESPONSE_MAX_BYTES` is
+     * new rather than restated.
+     *
+     * TRUNCATION IS A REFUSAL, NOT A SHORT ANSWER. Parsing the part that fit
+     * would hand `parseDiscovery` a half-document, and an administrator would
+     * be told "your provider has no `issuer`" — a lie about the provider, and
+     * the kind of lie that sends somebody to the wrong vendor's support desk.
+     *
+     * Driven through the OBSERVE arm because that is the arm that still uses
+     * global `fetch`, which a stub can answer; the pinned arm's own cap is
+     * `maxBytes`, which `pinned-request.test.ts` proves against a real socket.
+     */
+    const issuerHost = 'sso.pin-toobig.test';
+    resetSsoTransportCounts();
+
+    const realFetch = globalThis.fetch;
+    let served = 0;
+    globalThis.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!fetchUrlOf(input).includes(issuerHost)) return realFetch(input, init);
+      served += 1;
+      // Comfortably over 256 KiB, and valid JSON so a parse could not be what
+      // refuses it — the cap has to be the thing that does.
+      return Promise.resolve(
+        new Response(JSON.stringify({ issuer: `https://${issuerHost}`, pad: 'x'.repeat(400_000) }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    };
+
+    const io: EgressGuardIo = {
+      classifyHost: (h) => classifyHost(h),
+      classifyAddress: (a) => classifyAddress(a),
+      lookup: async () => [{ address: '169.254.169.254' }],
+      now: () => new Date('2026-11-05T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      delay: async () => {},
+    };
+    configureSsoEgress(() =>
+      Promise.resolve((url: string) =>
+        guardUrl({
+          url,
+          context: 'SSO_METADATA',
+          policy: resolveEgressPolicy({ deployment: 'HOSTED', mode: 'OBSERVE' }),
+          io,
+        }),
+      ),
+    );
+
+    const connection = seedConnection({
+      protocol: 'OIDC',
+      oidcIssuer: `https://${issuerHost}`,
+      oidcClientId: 'client_1',
+    });
+    seedDomain(connection);
+
+    let reply: Reply;
+    try {
+      reply = await call('GET', `/sso/start/${connection.id}`);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(served).toBe(1);
+    // Refused, not redirected to the identity provider.
+    expect(reply.status).toBe(302);
+    expect(reply.location).toContain('sso_error');
+    expect(ssoError(reply)).toContain('larger response than QAAI will read');
+    // And NOT the message a half-parsed document would have produced: the
+    // refusal names the SIZE, not a field the provider is accused of omitting.
+    expect(ssoError(reply)).not.toContain('discovery document');
+    expect(ssoError(reply)).not.toContain('has no');
+  });
+
+  it('connects BY NAME under the OBSERVE brake, and counts that it did', async () => {
+    /*
+     * ── THE CONVERSE OF FAIL-CLOSED, AND IT MATTERS AS MUCH ───────────────
+     *
+     * An OBSERVED permit authorises NO address, so `pinnedRequest` answers
+     * NOT_PINNED. Refusing on that would make the OBSERVE brake a silent
+     * enforcement switch — the opposite of what it promises — so this arm
+     * connects by name exactly as the code did before the pin existed. The
+     * rebinding window is open for those connections, which is why the only
+     * acceptable way to ship it is to COUNT it.
+     *
+     * The system resolver IS consulted here, and that asymmetry with the test
+     * above is the whole evidence that the pinned arm's zero is caused by the
+     * pin and not by something incidental to this harness.
+     */
+    const issuerHost = 'sso.pin-observe.test';
+    const internal = await internalServer();
+    const rebound = rebind(issuerHost);
+    resetSsoTransportCounts();
+
+    const io: EgressGuardIo = {
+      classifyHost: (h) => classifyHost(h),
+      classifyAddress: (a) => classifyAddress(a),
+      lookup: async () => [{ address: '169.254.169.254' }],
+      now: () => new Date('2026-11-05T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      delay: async () => {},
+    };
+    configureSsoEgress(() =>
+      Promise.resolve((url: string) =>
+        guardUrl({
+          url,
+          context: 'SSO_METADATA',
+          policy: resolveEgressPolicy({ deployment: 'HOSTED', mode: 'OBSERVE' }),
+          io,
+        }),
+      ),
+    );
+
+    const connection = seedConnection({
+      protocol: 'OIDC',
+      oidcIssuer: `https://${issuerHost}`,
+      oidcClientId: 'client_1',
+    });
+    seedDomain(connection);
+
+    try {
+      await call('GET', `/sso/start/${connection.id}`);
+    } finally {
+      rebound.restore();
+    }
+
+    const counts = ssoTransportCounts();
+    expect(counts.get('OBSERVED_BY_NAME')).toBe(1);
+    // No pinned outcome was recorded: the pinned arm did not run.
+    expect(counts.get('PINNED_SENT')).toBeUndefined();
+    expect(counts.get('NOT_PINNED')).toBeUndefined();
+    // And the name WAS resolved by the system resolver — by name is what
+    // OBSERVE promises, and the count above is the honest record of it.
+    expect(rebound.asked).toEqual([issuerHost]);
+    // Still unreachable at port 443, so nothing actually arrived; the point of
+    // this test is which arm ran, not what answered.
+    expect(internal.hits).toEqual([]);
   });
 });
 

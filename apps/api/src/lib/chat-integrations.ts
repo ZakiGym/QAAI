@@ -21,6 +21,12 @@
  *  - Validation runs at write time AND again immediately before every send
  *    (`checkChatDestination`), so a ciphertext row edited or imported by some
  *    path that skipped the API still cannot point a payload at the wrong host.
+ *  - THE SEND ITSELF LIVES HERE TOO, for the same reason the validation does.
+ *    `chatDestinationFor` returns the egress PERMIT and {@link sendChatPayload}
+ *    is the only function that opens the socket, so "which transport carries a
+ *    credential-bearing POST" has one answer instead of one per sender. It had
+ *    two, and both of them threw the permit away — see
+ *    {@link CHAT_PIN_LIMITATION}.
  */
 
 import * as dns from 'node:dns';
@@ -28,15 +34,41 @@ import type {
   ChatIntegrationKind,
   EgressGuardIo,
   EgressGuardVerdict,
+  EgressPermit,
   RunFinishedPref,
 } from '@qaai/shared';
 import {
   CHAT_INTEGRATION_KINDS,
+  EGRESS_REFUSAL_SENTENCE,
+  describeWebhookFailure,
   guardUrl,
   refusalForCaller,
   resolveEgressPolicy,
 } from '@qaai/shared';
 import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
+/*
+ * THE PINNED TRANSPORT, IMPORTED BY RELATIVE PATH AND NOT THROUGH THE BARREL.
+ *
+ * `packages/shared/src/pinned-request.ts` imports `node:http` and `node:https`,
+ * and `packages/shared/src/index.ts` is imported by `apps/web`, so it is not in
+ * the barrel and must not be added to it — the same rule that keeps
+ * `private-address.ts` (which reaches for `node:dns`) out of it.
+ *
+ * MEASURED, because the obvious spelling does not work: `@qaai/shared/private-address`
+ * resolves because `packages/shared/package.json` lists it in `exports`, and
+ * `pinned-request` IS NOT LISTED there — `npx tsx` on
+ * `import '@qaai/shared/pinned-request'` fails with ERR_PACKAGE_PATH_NOT_EXPORTED.
+ * So the reachable spelling today is this relative one, which is already how
+ * `notify.ts` imports THIS module across the workspace boundary. The one-line
+ * `exports` entry that would make the tidy spelling work is in the handover;
+ * `packages/shared/package.json` is not this slice's file to edit.
+ */
+import { pinnedRequest } from '../../../../packages/shared/src/pinned-request.js';
+import type {
+  PinnedRequestRefusal,
+  PinnedRequestResult,
+  PinnedRequestInit,
+} from '../../../../packages/shared/src/pinned-request.js';
 import { isInternalHostname, isIpLiteralHost } from './issues.js';
 
 export function isChatIntegrationKind(kind: string): kind is ChatIntegrationKind {
@@ -331,37 +363,60 @@ export function checkChatDestination(
 export type ChatEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
 
 /**
- * WHAT THIS CONTROL DOES NOT DO.
+ * WHAT THIS CONTROL DOES, AND THE THREE PLACES IT STILL DOES NOT.
  *
- * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
- * turns a check into a control. The transports are `notify.ts`, `digest.ts` and
- * the API's test-send endpoint, all of which use Node's GLOBAL `fetch` — and
- * MEASURED on Node v25.6.1, `fetch(url, { agent: new http.Agent({ lookup }) })`
- * answered 200 and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw.
- * There is no supported way to hand global `fetch` a resolver.
+ * ── WHAT CHANGED, AND THE CLAIM THAT HELD IT UP FOR FOUR ROUNDS ─────────────
  *
- * ── TRUE OF `fetch`, AND THE CONCLUSION DRAWN FROM IT WAS WRONG ──────────────
+ * This paragraph used to say the pin COULD NOT be enforced here, and that is
+ * why it is rewritten rather than edited: the sentence a reviewer trusts
+ * instead of reading the code was the thing that kept the hole open. It said
+ * `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200 and never
+ * called the lookup, therefore nothing could pin. That measurement reproduces
+ * (the `agent` option is silently IGNORED, 0 lookup calls — the worst kind of
+ * failure, because it looks like it worked). The CONCLUSION was wrong:
+ * `http.request({ host, port, path, lookup })` answers 200 with the lookup
+ * called ONCE, in Node core, with no dependency change. So the remedy was a
+ * TRANSPORT, and {@link sendChatPayload} is it.
  *
- * That sentence used to end the matter, and a reader took it to mean the pin
- * cannot be enforced. It can. RE-MEASURED on Node v25.6.1 against a loopback
- * server: `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200 with the
- * lookup called ZERO times (the original measurement reproduces — the agent is
- * IGNORED), but `http.request({ host, port, path, lookup })` -> 200 with the
- * lookup called ONCE. Node core honours it, with NO dependency change.
+ * TODAY, for the generic WEBHOOK kind — the only kind whose host a tenant
+ * chooses — the permit's address set IS enforced at the socket: the connection
+ * goes to a classified address and the NAME stays in the request, so Host, SNI
+ * and the certificate check all keep working. A name rebound between the
+ * guard's lookup and the socket's cannot move the POST, so the webhook token in
+ * the path cannot travel to an address nothing classified. MEASURED against a
+ * loopback server standing in for an internal host, with the name resolving to
+ * it and the permit pinning elsewhere: the internal server recorded ZERO hits
+ * and the send refused. The same request with this transport reverted to
+ * `fetch(url)` by name recorded `POST /services/…` with the token in the path.
  *
- * So the remedy is a TRANSPORT and not a dependency: moving this call off global
- * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
- * pin for free. The work is not done here; what is recorded is that the cheap
- * option exists, because the previous wording closed the question.
+ * ── WHAT IS STILL NOT PINNED, AND WHY EACH ONE IS NOT A HOLE ────────────────
  *
- * So every address the name answers with is classified and THE PIN IS NOT
- * ENFORCED AT THE SOCKET. Named rather than papered over, the same way
- * `REFRESH_PIN_LIMITATION` names it on the auth-refresh path.
+ *  1. SLACK, MSTEAMS and DISCORD get NO PERMIT AT ALL, because
+ *     {@link guardChatDestination} returns before the guard for them: their
+ *     hosts come from {@link webhookHostAllowed}, a real host allowlist no
+ *     config row can choose from. There is no pin to enforce, so those three
+ *     still connect BY NAME, and the outcome says so
+ *     (`transport: 'BY_NAME_ALLOWLISTED_HOST'`). A rebind there would need
+ *     control of Slack's or Microsoft's own zone.
+ *  2. An OBSERVED permit authorised no address, so observe mode connects BY
+ *     NAME exactly as it did before this control existed — which is what
+ *     OBSERVE promises — and every such send is reported as
+ *     `transport: 'BY_NAME_OBSERVE_MODE'` for the caller to count. A mode with
+ *     no counter is an off switch with a reassuring name.
+ *  3. The DIGEST processor is not a caller of this door at all: it refuses the
+ *     generic WEBHOOK kind outright and pins the other three to provider hosts,
+ *     so a guard there could never refuse anything. That reasoning is written
+ *     into digest.ts; read it rather than re-deriving it.
+ *
+ * Named rather than papered over, the same way `REFRESH_PIN_LIMITATION` names
+ * what is left on the auth-refresh path.
  */
 export const CHAT_PIN_LIMITATION =
-  'The webhook host was resolved and every address it answered with was classified, but Node’s ' +
-  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
-  'socket.';
+  'A generic WEBHOOK destination is resolved, every address it answered with is classified, and ' +
+  'the connection is made to the pinned address with the name left in the request, so the pinned ' +
+  'address set is enforced at the socket. The three allowlisted provider kinds hold no permit and ' +
+  'still connect by name, and an OBSERVE-mode permit authorises no address, so that send connects ' +
+  'by name and is counted as such.';
 
 /**
  * THE REAL GUARD.
@@ -464,14 +519,33 @@ export function configureChatEgress(next: ChatEgressGuardFactory | null): void {
 }
 
 /**
+ * WHAT A SENDER IS HANDED, AND WHY THE PERMIT IS PART OF IT.
+ *
+ * The `ok` arm used to be `{ ok: true, url }`, and that missing third field was
+ * THE DEFECT this shape exists to close. `guardUrl` hands back a PINNED ADDRESS
+ * SET — the half that turns a check into a control — and both senders read
+ * `verdict.ok`, dropped the permit on the floor and called global `fetch(url)`
+ * by name, which resolves independently. MEASURED on this tree:
+ * `guardChatDestination('WEBHOOK', 'https://hook.acme.test/p/abcdefgh', guard)`
+ * returned an object whose keys were exactly `['ok', 'url']` while the verdict
+ * behind it carried `permit.kind: 'PINNED'` with the classified address right
+ * there.
+ *
+ * `permit: null` IS A FACT AND NOT AN ABSENCE OF ONE: the three allowlisted
+ * provider kinds never reach the guard (their hosts are constants), so there is
+ * no permit to carry and {@link sendChatPayload} must not pretend otherwise.
+ * Null means "no guard decided about this host"; it never means "pin waived".
+ */
+export type ChatDestination =
+  | { readonly ok: true; readonly url: string; readonly permit: EgressPermit | null }
+  | { readonly ok: false; readonly reason: string };
+
+/**
  * Resolve, classify and refuse — the call every sender makes instead of
  * {@link checkChatDestination}. Thin on purpose: it is the one line that is easy
  * to get right and was missing in three places.
  */
-export async function chatDestinationFor(
-  kind: string,
-  rawUrl: string,
-): Promise<{ ok: true; url: string } | { ok: false; reason: string }> {
+export async function chatDestinationFor(kind: string, rawUrl: string): Promise<ChatDestination> {
   return guardChatDestination(kind, rawUrl, await chatGuard());
 }
 
@@ -479,17 +553,268 @@ export async function guardChatDestination(
   kind: string,
   rawUrl: string,
   guard: ChatEgressGuard,
-): Promise<{ ok: true; url: string } | { ok: false; reason: string }> {
+): Promise<ChatDestination> {
   // The synchronous rules FIRST, unchanged — and they are what refuses an
   // unparseable URL, a non-https scheme, embedded credentials and a wrong
   // provider host, none of which should cost a lookup.
   const checked = checkChatDestination(kind, rawUrl);
   if (!checked.ok) return checked;
-  if (kind !== 'WEBHOOK') return checked;
+  // NO PERMIT, SAID OUT LOUD. See ChatDestination above: these three kinds are
+  // pinned to provider hosts by an allowlist, not by an address set.
+  if (kind !== 'WEBHOOK') return { ...checked, permit: null };
 
   const verdict = await guard(checked.url);
   if (!verdict.ok) return { ok: false, reason: refusalForCaller(verdict).sentence };
-  return checked;
+  return { ...checked, permit: verdict.permit };
+}
+
+// ─── The send ────────────────────────────────────────────────────────────────
+
+/**
+ * WHICH TRANSPORT CARRIED A CREDENTIAL-BEARING POST. A closed vocabulary,
+ * because the caller COUNTS it and a count whose buckets are assembled as
+ * strings is one that drifts.
+ *
+ * PINNED is the control working: the socket went to an address the guard
+ * classified, and re-resolution was impossible.
+ *
+ * The two BY_NAME values are the honest names for the two cases where no pin
+ * exists to honour, and they are deliberately NOT one value — "there was never
+ * a permit" and "a permit was issued and it authorised nothing" are different
+ * facts about the install, and the second one is the rollout brake being used.
+ * {@link CHAT_PIN_LIMITATION} explains why neither is a hole.
+ */
+export const CHAT_TRANSPORTS = [
+  'PINNED',
+  'BY_NAME_ALLOWLISTED_HOST',
+  'BY_NAME_OBSERVE_MODE',
+] as const;
+export type ChatTransport = (typeof CHAT_TRANSPORTS)[number];
+
+/**
+ * The cap on the response body the pinned transport reads.
+ *
+ * `pinnedRequest` requires it rather than defaulting it, which is right, and
+ * for these two senders the honest number is SMALL: neither reads the body at
+ * all — the test endpoint reports `responseStatus` and the delivery row stores
+ * it, and nothing anywhere renders a provider's reply. The cap exists so a
+ * hostile receiver cannot stream forever into a worker, not so a body can be
+ * used, which is also why {@link ChatSendOutcome} does not carry `truncated`:
+ * there is no body being reported, so there is nothing for a truncation flag to
+ * be true of. If a sender ever starts reading the reply, that flag has to come
+ * with it.
+ */
+export const CHAT_RESPONSE_MAX_BYTES = 8_192;
+
+export interface ChatSendInit {
+  readonly headers: Readonly<Record<string, string>>;
+  readonly body: string;
+  readonly timeoutMs: number;
+}
+
+export interface ChatSendOutcome {
+  /** The provider's status, or null when no response was received at all. */
+  readonly status: number | null;
+  /** Null exactly when the send landed and the provider was happy. */
+  readonly error: string | null;
+  /** Recorded, never inferred. See {@link CHAT_TRANSPORTS}. */
+  readonly transport: ChatTransport;
+  /**
+   * The pinned transport's own refusal code, for an OPERATOR LOG and nothing
+   * else. A closed vocabulary, which is what makes it safe to write down where
+   * `operatorDetail` is not; null on every by-name send and on every send that
+   * got a response. See {@link chatRefusalForCaller} for what the caller is
+   * told instead.
+   */
+  readonly refusal: PinnedRequestRefusal | null;
+}
+
+/**
+ * THE TRANSPORT SEAM, for the same reason {@link configureChatEgress} exists.
+ *
+ * A send that is only ever tested against a fake transport is a pin nobody has
+ * evidence for — that is precisely how this defect survived four rounds — so
+ * the pin itself is proven in `chat-integrations.test.ts` against REAL loopback
+ * sockets through the REAL default, with no stub installed. This seam is for
+ * the route and processor tests either side of it, which are about the signed
+ * body and the delivery row rather than about the socket, and which cannot use
+ * a real one: a stored WEBHOOK URL is always https on a public name (see
+ * {@link validateChatWebhookUrl}), and a loopback https server would need a
+ * certificate this repository has no way to mint.
+ *
+ * `configureChatTransport(null)` restores the real transport, which is what an
+ * `afterEach` wants so one test cannot leak its fake into the next.
+ */
+export type ChatTransportFn = (
+  permit: EgressPermit,
+  url: string,
+  init: PinnedRequestInit,
+) => Promise<PinnedRequestResult>;
+
+let chatTransport: ChatTransportFn = pinnedRequest;
+
+export function configureChatTransport(next: ChatTransportFn | null): void {
+  chatTransport = next ?? pinnedRequest;
+}
+
+/**
+ * A STATUS THAT IS NOT A SUCCESS, named the way both senders already named it.
+ * A 3xx is reported and never followed: following one would re-post the body,
+ * the signature header and — for a webhook — the token in the path to whatever
+ * `Location` named, which is a host nothing classified.
+ */
+function chatStatusError(status: number): string | null {
+  if (status >= 300 && status < 400) return 'redirected; not followed';
+  if (status < 200 || status >= 300) return `HTTP ${status}`;
+  return null;
+}
+
+/**
+ * A PINNED REFUSAL, IN THE WORDS THIS FILE ALREADY USES.
+ *
+ * `reason` is recorded on the delivery row and shown in the cockpit to whoever
+ * typed the URL, so this maps the transport's six refusals onto sentences that
+ * already existed here and adds NO new one. The four control refusals collapse
+ * onto `EGRESS_REFUSAL_SENTENCE`, the same single sentence every one of the
+ * guard's seventeen refusals produces, because a message distinguishing "the
+ * permit pinned another host" from "that address refused the connection" is a
+ * port scanner with a readable report.
+ *
+ * ── WHAT THIS DELIBERATELY STOPPED SAYING ───────────────────────────────────
+ *
+ * On the old `fetch` path a transport failure went through
+ * `describeWebhookFailure`, which names a CLASS: refused, DNS, TLS, reset. The
+ * pinned transport reports a closed refusal vocabulary instead of a syscall
+ * code, so TRANSPORT_FAILED collapses onto that function's own fallback
+ * sentence and the generic WEBHOOK kind loses that breakdown. That is a real
+ * loss of debuggability and it is stated rather than hidden; inventing a finer
+ * message from `operatorDetail` would both re-open the oracle and render a
+ * string this file has no way to bound. TIMED_OUT keeps its sentence, because
+ * `describeWebhookFailure` says exactly that one for a timeout today.
+ */
+function chatRefusalForCaller(refusal: PinnedRequestRefusal, timeoutMs: number): string {
+  if (refusal === 'TIMED_OUT') return `no answer within ${timeoutMs / 1_000}s`;
+  if (refusal === 'TRANSPORT_FAILED') return 'delivery failed';
+  return EGRESS_REFUSAL_SENTENCE;
+}
+
+/**
+ * POST THE PAYLOAD, TO THE ADDRESS THE PERMIT AUTHORISED.
+ *
+ * The ONE place a chat or webhook POST leaves this product. It was two, and
+ * both of them resolved the name a second time; see {@link CHAT_PIN_LIMITATION}
+ * for the measurement and for what is still not pinned.
+ *
+ * FAILS CLOSED, and the shape says so: every arm either returns a status from a
+ * response that really arrived or an `error`, and there is no path from a
+ * refusal to a send. In particular an OBSERVED permit is NOT handed to
+ * `pinnedRequest` to be refused and then retried by name — that would make the
+ * fall-back an exception handler, which is the shape this rule exists to
+ * outlaw. It is a branch taken on purpose, named in the outcome, and the caller
+ * counts it.
+ *
+ * `operatorDetail` from the transport is NOT logged, recorded or returned here.
+ * It may name a host and the transport's own words, and the transport's own
+ * words are an unbounded Node error message on a path whose URL IS the
+ * credential — the same reason this file already refuses to record `err.message`
+ * from a `fetch` failure. The REFUSAL CODE is the debuggable fact, and it is a
+ * closed vocabulary, so the callers log that.
+ */
+export async function sendChatPayload(
+  destination: { readonly url: string; readonly permit: EgressPermit | null },
+  init: ChatSendInit,
+): Promise<ChatSendOutcome> {
+  const permit = destination.permit;
+
+  if (permit !== null && permit.kind === 'PINNED') {
+    /*
+     * THE THROW IS A REFUSAL, NEVER A FALL-BACK.
+     *
+     * `pinnedRequest` answers with a result rather than throwing for every
+     * failure it anticipates, but it CAN reject: `http.request` validates its
+     * options synchronously inside the promise, so a path or header value Node
+     * rejects arrives here as an exception. Neither is reachable from these two
+     * senders today — the URL was rebuilt from a parsed `URL`, so it is already
+     * percent-encoded, and the headers are a fixed shape — but a worker that
+     * threw out of here would lose the delivery row that is its only record of
+     * the attempt, which is the behaviour the old `catch` around `fetch` had.
+     *
+     * What this handler must never do is retry by name. It reports the same
+     * refusal a transport failure reports and the send does not happen: an
+     * exception handler that falls through to "send it anyway" is exactly the
+     * shape that would re-open this defect from the other side.
+     */
+    let result: PinnedRequestResult;
+    try {
+      result = await chatTransport(permit, destination.url, {
+        method: 'POST',
+        headers: init.headers,
+        body: init.body,
+        timeoutMs: init.timeoutMs,
+        maxBytes: CHAT_RESPONSE_MAX_BYTES,
+      });
+    } catch {
+      // Deliberately not the thrown message: this file does not render a
+      // runtime error on a path whose URL is the credential.
+      result = {
+        ok: false,
+        refusal: 'TRANSPORT_FAILED',
+        operatorDetail: 'the pinned transport threw instead of answering',
+      };
+    }
+    if (!result.ok) {
+      return {
+        status: null,
+        error: chatRefusalForCaller(result.refusal, init.timeoutMs),
+        transport: 'PINNED',
+        refusal: result.refusal,
+      };
+    }
+    return {
+      status: result.response.status,
+      error: chatStatusError(result.response.status),
+      transport: 'PINNED',
+      refusal: null,
+    };
+  }
+
+  /*
+   * BY NAME, and which of the two reasons it was. An OBSERVED permit means the
+   * policy WOULD have refused this destination and the mode is OBSERVE, so the
+   * connection happens exactly as it did before the control existed. Borrowing
+   * a pin it was not given would be worse than the hole OBSERVE leaves open on
+   * purpose.
+   */
+  const transport: ChatTransport =
+    permit === null ? 'BY_NAME_ALLOWLISTED_HOST' : 'BY_NAME_OBSERVE_MODE';
+
+  try {
+    const response = await fetch(destination.url, {
+      method: 'POST',
+      headers: { ...init.headers },
+      body: init.body,
+      // A 3xx is an error, not a hop. Following one would re-post the body —
+      // and the webhook token in the URL — to whatever Location named.
+      redirect: 'manual',
+      signal: AbortSignal.timeout(init.timeoutMs),
+    });
+    return {
+      status: response.status,
+      error: chatStatusError(response.status),
+      transport,
+      refusal: null,
+    };
+  } catch (err) {
+    // Deliberately not err.message: a fetch failure embeds the URL, and the URL
+    // is the credential. The shared classifier names the failure CLASS from the
+    // wrapped syscall code instead.
+    return {
+      status: null,
+      error: describeWebhookFailure(err, init.timeoutMs / 1_000),
+      transport,
+      refusal: null,
+    };
+  }
 }
 
 /**

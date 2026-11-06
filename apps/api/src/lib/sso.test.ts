@@ -827,13 +827,80 @@ describe('guardOutboundUrl resolves the provider host before a secret travels to
 
   it('still permits a real provider, so SSO keeps working', async () => {
     const guard = guardWith({ 'accounts.google.com': ['93.184.216.34'] });
-    const url = await guardOutboundUrl(
+    const { url } = await guardOutboundUrl(
       'https://accounts.google.com/.well-known/openid-configuration',
       'discovery URL',
       guard,
     );
     expect(url.hostname).toBe('accounts.google.com');
     expect(url.pathname).toBe('/.well-known/openid-configuration');
+  });
+
+  it('HANDS BACK THE PERMIT, because dropping it is what made the check cosmetic', async () => {
+    /*
+     * ── THE DEFECT THIS ASSERTION EXISTS FOR ───────────────────────────────
+     *
+     * This function used to return a bare `URL`. The guard had resolved the
+     * name, classified every address and PINNED them — and the pin was dropped
+     * on the floor, after which `providerFetch` called `fetch(url)` by name and
+     * the name was resolved a SECOND time. Whoever owns the zone answers the
+     * second query differently and the client secret follows. Not a timing
+     * race: two queries, no cache between them, 100% reliable.
+     *
+     * So the permit coming back, with the ADDRESSES the guard decided about, is
+     * the half that makes the rest of the control real.
+     */
+    const guard = guardWith({ 'accounts.google.com': ['93.184.216.34', '93.184.216.35'] });
+    const { permit } = await guardOutboundUrl(
+      'https://accounts.google.com/.well-known/openid-configuration',
+      'discovery URL',
+      guard,
+    );
+
+    expect(permit.kind).toBe('PINNED');
+    if (permit.kind !== 'PINNED') return;
+    // EVERY address the name answered with, in the order the zone listed them
+    // — a positional read of the first is what an adversary found last round.
+    expect(permit.pinned.addresses.map((pin) => pin.address)).toEqual([
+      '93.184.216.34',
+      '93.184.216.35',
+    ]);
+    // The host on the permit is the normalised one, which is what
+    // `pinnedRequest` compares the request URL against before it opens a socket.
+    expect(permit.target.host).toBe('accounts.google.com');
+    expect(permit.context).toBe('SSO_METADATA');
+  });
+
+  it('hands back an OBSERVED permit under the brake, with no pin to borrow', async () => {
+    /*
+     * OBSERVE mode is the one arm where the pin is NOT enforced at the socket,
+     * and the type is what makes that impossible to get wrong: an OBSERVED
+     * permit carries `pinned: null`, so a caller cannot connect to "the pinned
+     * addresses" because there are none. `providerFetch` reads this and
+     * connects by name — which is what OBSERVE promises — and counts it.
+     */
+    const io: EgressGuardIo = {
+      classifyHost: (host) => classifyHost(host),
+      classifyAddress: (address) => classifyAddress(address),
+      lookup: async () => [{ address: '169.254.169.254' }],
+      now: () => new Date('2026-10-30T00:00:00.000Z'),
+      monotonicMs: () => 0,
+      delay: async () => {},
+    };
+    const observing: SsoEgressGuard = (url) =>
+      guardUrl({
+        url,
+        context: 'SSO_METADATA',
+        policy: resolveEgressPolicy({ deployment: 'HOSTED', mode: 'OBSERVE' }),
+        io,
+      });
+
+    const { permit } = await guardOutboundUrl('https://sso.attacker.test/', 'issuer URL', observing);
+    expect(permit.kind).toBe('OBSERVED');
+    if (permit.kind !== 'OBSERVED') return;
+    expect(permit.pinned).toBeNull();
+    // And it says which refusal the brake skipped, so the count can too.
+    expect(permit.wouldRefuse).toBeTruthy();
   });
 
   it('says the SAME sentence whatever the reason, so a sign-in page is not a port scanner', async () => {

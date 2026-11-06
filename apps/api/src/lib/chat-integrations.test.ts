@@ -12,15 +12,18 @@
  * a log line, or a delivery row.
  */
 
-import { describe, expect, it } from 'vitest';
+import { createServer } from 'node:http';
+import type { Server } from 'node:http';
+import { afterEach, describe, expect, it } from 'vitest';
 import { EGRESS_REFUSAL_SENTENCE, guardUrl, resolveEgressPolicy } from '@qaai/shared';
-import type { EgressGuardIo } from '@qaai/shared';
+import type { EgressGuardIo, EgressPermit } from '@qaai/shared';
 import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
 import {
   ChatWebhookError,
   DEFAULT_NOTIFY_PREFS,
   chatPayload,
   checkChatDestination,
+  configureChatTransport,
   defaultChatEgressGuard,
   guardChatDestination,
   type ChatEgressGuard,
@@ -30,6 +33,7 @@ import {
   isChatIntegrationKind,
   notifyPrefsOf,
   parseChatConfig,
+  sendChatPayload,
   validateChatWebhookUrl,
   wantsRunFinished,
 } from './chat-integrations.js';
@@ -317,13 +321,32 @@ describe('guardChatDestination resolves a generic webhook host before delivering
     expect(answer.ok).toBe(false);
   });
 
-  it('still delivers to a generic webhook that resolves publicly', async () => {
+  it('still delivers to a generic webhook that resolves publicly, AND HANDS BACK THE PERMIT', async () => {
+    /*
+     * THE PERMIT IS THE DELIVERABLE OF THIS FUNCTION, not a side effect.
+     *
+     * MEASURED before this round: this call returned an object whose keys were
+     * exactly `['ok', 'url']` while the verdict behind it carried
+     * `permit.kind: 'PINNED'` with the classified address right there. Both
+     * senders read `ok`, dropped the permit and called global `fetch(url)` by
+     * name — which resolves independently. The pin is the half that turns a
+     * check into a control, so a destination that arrives without one cannot be
+     * sent to safely.
+     */
     const answer = await guardChatDestination(
       'WEBHOOK',
       'https://hook.acme.test/p/abcdefgh',
       guardWith({ 'hook.acme.test': ['93.184.216.34'] }),
     );
-    expect(answer).toEqual({ ok: true, url: 'https://hook.acme.test/p/abcdefgh' });
+    expect(answer.ok).toBe(true);
+    if (!answer.ok) return;
+    expect(answer.url).toBe('https://hook.acme.test/p/abcdefgh');
+    expect(answer.permit).not.toBeNull();
+    expect(answer.permit?.kind).toBe('PINNED');
+    expect(answer.permit?.pinned?.addresses.map((a) => a.address)).toEqual(['93.184.216.34']);
+    // The pinned host is the NORMALISED one the guard decided about, which is
+    // what `pinnedRequest` compares the URL against.
+    expect(answer.permit?.pinned?.host).toBe('hook.acme.test');
   });
 
   it('keeps every synchronous refusal checkChatDestination already made', async () => {
@@ -364,6 +387,13 @@ describe('guardChatDestination resolves a generic webhook host before delivering
       guard,
     );
     expect(discord.ok).toBe(true);
+    /*
+     * AND THEY CARRY NO PERMIT, which `sendChatPayload` must not paper over.
+     * `permit: null` means "no guard decided about this host", because these
+     * hosts are allowlisted constants — it never means "pin waived".
+     */
+    if (slack.ok) expect(slack.permit).toBeNull();
+    if (discord.ok) expect(discord.permit).toBeNull();
   });
 
   it('says the SAME sentence whatever the reason, so the cockpit is not a port scanner', async () => {
@@ -436,5 +466,333 @@ describe('defaultChatEgressGuard — the guard production actually gets', () => 
   it('permits a public address', async () => {
     const guard = await defaultChatEgressGuard();
     expect((await guard('https://93.184.216.34/p')).ok).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// THE PIN, ENFORCED AT THE SOCKET — AGAINST REAL SOCKETS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * WHY THESE TESTS OPEN REAL LOOPBACK SOCKETS, AND WHY THEY HAVE TO.
+ *
+ * Nothing leaves the machine, and no name is resolved by the system resolver
+ * except `localhost`. That is not a loophole in "no network in tests": a pin
+ * tested only against a fake transport is a pin nobody has evidence for, and
+ * that is exactly how this defect survived four rounds. `guardChatDestination`
+ * returned a permit with a classified address set, both senders read `ok`,
+ * dropped the permit and called global `fetch(url)` by name — and every test
+ * passed, because the fake they asserted against never resolved anything.
+ *
+ * ── THE DISCRIMINATOR, AND THE VACUOUS VERSION OF IT ────────────────────────
+ *
+ * The loopback server plays QAAI's OWN INTERNAL HOST. The destination names
+ * `localhost`, which DOES resolve — to 127.0.0.1, everywhere — and the permit
+ * pins 192.0.2.1 (RFC 5737 TEST-NET-1, which routes nowhere). So a transport
+ * that re-resolves the name reaches the internal server, and one that honours
+ * the pin cannot. A `.invalid` name here would have been VACUOUS: a name that
+ * never resolves fails whether the pin is honoured or not, which
+ * `pinned-request.test.ts` records having learned the hard way.
+ *
+ * MEASURED both ways on this tree. With the transport reverted to
+ * `fetch(destination.url)` — the exact code this round replaced — the internal
+ * server recorded `POST /services/T0001/B0001/<token>`, Host `localhost:<port>`,
+ * with the signature header present. With the pin enforced it recorded nothing.
+ *
+ * ── WHY THEY ENTER AT `sendChatPayload` AND NOT AT A ROUTE ──────────────────
+ *
+ * `validateChatWebhookUrl` forces a WEBHOOK destination to be https on a name
+ * with a dot, and it refuses `localhost` by name — correctly, and those rules
+ * are asserted above. So the only reachable spelling of a real-socket
+ * discriminator is http on `localhost`, which means entering at the function
+ * both senders call with the destination `chatDestinationFor` hands them. The
+ * route and the processor are driven in their own files; what is proven here is
+ * the socket.
+ */
+describe('sendChatPayload connects to the pinned address, not to the name', () => {
+  const servers: Server[] = [];
+
+  afterEach(() => {
+    // The REAL transport, restored, so no test here or later can pass because
+    // a fake was left installed.
+    configureChatTransport(null);
+    for (const server of servers.splice(0)) server.close();
+  });
+
+  /** A loopback server standing in for an internal host; it records every hit. */
+  async function internalHost(status = 200): Promise<{
+    port: number;
+    hits: Array<{ method: string; path: string; host: string | undefined; signed: boolean }>;
+  }> {
+    const hits: Array<{ method: string; path: string; host: string | undefined; signed: boolean }> =
+      [];
+    const server = createServer((req, res) => {
+      hits.push({
+        method: req.method ?? '',
+        path: req.url ?? '',
+        host: req.headers.host,
+        signed: req.headers['x-qaai-signature-256'] !== undefined,
+      });
+      res.writeHead(status, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    servers.push(server);
+    await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
+    const address = server.address();
+    if (address === null || typeof address === 'string') throw new Error('no port');
+    return { port: address.port, hits };
+  }
+
+  /**
+   * A PINNED permit for `host`, pinning exactly `addresses`.
+   *
+   * Built by hand rather than through `guardUrl`, because what is under test is
+   * the TRANSPORT's obedience to a permit and not the policy that issues one —
+   * and because `classifyAddress('192.0.2.1')` is `reserved` on this tree, so
+   * no real policy would ever issue this permit. The real attack is the mirror
+   * image of it: the guard sees a genuinely public address and the attacker's
+   * SECOND answer is 127.0.0.1. Inverting it is what makes a loopback server
+   * usable as the internal host, and `pinned-request.test.ts` inverts it the
+   * same way for the same reason.
+   */
+  function pinned(host: string, addresses: string[], port: number): EgressPermit {
+    return {
+      kind: 'PINNED',
+      context: 'WEBHOOK_DELIVERY',
+      target: { host, scheme: 'http:', port: String(port) },
+      decision: { allowed: true },
+      pinned: {
+        host,
+        addresses: addresses.map((address) => ({
+          address,
+          class: address.startsWith('127.') ? 'loopback' : 'public',
+        })),
+      },
+      wouldRefuse: null,
+    } as unknown as EgressPermit;
+  }
+
+  function observed(host: string, port: number): EgressPermit {
+    return {
+      kind: 'OBSERVED',
+      context: 'WEBHOOK_DELIVERY',
+      target: { host, scheme: 'http:', port: String(port) },
+      decision: { outcome: 'WOULD_REFUSE' },
+      pinned: null,
+      wouldRefuse: 'CLASS_NOT_PERMITTED',
+      observedBy: 'POLICY',
+    } as unknown as EgressPermit;
+  }
+
+  /** The webhook token, in the path, which is where a chat webhook keeps it. */
+  const TOKEN = 'T0001-B0001-cafebabed00d';
+  const SIGNED = {
+    'content-type': 'application/json',
+    'user-agent': 'qaai',
+    'x-qaai-signature-256': 'sha256=00',
+  } as const;
+  const SEND = { headers: SIGNED, body: JSON.stringify({ event: 'test', text: 'hi' }) };
+
+  it('REFUSES when the name is rebound between the guard and the socket, and the internal host records nothing', async () => {
+    const internal = await internalHost();
+    const url = `http://localhost:${internal.port}/services/${TOKEN}`;
+
+    const outcome = await sendChatPayload(
+      { url, permit: pinned('localhost', ['192.0.2.1'], internal.port) },
+      { ...SEND, timeoutMs: 1_200 },
+    );
+
+    // THE ASSERTION THE WHOLE ROUND IS FOR.
+    expect(internal.hits).toEqual([]);
+    expect(outcome.status).toBeNull();
+    expect(outcome.error).not.toBeNull();
+    // The pin was the transport that carried it; it did not quietly fall back.
+    expect(outcome.transport).toBe('PINNED');
+    /*
+     * Either the connection to the pinned address failed or it timed out — a
+     * host that routes nowhere does one or the other depending on the kernel,
+     * and both are refusals. What must never happen is a send.
+     */
+    expect(['TRANSPORT_FAILED', 'TIMED_OUT']).toContain(outcome.refusal);
+    expect(['delivery failed', 'no answer within 1.2s']).toContain(outcome.error);
+    // The URL IS the credential: the path token may not survive into anything a
+    // delivery row, an audit row or a log line is built from.
+    expect(JSON.stringify(outcome)).not.toContain(TOKEN);
+    expect(JSON.stringify(outcome)).not.toContain('/services');
+    expect(JSON.stringify(outcome)).not.toContain('192.0.2.1');
+    expect(JSON.stringify(outcome)).not.toContain('localhost');
+  });
+
+  it('DELIVERS to the pinned address with the NAME still in the request', async () => {
+    /*
+     * Without this arm the test above would also pass if sendChatPayload had
+     * simply stopped working. Here the pin and the resolver agree, so the send
+     * must land — and the Host header must be the NAME, because that is what
+     * keeps SNI and the certificate check working on the https path.
+     */
+    const receiver = await internalHost();
+    const url = `http://localhost:${receiver.port}/services/${TOKEN}`;
+
+    const outcome = await sendChatPayload(
+      { url, permit: pinned('localhost', ['127.0.0.1'], receiver.port) },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(outcome).toMatchObject({ status: 200, error: null, transport: 'PINNED', refusal: null });
+    expect(receiver.hits).toHaveLength(1);
+    expect(receiver.hits[0]).toEqual({
+      method: 'POST',
+      path: `/services/${TOKEN}`,
+      host: `localhost:${receiver.port}`,
+      signed: true,
+    });
+  });
+
+  it('reports a 3xx and does NOT follow it, so the token cannot be re-sent elsewhere', async () => {
+    const receiver = await internalHost(302);
+    const outcome = await sendChatPayload(
+      {
+        url: `http://localhost:${receiver.port}/services/${TOKEN}`,
+        permit: pinned('localhost', ['127.0.0.1'], receiver.port),
+      },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(outcome).toMatchObject({ status: 302, error: 'redirected; not followed' });
+    // One request. A followed redirect would be two.
+    expect(receiver.hits).toHaveLength(1);
+  });
+
+  it('reports a provider refusal as HTTP <status>, the way both senders already did', async () => {
+    const receiver = await internalHost(404);
+    const outcome = await sendChatPayload(
+      {
+        url: `http://localhost:${receiver.port}/services/${TOKEN}`,
+        permit: pinned('localhost', ['127.0.0.1'], receiver.port),
+      },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+    expect(outcome).toMatchObject({ status: 404, error: 'HTTP 404', transport: 'PINNED' });
+  });
+
+  it('connects BY NAME for an OBSERVED permit, and SAYS it did', async () => {
+    /*
+     * OBSERVE promises that the connection happens exactly as it did before the
+     * control existed, so this must reach the server — and it must not be a
+     * silent default. `pinnedRequest` would refuse an OBSERVED permit with
+     * NOT_PINNED; retrying by name in an exception handler is the
+     * "send it anyway" shape that rule exists to outlaw, so the by-name branch
+     * is taken on purpose and named in the outcome for the caller to count.
+     */
+    const receiver = await internalHost();
+    const outcome = await sendChatPayload(
+      {
+        url: `http://localhost:${receiver.port}/services/${TOKEN}`,
+        permit: observed('localhost', receiver.port),
+      },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(outcome).toMatchObject({ status: 200, error: null, transport: 'BY_NAME_OBSERVE_MODE' });
+    expect(receiver.hits).toHaveLength(1);
+    // The refusal code belongs to the pinned transport; nothing refused here.
+    expect(outcome.refusal).toBeNull();
+  });
+
+  it('connects BY NAME when there is no permit at all, and distinguishes that from observe mode', async () => {
+    // The three allowlisted provider kinds never reach the guard, so they hold
+    // no permit. That is a different fact from "a permit authorised nothing",
+    // and collapsing the two would hide the rollout brake being used.
+    const receiver = await internalHost();
+    const outcome = await sendChatPayload(
+      { url: `http://localhost:${receiver.port}/services/${TOKEN}`, permit: null },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(outcome).toMatchObject({ status: 200, transport: 'BY_NAME_ALLOWLISTED_HOST' });
+    expect(receiver.hits).toHaveLength(1);
+  });
+
+  it('refuses a destination whose URL is not the one the permit decided about', async () => {
+    // Defence in depth behind the two senders: a caller that pinned `a` and
+    // passed a URL for `b` would otherwise send b's path to a's addresses under
+    // b's Host header, which is worse than no pin at all.
+    const internal = await internalHost();
+    const outcome = await sendChatPayload(
+      {
+        url: `http://localhost:${internal.port}/services/${TOKEN}`,
+        permit: pinned('elsewhere.example', ['127.0.0.1'], internal.port),
+      },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(internal.hits).toEqual([]);
+    expect(outcome.refusal).toBe('HOST_NOT_THE_PINNED_ONE');
+    // ONE SENTENCE, the same one every guard refusal produces: a message that
+    // distinguished this from "that address refused the connection" would be a
+    // port scanner with a readable report.
+    expect(outcome.error).toBe(EGRESS_REFUSAL_SENTENCE);
+  });
+
+  it('turns a transport that THROWS into a refusal, and never retries by name', async () => {
+    /*
+     * `http.request` validates its options synchronously, so a transport can
+     * reject rather than answer. The send must not happen, and above all it
+     * must not be retried by name in the handler — an exception handler that
+     * falls through to "send it anyway" would re-open this defect from the
+     * other side. The loopback server here is the one a by-name retry would
+     * reach, and it must record nothing.
+     */
+    const internal = await internalHost();
+    configureChatTransport(() => {
+      throw new Error('synchronous option validation failed');
+    });
+
+    const outcome = await sendChatPayload(
+      {
+        url: `http://localhost:${internal.port}/services/${TOKEN}`,
+        permit: pinned('localhost', ['127.0.0.1'], internal.port),
+      },
+      { ...SEND, timeoutMs: 2_000 },
+    );
+
+    expect(internal.hits).toEqual([]);
+    expect(outcome).toMatchObject({
+      status: null,
+      error: 'delivery failed',
+      transport: 'PINNED',
+      refusal: 'TRANSPORT_FAILED',
+    });
+  });
+
+  it('uses the configured transport when one is installed, and the REAL one when it is not', async () => {
+    /*
+     * The seam exists for the route and processor tests either side of this
+     * file, and a seam nobody checks is a seam that can be left installed. The
+     * tests above run with NO transport configured, which is what makes them
+     * evidence about `pinnedRequest`; this one proves the stub is reachable and
+     * that `configureChatTransport(null)` really goes back.
+     */
+    const receiver = await internalHost();
+    const permit = pinned('localhost', ['127.0.0.1'], receiver.port);
+    const url = `http://localhost:${receiver.port}/services/${TOKEN}`;
+
+    const seen: string[] = [];
+    configureChatTransport(async (_permit, asked) => {
+      seen.push(asked);
+      return { ok: true, response: { status: 201, headers: {}, text: '', truncated: false } };
+    });
+    expect(await sendChatPayload({ url, permit }, { ...SEND, timeoutMs: 2_000 })).toMatchObject({
+      status: 201,
+    });
+    expect(seen).toEqual([url]);
+    // The fake answered, so no socket was opened.
+    expect(receiver.hits).toEqual([]);
+
+    configureChatTransport(null);
+    expect(await sendChatPayload({ url, permit }, { ...SEND, timeoutMs: 2_000 })).toMatchObject({
+      status: 200,
+    });
+    expect(receiver.hits).toHaveLength(1);
   });
 });

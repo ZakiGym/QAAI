@@ -27,7 +27,8 @@ import type { BrokerEgressGuard } from './contract-broker.js';
 import { guardUrl, resolveEgressPolicy } from '@qaai/shared';
 import type { EgressGuardIo } from '@qaai/shared';
 import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
-import { collectMessages } from './contract-events.js';
+import type { EgressPermit } from '@qaai/shared';
+import { BODY_SNIPPET_LIMIT, collectMessages, send, sendPinned } from './contract-events.js';
 
 let server: Server;
 let baseUrl: string;
@@ -875,6 +876,286 @@ describe('publishing is never the reason a contract test fails', () => {
     const publishStep = result.steps.at(-1)!;
     expect(publishStep.status).toBe('SKIPPED');
     expect(publishStep.error?.message).toContain('providerVersion');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pin, enforced at the socket
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE DEFECT, REPRODUCED AGAINST A REAL SOCKET AND THEN CLOSED.
+ *
+ * `guardUrl` hands back a PINNED ADDRESS SET. Every credential-carrying path in
+ * this repo used to take that permit, throw it away, and call global
+ * `fetch(url)` BY NAME — a SECOND resolution of the same name, by the transport,
+ * after the guard had already resolved and classified it. An adversary measured
+ * the consequence end to end by patching the `dns.promises.lookup` the guards
+ * close over to answer a public address to query #1 and `127.0.0.1` to query #2:
+ *
+ *     INTERNAL SERVER RECEIVED: POST /rest/api/2/issue
+ *     host: jira.attacker.test | authorization present: true
+ *
+ * Two queries, no cache between them, no timing precision needed, 100%
+ * reliable, with the credential attached.
+ *
+ * These tests open REAL loopback sockets, which is not a violation of "no
+ * network in tests": nothing leaves the machine and the only name resolved by
+ * the system resolver is `localhost`. A pin tested only against a fake transport
+ * is a pin nobody has evidence for, and that is exactly how this defect survived
+ * four rounds of green suites.
+ *
+ * ── WHY THE HOST IS `localhost` AND THE PIN IS A PUBLIC ADDRESS ─────────────
+ *
+ * Because the opposite arrangement is VACUOUS and shipped once already: an
+ * earlier version of the sibling test in `pinned-request.test.ts` used a
+ * `.invalid` hostname, which never resolves, so the request failed whether the
+ * pin was honoured or not and the test passed with no pin at all. `localhost`
+ * DOES resolve, to 127.0.0.1, everywhere. So the permit pins 192.0.2.1 — RFC
+ * 5737 TEST-NET-1, routes nowhere — and the loopback server is the "internal"
+ * one the attacker's second DNS answer points at. A transport that re-resolves
+ * reaches it; one that honours the pin cannot. The first assertion in the test
+ * proves the server really is reachable by name from this process, so "zero
+ * hits" can only mean the pin held.
+ */
+describe('the pin is enforced at the socket', () => {
+  let internal: Server;
+  let internalPort: number;
+  /** Every request the "internal" server received, and whether it carried one. */
+  let hits: Array<{
+    path: string;
+    credentialed: boolean;
+    length: string | undefined;
+    chunked: string | undefined;
+  }>;
+
+  /*
+   * Obviously fake and never key-shaped: this repository has had a finished
+   * green commit rejected by push protection over a literal in a comment
+   * explaining why a key had been removed.
+   */
+  const BROKER_TOKEN = 'not-a-real-broker-token-DO-NOT-LEAK';
+
+  beforeAll(async () => {
+    hits = [];
+    internal = createServer((req, res) => {
+      hits.push({
+        path: req.url ?? '',
+        credentialed: req.headers.authorization !== undefined,
+        length: req.headers['content-length'],
+        chunked: req.headers['transfer-encoding'],
+      });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('x'.repeat(5_000));
+    });
+    await new Promise<void>((ready) => internal.listen(0, '127.0.0.1', ready));
+    internalPort = (internal.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    internal.closeAllConnections();
+    await new Promise<void>((closed) => internal.close(() => closed()));
+  });
+
+  /** A PINNED permit for `host`, pinning exactly `addresses` and nothing else. */
+  const permitFor = (host: string, addresses: readonly string[]): EgressPermit =>
+    ({
+      kind: 'PINNED',
+      context: 'TRACKER_CALL',
+      target: {
+        host,
+        scheme: 'http:',
+        port: String(internalPort),
+        origin: `http://${host}:${internalPort}`,
+      },
+      decision: { allowed: true },
+      pinned: {
+        host,
+        addresses: addresses.map((address) => ({
+          address,
+          class: address.startsWith('127.') ? 'loopback' : 'public',
+        })),
+      },
+      wouldRefuse: null,
+    }) as unknown as EgressPermit;
+
+  it('REFUSES a rebound name, and the credential never reaches the internal server', async () => {
+    const url = `http://localhost:${internalPort}/rest/api/2/issue`;
+
+    /*
+     * ── THE NON-VACUITY CHECK, FIRST ──────────────────────────────────────────
+     *
+     * One request through `send` — the OLD transport, the one that resolves the
+     * name itself — with NO credential on it. It must arrive, because that is
+     * what makes the rest of this test mean something: the internal server IS
+     * reachable from this process by the name `localhost`, so a pinned request
+     * that does not arrive did not fail for some unrelated reason.
+     */
+    const byName = await send(
+      context(),
+      // A DIFFERENT PATH from the one below, so "the pinned request never
+      // arrived" is a statement about the pinned request and not about a path
+      // this probe already put in the log. The first run of this test asserted
+      // the shared path and went red on its own probe.
+      `http://localhost:${internalPort}/probe-reachable-by-name`,
+      'GET',
+      {},
+      undefined,
+      2_000,
+    );
+    expect(byName.status).toBe(200);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.credentialed).toBe(false);
+
+    // Now the same name, with a permit that pins an address that routes nowhere
+    // — the attacker's FIRST DNS answer, the one the guard classified — and the
+    // credential the real publisher carries.
+    const result = await sendPinned(
+      context(),
+      permitFor('localhost', ['192.0.2.1']),
+      url,
+      'POST',
+      { authorization: `Bearer ${BROKER_TOKEN}`, 'content-type': 'application/json' },
+      '{}',
+      1_500,
+      BODY_SNIPPET_LIMIT,
+    );
+
+    // ZERO further hits. The internal server never saw the request at all.
+    expect(hits).toHaveLength(1);
+    expect(hits.some((hit) => hit.credentialed)).toBe(false);
+    expect(hits.some((hit) => hit.path === '/rest/api/2/issue')).toBe(false);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    /*
+     * Either the connection to the pinned address was refused or it timed out.
+     * Both are refusals and which one happens depends on the machine's routing,
+     * so asserting one of them would be asserting the network. What must never
+     * happen is `ok: true`.
+     */
+    expect(['TRANSPORT_FAILED', 'TIMED_OUT']).toContain(result.refusal);
+  });
+
+  it('reaches the pinned address, keeps the name, and SAYS when it capped the body', async () => {
+    /*
+     * A control that refuses everything passes an attack suite and does not
+     * work. This is the same transport doing the job: the pin names 127.0.0.1,
+     * the request arrives, and the 5,000-byte answer comes back capped with
+     * `truncated: true` rather than as a whole answer it is not.
+     */
+    const before = hits.length;
+    const result = await sendPinned(
+      context(),
+      permitFor('localhost', ['127.0.0.1']),
+      `http://localhost:${internalPort}/pacts/provider/p/consumer/c/version/1/verification-results`,
+      'POST',
+      { 'content-type': 'application/json' },
+      '{"success":true}',
+      2_000,
+      100,
+    );
+
+    expect(hits).toHaveLength(before + 1);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.status).toBe(200);
+    expect(result.truncated).toBe(true);
+    expect(result.text.length).toBeLessThanOrEqual(100);
+  });
+
+  it('frames the body the way the old transport did, with a content-length', async () => {
+    /*
+     * ── A SECURITY FIX MUST NOT QUIETLY RESHAPE THE REQUEST ──────────────────
+     *
+     * MEASURED when this moved off `fetch`: `fetch` sets `content-length` from a
+     * string body, while `http.request` with a body written to the stream and no
+     * length sends `transfer-encoding: chunked`. Same body, same headers, two
+     * different requests on the wire — and a broker behind a WAF that rejects a
+     * chunked POST would have started failing with "the broker was unreachable"
+     * as the only visible symptom. `sendPinned` sets the BYTE length, so this
+     * asserts the framing and not just the delivery.
+     */
+    const before = hits.length;
+    const body = JSON.stringify({ success: true, providerApplicationVersion: 'd\u00e9adbee' });
+    const result = await sendPinned(
+      context(),
+      permitFor('localhost', ['127.0.0.1']),
+      `http://localhost:${internalPort}/framing`,
+      'POST',
+      { 'content-type': 'application/json' },
+      body,
+      2_000,
+      BODY_SNIPPET_LIMIT,
+    );
+
+    expect(result.ok).toBe(true);
+    const hit = hits[before]!;
+    expect(hit.chunked).toBeUndefined();
+    // The BYTE length: the payload has a multi-byte character in it on purpose,
+    // because a character count here truncates the request on the wire.
+    expect(hit.length).toBe(String(Buffer.byteLength(body)));
+  });
+
+  it('refuses an OBSERVED permit rather than borrowing a pin it was not given', async () => {
+    /*
+     * An OBSERVED permit authorised NO ADDRESS. The caller in observe mode
+     * connects the way it did before this control existed — that is the
+     * CALLER's decision, made in `contract-broker.ts` and counted there — so
+     * this layer refuses rather than quietly falling back on its behalf.
+     */
+    const before = hits.length;
+    const observed = {
+      kind: 'OBSERVED',
+      context: 'TRACKER_CALL',
+      target: {
+        host: 'localhost',
+        scheme: 'http:',
+        port: String(internalPort),
+        origin: `http://localhost:${internalPort}`,
+      },
+      decision: { allowed: null },
+      pinned: null,
+      wouldRefuse: 'CLASS_NOT_PERMITTED',
+      observedBy: 'POLICY',
+    } as unknown as EgressPermit;
+
+    const result = await sendPinned(
+      context(),
+      observed,
+      `http://localhost:${internalPort}/observed`,
+      'POST',
+      { authorization: `Bearer ${BROKER_TOKEN}` },
+      '{}',
+      1_000,
+      BODY_SNIPPET_LIMIT,
+    );
+
+    expect(hits).toHaveLength(before);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusal).toBe('NOT_PINNED');
+  });
+
+  it('will not start a request on a run that is already cancelled', async () => {
+    const before = hits.length;
+    const cancelled = new AbortController();
+    cancelled.abort();
+    const result = await sendPinned(
+      context({ signal: cancelled.signal }),
+      permitFor('localhost', ['127.0.0.1']),
+      `http://localhost:${internalPort}/cancelled`,
+      'POST',
+      { authorization: `Bearer ${BROKER_TOKEN}` },
+      '{}',
+      1_000,
+      BODY_SNIPPET_LIMIT,
+    );
+
+    expect(hits).toHaveLength(before);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusal).toBe('RUN_CANCELLED');
   });
 });
 

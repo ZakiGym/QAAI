@@ -62,6 +62,27 @@ const MAX_ERROR_SNIPPET = 4_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 
 /**
+ * HOW MUCH OF A PROVIDER'S ANSWER THIS MODULE WILL READ.
+ *
+ * NEW IN THIS CHANGE, and said plainly because the handover that asked for the
+ * change claimed this file already had a response cap to reuse. IT DID NOT:
+ * `sendJson` called `await response.text()` with no ceiling at all. The
+ * requirement surfaced only because `pinnedRequest` makes `maxBytes` mandatory
+ * rather than defaulting it, which is the entire argument for making it
+ * mandatory.
+ *
+ * 64 KiB is chosen against what this file actually READS, not guessed: a Jira
+ * create answers a three-field object (`id`, `key`, `self`), an edit answers 204
+ * with no body at all, and a Jira error collection (`errorMessages` plus
+ * `errors`) is a few hundred bytes. So the cap is orders of magnitude above any
+ * real answer and `truncated` cannot fire on one — and a body that DOES hit it
+ * is reported as a provider failure rather than parsed, because a truncated body
+ * handed to `JSON.parse` fails and then reads as "Jira did not return a key",
+ * which is a different bug with a different fix.
+ */
+const MAX_RESPONSE_BYTES = 64 * 1024;
+
+/**
  * Carries a message that is already safe to show the user and says what to fix.
  * `kind` only decides which HTTP status the route maps it to: CONFIG means the
  * org's integration is wrong, PROVIDER means the tracker refused us.
@@ -205,8 +226,29 @@ export function githubRepoSlug(repo: string): string {
  */
 import * as dns from 'node:dns';
 import { classifyAddress, classifyHost, isPrivateNetworkName } from '@qaai/shared/private-address';
-import { guardUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
-import type { EgressGuardIo, EgressGuardVerdict } from '@qaai/shared';
+import {
+  EGRESS_REFUSAL_SENTENCE,
+  guardUrl,
+  refusalForCaller,
+  resolveEgressPolicy,
+} from '@qaai/shared';
+import type { EgressGuardIo, EgressGuardVerdict, EgressPermit } from '@qaai/shared';
+/*
+ * BY PATH, AND NOT FROM THE BARREL. `pinned-request.ts` imports `node:http` and
+ * `node:https`, and `packages/shared/src/index.ts` is imported by `apps/web`.
+ * `private-address.ts` (which imports `node:dns`) is kept out of the barrel for
+ * the same reason.
+ *
+ * THE SPELLING IS THE ONE THIS WORKSPACE ALREADY USES, checked rather than
+ * invented: `@qaai/shared/pinned-request` does NOT resolve — MEASURED, "Package
+ * subpath './pinned-request' is not defined by exports" — because the exports
+ * map lists only `.`, `./constants`, `./private-address`, `./plugin-manifest`
+ * and `./action-events`. The non-barrel module this app already reaches for,
+ * `sealed.ts`, is reached by relative path with a `.js` specifier from
+ * `lib/vault.ts` and `lib/kms.ts`, so that is what this does too. No
+ * package.json changes.
+ */
+import { pinnedRequest } from '../../../../packages/shared/src/pinned-request.js';
 
 export { isPrivateNetworkName as isInternalHostname };
 /** IPv4 literal or anything with a colon (IPv6, or a port smuggled into a host). */
@@ -477,32 +519,170 @@ export interface CreatedIssue {
 }
 
 /**
- * One request, with the two rules that matter applied in one place: never
- * follow a redirect (the auth header would go with it) and never let a hung
- * provider hold the request open. Returns the parsed JSON without ever logging
- * it.
+ * WHY ONE REASON TO CONNECT BY NAME IS NOT THE SAME AS ANOTHER.
  *
- * THE METHOD IS A PARAMETER AND THE FUNCTION IS STILL ONE FUNCTION. Editing an
- * issue needs PATCH on GitHub and PUT on Jira, and the obvious shortcut — a
- * second `patchJson` next to this one — is how this repo ended up with three
- * implementations of "is this host private", two of which were wrong. Every
- * line below is a refusal that has to hold for an edit exactly as it holds for
- * a create: the Authorization header must not follow a 3xx, the timeout must
- * bound the request, and the response body must never be logged.
+ * CONSTANT_HOST is GitHub and Linear. `API_HOST` is a compile-time constant, no
+ * config can influence it, and the module header states the rule: a configured
+ * repo or URL may only ever derive a PATH. There is no rebinding window to
+ * close, because the name is ours and not the attacker's.
+ *
+ * OBSERVE_MODE is the brake, armed on purpose. An OBSERVED permit authorises NO
+ * addresses — `decideEgress` refuses to issue a pin on an observed refusal — so
+ * `pinnedRequest` refuses it with NOT_PINNED, and it is right to: borrowing a
+ * pin nobody issued would be a worse lie than the hole OBSERVE deliberately
+ * leaves open. Connecting by name is exactly what OBSERVE promises, which is
+ * also what `LoginHostApproval`'s OBSERVED arm decides in
+ * `packages/runner/src/login.ts`. It is COUNTED — see
+ * {@link trackerByNameSends} — because a mode that does not count is an off
+ * switch with a reassuring name.
  */
-async function sendJson(
+export type TrackerByNameReason = 'CONSTANT_HOST' | 'OBSERVE_MODE';
+
+/**
+ * HOW ONE REQUEST IS OPENED — stated by every caller, never defaulted.
+ *
+ * A UNION AND NOT AN OPTIONAL `permit` PARAMETER, deliberately. An optional
+ * parameter is forgotten silently and the request then goes out by name, which
+ * is the defect this change closes arriving by a shorter route: for four rounds
+ * `sendToJira` read `verdict.ok`, threw the permit away, and called global
+ * `fetch(url)`, which resolves the name again.
+ */
+type SendRoute =
+  | { readonly kind: 'PINNED'; readonly permit: EgressPermit }
+  | { readonly kind: 'BY_NAME'; readonly why: TrackerByNameReason };
+
+const BY_NAME_SENDS: Record<TrackerByNameReason, number> = {
+  CONSTANT_HOST: 0,
+  OBSERVE_MODE: 0,
+};
+
+/**
+ * HOW MANY REQUESTS WENT OUT BY NAME, AND WHY.
+ *
+ * Process-local and monotonic, which is all an operator needs from it: the
+ * question it answers is "is this install sending Jira credentials over an
+ * unpinned connection, and is that because somebody armed the brake". A
+ * non-zero OBSERVE_MODE is that answer. CONSTANT_HOST is the denominator — a
+ * count of refusals with no denominator is the kind of number that gets quoted
+ * at a customer and cannot be defended.
+ *
+ * Carries NO host and no URL: a per-host tally on this path would be an
+ * inventory of every tracker hostname an install talks to, and the host belongs
+ * on the persisted `EgressDecisionTally` where an operator needs it.
+ */
+export function trackerByNameSends(): Readonly<Record<TrackerByNameReason, number>> {
+  return { ...BY_NAME_SENDS };
+}
+
+/** What either transport hands back, before this module decides what it means. */
+interface RawAnswer {
+  readonly status: number;
+  readonly text: string;
+  /** True when {@link MAX_RESPONSE_BYTES} bit. Never dropped: see `sendJson`. */
+  readonly truncated: boolean;
+  /** A 3xx a spec-strict runtime reports opaquely instead of as a status. */
+  readonly opaqueRedirect: boolean;
+}
+
+/**
+ * THE PINNED TRANSPORT: the addresses the guard classified, and no second
+ * resolution of the name.
+ *
+ * `pinnedRequest` builds an `http`/`https` Agent with `pinnedLookup(permit)`,
+ * so the socket goes to a classified address while the NAME stays in the
+ * request — Host, SNI and the certificate check all keep working. It never
+ * follows a redirect and that is not configurable, which is the same rule
+ * `redirect: 'manual'` buys on the by-name path.
+ *
+ * ── THE REFUSALS, MAPPED ONTO SENTENCES THIS FILE ALREADY SAYS ──────────────
+ *
+ * Nothing more helpful is added, because a message that distinguished "the
+ * pinned address refused the connection" from "that name does not resolve"
+ * would turn a Jira integration into a port scanner with a readable report,
+ * filed by whoever can edit the integration row.
+ *
+ *   TIMED_OUT         the existing deadline sentence, unchanged.
+ *   TRANSPORT_FAILED  the existing "was unreachable" sentence. A REFUSED PIN
+ *                     surfaces here too — `pinnedLookup` calls back with an
+ *                     Error rather than an empty success — and it is right that
+ *                     the two read alike to a caller.
+ *   the other four    {@link EGRESS_REFUSAL_SENTENCE}, the file's one refusal
+ *                     sentence, because these are facts about OUR permit and
+ *                     not about the provider: calling them "unreachable" would
+ *                     be a small lie in the one place a reader checks. The
+ *                     constant is used directly rather than through
+ *                     `refusalForCaller`, which needs a `GuardVerdict` there is
+ *                     none of here; it is the same string by construction and
+ *                     `issues.test.ts` asserts so.
+ *
+ * `operatorDetail` is deliberately DROPPED rather than attached: it may name
+ * the host and the transport's own words, and this error reaches whoever
+ * supplied the URL.
+ */
+async function openPinned(
   url: string,
   headers: Record<string, string>,
-  payload: unknown,
+  body: string,
+  method: 'POST' | 'PATCH' | 'PUT',
   provider: IssueTrackerKind,
-  method: 'POST' | 'PATCH' | 'PUT' = 'POST',
-): Promise<{ status: number; json: unknown }> {
+  permit: EgressPermit,
+): Promise<RawAnswer> {
+  const result = await pinnedRequest(permit, url, {
+    method,
+    headers,
+    body,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    maxBytes: MAX_RESPONSE_BYTES,
+  });
+
+  if (result.ok) {
+    return {
+      status: result.response.status,
+      text: result.response.text,
+      truncated: result.response.truncated,
+      opaqueRedirect: false,
+    };
+  }
+
+  if (result.refusal === 'TIMED_OUT') {
+    throw new IssueFilingError(
+      `${TRACKER_LABEL[provider]} did not answer within ${REQUEST_TIMEOUT_MS / 1000}s. Nothing was filed — try again.`,
+      'PROVIDER',
+    );
+  }
+  if (result.refusal === 'TRANSPORT_FAILED') {
+    throw new IssueFilingError(
+      `${TRACKER_LABEL[provider]} was unreachable. Nothing was filed — try again.`,
+      'PROVIDER',
+    );
+  }
+  throw new IssueFilingError(EGRESS_REFUSAL_SENTENCE);
+}
+
+/**
+ * THE BY-NAME TRANSPORT: global `fetch`, which resolves the name itself.
+ *
+ * Unchanged from what every provider used to get, and kept for the two reasons
+ * {@link TrackerByNameReason} names. The send is counted here rather than where
+ * the route is chosen, so the number is a count of REQUESTS THAT WENT OUT and
+ * not of decisions that might still have refused.
+ */
+async function openByName(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  method: 'POST' | 'PATCH' | 'PUT',
+  provider: IssueTrackerKind,
+  why: TrackerByNameReason,
+): Promise<RawAnswer> {
+  BY_NAME_SENDS[why] += 1;
+
   let response: Response;
   try {
     response = await fetch(url, {
       method,
-      headers: { ...headers, 'content-type': 'application/json', 'user-agent': 'qaai' },
-      body: JSON.stringify(payload),
+      headers,
+      body,
       // Non-negotiable: a 3xx must surface as an error rather than re-sending
       // the Authorization header to whatever Location names.
       redirect: 'manual',
@@ -519,10 +699,70 @@ async function sendJson(
     );
   }
 
-  // Node's fetch hands back the real 3xx here; a spec-strict runtime hands back
-  // an opaque-redirect with status 0. Both mean the same thing and neither is
-  // followed.
-  if ((response.status >= 300 && response.status < 400) || response.type === 'opaqueredirect') {
+  // Read as text and parse defensively: an error page is often HTML, and
+  // response.json() would throw something less useful than our own message.
+  let text = '';
+  try {
+    text = await response.text();
+  } catch {
+    text = '';
+  }
+
+  /*
+   * THE CAP, APPLIED TO WHAT IS PARSED — AND NOT TO WHAT WAS BUFFERED.
+   *
+   * By the time `text()` resolves, `fetch` has already read the whole body into
+   * memory, so this bounds the parse and NOT the allocation. That is a real
+   * remaining gap on the two constant-host providers and it is named rather
+   * than implied: closing it means reading `response.body` as a stream, which
+   * is a change to the GitHub and Linear paths and not to the one this round
+   * is about. The PINNED path has no such gap — `pinnedRequest` destroys the
+   * response at the cap.
+   */
+  const truncated = Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES;
+
+  return {
+    status: response.status,
+    text,
+    truncated,
+    // Node's fetch hands back the real 3xx; a spec-strict runtime hands back an
+    // opaque-redirect with status 0. Both mean the same thing.
+    opaqueRedirect: response.type === 'opaqueredirect',
+  };
+}
+
+/**
+ * One request, with the rules that matter applied in one place: connect to the
+ * addresses the guard pinned, never follow a redirect (the auth header would go
+ * with it), never let a hung provider hold the request open, and never report a
+ * capped body as a whole one. Returns the parsed JSON without ever logging it.
+ *
+ * THE METHOD AND THE ROUTE ARE PARAMETERS AND THE FUNCTION IS STILL ONE
+ * FUNCTION. Editing an issue needs PATCH on GitHub and PUT on Jira, and the
+ * obvious shortcut — a second `patchJson` next to this one — is how this repo
+ * ended up with three implementations of "is this host private", two of which
+ * were wrong. Every line below is a refusal that has to hold for an edit exactly
+ * as it holds for a create, and for a pinned request exactly as for a by-name
+ * one: the Authorization header must not follow a 3xx, the timeout must bound
+ * the request, and the response body must never be logged.
+ */
+async function sendJson(
+  url: string,
+  headers: Record<string, string>,
+  payload: unknown,
+  provider: IssueTrackerKind,
+  method: 'POST' | 'PATCH' | 'PUT',
+  route: SendRoute,
+): Promise<{ status: number; json: unknown }> {
+  const sent = { ...headers, 'content-type': 'application/json', 'user-agent': 'qaai' };
+  const body = JSON.stringify(payload);
+
+  const answer =
+    route.kind === 'PINNED'
+      ? await openPinned(url, sent, body, method, provider, route.permit)
+      : await openByName(url, sent, body, method, provider, route.why);
+
+  if ((answer.status >= 300 && answer.status < 400) || answer.opaqueRedirect) {
     throw new IssueFilingError(
       `${TRACKER_LABEL[provider]} answered with a redirect, and QAAI will not follow one while holding your token. ` +
         'Check the site URL on that integration.',
@@ -530,18 +770,32 @@ async function sendJson(
     );
   }
 
-  // Read as text and parse defensively: an error page is often HTML, and
-  // response.json() would throw something less useful than our own message.
+  /*
+   * A CAPPED BODY IS NOT AN ANSWER. Parsing it would fail, `json` would be
+   * null, and the caller would report "Jira accepted the issue but did not
+   * return its key" — a sentence that sends somebody to look at their Jira
+   * project for a ticket, about a request whose answer we simply did not read.
+   */
+  if (answer.truncated) {
+    throw new IssueFilingError(
+      `${TRACKER_LABEL[provider]} answered with more than ${MAX_RESPONSE_BYTES / 1024} KiB, which QAAI will not read. ` +
+        'Nothing was filed — try again.',
+      'PROVIDER',
+    );
+  }
+
   let json: unknown = null;
   try {
-    const text = await response.text();
-    json = text ? JSON.parse(text) : null;
+    json = answer.text ? JSON.parse(answer.text) : null;
   } catch {
     json = null;
   }
 
-  return { status: response.status, json };
+  return { status: answer.status, json };
 }
+
+/** GitHub and Linear: the host is a compile-time constant. See {@link TrackerByNameReason}. */
+const CONSTANT_HOST_ROUTE: SendRoute = { kind: 'BY_NAME', why: 'CONSTANT_HOST' };
 
 // ─── The egress guard, at the one seam a customer-named host is reached ──────
 
@@ -570,52 +824,59 @@ async function sendJson(
 export type TrackerEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
 
 /**
- * WHAT THIS CONTROL DOES NOT DO, STATED HERE BECAUSE A COMMENT IS WHAT THE NEXT
- * REVIEWER TRUSTS.
+ * WHAT THIS CONTROL NOW DOES, AND WHAT IT STILL DOES NOT. A COMMENT IS WHAT THE
+ * NEXT REVIEWER TRUSTS INSTEAD OF READING THE CODE, SO IT HAS TO BE TRUE.
+ *
+ * ── THE PIN IS NOW ENFORCED AT THE SOCKET ───────────────────────────────────
  *
  * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
  * turns a check into a control: whoever opens the connection must connect to
- * those addresses and must not resolve the name again. The transport here is
- * Node's GLOBAL `fetch`, and MEASURED on Node v25.6.1:
- * `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200 and NEVER
- * CALLED THE LOOKUP, while `{ dispatcher: new http.Agent(…) }` threw. There is
- * no supported way to hand global `fetch` a resolver, and `undici` — which has
- * `connect: { lookup }` — is present in the tree but is not a declared
- * dependency of any workspace.
+ * those addresses and must not resolve the name again. Until this change the
+ * Jira path got a permit, THREW IT AWAY, and called global `fetch(url)` by name
+ * — which resolves independently. It no longer does. {@link sendToJira} threads
+ * the permit to `pinnedRequest`, which builds an `http`/`https` Agent with
+ * `pinnedLookup(permit)`, so the socket goes to a classified address while the
+ * NAME stays in the request.
  *
- * ── THAT IS TRUE OF `fetch` AND THE CONCLUSION DRAWN FROM IT WAS WRONG ───────
+ * ── THE PARAGRAPH THAT USED TO BE HERE, AND WHY IT WAS WRONG ────────────────
  *
- * This paragraph used to end "there is no supported way", and a reader took it
- * to mean the pin cannot be enforced. It can. RE-MEASURED on Node v25.6.1
- * against a loopback server:
+ * It said: "There is no supported way to hand global `fetch` a resolver", and
+ * three modules carried the same sentence. The MEASUREMENT behind it is real and
+ * reproduces on Node v25.6.1 — `fetch(url, { agent: new http.Agent({ lookup }) })`
+ * answers 200 with the lookup called ZERO times, the agent silently ignored,
+ * which is the worst kind of failure because it looks like it worked. THE
+ * CONCLUSION WAS WRONG: `http.request({ host, port, path, lookup })` answers 200
+ * with the lookup called ONCE, Node core, no dependency change. A true
+ * measurement with a false conclusion closed the question for four rounds, and
+ * that is the shape of comment this file now exists as a warning about.
  *
- *   · `fetch(url, { agent: new http.Agent({ lookup }) })` -> 200, lookup called
- *     ZERO times. The original measurement reproduces: the agent is IGNORED.
- *   · `http.request({ host, port, path, lookup })`        -> 200, lookup called
- *     ONCE. Node core honours it, with NO dependency change.
+ * `undici`'s `{ dispatcher: new undici.Agent({ connect: { lookup } }) }` also
+ * works and would have kept `fetch`, and it is NOT used: `undici` resolves only
+ * out of the dev tree (an optional dependency of `@electron/get`, under a
+ * devDependency of apps/desktop) and no package.json declares it, so it would
+ * be ABSENT under `npm ci --omit=dev`.
  *
- * So the remedy is a transport, not a dependency: moving this call off global
- * `fetch` onto `node:http`/`node:https` with the permit's `lookup` enforces the
- * pin for free. `undici`'s `{ dispatcher: new undici.Agent({ connect: { lookup } }) }`
- * also works and keeps `fetch`, but needs the package declared — it currently
- * resolves only out of the dev tree, under electron, so it would be absent
- * under `npm ci --omit=dev`.
+ * ── WHAT IS STILL NOT CLOSED ────────────────────────────────────────────────
  *
- * Both are real work and neither is done here. What is recorded is that the
- * cheaper one exists, because the previous wording closed the question.
- *
- * So the classification is real, every address the name answers with is
- * classified, and THE PIN IS NOT ENFORCED AT THE SOCKET. The residual hole is
- * exactly one race: a record set that answers a public address to this guard
- * and a private one to `fetch`. It is named rather than papered over, the same
- * way `REFRESH_PIN_LIMITATION` names it on the auth-refresh path, and the
- * remedy is a transport that takes `lookup: pinnedLookup(permit)` — see the
- * handover.
+ *  1. GITHUB AND LINEAR STILL CONNECT BY NAME, on purpose. `API_HOST` is a
+ *     compile-time constant and no config can influence it, so there is no
+ *     rebinding window an attacker can open — the name is ours. They are not
+ *     guarded and not pinned, and {@link TrackerByNameReason} says so.
+ *  2. OBSERVE MODE STILL CONNECTS BY NAME, with the rebinding window open,
+ *     because that is what OBSERVE means. It is counted by
+ *     {@link trackerByNameSends}, so it is a measurable state and not a silent
+ *     one. ENFORCE is the default.
+ *  3. The by-name path still BUFFERS an unbounded response body before the cap
+ *     is applied to the parse — see the note in `openByName`.
+ *  4. `jiraSite` is still a PATTERN MATCH and decides nothing about where a
+ *     host points; the guard plus the pin is what decides. That division is
+ *     unchanged and is described on `jiraSite` itself.
  */
 export const TRACKER_PIN_LIMITATION =
-  'The Jira host was resolved and every address it answered with was classified, but Node’s ' +
-  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
-  'socket.';
+  'The Jira host is resolved, every address it answers with is classified, and the request is ' +
+  'opened to those addresses only — the name is not resolved a second time. GitHub and Linear ' +
+  'still connect by name, because their host is a compile-time constant; so does a permit issued ' +
+  'in OBSERVE mode, which authorises no address and is counted instead.';
 
 /**
  * THE REAL GUARD.
@@ -707,7 +968,47 @@ async function sendToJira(
      */
     throw new IssueFilingError(refusalForCaller(verdict).sentence);
   }
-  return sendJson(url, headers, payload, 'JIRA', method);
+  return sendJson(url, headers, payload, 'JIRA', method, routeFor(verdict.permit));
+}
+
+/**
+ * THE PERMIT, READ RATHER THAN DISCARDED. This function is the whole fix.
+ *
+ * `verdict.ok` was the only thing this path used to look at. The permit beside
+ * it carried the addresses the guard had just classified, and throwing it away
+ * meant the socket resolved the name a second time — which an adversary measured
+ * end to end on this very path: two DNS queries, no cache between them, a public
+ * address to the guard and 127.0.0.1 to the transport, and the Jira credential
+ * arriving at a loopback server as `POST /rest/api/2/issue` with the
+ * authorization header on it. No timing precision, 100% reliable.
+ *
+ * ── THE THREE ARMS, AND WHY NONE OF THEM IS A FALLBACK ──────────────────────
+ *
+ * PINNED with addresses  the request goes to those addresses and nowhere else.
+ *
+ * OBSERVED               by name, counted. The policy would have refused and the
+ *                        mode is OBSERVE, so the connection happens exactly as it
+ *                        did before this control existed. Taking the integration
+ *                        away from an operator who armed the brake would be the
+ *                        silent behaviour change the brake exists to avoid, and
+ *                        `pinnedRequest` cannot be used here anyway: an OBSERVED
+ *                        permit authorises no address and it refuses one with
+ *                        NOT_PINNED.
+ *
+ * PINNED with NO address REFUSED. A pin that authorises nothing is as dangerous
+ *                        as no pin, because `pinnedLookup` answers nothing for an
+ *                        empty set and a resolver that answers nothing falls back
+ *                        to the system one — the rebinding window this pin exists
+ *                        to close, reopened by an empty success.
+ *                        `approvalFor` in `packages/runner/src/login.ts` refuses
+ *                        the same case for the same reason. It is a broken
+ *                        permit, not a mode, so it gets the refusal sentence and
+ *                        not the OBSERVE count.
+ */
+function routeFor(permit: EgressPermit): SendRoute {
+  if (permit.kind === 'OBSERVED') return { kind: 'BY_NAME', why: 'OBSERVE_MODE' };
+  if (permit.pinned.addresses.length === 0) throw new IssueFilingError(EGRESS_REFUSAL_SENTENCE);
+  return { kind: 'PINNED', permit };
 }
 
 /** A sentence per failure shape, saying what the user has to change. */
@@ -768,6 +1069,8 @@ async function fileOnGithub(
     },
     { title: issue.title, body: issue.body, ...(cfg.labels.length ? { labels: cfg.labels } : {}) },
     'GITHUB',
+    'POST',
+    CONSTANT_HOST_ROUTE,
   );
 
   if (status !== 201) throw new IssueFilingError(describeFailure('GITHUB', status), 'PROVIDER');
@@ -860,6 +1163,8 @@ async function fileOnLinear(
       },
     },
     'LINEAR',
+    'POST',
+    CONSTANT_HOST_ROUTE,
   );
 
   if (status !== 200) throw new IssueFilingError(describeFailure('LINEAR', status), 'PROVIDER');
@@ -1012,8 +1317,10 @@ export async function updateIssue(
       { ...(title === undefined ? {} : { title }), ...(body === undefined ? {} : { body }) },
       'GITHUB',
       'PATCH',
+      CONSTANT_HOST_ROUTE,
     );
-    if (status !== 200) throw new IssueFilingError(describeEditFailure('GITHUB', status), 'PROVIDER');
+    if (status !== 200)
+      throw new IssueFilingError(describeEditFailure('GITHUB', status), 'PROVIDER');
     return;
   }
 
@@ -1069,6 +1376,8 @@ export async function updateIssue(
       },
     },
     'LINEAR',
+    'POST',
+    CONSTANT_HOST_ROUTE,
   );
 
   if (status !== 200) throw new IssueFilingError(describeEditFailure('LINEAR', status), 'PROVIDER');

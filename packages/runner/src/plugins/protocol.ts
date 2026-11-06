@@ -21,8 +21,10 @@
  */
 
 import { spawn } from 'node:child_process';
+import { isIP } from 'node:net';
 import { isAbsolute } from 'node:path';
 import {
+  EGRESS_REFUSAL_SENTENCE,
   PROTOCOL_KINDS,
   SELF_HOSTED_EGRESS_POLICY,
   guardUrl,
@@ -31,12 +33,31 @@ import {
   refusalForCaller,
   resolveEgressPolicy,
 } from '@qaai/shared';
+/*
+ * Reached by RELATIVE PATH, for the reason `apps/api/src/lib/kms.ts` records
+ * above its own import of `sealed.ts`: `packages/shared/src/pinned-request.ts`
+ * is deliberately NOT in `packages/shared/src/index.ts` — it imports
+ * `node:http` and `node:https`, and that barrel is imported by `apps/web` —
+ * and `@qaai/shared/pinned-request` is not in that package's `exports` map
+ * either. The fix is one line in `packages/shared/package.json` and it is in
+ * this round's needsFromOtherFiles; adding it to the BARREL would be the wrong
+ * fix and that module's header says so. Until the subpath lands, the
+ * alternative is a second copy of the pinned transport in this file, which for
+ * a control that decides which address a credential is sent to is the worst
+ * possible place to have two.
+ */
+import { pinnedRequest } from '../../../shared/src/pinned-request.js';
+import type {
+  PinnedRequestRefusal,
+  PinnedRequestResult,
+} from '../../../shared/src/pinned-request.js';
 import { childEnv } from '../child-env.js';
 import { resolveInsideWorkspace, runWorkspaceOf } from '../run-workspace.js';
 import type {
   ConsoleEntry,
   EgressGuardIo,
   EgressGuardVerdict,
+  EgressPermit,
   EgressPolicy,
   ExecutableTest,
   GraphqlProtocolSpec,
@@ -57,6 +78,24 @@ const BODY_SNIPPET_LIMIT = 2000;
 const FRAME_SNIPPET_LIMIT = 600;
 /** Cap on transcript entries, so a firehose subscription cannot fill the database. */
 const MAX_TRANSCRIPT_ENTRIES = 300;
+/**
+ * THE CAP ON THE GRAPHQL BODY THIS PATH READS. 8 MiB.
+ *
+ * NEW, and the reason it is new rather than reused is worth stating: the two
+ * numbers above are DISPLAY caps — `BODY_SNIPPET_LIMIT` truncates what is
+ * stored or shown to the model — and until now this path read the body with
+ * `response.text()` and no cap at all. So an endpoint that streams forever
+ * filled the worker's memory, and there was no existing READ cap to adopt.
+ *
+ * `pinnedRequest` requires `maxBytes` and that requirement is what surfaced
+ * this. The number has to be far above any real answer, because a cap that
+ * bites a working customer test is a worse defect than the one it prevents: a
+ * GraphQL introspection document for a very large schema runs to about a
+ * megabyte, so 8 MiB leaves an order of magnitude of headroom and is still
+ * finite. It is the same order as `MAX_GENERATED_FIXTURE_BYTES` in `files.ts`.
+ * When it bites, the caller is TOLD it bit — see `post` below.
+ */
+const MAX_GRAPHQL_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
@@ -109,10 +148,21 @@ function readPath(value: unknown, path: string): unknown {
  * file in the customer's own repository, which the worker then fetches from
  * inside our network. Before {@link guardProtocolTarget} nothing classified it:
  * measured on this tree, zero occurrences of a pin, a resolve or a name-level
- * check anywhere in this file. `fetch` answered `http://169.254.169.254/`, the
- * status went into a `NetworkEntry` (a reachability oracle) and 300 characters
- * of the body came back in a step. The guard is the control; this function only
- * builds the string.
+ * check anywhere in this file. `fetch` answered `http://169.254.169.254/` and
+ * the status went into a `NetworkEntry`, which is a reachability oracle.
+ *
+ * THE BODY CHANNEL IS LARGER THAN THIS PARAGRAPH USED TO SAY, and the number it
+ * gave was the small one. It said "300 characters of the body came back in a
+ * step": that is the non-JSON branch in `runGraphql` and it is real, but
+ * `NetworkEntry.responseBodySnippet` carries up to `BODY_SNIPPET_LIMIT` on a
+ * failing operation, and `recorder.log('↓', …)` puts the WHOLE response text in
+ * the transcript. MEASURED against a loopback server standing in for an
+ * internal host: the marker in its body was absent from the steps and the
+ * network entries and PRESENT in the transcript. So the exfiltration channel is
+ * the response, not a snippet of it.
+ *
+ * The guard is the control and {@link pinnedRequest} is what makes its pin
+ * bind; this function only builds the string.
  */
 function resolveUrl(baseUrl: string, path: string): string {
   return /^https?:\/\//i.test(path) ? path : new URL(path, baseUrl).toString();
@@ -142,26 +192,61 @@ function resolveWsUrl(baseUrl: string, path: string): string {
 export type ProtocolEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
 
 /**
- * WHAT THIS CONTROL DOES NOT DO.
+ * WHERE THE PIN IS ENFORCED NOW, AND WHERE IT STILL IS NOT.
  *
- * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
- * turns a check into a control. The transports here are Node's GLOBAL `fetch`
- * (GraphQL, SSE) and the runtime's GLOBAL `WebSocket`, and MEASURED on Node
- * v25.6.1: `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200
- * and NEVER CALLED THE LOOKUP, while `{ dispatcher: … }` threw. Neither global
- * takes a resolver, and `undici` — which has `connect: { lookup }` — is present
- * in the tree but is not a declared dependency of any workspace.
+ * This paragraph used to say the pin COULD NOT be enforced here. It was wrong,
+ * and it was the reason nothing was done about it for four rounds, so the
+ * correction is written out rather than quietly swapped.
  *
- * So every address the name answers with is classified and THE PIN IS NOT
- * ENFORCED AT THE SOCKET. The residual hole is exactly one race: a record set
- * answering a public address to this guard and a private one to the transport.
- * It is named rather than papered over, the same way `REFRESH_PIN_LIMITATION`
- * names it on the auth-refresh path.
+ * ── WHAT WAS MEASURED, AND WHAT THE OLD NOTE GOT RIGHT AND WRONG ────────────
+ *
+ * The old note said: "MEASURED on Node v25.6.1, `fetch(url, { agent: new
+ * http.Agent({ lookup }) })` answered 200 and NEVER CALLED THE LOOKUP". That
+ * REPRODUCES — the `agent` option is silently ignored by the global `fetch`,
+ * which is the worst kind of failure because it looks like it worked. What did
+ * not follow was the conclusion that nothing could pin: `http.request({ host,
+ * port, path, lookup })` honours the lookup, Node core, no new dependency.
+ * {@link pinnedRequest} is that transport and the GraphQL path now uses it.
+ *
+ * MEASURED HERE, on this file's own production path, with the name rebound
+ * (guard answered 192.0.2.1 for `localhost`, transport resolved it for real):
+ *
+ *   before — POST /graphql reached the loopback server, authorization present,
+ *            status PASSED, and the server's body came back in the transcript
+ *   after  — zero hits on that server, the operation FAILED with the uniform
+ *            sentence, and no byte of its body reached the result
+ *
+ * ── THE TWO TRANSPORTS THAT ARE STILL UNPINNED, AND WHY ─────────────────────
+ *
+ * SSE and WebSocket are NOT pinned and this is the honest statement of it:
+ *
+ *   • SSE reads an open stream incrementally — each event is logged as it
+ *     arrives and each expectation has its own deadline. {@link pinnedRequest}
+ *     buffers to the end of the body and answers once, so porting SSE to it
+ *     would turn a stream that stays open into a TIMED_OUT with every event
+ *     already received thrown away. A streaming sibling is what that path
+ *     needs and it does not exist yet.
+ *   • WebSocket uses the runtime's own global `WebSocket`, which takes no
+ *     resolver at all, and {@link pinnedRequest} opens http(s) and not ws(s).
+ *
+ * Two pins that do NOT work for these, both measured here rather than assumed:
+ * the global `fetch` IGNORES a `host` request header (a loopback server saw
+ * `127.0.0.1:PORT`, not the name), so the address-in-URL-plus-Host-header form
+ * `pinnedRequestTarget` offers is not available through it; and `undici`, which
+ * does take `connect: { lookup }`, resolves only out of the dev tree and is
+ * declared by no package.json, so it would be absent under `npm ci --omit=dev`.
+ *
+ * So the residual hole is the same race as before — a record set answering a
+ * public address to this guard and a private one to the transport — on two of
+ * the four protocols instead of all four. {@link recordUnpinnedConnection}
+ * writes it into the run's transcript every time it is taken, because a
+ * limitation that is only in a comment is one the reader of a run never sees.
  */
 export const PROTOCOL_PIN_LIMITATION =
-  'The endpoint host was resolved and every address it answered with was classified, but neither ' +
-  'Node’s global fetch nor its global WebSocket can be handed a resolver, so the pinned address ' +
-  'set is not enforced at the socket.';
+  'The GraphQL path connects to the pinned address and never resolves the endpoint name a second ' +
+  'time. The SSE and WebSocket paths resolve it again at the socket: Node’s global WebSocket takes ' +
+  'no resolver, and the pinned transport answers a whole body rather than an open stream, so the ' +
+  'pinned address set is not enforced for those two.';
 
 /**
  * THE POLICY A PROTOCOL ENDPOINT IS DECIDED UNDER, AND THE ONE PLACE THE
@@ -298,7 +383,10 @@ async function guardProtocolTarget(
   guard: ProtocolEgressGuard,
   recorder: StepRecorder,
   url: string,
-): Promise<{ readonly ok: true } | { readonly ok: false; readonly sentence: string }> {
+): Promise<
+  | { readonly ok: true; readonly permit: EgressPermit }
+  | { readonly ok: false; readonly sentence: string }
+> {
   const verdict = await guard(egressUrlFor(url));
   if (!verdict.ok) return { ok: false, sentence: refusalForCaller(verdict).sentence };
 
@@ -310,14 +398,100 @@ async function guardProtocolTarget(
      * The brake let this through and it must be VISIBLE, not merely counted
      * somewhere an operator has to go looking. A mode that nobody can see the
      * effect of is an off switch with a reassuring name.
+     *
+     * "and counted" USED TO BE THE TAIL OF THIS SENTENCE AND IT WAS NOT TRUE.
+     * `countGuard` in egress-guard.ts is the counter and it has ZERO production
+     * callers on this tree — measured, not assumed — so nothing aggregated this
+     * anywhere. A message claiming a count that does not exist is exactly the
+     * doc-contradicts-code defect, in the one place a reader would check. This
+     * line IS the record, one per connection, and it now says so; an aggregate
+     * tally needs a sink outside this file and is in needsFromOtherFiles.
      */
     recorder.log(
       '•',
       'This connection would have been refused by the egress policy; the policy is in OBSERVE ' +
-        'mode, so it was allowed and counted.',
+        'mode, so it was allowed, and this line is the record of it.',
     );
   }
-  return { ok: true };
+  /*
+   * THE PERMIT IS RETURNED, and that is the whole of this round's change here.
+   * It was built, read for `ok`, and thrown away — so the pin it carries bound
+   * nothing and the transport resolved the name a second time. Every caller now
+   * either hands it to {@link pinnedRequest} or declares, through
+   * {@link recordUnpinnedConnection}, that it could not.
+   */
+  return { ok: true, permit: verdict.permit };
+}
+
+/**
+ * WHAT A CALLER MAY SAY WHEN A PINNED REQUEST DID NOT HAPPEN. Two sentences for
+ * six refusals, and the split is deliberately NOT by refusal code.
+ *
+ * `pinnedRequest`'s `operatorDetail` names the host and the transport's own
+ * words, and it must never reach a step: whoever wrote the spec chose the host,
+ * so "that address refused the connection" beside "that name does not resolve"
+ * is a port scanner with a readable report. The six refusals collapse to the
+ * two facts a spec author can act on:
+ *
+ *   • WE DID NOT MAKE THE REQUEST — a permit that authorised no address, a URL
+ *     that is not the one that was decided about, a scheme this transport does
+ *     not open. The policy's own sentence already covers this and says what to
+ *     do about it, so it is reused rather than reworded.
+ *   • WE MADE IT AND GOT NOTHING BACK — a transport failure or a deadline.
+ *     ONE sentence for both, because "connection refused" and "no answer at all"
+ *     are two different facts about the inside of our network, and the old code
+ *     put the raw errno and the address into the step for the tenant to read.
+ *
+ * That is strictly less than this path disclosed before: `Request failed:
+ * ${errorText(err)}` rendered `connect ECONNREFUSED 10.0.0.5:80` verbatim.
+ */
+function sentenceForPinnedRefusal(refusal: PinnedRequestRefusal): string {
+  switch (refusal) {
+    case 'TRANSPORT_FAILED':
+    case 'TIMED_OUT':
+      return 'The endpoint did not answer.';
+    case 'NOT_PINNED':
+    case 'UNPARSEABLE_URL':
+    case 'SCHEME_NOT_SUPPORTED':
+    case 'HOST_NOT_THE_PINNED_ONE':
+      return EGRESS_REFUSAL_SENTENCE;
+  }
+}
+
+/**
+ * SAY, IN THE RUN, THAT THIS CONNECTION WENT OUT WITHOUT THE PIN.
+ *
+ * Three callers reach this: SSE and WebSocket, whose transports cannot be
+ * pinned (see {@link PROTOCOL_PIN_LIMITATION}), and any path holding an
+ * OBSERVED permit, which authorised no address at all — in OBSERVE mode the
+ * connection must happen exactly as it did before the control existed, because
+ * that is what OBSERVE promises, and borrowing a pin nobody granted would be
+ * the opposite.
+ *
+ * ── WHY IT IS SILENT FOR A NUMERIC HOST, which is not laziness ──────────────
+ *
+ * The hole is a NAME answered twice. A numeric host has no name for a
+ * nameserver to answer differently, so for `http://10.0.0.5/events` there is
+ * nothing a pin would have closed and claiming otherwise would be a warning
+ * that is simply false. (MEASURED, because the obvious version of this claim is
+ * wrong: the global `fetch` DOES call `dns.lookup` for `127.0.0.1`. It is the
+ * absence of a name, not the absence of a lookup, that shuts the window.)
+ *
+ * A line per connection rather than a summary, for the reason the OBSERVE line
+ * above gives: the reader of a run has to be able to see which connection it
+ * was, and one line per occurrence is also the count.
+ */
+function recordUnpinnedConnection(
+  recorder: StepRecorder,
+  permit: EgressPermit,
+  why: 'the transport cannot be handed a resolver' | 'the egress policy is in observe mode',
+): void {
+  if (isIP(permit.target.host) !== 0) return;
+  recorder.log(
+    '•',
+    `This connection resolved the endpoint name again at the socket, because ${why}; the ` +
+      'classified address set was not enforced for it.',
+  );
 }
 
 /**
@@ -869,10 +1043,128 @@ async function runGraphql(
     return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
   }
 
+  /*
+   * ── THE PIN, HONOURED. This is the defect this round closes. ───────────────
+   *
+   * This used to be `fetch(endpoint, …)`, by NAME, after the guard had already
+   * resolved that name and pinned the addresses it approved. Two resolutions,
+   * no cache between them, so whoever owns the zone answers the second one
+   * differently and the POST — with the interpolated `authorization` header on
+   * it — goes wherever they like. REPRODUCED on this exact path before the
+   * change; the numbers are in {@link PROTOCOL_PIN_LIMITATION}.
+   *
+   * `pinnedRequest` connects to an address the permit authorised and keeps the
+   * NAME in the request, so Host, SNI and the certificate check are untouched.
+   * It never follows a redirect, which is why `redirect: 'manual'` was here and
+   * is why that prose is kept: following one would re-send this body and this
+   * credential to whatever `Location` names, a host nothing classified.
+   *
+   * An OBSERVED permit authorised NO address, so `pinnedRequest` refuses it
+   * with NOT_PINNED. Observe mode has to behave exactly as it did before the
+   * control existed — that is the promise the mode makes — so that case keeps
+   * the old `fetch` and SAYS SO in the transcript rather than failing a test
+   * the brake was meant to let through.
+   */
+  const pinned = allowed.permit.kind === 'PINNED' ? allowed.permit : null;
+  if (pinned === null) {
+    recordUnpinnedConnection(recorder, allowed.permit, 'the egress policy is in observe mode');
+  }
+
   const post = async (
     body: string,
   ): Promise<{ status: number | null; text: string; durationMs: number; error: string | null }> => {
     const began = Date.now();
+    if (pinned !== null) {
+      /*
+       * `pinnedRequest` takes no AbortSignal, so run cancellation is honoured by
+       * RACING it rather than by aborting it. The step returns at once, exactly
+       * as it did when `AbortSignal.any` was passed to `fetch`; the socket it
+       * leaves behind is bounded by the transport's own `timeoutMs`, which is
+       * the spec's deadline, and the transport destroys its agent when it
+       * settles. A cancelled run therefore waits for nothing and leaks nothing
+       * past that deadline. Handing the transport a signal is the better
+       * answer and it is in needsFromOtherFiles.
+       */
+      if (ctx.signal.aborted) {
+        /*
+         * CHECKED BEFORE THE REQUEST IS CONSTRUCTED, not only raced against it.
+         * `Promise.race` builds both sides, so an already-cancelled run would
+         * still have opened the socket and sent the credential before losing the
+         * race. The old `AbortSignal.any([ctx.signal, …])` refused on an
+         * already-aborted signal; this restores that, and the introspection
+         * call is the one `post` the operation loop's own abort check does not
+         * stand in front of.
+         */
+        return { status: null, text: '', durationMs: 0, error: 'cancelled' };
+      }
+      /*
+       * THE LISTENER IS REMOVED WHEN THE REQUEST SETTLES, and that is not
+       * tidiness. `ctx.signal` belongs to the whole RUN, not to this request, so
+       * a listener left behind by every `post` would accumulate one per
+       * operation per GraphQL test — up to 51 from a single spec — each holding
+       * the resolver of a promise that already lost the race. `{ once: true }`
+       * only fires it once; it does not remove it on the path where it never
+       * fires at all, which is the normal path.
+       */
+      let fireCancellation = (): void => {};
+      const cancellation = new Promise<'cancelled'>((done) => {
+        fireCancellation = () => done('cancelled');
+        ctx.signal.addEventListener('abort', fireCancellation, { once: true });
+      });
+      let result: PinnedRequestResult | 'cancelled';
+      try {
+        result = await Promise.race([
+          pinnedRequest(pinned, endpoint, {
+            method: 'POST',
+            headers,
+            body,
+            timeoutMs: spec.timeoutMs,
+            maxBytes: MAX_GRAPHQL_RESPONSE_BYTES,
+          }),
+          cancellation,
+        ]);
+      } finally {
+        ctx.signal.removeEventListener('abort', fireCancellation);
+      }
+      if (result === 'cancelled') {
+        return { status: null, text: '', durationMs: Date.now() - began, error: 'cancelled' };
+      }
+      if (!result.ok) {
+        /*
+         * `result.operatorDetail` is NOT read here. It names the host and the
+         * transport's own words, and the tenant who wrote the spec chose the
+         * host — see {@link sentenceForPinnedRefusal}.
+         */
+        return {
+          status: null,
+          text: '',
+          durationMs: Date.now() - began,
+          error: sentenceForPinnedRefusal(result.refusal),
+        };
+      }
+      if (result.response.truncated) {
+        /*
+         * A CAP THAT BIT IS REPORTED AS A CAP. Handing the truncated text on
+         * would make `JSON.parse` fail and this path would report "Response was
+         * not valid JSON" with a snippet of a body the server never finished —
+         * a reader would conclude the endpoint is broken. The old code had no
+         * cap at all, so an endpoint streaming forever filled the worker's
+         * memory instead; neither is the honest answer and this is.
+         */
+        return {
+          status: result.response.status,
+          text: '',
+          durationMs: Date.now() - began,
+          error: `the response exceeded ${MAX_GRAPHQL_RESPONSE_BYTES} bytes and was not read`,
+        };
+      }
+      return {
+        status: result.response.status,
+        text: result.response.text,
+        durationMs: Date.now() - began,
+        error: null,
+      };
+    }
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -1147,6 +1439,19 @@ async function runWebSocket(
   if (!allowed.ok) {
     return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
   }
+  /*
+   * AND THE PIN IS NOT HONOURED HERE, which is stated rather than left for a
+   * reader to discover. `SocketCtor` below is the runtime's global `WebSocket`:
+   * it takes a URL and nothing else — no resolver, no agent — so the name is
+   * resolved again when it connects, and `pinnedRequest` opens http(s) rather
+   * than ws(s) so it is not the answer either. What the WebSocket path still
+   * owes is in {@link PROTOCOL_PIN_LIMITATION}.
+   */
+  recordUnpinnedConnection(
+    recorder,
+    allowed.permit,
+    'the transport cannot be handed a resolver',
+  );
 
   const frames: string[] = [];
   let cursor = 0;
@@ -1461,6 +1766,28 @@ async function runSse(
   if (!allowed.ok) {
     return refusedByEgress(test, startedAt, recorder, ctx.secrets, allowed.sentence);
   }
+  /*
+   * AND THE PIN IS NOT HONOURED HERE EITHER — stated, not glossed over.
+   *
+   * The GraphQL path above now hands its permit to `pinnedRequest` and never
+   * resolves the endpoint name twice. This one cannot use that transport: a
+   * stream is read INCREMENTALLY below — `reader.read()` in a loop, one `↓`
+   * line per event as it arrives, a separate deadline per expectation — while
+   * `pinnedRequest` answers once, with a whole body, at `end`. Handing this
+   * path to it would turn a stream that legitimately stays open into a
+   * TIMED_OUT with every event already received discarded, which is a worse
+   * lie than the one it would close.
+   *
+   * So this keeps `fetch` and the window stays open for a NAME. The streaming
+   * sibling that would close it is in needsFromOtherFiles; it is not written
+   * here, because a second copy of the pinned transport is the last thing a
+   * control like this needs.
+   */
+  recordUnpinnedConnection(
+    recorder,
+    allowed.permit,
+    'the transport cannot be handed a resolver',
+  );
 
   const controller = new AbortController();
   const onRunAbort = () => controller.abort();

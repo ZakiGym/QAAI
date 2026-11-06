@@ -23,7 +23,6 @@
 import { createHmac } from 'node:crypto';
 import { Router } from 'express';
 import {
-  describeWebhookFailure,
   createChatIntegrationSchema,
   createIntegrationSchema,
   updateChatIntegrationSchema,
@@ -46,9 +45,14 @@ import {
   isChatIntegrationKind,
   maskWebhookUrl,
   parseChatConfig,
+  sendChatPayload,
   validateChatWebhookUrl,
 } from '../lib/chat-integrations.js';
-import type { ChatCredentials, NotifyPrefs } from '../lib/chat-integrations.js';
+import type {
+  ChatCredentials,
+  ChatTransport,
+  NotifyPrefs,
+} from '../lib/chat-integrations.js';
 import { actorOf, requireAuth, requireRole } from '../middleware/auth.js';
 
 export const integrationsRouter: Router = Router();
@@ -465,39 +469,48 @@ integrationsRouter.post('/chat/:id/test', requireRole('ADMIN'), async (req, res)
    * pattern match, so a webhook URL whose name answers 169.254.169.254 passed
    * it with zero DNS queries — and the webhook URL IS the credential, because a
    * Slack or Discord token lives in its path.
+   *
+   * AND IT HANDS BACK THE PERMIT, which this handler used to drop. The permit's
+   * address set is what the send below connects to; see `sendChatPayload`.
    */
   const destination = await chatDestinationFor(row.kind, credentials.url);
 
   let responseStatus: number | null = null;
   let error: string | null = null;
   let attempts = 0;
+  let transport: ChatTransport | null = null;
 
   if (!destination.ok) {
     error = destination.reason;
   } else {
+    /*
+     * ── AND THEN TO THE ADDRESS THE PERMIT AUTHORISED ───────────────────────
+     *
+     * This was `fetch(destination.url)`, which resolves the name a SECOND time
+     * and so threw away the half of the guard that is a control. The webhook
+     * URL IS the credential here — a Slack or Discord token lives in its path —
+     * so a name rebound between the guard's lookup and the socket's sent that
+     * token wherever the second answer pointed. `sendChatPayload` connects to
+     * the pinned address with the NAME left in the request;
+     * `CHAT_PIN_LIMITATION` records the measurement and what is still by-name.
+     *
+     * `attempts: 1` STAYS TRUE, which is worth saying because the comment above
+     * this handler promises it: of the transport's six refusals, four are
+     * decided before a socket is opened, and all four are unreachable from here
+     * by construction — a non-PINNED permit never reaches the transport at all,
+     * the URL passed `validateChatWebhookUrl` so it parses and is https, and it
+     * is the very URL the guard decided about. What is reachable is a timeout
+     * or a transport failure, and both of those did try to connect.
+     */
     attempts = 1;
-    try {
-      const response = await fetch(destination.url, {
-        method: 'POST',
-        headers,
-        body,
-        // A 3xx is an error, not a hop. Following one would re-post the body —
-        // and the webhook token in the URL — to whatever Location named.
-        redirect: 'manual',
-        signal: AbortSignal.timeout(TEST_TIMEOUT_MS),
-      });
-      responseStatus = response.status;
-      if (response.status >= 300 && response.status < 400) {
-        error = 'redirected; not followed';
-      } else if (!response.ok) {
-        error = `HTTP ${response.status}`;
-      }
-    } catch (err) {
-      // Classified without the URL — the failure CLASS (refused / DNS / TLS /
-      // reset) is what an operator debugs with, and none of it carries the
-      // credential the way err.message would.
-      error = describeWebhookFailure(err, TEST_TIMEOUT_MS / 1000);
-    }
+    const outcome = await sendChatPayload(destination, {
+      headers,
+      body,
+      timeoutMs: TEST_TIMEOUT_MS,
+    });
+    responseStatus = outcome.status;
+    error = outcome.error;
+    transport = outcome.transport;
   }
 
   // Decided in one attempt, never PENDING: the test button does not retry —
@@ -523,7 +536,16 @@ integrationsRouter.post('/chat/:id/test', requireRole('ADMIN'), async (req, res)
     action: 'integration.test',
     targetType: 'Integration',
     targetId: row.id,
-    metadata: { kind: row.kind, ok: !error, responseStatus },
+    /*
+     * `transport` IS THE COUNT, not decoration. An OBSERVE-mode permit
+     * authorises no address, so that send connects by name exactly as it did
+     * before this control existed — which is what OBSERVE promises — and a mode
+     * with no counter is an off switch with a reassuring name. Recorded on
+     * every test send, so "how many of these skipped the pin, and which
+     * integrations" is one query over AuditLog. Null only when the destination
+     * was refused and nothing was sent at all.
+     */
+    metadata: { kind: row.kind, ok: !error, responseStatus, transport },
   });
 
   res.json({ ok: !error, responseStatus, error, deliveryId: delivery.id });

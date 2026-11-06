@@ -35,7 +35,24 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net';
 import { z } from 'zod';
 import { pactContractSpecSchema } from '@qaai/shared';
-import type { NetworkEntry, RunContext } from '@qaai/shared';
+import type { EgressPermit, NetworkEntry, RunContext } from '@qaai/shared';
+/*
+ * BY PATH, NOT OUT OF THE BARREL, and that is the shipped rule rather than a
+ * preference: `pinned-request.ts` imports `node:http`/`node:https`, and
+ * `packages/shared/src/index.ts` is imported by `apps/web`. `private-address.ts`
+ * (which imports `node:dns`) is handled the same way and says so.
+ *
+ * A RELATIVE PATH because `@qaai/shared/pinned-request` DOES NOT RESOLVE —
+ * MEASURED, not assumed: `packages/shared/package.json`'s `exports` map lists
+ * `.`, `./constants`, `./private-address`, `./plugin-manifest` and
+ * `./action-events` and nothing else, and importing the subpath fails with
+ * "Package subpath './pinned-request' is not defined by exports". That one-line
+ * map entry is the right fix and is in the handover; it is not this slice's
+ * file to edit, and five agents editing one `exports` map is a merge conflict
+ * with a security consequence.
+ */
+import { pinnedRequest } from '../../shared/src/pinned-request.js';
+import type { PinnedRequestRefusal } from '../../shared/src/pinned-request.js';
 
 /** Response bodies are truncated before they are stored or shown to the model. */
 export const BODY_SNIPPET_LIMIT = 2000;
@@ -162,6 +179,170 @@ export async function send(
   } finally {
     done();
   }
+}
+
+/**
+ * ════════════════════════════════════════════════════════════════════════════
+ * THE SAME REQUEST, TO THE ADDRESS A PERMIT PINNED.
+ * ════════════════════════════════════════════════════════════════════════════
+ *
+ * {@link send} above calls global `fetch(url)` BY NAME, so the name is resolved
+ * a second time, by the transport, after the guard already resolved and
+ * classified it. That second resolution is the whole defect: an adversary who
+ * owns the authoritative nameserver answers query #1 with a public address (the
+ * guard approves) and query #2 with `127.0.0.1` (the socket goes inside).
+ *
+ * MEASURED ON THIS PATH, not inherited from a report about another one. The real
+ * `defaultBrokerEgressGuard` and the real `send` were run against a loopback
+ * server with `dns.promises.lookup` and `dns.lookup` patched to answer a
+ * public-classified address once and `127.0.0.1` after that:
+ *
+ *     guard verdict: ok, pinned [{"address":"3fff::1","class":"public"}]
+ *     dns queries  : #1 broker.attacker.test -> 3fff::1   (the guard's)
+ *                    #2 broker.attacker.test -> 127.0.0.1 (the transport's)
+ *     internal saw : POST /pacts/provider/p/consumer/c/pact-version/v/
+ *                    verification-results
+ *                    host: broker.attacker.test:55741 | credentialed: TRUE
+ *
+ * Two queries, no cache between them, no timing precision needed, 100%
+ * reliable. Through `sendPinned` the same scenario produces ONE query — the
+ * guard's — and the internal server sees NOTHING, because there is no second
+ * query left for an attacker to answer.
+ *
+ * `send` is kept exactly as it is — six callers replay a provider's
+ * own documented endpoints through it — and the ONE caller that carries a
+ * customer's credential to a destination out of a config field uses this
+ * instead.
+ *
+ * ── WHAT THIS GIVES THE CALLER, AND WHAT IT DELIBERATELY WITHHOLDS ──────────
+ *
+ * A closed result, not a `SentRequest`. The refusal is a CODE and never a
+ * sentence, and `pinnedRequest`'s `operatorDetail` — which may name a host and
+ * a transport error — IS DROPPED HERE. Every caller in this file turns its
+ * answer into a run step a tenant reads, and a message that distinguishes "that
+ * address refused the connection" from "that name does not resolve" is a port
+ * scanner with a readable report. The runner has no operator-only sink to put
+ * it in; when one exists, this is where it goes.
+ *
+ * ── THE TWO THINGS THIS CANNOT DO THAT `send` CAN ───────────────────────────
+ *
+ *   · IT DOES NOT ABORT ON RUN CANCELLATION. `send` builds an `AbortSignal`
+ *     from `ctx.signal`; `PinnedRequestInit` takes a `timeoutMs` and no signal,
+ *     and `pinned-request.ts` is nobody's file to widen this round. So a
+ *     cancelled run no longer tears the socket down and waits out the caller's
+ *     timeout instead. The signal IS still honoured BEFORE the request, so a
+ *     cancelled run never STARTS a new credentialed one, and an optional
+ *     `signal` on `PinnedRequestInit` is in the handover.
+ *   · IT DOES NOT FOLLOW REDIRECTS, which is not a loss: `send` passes
+ *     `redirect: 'manual'` for the same reason and the broker publisher refuses
+ *     a 3xx outright rather than re-sending a token to whatever `Location`
+ *     names.
+ */
+export type PinnedSendRefusal =
+  | PinnedRequestRefusal
+  /** `ctx.signal` was already aborted. Nothing was sent. */
+  | 'RUN_CANCELLED'
+  /**
+   * A PINNED permit carrying an EMPTY address set, refused here rather than
+   * handed to the transport. `pinnedLookup` does fail closed on one — it calls
+   * back with an Error and never falls through to the system resolver — so this
+   * is defence in depth and not the only guard: `login.ts` refuses the same
+   * case for the same reason, because a pin that authorises nothing is as
+   * dangerous as no pin and reads like a success.
+   */
+  | 'PIN_AUTHORISED_NOTHING';
+
+export type PinnedSent =
+  | {
+      readonly ok: true;
+      readonly status: number;
+      /** Lower-cased, and a repeated header joined — exactly as `send` reports them. */
+      readonly headers: Record<string, string>;
+      readonly text: string;
+      /**
+       * True when `maxBytes` bit. A truncated body reported as a whole one is
+       * how a reader comes to believe a provider answered something it did not,
+       * so it is returned rather than folded into `text`.
+       */
+      readonly truncated: boolean;
+      readonly durationMs: number;
+    }
+  | { readonly ok: false; readonly refusal: PinnedSendRefusal; readonly durationMs: number };
+
+export async function sendPinned(
+  ctx: RunContext,
+  permit: EgressPermit,
+  url: string,
+  method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
+  headers: Record<string, string>,
+  body: string | undefined,
+  timeoutMs: number,
+  /**
+   * The cap on the body read, in bytes. Required, like `PinnedRequestInit`'s
+   * own: every caller already has a documented cap and two numbers in two
+   * places is how one of them stops being the real one.
+   */
+  maxBytes: number,
+): Promise<PinnedSent> {
+  const started = Date.now();
+
+  // FAIL CLOSED, and before anything is written to a socket: a cancelled run
+  // does not open a new credentialed request.
+  if (ctx.signal.aborted) return { ok: false, refusal: 'RUN_CANCELLED', durationMs: 0 };
+
+  if (permit.kind === 'PINNED' && permit.pinned.addresses.length === 0) {
+    return { ok: false, refusal: 'PIN_AUTHORISED_NOTHING', durationMs: Date.now() - started };
+  }
+
+  /*
+   * ── CONTENT-LENGTH, BECAUSE THE FRAMING CHANGED AND THAT WAS MEASURED ─────
+   *
+   * `fetch` sets `content-length` from a string body; `http.request` with a
+   * body written to the stream and no length set sends
+   * `transfer-encoding: chunked` instead. MEASURED on a loopback server, same
+   * body, same headers:
+   *
+   *     by fetch -> content-length: 55
+   *     by pin   -> transfer-encoding: chunked
+   *
+   * Framing is not cosmetic: a provider behind a WAF or a proxy that rejects a
+   * chunked POST would start failing for a reason that has nothing to do with
+   * the security fix, and "the broker was unreachable" would be the only thing
+   * anyone saw. Set here rather than in the shared transport because the
+   * transport is nobody's file this round — and the BYTE length, not the string
+   * length, or a multi-byte character truncates the request on the wire.
+   *
+   * A caller that set its own is left alone: disagreeing with it would be two
+   * facts in one request.
+   */
+  const framed =
+    body === undefined || Object.keys(headers).some((key) => key.toLowerCase() === 'content-length')
+      ? headers
+      : { ...headers, 'content-length': String(Buffer.byteLength(body)) };
+
+  const result = await pinnedRequest(permit, url, {
+    method,
+    headers: framed,
+    body,
+    timeoutMs,
+    maxBytes,
+  });
+  const durationMs = Date.now() - started;
+  if (!result.ok) return { ok: false, refusal: result.refusal, durationMs };
+
+  const received: Record<string, string> = {};
+  for (const [key, value] of Object.entries(result.response.headers)) {
+    if (value === undefined) continue;
+    received[key.toLowerCase()] = Array.isArray(value) ? value.join(', ') : value;
+  }
+  return {
+    ok: true,
+    status: result.response.status,
+    headers: received,
+    text: result.response.text,
+    truncated: result.response.truncated,
+    durationMs,
+  };
 }
 
 export function toNetworkEntry(method: string, url: string, sent: SentRequest): NetworkEntry {

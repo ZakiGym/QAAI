@@ -21,6 +21,7 @@ import {
   SECRET_MASK,
   SELF_HOSTED_EGRESS_POLICY,
   guardUrl,
+  resolveEgressPolicy,
 } from '@qaai/shared';
 import type { EgressGuardIo, ExecutableTest, RunContext, TestExecution } from '@qaai/shared';
 import { classifyAddress, classifyHost } from '@qaai/shared/private-address';
@@ -1274,5 +1275,235 @@ describe('a PROTOCOL endpoint is classified before it is opened', () => {
     // One entry: the operation. Introspection is off in this fixture.
     expect(execution.network).toHaveLength(1);
     expect(execution.network[0]!.url).toBe(`${elsewhere}/graphql`);
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // The pin, at the socket
+  // ───────────────────────────────────────────────────────────────────────────
+
+  /**
+   * A string that exists only inside the internal server's answer, so "did any
+   * of its body reach the tenant" is one assertion and not a guess.
+   */
+  const INTERNAL_BODY_MARKER = 'INTERNAL-ONLY-BODY-6f2a91';
+
+  /**
+   * A loopback server that is the INTERNAL host, and counts what reached it.
+   *
+   * It records the PRESENCE of the authorization header, never its value: a
+   * credential must not be in a test's memory any more than in a log line.
+   */
+  async function internalHost(): Promise<{
+    port: number;
+    hits: Array<{ method: string; path: string; host: string; authPresent: boolean }>;
+  }> {
+    const hits: Array<{ method: string; path: string; host: string; authPresent: boolean }> = [];
+    const base = await httpServer((req, res) => {
+      hits.push({
+        method: req.method ?? '',
+        path: req.url ?? '',
+        host: req.headers.host ?? '',
+        authPresent: typeof req.headers.authorization === 'string',
+      });
+      sendJson(res, { data: { secret: INTERNAL_BODY_MARKER } });
+    });
+    return { port: Number(new URL(base).port), hits };
+  }
+
+  /** Everything the tenant who wrote the spec can read back. */
+  const tenantVisible = (execution: TestExecution): string =>
+    JSON.stringify({
+      steps: execution.steps,
+      network: execution.network,
+      console: execution.console,
+      errorMessage: execution.errorMessage,
+    });
+
+  const credentialled = (endpoint: string) =>
+    makeTest({
+      protocol: 'GRAPHQL',
+      endpoint,
+      // The credential this path carries, interpolated from `ctx.secrets` the
+      // way a vault-backed spec does.
+      headers: { authorization: 'Bearer {{PROBE_CREDENTIAL}}' },
+      timeoutMs: 400,
+      operations: [{ name: 'read secret', query: '{ secret }' }],
+    });
+
+  it('REFUSES when the endpoint name is rebound between the guard and the socket', async () => {
+    /*
+     * ── THE DEFECT, MEASURED ON THIS PATH AND THEN CLOSED ─────────────────────
+     *
+     * `guardUrl` pins the addresses it approved, and until this round `runGraphql`
+     * read `verdict.ok`, threw the permit away and called `fetch(endpoint)` by
+     * NAME. Two resolutions per request, no cache between them, so whoever owns
+     * the zone answers the second one differently. Run against this very
+     * fixture before the change:
+     *
+     *   INTERNAL SERVER RECEIVED: POST /graphql
+     *   host: localhost:PORT | authorization present: true
+     *   status PASSED, and the server's body came back in the transcript
+     *
+     * THE HOST NAME IS `localhost` ON PURPOSE and the test is vacuous without
+     * it. A `.invalid` or `.test` name never resolves, so the request would fail
+     * whether the pin was honoured or not — `pinned-request.test.ts` records a
+     * version of itself that was vacuous for exactly that reason. `localhost`
+     * DOES resolve, to 127.0.0.1, everywhere: so the guard is handed a zone that
+     * answers a PUBLIC unroutable address (192.0.2.1, RFC 5737 TEST-NET-1) —
+     * the attacker's first answer, which the policy permits and pins — and the
+     * real resolver is the attacker's second answer, pointing at the loopback
+     * server below. A transport that re-resolves reaches it. One that honours
+     * the pin cannot. Nothing but `localhost` is resolved and nothing leaves
+     * the machine.
+     */
+    const internal = await internalHost();
+
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com', { PROBE_CREDENTIAL: 'probe-value-not-a-credential' }),
+      credentialled(`http://localhost:${internal.port}/graphql`),
+      guardWith({ localhost: ['192.0.2.1'] }),
+    );
+
+    // THE ASSERTION THIS ROUND EXISTS FOR: the internal server was never reached,
+    // so the credential in the header never left for it.
+    expect(internal.hits).toEqual([]);
+    // Not PASSED. A rebound endpoint reported as a pass is the worst outcome.
+    expect(execution.status).toBe('FAILED');
+    /*
+     * And no part of the internal server's body reached the tenant who chose
+     * the host — this path logs the whole response into the transcript and
+     * returns 300 characters of it in a step, so the body is an exfiltration
+     * channel and not only the status an oracle.
+     */
+    expect(tenantVisible(execution)).not.toContain(INTERNAL_BODY_MARKER);
+    // The reachability oracle is closed with it: no status came back.
+    expect(execution.network[0]?.status).toBeNull();
+    /*
+     * The refusal says the same thing whatever went wrong. `operatorDetail`
+     * from the transport names the host and the socket error — `connect
+     * ECONNREFUSED 10.0.0.5:80` was rendered verbatim here before — and it is
+     * deliberately not read.
+     */
+    expect(execution.errorMessage).toBe('Request failed: The endpoint did not answer.');
+  });
+
+  it('still reaches a pinned NAME, with the name intact in the Host header', async () => {
+    /*
+     * The other half, and without it the test above is satisfied by a plugin
+     * that refuses everything. The same `localhost` endpoint, pinned to the
+     * address it really has: the request must go through, AND the Host header
+     * must still be the NAME — which is why the pin is on the resolver rather
+     * than a rewrite of the URL to an address literal. On https that header is
+     * also the SNI name and what the certificate is checked against.
+     */
+    const internal = await internalHost();
+
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com', { PROBE_CREDENTIAL: 'probe-value-not-a-credential' }),
+      credentialled(`http://localhost:${internal.port}/graphql`),
+      guardWith({ localhost: ['127.0.0.1'] }),
+    );
+
+    expect(execution.status).toBe('PASSED');
+    expect(internal.hits).toHaveLength(1);
+    expect(internal.hits[0]?.host).toBe(`localhost:${internal.port}`);
+    expect(internal.hits[0]?.path).toBe('/graphql');
+    // The credential still arrives: pinning the address must not drop a header.
+    expect(internal.hits[0]?.authPresent).toBe(true);
+  });
+
+  it('does not follow a redirect away from the pinned host', async () => {
+    /*
+     * Following one would re-send this body and this `authorization` header to
+     * whatever `Location` names, which is a host nothing classified — the same
+     * reason the old code passed `redirect: 'manual'`, now enforced by a
+     * transport where it is not configurable.
+     */
+    const elsewhere = await internalHost();
+    const redirector = await httpServer((_req, res) => {
+      res.writeHead(302, { location: `http://localhost:${elsewhere.port}/graphql` });
+      res.end();
+    });
+
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com', { PROBE_CREDENTIAL: 'probe-value-not-a-credential' }),
+      credentialled(`http://localhost:${Number(new URL(redirector).port)}/graphql`),
+      guardWith({ localhost: ['127.0.0.1'] }),
+    );
+
+    // The 302 came back as a 302 and the credential went nowhere else.
+    expect(elsewhere.hits).toEqual([]);
+    expect(execution.network[0]?.status).toBe(302);
+  });
+
+  it('in OBSERVE mode connects by NAME as before, and says that it did', async () => {
+    /*
+     * An OBSERVED permit authorised NO address, so `pinnedRequest` refuses it
+     * with NOT_PINNED. Fail-closed is the wrong reading of that here: OBSERVE
+     * promises that today's traffic keeps flowing, so this path must connect
+     * the way it did before the control existed — and must SAY so, because a
+     * connection that went out unpinned and silently is the limitation nobody
+     * ever reads about in the comment.
+     */
+    const internal = await internalHost();
+
+    const execution = await protocolPlugin.execute(
+      makeCtx('https://app.example.com', { PROBE_CREDENTIAL: 'probe-value-not-a-credential' }),
+      credentialled(`http://localhost:${internal.port}/graphql`),
+      // 10.0.0.5 is private, HOSTED permits public only, the mode is OBSERVE.
+      guardWith({ localhost: ['10.0.0.5'] }, resolveEgressPolicy({ deployment: 'HOSTED', mode: 'OBSERVE' })),
+    );
+
+    // The brake did not brake, which is what OBSERVE means: it connected.
+    expect(internal.hits).toHaveLength(1);
+    expect(execution.status).toBe('PASSED');
+    const transcript = execution.console.map((entry) => entry.text).join('\n');
+    expect(transcript).toContain('would have been refused by the egress policy');
+    expect(transcript).toContain('resolved the endpoint name again at the socket');
+  });
+
+  it('says the SSE and WebSocket streams were not pinned, rather than implying they were', async () => {
+    /*
+     * `PROTOCOL_PIN_LIMITATION` used to say the pin could not be enforced
+     * ANYWHERE in this plugin, and that claim is now false for GraphQL and
+     * still true for these two — SSE is read incrementally and the pinned
+     * transport answers a whole body, and the global `WebSocket` takes no
+     * resolver at all. A limitation that lives only in a comment is one the
+     * reader of a run never sees, so each such connection writes a line.
+     */
+    const internal = await internalHost();
+    const sse = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      makeTest({
+        protocol: 'SSE',
+        path: `http://localhost:${internal.port}/events`,
+        connectTimeoutMs: 400,
+        expect: [{ name: 'first event', event: 'tick', count: 1, timeoutMs: 400 }],
+      }),
+      guardWith({ localhost: ['127.0.0.1'] }),
+    );
+    expect(sse.console.map((e) => e.text).join('\n')).toContain(
+      'resolved the endpoint name again at the socket',
+    );
+
+    /*
+     * And it is SILENT for a numeric host, because there is no name for a
+     * nameserver to answer differently — a warning there would simply be false.
+     * MEASURED rather than reasoned: the global `fetch` DOES call `dns.lookup`
+     * for `127.0.0.1`, so it is the absence of a NAME and not of a lookup that
+     * shuts the window.
+     */
+    const literal = await protocolPlugin.execute(
+      makeCtx('https://app.example.com'),
+      makeTest({
+        protocol: 'SSE',
+        path: `http://127.0.0.1:${internal.port}/events`,
+        connectTimeoutMs: 400,
+        expect: [{ name: 'first event', event: 'tick', count: 1, timeoutMs: 400 }],
+      }),
+    );
+    expect(literal.console.map((e) => e.text).join('\n')).not.toContain(
+      'resolved the endpoint name again at the socket',
+    );
   });
 });

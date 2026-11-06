@@ -26,6 +26,29 @@
  *      ticket was rewritten.
  *
  * `fetch` is stubbed globally; nothing here opens a socket.
+ *
+ * ── WHAT MOVED OUT OF THIS FILE, AND WHY ────────────────────────────────────
+ *
+ * THE JIRA PATH NO LONGER GOES THROUGH GLOBAL `fetch`. It threads the permit
+ * `guardUrl` issued into `pinnedRequest`, which opens the connection to the
+ * addresses the guard classified and does NOT resolve the name again — the half
+ * of the control that was missing while this path got a permit and discarded
+ * it. A stub of `fetch` therefore cannot observe a Jira send at all, and the two
+ * tests here that asserted one by reading `sent[0]` have moved to
+ * `issues.pin.test.ts`, where a real loopback server records which address the
+ * socket actually went to.
+ *
+ * `expect(sent).toEqual([])` in the Jira blocks below is NOT vacuous because of
+ * that: it is now also the assertion that the Jira path has not regressed to
+ * global `fetch`. The refusals it guards are proven against a real socket as
+ * well, in `issues.pin.test.ts`.
+ *
+ * It also removed a DNS query this file used to make. `updateIssue(jira, …)`
+ * with no injected guard built the real `defaultTrackerEgressGuard`, which
+ * resolved `acme.atlassian.net` through the system resolver; with the pin
+ * enforced that would have gone on to open a TCP connection to Atlassian from
+ * the unit suite. Every Jira test here now either injects a guard or refuses
+ * before the guard runs.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -176,25 +199,12 @@ describe('updateIssue — GitHub', () => {
 });
 
 describe('updateIssue — Jira', () => {
-  it('PUTs the issue on the validated site, keyed by its own key', async () => {
-    stubFetch({ status: 204 });
-
-    await updateIssue(jira, TOKEN, 'QA-12', patch);
-
-    expect(sent[0]!.url).toBe('https://acme.atlassian.net/rest/api/2/issue/QA-12');
-    expect(sent[0]!.method).toBe('PUT');
-    expect(sent[0]!.body).toEqual({
-      fields: { summary: 'A new title', description: 'A new body' },
-    });
-  });
-
-  it('accepts the 204 Jira actually answers with', async () => {
-    // A successful Jira edit has no body. An implementation that insisted on
-    // 200 would report every successful rewrite as a failure.
-    stubFetch({ status: 204 });
-    await expect(updateIssue(jira, TOKEN, 'QA-12', patch)).resolves.toBeUndefined();
-  });
-
+  /*
+   * THE URL, THE METHOD, THE BODY AND THE 204 ARE ASSERTED IN
+   * `issues.pin.test.ts`, against a real loopback server, because the Jira path
+   * now sends through `pinnedRequest` and a `fetch` stub cannot see it. What is
+   * left here is the refusal that happens BEFORE any transport is chosen.
+   */
   it('refuses a key that is not a key, before sending anything', async () => {
     stubFetch({ status: 204 });
 
@@ -386,15 +396,26 @@ describe('the Jira path resolves its host before it sends the token', () => {
     expect(sent).toEqual([]);
   });
 
-  it('still sends to a Jira site that resolves publicly — the product keeps working', async () => {
-    stubFetch({ status: 204 });
-    const egress = guardWith({ 'acme.atlassian.net': ['93.184.216.34'] });
+  it('still PERMITS a Jira site that resolves publicly, and pins what it resolved', async () => {
+    /*
+     * The product keeps working: a real Jira Cloud site is allowed, and the
+     * permit carries the address the guard classified so the socket can be held
+     * to it. ASSERTED ON THE VERDICT AND NOT BY SENDING, deliberately — with the
+     * pin enforced, driving the send here would open a TCP connection to
+     * 93.184.216.34 from the unit suite. That the send then goes to the pinned
+     * address and nowhere else is proven in `issues.pin.test.ts` against a
+     * loopback server.
+     */
+    const verdict = await guardWith({ 'acme.atlassian.net': ['93.184.216.34'] })(
+      'https://acme.atlassian.net/rest/api/2/issue/QA-12',
+    );
 
-    await updateIssue(jira, TOKEN, 'QA-12', patch, egress);
-
-    expect(sent).toHaveLength(1);
-    expect(sent[0]!.url).toBe('https://acme.atlassian.net/rest/api/2/issue/QA-12');
-    expect(sent[0]!.method).toBe('PUT');
+    expect(verdict.ok).toBe(true);
+    if (!verdict.ok) return;
+    expect(verdict.permit.kind).toBe('PINNED');
+    if (verdict.permit.kind !== 'PINNED') return;
+    expect(verdict.permit.pinned.host).toBe('acme.atlassian.net');
+    expect(verdict.permit.pinned.addresses.map((pin) => pin.address)).toEqual(['93.184.216.34']);
   });
 
   it('guards the CREATE path too, not only the edit', async () => {

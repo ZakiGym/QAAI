@@ -89,6 +89,27 @@ export const CLOCK_SKEW_SECONDS = 60;
 /** Neither provider needs longer than this to answer a back-channel call. */
 export const REQUEST_TIMEOUT_MS = 10_000;
 
+/**
+ * THE CAP ON A PROVIDER'S ANSWER, AND IT IS NEW — THERE WAS NONE.
+ *
+ * Stated plainly because the round that wired the pin was briefed that "every
+ * call site already has a documented cap", and MEASURED on this tree that is
+ * not true here: `providerFetch` read `await response.text()` with no limit, so
+ * a provider — or whatever a rebound name pointed at — could stream until the
+ * process ran out of memory on a path reachable by an ANONYMOUS request to
+ * /sso/start. The transport this now uses requires a cap rather than defaulting
+ * one, which is how the absence came to light.
+ *
+ * 256 KiB, and the number is argued rather than picked: the four answers this
+ * path reads are a discovery document (~2 KB), a JWKS (a dozen RSA keys is
+ * ~6 KB), a token response (~4 KB with a fat ID token) and a userinfo document
+ * (~1 KB). Two orders of magnitude of headroom means no real provider meets it,
+ * and a body that does is reported as truncated rather than parsed — see
+ * `providerFetch`, which refuses a truncated answer instead of handing a
+ * half-read document to `parseDiscovery`.
+ */
+export const PROVIDER_RESPONSE_MAX_BYTES = 256 * 1024;
+
 // ─── Constant-time comparison ────────────────────────────────────────────────
 
 /**
@@ -233,7 +254,7 @@ export function safeRelativePath(next: unknown, fallback = '/runs'): string {
 import * as dns from 'node:dns';
 import { classifyAddress, classifyHost, isPrivateNetworkName } from '@qaai/shared/private-address';
 import { guardUrl, refusalForCaller, resolveEgressPolicy } from '@qaai/shared';
-import type { EgressGuardIo, EgressGuardVerdict } from '@qaai/shared';
+import type { EgressGuardIo, EgressGuardVerdict, EgressPermit } from '@qaai/shared';
 
 /**
  * Hosts an issuer is permitted to name in its discovery document, beyond its
@@ -334,27 +355,63 @@ export function safeOutboundUrl(raw: string, what: string): URL {
 export type SsoEgressGuard = (url: string) => Promise<EgressGuardVerdict>;
 
 /**
- * WHAT THIS CONTROL DOES NOT DO, STATED BECAUSE A COMMENT IS WHAT THE NEXT
- * REVIEWER TRUSTS INSTEAD OF READING THE CODE.
+ * WHAT THIS CONTROL DOES, AND THE THREE THINGS IT STILL DOES NOT — STATED
+ * BECAUSE A COMMENT IS WHAT THE NEXT REVIEWER TRUSTS INSTEAD OF READING THE
+ * CODE, AND THE PREVIOUS VERSION OF THIS PARAGRAPH SAID THE FIX WAS IMPOSSIBLE.
+ *
+ * ── WHAT CHANGED ────────────────────────────────────────────────────────────
  *
  * `guardUrl` hands back a PINNED ADDRESS SET, and the pin is the half that
  * turns a check into a control: whoever opens the connection must connect to
- * those addresses and must not resolve the name again. The transport is
- * `providerFetch` in `apps/api/src/routes/sso.ts`, which uses Node's GLOBAL
- * `fetch` — and MEASURED on Node v25.6.1,
- * `fetch(url, { agent: new http.Agent({ lookup }) })` answered 200 and NEVER
- * CALLED THE LOOKUP, while `{ dispatcher: … }` threw. There is no supported way
- * to hand global `fetch` a resolver.
+ * those addresses and must not resolve the name again. For four rounds this
+ * paragraph said the second half could not be done, on the strength of a real
+ * measurement and a wrong conclusion drawn from it:
  *
- * So every address the name answers with is classified and THE PIN IS NOT
- * ENFORCED AT THE SOCKET. The residual hole is exactly one race, and it is
- * named here rather than papered over, the same way `REFRESH_PIN_LIMITATION`
- * names it on the auth-refresh path.
+ *   MEASURED, AND STILL TRUE: `fetch(url, { agent: new http.Agent({ lookup }) })`
+ *   answers 200 with the lookup called ZERO times. The `agent` option is
+ *   silently ignored, which is the worst kind of failure because it looks like
+ *   it worked.
+ *
+ *   THE CONCLUSION THAT WAS WRONG: "there is no supported way to hand a
+ *   resolver to the transport". `http.request({ host, port, path, agent })`
+ *   with a `lookup` on the agent answers 200 with the lookup called ONCE —
+ *   Node core, no dependency change. RE-MEASURED on this tree against a
+ *   loopback server: by name, `dns.lookup` is consulted once; through an agent
+ *   carrying a `lookup`, it is consulted ZERO times.
+ *
+ * So `providerFetch` in `apps/api/src/routes/sso.ts` no longer calls global
+ * `fetch` for a PINNED permit. It calls `pinnedRequest`, which builds an agent
+ * around `pinnedLookup(permit)`, keeps the NAME in the request (Host, SNI and
+ * the certificate check all still work) and lets only the ADDRESS be decided by
+ * the permit. THE PIN IS NOW ENFORCED AT THE SOCKET, and the rebinding window
+ * between the guard's DNS query and the transport's is closed because the
+ * transport makes no DNS query at all.
+ *
+ * ── WHAT IS STILL NOT ENFORCED ──────────────────────────────────────────────
+ *
+ *   1. OBSERVE MODE CONNECTS BY NAME, deliberately. An OBSERVED permit carries
+ *      no addresses — `decideEgress` refuses to issue a pin on an observed
+ *      refusal — so there is nothing to pin to, and borrowing one would be
+ *      claiming an authorisation nobody gave. The brake means "behave as before
+ *      and count it", so `providerFetch` connects by name and counts the
+ *      connection as OBSERVED_BY_NAME. The rebinding window is open for exactly
+ *      those connections and for no others.
+ *   2. THE ADDRESSES ARE NOT RE-CLASSIFIED AT CONNECT TIME. They do not need to
+ *      be — they are the ones the guard classified — but a permit held across a
+ *      long gap is a decision about a record set that may have changed. Nothing
+ *      in this path holds one: the permit is obtained per URL, immediately
+ *      before the request.
+ *   3. SAML'S OUTBOUND LEG HAS NO BACK-CHANNEL TO PIN. /sso/start redirects the
+ *      BROWSER to `samlSsoUrl`; QAAI opens no socket, so there is no transport
+ *      here to hand a resolver to. `safeOutboundUrl` is the whole control on
+ *      that URL and that is the honest description of it.
  */
 export const SSO_PIN_LIMITATION =
-  'The provider host was resolved and every address it answered with was classified, but Node’s ' +
-  'global fetch cannot be handed a resolver, so the pinned address set is not enforced at the ' +
-  'socket.';
+  'The provider host is resolved once, every address it answers with is classified, and the ' +
+  'pinned address set is enforced at the socket — the transport opens the connection through the ' +
+  'permit’s own resolver and makes no DNS query of its own. The one exception is OBSERVE mode, ' +
+  'which authorises no address and therefore connects by name, exactly as it did before this ' +
+  'control existed, and is counted as such.';
 
 /**
  * THE REAL GUARD, built from the deployment's own policy when it has one.
@@ -391,14 +448,28 @@ export async function defaultSsoEgressGuard(policy?: unknown): Promise<SsoEgress
 }
 
 /**
- * {@link safeOutboundUrl} AND THEN THE RESOLUTION IT CANNOT DO.
+ * {@link safeOutboundUrl}, THEN THE RESOLUTION IT CANNOT DO, AND THE PERMIT
+ * THAT RESOLUTION PRODUCED.
  *
- * This is the function `providerFetch` must call instead of `safeOutboundUrl`:
- * it keeps every refusal that one makes, in the same order, and adds the one
- * nobody was making. Shaped to RETURN THE SAME `URL` and THROW THE SAME
- * `SsoError` so the call site is a one-line change and the three endpoints —
- * discovery, token, JWKS — are all covered by it. The exact edit is in the
- * handover; this slice does not own `apps/api/src/routes/sso.ts`.
+ * This is the function `providerFetch` calls instead of `safeOutboundUrl`: it
+ * keeps every refusal that one makes, in the same order, and adds the one
+ * nobody was making.
+ *
+ * ── WHY IT RETURNS THE PERMIT AND NOT JUST THE URL ──────────────────────
+ *
+ * It used to return a bare `URL`, and that WAS the defect: the guard resolved
+ * the name, pinned the addresses it had classified, and this function dropped
+ * the pin on the floor. The caller then called `fetch(url)` by name, which
+ * resolved the name a SECOND time — so whoever owns the zone answers the second
+ * query differently and the client secret goes wherever they like. No timing
+ * precision, 100% reliable.
+ *
+ * Returning `{ url, permit }` rather than taking a callback or moving the
+ * request in here keeps the two jobs apart: this module stays free of
+ * `node:http`, and the one caller that opens sockets stays the one place that
+ * decides what to do with a refused or unpinned one. It has exactly one
+ * production caller (`providerFetch`), so widening it is a change to one call
+ * site and to this file's own tests.
  *
  * ── The refusal is ONE SENTENCE ────────────────────────────────────────────
  *
@@ -418,7 +489,7 @@ export async function guardOutboundUrl(
   raw: string,
   what: string,
   guard: SsoEgressGuard,
-): Promise<URL> {
+): Promise<{ readonly url: URL; readonly permit: EgressPermit }> {
   // The synchronous rules FIRST, unchanged: https only, no userinfo, no
   // non-default port, no IP literal, no recognisable internal name, no `..` —
   // and the normalised host, which is what gets resolved below. A refusal here
@@ -429,7 +500,16 @@ export async function guardOutboundUrl(
   if (!verdict.ok) {
     throw new SsoError(refusalForCaller(verdict).sentence, 'CONFIG');
   }
-  return url;
+  /*
+   * BOTH, and the URL is the NORMALISED one rather than `permit.target.origin`.
+   * The permit records an origin and deliberately no path or query (a webhook
+   * path IS a credential, and `GuardedTarget` says so), so rebuilding the
+   * request URL from the permit would silently drop
+   * `/.well-known/openid-configuration`. The permit's host and the URL's host
+   * are the same string by construction — the guard was handed `url.href` —
+   * and `pinnedRequest` refuses the pair if they ever stop being.
+   */
+  return { url, permit: verdict.permit };
 }
 
 /**

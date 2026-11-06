@@ -985,10 +985,34 @@ export interface PinnedLookupAddress {
  * only one of them would silently fall back to the system resolver for the
  * other, which is the pin not applying — the exact failure this adapter exists
  * to prevent.
+ *
+ * ── `family` IS NOT JUST A NUMBER, AND THAT WAS A LATENT BUG ─────────────────
+ *
+ * Node's own `LookupOptions.family` is `number | 'IPv4' | 'IPv6'` — it has
+ * accepted the string spellings since Node 18, and `http.Agent` passes through
+ * whatever it was given. This type declared `number`, so the compiler accepted
+ * it right up until a real `node:http` caller appeared, and
+ * {@link pinnedLookup}'s filter read a string family as "no family asked for"
+ * and would have answered an IPv6 address to a caller that asked for IPv4.
+ *
+ * Widened here rather than cast at the call site: a cast would have made the
+ * compiler stop objecting without making the filter correct, which is the worse
+ * of the two outcomes and the one that leaves no trace.
  */
 export type PinnedLookup = (
   hostname: string,
-  options: { readonly all?: boolean; readonly family?: number },
+  /*
+   * OPTIONAL, because Node's `lookup` has a two-argument overload — a caller may
+   * pass `(hostname, callback)` with no options at all. This was typed as
+   * required and the body read `options.family` unguarded, so that form threw a
+   * TypeError SYNCHRONOUSLY out of the lookup instead of refusing: a crash
+   * inside a resolver is not a refusal, and depending on the caller it is a
+   * fallback. Measured and fixed rather than left to the one call site that
+   * happens to always pass options.
+   */
+  options:
+    | { readonly all?: boolean; readonly family?: number | 'IPv4' | 'IPv6' }
+    | undefined,
   callback: (
     err: Error | null,
     addressOrAddresses?: string | readonly PinnedLookupAddress[],
@@ -1045,7 +1069,17 @@ export function pinnedLookup(permit: EgressPermit): PinnedLookup {
       );
     }
 
-    const wanted = options.family === 4 || options.family === 6 ? options.family : null;
+    /*
+     * NORMALISED, because `family` arrives as 4, 6, 'IPv4', 'IPv6', 0 or absent
+     * and only the first two were understood. 0 and absent both mean "either",
+     * which is what `null` says here; an unrecognised value is ALSO `null`
+     * rather than a refusal, because a family this build cannot name is a
+     * question about Node's API and not evidence about the host — and refusing
+     * a connection over it would break a caller for no security gain.
+     */
+    const family = options?.family;
+    const wanted =
+      family === 4 || family === 'IPv4' ? 4 : family === 6 || family === 'IPv6' ? 6 : null;
     const answers = permit.pinned.addresses
       .map((pin) => ({ address: pin.address, family: familyOf(pin.address) }))
       .filter((answer) => wanted === null || answer.family === wanted);
@@ -1056,7 +1090,7 @@ export function pinnedLookup(permit: EgressPermit): PinnedLookup {
       );
     }
 
-    if (options.all === true) {
+    if (options?.all === true) {
       callback(null, answers);
       return;
     }
@@ -1107,9 +1141,30 @@ export function chromiumHostResolverRules(permits: readonly EgressPermit[]): str
 /**
  * THE IP-FORM URL WITH THE HOST HEADER KEPT — HTTP ONLY, AND IT SAYS SO.
  *
- * For a transport with no `lookup` hook (a bare `fetch`), the only pin
- * available is to put the address in the URL and the name in the Host header.
- * That works over http and it is genuinely how a pinned fetch is done.
+ * For a transport with no `lookup` hook, the only pin available is to put the
+ * address in the URL and the name in the Host header.
+ *
+ * ── AND NOT WITH GLOBAL `fetch`, WHICH IS WHAT THIS USED TO SAY ─────────────
+ *
+ * The sentence here read "That works over http and it is genuinely how a pinned
+ * fetch is done", naming a bare `fetch` as the transport. MEASURED on Node
+ * v25.6.1 against a loopback server, and it is false: the global `fetch`
+ * SILENTLY DROPS a `host` request header — the server saw `127.0.0.1:<port>`,
+ * not the name that was set — while `http.request` with the same header sent
+ * `app.example.com`. So this helper's output is usable only from a transport
+ * that lets the caller set Host, which means `http.request`; handed to `fetch`
+ * it produces a request with the address in the URL and the ADDRESS in the Host
+ * header, which is a rewritten URL and no pin at all.
+ *
+ * Corrected rather than deleted because the mistake is the one this whole area
+ * exists to stop: a comment that invites the next reader to build a pin that
+ * does not pin is the same class of defect as the "there is no supported way to
+ * hand global `fetch` a resolver" note that kept five credential-carrying paths
+ * unpinned for four rounds. The helper has NO production caller today
+ * (grepped: its own tests, and a reference in `packages/agent/src/crawler.ts`);
+ * {@link pinnedLookup} with `http.request` — which is what
+ * `packages/shared/src/pinned-request.ts` does — is the answer for http as well
+ * as https, and is strictly better because it never rewrites the URL.
  *
  * It returns null for https, and the null is the honest answer rather than a
  * missing feature. Rewriting `https://app.example.com/` to
